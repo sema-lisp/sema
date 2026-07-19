@@ -19,8 +19,7 @@ use sema_core::{check_arity, SemaError, Value};
 
 use crate::register_fn;
 
-/// Compute `(sources, timeout_ms, started)` for one `event/select` call — the
-/// shared setup for the sync, legacy-async, and unified-runtime paths.
+/// Compute `(sources, timeout_ms, started)` for one `event/select` call.
 fn select_setup(args: &[Value]) -> Result<(Vec<Value>, u128, Instant), SemaError> {
     let sources = sources_of(&args[0])?;
     // Explicit timeout, else the smallest timer among the sources, else 10s.
@@ -35,18 +34,11 @@ fn select_setup(args: &[Value]) -> Result<(Vec<Value>, u128, Instant), SemaError
     Ok((sources, timeout_ms, Instant::now()))
 }
 
-/// Value-ABI body for `event/select`: the sync polling loop plus the legacy
-/// cooperative-scheduler `in_async_context()` `AwaitIo` poll. The unified-runtime
-/// cooperative path lives in the runtime ABI (see [`register`]).
+/// Synchronous value-ABI body for `event/select`. The cooperative path lives in
+/// the runtime ABI (see [`register`]).
 fn event_select_value(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "event/select", 1..=2);
     let (sources, timeout_ms, started) = select_setup(args)?;
-
-    // In a legacy scheduler task, cooperatively poll the sources on the scheduler
-    // thread rather than `std::thread::sleep`-blocking it between scans, so
-    // sibling tasks (e.g. an LLM/agent task) make progress while we wait for a
-    // source or the timeout. Reuses the same `AwaitIo` yield the file/http/shell
-    // async paths use. The sync path below is unchanged.
 
     loop {
         for s in &sources {
@@ -63,7 +55,7 @@ fn event_select_value(args: &[Value]) -> Result<Value, SemaError> {
 
 /// The VM-thread readiness probe for `event/select` under the unified runtime:
 /// the first ready source fires. Holds the source maps (live `Value`s), so it is
-/// GC-traced — unlike the legacy untraced `AwaitIo` closure.
+/// GC-traced because the probe owns live source-map `Value`s.
 #[cfg(not(target_arch = "wasm32"))]
 struct SourcesProbe {
     sources: Vec<Value>,
@@ -208,11 +200,9 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::map(m))
     });
 
-    // event/select — first ready source, or nil on timeout. Registered dual-ABI:
-    // the value body serves the sync + legacy-scheduler paths; under the unified
-    // runtime the runtime body yields a cooperative structural-timer poll so a TUI
-    // "input OR agent progress" loop overlaps siblings without the legacy
-    // `AwaitIo` bridge (crates/sema/tests/vm_async_test.rs asserts the yield).
+    // event/select — first ready source, or nil on timeout. The synchronous
+    // value body polls directly; the runtime body uses structural timer wakes so
+    // a TUI "input OR agent progress" loop overlaps sibling tasks.
     register_event_select(env);
 }
 

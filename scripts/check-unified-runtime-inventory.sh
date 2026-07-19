@@ -88,20 +88,29 @@ check_mapping_files() {
     return 1
   fi
 
-  awk -F '|' '
+  if ! awk -F '|' '
     /^\|/ {
       cell = $2
       sub(/^[[:space:]]+/, "", cell)
       sub(/[[:space:]]+$/, "", cell)
       split(cell, parts, /[[:space:]]+/)
       if (parts[1] ~ /^[A-Z][0-9][0-9][A-Z]?$/) {
+        if (seen[parts[1]]++) {
+          print "runtime inventory contains duplicate ledger row " parts[1] > "/dev/stderr"
+          invalid = 1
+          next
+        }
         status = $(NF - 1)
         sub(/^[[:space:]]+/, "", status)
         sub(/[[:space:]]+$/, "", status)
         print parts[1] "\t" status
       }
     }
-  ' "$inventory_file" | LC_ALL=C sort -u >"$ledger_status_file"
+    END { exit invalid }
+  ' "$inventory_file" >"$ledger_status_file"; then
+    rm -f "$payload_file" "$ledger_status_file" "$mapped_row_file"
+    return 1
+  fi
   cut -f1 "$mapping_file" | LC_ALL=C sort -u >"$mapped_row_file"
   if ! awk -F '\t' '
     NR == FNR { ledger[$1] = $2; next }

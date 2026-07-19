@@ -311,13 +311,10 @@ impl NativeFn {
         }
     }
 
-    /// Constructs a native carrying BOTH the legacy value ABI and the runtime
-    /// ABI. The runtime callback drives the native under the unified cooperative
-    /// runtime (where a [`TaskContext`](crate::runtime::TaskContext) is
-    /// installed); the legacy `func` runs it everywhere else (a bare top-level
-    /// eval and the legacy scheduler). `async/sleep` uses this so it suspends
-    /// structurally under the runtime yet still sleeps synchronously — or yields
-    /// the legacy signal — outside it.
+    /// Constructs a native carrying both the synchronous value ABI and the
+    /// runtime ABI. The runtime callback runs with an installed
+    /// [`TaskContext`](crate::runtime::TaskContext); `func` handles callers that
+    /// invoke the native outside a runtime quantum.
     ///
     /// Invariant I2 applies to both callbacks: do not strongly capture a
     /// `Value`, `Env`, or a transitive owner. Put traceable state in a registered
@@ -341,10 +338,8 @@ impl NativeFn {
     /// Like [`simple_with_runtime`](Self::simple_with_runtime), but the legacy
     /// callback receives the evaluator context (parity with
     /// [`with_ctx`](Self::with_ctx)). The runtime callback drives the native
-    /// under the unified cooperative runtime; the legacy `func` runs it in a bare
-    /// top-level eval and the legacy scheduler — where a converted native's
-    /// suspending branch (gated on `in_runtime_quantum`) is never reached, so the
-    /// legacy callback only ever produces plain values.
+    /// under the unified cooperative runtime; `func` handles synchronous callers
+    /// outside a runtime quantum and therefore only produces plain values.
     ///
     /// Invariant I2 applies to both callbacks: do not strongly capture a
     /// `Value`, `Env`, or a transitive owner. Put traceable state in a registered

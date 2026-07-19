@@ -57,11 +57,8 @@ thread_local! {
 /// unset/empty, and `--no-auth-prompt` was not passed.
 ///
 /// Resolution happens before any workflow phase runs, so a browser prompt here
-/// has nothing to park/resume — this collapses the plan's "live gate"
-/// (yield-signal parking, shared with the deferred HITL-approval-gate
-/// milestone) for the run-start case specifically. That yield machinery is
-/// NOT needed for this path and is not built here; a mid-run re-auth (a token
-/// revoked while phases are already executing) is out of scope too.
+/// has no task to park or resume. A mid-run re-authentication request (for
+/// example, after token revocation) is outside this run-start gate's scope.
 ///
 /// Thread-local because a Sema interpreter (and thus a workflow run) is
 /// single-threaded.

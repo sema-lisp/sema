@@ -379,6 +379,33 @@ fn unified_runtime_inventory_checker_rejects_invalid_fixture_states() {
         );
     }
 
+    fs::write(
+        &inventory,
+        "| Area | Path | Status |\n| --- | --- | --- |\n\
+         | R01A first row | match | LEGACY |\n\
+         | R01A conflicting row | match | MIGRATED |\n",
+    )
+    .expect("write conflicting duplicate ledger fixture");
+    let output = Command::new(root.join("scripts/check-unified-runtime-inventory.sh"))
+        .args(["--check-files"])
+        .arg(&mapping)
+        .arg(&current)
+        .arg(&inventory)
+        .current_dir(&root)
+        .output()
+        .expect("run inventory checker duplicate-ledger fixture");
+    assert!(
+        !output.status.success(),
+        "conflicting duplicate ledger row unexpectedly passed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("duplicate ledger row R01A"),
+        "duplicate ledger row did not report its id\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
     fs::remove_dir_all(&fixture_dir).expect("remove inventory checker fixture directory");
 }
 

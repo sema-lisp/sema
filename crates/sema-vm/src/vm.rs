@@ -1047,11 +1047,10 @@ pub fn close_closure_upvalues_for_foreign_run(closure: &Closure) {
 /// registered as the current VM, so `close_closure_upvalues_for_foreign_run` can
 /// find the (paused) owning stack the cells point into.
 ///
-/// The synchronous native-call paths register the running VM via a
-/// `CurrentVmGuard` *before* invoking the native, so an `async/spawn` handled
-/// inline (legacy scheduler) snapshots against a live `CURRENT_VM`. The unified
-/// runtime instead defers the spawn to `spawn_detached`, which runs *after*
-/// `run_quantum` returned and dropped that guard — leaving `CURRENT_VM` empty.
+/// Synchronous native-call paths register the running VM via a
+/// `CurrentVmGuard` before invoking the native. Runtime spawn is deferred to
+/// `spawn_detached`, after `run_quantum` has returned and dropped that guard,
+/// leaving `CURRENT_VM` empty.
 /// Without this, a spawned closure that captures an enclosing frame's locals
 /// keeps Open cells that later dereference the wrong (task-VM) stack: a silent
 /// wrong-slot read (deadlock) or an escaped inner closure re-run synchronously
@@ -1835,8 +1834,7 @@ impl VM {
     /// (`runtime_quantum_active`). A nested synchronous re-entry (a module body
     /// run via `execute`, or a legacy callback) suspends that flag precisely so
     /// its natives take the value ABI and never re-borrow the `TaskContext` the
-    /// enclosing native already holds — mirroring the existing yield-signal
-    /// bridge, which was reached only through the same value ABI.
+    /// enclosing native already holds.
     fn dispatch_native(
         &mut self,
         func: &Rc<NativeFn>,

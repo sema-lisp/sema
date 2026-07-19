@@ -956,7 +956,9 @@ DELETED (P5, commit a1862f67); `scripts/check-unified-runtime-legacy.sh
   `native_call_multimethod_dispatches_selected_suspending_handler`
   (`crates/sema-vm/src/runtime/tests.rs`).
 
-  Historical description follows (superseded by the resolution above).
+  The indented diagnosis below is retained as historical evidence only. Every
+  “remaining” or failing statement in that block is superseded by the
+  resolution and passing gates above.
 
   **`vm_eval_is_vm_native_runs_async`** (`crates/sema/tests/vm_integration_test.rs`).
   `(eval '(await (async (+ 40 2))))` fails with "no async scheduler registered".
@@ -1281,11 +1283,13 @@ take_output, command_handle, shutdown}`, `RootOptions` (`capture_output`;
 the completion inbox; delivery at drive-turn start). Proving consumers: CLI
 Ctrl-C (`cancel_all`, double-press hard-exit — see docs/limitations.md for the
 long-synchronous-native caveat) and the notebook engine (per-cell capture +
-cross-thread cell cancel via `CancelToken`). Blocker 1 below is closed; P6-3
-remains gated only on real-browser verification.
+cross-thread cell cancel via `CancelToken`). Both P6-1 and P6-3 are closed by
+the resolutions above.
 
-**Attempted 2026-07-16; fell back cleanly (shipped mechanism unchanged).** The wasm host
-(`crates/sema-wasm/src/lib.rs`) still runs the shipped **replay-with-cache** HTTP path
+**Historical pre-landing attempt (superseded).** On 2026-07-16 the rewrite
+fell back cleanly, before the Promise-driven implementation and browser gate
+landed the next day. At that checkpoint the wasm host
+(`crates/sema-wasm/src/lib.rs`) still ran the shipped **replay-with-cache** HTTP path
 (`eval_async` re-runs the whole program up to `MAX_REPLAYS=50` on each `HTTP_AWAIT_MARKER`,
 so non-idempotent side effects re-execute) and the `Atomics.wait`/SharedArrayBuffer sleep
 (`installAtomicsSleep`/`worker_atomics_sleep`). The target (P6-3) is a Promise-returning
@@ -1293,8 +1297,8 @@ so non-idempotent side effects re-execute) and the `Atomics.wait`/SharedArrayBuf
 JS-callback-fed `WaitKind::External` completions (program body runs ONCE, no replay), deleting
 the replay+Atomics machinery and routing cancel through `RuntimeCommandHandle::cancel_root`.
 
-**Two coupled blockers:**
-1. **P6-1 (common host API) is unimplemented** — `Interpreter::submit_str`/`submit_value`/
+**Two coupled blockers recorded at that checkpoint:**
+1. **P6-1 (common host API) was unimplemented** — `Interpreter::submit_str`/`submit_value`/
    `drive`/`cancel_root`/`command_handle`, `RuntimeCommandHandle` (the only `Send` surface),
    `RootOptions`, root-tagged `OutputEvent`. Only the low-level `Runtime::submit_root`/`drive`/
    `poll_result`/`cancel_root` and `Interpreter::drive_vm_on_runtime` exist. P6-3 builds on

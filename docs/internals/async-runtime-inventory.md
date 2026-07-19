@@ -4,6 +4,12 @@ This ledger is the review boundary for the hard cut to one interpreter-owned
 cooperative runtime. Every production match from the Task 01 discovery scans is
 mapped below. Later tasks update rows; they do not delete unexplained rows.
 
+The mechanism and target columns preserve the original migration boundary: they
+describe what each family replaced and the contract it had to reach. The Status
+column is the current-HEAD disposition. A terminal `MIGRATED` row therefore may
+name a deleted source path in its original-mechanism column; its target and test
+columns state the replacement and evidence.
+
 ## Ledger rules
 
 A row becomes `MIGRATED` only when its target wait family, cancellation class,

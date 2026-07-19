@@ -1040,9 +1040,8 @@ fn resolved_path(p: &str) -> std::path::PathBuf {
 // the VM thread BEFORE dispatch, the job carries only an owned `Send` input
 // snapshot (a `String`/`Vec<u8>`, never an `Rc`/`Value`), computes off-thread,
 // and its send-safe payload is decoded back into a `Value` on the VM thread.
-// This is distinct from (and does NOT use) the legacy `LegacyAwaitIoBridge`
-// (`fs_offload`, gated on `in_async_context()`), which stays for the legacy
-// cooperative scheduler.
+// Every runtime caller receives a structural External suspension; synchronous
+// callers use the native's value ABI.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Duration;
@@ -1227,10 +1226,8 @@ where
 /// Unlike [`FsDecoder`], a domain error (the job's `Err(String)`) is surfaced as
 /// `SemaError::eval` rather than `SemaError::Io`. The CPU-bound archive/pdf/diff/
 /// server-file ops already build their own op-prefixed error strings (often the
-/// full `Display` of a `SemaError`), and the legacy offloaded path
-/// (`fs_offload` → `AwaitIo` → `await_io_error`) surfaced them through
-/// `SemaError::eval` — so eval-wrapping here preserves the exact user-visible
-/// message the runtime-quantum path produced before the External conversion.
+/// full `Display` of a `SemaError`), so eval-wrapping preserves their
+/// user-visible error contract.
 struct ComputeDecoder<T: Send + 'static> {
     op: &'static str,
     to_value: fn(T) -> Value,
@@ -1265,10 +1262,9 @@ impl<T: Send + 'static> CompletionDecoder for ComputeDecoder<T> {
 
 /// Like [`fs_quarantined`], but for a pure CPU-bound compute (archive/pdf/diff/
 /// server-file) whose domain errors are surfaced through `SemaError::eval` (see
-/// [`ComputeDecoder`]). Under the unified runtime this replaces the legacy
-/// `fs_offload` (`AwaitIo`) offload: the `job` runs quarantined-bounded on the
-/// thread-pool executor (overlapping siblings) and the decoded value resumes the
-/// parked frame. `job` is `Send` and returns `Result<T, String>` (Ok payload /
+/// [`ComputeDecoder`]). The `job` runs quarantined-bounded on the thread-pool
+/// executor (overlapping siblings) and the decoded value resumes the parked
+/// frame. `job` is `Send` and returns `Result<T, String>` (Ok payload /
 /// pre-rendered domain error); `to_value` decodes the `Ok` payload on the VM
 /// thread. Cancellation is best-effort (the bounded job runs to completion and
 /// its result is discarded), matching `fs_offload`'s no-abort-hook policy.
@@ -1537,19 +1533,15 @@ impl RuntimePoll for KeyProbe {
     }
 }
 
-/// Value-ABI body for `io/read-key-timeout`: the sync (blocking `select(2)`) path,
-/// plus the legacy cooperative-scheduler `in_async_context()` `AwaitIo` poll. The
-/// unified-runtime cooperative path lives in the runtime ABI ([`register_read_key_timeout`]).
+/// Synchronous value-ABI body for `io/read-key-timeout` using blocking
+/// `select(2)`. The cooperative path lives in the runtime ABI
+/// ([`register_read_key_timeout`]).
 fn read_key_timeout_value(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "io/read-key-timeout", 1);
     let ms = args[0]
         .as_int()
         .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))? as u64;
 
-    // In a legacy scheduler task, park on a cooperative poll instead of blocking
-    // the scheduler thread in `select(2)` for the whole timeout, so a "key OR
-    // agent progress" loop lets sibling tasks run while it waits. The sync path
-    // below is byte-identical to before.
     #[cfg(not(target_arch = "wasm32"))]
     if !unix_stdin_ready(ms) {
         return Ok(Value::nil());
@@ -1563,10 +1555,9 @@ fn read_key_timeout_value(args: &[Value]) -> Result<Value, SemaError> {
     }
 }
 
-/// Register `io/read-key-timeout` dual-ABI: the value body serves the sync +
-/// legacy-scheduler paths; under the unified runtime the runtime body yields a
-/// cooperative structural-timer poll ([`await_runtime_until`]) so a "key OR agent
-/// progress" loop overlaps siblings without the legacy `AwaitIo` bridge.
+/// Register `io/read-key-timeout` dual-ABI: the value body is synchronous; the
+/// runtime body uses structural timer wakes so a "key OR agent progress" loop
+/// overlaps sibling tasks.
 #[cfg(not(target_arch = "wasm32"))]
 fn register_read_key_timeout(env: &sema_core::Env) {
     env.set(

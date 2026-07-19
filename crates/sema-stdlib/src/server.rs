@@ -335,8 +335,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             // paths/strings — no `Value`/`Rc` crosses the thread boundary;
             // `http_file_marker` rebuilds the identical `__file` marker map on
             // the VM thread once the worker resolves. Under the unified runtime
-            // this suspends structurally on a quarantined-bounded External wait;
-            // the legacy scheduler still uses the `AwaitIo` bridge.
+            // this suspends structurally on a quarantined-bounded External wait.
             let resolve = move || -> Result<(String, String), String> {
                 let real_path = abs_path
                     .canonicalize()
@@ -641,9 +640,8 @@ impl sema_core::runtime::CompletionDecoder for RouterDecoder {
 
 /// Parse the route table and build the dispatch fn. Under the unified runtime a
 /// `:static` route's directory canonicalize is offloaded to a
-/// quarantined-bounded External wait (suspending structurally); the legacy
-/// scheduler still uses the `AwaitIo` bridge; a bare/top-level eval canonicalizes
-/// inline. Returns the runtime native ABI so the External suspend can flow out.
+/// quarantined-bounded External wait; synchronous callers canonicalize inline.
+/// Returns the runtime native ABI so the External suspend can flow out.
 fn router_body(args: &[Value]) -> sema_core::runtime::NativeResult {
     use std::rc::Rc;
 
@@ -655,8 +653,8 @@ fn router_body(args: &[Value]) -> sema_core::runtime::NativeResult {
         .or_else(|| args[0].as_vector())
         .ok_or_else(|| SemaError::type_error("list or vector", args[0].type_name()))?;
 
-    // Under the runtime (or the legacy scheduler): don't `canonicalize()` a
-    // `:static` route's directory inline (a symlink-resolving stat chain) — it
+    // Under the runtime, don't `canonicalize()` a `:static` route's directory
+    // inline (a symlink-resolving stat chain) — it
     // would run on the single cooperative VM thread. Instead defer it: push a
     // `nil` placeholder handler and remember (index, absolute-but-not-yet-
     // canonical dir) in `pending`, then resolve every pending dir in ONE offload
@@ -789,9 +787,8 @@ fn register_router(env: &sema_core::Env) {
 /// a matched non-static route's handler (through the evaluator's call callback —
 /// the caller supplies the appropriate `EvalContext`). `can_suspend` is `true`
 /// only when the caller reached this via the runtime ABI (so a structural
-/// suspend can flow out); the legacy value ABI passes `false`, taking either the
-/// `AwaitIo` bridge (legacy scheduler) or the inline sync canonicalize instead —
-/// so it never emits a runtime-path `AwaitIo` nor a suspend the value ABI can't
+/// suspend can flow out); the synchronous value ABI passes `false` and
+/// canonicalizes inline, so it never returns a suspension the value ABI cannot
 /// carry.
 fn dispatch_body(
     routes: &[(String, String, Value)],
@@ -971,10 +968,10 @@ fn dispatch_body(
 /// Build the `http/router/dispatch` closure for a fully-resolved route table
 /// (every `:static` directory already canonicalized). Dual-ABI: the runtime
 /// callback lets a `:static` file's `canonicalize()` suspend structurally on an
-/// External wait; the legacy value callback runs it via the `AwaitIo` bridge (in
-/// the legacy scheduler) or inline (bare/top-level). Both invoke a matched
-/// non-static handler through `call_callback` — the value ABI with its passed
-/// `EvalContext`, the runtime ABI with the thread-local stdlib context.
+/// External wait; the synchronous value callback canonicalizes inline. Both
+/// invoke a matched non-static handler through `call_callback` — the value ABI
+/// with its passed `EvalContext`, the runtime ABI with the installed stdlib
+/// context.
 fn build_router_dispatch_fn(routes: std::rc::Rc<Vec<(String, String, Value)>>) -> Value {
     use sema_core::{call_callback, with_stdlib_ctx, EvalContext, NativeFn};
 

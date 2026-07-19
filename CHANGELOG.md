@@ -80,8 +80,9 @@
   cleanly too, instead of leaking "internal error: runtime native function 'X'
   requires runtime invocation" — the VM's direct-call sites route a
   runtime-quantum multimethod dispatch through the same cooperative Call path.
-  Both synchronous paths (top-level `eval`, a multimethod call outside a
-  runtime quantum, `apply` of a multimethod) are unchanged. See
+  Synchronous value-ABI evaluation and multimethod calls outside a runtime
+  quantum are unchanged. `apply` now uses the same runtime dispatcher, so a
+  selected multimethod method can suspend there as well. See
   `docs/deferred.md`'s Step G entry.
 - **WASM Promise-driven roots — the deletion (P6-3 step 5):** the shipped
   HTTP-replay loops (`evalAsync`/`evalVMAsync`/`runEntryAsync` re-running the

@@ -250,10 +250,9 @@ fn register_fn_path_gated(
 /// ABI (`NativeResult`) so its `in_runtime_quantum` branch can return a
 /// `NativeOutcome::Suspend` (an external-wait offload) directly. The sandbox
 /// capability + path checks are applied identically, then the checked body is
-/// exposed under BOTH ABIs: the runtime callback returns the body's
-/// `NativeOutcome` (surfaced structurally by the unified runtime), and the legacy
-/// value callback unwraps a plain `Return` for a bare/top-level or legacy-
-/// scheduler eval (where the body never reaches its suspending branch).
+/// exposed under both ABIs: the runtime callback returns the body's structural
+/// `NativeOutcome`, and the synchronous value callback unwraps a plain `Return`
+/// when no runtime quantum is active.
 #[cfg(not(target_arch = "wasm32"))]
 fn register_runtime_fn_path_gated(
     env: &Env,
@@ -315,12 +314,10 @@ fn register_fn(
 /// Like [`register_fn`], but the op body speaks the runtime native ABI
 /// (`NativeResult`) so its `in_runtime_quantum` branch can return a
 /// `NativeOutcome::Suspend` (an external-wait offload) directly. The single body
-/// is exposed under BOTH ABIs: the runtime callback returns its `NativeOutcome`
-/// (surfaced structurally by the unified runtime), and the legacy value callback
-/// unwraps a plain `Return` for a bare/top-level or legacy-scheduler eval (where
-/// the body's suspending branch, gated on `in_runtime_quantum`, is never
-/// reached). Mirrors [`register_runtime_fn_path_gated`] without the sandbox
-/// checks — for ungated ops (`gzip/*`).
+/// is exposed under both ABIs: the runtime callback returns its
+/// `NativeOutcome`, while the synchronous value callback unwraps a plain
+/// `Return` when no runtime quantum is active. Mirrors
+/// [`register_runtime_fn_path_gated`] without the sandbox checks.
 #[cfg(not(target_arch = "wasm32"))]
 fn register_runtime_fn(
     env: &Env,

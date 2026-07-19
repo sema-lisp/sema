@@ -2663,12 +2663,8 @@ mod runtime_eval_tests {
         assert_eq!(dyn_bound, Value::int(102));
     }
 
-    // ACCEPTANCE GATE (Task 04 native-suspend ABI, first async op): `async/sleep`
-    // runs end-to-end through the unified runtime. The VM native yields via the
-    // TLS yield signal (surfaced as `VmExecResult::AsyncYield(Sleep)`); the
-    // runtime parks the VM in `vm_call`, arms a real timer wait, and resumes the
-    // same VM frame with nil once `fire_timer` fires. No legacy scheduler is
-    // installed — the runtime's own timer/drive loop drives the suspension.
+    // `async/sleep` returns a structural timer suspension. The runtime parks its
+    // continuation and resumes the same VM frame with nil when the timer fires.
     #[test]
     fn eval_via_runtime_async_sleep_settles_after_timer_fires() {
         let interp = Interpreter::new();
@@ -4147,10 +4143,8 @@ mod runtime_eval_tests {
 
     // ── SPAWNED-TASK OBSERVATION PARITY (full-flip family A) ──────────────────
     //
-    // These gate the cooperative-scheduling parity fixes that let a parent
-    // observe a JUST-spawned child synchronously through the unified runtime,
-    // matching the legacy scheduler. They run on `eval_str_via_runtime` so they
-    // hold regardless of whether `eval_str_compiled` is flipped onto the runtime.
+    // These gate the scheduling contract that lets a parent observe a
+    // JUST-spawned child synchronously through the unified runtime.
 
     // A freshly spawned task is Pending until the spawner suspends: the runtime
     // resumes the spawner AHEAD of the child (`spawn_detached`), so a same-quantum
@@ -4222,8 +4216,8 @@ mod runtime_eval_tests {
         assert_eq!(result, Value::list(vec![Value::int(1)]));
     }
 
-    // `async/run` inside an async task is a cooperative yield under the runtime
-    // (no legacy scheduler to invoke) and preserves the async context across it.
+    // `async/run` inside an async task suspends cooperatively and preserves the
+    // task context across the origin barrier.
     #[test]
     fn runtime_async_run_yields_and_preserves_context() {
         let interp = Interpreter::new();

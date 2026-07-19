@@ -2,6 +2,15 @@
 
 Date: 2026-07-16. Branch: `codex/unified-async-runtime`.
 
+> **Historical point-in-time report — superseded.** This file records the
+> 2026-07-16 P8 verdict and its then-current deferrals. Later finish-remediation
+> work landed SRV-1, Promise-driven WASM roots, and runtime-scoped identity, then
+> continued across resource ownership and callback boundaries. Its gate counts
+> and release verdict therefore do not describe current HEAD. Follow the tracked
+> [finish-remediation plan](../../2026-07-18-unified-runtime-finish-remediation.md)
+> and [terminal-inventory follow-up](../../2026-07-19-unified-runtime-terminal-inventory.md)
+> until a final verification record lands.
+
 This report assesses the unified cooperative runtime migration against
 release-readiness after the core migration, P7 verification, and the
 productionization wave. It stands in for Task 11's formal profiling pass; the

@@ -695,10 +695,10 @@ fn register_fn_ctx(
 /// Register a dual-ABI native whose body speaks the runtime native ABI
 /// (`NativeResult`) so its `in_runtime_quantum` branch can return a
 /// `NativeOutcome::Suspend`/`Call` directly (an external-wait offload or a
-/// cooperative tool round). The runtime callback has no evaluator context of its
-/// own, so it borrows the shared stdlib `EvalContext` for callback dispatch. The
-/// plain value callback runs the same body with its evaluator context and unwraps
-/// the `Return` produced outside a runtime quantum.
+/// cooperative tool round). The runtime callback uses the exact evaluator
+/// context carried by its [`sema_core::runtime::NativeCallContext`]. The plain
+/// value callback runs the same body with its evaluator context and unwraps the
+/// `Return` produced outside a runtime quantum.
 ///
 /// True when a provider call must offload so the interpreter thread never
 /// blocks. Root-main and addressable spawned tasks are both suspendable runtime
@@ -729,7 +729,7 @@ fn register_runtime_fn_ctx(
                     "{err_name}: native suspended outside the cooperative runtime"
                 ))),
             },
-            move |_native_ctx, args| sema_core::with_stdlib_ctx(|ctx| for_runtime(ctx, args)),
+            move |native_ctx, args| for_runtime(native_ctx.eval_context, args),
         )),
     );
 }
@@ -1890,9 +1890,10 @@ fn register_fn_ctx_gated_as(
 /// Runtime-ABI sibling of [`register_fn_ctx_gated_as`]: registers under
 /// `reg_name` a dual-ABI native whose body speaks `NativeResult` (so its
 /// `in_runtime_quantum` branch can `NativeOutcome::Suspend`), gated as
-/// `display_name`. The runtime callback borrows the shared stdlib `EvalContext`
-/// (as [`register_runtime_fn_ctx`] does); the plain value callback runs the same
-/// body with its evaluator context and unwraps the `Return`.
+/// `display_name`. The runtime callback receives the invoking runtime's exact
+/// evaluator context (as [`register_runtime_fn_ctx`] does); the plain value
+/// callback runs the same body with its evaluator context and unwraps the
+/// `Return`.
 fn register_runtime_fn_ctx_gated_as(
     env: &Env,
     sandbox: &sema_core::Sandbox,
@@ -1926,11 +1927,11 @@ fn register_runtime_fn_ctx_gated_as(
                     ))),
                 }
             },
-            move |_native_ctx, args| {
+            move |native_ctx, args| {
                 if !unrestricted {
                     sandbox_runtime.check(cap, &gate_name_runtime)?;
                 }
-                sema_core::with_stdlib_ctx(|ctx| for_runtime(ctx, args))
+                for_runtime(native_ctx.eval_context, args)
             },
         )),
     );
@@ -12290,6 +12291,62 @@ mod tests {
     use super::*;
     use sema_core::{intern, Lambda};
     use serde_json::json;
+
+    fn runtime_quantum_probe(
+        ctx: &EvalContext,
+        _args: &[Value],
+    ) -> sema_core::runtime::NativeResult {
+        Ok(sema_core::runtime::NativeOutcome::Return(Value::bool(
+            ctx.runtime_quantum_active(),
+        )))
+    }
+
+    fn invoke_context_probe(env: &Env, name: &str, eval_context: &EvalContext) -> Value {
+        use sema_core::runtime::{CancellationView, NativeCallContext, NativeOutcome, TaskContext};
+
+        let callable = env.get(intern(name)).expect("registered context probe");
+        let native = callable.as_native_fn_rc().expect("probe is a native");
+        let mut task_context = TaskContext::empty();
+        let mut call_context = NativeCallContext {
+            eval_context,
+            task_context: &mut task_context,
+            cancellation: CancellationView::default(),
+        };
+        match native
+            .invoke_runtime(&mut call_context, &[])
+            .expect("probe invocation succeeds")
+        {
+            NativeOutcome::Return(value) => value,
+            _ => panic!("context probe must return directly"),
+        }
+    }
+
+    #[test]
+    fn runtime_context_helpers_use_the_invocation_context() {
+        let eval_context = EvalContext::new();
+        let env = Env::new();
+        register_runtime_fn_ctx(&env, "runtime-context-probe", runtime_quantum_probe);
+        register_runtime_fn_ctx_gated_as(
+            &env,
+            &sema_core::Sandbox::allow_all(),
+            sema_core::Caps::NETWORK,
+            "gated-runtime-context-probe",
+            "gated-runtime-context-probe",
+            runtime_quantum_probe,
+        );
+
+        let _quantum = eval_context
+            .enter_runtime_quantum()
+            .expect("probe owns the runtime quantum");
+        assert_eq!(
+            invoke_context_probe(&env, "runtime-context-probe", &eval_context),
+            Value::bool(true)
+        );
+        assert_eq!(
+            invoke_context_probe(&env, "gated-runtime-context-probe", &eval_context),
+            Value::bool(true)
+        );
+    }
 
     #[test]
     fn conversation_callback_driver_traces_retained_values() {

@@ -113,14 +113,19 @@ pub fn register(env: &sema_core::Env) {
     // yield — the scheduler delivers a park's resume value straight to the
     // CALL SITE, not back into the middle of this loop (see
     // `sema_core::async_signal` / `docs/plans/archive/2026-07-02-
-    // nonblocking-agent-run.md`) — so this real `thread::sleep` loop is only
-    // ever reached at top level; the prelude `retry` wrapper routes async
-    // context through a Sema-level loop (`__retry-setup` below) that backs
-    // off via `async/sleep` instead.
+    // nonblocking-agent-run.md`) — so this real `thread::sleep` loop is
+    // reserved for host/plain-worker callers. The prelude `retry` wrapper
+    // routes runtime context through a Sema-level loop (`__retry-setup` below)
+    // that backs off via `async/sleep` instead.
     register_fn(env, "__retry-blocking", |args| {
         check_arity!(args, "retry", 1..=2);
         let thunk = &args[0];
         let (max_attempts, base_delay_ms, backoff) = retry_opts(args)?;
+        if sema_core::in_runtime_quantum() {
+            return Err(SemaError::eval(
+                "__retry-blocking is a host-only adapter; runtime code must use retry",
+            ));
+        }
 
         let mut last_error = None;
         for attempt in 0..max_attempts {

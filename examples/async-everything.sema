@@ -55,8 +55,8 @@
 
 ;; ── SECTION 1 (THE CANARY): 4 levels of async nesting, upvalues captured across
 ;;    levels, streaming for-each/fold callbacks, and a nested async/all inside. ──
-;; If snapshot_escaping_closure or run_closure_foreign_sync ever regress, the
-;; cross-level upvalues (l1-tag, l1-base) vanish and these checks go ✖.
+;; These checks pin the cross-level upvalues (l1-tag, l1-base) through every
+;; structural callback handoff.
 (defun section-deep-nesting (id p)
   (async ; ── level 1 ──
     (let ((l1-tag "α") (l1-base 1000))

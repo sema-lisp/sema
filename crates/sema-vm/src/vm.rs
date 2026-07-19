@@ -783,48 +783,6 @@ pub fn call_closure_owned(
     Some(vm.run(ctx))
 }
 
-/// Run a VM closure SYNCHRONOUSLY on a fresh foreign VM, WITHOUT touching the
-/// async scheduler (no inline task, no `take_scheduler`).
-///
-/// This is the invocation path for a per-item callback fired from inside an I/O
-/// poll — e.g. the streaming file line readers (`file/for-each-line` /
-/// `fold-lines` / `fold-lines-bytes`), whose callback runs while the scheduler
-/// is already borrowed to drive that very poll. Routing through the normal
-/// `call_callback` → `run_closure_as_inline_task` path would `take_scheduler()`
-/// and fail with "scheduler not initialized" (the scheduler is out, running the
-/// poll), and a *nested* `async/all` on a sibling task makes it reproducible.
-/// Running synchronously on a fresh VM sidesteps the scheduler entirely.
-///
-/// The callback's upvalues must have been snapshotted earlier via
-/// [`snapshot_escaping_closure`] (while the owning task VM was current) — here
-/// they are already `Tracked`, so the fresh VM reads them correctly. The
-/// callback must not itself yield (await/sleep/spawn) — the same constraint the
-/// synchronous non-async line-reader path imposes on its callback. Non-VM-closure
-/// callables (e.g. a builtin passed directly) fall back to the ordinary call.
-pub fn run_closure_foreign_sync(
-    func: &Value,
-    ctx: &EvalContext,
-    args: &[Value],
-) -> Result<Value, SemaError> {
-    let Some((closure, functions, native_fns)) = extract_vm_closure(func) else {
-        return sema_core::call_callback(ctx, func, args);
-    };
-    let Some(globals) = closure.globals.as_ref().map(|g| g.clone()) else {
-        return sema_core::call_callback(ctx, func, args);
-    };
-    close_closure_upvalues_for_foreign_run(&closure);
-    let mut vm = VM::new_with_rc_functions(globals, functions, native_fns);
-    vm.setup_for_call_args(closure, CallArgs::Borrowed(args))?;
-    // TEMPORARY BRIDGE: this helper is contractually SYNCHRONOUS-ONLY (its
-    // callback must not yield/await/spawn), so the fresh VM never touches the
-    // runtime scheduler. Suspend the quantum flag so the `run` entry guard
-    // doesn't reject this synchronous nested run during an active runtime
-    // quantum. Deleted with the Task 04 `NativeOutcome::Call` migration of
-    // legacy callback re-entry (see `suspend_runtime_quantum`).
-    let _q = ctx.suspend_runtime_quantum();
-    vm.run(ctx)
-}
-
 /// The home globals env of the VM currently executing a native call on this
 /// thread (the innermost `CURRENT_VM`), if any. A native invoked from a running
 /// VM uses this to act on the *current* environment — e.g. a nested `import`/

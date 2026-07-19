@@ -1424,6 +1424,37 @@ fn retry_exhausted_in_async_context_reraises_last_error() {
     );
 }
 
+#[test]
+fn retry_blocking_compatibility_native_rejects_runtime_entry_before_calling_thunk() {
+    let result = eval(
+        r#"
+        (let ((thunk-calls 0))
+          (try
+            (__retry-blocking
+              (fn ()
+                (set! thunk-calls (+ thunk-calls 1))
+                :must-not-return)
+              {:max-attempts 2 :base-delay-ms 0})
+            (catch error (list (:message error) thunk-calls))))
+        "#,
+    );
+
+    let result = result
+        .as_list()
+        .expect("runtime guard error should be catchable")
+        .to_vec();
+    let error = result[0].as_str().expect("guard error message");
+    assert!(
+        error.contains("__retry-blocking is a host-only adapter; runtime code must use retry"),
+        "unexpected blocking-native error: {error}"
+    );
+    assert_eq!(
+        result[1],
+        Value::int(0),
+        "guard must run before the thunk callback"
+    );
+}
+
 // === Regression #104: async/spawn keeps captured locals live across the spawn boundary ===
 //
 // `async/spawn` runs the task on a dedicated task VM whose stack differs from the

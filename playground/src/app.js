@@ -669,8 +669,8 @@ function toggleBreakpoint(lineNum) {
     }
   }
   updateGutter();
-  if (interp && interp.debugIsActive()) {
-    interp.debugSetBreakpoints(Array.from(breakpoints));
+  if (interp && interp.debugIsActivePromise()) {
+    interp.debugSetBreakpointsPromise(Array.from(breakpoints));
   }
 }
 
@@ -753,24 +753,9 @@ function handleDebugResult(result) {
   if (result.status === 'stopped') {
     currentDebugLine = result.line;
     updateGutter();
+    setDebugState('paused');
     scrollToLine(result.line);
     updateVariablesPanel();
-    setDebugState('paused');
-  } else if (result.status === 'yielded') {
-    // VM yielded to keep browser responsive — resume after yielding to event loop
-    setTimeout(() => {
-      if (debugState === 'running' && interp) {
-        try {
-          handleDebugResult(interp.debugPoll());
-        } catch (e) {
-          showDebugError(e);
-        }
-      }
-    }, 0);
-  } else if (result.status === 'http_needed') {
-    // VM hit an HTTP call — perform the fetch and restart the debug session
-    handleDebugHttpNeeded(result.request);
-    return;
   } else if (result.status === 'finished') {
     if (result.value !== null && result.value !== undefined) {
       const div = document.createElement('div');
@@ -779,7 +764,6 @@ function handleDebugResult(result) {
       div.textContent = `=> ${result.value}`;
       outputEl.appendChild(div);
     }
-    interp.debugStop();
     setDebugState('idle');
   } else if (result.status === 'error') {
     const div = document.createElement('div');
@@ -787,36 +771,9 @@ function handleDebugResult(result) {
     div.setAttribute('data-testid', 'output-error');
     div.textContent = result.error;
     outputEl.appendChild(div);
-    interp.debugStop();
     setDebugState('idle');
-  }
-}
-
-let debugHttpRetries = 0;
-const MAX_DEBUG_HTTP_RETRIES = 50;
-
-async function handleDebugHttpNeeded(request) {
-  debugHttpRetries++;
-  if (debugHttpRetries > MAX_DEBUG_HTTP_RETRIES) {
-    showDebugError(new Error('Exceeded maximum HTTP requests during debug session'));
-    return;
-  }
-
-  try {
-    // Let WASM perform the fetch and cache the response natively
-    const success = await interp.debugPerformFetch(JSON.stringify(request));
-    if (!success) {
-      showDebugError(new Error(`HTTP fetch failed: ${request.method} ${request.url}`));
-      return;
-    }
-
-    // Restart the debug session — cached response will be used this time
-    const code = editorEl.value;
-    outputEl.innerHTML = '';
-    const result = interp.debugStart(code, Array.from(breakpoints));
-    handleDebugResult(result);
-  } catch (e) {
-    showDebugError(e);
+  } else if (result.status === 'cancelled') {
+    setDebugState('idle');
   }
 }
 
@@ -826,7 +783,7 @@ function showDebugError(e) {
   div.setAttribute('data-testid', 'output-error');
   div.textContent = e.message || String(e);
   outputEl.appendChild(div);
-  try { interp.debugStop(); } catch (_) { /* ignore */ }
+  try { interp.debugStopPromise(); } catch (_) { /* ignore */ }
   setDebugState('idle');
 }
 
@@ -840,7 +797,7 @@ function updateVariablesPanel() {
 
   if (debugState !== 'paused' || !interp) return;
 
-  const locals = interp.debugGetLocals();
+  const locals = interp.debugGetLocalsPromise();
   if (!locals || !Array.isArray(locals) || locals.length === 0) return;
 
   const panel = document.createElement('div');
@@ -865,17 +822,15 @@ function updateVariablesPanel() {
 }
 
 // Debug button
-debugBtn.addEventListener('click', () => {
+debugBtn.addEventListener('click', async () => {
   if (!interp || debugState !== 'idle') return;
   const code = editorEl.value;
   if (!code.trim()) return;
 
   outputEl.innerHTML = '';
   setDebugState('running');
-  debugHttpRetries = 0;
-
   try {
-    const result = interp.debugStart(code, Array.from(breakpoints));
+    const result = await interp.debugStartPromise(code, Array.from(breakpoints));
     handleDebugResult(result);
   } catch (e) {
     showDebugError(e);
@@ -883,33 +838,33 @@ debugBtn.addEventListener('click', () => {
 });
 
 // Debug control buttons
-document.getElementById('dbg-continue').addEventListener('click', () => {
+document.getElementById('dbg-continue').addEventListener('click', async () => {
   if (!interp || debugState !== 'paused') return;
   setDebugState('running');
-  try { handleDebugResult(interp.debugContinue()); } catch (e) { showDebugError(e); }
+  try { handleDebugResult(await interp.debugContinuePromise()); } catch (e) { showDebugError(e); }
 });
 
-document.getElementById('dbg-step-over').addEventListener('click', () => {
+document.getElementById('dbg-step-over').addEventListener('click', async () => {
   if (!interp || debugState !== 'paused') return;
   setDebugState('running');
-  try { handleDebugResult(interp.debugStepOver()); } catch (e) { showDebugError(e); }
+  try { handleDebugResult(await interp.debugStepOverPromise()); } catch (e) { showDebugError(e); }
 });
 
-document.getElementById('dbg-step-into').addEventListener('click', () => {
+document.getElementById('dbg-step-into').addEventListener('click', async () => {
   if (!interp || debugState !== 'paused') return;
   setDebugState('running');
-  try { handleDebugResult(interp.debugStepInto()); } catch (e) { showDebugError(e); }
+  try { handleDebugResult(await interp.debugStepIntoPromise()); } catch (e) { showDebugError(e); }
 });
 
-document.getElementById('dbg-step-out').addEventListener('click', () => {
+document.getElementById('dbg-step-out').addEventListener('click', async () => {
   if (!interp || debugState !== 'paused') return;
   setDebugState('running');
-  try { handleDebugResult(interp.debugStepOut()); } catch (e) { showDebugError(e); }
+  try { handleDebugResult(await interp.debugStepOutPromise()); } catch (e) { showDebugError(e); }
 });
 
 document.getElementById('dbg-stop').addEventListener('click', () => {
   if (!interp) return;
-  interp.debugStop();
+  interp.debugStopPromise();
   setDebugState('idle');
 });
 

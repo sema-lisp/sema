@@ -33,21 +33,10 @@
 // and the SAB/`legacySab` machinery, not just `driver.rs`/the shipped
 // bundle's default branch as step 4 scoped it.
 //
-// This is NOT a claim that `HTTP_AWAIT_MARKER`/`installAtomicsSleep` are gone
-// from the Rust crate entirely — a step-5 audit found each has a real, still-
-// live consumer beyond the deleted replay/legacySab machinery: (1) the wasm
-// debugger's own `http_needed`/`debugPerformFetch` flow (`debugStart` is not
-// promise-driven and has no other way to surface a pending fetch to JS), and
-// (2) `check_interrupt`/blocking-sleep support for every still-synchronous
-// entry point (`eval`/`evalGlobal`/`evalVM`, a precompiled bytecode archive
-// entry) via `crates/sema-eval/src/eval.rs`'s `drive_handle_to_settlement`,
-// which a bare `(async/sleep ...)` reaches on ANY path (`async/sleep` is not
-// dual-ABI-gated the way `http/get` is). Forcing their deletion would break
-// those live callers with no replacement mechanism in scope here — see
-// `docs/deferred.md`'s P6-3 entry and
-// `scripts/check-unified-runtime-legacy.sh`'s zero-tolerance list comment for
-// the full record. `driver.rs` (the promise-driven path's own code) and the
-// shipped JS bundle stay clean of all four markers, checked below.
+// Promise-driven HTTP, timers, and debugging now own every admissible browser
+// suspension. Synchronous WASM entry points reject suspension instead of
+// retaining a replay or blocking-host bridge. The source and artifact checks
+// below therefore reject those retired markers across both Rust and shipped JS.
 import { test, expect, type Page } from '@playwright/test';
 import { readFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
@@ -542,6 +531,114 @@ test('synchronous evalVM rejects timer suspension promptly and keeps the runtime
   expect(result.next).toMatchObject({ value: '3', error: null });
 });
 
+test('synchronous eval rejected behind a promise debug barrier leaves no runnable root', async ({ page }) => {
+  await page.goto('/');
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+
+    const paused = await interp.debugStartPromise('(define held 1)\n(+ held 1)', [2]);
+    const rejected = interp.evalVM('(context/set :foreign-sync-root 99)');
+    const stopAccepted = interp.debugStopPromise();
+
+    // A synchronous debugger drives the whole runtime. If evalVM admitted a
+    // root before noticing the foreign debug barrier, that stranded root runs
+    // here and mutates the shared context before the inspected expression.
+    const entry = interp.debugStart('(context/get :foreign-sync-root)', []);
+    const finished = interp.debugContinue();
+    interp.debugStop();
+
+    return { paused, rejected, stopAccepted, entry, finished };
+  });
+
+  expect(result.paused).toMatchObject({ status: 'stopped', line: 2 });
+  expect(result.stopAccepted).toBe(true);
+  expect(result.entry).toMatchObject({ status: 'stopped' });
+  expect(result.finished).toMatchObject({ status: 'finished', value: null });
+  expect(result.rejected.error).toContain('debugger is paused');
+});
+
+test('synchronous eval rejected behind a promise debug barrier cannot register a macro', async ({ page }) => {
+  await page.goto('/');
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+
+    const paused = await interp.debugStartPromise('(+ 1 2)', []);
+    const rejected = interp.evalVM('(defmacro leaked () 123)');
+    const stopAccepted = interp.debugStopPromise();
+    const probe = interp.evalVM('(leaked)');
+    return { paused, rejected, stopAccepted, probe };
+  });
+
+  expect(result.paused).toMatchObject({ status: 'stopped' });
+  expect(result.rejected.error).toContain('debugger is paused');
+  expect(result.stopAccepted).toBe(true);
+  expect(result.probe.value).toBeNull();
+  expect(result.probe.error.toLowerCase()).toContain('unbound variable');
+});
+
+test('a detached foreign timer does not delay promise-root deadlock settlement', async ({ page }) => {
+  await page.goto('/');
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+
+    const foreign = interp.evalVM('(async/spawn (fn () (async/sleep 800)))');
+    const started = performance.now();
+    const deadlocked = await interp.evalPromise('(channel/recv (channel/new 1))').then(
+      (value: string) => ({ value, error: null }),
+      (error: Error) => ({ value: null, error: error.message }),
+    );
+    return { foreign, deadlocked, elapsed: performance.now() - started };
+  });
+
+  expect(result.foreign.error).toBeNull();
+  expect(result.deadlocked.value).toBeNull();
+  expect(result.deadlocked.error).toContain('deadlock');
+  expect(result.elapsed).toBeLessThan(250);
+});
+
+test('a detached foreign external wait does not suppress promise-root deadlock settlement', async ({ page }) => {
+  await page.route('**/foreign-external-wait', async (route) => {
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    await route.fulfill({ status: 200, body: 'ok' });
+  });
+  await page.goto('/');
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+    const foreign = await interp.evalPromise(
+      `(let ((task (async/spawn (fn () (http/get "${location.origin}/foreign-external-wait")))))
+         (async/sleep 20)
+         task)`,
+    );
+    const started = performance.now();
+    const deadlocked = await interp.evalPromise('(channel/recv (channel/new 1))').then(
+      (value: string) => ({ value, error: null }),
+      (error: Error) => ({ value: null, error: error.message }),
+    );
+    return { foreign, deadlocked, elapsed: performance.now() - started };
+  });
+
+  expect(result.foreign).toBe('<async-promise>');
+  expect(result.deadlocked.value).toBeNull();
+  expect(result.deadlocked.error).toContain('deadlock');
+  expect(result.elapsed).toBeLessThan(250);
+});
+
 test('synchronous debugger rejects suspension and clears only its session', async ({ page }) => {
   await page.goto('/');
 
@@ -638,15 +735,12 @@ test('the shipped default worker protocol never reaches legacy Atomics/replay co
   const workerSrc = readFileSync(path.join(__dirname, '..', 'dist', 'sema-worker.js'), 'utf8');
   const appSrc = readFileSync(path.join(__dirname, '..', 'dist', 'app.js'), 'utf8');
 
-  // The replay markers are `lib.rs`-only (Rust, and narrowed to the
-  // debugger); they must not appear in the shipped JS bundle at all.
+  // Retired replay markers must not appear in either shipped JS bundle.
   for (const marker of ['HTTP_AWAIT_MARKER', 'MAX_REPLAYS', 'legacySab', 'SharedArrayBuffer(']) {
     expect(workerSrc).not.toContain(marker);
     expect(appSrc).not.toContain(marker);
   }
-  // No real blocking Atomics.wait/notify CALL exists anywhere in the shipped
-  // worker (the sleep wait, where it still exists at all, happens inside the
-  // wasm binary via `js_sys::Atomics`, not as a literal invocation in JS).
+  // No blocking Atomics wait/notify call exists in the shipped worker or app.
   expect(workerSrc).not.toMatch(/Atomics\.(wait|store|notify)\(/);
   expect(appSrc).not.toMatch(/Atomics\.(wait|store|notify)\(/);
   expect(workerSrc).not.toContain('installAtomicsSleep');

@@ -334,8 +334,20 @@ impl Interpreter {
     /// Macro-expand, compile, and drive a sequence of top-level forms as one
     /// root on the unified runtime. Shared by the runtime eval entry points.
     fn run_exprs_via_runtime(&self, exprs: &[Value]) -> EvalResult {
+        self.ensure_synchronous_runtime_entry_allowed()?;
         let vm = self.build_vm_for_exprs(exprs)?;
         self.drive_vm_on_runtime(vm)
+    }
+
+    fn ensure_synchronous_runtime_entry_allowed(&self) -> Result<(), SemaError> {
+        #[cfg(target_arch = "wasm32")]
+        if self.runtime().is_debug_paused() {
+            return Err(SemaError::eval(
+                "synchronous WebAssembly evaluation cannot run while a debugger is paused",
+            )
+            .with_hint("Resume or stop the debugger before starting a synchronous evaluation"));
+        }
+        Ok(())
     }
 
     /// Macro-expand and compile a sequence of top-level forms into a
@@ -579,6 +591,7 @@ impl Interpreter {
             .runtime
             .as_ref()
             .expect("runtime is present outside of Drop");
+        self.ensure_synchronous_runtime_entry_allowed()?;
         let handle = runtime
             .submit_root(vm)
             .map_err(|e| SemaError::eval(format!("root submission failed: {e:?}")))?;

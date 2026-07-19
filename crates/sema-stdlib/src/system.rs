@@ -264,37 +264,36 @@ impl SignalKind {
         Ok(())
     }
 
-    fn release(self) {
+    /// Release one registry's process-handler lease without panicking. A failed
+    /// final `sigaction` restore leaves the subscriber and prior action intact
+    /// so Drop, GC severing, or a later interpreter hook can retry it.
+    fn release(self) -> bool {
         let mut ownership = process_signal_ownership()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let slot = &mut ownership[self.index()];
-        assert!(
-            slot.subscribers > 0,
-            "signal registry released an unowned process handler"
-        );
+        if slot.subscribers == 0 {
+            return true;
+        }
         if slot.subscribers > 1 {
             slot.subscribers -= 1;
-            return;
+            return true;
         }
 
-        let previous = slot
-            .previous
-            .as_ref()
-            .expect("owned process signal handler retains its prior sigaction");
+        let Some(previous) = slot.previous.as_ref() else {
+            return false;
+        };
         // SAFETY: `previous` was returned by `sigaction` for this exact signal
         // when the first subscriber installed the process handler. The global
         // ownership mutex keeps a new first subscriber from racing this restore.
         let restored =
             unsafe { libc::sigaction(self.signal_number(), previous, std::ptr::null_mut()) };
-        assert_eq!(
-            restored,
-            0,
-            "failed to restore prior signal disposition: {}",
-            std::io::Error::last_os_error()
-        );
+        if restored != 0 {
+            return false;
+        }
         slot.subscribers = 0;
         slot.previous = None;
+        true
     }
 }
 
@@ -399,12 +398,14 @@ impl SignalRegistry {
 
     fn release_installed_handlers(&self) {
         self.teardown_hook_registered.set(false);
-        let installed = self.installed.replace([false; 3]);
+        let mut installed = self.installed.get();
         for kind in SignalKind::ALL {
-            if installed[kind.index()] {
-                kind.release();
+            let index = kind.index();
+            if installed[index] && kind.release() {
+                installed[index] = false;
             }
         }
+        self.installed.set(installed);
     }
 }
 

@@ -137,11 +137,14 @@ impl Drop for Interpreter {
         // the collector would be a panic-in-destructor-during-cleanup, which
         // aborts the whole process instead of unwinding. Nothing is lost —
         // the candidates stay registered, so the next safe point on this
-        // thread reclaims the env. The persistent runtime field is left in
-        // place; its own `Drop` (`close_for_interpreter_drop`) cancels every
-        // task and closes the inbox WITHOUT driving any VM quantum, so it is
-        // bounded and panic-safe (no re-entrant evaluation while unwinding).
+        // thread reclaims the env. Signal leases are the exception: restoring
+        // a process disposition is non-evaluating and must not depend on a
+        // later GC. The persistent runtime field is left in place; its own
+        // `Drop` (`close_for_interpreter_drop`) cancels every task and closes
+        // the inbox WITHOUT driving any VM quantum, so it is bounded and
+        // panic-safe (no re-entrant evaluation while unwinding).
         if std::thread::panicking() {
+            let _ = self.ctx.try_run_signal_teardown_hooks();
             return;
         }
         // Tear down the persistent unified runtime BEFORE the global-env
@@ -167,7 +170,7 @@ impl Drop for Interpreter {
         // Process signal leases belong to the interpreter lifetime, not the
         // reachability of its global env. Embedders may retain `global_env`, so
         // run the registry's weak teardown hooks before clearing Value roots.
-        self.ctx.run_signal_teardown_hooks();
+        let _ = self.ctx.try_run_signal_teardown_hooks();
         // `self.ctx` outlives this Drop body (fields drop after it), and its
         // caches hold Values: module-cache export closures keep their module
         // envs — and via the parent chain the ENTIRE global env — externally

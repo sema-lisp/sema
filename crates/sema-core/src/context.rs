@@ -231,11 +231,15 @@ impl EvalContext {
     }
 
     #[doc(hidden)]
-    pub fn run_signal_teardown_hooks(&self) {
-        let hooks = self.signal_teardown_hooks.take();
+    pub fn try_run_signal_teardown_hooks(&self) -> bool {
+        let hooks = match self.signal_teardown_hooks.try_borrow_mut() {
+            Ok(mut hooks) => std::mem::take(&mut *hooks),
+            Err(_) => return false,
+        };
         for hook in hooks {
             hook();
         }
+        true
     }
 
     #[doc(hidden)]

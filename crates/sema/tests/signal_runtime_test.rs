@@ -526,6 +526,45 @@ fn retained_environment_does_not_retain_process_signal_ownership() {
 }
 
 #[test]
+fn unwinding_interpreter_drop_releases_signal_ownership_with_retained_state() {
+    let _guard = signal_test_guard();
+    let _restore = install_prior_sigwinch_handler();
+    let mut retained_env = None;
+    let mut retained_ctx = None;
+
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let interp = Interpreter::new();
+        eval(&interp, "(sys/on-signal :winch (fn () nil))");
+        retained_env = Some(std::rc::Rc::clone(&interp.global_env));
+        retained_ctx = Some(std::rc::Rc::clone(&interp.ctx));
+        panic!("trigger interpreter teardown during unwind");
+    }));
+    assert!(unwind.is_err(), "the fixture panic is caught by the host");
+
+    let restored = current_sigwinch_action();
+    assert_eq!(
+        restored.sa_sigaction, prior_sigwinch_handler as *const () as libc::sighandler_t,
+        "unwinding teardown restores the prior handler while env and ctx survive"
+    );
+    assert_ne!(
+        restored.sa_flags & libc::SA_RESTART,
+        0,
+        "unwinding teardown restores the prior flags"
+    );
+    // SAFETY: the successful sigaction query initialized `restored.sa_mask`.
+    assert_eq!(
+        unsafe { libc::sigismember(&restored.sa_mask, libc::SIGTERM) },
+        1,
+        "unwinding teardown restores the prior signal mask"
+    );
+
+    raise_sigwinch();
+    assert_eq!(PRIOR_SIGWINCH_CALLS.load(Ordering::Relaxed), 1);
+    drop(retained_ctx);
+    drop(retained_env);
+}
+
+#[test]
 fn callback_failure_is_fail_fast_and_consumes_the_signal_batch() {
     let _guard = signal_test_guard();
     let interp = Interpreter::new();

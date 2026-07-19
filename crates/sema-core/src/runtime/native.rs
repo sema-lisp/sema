@@ -238,6 +238,82 @@ pub struct NativeCall {
     pub continuation: Box<dyn NativeContinuation>,
 }
 
+/// Build the first stage of a structural multimethod call.
+///
+/// The returned call invokes the dispatch function. Its continuation retains
+/// the multimethod, original arguments, and caller continuation, selects a
+/// handler from the returned dispatch value, and emits a second
+/// [`NativeOutcome::Call`] for that handler. No evaluator callback is performed
+/// inside the active runtime quantum.
+pub fn multimethod_call(
+    multimethod: Value,
+    args: Vec<Value>,
+    continuation: Box<dyn NativeContinuation>,
+) -> Result<NativeCall, SemaError> {
+    let dispatch_fn = multimethod
+        .as_multimethod_rc()
+        .ok_or_else(|| SemaError::type_error("multimethod", multimethod.type_name()))?
+        .dispatch_fn
+        .clone();
+    Ok(NativeCall {
+        callable: dispatch_fn,
+        args: args.clone(),
+        continuation: Box::new(MultimethodDispatchContinuation {
+            multimethod,
+            args,
+            continuation,
+        }),
+    })
+}
+
+struct MultimethodDispatchContinuation {
+    multimethod: Value,
+    args: Vec<Value>,
+    continuation: Box<dyn NativeContinuation>,
+}
+
+impl Trace for MultimethodDispatchContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.multimethod));
+        for arg in &self.args {
+            sink(GcEdge::Value(arg));
+        }
+        self.continuation.trace(sink)
+    }
+}
+
+impl NativeContinuation for MultimethodDispatchContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let dispatch_value = match input {
+            ResumeInput::Returned(value) => value,
+            ResumeInput::Failed(error) => return Err(error),
+            ResumeInput::Cancelled(reason) => {
+                return Err(SemaError::eval(format!(
+                    "multimethod dispatch was cancelled ({reason:?})"
+                )))
+            }
+            ResumeInput::Runtime(_) => {
+                return Err(SemaError::eval(
+                    "multimethod dispatch received an unexpected runtime response",
+                ))
+            }
+        };
+        let multimethod = self.multimethod.as_multimethod_rc().ok_or_else(|| {
+            SemaError::eval("internal error: multimethod dispatch state lost its callable")
+        })?;
+        let handler = crate::select_multimethod_handler(&multimethod, &dispatch_value)?;
+        Ok(NativeOutcome::Call(NativeCall {
+            callable: handler,
+            args: self.args,
+            continuation: self.continuation,
+        }))
+    }
+}
+
 pub struct NativeSuspend {
     pub wait: WaitKind,
     pub continuation: Box<dyn NativeContinuation>,
@@ -397,6 +473,7 @@ impl Trace for ResumeInput {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
     use std::rc::Rc;
     use std::time::Duration;
 
@@ -453,6 +530,17 @@ mod tests {
         let mut count = 0;
         assert!(trace.trace(&mut |_| count += 1));
         count
+    }
+
+    fn test_multimethod() -> Value {
+        let mut methods = BTreeMap::new();
+        methods.insert(Value::keyword("selected"), Value::string("handler"));
+        Value::multimethod(crate::MultiMethod {
+            name: crate::intern("test/structural-multimethod"),
+            dispatch_fn: Value::string("dispatch"),
+            methods: RefCell::new(methods),
+            default: RefCell::new(None),
+        })
     }
 
     #[test]
@@ -567,6 +655,96 @@ mod tests {
             edge_count(&ResumeInput::Cancelled(CancelReason::Explicit)),
             0
         );
+    }
+
+    #[test]
+    fn multimethod_call_traces_both_structural_stages() {
+        let retained = Value::string("outer-retained");
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let dispatch = multimethod_call(
+            test_multimethod(),
+            vec![Value::int(7)],
+            Box::new(Continuation {
+                edge: retained,
+                seen,
+            }),
+        )
+        .expect("multimethod call");
+
+        assert_eq!(
+            edge_count(&dispatch),
+            5,
+            "dispatch callable + arg + retained multimethod + retained arg + outer continuation"
+        );
+
+        let mut task_context = TaskContext::default();
+        let mut context = NativeCallContext {
+            task_context: &mut task_context,
+            cancellation: CancellationView::default(),
+        };
+        let outcome = dispatch
+            .continuation
+            .resume(
+                &mut context,
+                ResumeInput::Returned(Value::keyword("selected")),
+            )
+            .expect("dispatch selects handler");
+        let NativeOutcome::Call(handler) = outcome else {
+            panic!("dispatch continuation must emit the handler call")
+        };
+        assert_eq!(handler.callable, Value::string("handler"));
+        assert_eq!(handler.args, vec![Value::int(7)]);
+        assert_eq!(
+            edge_count(&handler),
+            3,
+            "selected handler + arg + outer continuation"
+        );
+    }
+
+    #[test]
+    fn multimethod_dispatch_propagates_failure_cancellation_and_protocol_error() {
+        fn dispatch_continuation() -> Box<dyn NativeContinuation> {
+            multimethod_call(
+                test_multimethod(),
+                vec![Value::int(7)],
+                Box::new(Continuation {
+                    edge: Value::nil(),
+                    seen: Rc::default(),
+                }),
+            )
+            .expect("multimethod call")
+            .continuation
+        }
+
+        let mut task_context = TaskContext::default();
+        let mut context = NativeCallContext {
+            task_context: &mut task_context,
+            cancellation: CancellationView::default(),
+        };
+
+        let failure = dispatch_continuation()
+            .resume(
+                &mut context,
+                ResumeInput::Failed(SemaError::eval("dispatch failed")),
+            )
+            .err()
+            .expect("failure propagates");
+        assert!(failure.to_string().contains("dispatch failed"));
+
+        let cancelled = dispatch_continuation()
+            .resume(&mut context, ResumeInput::Cancelled(CancelReason::Explicit))
+            .err()
+            .expect("cancellation propagates");
+        assert!(cancelled.to_string().contains("cancelled"));
+
+        let protocol = dispatch_continuation()
+            .resume(
+                &mut context,
+                ResumeInput::Runtime(RuntimeResponse::Value(Value::nil())),
+            )
+            .err()
+            .expect("unexpected runtime response fails");
+        assert!(protocol.to_string().contains("unexpected runtime response"));
     }
 
     #[test]

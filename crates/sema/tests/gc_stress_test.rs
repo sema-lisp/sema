@@ -407,6 +407,33 @@ fn channel_ping_pong_with_collects_mid_exchange() {
     );
 }
 
+#[test]
+fn multimethod_structural_stages_survive_collections_while_parked() {
+    let v = eval_ok(
+        "(let ((seen 0))
+           (defmulti collected-multimethod
+             (fn (key)
+               (set! seen (+ seen 1))
+               (async/sleep 50)
+               key))
+           (defmethod collected-multimethod :go
+             (fn (key)
+               (set! seen (+ seen 10))
+               (async/sleep 50)
+               seen))
+           (let ((collector
+                   (async
+                     (async/sleep 10)
+                     (gc/collect)
+                     (async/sleep 50)
+                     (gc/collect))))
+             (let ((result (collected-multimethod :go)))
+               (await collector)
+               (list result seen))))",
+    );
+    assert_eq!(v, Value::list(vec![Value::int(11), Value::int(11)]));
+}
+
 // ── Collections from inside foreign frames ─────────────────────────
 
 #[test]

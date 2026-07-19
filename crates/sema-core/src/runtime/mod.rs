@@ -27,10 +27,10 @@ pub use ids::{
     RuntimeTaskId, ScopeId, SettlementSeq, TaskId, WaitGeneration, WaitId,
 };
 pub use native::{
-    CancellationView, ChannelOperation, ChannelQuery, ChannelReceive, ChannelSend, ChannelWait,
-    NativeCall, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, NativeSuspend,
-    PromiseSetMode, PromiseSetWait, ResourceGateCloseError, ResourceGateHandle, ResumeInput,
-    RuntimeRequest, RuntimeResponse, WaitKind,
+    multimethod_call, CancellationView, ChannelOperation, ChannelQuery, ChannelReceive,
+    ChannelSend, ChannelWait, NativeCall, NativeCallContext, NativeContinuation, NativeOutcome,
+    NativeResult, NativeSuspend, PromiseSetMode, PromiseSetWait, ResourceGateCloseError,
+    ResourceGateHandle, ResumeInput, RuntimeRequest, RuntimeResponse, WaitKind,
 };
 pub use resource::{
     CancelDisposition, CancelHook, CancelHookError, InterruptibleResource, InvalidQuarantineBound,

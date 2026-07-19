@@ -2930,17 +2930,6 @@ fn native_call_into_sema_closure_and_back_to_native_uses_task_vm() {
     );
 }
 
-fn invoke_native_multimethod_dispatch_for_test(
-    context: &sema_core::EvalContext,
-    callable: &Value,
-    args: &[Value],
-) -> Result<Value, SemaError> {
-    let native = callable
-        .as_native_fn_ref()
-        .ok_or_else(|| SemaError::type_error("native function", callable.type_name()))?;
-    (native.func)(context, args)
-}
-
 struct ForwardReturnedValue;
 
 impl Trace for ForwardReturnedValue {
@@ -2985,11 +2974,29 @@ impl NativeContinuation for ReturnAfterTimer {
     }
 }
 
+struct ReturnDispatchKeyAfterTimer;
+
+impl Trace for ReturnDispatchKeyAfterTimer {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for ReturnDispatchKeyAfterTimer {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        assert!(matches!(input, ResumeInput::Returned(_)));
+        Ok(NativeOutcome::Return(Value::keyword("selected")))
+    }
+}
+
 #[test]
-fn native_call_multimethod_dispatches_selected_suspending_handler() {
+fn native_call_multimethod_dispatch_and_selected_handler_suspend() {
     let clock = Rc::new(FakeClock::new());
     let context = Rc::new(sema_core::EvalContext::new());
-    sema_core::set_call_callback(&context, invoke_native_multimethod_dispatch_for_test);
     let runtime = Runtime::new(
         context,
         clock.clone(),
@@ -3000,9 +3007,14 @@ fn native_call_multimethod_dispatches_selected_suspending_handler() {
     )
     .expect("runtime");
 
-    let dispatch = Value::native_fn(sema_core::NativeFn::simple(
+    let dispatch = Value::native_fn(sema_core::NativeFn::simple_result(
         "test/multimethod-dispatch",
-        |_| Ok(Value::keyword("selected")),
+        |_| {
+            Ok(NativeOutcome::Suspend(NativeSuspend {
+                wait: WaitKind::Timer(Duration::from_millis(3)),
+                continuation: Box::new(ReturnDispatchKeyAfterTimer),
+            }))
+        },
     ));
     let selected = Value::native_fn(sema_core::NativeFn::simple_result(
         "test/suspending-method",
@@ -3031,6 +3043,11 @@ fn native_call_multimethod_dispatches_selected_suspending_handler() {
         ))))
         .expect("root admitted");
 
+    runtime.drive(&drive_budget(32)).expect("park dispatch");
+    assert!(matches!(handle.poll_result(), RootPoll::Pending));
+    assert_eq!(runtime.timer_count_for_test(), 1);
+
+    clock.advance(Duration::from_millis(3));
     runtime.drive(&drive_budget(32)).expect("park method");
     assert!(matches!(handle.poll_result(), RootPoll::Pending));
     assert_eq!(runtime.timer_count_for_test(), 1);

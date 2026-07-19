@@ -1,7 +1,9 @@
 mod common;
 
 use common::eval;
+use sema_core::runtime::{CancelReason, TaskOutcome};
 use sema_core::{Caps, Sandbox, Value};
+use sema_vm::runtime::{RootOptions, RootPoll};
 
 fn eval_vm_err(input: &str) -> String {
     let interp = sema_eval::Interpreter::new();
@@ -1770,6 +1772,14 @@ fn apply_preserves_synchronous_semantics() {
 }
 
 #[test]
+fn apply_structurally_invokes_keyword_callable() {
+    assert_eq!(
+        eval(r#"(apply :name (list {:name "Ada"}))"#),
+        Value::string("Ada")
+    );
+}
+
+#[test]
 fn apply_of_suspending_lambda_runs_cooperatively() {
     // `(apply <lambda> …)` where the lambda body performs a runtime-only async
     // op must suspend + drain like single-list `map`/`foldl`/`call-with-values`,
@@ -1806,6 +1816,136 @@ fn multimethod_selected_method_suspends_cooperatively() {
 }
 
 #[test]
+fn multimethod_dispatch_function_suspends_cooperatively() {
+    assert_eq!(
+        eval(
+            r#"(begin
+                 (defmulti after-sleep async/sleep)
+                 (defmethod after-sleep nil (fn (ms) :done))
+                 (after-sleep 5))"#
+        ),
+        Value::keyword("done")
+    );
+}
+
+#[test]
+fn multimethod_dispatch_and_method_preserve_captured_mutation() {
+    assert_eq!(
+        eval(
+            r#"(let ((seen 0))
+                 (defmulti mutate-after-wait
+                   (fn (key)
+                     (set! seen (+ seen 1))
+                     (async/sleep 5)
+                     key))
+                 (defmethod mutate-after-wait :go
+                   (fn (key)
+                     (set! seen (+ seen 10))
+                     (async/sleep 5)
+                     seen))
+                 (list (mutate-after-wait :go) seen))"#
+        ),
+        Value::list(vec![Value::int(11), Value::int(11)])
+    );
+}
+
+#[test]
+fn multimethod_structural_stages_propagate_failures() {
+    let dispatch_error = eval_vm_err(
+        r#"(begin
+             (defmulti failing-dispatch
+               (fn (key) (async/sleep 5) (error "dispatch boom")))
+             (defmethod failing-dispatch :go (fn (key) :unreachable))
+             (failing-dispatch :go))"#,
+    );
+    assert!(
+        dispatch_error.contains("dispatch boom"),
+        "expected dispatch failure, got: {dispatch_error}"
+    );
+
+    let handler_error = eval_vm_err(
+        r#"(begin
+             (defmulti failing-handler (fn (key) key))
+             (defmethod failing-handler :go
+               (fn (key) (async/sleep 5) (error "handler boom")))
+             (failing-handler :go))"#,
+    );
+    assert!(
+        handler_error.contains("handler boom"),
+        "expected handler failure, got: {handler_error}"
+    );
+}
+
+#[test]
+fn cancelling_multimethod_dispatch_cancels_the_parked_call() {
+    assert_eq!(
+        eval(
+            r#"(let ((started (channel/new 1)))
+                 (defmulti cancellable-dispatch
+                   (fn (key)
+                     (channel/send started :started)
+                     (async/sleep 1000)
+                     key))
+                 (defmethod cancellable-dispatch :go (fn (key) :unreachable))
+                 (let ((p (async (cancellable-dispatch :go))))
+                   (await (async (channel/recv started)))
+                   (let ((requested (async/cancel p)))
+                     (try (await p) (catch error nil))
+                     (list requested (async/cancelled? p)))))"#
+        ),
+        Value::list(vec![Value::bool(true), Value::bool(true)])
+    );
+}
+
+#[test]
+fn multimethod_continuations_are_isolated_between_interpreters() {
+    let left = sema_eval::Interpreter::new();
+    let right = sema_eval::Interpreter::new();
+    let left_root = left
+        .submit_str(
+            r#"(begin
+                 (defmulti colliding-multimethod async/sleep)
+                 (defmethod colliding-multimethod nil (fn (ms) :left))
+                 (colliding-multimethod 50))"#,
+            RootOptions::default(),
+        )
+        .expect("left root admitted");
+    let right_root = right
+        .submit_str(
+            r#"(begin
+                 (defmulti colliding-multimethod async/sleep)
+                 (defmethod colliding-multimethod nil (fn (ms) :right))
+                 (colliding-multimethod 50))"#,
+            RootOptions::default(),
+        )
+        .expect("right root admitted");
+
+    for _ in 0..8 {
+        left.drive_turn().expect("left runtime progresses");
+        right.drive_turn().expect("right runtime progresses");
+    }
+    assert!(matches!(left_root.poll_result(), RootPoll::Pending));
+    assert!(matches!(right_root.poll_result(), RootPoll::Pending));
+
+    assert!(left_root.cancel(CancelReason::Explicit));
+    while matches!(left_root.poll_result(), RootPoll::Pending) {
+        left.drive_turn().expect("left cancellation settles");
+    }
+    assert!(matches!(
+        left_root.poll_result(),
+        RootPoll::Ready(settlement)
+            if matches!(settlement.outcome, TaskOutcome::Cancelled(CancelReason::Explicit))
+    ));
+    assert!(matches!(right_root.poll_result(), RootPoll::Pending));
+    assert_eq!(
+        right
+            .drive_until_settled(&right_root)
+            .expect("right runtime remains isolated"),
+        Value::keyword("right")
+    );
+}
+
+#[test]
 fn apply_of_suspending_multimethod_runs_cooperatively() {
     assert_eq!(
         eval(
@@ -1820,22 +1960,17 @@ fn apply_of_suspending_multimethod_runs_cooperatively() {
 }
 
 #[test]
-fn nested_apply_of_runtime_native_is_graceful_error() {
-    // `apply`/`call-with-values` reached through another synchronous `apply`
-    // run on the value ABI, where a runtime-only native cannot suspend. That
-    // must surface a clear, actionable error — never the raw internal
-    // "requires runtime invocation" stub.
-    let a = eval_vm_err(r#"(apply apply (list async/spawn (list (fn () 1))))"#);
-    assert!(
-        a.contains("cannot invoke runtime-only native 'async/spawn'")
-            && !a.contains("internal error"),
-        "expected a graceful error, got: {a}"
+fn nested_apply_of_runtime_native_runs_structurally() {
+    assert_eq!(
+        eval(r#"(async/await (apply apply (list async/spawn (list (fn () 1)))))"#),
+        Value::int(1)
     );
-    let b = eval_vm_err(r#"(apply call-with-values (list (fn () 5) async/resolved))"#);
-    assert!(
-        b.contains("cannot invoke runtime-only native 'async/resolved'")
-            && !b.contains("internal error"),
-        "expected a graceful error, got: {b}"
+    assert_eq!(
+        eval(
+            r#"(async/await
+                 (apply call-with-values (list (fn () 5) async/resolved)))"#
+        ),
+        Value::int(5)
     );
 }
 
@@ -1855,8 +1990,8 @@ fn apply_channel_send_callback_runs() {
 // `async/sleep` is DUAL-ABI (unlike `async/spawn`/`channel/*`/`async/resolved`,
 // which are runtime-only): its structural Timer suspend is always preferred by
 // `invoke_runtime`, so these only exercise the LEGACY value-ABI closure, which
-// is reached when a raw native bypasses `invoke_runtime` entirely — a
-// single-ABI (`register_fn`-only) HOF like `any`/`every`, or `apply` of one.
+// is reached when a raw native bypasses `invoke_runtime` entirely through a
+// single-ABI (`register_fn`-only) HOF like `any`/`every`.
 // That closure cannot suspend from a bare Rust callback, so (post
 // YieldReason::Sleep retirement) it raises a clear error instead of silently
 // skipping the sleep. See `docs/deferred.md`'s LEGACY-SCHEDULER residue note.
@@ -1871,11 +2006,50 @@ fn sleep_passed_directly_to_single_abi_hof_is_graceful_error() {
 }
 
 #[test]
-fn sleep_passed_directly_to_apply_is_graceful_error() {
-    let err = eval_vm_err(r#"(apply async/sleep (list 500))"#);
+fn apply_drives_dual_abi_native_structurally() {
+    let out = eval(
+        r#"
+        (let ((events (mutable-array/new)))
+          (async/all
+            (list
+              (async
+                (apply async/sleep (list 20))
+                (mutable-array/push! events :slept))
+              (async
+                (mutable-array/push! events :sibling))))
+          (mutable-array/->vector events))
+        "#,
+    );
+    assert_eq!(
+        out,
+        Value::vector(vec![Value::keyword("sibling"), Value::keyword("slept")]),
+        "the dual-ABI sleep must park the applied call so its sibling runs"
+    );
+}
+
+#[test]
+fn cancelling_structural_apply_cancels_the_parked_call() {
+    assert_eq!(
+        eval(
+            r#"(let ((started (channel/new 1)))
+                 (let ((p (async
+                            (channel/send started :started)
+                            (apply async/sleep (list 1000)))))
+                   (await (async (channel/recv started)))
+                   (let ((requested (async/cancel p)))
+                     (try (await p) (catch error nil))
+                     (list requested (async/cancelled? p)))))"#
+        ),
+        Value::list(vec![Value::bool(true), Value::bool(true)])
+    );
+}
+
+#[test]
+fn structural_apply_propagates_native_failure() {
+    let err = eval_vm_err(r#"(apply error (list "apply boom"))"#);
     assert!(
-        err.contains("async/sleep") && err.contains("wrap it in a lambda"),
-        "expected a graceful 'wrap it in a lambda' error, got: {err}"
+        err.contains("apply boom"),
+        "expected the applied native failure, got: {err}"
     );
 }
 

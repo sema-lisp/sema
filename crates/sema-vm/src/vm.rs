@@ -5,7 +5,7 @@ use std::rc::{Rc, Weak};
 use smallvec::SmallVec;
 
 use sema_core::runtime::{
-    CancellationView, NativeCall, NativeCallContext, NativeContinuation, NativeOutcome,
+    multimethod_call, CancellationView, NativeCallContext, NativeContinuation, NativeOutcome,
     NativeResult, ResumeInput, Trace,
 };
 use sema_core::{
@@ -3774,40 +3774,26 @@ impl VM {
         }
     }
 
-    /// Dispatch a callable that is neither a native fn nor a keyword: a
-    /// multimethod resolved COOPERATIVELY when a runtime quantum is active,
-    /// so a suspending selected method routes through the `NativeOutcome::Call`
-    /// ABI exactly like a HOF callback instead of leaking the "requires
-    /// runtime invocation" stub — the multimethod half of Step G (see
-    /// `docs/deferred.md`). Outside a runtime quantum (or for any other
-    /// non-native callable), falls back to the exact prior synchronous
-    /// `call_callback` path. Only the SELECTED METHOD is routed cooperatively;
-    /// the dispatch function itself is always invoked synchronously (mirrors
-    /// `apply`'s cooperative gate, which never routes a multimethod's dispatch
-    /// function through the Call ABI either) — see
-    /// `sema_core::resolve_multimethod_handler`.
+    /// Dispatch a callable that is neither a native fn nor a keyword. During a
+    /// runtime quantum a multimethod becomes two structural calls: first its
+    /// dispatch function, then the selected handler. Outside a runtime quantum
+    /// this retains the host-only synchronous callback path.
     fn call_non_native(
         &mut self,
         func_val: Value,
         call_args: SmallVec<[Value; 8]>,
         ctx: &EvalContext,
     ) -> Result<(), SemaError> {
-        if ctx.runtime_quantum_active() {
-            if let Some(mm) = func_val.as_multimethod_rc() {
-                let handler = {
-                    let _vm_guard = CurrentVmGuard::enter(self);
-                    sema_core::resolve_multimethod_handler(ctx, &mm, &call_args)
-                }?;
-                let outcome = NativeOutcome::Call(NativeCall {
-                    callable: handler,
-                    args: call_args.into_vec(),
-                    continuation: Box::new(MultimethodCallContinuation),
-                });
-                self.stash_native_dispatch(NativeDispatchResult::Pending(
-                    VmPendingOutcome::from_outcome(outcome),
-                ));
-                return Ok(());
-            }
+        if ctx.runtime_quantum_active() && func_val.as_multimethod_rc().is_some() {
+            let outcome = NativeOutcome::Call(multimethod_call(
+                func_val,
+                call_args.into_vec(),
+                Box::new(MultimethodCallContinuation),
+            )?);
+            self.stash_native_dispatch(NativeDispatchResult::Pending(
+                VmPendingOutcome::from_outcome(outcome),
+            ));
+            return Ok(());
         }
         let result = {
             let _vm_guard = CurrentVmGuard::enter(self);

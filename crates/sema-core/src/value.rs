@@ -153,10 +153,9 @@ pub struct NativeFn {
     /// "requires runtime invocation" hard-error stub (async/spawn, channel/*,
     /// async/resolved, …). A dual-ABI native (`simple_with_runtime` /
     /// `with_ctx_runtime`, e.g. `async/sleep`, `__llm-chat-blocking`) has a real
-    /// `func` and is NOT runtime-only. Callback-driving builtins (`apply`) use
-    /// this to route ONLY genuinely runtime-only callees through the cooperative
-    /// `NativeOutcome::Call` path, keeping every other callee on its exact prior
-    /// synchronous value-ABI path.
+    /// `func` and is NOT runtime-only. Synchronous compatibility entry points
+    /// use this to reject only shapes whose value ABI is an error stub; runtime
+    /// callback drivers route all callables through `NativeOutcome::Call`.
     runtime_only: bool,
 }
 
@@ -378,9 +377,8 @@ impl NativeFn {
     /// True when this native can ONLY run through the runtime ABI — its legacy
     /// value `func` is the "requires runtime invocation" hard-error stub
     /// (`async/spawn`, `channel/*`, `async/resolved`, …). Callback-driving
-    /// builtins consult this to route a genuinely runtime-only callee through the
-    /// cooperative `NativeOutcome::Call` path (its only viable path) while keeping
-    /// every dual-ABI / legacy callee on its exact prior synchronous path.
+    /// builtins consult this when they must diagnose an attempted synchronous
+    /// invocation. Runtime callback drivers structurally invoke every callable.
     pub fn is_runtime_only(&self) -> bool {
         self.runtime_only
     }
@@ -644,24 +642,28 @@ impl fmt::Debug for MultiMethod {
     }
 }
 
-/// Resolve the handler a `MultiMethod` selects for `args`, WITHOUT calling it.
-/// Shared by the synchronous dispatch in `sema-eval`'s `call_value` (via
-/// `call_multimethod`) and the runtime-quantum-aware direct-call sites in
-/// `sema-vm`'s `call_value`/`call_value_with`, which route the resolved
-/// handler through the cooperative `NativeOutcome::Call` ABI instead of
-/// calling it synchronously — the multimethod half of Step G (see
-/// `docs/deferred.md`). Dispatch-function invocation itself stays fully
-/// synchronous: it is a plain value-selector call, never expected to suspend,
-/// mirroring `apply`'s cooperative gate (which never routes a multimethod's
-/// dispatch function through the Call ABI either).
+/// Invoke a multimethod's dispatch function synchronously and select its
+/// handler. This is the host-only value-ABI path used outside an active runtime
+/// quantum. Runtime callers structurally invoke the dispatch function and then
+/// use [`select_multimethod_handler`] with its returned dispatch value.
 pub fn resolve_multimethod_handler(
     ctx: &EvalContext,
     mm: &MultiMethod,
     args: &[Value],
 ) -> Result<Value, SemaError> {
     let dispatch_val = crate::call_callback(ctx, &mm.dispatch_fn, args)?;
+    select_multimethod_handler(mm, &dispatch_val)
+}
+
+/// Select the handler for an already-computed multimethod dispatch value.
+/// Performs no evaluator callback and is therefore safe inside runtime
+/// continuations.
+pub fn select_multimethod_handler(
+    mm: &MultiMethod,
+    dispatch_val: &Value,
+) -> Result<Value, SemaError> {
     let methods = mm.methods.borrow();
-    if let Some(handler) = methods.get(&dispatch_val) {
+    if let Some(handler) = methods.get(dispatch_val) {
         Ok(handler.clone())
     } else {
         drop(methods);

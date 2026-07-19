@@ -475,9 +475,9 @@ impl NativeContinuation for IdentityContinuation {
 
 /// Initial cooperative `NativeOutcome::Call` for `apply`: collect the flattened
 /// arg vector (leading fixed args + the final list spread), then drive the
-/// applied function as one runtime Call so a runtime-only op passed as `f`
-/// (`(apply async/spawn …)`) suspends cleanly. `IdentityContinuation` returns
-/// its result unchanged.
+/// applied function as one runtime Call. Every callable crosses this boundary
+/// structurally so dual-ABI natives select their runtime implementation and can
+/// suspend just like runtime-only natives and VM closures.
 fn apply_call(args: &[Value]) -> NativeResult {
     let func = args[0].clone();
     let last = &args[args.len() - 1];
@@ -902,17 +902,12 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::list(result))
     });
 
-    // `apply` routes the applied function through the cooperative
-    // `NativeOutcome::Call` path ONLY when it is a genuinely runtime-only native
-    // (`async/spawn`, `channel/*`, `async/resolved`, … — whose legacy value ABI
-    // is the "requires runtime invocation" stub); that is the only path on which
-    // such an op can run/suspend, so `(apply async/spawn (list thunk))` works
-    // instead of leaking the stub error. EVERY other callee — user closures
-    // (whose async is already handled by `call_function`'s inline-task routing)
-    // and dual-ABI blocking natives (e.g. `__llm-chat-blocking`, which manages
-    // task-scoped stream/agent slab state and must run on its own value ABI so
-    // cancellation reaping stays correct) — keeps its exact prior synchronous
-    // `call_function` path. The legacy value ABI is likewise fully synchronous.
+    // Under the runtime, `apply` always hands its callable to the structural
+    // `NativeOutcome::Call` ABI. Besides runtime-only natives and VM closures,
+    // this is required for dual-ABI natives: invoking their value callback here
+    // would bypass `invoke_runtime` and turn a legal suspension into a legacy
+    // synchronous-callback error. The legacy value ABI remains synchronous for
+    // host-only calls where no runtime can drive a suspension.
     register_hof(
         env,
         "apply",
@@ -931,30 +926,7 @@ pub fn register(env: &sema_core::Env) {
         },
         |args| {
             check_arity!(args, "apply", 2..);
-            // Route through the cooperative Call path when the callee can
-            // SUSPEND once invoked: a runtime-only native, or a user closure
-            // whose body may run an async op (like single-list `map`/`foldl`
-            // and `call-with-values` do). A dual-ABI blocking native
-            // (`__llm-chat-blocking`, `is_closure` false) stays on the
-            // synchronous path so its task-scoped slab reaping is unaffected;
-            // plain builtins and keyword getters never suspend, so the sync
-            // path is correct for them too. Multimethods use the cooperative
-            // path so the runtime can dispatch the selected method and suspend
-            // it as an ordinary `NativeOutcome::Call`.
-            let is_closure_callee = args[0]
-                .as_native_fn_rc()
-                .is_some_and(|native| native.is_closure);
-            let is_multimethod_callee = args[0].as_multimethod_rc().is_some();
-            if is_runtime_only_native(&args[0]) || is_closure_callee || is_multimethod_callee {
-                apply_call(args)
-            } else {
-                let func = &args[0];
-                let last = &args[args.len() - 1];
-                let last_items = get_sequence(last, "apply")?;
-                let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
-                all_args.extend(last_items.iter().cloned());
-                call_function(func, &all_args).map(NativeOutcome::Return)
-            }
+            apply_call(args)
         },
     );
 
@@ -2107,10 +2079,9 @@ fn num_lt(a: &Value, b: &Value) -> Result<bool, SemaError> {
 
 /// True when `v` is a genuinely runtime-only native — its legacy value ABI is
 /// the "requires runtime invocation" hard-error stub, so the cooperative
-/// `NativeOutcome::Call` path is its ONLY viable path. Callback-driving builtins
-/// (`apply`, `call-with-values`) use this to route exactly those callees through
-/// the cooperative path while keeping closures and dual-ABI natives on their
-/// exact prior synchronous `call_function` path.
+/// `NativeOutcome::Call` path is its only viable path. Synchronous compatibility
+/// entry points use this to produce an actionable error before reaching that
+/// stub; runtime callback drivers structurally invoke every callable.
 fn is_runtime_only_native(v: &Value) -> bool {
     v.as_native_fn_rc()
         .is_some_and(|native| native.is_runtime_only())

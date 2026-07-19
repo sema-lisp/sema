@@ -22,16 +22,14 @@ use crate::{
 #[cfg(test)]
 use sema_core::runtime::ExternalFailure;
 use sema_core::runtime::{
-    CancelReason, CancellationView, IdCounter, IoExecutor, NativeCall, NativeCallContext,
-    NativeContinuation, NativeOutcome, NativeResult, ResourceGateCloseError, ResourceGateHandle,
-    ResourceGateId, ResumeInput, RootId, RuntimeId, RuntimeRequest, RuntimeResponse,
-    RuntimeScopedIdCounter, RuntimeTaskId, SettlementSeq, TaskContextHandle, TaskId, TaskOutcome,
-    TaskSettlement, Trace, WaitKind,
+    multimethod_call, CancelReason, CancellationView, IdCounter, IoExecutor, NativeCall,
+    NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, ResourceGateCloseError,
+    ResourceGateHandle, ResourceGateId, ResumeInput, RootId, RuntimeId, RuntimeRequest,
+    RuntimeResponse, RuntimeScopedIdCounter, RuntimeTaskId, SettlementSeq, TaskContextHandle,
+    TaskId, TaskOutcome, TaskSettlement, Trace, WaitKind,
 };
 use sema_core::runtime::{CancellationParent, LifetimeOwner, TaskRelations};
-#[cfg(test)]
-use sema_core::Value;
-use sema_core::{Env, EvalContext, NativeFn};
+use sema_core::{Env, EvalContext, NativeFn, Value};
 
 use super::channel::{ChannelClose, ChannelWake};
 use super::wait::RuntimeCommand;
@@ -3491,8 +3489,8 @@ impl Runtime {
     fn invoke_callable(
         &self,
         task_id: TaskId,
-        mut owner: ReturnOwner,
-        mut call: NativeCall,
+        owner: ReturnOwner,
+        call: NativeCall,
     ) -> Result<(), RuntimeFault> {
         let (eval_context, context, cancellation) = {
             let state = self.state.borrow();
@@ -3527,45 +3525,14 @@ impl Runtime {
                 ));
             return Ok(());
         }
-        if let Some(multimethod) = call.callable.as_multimethod_rc() {
-            // A multimethod can enter the structural Call ABI directly from a
-            // runtime native (for example `apply`), without first passing
-            // through VM::call_non_native. Its dispatch function is synchronous,
-            // but it may be a closure whose open cells still belong to the
-            // parked caller VM. Close those cells before call_callback runs it
-            // on a foreign evaluator VM.
-            if let Some(parent_vm) = owner.parked_parent_vm_mut() {
-                snapshot_escaping_call_with_owner(parent_vm, &multimethod.dispatch_fn, &call.args);
-            }
-            let selected = {
-                let _installed = eval_context.scope_task_context(context.clone());
-                let _quantum_guard = eval_context.enter_runtime_quantum().map_err(|error| {
+        if call.callable.as_multimethod_rc().is_some() {
+            let dispatch =
+                multimethod_call(call.callable, call.args, call.continuation).map_err(|error| {
                     RuntimeFault::Invariant {
                         message: error.to_string(),
                     }
                 })?;
-                sema_core::resolve_multimethod_handler(&eval_context, &multimethod, &call.args)
-            };
-            match selected {
-                Ok(handler) => {
-                    call.callable = handler;
-                    return self.invoke_callable(task_id, owner, call);
-                }
-                Err(error) => {
-                    self.state
-                        .borrow_mut()
-                        .pending
-                        .push_back(PendingStage::Apply(
-                            task_id,
-                            ReturnOwner::Continuation(
-                                Box::new(owner),
-                                ContinuationFrame::vm_native(call.continuation),
-                            ),
-                            Err(error),
-                        ));
-                    return Ok(());
-                }
-            }
+            return self.invoke_callable(task_id, owner, dispatch);
         }
         let (frame, result) =
             if let Some((closure, functions, native_fns)) = extract_vm_closure(&call.callable) {
@@ -3600,6 +3567,31 @@ impl Runtime {
                 let native_result =
                     native.invoke_runtime(&eval_context, &mut native_context, &call.args);
                 (ContinuationFrame::native(call.continuation), native_result)
+            } else if let Some(keyword) = call.callable.as_keyword_spur() {
+                let result = if call.args.len() != 1 {
+                    Err(sema_core::SemaError::arity(
+                        sema_core::resolve(keyword),
+                        "1",
+                        call.args.len(),
+                    ))
+                } else {
+                    let key = Value::keyword_from_spur(keyword);
+                    let arg = &call.args[0];
+                    if let Some(map) = arg.as_map_rc() {
+                        Ok(map.get(&key).cloned().unwrap_or_else(Value::nil))
+                    } else if let Some(map) = arg.as_hashmap_rc() {
+                        Ok(map.get(&key).cloned().unwrap_or_else(Value::nil))
+                    } else {
+                        Err(sema_core::SemaError::type_error(
+                            "map or hashmap",
+                            arg.type_name(),
+                        ))
+                    }
+                };
+                (
+                    ContinuationFrame::native(call.continuation),
+                    result.map(NativeOutcome::Return),
+                )
             } else {
                 (
                     ContinuationFrame::vm_native(call.continuation),

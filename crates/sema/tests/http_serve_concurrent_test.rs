@@ -279,6 +279,51 @@ fn idle_websocket_does_not_block_plain_request() {
 }
 
 #[test]
+fn suspended_sse_handler_does_not_block_plain_request() {
+    let mut server = ServeProcess::spawn(
+        r#"(fn (req)
+              (if (= (:path req) "/events")
+                  (http/stream
+                    (fn (send)
+                      (println "SRV1_SSE_ENTERED")
+                      (async/sleep 60000)
+                      (send "late")))
+                  (http/text "pong")))"#,
+    );
+    let port = server.port();
+    let events = thread::spawn(move || http_get_body(port, "/events", Duration::from_secs(10)));
+    server
+        .wait_for_signal("SRV1_SSE_ENTERED", Duration::from_secs(5))
+        .expect("SSE handler publishes entry before the sibling request");
+
+    let ping = http_get_body(port, "/ping", Duration::from_secs(3));
+    server.terminate();
+    let _ = events.join();
+
+    assert_eq!(ping.as_deref(), Ok("pong"));
+}
+
+#[test]
+fn suspended_sse_handler_resumes_and_closes_stream() {
+    let mut server = ServeProcess::spawn(
+        r#"(fn (_req)
+              (http/stream
+                (fn (send)
+                  (async/sleep 10)
+                  (send "resumed"))))"#,
+    );
+
+    let body = http_get_body(server.port(), "/events", Duration::from_secs(3));
+    server.terminate();
+
+    assert!(
+        body.as_deref()
+            .is_ok_and(|body| body.contains("data: resumed")),
+        "SSE handler must resume, publish its event, and close: {body:?}"
+    );
+}
+
+#[test]
 fn handler_parking_on_async_returns_response() {
     let mut server = ServeProcess::spawn(
         r#"(fn (req)

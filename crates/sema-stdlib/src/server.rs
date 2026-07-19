@@ -178,7 +178,9 @@ impl RequestFutureLease {
 impl Drop for RequestFutureLease {
     fn drop(&mut self) {
         if let Some(lifecycle) = self.0.take() {
-            lifecycle.mark_disconnected();
+            if !lifecycle.is_finished() {
+                lifecycle.mark_disconnected();
+            }
         }
     }
 }
@@ -1217,16 +1219,26 @@ async fn handle_axum_request(
 
     // Wait for response from main thread
     let response = resp_rx.await;
-    request_lease.disarm();
+    if !matches!(&response, Ok(ServerResponse::Sse(_))) {
+        request_lease.disarm();
+    }
     match response {
         Ok(ServerResponse::Raw(raw_resp)) => raw_response_to_axum(&raw_resp),
         Ok(ServerResponse::Sse(rx)) => {
             use axum::response::sse::{Event, Sse};
-            use futures::stream::StreamExt;
-            use tokio_stream::wrappers::UnboundedReceiverStream;
-
-            let stream = UnboundedReceiverStream::new(rx)
-                .map(|data| Ok::<_, std::convert::Infallible>(Event::default().data(data)));
+            let stream =
+                futures::stream::unfold((rx, request_lease), |(mut rx, mut lease)| async {
+                    match rx.recv().await {
+                        Some(data) => Some((
+                            Ok::<_, std::convert::Infallible>(Event::default().data(data)),
+                            (rx, lease),
+                        )),
+                        None => {
+                            lease.disarm();
+                            None
+                        }
+                    }
+                });
             Sse::new(stream).into_response()
         }
         Ok(ServerResponse::WebSocket {
@@ -1427,15 +1439,11 @@ fn make_sse_send_fn(sse_tx: tokio::sync::mpsc::UnboundedSender<String>) -> Value
     }))
 }
 
-/// Handle an SSE stream response: extract the stream handler, create channels,
-/// send the SSE receiver to axum, then call the handler with a `send` function.
-fn handle_sse_response(
-    ctx: &sema_core::EvalContext,
+/// Create the SSE transport and return the handler call's callable and argument.
+fn prepare_sse_response(
     response_val: &Value,
     respond: tokio::sync::oneshot::Sender<ServerResponse>,
-) {
-    use sema_core::call_callback;
-
+) -> (Value, Value) {
     let map = response_val.as_map_rc().unwrap();
     let stream_handler = map
         .get(&Value::keyword("__stream_handler"))
@@ -1455,6 +1463,19 @@ fn handle_sse_response(
     // Build the `send` function for the Sema handler
     let send_fn = make_sse_send_fn(sse_tx);
 
+    (stream_handler, send_fn)
+}
+
+/// Invoke an SSE handler from the host-only value ABI.
+fn handle_sse_response(
+    ctx: &sema_core::EvalContext,
+    response_val: &Value,
+    respond: tokio::sync::oneshot::Sender<ServerResponse>,
+) {
+    use sema_core::call_callback;
+
+    let (stream_handler, send_fn) = prepare_sse_response(response_val, respond);
+
     // Call the stream handler with the send function.
     // When it returns (or errors), the sse_tx is dropped, closing the stream.
     match call_callback(ctx, &stream_handler, &[send_fn]) {
@@ -1463,6 +1484,55 @@ fn handle_sse_response(
             eprintln!("http/stream handler error: {e}");
         }
     }
+}
+
+/// Completes the responder call after its VM-dispatched SSE handler finishes.
+struct SseHandlerContinuation;
+
+impl sema_core::runtime::Trace for SseHandlerContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for SseHandlerContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+
+        match input {
+            ResumeInput::Returned(_) => Ok(NativeOutcome::Return(Value::nil())),
+            ResumeInput::Failed(error) => {
+                eprintln!("http/stream handler error: {error}");
+                Ok(NativeOutcome::Return(Value::nil()))
+            }
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "http/serve: SSE handler was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "http/serve: SSE handler call received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// Dispatch an SSE handler within its request task so cooperative operations
+/// park only that connection.
+fn handle_sse_response_runtime(
+    response_val: &Value,
+    respond: tokio::sync::oneshot::Sender<ServerResponse>,
+) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::NativeCall;
+
+    let (stream_handler, send_fn) = prepare_sse_response(response_val, respond);
+    Ok(NativeOutcome::Call(NativeCall {
+        callable: stream_handler,
+        args: vec![send_fn],
+        continuation: Box::new(SseHandlerContinuation),
+    }))
 }
 
 const SERVER_WS_RECV_COMPLETION_KIND: u64 = 0x7377_7372; // "swsr"
@@ -2273,13 +2343,9 @@ type ServeLoopStateRef = std::rc::Rc<ServeLoopState>;
 /// restore it, and `server_test.rs`'s `test_http_serve_handler_error` only
 /// ever asserted the status code (500), never the body.
 ///
-/// Dual-ABI: the runtime branch routes a WebSocket response through
-/// `handle_ws_response_runtime`'s `NativeOutcome::Call` (see its doc comment
-/// for why a plain synchronous `call_callback` can't let the handler's
-/// `(:recv conn)` suspend cooperatively); every other response shape needs no
-/// suspension, so both branches build it identically. The legacy branch
-/// (reachable only outside a runtime quantum — dead in the shipped product)
-/// keeps calling the WS handler synchronously via `handle_ws_response`.
+/// Dual-ABI: the runtime branch routes streaming and WebSocket handlers through
+/// `NativeOutcome::Call`, preserving their request task while they suspend.
+/// The host-only value ABI invokes those callbacks synchronously.
 fn make_responder_native(
     respond: tokio::sync::oneshot::Sender<ServerResponse>,
     lifecycle: Arc<ServeRequestLifecycle>,
@@ -2325,8 +2391,7 @@ fn make_responder_native(
                 return handle_ws_response_runtime(&response_val, respond);
             }
             if is_stream_response(&response_val) {
-                sema_core::with_stdlib_ctx(|c| handle_sse_response(c, &response_val, respond));
-                return Ok(NativeOutcome::Return(Value::nil()));
+                return handle_sse_response_runtime(&response_val, respond);
             }
             if is_file_response(&response_val) {
                 handle_file_response(&response_val, respond);
@@ -2787,6 +2852,70 @@ mod tests {
         assert!(!notification.is_finished());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_sse_response_body_publishes_disconnect() {
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let request = axum::extract::Request::builder()
+            .uri("/events")
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let task = tokio::spawn(handle_axum_request(None, request, request_tx, lifecycle_tx));
+        let request = request_rx.recv().await.expect("route enqueues request");
+        let ServerRequest::Http {
+            lifecycle, respond, ..
+        } = request;
+        let (sse_tx, sse_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(
+            respond.send(ServerResponse::Sse(sse_rx)).is_ok(),
+            "send SSE response"
+        );
+        let response = task.await.expect("route returns SSE response");
+
+        assert!(matches!(
+            lifecycle_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        drop(response);
+        let notification = lifecycle_rx
+            .recv()
+            .await
+            .expect("dropping the SSE body publishes disconnect");
+        assert_eq!(notification.id, lifecycle.id);
+        assert!(notification.is_disconnected());
+        assert!(!notification.is_finished());
+        drop(sse_tx);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn natural_sse_eof_does_not_publish_disconnect() {
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let request = axum::extract::Request::builder()
+            .uri("/events")
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let task = tokio::spawn(handle_axum_request(None, request, request_tx, lifecycle_tx));
+        let request = request_rx.recv().await.expect("route enqueues request");
+        let ServerRequest::Http {
+            lifecycle, respond, ..
+        } = request;
+        let (sse_tx, sse_rx) = tokio::sync::mpsc::unbounded_channel();
+        assert!(respond.send(ServerResponse::Sse(sse_rx)).is_ok());
+        let response = task.await.expect("route returns SSE response");
+
+        drop(sse_tx);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("consume natural SSE EOF");
+        assert!(body.is_empty());
+        assert!(!lifecycle.is_disconnected());
+        assert!(matches!(
+            lifecycle_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
     // `RouterDecoder` holds the route table's handler `Value`s across the
     // External park while a `:static` directory batch canonicalizes off-thread.
     // Its `Trace` MUST expose each handler as exactly one GC edge (nothing more,
@@ -2882,6 +3011,19 @@ mod tests {
             }
         });
         assert_eq!(edges, 0, "WsHandlerContinuation must trace no Value edges");
+    }
+
+    #[test]
+    fn sse_handler_continuation_traces_no_edges() {
+        use sema_core::runtime::Trace;
+        let cont = SseHandlerContinuation;
+        let mut edges = 0usize;
+        cont.trace(&mut |edge| {
+            if let sema_core::cycle::GcEdge::Value(_) = edge {
+                edges += 1;
+            }
+        });
+        assert_eq!(edges, 0, "SseHandlerContinuation must trace no Value edges");
     }
 
     fn take_server_ws_external_continuation(

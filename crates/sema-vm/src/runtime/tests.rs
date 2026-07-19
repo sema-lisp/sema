@@ -1787,19 +1787,75 @@ fn runtime_with_inline_executor(clock: Rc<dyn RuntimeClock>) -> Runtime {
     .expect("runtime")
 }
 
+#[test]
+fn simultaneous_runtimes_route_colliding_local_roots_to_their_own_output_sinks() {
+    let runtime_a = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let root_a_slot = Rc::new(Cell::new(None));
+    let root_a_for_call = Rc::clone(&root_a_slot);
+    let handle_a = runtime_a
+        .submit_test_root(TestPreparedTask::native_call(move || {
+            let previous = sema_core::set_current_root(root_a_for_call.get());
+            sema_core::write_stdout("A-only");
+            let _ = sema_core::set_current_root(previous);
+            Ok(NativeOutcome::Return(Value::int(1)))
+        }))
+        .expect("root A admitted");
+    root_a_slot.set(Some(handle_a.id()));
+    sema_core::mark_root_capturing(handle_a.id());
+
+    // Both scoped counters start at local root 1. The runtime component is the
+    // only identity that can select the correct sink while A and B coexist.
+    let runtime_b = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let root_b_slot = Rc::new(Cell::new(None));
+    let root_b_for_call = Rc::clone(&root_b_slot);
+    let handle_b = runtime_b
+        .submit_test_root(TestPreparedTask::native_call(move || {
+            let previous = sema_core::set_current_root(root_b_for_call.get());
+            sema_core::write_stdout("B-only");
+            let _ = sema_core::set_current_root(previous);
+            Ok(NativeOutcome::Return(Value::int(2)))
+        }))
+        .expect("root B admitted");
+    root_b_slot.set(Some(handle_b.id()));
+    sema_core::mark_root_capturing(handle_b.id());
+    let root_a = handle_a.id();
+    let root_b = handle_b.id();
+    assert_eq!(root_a.local(), root_b.local());
+    assert_ne!(root_a.runtime(), root_b.runtime());
+
+    while matches!(handle_a.poll_result(), RootPoll::Pending) {
+        runtime_a.drive(&drive_budget(8)).expect("runtime A drives");
+    }
+    let events_a = runtime_a.take_captured_output();
+    assert!(matches!(
+        events_a.as_slice(),
+        [super::OutputEvent::Stdout { root, text }]
+            if *root == root_a && text == "A-only"
+    ));
+
+    // A is still marked because its settled root handle has not been reaped.
+    // Dropping its final Runtime owner must clean up A without removing B's
+    // marker or route.
+    drop(handle_a);
+    drop(runtime_a);
+    assert_eq!(sema_core::capturing_root_count(), 1);
+
+    while matches!(handle_b.poll_result(), RootPoll::Pending) {
+        runtime_b.drive(&drive_budget(8)).expect("runtime B drives");
+    }
+    let events_b = runtime_b.take_captured_output();
+    assert!(matches!(
+        events_b.as_slice(),
+        [super::OutputEvent::Stdout { root, text }]
+            if *root == root_b && text == "B-only"
+    ));
+}
+
 /// A `Runtime` dropped directly (bypassing `Interpreter::drop`'s bounded
 /// `shutdown`, which drives every task to cancellation/reap before tearing
-/// down) runs only `close_for_interpreter_drop` — documented as closing the
-/// inbox WITHOUT driving any VM quantum. A root still marked
-/// `capture_output`-capturing at that point is therefore never reaped and
-/// never reaches `unmark_root_capturing` (that only runs from
-/// `cleanup_one`, on the reap path). Before the fix, `Runtime::new`'s
-/// `install_output_capture_sink` call only replaced the sink pointer, so
-/// `sema_core::capturing_root_count()` — and the `CAPTURING_ROOTS` set
-/// backing it — stayed dirty forever afterward on this OS thread: every
-/// later `Runtime` on the same thread paid the non-empty capture-set path
-/// (`CURRENT_ROOT` read + `HashSet::contains`) on every `print`, never the
-/// intended `CAPTURING_COUNT == 0` fast return.
+/// down) closes its inbox without driving any VM quantum. An abandoned root
+/// therefore never reaches the normal `cleanup_one` reap path, so Runtime
+/// teardown itself must unregister that runtime's capturing-root markers.
 #[test]
 fn dropped_runtime_with_live_capturing_root_does_not_leak_into_next_runtime_on_thread() {
     {
@@ -1822,8 +1878,8 @@ fn dropped_runtime_with_live_capturing_root_does_not_leak_into_next_runtime_on_t
         // not drive a single quantum.
     }
 
-    // A second `Runtime` on this same thread: a fresh `install_output_capture_sink`
-    // call must not inherit runtime A's abandoned capturing-root entry.
+    // A second `Runtime` on this same thread must not inherit runtime A's
+    // abandoned capturing-root entry.
     let clock_b = Rc::new(FakeClock::new());
     let _runtime_b = runtime_with_inline_executor(clock_b);
     assert_eq!(

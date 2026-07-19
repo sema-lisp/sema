@@ -23,7 +23,7 @@ use crate::{
 use sema_core::runtime::ExternalFailure;
 use sema_core::runtime::{
     CancelReason, CancellationView, IdCounter, IoExecutor, NativeCall, NativeCallContext,
-    NativeOutcome, NativeResult, ResourceGateId, ResumeInput, RootId, RuntimeRequest,
+    NativeOutcome, NativeResult, ResourceGateId, ResumeInput, RootId, RuntimeId, RuntimeRequest,
     RuntimeResponse, RuntimeScopedIdCounter, RuntimeTaskId, SettlementSeq, TaskContextHandle,
     TaskId, TaskOutcome, TaskSettlement, Trace, WaitKind,
 };
@@ -56,6 +56,7 @@ pub enum RuntimeFault {
 }
 
 pub struct Runtime {
+    runtime_id: RuntimeId,
     pub(super) state: Rc<RefCell<RuntimeState>>,
 }
 
@@ -754,10 +755,9 @@ impl Runtime {
         register_runtime_interior_hooks();
         let output_sink: Rc<RefCell<Vec<sema_core::CapturedOutput>>> =
             Rc::new(RefCell::new(Vec::new()));
-        // Idempotent: re-registering on a thread that already had a (now
-        // dropped) runtime just points capture at the new runtime's sink.
-        sema_core::install_output_capture_sink(Rc::clone(&output_sink));
+        sema_core::register_output_capture_sink(runtime_id, &output_sink);
         Ok(Self {
+            runtime_id,
             state: Rc::new(RefCell::new(RuntimeState {
                 _context: context,
                 clock,
@@ -4757,6 +4757,7 @@ impl Runtime {
     #[cfg(test)]
     pub(super) fn clone_for_test(&self) -> Self {
         Self {
+            runtime_id: self.runtime_id,
             state: Rc::clone(&self.state),
         }
     }
@@ -5918,6 +5919,9 @@ impl Drop for ActiveDriveGuard {
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.close_for_interpreter_drop();
+        if Rc::strong_count(&self.state) == 1 {
+            sema_core::unregister_output_capture_sink(self.runtime_id);
+        }
     }
 }
 

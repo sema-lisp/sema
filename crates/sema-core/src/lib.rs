@@ -65,9 +65,9 @@ pub use mcp_cassette::{
 };
 pub use mutable_ops::{mutable_array_get, mutable_array_set};
 pub use output_hook::{
-    capturing_root_count, install_output_capture_sink, mark_root_capturing, set_current_root,
-    set_stderr_hook, set_stdout_hook, unmark_root_capturing, write_stderr, write_stdout,
-    CapturedOutput,
+    capturing_root_count, mark_root_capturing, register_output_capture_sink, set_current_root,
+    set_stderr_hook, set_stdout_hook, unmark_root_capturing, unregister_output_capture_sink,
+    write_stderr, write_stdout, CapturedOutput,
 };
 pub use sandbox::{Caps, Sandbox};
 pub use text_util::truncate_chars;

@@ -361,6 +361,101 @@ test('cancelling one interpreter root cannot cancel a colliding root owned by an
   expect(result.outcomes).toEqual(['cancelled', 'fulfilled']);
 });
 
+test('separate interpreters isolate colliding-root Promise and compatibility output', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interpA = new mod.SemaInterpreter();
+    const interpB = new mod.SemaInterpreter();
+
+    const eventsA: string[] = [];
+    const eventsB: string[] = [];
+    let rootA: number | undefined;
+    let rootB: number | undefined;
+    interpA.setPromiseOutputSink((_root: number, _stream: string, text: string) => {
+      eventsA.push(text);
+    });
+    interpB.setPromiseOutputSink((_root: number, _stream: string, text: string) => {
+      eventsB.push(text);
+    });
+
+    await Promise.all([
+      interpA.evalPromise(
+        '(async/sleep 10)(println "A-promise-only")',
+        (root: number) => { rootA = root; },
+      ),
+      interpB.evalPromise(
+        '(async/sleep 40)(println "B-promise-only")',
+        (root: number) => { rootB = root; },
+      ),
+    ]);
+
+    const [compatA, compatB] = await Promise.all([
+      interpA.evalAsync('(async/sleep 10)(println "A-compat-only")'),
+      interpB.evalAsync('(async/sleep 40)(println "B-compat-only")'),
+    ]);
+    const promiseMarkers = (events: string[]) =>
+      events.filter((text) => text.includes('promise-only'));
+    const compatMarkers = (output: string[]) =>
+      output.filter((text) => text.includes('compat-only'));
+
+    return {
+      rootA,
+      rootB,
+      eventsA: promiseMarkers(eventsA),
+      eventsB: promiseMarkers(eventsB),
+      compatA: compatMarkers(compatA.output),
+      compatB: compatMarkers(compatB.output),
+    };
+  });
+
+  expect(result.rootA).toBeDefined();
+  expect(result.rootA).toBe(result.rootB);
+  expect(result.eventsA).toEqual(['A-promise-only']);
+  expect(result.eventsB).toEqual(['B-promise-only']);
+  expect(result.compatA).toEqual(['A-compat-only']);
+  expect(result.compatB).toEqual(['B-compat-only']);
+});
+
+test('a Promise output callback can clear itself reentrantly', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+    const events: string[] = [];
+    let clearError: string | null = null;
+
+    interp.setPromiseOutputSink((_root: number, _stream: string, text: string) => {
+      events.push(text);
+      try {
+        interp.setPromiseOutputSink(undefined);
+      } catch (error) {
+        clearError = error instanceof Error ? error.message : String(error);
+      }
+    });
+    await interp.evalPromise('(println "first-only")', undefined);
+    await interp.evalPromise('(println "second-must-not-be-observed")', undefined);
+
+    return {
+      clearError,
+      markers: events.filter(
+        (text) => text.includes('first-only') || text.includes('second-must-not-be-observed'),
+      ),
+    };
+  });
+
+  expect(result.clearError).toBeNull();
+  expect(result.markers).toEqual(['first-only']);
+});
+
 // ── Gate (f), un-scoped (P6-3 step 5 —
 // `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md`): the replay loops and
 // the JS-side SAB/`legacySab` fallback are now actually deleted, so this

@@ -1,8 +1,8 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
-use std::rc::Rc;
+use std::collections::{HashMap, HashSet};
+use std::rc::{Rc, Weak};
 
-use crate::runtime::RootId;
+use crate::runtime::{RootId, RuntimeId};
 
 type OutputHook = Option<Box<dyn Fn(&str) + Send>>;
 
@@ -40,10 +40,10 @@ pub struct CapturedOutput {
 }
 
 thread_local! {
-    // The runtime's shared per-quantum output sink, installed once at
-    // `Runtime::new`. `None` until a runtime exists on this thread.
-    static OUTPUT_CAPTURE_SINK: RefCell<Option<Rc<RefCell<Vec<CapturedOutput>>>>> =
-        const { RefCell::new(None) };
+    // Each runtime owns its output buffer. Routes are weak so this hook cannot
+    // keep a dropped runtime alive when its explicit teardown is bypassed.
+    static OUTPUT_CAPTURE_ROUTES: RefCell<HashMap<RuntimeId, Weak<RefCell<Vec<CapturedOutput>>>>> =
+        RefCell::new(HashMap::new());
     // Roots currently opted into capture. A root is added here at submission
     // (`capture_output: true`) and removed when it is reaped, so this never
     // grows unbounded across a long-running host (REPL, notebook server).
@@ -58,39 +58,38 @@ thread_local! {
     static CURRENT_ROOT: Cell<Option<RootId>> = const { Cell::new(None) };
 }
 
-/// Install (or replace) the shared buffer that captured output is appended
-/// to. Called once per `Runtime::new`.
-///
-/// Also resets `CAPTURING_ROOTS`/`CAPTURING_COUNT` to empty. Sema's core is
-/// single-threaded: at most one `Runtime` is ever live on a given OS thread
-/// at a time (a second `Runtime::new` on the same thread only happens after
-/// the first one has been dropped — `Runtime` is `!Send`/`!Sync` via its
-/// `Rc`-based state, so it can't migrate threads, and nothing else installs
-/// a sink). A `Runtime` that dies with capturing roots still marked (e.g. a
-/// host drops the `Interpreter` without driving its roots to settlement,
-/// which is the only way `unmark_root_capturing` is skipped — see
-/// `cleanup_one`) therefore never has a legitimate reason to keep those
-/// entries alive past its own death: no root id it minted can ever recur
-/// (`RootId` embeds the dead runtime's `RuntimeId`, so even a theoretical
-/// stale entry could never match a live root), and no future runtime on
-/// this thread has any relationship to those roots. Resetting here — the
-/// one place a fresh runtime's lifetime begins on this thread — is there-
-/// fore always correct, and is what keeps a long-lived host that creates
-/// many short-lived runtimes on one thread (tests, a REPL that restarts its
-/// interpreter, embedders) from permanently paying the `HashSet::contains`
-/// path on every `print` after the first abandoned capturing root.
-pub fn install_output_capture_sink(sink: Rc<RefCell<Vec<CapturedOutput>>>) {
-    OUTPUT_CAPTURE_SINK.with(|cell| *cell.borrow_mut() = Some(sink));
-    CAPTURING_ROOTS.with(|set| set.borrow_mut().clear());
-    CAPTURING_COUNT.with(|c| c.set(0));
+/// Register the buffer owned by `runtime_id`. Other live runtime routes and
+/// capturing-root markers on this thread remain intact.
+pub fn register_output_capture_sink(
+    runtime_id: RuntimeId,
+    sink: &Rc<RefCell<Vec<CapturedOutput>>>,
+) {
+    OUTPUT_CAPTURE_ROUTES.with(|routes| {
+        routes.borrow_mut().insert(runtime_id, Rc::downgrade(sink));
+    });
+}
+
+/// Remove one runtime's output route and any abandoned capturing-root markers
+/// it minted. Teardown is scoped by the full runtime identity so another live
+/// runtime on the same thread is unaffected.
+pub fn unregister_output_capture_sink(runtime_id: RuntimeId) {
+    OUTPUT_CAPTURE_ROUTES.with(|routes| {
+        routes.borrow_mut().remove(&runtime_id);
+    });
+    let remaining = CAPTURING_ROOTS.with(|roots| {
+        let mut roots = roots.borrow_mut();
+        roots.retain(|root| root.runtime() != runtime_id);
+        roots.len()
+    });
+    CAPTURING_COUNT.with(|count| count.set(remaining));
 }
 
 /// Test/introspection accessor for `CAPTURING_COUNT` — lets a white-box
 /// test (in another crate, so it can't reach the thread-local directly)
-/// assert the fast-path counter is clean after `install_output_capture_sink`
-/// resets it. Not `cfg(test)`: integration tests in downstream crates build
-/// this crate without the library's own `test` cfg, so a `cfg(test)`-gated
-/// item here would be invisible to them.
+/// assert the fast-path counter is clean after runtime teardown. Not
+/// `cfg(test)`: integration tests in downstream crates build this crate without
+/// the library's own `test` cfg, so a `cfg(test)`-gated item here would be
+/// invisible to them.
 #[doc(hidden)]
 pub fn capturing_root_count() -> usize {
     CAPTURING_COUNT.with(Cell::get)
@@ -139,17 +138,25 @@ fn try_capture(is_stderr: bool, s: &str) -> bool {
     if !CAPTURING_ROOTS.with(|set| set.borrow().contains(&root)) {
         return false;
     }
-    OUTPUT_CAPTURE_SINK.with(|cell| {
-        let Some(sink) = cell.borrow().clone() else {
-            return false;
-        };
-        sink.borrow_mut().push(CapturedOutput {
-            root,
-            is_stderr,
-            text: s.to_string(),
-        });
-        true
-    })
+    let route = OUTPUT_CAPTURE_ROUTES.with(|routes| routes.borrow().get(&root.runtime()).cloned());
+    let Some(route) = route else {
+        return false;
+    };
+    let Some(sink) = route.upgrade() else {
+        unregister_output_capture_sink(root.runtime());
+        return false;
+    };
+    sink.borrow_mut().push(CapturedOutput {
+        root,
+        is_stderr,
+        text: s.to_string(),
+    });
+    true
+}
+
+#[cfg(test)]
+fn output_capture_route_count() -> usize {
+    OUTPUT_CAPTURE_ROUTES.with(|routes| routes.borrow().len())
 }
 
 /// Write a string to stdout: captured for the current quantum's root if it
@@ -182,4 +189,82 @@ pub fn write_stderr(s: &str) {
             eprint!("{}", s);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::{RootId, RuntimeId, RuntimeScopedIdCounter};
+
+    fn runtime_and_root() -> (RuntimeId, RootId) {
+        let runtime = RuntimeId::allocate().expect("runtime identity available");
+        let root = RuntimeScopedIdCounter::<RootId>::new(runtime)
+            .allocate()
+            .expect("root identity available");
+        (runtime, root)
+    }
+
+    #[test]
+    fn capture_routes_equal_local_roots_to_their_runtime_sinks() {
+        let (runtime_a, root_a) = runtime_and_root();
+        let (runtime_b, root_b) = runtime_and_root();
+        assert_eq!(root_a.local(), root_b.local());
+
+        let sink_a = Rc::new(RefCell::new(Vec::new()));
+        let sink_b = Rc::new(RefCell::new(Vec::new()));
+        register_output_capture_sink(runtime_a, &sink_a);
+        register_output_capture_sink(runtime_b, &sink_b);
+        mark_root_capturing(root_a);
+        mark_root_capturing(root_b);
+
+        set_current_root(Some(root_a));
+        write_stdout("A-only");
+        set_current_root(Some(root_b));
+        write_stdout("B-only");
+        set_current_root(None);
+
+        let events_a = sink_a.borrow();
+        assert!(matches!(
+            events_a.as_slice(),
+            [CapturedOutput { root, is_stderr: false, text }]
+                if *root == root_a && text == "A-only"
+        ));
+        let events_b = sink_b.borrow();
+        assert!(matches!(
+            events_b.as_slice(),
+            [CapturedOutput { root, is_stderr: false, text }]
+                if *root == root_b && text == "B-only"
+        ));
+
+        unregister_output_capture_sink(runtime_a);
+        unregister_output_capture_sink(runtime_b);
+    }
+
+    #[test]
+    fn unregister_and_dead_weak_pruning_are_scoped_to_one_runtime() {
+        let (runtime_a, root_a) = runtime_and_root();
+        let (runtime_b, root_b) = runtime_and_root();
+        let sink_a = Rc::new(RefCell::new(Vec::new()));
+        let sink_b = Rc::new(RefCell::new(Vec::new()));
+        register_output_capture_sink(runtime_a, &sink_a);
+        register_output_capture_sink(runtime_b, &sink_b);
+        mark_root_capturing(root_a);
+        mark_root_capturing(root_b);
+        assert_eq!(capturing_root_count(), 2);
+        assert_eq!(output_capture_route_count(), 2);
+
+        unregister_output_capture_sink(runtime_a);
+        assert_eq!(capturing_root_count(), 1);
+        assert_eq!(output_capture_route_count(), 1);
+
+        drop(sink_b);
+        set_stdout_hook(Some(Box::new(|_| {})));
+        set_current_root(Some(root_b));
+        write_stdout("dead route falls through");
+        set_current_root(None);
+
+        assert_eq!(capturing_root_count(), 0);
+        assert_eq!(output_capture_route_count(), 0);
+        set_stdout_hook(None);
+    }
 }

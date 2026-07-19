@@ -53,8 +53,7 @@ impl PromiseOutput {
         if events.is_empty() {
             return;
         }
-        let sink = self.sink.borrow();
-        let Some(f) = sink.as_ref() else {
+        let Some(sink) = self.sink.borrow().clone() else {
             return;
         };
         for event in events {
@@ -65,7 +64,7 @@ impl PromiseOutput {
             let root_val = JsValue::from_f64(root_id_as_f64(root));
             let stream_val = JsValue::from_str(stream);
             let text_val = JsValue::from_str(&text);
-            let _ = f.call3(&JsValue::NULL, &root_val, &stream_val, &text_val);
+            let _ = sink.call3(&JsValue::NULL, &root_val, &stream_val, &text_val);
         }
     }
 }

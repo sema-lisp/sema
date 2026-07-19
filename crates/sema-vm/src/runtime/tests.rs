@@ -2930,6 +2930,124 @@ fn native_call_into_sema_closure_and_back_to_native_uses_task_vm() {
     );
 }
 
+fn invoke_native_multimethod_dispatch_for_test(
+    context: &sema_core::EvalContext,
+    callable: &Value,
+    args: &[Value],
+) -> Result<Value, SemaError> {
+    let native = callable
+        .as_native_fn_ref()
+        .ok_or_else(|| SemaError::type_error("native function", callable.type_name()))?;
+    (native.func)(context, args)
+}
+
+struct ForwardReturnedValue;
+
+impl Trace for ForwardReturnedValue {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for ForwardReturnedValue {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => {
+                Err(SemaError::eval(format!("call was cancelled ({reason:?})")))
+            }
+            ResumeInput::Runtime(_) => Err(SemaError::eval("unexpected runtime response")),
+        }
+    }
+}
+
+struct ReturnAfterTimer;
+
+impl Trace for ReturnAfterTimer {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for ReturnAfterTimer {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        assert!(matches!(input, ResumeInput::Returned(_)));
+        Ok(NativeOutcome::Return(Value::int(73)))
+    }
+}
+
+#[test]
+fn native_call_multimethod_dispatches_selected_suspending_handler() {
+    let clock = Rc::new(FakeClock::new());
+    let context = Rc::new(sema_core::EvalContext::new());
+    sema_core::set_call_callback(&context, invoke_native_multimethod_dispatch_for_test);
+    let runtime = Runtime::new(
+        context,
+        clock.clone(),
+        Arc::new(FakeExecutor {
+            mode: FakeSubmit::Inline,
+            failure: None,
+        }),
+    )
+    .expect("runtime");
+
+    let dispatch = Value::native_fn(sema_core::NativeFn::simple(
+        "test/multimethod-dispatch",
+        |_| Ok(Value::keyword("selected")),
+    ));
+    let selected = Value::native_fn(sema_core::NativeFn::simple_result(
+        "test/suspending-method",
+        |_| {
+            Ok(NativeOutcome::Suspend(NativeSuspend {
+                wait: WaitKind::Timer(Duration::from_millis(5)),
+                continuation: Box::new(ReturnAfterTimer),
+            }))
+        },
+    ));
+    let mut methods = std::collections::BTreeMap::new();
+    methods.insert(Value::keyword("selected"), selected);
+    let multimethod = Value::multimethod(sema_core::MultiMethod {
+        name: sema_core::intern("test/runtime-multimethod"),
+        dispatch_fn: dispatch,
+        methods: RefCell::new(methods),
+        default: RefCell::new(None),
+    });
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Call(
+            NativeCall {
+                callable: multimethod,
+                args: vec![Value::int(1)],
+                continuation: Box::new(ForwardReturnedValue),
+            },
+        ))))
+        .expect("root admitted");
+
+    runtime.drive(&drive_budget(32)).expect("park method");
+    assert!(matches!(handle.poll_result(), RootPoll::Pending));
+    assert_eq!(runtime.timer_count_for_test(), 1);
+
+    clock.advance(Duration::from_millis(5));
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(8)).expect("settle method");
+    }
+    let RootPoll::Ready(settlement) = handle.poll_result() else {
+        panic!("multimethod call settles");
+    };
+    assert!(matches!(
+        settlement.outcome,
+        TaskOutcome::Returned(ref value) if value.as_int() == Some(73)
+    ));
+}
+
 /// `channel/send`/`channel/recv`'s continuation for the in-place handoff fast
 /// path (`try_channel_handoff`, state.rs) — `SendCont`/`RecvCont` in
 /// `sema-stdlib`'s `async_ops.rs` — only ever `resume()` to

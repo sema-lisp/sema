@@ -938,16 +938,14 @@ pub fn register(env: &sema_core::Env) {
             // (`__llm-chat-blocking`, `is_closure` false) stays on the
             // synchronous path so its task-scoped slab reaping is unaffected;
             // plain builtins and keyword getters never suspend, so the sync
-            // path is correct for them too. (Multimethods are NOT routed here —
-            // the cooperative Call path doesn't dispatch them; they stay on
-            // `call_function`. A multimethod whose selected method suspends leaks
-            // the stub regardless of `apply` — a separate multimethod-dispatch
-            // limitation tracked in docs/deferred.md, not something `apply` can
-            // fix.)
+            // path is correct for them too. Multimethods use the cooperative
+            // path so the runtime can dispatch the selected method and suspend
+            // it as an ordinary `NativeOutcome::Call`.
             let is_closure_callee = args[0]
                 .as_native_fn_rc()
                 .is_some_and(|native| native.is_closure);
-            if is_runtime_only_native(&args[0]) || is_closure_callee {
+            let is_multimethod_callee = args[0].as_multimethod_rc().is_some();
+            if is_runtime_only_native(&args[0]) || is_closure_callee || is_multimethod_callee {
                 apply_call(args)
             } else {
                 let func = &args[0];

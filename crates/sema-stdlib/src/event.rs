@@ -72,7 +72,8 @@ struct SourcesProbe {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl SourcesProbe {
-    fn next_check_after(&self) -> Duration {
+    fn next_check_after_at(&self, now: Instant) -> Duration {
+        let elapsed_ms = now.saturating_duration_since(self.started).as_millis();
         let next_timer = self
             .sources
             .iter()
@@ -84,9 +85,7 @@ impl SourcesProbe {
                         .and_then(|value| value.as_int())
                         .unwrap_or(0)
                         .max(0) as u128;
-                    Duration::from_millis(
-                        ms.saturating_sub(self.started.elapsed().as_millis()) as u64
-                    )
+                    Duration::from_millis(ms.saturating_sub(elapsed_ms) as u64)
                 })
             })
             .min();
@@ -104,6 +103,17 @@ impl SourcesProbe {
             (true, None) | (false, None) => Duration::from_millis(5),
         }
     }
+
+    fn poll_at(&self, now: Instant) -> crate::io::RuntimePollResult {
+        if let Some(value) = self
+            .sources
+            .iter()
+            .find_map(|source| ready_at(source, self.started, now))
+        {
+            return crate::io::RuntimePollResult::Ready(value);
+        }
+        crate::io::RuntimePollResult::PendingAfter(self.next_check_after_at(now))
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -119,14 +129,7 @@ impl sema_core::runtime::Trace for SourcesProbe {
 #[cfg(not(target_arch = "wasm32"))]
 impl crate::io::RuntimePoll for SourcesProbe {
     fn poll(&mut self) -> crate::io::RuntimePollResult {
-        if let Some(value) = self
-            .sources
-            .iter()
-            .find_map(|source| ready(source, self.started))
-        {
-            return crate::io::RuntimePollResult::Ready(value);
-        }
-        crate::io::RuntimePollResult::PendingAfter(self.next_check_after())
+        self.poll_at(Instant::now())
     }
 }
 
@@ -156,6 +159,10 @@ fn fire(source: &Value, extra: Vec<(&str, Value)>) -> Value {
 
 /// Check one source; `Some(event)` if it's ready right now.
 fn ready(source: &Value, started: Instant) -> Option<Value> {
+    ready_at(source, started, Instant::now())
+}
+
+fn ready_at(source: &Value, started: Instant, now: Instant) -> Option<Value> {
     let m = source.as_map_ref()?;
     let ty = m.get(&kw("type"))?;
     if ty == &kw("key") {
@@ -178,7 +185,7 @@ fn ready(source: &Value, started: Instant) -> Option<Value> {
             .and_then(|v| v.as_int())
             .unwrap_or(0)
             .max(0) as u128;
-        if started.elapsed().as_millis() >= ms {
+        if now.saturating_duration_since(started).as_millis() >= ms {
             Some(fire(source, vec![]))
         } else {
             None
@@ -299,32 +306,49 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
-    fn sources_probe_uses_earliest_timer_deadline() {
+    fn sources_probe_uses_one_clock_sample_for_timer_readiness_and_rearm() {
+        let started = Instant::now();
         let probe = SourcesProbe {
             sources: vec![
                 source("timer", &[("ms", Value::int(100))]),
                 source("timer", &[("ms", Value::int(25))]),
             ],
-            started: Instant::now(),
+            started,
         };
 
-        let delay = probe.next_check_after();
-        assert!((Duration::ZERO..=Duration::from_millis(25)).contains(&delay));
+        match probe.poll_at(started + Duration::from_millis(7)) {
+            crate::io::RuntimePollResult::PendingAfter(delay) => {
+                assert_eq!(delay, Duration::from_millis(18));
+                assert_ne!(delay, Duration::ZERO);
+            }
+            other => panic!("expected a pending timer probe, got {other:?}"),
+        }
+
+        match probe.poll_at(started + Duration::from_millis(25)) {
+            crate::io::RuntimePollResult::Ready(event) => {
+                assert_eq!(
+                    event.as_map_ref().unwrap().get(&kw("type")),
+                    Some(&kw("timer"))
+                );
+            }
+            other => panic!("expected the earliest timer to be ready, got {other:?}"),
+        }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn sources_probe_caps_vm_probe_delay() {
+        let started = Instant::now();
         let probe = SourcesProbe {
             sources: vec![
                 source("timer", &[("ms", Value::int(100))]),
                 source("timer", &[("ms", Value::int(25))]),
                 source("proc", &[("handle", Value::int(999999))]),
             ],
-            started: Instant::now(),
+            started,
         };
 
-        let delay = probe.next_check_after();
-        assert!((Duration::ZERO..=Duration::from_millis(5)).contains(&delay));
+        let delay = probe.next_check_after_at(started + Duration::from_millis(7));
+        assert_eq!(delay, Duration::from_millis(5));
     }
 }

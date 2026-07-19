@@ -456,6 +456,24 @@ test('a Promise output callback can clear itself reentrantly', async ({ page }) 
   expect(result.markers).toEqual(['first-only']);
 });
 
+test('synchronous evalVM points HTTP callers to evalPromise without leaking its marker', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+    return interp.evalVM(`(http/get "${location.origin}/index.html")`);
+  });
+
+  expect(result.error).toContain(
+    'http/get: evalVM cannot perform HTTP requests synchronously; use evalPromise',
+  );
+  expect(result.error).not.toContain('__SEMA_WASM_HTTP__');
+});
+
 // ── Gate (f), un-scoped (P6-3 step 5 —
 // `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md`): the replay loops and
 // the JS-side SAB/`legacySab` fallback are now actually deleted, so this

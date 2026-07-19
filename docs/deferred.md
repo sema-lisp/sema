@@ -934,20 +934,27 @@ DELETED (P5, commit a1862f67); `scripts/check-unified-runtime-legacy.sh
   non-native callable, `call_non_native` falls back to the exact prior
   synchronous `call_callback` path.
 
+  A multimethod can also enter the structural Call ABI directly through a
+  runtime native such as `apply`, without passing through `call_non_native`.
+  `Runtime::invoke_callable` resolves that case with the same shared helper,
+  snapshots a dispatch closure that crosses from the parked caller VM, and
+  recursively invokes the selected handler under the original continuation.
+
   Verified working: `(eval '(async/await (async (+ 40 2))))` → 42 (was: "no
   async scheduler registered"); `(eval '(+ 1 2))` unaffected at top level and
   inside a runtime quantum; `(map (fn (x) (eval x)) '((+ 1 1) (+ 2 2)))` →
   `(2 4)`; a direct multimethod call whose selected method does
   `(async/await (async/spawn ...))` suspends and resumes cleanly, while a
-  sibling synchronous method on the same multimethod, and `(apply mm ...)`
-  (which deliberately keeps multimethod callees on the synchronous path — the
-  cooperative Call path still does not dispatch multimethods, so `apply`'s
-  existing graceful "cannot invoke runtime-only native" error surface for a
-  runtime-only callee is unaffected), are both unchanged. Gate tests:
+  sibling synchronous method on the same multimethod is unchanged. `(apply mm
+  ...)` now uses the same cooperative dispatcher, so a suspending selected
+  method parks and resumes normally. Gate tests:
   `vm_eval_is_vm_native_runs_async` (`crates/sema/tests/vm_integration_test.rs`,
   un-`#[ignore]`d) and
   `multimethod_selected_method_suspends_cooperatively`
-  (`crates/sema/tests/vm_async_test.rs`).
+  plus `apply_of_suspending_multimethod_runs_cooperatively`
+  (`crates/sema/tests/vm_async_test.rs`), and
+  `native_call_multimethod_dispatches_selected_suspending_handler`
+  (`crates/sema-vm/src/runtime/tests.rs`).
 
   Historical description follows (superseded by the resolution above).
 
@@ -1354,6 +1361,6 @@ debugger tests pass. Two independent defects remain:
   Yielded` instead of the expected step-limit termination.
 
 The release gates now build the final playground WASM and run the stable
-runtime subset: `unified-runtime.spec.ts` and `debug-http-replay.spec.ts` (12
+runtime subset: `unified-runtime.spec.ts` and `debug-http-replay.spec.ts` (13
 tests). The two remaining debugger defects are excluded from that focused gate
 until repaired; the full playground suite remains the local acceptance suite.

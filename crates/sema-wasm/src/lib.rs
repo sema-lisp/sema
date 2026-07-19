@@ -2165,16 +2165,22 @@ impl WasmInterpreter {
             }
             Err(e) => {
                 let output = take_output();
-                let mut err_str = format!("{}", e.inner());
-                if let Some(trace) = e.stack_trace() {
-                    err_str.push_str(&format!("\n{trace}"));
-                }
-                if let Some(hint) = e.hint() {
-                    err_str.push_str(&format!("\n  hint: {hint}"));
-                }
-                if let Some(note) = e.note() {
-                    err_str.push_str(&format!("\n  note: {note}"));
-                }
+                let err_str = if is_http_await_marker(&e) {
+                    "http/get: evalVM cannot perform HTTP requests synchronously; use evalPromise"
+                        .to_string()
+                } else {
+                    let mut message = format!("{}", e.inner());
+                    if let Some(trace) = e.stack_trace() {
+                        message.push_str(&format!("\n{trace}"));
+                    }
+                    if let Some(hint) = e.hint() {
+                        message.push_str(&format!("\n  hint: {hint}"));
+                    }
+                    if let Some(note) = e.note() {
+                        message.push_str(&format!("\n  note: {note}"));
+                    }
+                    message
+                };
                 format!(
                     "{{\"value\":null,\"output\":[{}],\"error\":\"{}\"}}",
                     output

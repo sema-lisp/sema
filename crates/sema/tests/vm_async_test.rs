@@ -1806,6 +1806,20 @@ fn multimethod_selected_method_suspends_cooperatively() {
 }
 
 #[test]
+fn apply_of_suspending_multimethod_runs_cooperatively() {
+    assert_eq!(
+        eval(
+            r#"(begin
+                 (defmulti shape-area (fn (s) (:kind s)))
+                 (defmethod shape-area :circle
+                   (fn (s) (async/await (async/spawn (fn () (* 3 (:r s) (:r s)))))))
+                 (apply shape-area (list {:kind :circle :r 2})))"#
+        ),
+        Value::int(12)
+    );
+}
+
+#[test]
 fn nested_apply_of_runtime_native_is_graceful_error() {
     // `apply`/`call-with-values` reached through another synchronous `apply`
     // run on the value ABI, where a runtime-only native cannot suspend. That

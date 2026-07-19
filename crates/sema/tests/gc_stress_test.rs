@@ -1181,6 +1181,30 @@ fn zero_upvalue_env_cycle_collected_via_env_candidate() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn signal_registry_callback_cycle_collected_at_interpreter_teardown() {
+    // The interpreter env owns the signal builtins, their shared registry
+    // payload owns this callback, and the callback points back to its home env.
+    // Dropping the interpreter must trace and sever that complete cycle.
+    let weak_bindings = {
+        let interp = Interpreter::new();
+        interp
+            .eval_str_compiled(
+                "(begin
+                   (define signal-root :kept-until-drop)
+                   (sys/on-signal :winch (fn () signal-root)))",
+            )
+            .expect("register signal callback");
+        std::rc::Rc::downgrade(&interp.global_env.bindings)
+    };
+    assert_eq!(
+        weak_bindings.strong_count(),
+        0,
+        "signal registry callback cycle reclaimed with its interpreter"
+    );
+}
+
 #[test]
 fn zero_upvalue_module_closure_bound_in_importer_env_collected_at_teardown() {
     // Cross-env variant: a zero-upvalue closure homed in a MODULE env is

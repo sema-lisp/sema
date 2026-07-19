@@ -65,6 +65,9 @@ mod stream;
 mod string;
 #[cfg(not(target_arch = "wasm32"))]
 mod system;
+#[cfg(all(not(target_arch = "wasm32"), unix))]
+#[doc(hidden)]
+pub use system::mark_sigwinch_pending_for_test;
 #[cfg(not(target_arch = "wasm32"))]
 mod terminal;
 mod text;

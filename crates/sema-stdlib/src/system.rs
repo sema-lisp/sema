@@ -1,7 +1,13 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(unix)]
+use std::cell::RefCell;
+#[cfg(unix)]
+use std::collections::VecDeque;
+#[cfg(unix)]
+use std::rc::Rc;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sema_core::cycle::GcEdge;
 use sema_core::runtime::{
@@ -148,31 +154,266 @@ fn is_executable(path: &std::path::Path) -> bool {
     }
 }
 
-// ─── Signal pending flags (set by async signal handlers) ────────────────────
-static SIGWINCH_PENDING: AtomicBool = AtomicBool::new(false);
-static SIGINT_PENDING: AtomicBool = AtomicBool::new(false);
-static SIGTERM_PENDING: AtomicBool = AtomicBool::new(false);
+// ─── Deferred Unix signal delivery ─────────────────────────────────────────
 
-// ─── Signal callbacks (thread-local, keyed by signal number) ────────────────
-// Values are Sema callables stored per-signal.
-thread_local! {
-    static SIGNAL_CALLBACKS: RefCell<HashMap<i32, Vec<Value>>> = RefCell::new(HashMap::new());
+/// Process-wide event generations. A generation is a broadcast token: each
+/// interpreter-owned registry remembers the last generation it observed, so
+/// one interpreter checking signals cannot consume another's event. Multiple
+/// arrivals before one interpreter checks remain coalesced into one dispatch.
+#[cfg(unix)]
+static SIGWINCH_EPOCH: AtomicUsize = AtomicUsize::new(0);
+#[cfg(unix)]
+static SIGINT_EPOCH: AtomicUsize = AtomicUsize::new(0);
+#[cfg(unix)]
+static SIGTERM_EPOCH: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SignalKind {
+    Winch,
+    Int,
+    Term,
+}
+
+#[cfg(unix)]
+impl SignalKind {
+    const ALL: [Self; 3] = [Self::Winch, Self::Int, Self::Term];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Winch => 0,
+            Self::Int => 1,
+            Self::Term => 2,
+        }
+    }
+
+    fn epoch(self) -> &'static AtomicUsize {
+        match self {
+            Self::Winch => &SIGWINCH_EPOCH,
+            Self::Int => &SIGINT_EPOCH,
+            Self::Term => &SIGTERM_EPOCH,
+        }
+    }
+
+    fn from_value(value: &Value) -> Result<Self, SemaError> {
+        let keyword = value
+            .as_keyword()
+            .ok_or_else(|| SemaError::type_error("keyword", value.type_name()))?;
+        match keyword.as_str() {
+            "winch" => Ok(Self::Winch),
+            "int" => Ok(Self::Int),
+            "term" => Ok(Self::Term),
+            other => Err(SemaError::eval(format!(
+                "sys/on-signal: unknown signal :{other}; use :winch, :int, or :term"
+            ))),
+        }
+    }
+
+    fn install_handler(self) -> Result<(), SemaError> {
+        // Cast through a pointer to avoid the fn_to_numeric_cast lint. The
+        // installed handler touches only one lock-free atomic generation.
+        let handler: libc::sighandler_t = match self {
+            Self::Winch => handle_sigwinch as *const () as usize,
+            Self::Int => handle_sigint as *const () as usize,
+            Self::Term => handle_sigterm as *const () as usize,
+        };
+        let signal = match self {
+            Self::Winch => libc::SIGWINCH,
+            Self::Int => libc::SIGINT,
+            Self::Term => libc::SIGTERM,
+        };
+        // SAFETY: `handler` is an extern-C function with the exact platform
+        // signal-handler signature and has process lifetime.
+        let previous = unsafe { libc::signal(signal, handler) };
+        if previous == libc::SIG_ERR {
+            return Err(SemaError::eval(format!(
+                "sys/on-signal: failed to install signal handler: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct SignalSlot {
+    callbacks: Vec<Value>,
+    seen_epoch: usize,
+}
+
+/// One interpreter's signal subscriptions. The two signal builtins in that
+/// interpreter's environment share this as a traced native payload; no process
+/// or thread-local cell owns callback `Value`s.
+#[cfg(unix)]
+#[derive(Default)]
+struct SignalRegistry {
+    slots: RefCell<[SignalSlot; 3]>,
+}
+
+#[cfg(unix)]
+impl SignalRegistry {
+    fn register(&self, kind: SignalKind, callback: Value) -> Result<(), SemaError> {
+        let index = kind.index();
+        if self.slots.borrow()[index].callbacks.is_empty() {
+            kind.install_handler()?;
+            // Registration linearizes at this load. Signals observed before it
+            // are historical; a signal racing after it advances the generation
+            // and is delivered on the next check.
+            self.slots.borrow_mut()[index].seen_epoch = kind.epoch().load(Ordering::Relaxed);
+        }
+        self.slots.borrow_mut()[index].callbacks.push(callback);
+        Ok(())
+    }
+
+    /// Consume this interpreter's current generation snapshot and clone its
+    /// callback batch in stable signal/registration order. The borrow ends
+    /// before any callback runs, so callbacks may register more callbacks.
+    fn take_pending_callbacks(&self) -> Result<VecDeque<Value>, SemaError> {
+        let observed = SignalKind::ALL.map(|kind| kind.epoch().load(Ordering::Relaxed));
+        let mut slots = self.slots.try_borrow_mut().map_err(|_| {
+            SemaError::eval("sys/check-signals: signal registry is already borrowed")
+        })?;
+        let mut callbacks = VecDeque::new();
+        for kind in SignalKind::ALL {
+            let index = kind.index();
+            let slot = &mut slots[index];
+            if !slot.callbacks.is_empty() && slot.seen_epoch != observed[index] {
+                slot.seen_epoch = observed[index];
+                callbacks.extend(slot.callbacks.iter().cloned());
+            }
+        }
+        Ok(callbacks)
+    }
+}
+
+#[cfg(unix)]
+struct SignalDispatchContinuation {
+    remaining: VecDeque<Value>,
+}
+
+#[cfg(unix)]
+impl Trace for SignalDispatchContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        for callback in &self.remaining {
+            sink(GcEdge::Value(callback));
+        }
+        true
+    }
+}
+
+#[cfg(unix)]
+impl NativeContinuation for SignalDispatchContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(_) => dispatch_signal_callbacks(self.remaining),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "sys/check-signals callback was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "sys/check-signals callback received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn dispatch_signal_callbacks(mut callbacks: VecDeque<Value>) -> NativeResult {
+    let Some(callable) = callbacks.pop_front() else {
+        return Ok(NativeOutcome::Return(Value::nil()));
+    };
+    Ok(NativeOutcome::Call(sema_core::runtime::NativeCall {
+        callable,
+        args: Vec::new(),
+        continuation: Box::new(SignalDispatchContinuation {
+            remaining: callbacks,
+        }),
+    }))
+}
+
+#[cfg(unix)]
+fn check_signals(
+    registry: &SignalRegistry,
+    _context: &mut NativeCallContext<'_>,
+    args: &[Value],
+) -> NativeResult {
+    check_arity!(args, "sys/check-signals", 0);
+    dispatch_signal_callbacks(registry.take_pending_callbacks()?)
+}
+
+/// Reports the one strong payload edge owned by the NativeFn currently being
+/// traced. Both signal builtins point at the same allocation, so two NativeFns
+/// report two edges and the opaque node's `strong_count` is two.
+#[cfg(unix)]
+fn signal_registry_payload_tracer(
+    payload: &Rc<dyn std::any::Any>,
+    sink: &mut dyn FnMut(GcEdge<'_>),
+) -> bool {
+    sink(GcEdge::Opaque {
+        ptr: sema_core::NodePtr::of_rc(payload),
+        strong_count: Rc::strong_count(payload),
+        trace: trace_signal_registry,
+        sever: sever_signal_registry,
+    });
+    true
+}
+
+#[cfg(unix)]
+fn trace_signal_registry(ptr: sema_core::NodePtr, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+    // SAFETY: payload tracing supplied the data pointer of a live
+    // `Rc<SignalRegistry>`; the collector retains traced allocations through
+    // the complete pass.
+    let registry = unsafe { &*(ptr.raw() as *const SignalRegistry) };
+    let Ok(slots) = registry.slots.try_borrow() else {
+        return false;
+    };
+    for callback in slots.iter().flat_map(|slot| &slot.callbacks) {
+        sink(GcEdge::Value(callback));
+    }
+    true
+}
+
+#[cfg(unix)]
+fn sever_signal_registry(ptr: sema_core::NodePtr) -> Option<Value> {
+    // SAFETY: see `trace_signal_registry`; severing runs while the same opaque
+    // allocation remains retained by the collector.
+    let registry = unsafe { &*(ptr.raw() as *const SignalRegistry) };
+    let mut slots = registry.slots.try_borrow_mut().ok()?;
+    let callbacks = slots
+        .iter_mut()
+        .flat_map(|slot| std::mem::take(&mut slot.callbacks))
+        .collect();
+    Some(Value::list(callbacks))
 }
 
 // ─── Signal handlers: only allowed to use async-signal-safe operations ───────
 #[cfg(unix)]
 extern "C" fn handle_sigwinch(_: libc::c_int) {
-    SIGWINCH_PENDING.store(true, Ordering::Relaxed);
+    SIGWINCH_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(unix)]
 extern "C" fn handle_sigint(_: libc::c_int) {
-    SIGINT_PENDING.store(true, Ordering::Relaxed);
+    SIGINT_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(unix)]
 extern "C" fn handle_sigterm(_: libc::c_int) {
-    SIGTERM_PENDING.store(true, Ordering::Relaxed);
+    SIGTERM_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Deterministic delivery hook for runtime integration tests. It exercises the
+/// same epoch transition as the async OS handler without sending a process
+/// signal that could interfere with a parallel test.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn mark_sigwinch_pending_for_test() {
+    SIGWINCH_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Resolve the (program, argv) for a `shell` invocation. A lone command string
@@ -783,93 +1024,72 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         Ok(Value::nil())
     });
 
-    // ─── Signal hooks (Unix only) ────────────────────────────────────────────
+    // ─── Signal hooks ────────────────────────────────────────────────────────
     // sys/on-signal — register a Sema callback for a signal.
     // Supported signals: :winch (SIGWINCH), :int (SIGINT), :term (SIGTERM).
-    // Registering a handler installs the OS signal handler the first time.
+    // An interpreter's first callback for a signal installs the OS handler.
     // Call (sys/check-signals) from your event loop to dispatch pending callbacks.
     #[cfg(unix)]
     {
         use sema_core::NativeFn;
 
+        let registry = Rc::new(SignalRegistry::default());
+        sema_core::register_payload_tracer(
+            std::any::TypeId::of::<SignalRegistry>(),
+            signal_registry_payload_tracer,
+        );
+
+        let on_signal_registry = Rc::downgrade(&registry);
+        let on_signal_payload: Rc<dyn std::any::Any> = registry.clone();
+
         env.set(
             sema_core::intern("sys/on-signal"),
-            Value::native_fn(NativeFn::with_ctx("sys/on-signal", |_ctx, args| {
-                check_arity!(args, "sys/on-signal", 2);
-                let kw = args[0]
-                    .as_keyword()
-                    .ok_or_else(|| SemaError::type_error("keyword", args[0].type_name()))?;
-                let sig_num = match kw.as_str() {
-                    "winch" => libc::SIGWINCH,
-                    "int" => libc::SIGINT,
-                    "term" => libc::SIGTERM,
-                    other => {
-                        return Err(SemaError::eval(format!(
-                            "sys/on-signal: unknown signal :{other}; use :winch, :int, or :term"
-                        )))
-                    }
-                };
-                let callback = args[1].clone();
-                // Install the OS-level signal handler on first registration
-                SIGNAL_CALLBACKS.with(|cbs| {
-                    let mut map = cbs.borrow_mut();
-                    let entry = map.entry(sig_num).or_default();
-                    if entry.is_empty() {
-                        // First callback for this signal: install handler.
-                        // Cast via *const () to avoid the fn_to_numeric_cast lint.
-                        let handler: libc::sighandler_t = match sig_num {
-                            s if s == libc::SIGWINCH => handle_sigwinch as *const () as usize,
-                            s if s == libc::SIGINT => handle_sigint as *const () as usize,
-                            s if s == libc::SIGTERM => handle_sigterm as *const () as usize,
-                            // Unreachable: sig_num is validated against the three above by the
-                            // kw match earlier in this function.
-                            _ => unreachable!("unexpected signal number {sig_num}"),
-                        };
-                        unsafe { libc::signal(sig_num, handler) };
-                    }
-                    entry.push(callback);
-                });
-                Ok(Value::nil())
-            })),
+            Value::native_fn(
+                NativeFn::with_payload("sys/on-signal", on_signal_payload, move |_ctx, args| {
+                    check_arity!(args, "sys/on-signal", 2);
+                    let kind = SignalKind::from_value(&args[0])?;
+                    let registry = on_signal_registry.upgrade().ok_or_else(|| {
+                        SemaError::eval("internal error: sys/on-signal registry is unavailable")
+                    })?;
+                    registry.register(kind, args[1].clone())?;
+                    Ok(Value::nil())
+                })
+                .with_escaping_args(&[1]),
+            ),
         );
 
-        // sys/check-signals — call all pending signal callbacks.
-        // Should be called from the main event loop (e.g., after io/read-key returns).
+        // sys/check-signals — call all pending signal callbacks. Callback
+        // dispatch is runtime-only because a callback may suspend; ordinary
+        // eval entry points already execute through that runtime ABI.
         env.set(
             sema_core::intern("sys/check-signals"),
-            Value::native_fn(NativeFn::with_ctx("sys/check-signals", |ctx, args| {
-                check_arity!(args, "sys/check-signals", 0);
-                let mut to_dispatch: Vec<(i32, Vec<Value>)> = Vec::new();
-
-                if SIGWINCH_PENDING.swap(false, Ordering::Relaxed) {
-                    SIGNAL_CALLBACKS.with(|cbs| {
-                        if let Some(callbacks) = cbs.borrow().get(&libc::SIGWINCH) {
-                            to_dispatch.push((libc::SIGWINCH, callbacks.clone()));
-                        }
-                    });
-                }
-                if SIGINT_PENDING.swap(false, Ordering::Relaxed) {
-                    SIGNAL_CALLBACKS.with(|cbs| {
-                        if let Some(callbacks) = cbs.borrow().get(&libc::SIGINT) {
-                            to_dispatch.push((libc::SIGINT, callbacks.clone()));
-                        }
-                    });
-                }
-                if SIGTERM_PENDING.swap(false, Ordering::Relaxed) {
-                    SIGNAL_CALLBACKS.with(|cbs| {
-                        if let Some(callbacks) = cbs.borrow().get(&libc::SIGTERM) {
-                            to_dispatch.push((libc::SIGTERM, callbacks.clone()));
-                        }
-                    });
-                }
-
-                for (_, callbacks) in to_dispatch {
-                    for cb in &callbacks {
-                        sema_core::call_callback(ctx, cb, &[])?;
-                    }
-                }
-                Ok(Value::nil())
-            })),
+            Value::native_fn(NativeFn::with_payload_result(
+                "sys/check-signals",
+                registry,
+                check_signals,
+            )),
         );
+    }
+
+    // The documented non-Unix ABI is a no-op, not an unbound symbol. Keep the
+    // same arity/keyword validation while retaining no callback values.
+    #[cfg(not(unix))]
+    {
+        register_fn(env, "sys/on-signal", |args| {
+            check_arity!(args, "sys/on-signal", 2);
+            let keyword = args[0]
+                .as_keyword()
+                .ok_or_else(|| SemaError::type_error("keyword", args[0].type_name()))?;
+            match keyword.as_str() {
+                "winch" | "int" | "term" => Ok(Value::nil()),
+                other => Err(SemaError::eval(format!(
+                    "sys/on-signal: unknown signal :{other}; use :winch, :int, or :term"
+                ))),
+            }
+        });
+        register_fn(env, "sys/check-signals", |args| {
+            check_arity!(args, "sys/check-signals", 0);
+            Ok(Value::nil())
+        });
     }
 }

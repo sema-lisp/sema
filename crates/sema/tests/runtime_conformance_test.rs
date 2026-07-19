@@ -226,6 +226,42 @@ fn unified_runtime_purged_legacy_symbols_absent() {
 }
 
 #[test]
+fn signal_callbacks_use_interpreter_owned_structural_dispatch() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = fs::read_to_string(root.join("crates/sema-stdlib/src/system.rs"))
+        .expect("read system stdlib source");
+    let production: String = source
+        .lines()
+        .map(strip_line_comments)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for forbidden in [
+        "SIGNAL_CALLBACKS",
+        "sema_core::call_callback",
+        "SIGWINCH_PENDING.swap",
+        "SIGINT_PENDING.swap",
+        "SIGTERM_PENDING.swap",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "signal dispatch retained forbidden production token {forbidden}"
+        );
+    }
+    for required in [
+        "SignalRegistry",
+        "NativeOutcome::Call",
+        "with_escaping_args(&[1])",
+        "signal_registry_payload_tracer",
+    ] {
+        assert!(
+            production.contains(required),
+            "signal dispatch is missing required production token {required}"
+        );
+    }
+}
+
+#[test]
 fn unified_runtime_scanner_detects_raw_blocking_recv_fixture() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let fixture =

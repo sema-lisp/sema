@@ -35,19 +35,19 @@ thread_local! {
     /// per-TASK slot (captured at task spawn, swapped in/out at each task step via the
     /// `sema_core` usage-scope seam — mirroring the otel context), so a sibling leaf
     /// running concurrently can't clobber an in-flight leaf's tally. A multi-round tool
-    /// loop SUMS every round's usage instead of seeing only the last. The async
-    /// completion path additionally captures this frame's `Rc` into its poller closure
-    /// so the fold lands even though the poller runs outside the task-step boundary.
+    /// loop sums every round's usage instead of seeing only the last. Runtime
+    /// completion paths capture this frame's `Rc` into their decoder so the fold
+    /// lands outside the task-step boundary.
     static ACTIVE_LEAF_SCOPE: RefCell<Option<Rc<RefCell<LeafUsage>>>> = const { RefCell::new(None) };
-    /// Set while an async completion's poller folds usage into a CAPTURED frame Rc.
-    /// Suppresses `track_usage`'s own active-frame fold so the async path counts each
+    /// Set while a runtime completion decoder folds usage into a captured frame `Rc`.
+    /// Suppresses `track_usage`'s own active-frame fold so the runtime path counts each
     /// completion exactly once.
     static USAGE_ACCUM_SUPPRESS: Cell<bool> = const { Cell::new(false) };
     static SESSION_COST: RefCell<f64> = const { RefCell::new(0.0) };
     /// The budget frame in force for the CURRENT TASK, held behind a shared `Rc` so
     /// that all concurrent tasks spawned inside one `llm/with-budget` charge ONE
     /// aggregate frame (captured by-`Rc` onto each task at spawn via the per-task LLM
-    /// dynamic-scope seam, and re-installed around the async completion poller's
+    /// dynamic-scope seam, and re-installed around the runtime completion decoder's
     /// `track_usage`). `None` when no budget is active.
     static ACTIVE_BUDGET: RefCell<Option<Rc<RefCell<BudgetFrame>>>> = const { RefCell::new(None) };
     /// When set (via `llm/with-budget {:on-stream :pre-gate}`), `llm/stream` checks the
@@ -182,8 +182,8 @@ impl Drop for UsageScope {
 }
 
 /// Open a per-leaf usage accumulation scope. `track_usage` folds each completion made
-/// while the returned guard is alive into this scope's frame; the async completion path
-/// captures the frame's `Rc` into its poller so an in-flight leaf is tallied even after
+/// while the returned guard is alive into this scope's frame; the runtime completion path
+/// captures the frame's `Rc` into its decoder so an in-flight leaf is tallied even after
 /// a sibling task runs. The guard restores the prior active scope on drop.
 pub fn open_usage_scope() -> UsageScope {
     let slot = Rc::new(RefCell::new(LeafUsage::default()));
@@ -191,8 +191,8 @@ pub fn open_usage_scope() -> UsageScope {
     UsageScope { slot, prev }
 }
 
-/// Clone the active (per-task) usage-accumulator frame's `Rc`, if any. The async
-/// completion path captures this at yield time so the poller folds usage into the
+/// Clone the active (per-task) usage-accumulator frame's `Rc`, if any. The runtime
+/// completion path captures this at dispatch so the decoder folds usage into the
 /// LEAF'S OWN frame — correct even across a concurrent sibling task.
 fn current_usage_accum() -> Option<Rc<RefCell<LeafUsage>>> {
     ACTIVE_LEAF_SCOPE.with(|s| s.borrow().clone())
@@ -421,7 +421,7 @@ thread_local! {
     static LAST_SERVING_PROVIDER: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-// ── AwaitIo spike instrumentation ───────────────────────────────
+// ── I/O-overlap instrumentation ─────────────────────────────────
 //
 // Used only by the `llm/io-sleep-once` spike leaf (and its acceptance test) to
 // prove that N offloaded futures are in flight *simultaneously* on SHARED_RT,
@@ -454,9 +454,9 @@ pub fn reset_io_inflight() {
 
 /// RAII gauge for one offloaded completion future: bumps `IO_INFLIGHT` + `IO_PEAK`
 /// on construction and decrements (clamped at 0) on drop, so an abort that drops
-/// the future before or during its first poll can't strand the gauge at +1. Shared
-/// by the `AwaitIo` async yield and the runtime External-wait paths so both prove
-/// simultaneity the same way (`io_peak_inflight() >= 2`).
+/// the future before or during its first poll cannot strand the gauge at +1.
+/// External-wait paths use this to prove simultaneity
+/// (`io_peak_inflight() >= 2`).
 #[cfg(not(target_arch = "wasm32"))]
 struct InflightGuard;
 
@@ -609,19 +609,19 @@ fn register_fn_ctx(
 /// Register a dual-ABI native whose body speaks the runtime native ABI
 /// (`NativeResult`) so its `in_runtime_quantum` branch can return a
 /// `NativeOutcome::Suspend`/`Call` directly (an external-wait offload or a
-/// cooperative tool round). Under the unified runtime the runtime callback drives
-/// the body — it has no evaluator context of its own, so it borrows the shared
-/// stdlib `EvalContext` for any callback dispatch. Outside the runtime (bare eval
-/// / legacy scheduler) the legacy callback runs the same body with the real
-/// evaluator context and unwraps the plain `Return` it produces there.
-/// True when a blocking provider call should offload+yield so siblings overlap: inside
-/// a legacy scheduler task, OR a unified-runtime SPAWNED task (a real `async/spawn` /
-/// `async/pool-map` child). Deliberately FALSE for the root/top-level quantum
+/// cooperative tool round). The runtime callback has no evaluator context of its
+/// own, so it borrows the shared stdlib `EvalContext` for callback dispatch. The
+/// plain value callback runs the same body with its evaluator context and unwraps
+/// the `Return` produced outside a runtime quantum.
+///
+/// True when a blocking provider call should offload so siblings overlap: inside
+/// a unified-runtime spawned task (a real `async/spawn` / `async/pool-map` child).
+/// Deliberately false for the root/top-level quantum
 /// (`current_task_id() == None`): top-level code — including a cooperative
 /// `(map llm/embed …)` whose HOF driver cannot suspend a directly-invoked native's
-/// offload yield — must run the synchronous provider path, exactly as before the runtime
+/// offload suspension — must run the synchronous provider path
 /// (a plain `in_runtime_quantum()` gate would wrongly offload it and hit the
-/// "wrap it in a lambda" HOF-yield stub).
+/// "wrap it in a lambda" synchronous-HOF guard).
 #[cfg(not(target_arch = "wasm32"))]
 fn in_async_offload_context() -> bool {
     sema_core::in_runtime_quantum() && sema_core::current_task_id().is_some()
@@ -654,8 +654,8 @@ fn register_runtime_fn_ctx(
 
 /// Like [`register_runtime_fn_ctx`], but capability-gated and value-args (no
 /// `EvalContext` in the body). The gate runs on BOTH ABI callbacks so a sandboxed
-/// caller sees the same `PermissionDenied` whether the native is reached at top
-/// level (legacy callback) or inside a runtime task quantum (runtime callback).
+/// caller sees the same `PermissionDenied` whether the native is reached through
+/// its plain value callback or its runtime callback.
 fn register_runtime_fn_gated(
     env: &Env,
     sandbox: &sema_core::Sandbox,
@@ -745,11 +745,11 @@ impl sema_core::runtime::NativeContinuation for ScopeGuardContinuation {
 /// `channel/*`, …) parks on the active task and works — where a synchronous
 /// `call_callback` re-entry would suspend the runtime quantum and hit the
 /// runtime-only error stub. Teardown runs when the thunk RETURNS (matching the
-/// legacy `call_callback` extent): a thunk that only builds a promise tears down
+/// synchronous `call_callback` extent): a thunk that only builds a promise tears down
 /// immediately; a thunk that itself awaits keeps the scope installed across the
-/// await (the thread-local is not per-task-swapped mid-quantum). Outside the
-/// runtime (bare top-level eval / legacy scheduler) the legacy callback runs the
-/// thunk synchronously and tears down inline.
+/// await (the thread-local is not per-task-swapped mid-quantum). Outside a runtime
+/// quantum the plain value callback runs the thunk synchronously and tears down
+/// inline.
 fn register_scope_fn_ctx(
     env: &Env,
     name: &'static str,
@@ -867,7 +867,7 @@ fn track_usage(usage: &Usage) -> Result<(), SemaError> {
     LAST_USAGE.with(|u| *u.borrow_mut() = Some(usage.clone()));
     // Fold into the active per-task leaf accumulator for the workflow runtime. SUMS
     // every round of a multi-round tool loop; cache hits (all-zero) don't bump `calls`.
-    // The async poller captures the leaf's own frame Rc and folds there instead, so it
+    // The runtime decoder captures the leaf's own frame Rc and folds there instead, so it
     // sets USAGE_ACCUM_SUPPRESS to keep this fold from double-counting.
     if !USAGE_ACCUM_SUPPRESS.with(|s| s.get()) {
         if let Some(slot) = current_usage_accum() {
@@ -910,7 +910,7 @@ fn track_usage(usage: &Usage) -> Result<(), SemaError> {
 }
 
 /// Clone the active (per-task) budget frame's `Rc`, if any. The sync path charges
-/// this via `track_usage`; the async completion poller captures it at yield time and
+/// this via `track_usage`; the runtime completion decoder captures it at dispatch and
 /// re-installs it around its own `track_usage` so the charge lands on the frame that
 /// was active when the completion was DISPATCHED, not whatever is active when the
 /// future resolves.
@@ -930,7 +930,7 @@ fn ensure_active_budget() -> Rc<RefCell<BudgetFrame>> {
 
 /// Charge `total_tokens` / `cost` into `frame` and return `Err` if either limit is now
 /// exceeded. Cost is charged only when known (`Some`); the token charge always applies.
-/// Shared by the sync path and the async poller so both gate identically.
+/// Shared by synchronous and runtime completion paths so both gate identically.
 fn charge_budget_frame(
     frame: &Rc<RefCell<BudgetFrame>>,
     total_tokens: u64,
@@ -1526,8 +1526,8 @@ fn register_fn_ctx_gated_as(
 /// `reg_name` a dual-ABI native whose body speaks `NativeResult` (so its
 /// `in_runtime_quantum` branch can `NativeOutcome::Suspend`), gated as
 /// `display_name`. The runtime callback borrows the shared stdlib `EvalContext`
-/// (as [`register_runtime_fn_ctx`] does); the legacy callback runs the same body
-/// with the real evaluator context and unwraps the plain `Return`.
+/// (as [`register_runtime_fn_ctx`] does); the plain value callback runs the same
+/// body with its evaluator context and unwraps the `Return`.
 fn register_runtime_fn_ctx_gated_as(
     env: &Env,
     sandbox: &sema_core::Sandbox,
@@ -2337,11 +2337,10 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.reasoning_effort = reasoning_effort;
         request.timeout_ms = opt_timeout_ms(args.get(1));
 
-        // Inside a unified-runtime spawned task → SUSPEND on an External wait (the
-        // wire call runs off the VM thread on the executor's async tier); inside a
-        // legacy scheduler task → the `AwaitIo` yield; top level / non-offloadable
-        // chain → the synchronous provider call. The poller/decoder account (no
-        // post-call `track_usage` on the offload paths) and shape the value.
+        // A spawned runtime task suspends on an External wait while the wire call
+        // runs on the executor's async tier. Top-level and non-offloadable chains
+        // use the synchronous provider call. The completion decoder accounts usage
+        // and shapes the value on the offload path.
         #[cfg(not(target_arch = "wasm32"))]
         {
             dispatch_complete_offload(
@@ -2360,13 +2359,11 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
     // (llm/chat messages {:model "..." :tools [...] :tool-mode :auto ...})
     // Synchronous / no-tools-needed twin. The Sema-visible `llm/chat` is a prelude
-    // dispatcher (mirrors `agent/run`): in async context WITH a configured tool
+    // dispatcher (mirrors `agent/run`): in a runtime quantum with a configured tool
     // loop it drives `__chat-begin` + the shared `__agent-*` step natives instead
-    // (a native can't loop-yield across multiple provider rounds); every other
-    // case — top level, or async with no `:tools`/`:tool-mode :none` — reaches
-    // this native, which is otherwise byte-identical to the pre-split `llm/chat`
-    // (its own `in_async_context()` branch below already offloads the no-tools
-    // completion — WP-LLM-SIMPLE). Gated as "llm/chat" (not this native's own
+    // (a native cannot retain a Rust loop across multiple suspensions); every
+    // other case—top level, or no `:tools`/`:tool-mode :none`—reaches this native.
+    // Its runtime branch offloads the no-tools completion. Gated as "llm/chat" (not this native's own
     // registration name) so a sandboxed caller sees the same `PermissionDenied`
     // regardless of which internal entry point actually runs.
     register_runtime_fn_ctx_gated_as(
@@ -2437,9 +2434,8 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 request.timeout_ms = opt_timeout_ms(args.get(1));
                 let _conv = conv_scope.open();
 
-                // A unified-runtime spawned task suspends on an External wait; a
-                // legacy scheduler task yields `AwaitIo`; top level runs the
-                // synchronous provider call.
+                // A spawned runtime task suspends on an External wait; top-level
+                // execution uses the synchronous provider call.
                 #[cfg(not(target_arch = "wasm32"))]
                 {
                     dispatch_complete_offload(
@@ -2603,13 +2599,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.json_mode = true;
         request.system = Some(system.clone());
 
-        // ONLY attempt 0 is offloaded so siblings overlap; the poller/decoder
+        // Only attempt 0 is offloaded so siblings overlap; the decoder
         // accounts attempt 0, then `finalize` validates and — only if a re-ask is
         // needed — runs the remaining attempts on the SYNCHRONOUS `do_complete`
-        // path (VM thread). A unified-runtime spawned task suspends on an External
-        // wait; a legacy scheduler task yields `AwaitIo`; top level runs
-        // synchronously (attempt 0 through `do_complete` + `track_usage`, then the
-        // shared validate/re-ask loop — byte-identical to before).
+        // path (VM thread). A spawned runtime task suspends on an External wait;
+        // top-level execution runs attempt 0 through `do_complete` + `track_usage`
+        // and then uses the shared validate/re-ask loop.
         let cfg = ExtractConfig {
             schema,
             schema_desc,
@@ -2782,9 +2777,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }
         };
 
-        // A unified-runtime spawned task suspends on an External wait; a legacy
-        // scheduler task yields `AwaitIo`; top level runs the synchronous provider
-        // call. The poller/decoder accounts and runs `parse_category`.
+        // A spawned runtime task suspends on an External wait; top-level execution
+        // uses the synchronous provider call. The completion decoder accounts
+        // usage and runs `parse_category`.
         #[cfg(not(target_arch = "wasm32"))]
         {
             dispatch_complete_offload(request, Box::new(parse_category), true)
@@ -2893,8 +2888,8 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }))
         };
 
-        // A unified-runtime spawned task suspends on an External wait; a legacy
-        // scheduler task yields `AwaitIo`; top level runs the synchronous call.
+        // A spawned runtime task suspends on an External wait; top-level execution
+        // uses the synchronous call.
         #[cfg(not(target_arch = "wasm32"))]
         {
             dispatch_complete_offload(request, Box::new(finalize), true)
@@ -3119,9 +3114,8 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
     // (agent/run agent "msg") returns string
     // (agent/run agent "msg" {:on-tool-call cb :messages history}) returns {:response "..." :messages [...]}
-    // Synchronous / wasm agent loop (byte-identical to the historical `agent/run`).
-    // The `agent/run` name is bound in the prelude to a dispatcher that reaches this
-    // native in non-async context and the yield-per-round driver in async context.
+    // Synchronous agent loop. The prelude dispatcher reaches this native outside a
+    // runtime quantum and uses the suspend-per-round bytecode driver inside one.
     register_fn_ctx(env, "__agent-run-blocking", |ctx, args| {
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("agent/run", "2-3", args.len()));
@@ -3316,10 +3310,10 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         }
     });
 
-    // ── Non-blocking multi-round agent loop (async-context path) ──────────────
+    // ── Non-blocking multi-round agent loop (runtime-task path) ───────────────
     // The prelude `agent/run` dispatches here (four internal natives + a Sema
-    // driver loop) when `(__async-context?)`, so each provider round offloads +
-    // yields `AwaitIo` and sibling scheduler tasks overlap during the conversation.
+    // driver loop) when `(__async-context?)`, so each provider round suspends on
+    // an External wait and sibling tasks overlap during the conversation.
     // See docs/plans/2026-07-02-nonblocking-agent-run.md (ADR #68).
     register_fn_ctx(env, "__async-context?", |_ctx, _args| {
         Ok(Value::bool(in_async_offload_context()))
@@ -3337,8 +3331,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // round journals the same per-tool OTel span + `:on-tool-call` start/end events
     // the synchronous `run_tool_loop` does (see `ExecToolsContinuation`), so the flip
     // is span/journaling-transparent. The synchronous `run_tool_loop` remains only
-    // for the genuinely non-runtime path (bare legacy eval without a quantum), where
-    // no handler can suspend. See Task 04/06
+    // for execution outside a runtime quantum, where no handler can suspend. See Task 04/06
     // (`docs/plans/archive/2026-07-13-unified-cooperative-runtime.md`).
     register_fn_ctx(env, "__runtime-quantum?", |_ctx, _args| {
         Ok(Value::bool(sema_core::in_runtime_quantum()))
@@ -3517,12 +3510,6 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     register_runtime_fn_ctx(env, "llm/batch", |_ctx, args| {
         #[allow(unused_imports)]
         use sema_core::runtime::NativeOutcome;
-        // On resume from the async yield the scheduler re-runs the bytecode AFTER
-        // this CALL via `replace_stack_top`, so this native is not re-invoked.
-        // Drain any stray resume value defensively (mirrors llm/embed).
-        if let Some(v) = sema_core::take_resume_value() {
-            return Ok(NativeOutcome::Return(v));
-        }
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/batch", "1-2", args.len()));
         }
@@ -3561,7 +3548,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             })
             .collect();
 
-        // ── ASYNC path: offload the whole batch + yield (native targets only) ──
+        // ── Runtime path: offload the whole batch (native targets only) ──────
         //
         // `batch_complete`'s provider impls (anthropic/openai/gemini/ollama) drive
         // their own concurrency internally via `sema_io::io_block_on(join_all(..))`
@@ -3593,16 +3580,15 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 .collect();
 
             // Capture the dispatch-time budget + leaf-usage frames (ASYNC-1), so the
-            // poller charges the frames active NOW — not whatever scope is installed
-            // when the future lands. Mirrors do_complete_async_yield/llm/embed.
+            // decoder charges the frames active now, not whatever scope is installed
+            // when the future lands. Mirrors the completion and embedding paths.
             let usage_accum_slot = current_usage_accum();
             let budget_slot = active_budget();
 
             // A unified-runtime spawned task SUSPENDS on an External wait (the whole
             // batch runs as ONE unit on the executor's blocking tier, since
             // `batch_complete` drives its own internal `join_all`); the decoder folds
-            // usage and shapes the list on the VM thread — byte-identical to the
-            // legacy `AwaitIo` poller. A legacy scheduler task falls through below.
+            // usage and shapes the list on the VM thread.
             if in_runtime_offload_task() {
                 use sema_core::runtime::{
                     CompletionKind, InterruptibleResource, NativeSuspend,
@@ -3757,35 +3743,24 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         })
     });
 
-    // `llm/embed` — a SINGLE first-class native function that branches internally
-    // on `sema_core::in_async_context()`:
+    // `llm/embed` — a single first-class native function that branches internally
+    // on whether it runs in a spawned runtime task:
     //
     //   (llm/embed "text" {:model "..."})        ; → bytevector
     //   (llm/embed ["text1" "text2"] {:model …}) ; → list of bytevectors
     //
-    // Outside an async scheduler task it runs the SYNCHRONOUS embed path inline
+    // Outside a spawned runtime task it runs the synchronous embed path inline
     // (open span, cassette, provider.embed, set_response, track_usage, decode).
-    // Inside a task it offloads `provider.embed` onto the shared runtime and
-    // yields `AwaitIo` so sibling tasks overlap; the IoHandle poller (which runs
-    // on the VM thread inside the scheduler) finalizes the DETACHED span, records
-    // the cassette, runs `track_usage`, and decodes the embeddings into the SAME
-    // Value the sync path returns — so the concurrent and sync paths are
-    // byte-identical. Folding `track_usage` into the poller is what lets a single
-    // native (which is NOT re-invoked on resume — the scheduler resumes the
-    // bytecode after the CALL via `replace_stack_top`) account correctly without
-    // a separate Sema-sequenced accounting step.
+    // Inside a task it offloads `provider.embed` and suspends on an External wait
+    // so sibling tasks overlap. The VM-thread decoder finalizes the detached span,
+    // records the cassette, runs `track_usage`, and builds the same `Value` as the
+    // synchronous path.
     //
     // Keeping it a native (not a macro) means `(procedure? llm/embed)` is #t and
     // it is usable as a value: `(map llm/embed …)`, `(async/pool-map llm/embed …)`.
     register_runtime_fn_ctx(env, "llm/embed", |_ctx, args| {
         #[allow(unused_imports)]
         use sema_core::runtime::NativeOutcome;
-        // On resume from the async yield the scheduler re-runs the bytecode AFTER
-        // this CALL via `replace_stack_top`, so this native is not re-invoked.
-        // Drain any stray resume value defensively (mirrors io-sleep-once).
-        if let Some(v) = sema_core::take_resume_value() {
-            return Ok(NativeOutcome::Return(v));
-        }
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/embed", "1-2", args.len()));
         }
@@ -3820,14 +3795,14 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         let req_model = request.model.clone().unwrap_or_default();
         let cassette_key = compute_embed_key(&request);
 
-        // ── ASYNC path: offload + yield (native targets only) ──────────────
+        // ── Runtime path: offload and suspend (native targets only) ─────────
         //
         // The concurrent embed path is native-only (no shared tokio runtime on
         // wasm), so wasm always falls through to the synchronous path below.
         #[cfg(not(target_arch = "wasm32"))]
         if in_async_offload_context() {
-            // DETACHED embeddings span: parent captured now, finalized in the
-            // poller after the yield (where the active-span stack may hold a
+            // DETACHED embeddings span: parent captured now, finalized by the
+            // decoder after the wait (where the active-span stack may hold a
             // sibling task's span, so the span must not pop the stack on drop).
             let span = sema_otel::llm_span_detached("embeddings");
             span.set_embedding_input(&request.texts);
@@ -3837,8 +3812,8 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 CASSETTE.with(|c| c.borrow().as_ref().map(|cass| cass.decide(&cassette_key)));
             match decision {
                 Some(crate::cassette::Decision::Replay(entry)) => {
-                    // Replay made no provider call → finalize the span inline,
-                    // account, and return WITHOUT yielding (nothing to overlap).
+                    // Replay made no provider call: finalize the span inline,
+                    // account, and return without suspending.
                     let resp = EmbedResponse {
                         embeddings: entry.embeddings,
                         model: entry.model.clone(),
@@ -3880,19 +3855,17 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             };
 
             // The provider name + canonical price are needed on the VM thread in
-            // the poller; capture them before the Arc is moved into the worker.
+            // the decoder; capture them before the Arc is moved into the worker.
             let provider_name = provider.name().to_string();
             // Capture the dispatch-time budget + leaf-usage frames (ASYNC-1), so the
-            // poller charges the frames active NOW — not whatever scope is installed
-            // when the future lands. Mirrors do_complete_async_yield.
+            // decoder charges the frames active now, not whatever scope is installed
+            // when the future lands. Mirrors the completion path.
             let usage_accum_slot = current_usage_accum();
             let budget_slot = active_budget();
 
             // A unified-runtime spawned task SUSPENDS on an External wait (the wire
             // call runs off the VM thread on the executor's async tier); the decoder
-            // finalizes the span / cassette / usage on the VM thread when it lands —
-            // byte-identical to the legacy `AwaitIo` poller below. A legacy scheduler
-            // task falls through to that `AwaitIo` path.
+            // finalizes the span, cassette, and usage on the VM thread when it lands.
             if in_runtime_offload_task() {
                 use sema_core::runtime::{
                     CompletionKind, InterruptibleResource, NativeSuspend,
@@ -4026,12 +3999,6 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     register_runtime_fn_ctx(env, "llm/rerank", |_ctx, args| {
         #[allow(unused_imports)]
         use sema_core::runtime::NativeOutcome;
-        // On resume from the async yield the scheduler re-runs the bytecode AFTER
-        // this CALL via `replace_stack_top`, so this native is not re-invoked.
-        // Drain any stray resume value defensively (mirrors llm/embed).
-        if let Some(v) = sema_core::take_resume_value() {
-            return Ok(NativeOutcome::Return(v));
-        }
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/rerank", "2-3", args.len()));
         }
@@ -4071,14 +4038,14 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             model: model.clone(),
         };
 
-        // ── ASYNC path: offload + yield (native targets only) ──────────────
+        // ── Runtime path: offload and suspend (native targets only) ─────────
         //
         // The concurrent rerank path is native-only (no shared tokio runtime on
         // wasm), so wasm always falls through to the synchronous path below.
         #[cfg(not(target_arch = "wasm32"))]
         if in_async_offload_context() {
-            // DETACHED reranker span: parent captured now, finalized in the
-            // poller after the yield (where the active-span stack may hold a
+            // DETACHED reranker span: parent captured now, finalized by the
+            // decoder after the wait (where the active-span stack may hold a
             // sibling task's span, so the span must not pop the stack on drop).
             let span =
                 sema_otel::reranker_span_detached(&query, model.as_deref().unwrap_or(""), top_k);
@@ -4105,9 +4072,8 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 }
             })?;
 
-            // A unified-runtime spawned task SUSPENDS on an External wait; the
-            // decoder builds the reordered output on the VM thread when it lands. A
-            // legacy scheduler task falls through to the `AwaitIo` path below.
+            // A spawned runtime task suspends on an External wait; the decoder
+            // builds the reordered output on the VM thread when it lands.
             if in_runtime_offload_task() {
                 use sema_core::runtime::{
                     CompletionKind, InterruptibleResource, NativeSuspend,
@@ -4807,8 +4773,8 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }))
         };
 
-        // A unified-runtime spawned task suspends on an External wait; a legacy
-        // scheduler task yields `AwaitIo`; top level runs the synchronous call.
+        // A spawned runtime task suspends on an External wait; top-level execution
+        // uses the synchronous call.
         #[cfg(not(target_arch = "wasm32"))]
         {
             dispatch_complete_offload(request, Box::new(finalize), true)
@@ -6015,8 +5981,8 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.system = Some(system);
         request.max_tokens = Some(4096);
 
-        // A unified-runtime spawned task suspends on an External wait; a legacy
-        // scheduler task yields `AwaitIo`; top level runs the synchronous call.
+        // A spawned runtime task suspends on an External wait; top-level execution
+        // uses the synchronous call.
         #[cfg(not(target_arch = "wasm32"))]
         {
             dispatch_complete_offload(
@@ -6085,8 +6051,8 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             Ok(sema_core::json_to_value(&json))
         };
 
-        // A unified-runtime spawned task suspends on an External wait; a legacy
-        // scheduler task yields `AwaitIo`; top level runs the synchronous call.
+        // A spawned runtime task suspends on an External wait; top-level execution
+        // uses the synchronous call.
         #[cfg(not(target_arch = "wasm32"))]
         {
             dispatch_complete_offload(request, Box::new(parse_comparison), true)
@@ -6099,33 +6065,27 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         }
     });
 
-    // (llm/io-sleep-once id [ms]) — AwaitIo spike leaf (NOT for production use).
+    // (llm/io-sleep-once id [ms]) — external-wait test leaf (NOT for production use).
     //
     // Mimics `llm/chat-once` but does a timer instead of an HTTP call: spawns a
-    // `tokio::time::sleep` on the I/O pool and yields `AwaitIo`, so the
-    // scheduler parks the task and runs siblings. Proves real overlap across the
-    // per-task-VM scheduler before any agent-loop work. Resolves to `id`.
+    // `tokio::time::sleep` on the I/O pool and suspends on an External wait, so
+    // the runtime can drive sibling tasks. This proves real overlap before any
+    // agent-loop work. Resolves to `id`.
     #[cfg(not(target_arch = "wasm32"))]
     register_runtime_fn_ctx(env, "llm/io-sleep-once", |_ctx, args| {
         use sema_core::runtime::NativeOutcome;
         use std::sync::atomic::Ordering;
 
-        // Vestigial under CALL_NATIVE: the response arrives via the scheduler's
-        // `replace_stack_top`, not by re-invoking this native. Kept for symmetry
-        // with the shipped `async/await` pattern.
-        if let Some(v) = sema_core::take_resume_value() {
-            return Ok(NativeOutcome::Return(v));
-        }
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/io-sleep-once", "1-2", args.len()));
         }
         let id = args[0].as_int().unwrap_or(0);
         let ms = args.get(1).and_then(|v| v.as_int()).unwrap_or(1000).max(0) as u64;
 
-        // A unified-runtime spawned task SUSPENDS on an External wait (an async-tier
-        // timer); a legacy scheduler task yields `AwaitIo`. The in-flight gauge is
-        // bumped on the VM thread (matching the legacy path) so a test can prove
-        // simultaneity even before the future's first poll; the future decrements it.
+        // A spawned runtime task suspends on an External wait backed by an
+        // async-tier timer. The in-flight gauge is bumped on the VM thread so a
+        // test can prove simultaneity before the future's first poll; the future
+        // decrements it.
         if in_runtime_offload_task() {
             use sema_core::runtime::{
                 CompletionKind, InterruptibleResource, NativeSuspend, PreparedExternalOperation,
@@ -6238,9 +6198,8 @@ fn complete_with_prompt(prompt: &Prompt, opts: Option<&Value>) -> sema_core::run
     // Per-call observability tags/metadata (read inside do_complete's span).
     let _tele = install_call_telemetry(opts.and_then(|v| v.as_map_rc()).as_ref());
 
-    // Shared by `llm/send` and the Prompt-arg branch of `llm/complete`: a
-    // unified-runtime spawned task suspends on an External wait, a legacy
-    // scheduler task yields `AwaitIo`, top level runs synchronously.
+    // Shared by `llm/send` and the Prompt-arg branch of `llm/complete`: a spawned
+    // runtime task suspends on an External wait; top-level execution is synchronous.
     #[cfg(not(target_arch = "wasm32"))]
     {
         dispatch_complete_offload(
@@ -6818,10 +6777,9 @@ fn do_complete_streaming(
 #[cfg(not(target_arch = "wasm32"))]
 type CompleteFinalize = Box<dyn FnOnce(ChatResponse) -> Result<Value, SemaError>>;
 
-/// On-VM-thread prep result shared by the `AwaitIo` (async scheduler) and External
-/// (unified runtime) completion-offload yields. `Inline` = a cache hit or cassette
-/// replay that made NO provider call (span already finalized); the caller accounts
-/// zero usage + finalizes without yielding. `Offload` = the wire stage must run.
+/// On-VM-thread preparation result for a completion offload. `Inline` is a cache
+/// hit or cassette replay that made no provider call; the caller accounts zero
+/// usage and finalizes without suspending. `Offload` means the wire stage must run.
 #[cfg(not(target_arch = "wasm32"))]
 enum CompletePrep {
     Inline(ChatResponse),
@@ -6848,15 +6806,15 @@ struct CompleteOffloadPlan {
 /// The on-VM-thread prep stage of an offloaded completion: open the conversation
 /// scope, start the DETACHED `chat` span, consult the response cache and cassette
 /// (either can short-circuit to `Inline`), then resolve the fallback chain +
-/// rate-limit/retry parameters into `Arc` clones the pool worker can own. Byte-for-
-/// byte the front half of the old `do_complete_async_yield`; shared so the runtime
-/// External-wait path stays in lockstep with the async path (cache/cassette/retry).
+/// rate-limit/retry parameters into `Arc` clones the pool worker can own. All
+/// runtime completion paths use this stage to keep cache, cassette, and retry
+/// behavior aligned.
 #[cfg(not(target_arch = "wasm32"))]
 /// Whether the resolved default completion chain can be OFFLOADED to the IO pool
 /// (every target is a native/Send provider) vs. contains a `LispProvider` that
-/// must run on the VM thread. The async/runtime `llm/complete` path yields
-/// `AwaitIo` (offload) only when this holds; otherwise it runs synchronously so a
-/// user-defined `:complete` closure keeps its VM-thread callback context. A
+/// must run on the VM thread. The runtime `llm/complete` path offloads only when
+/// this holds; otherwise it runs synchronously so a user-defined `:complete`
+/// closure keeps its VM-thread callback context. A
 /// missing/unconfigured provider is treated as offloadable so the offload path
 /// surfaces the usual "no provider configured" error unchanged.
 #[cfg(not(target_arch = "wasm32"))]
@@ -7044,8 +7002,7 @@ fn complete_offload_prep(request: ChatRequest) -> Result<CompletePrep, SemaError
     })))
 }
 
-/// VM-thread finalize for a SUCCESSFUL offloaded completion, shared by the async
-/// poller and the runtime External-wait decoder: finalize the span (retry spans,
+/// VM-thread finalizer for a successful offloaded completion: finalize the span (retry spans,
 /// dispatch/response/messages facts), store the cache entry, record the cassette,
 /// fold the leaf usage accumulator, then `track_usage` under the captured budget
 /// frame (a budget overrun fails the task, exactly as the sync path's `?`) and
@@ -7099,7 +7056,7 @@ fn finalize_complete_success(
         });
     }
     // Fold this completion into the LEAF'S OWN captured accumulator frame — the
-    // `Rc` snapshotted at yield time, not whatever scope is active when the offload
+    // `Rc` snapshotted at dispatch, not whatever scope is active when the offload
     // lands (the finalize runs outside the per-task install boundary). Price it the
     // same way `track_usage` does, then suppress `track_usage`'s own active-frame
     // fold so this completion is counted exactly once.
@@ -7145,11 +7102,9 @@ fn in_runtime_offload_task() -> bool {
 /// Route a prepared completion through the offload appropriate to the current
 /// execution context, returning a `NativeResult`. This is the shared split every
 /// simple completion entry point (`llm/complete`, `llm/send`, `llm/chat` no-tools,
-/// `llm/compare`) uses so the runtime (External-wait) and legacy (`AwaitIo`) and
-/// synchronous paths can never drift:
+/// `llm/compare`) uses so runtime and synchronous paths stay aligned:
 ///
 /// * a unified-runtime spawned task → [`do_complete_runtime_suspend`] (External);
-/// * a legacy cooperative scheduler task → [`do_complete_async_yield`] (`AwaitIo`);
 /// * top level / a non-offloadable chain → the synchronous provider call.
 ///
 /// `offloadable` gates the whole offload (`llm/complete`'s
@@ -7172,10 +7127,9 @@ fn dispatch_complete_offload(
     finalize(response).map(NativeOutcome::Return)
 }
 
-/// Cooperative provider-complete round under the UNIFIED RUNTIME. Shares the exact
-/// on-VM-thread prep + finalize with `do_complete_async_yield` (cache/cassette/
-/// retry/usage/budget parity), but instead of the legacy `AwaitIo` yield it
-/// suspends the active runtime task on an External wait: the wire stage runs off
+/// Cooperative provider-complete round under the unified runtime. It uses the
+/// shared on-VM-thread preparation and finalization stages, then suspends the
+/// active runtime task on an External wait. The wire stage runs off
 /// the VM thread on the executor's IO pool so sibling tasks (other agents) overlap,
 /// and an `async/cancel` runs the wait's abort (dropping the in-flight request). On
 /// a cache hit / cassette replay it finalizes inline (no suspend). Returns the
@@ -7190,12 +7144,6 @@ fn do_complete_runtime_suspend(
         CompletionKind, InterruptibleResource, NativeOutcome, NativeSuspend,
         PreparedExternalOperation, SendPayload, WaitKind,
     };
-
-    // Defensive resume-value drain (the runtime resumes the parked frame in place;
-    // this native is not re-invoked). Mirrors the async path.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(NativeOutcome::Return(v));
-    }
 
     let plan = match complete_offload_prep(request)? {
         CompletePrep::Inline(resp) => {
@@ -7504,8 +7452,8 @@ const EMBED_COMPLETION_KIND: u64 = 0x656d_6264; // "embd"
 
 /// Decoder for an offloaded `llm/embed`: finalizes the detached span, records the
 /// cassette, decodes the embedding, and accounts usage against the DISPATCH-TIME
-/// leaf/budget frames — byte-identical to the legacy `AwaitIo` poller, run on the
-/// VM thread when the wire future lands. Holds no live `Value` (the span, model
+/// leaf/budget frames on the VM thread when the wire future lands. Holds no live
+/// `Value` (the span, model
 /// strings, and captured slots are not `Value`s), so it emits no GC edges.
 #[cfg(not(target_arch = "wasm32"))]
 struct EmbedDecoder {
@@ -7610,9 +7558,8 @@ impl sema_core::runtime::CompletionDecoder for EmbedDecoder {
 const RERANK_COMPLETION_KIND: u64 = 0x7272_6e6b; // "rrnk"
 
 /// Decoder for an offloaded `llm/rerank`: finalizes the detached reranker span and
-/// builds the reordered result list on the VM thread when the wire future lands —
-/// byte-identical to the legacy `AwaitIo` poller. `documents` is plain `String`
-/// data (not `Value`s), so it emits no GC edges.
+/// builds the reordered result list on the VM thread when the wire future lands.
+/// `documents` is plain `String` data (not `Value`s), so it emits no GC edges.
 #[cfg(not(target_arch = "wasm32"))]
 struct RerankDecoder {
     span: Option<sema_otel::RerankerSpan>,
@@ -7681,8 +7628,8 @@ impl sema_core::runtime::CompletionDecoder for RerankDecoder {
 const BATCH_COMPLETION_KIND: u64 = 0x6261_7463; // "batc"
 
 /// Decoder for an offloaded `llm/batch`: folds each response into the
-/// DISPATCH-TIME leaf/budget frames and shapes the result list on the VM thread —
-/// byte-identical to the legacy `AwaitIo` poller. Holds no live `Value`.
+/// dispatch-time leaf/budget frames and shapes the result list on the VM thread.
+/// Holds no live `Value`.
 #[cfg(not(target_arch = "wasm32"))]
 struct BatchDecoder {
     usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
@@ -8014,7 +7961,7 @@ fn extract_parse_response(response: &ChatResponse) -> Result<Value, SemaError> {
 /// retries remaining, run the re-ask attempts via the SYNCHRONOUS `do_complete`
 /// path (+ `track_usage` per attempt) — preserving the exact loop semantics and
 /// error messages of the original native. `first` is the attempt-0 response, which
-/// the caller has ALREADY accounted (sync path: inline; async path: in the poller).
+/// the caller has already accounted (synchronous path inline; runtime path in the decoder).
 fn extract_validate_and_reask(
     first: ChatResponse,
     cfg: &ExtractConfig,
@@ -8168,8 +8115,8 @@ fn retry_backoff_ms(attempt: u32, server_hint: u64, base_ms: u64) -> u64 {
 
 /// A single network-retry event, captured as DATA (not emitted as an otel span at
 /// the point it happens). The synchronous completion path emits `retry_span`s
-/// inline from these; the async path collects them on a worker thread (no otel TLS
-/// there) and replays them as spans in the VM-thread poller. Capturing-as-data is
+/// inline from these; the runtime path collects them on a worker thread (no otel TLS
+/// there) and replays them as spans in the VM-thread finalizer. Capturing-as-data is
 /// what lets both paths share one retry loop with zero telemetry drift.
 #[derive(Debug, Clone)]
 struct RetryEvent {
@@ -8221,7 +8168,7 @@ fn complete_with_retry_collecting(
 }
 
 /// Emit one `retry_span` child per collected [`RetryEvent`] under the active LLM
-/// span. Called on the VM thread (sync path: inline; async path: in the poller)
+/// span. Called on the VM thread (synchronous path inline; runtime path in the finalizer)
 /// where the otel context is live.
 fn emit_retry_spans(events: &[RetryEvent]) {
     for ev in events {
@@ -8233,7 +8180,7 @@ fn emit_retry_spans(events: &[RetryEvent]) {
 
 /// Run `provider.complete` with retry on transient errors (429 / 5xx / network),
 /// using capped exponential backoff with jitter (429 honors `retry-after`).
-/// Re-expressed on top of [`complete_with_retry_collecting`] so the sync and async
+/// Re-expressed on top of [`complete_with_retry_collecting`] so synchronous and runtime
 /// paths share one retry loop: this variant emits the collected retries as otel
 /// `retry_span` children inline (the sync path's behavior, unchanged).
 fn complete_with_retry(
@@ -8260,7 +8207,7 @@ struct ResolvedProvider {
 
 /// Result of the offloadable completion wire stage: the response, the name of the
 /// provider that served it (for `set_serving_provider` + pricing on the VM thread),
-/// and the collected retry events (replayed as spans in the poller).
+/// and the collected retry events (replayed as spans in the VM-thread finalizer).
 #[cfg(not(target_arch = "wasm32"))]
 struct CompleteOutcome {
     resp: ChatResponse,
@@ -8330,12 +8277,12 @@ async fn complete_with_retry_collecting_async(
     }
 }
 
-/// The OFFLOADED wire unit for an async completion: walk the resolved fallback
+/// The offloaded wire unit for a runtime completion: walk the resolved fallback
 /// chain (via [`complete_with_retry_collecting_async`], preserving
 /// DROP_TEMPERATURE self-heal + network retry), failing over on error. Does NO
 /// thread-local access — no cassette, cache, spans, `track_usage`, or
-/// `set_serving_provider` (those all stay on the VM thread, in the poller).
-/// Runs inside an `io_spawn`ed pool future, so the scheduler's abort hook
+/// `set_serving_provider` (those all stay in the VM-thread finalizer).
+/// Runs inside an `io_spawn`ed pool future, so the external wait's abort hook
 /// cancels it mid-flight.
 #[cfg(not(target_arch = "wasm32"))]
 async fn run_fallback_retry_async(
@@ -8645,9 +8592,9 @@ fn enforce_rate_limit() {
     }
 }
 
-/// Non-blocking counterpart to `enforce_rate_limit`, for the two async-path
-/// callers (`do_complete_async_yield`, `stream_run_begin`). Runs on the VM
-/// thread, synchronously, BEFORE the offload is dispatched — it never sleeps
+/// Non-blocking counterpart to `enforce_rate_limit`, used by completion and
+/// streaming offloads. Runs synchronously on the VM thread before dispatch and
+/// never sleeps
 /// itself. It returns how many milliseconds THIS call's send must be delayed
 /// (0 if the gate is clear), and the caller is responsible for spending that
 /// delay somewhere that isn't the VM thread (a `tokio::time::sleep` inside the
@@ -8918,12 +8865,12 @@ fn chat_messages_to_sema_list(messages: &[ChatMessage]) -> Value {
 /// Bound runaway error loops across the agent conversation (mirrors `run_tool_loop`).
 const MAX_CONSECUTIVE_TOOL_ERRORS: usize = 5;
 
-/// Per-run state for the non-blocking (async-context) agent loop. Lives in the
-/// thread-local `AGENT_RUNS` slab keyed by an integer token handed to Sema, so it
-/// survives every inter-round / inter-tool `AwaitIo` park (the slab is on the VM
-/// thread; nothing here is `Send` and nothing crosses threads). No `__agent-*`
+/// Per-run state for the non-blocking runtime agent loop. Lives in the thread-local
+/// `AGENT_RUNS` slab keyed by an integer token handed to Sema, so it survives every
+/// inter-round and inter-tool suspension (the slab is on the VM thread; nothing
+/// here is `Send` and nothing crosses threads). No `__agent-*`
 /// native holds a `RefCell` borrow of the slab across a callback / tool execution /
-/// completion yield — each short-borrows to copy inputs out, drops, does the work,
+/// completion suspension — each short-borrows to copy inputs out, drops, does the work,
 /// then short-borrows again to write back.
 struct AgentLoopState {
     messages: Vec<ChatMessage>,
@@ -9209,7 +9156,7 @@ fn agent_begin(args: &[Value]) -> Result<Value, SemaError> {
     ));
     let agent_span = sema_otel::agent_span(Some(&agent.name));
     // User :tags / :metadata attached directly to the agent span (a `CallTelemetry`
-    // guard cannot be held across the loop's yields; the async path attaches to the
+    // guard cannot be held across the loop's suspensions; the runtime path attaches to the
     // agent root rather than threading CALL_TAGS through every round).
     if let Some(o) = opts.as_ref() {
         let tags = get_opt_string_list(o, "tags");
@@ -9396,8 +9343,8 @@ fn chat_begin(args: &[Value]) -> Result<Value, SemaError> {
 }
 
 /// Apply one provider round's response to the loop state and return the driver's
-/// `{:done bool :has-tools bool}` map. Runs on the VM thread (either the poller after
-/// an async round, or inline for the synchronous fallback). Short-borrows the slab.
+/// `{:done bool :has-tools bool}` map. Runs on the VM thread, either from the
+/// runtime decoder or inline for the synchronous fallback. Short-borrows the slab.
 fn agent_apply_step_response(token: u64, resp: ChatResponse) -> Result<Value, SemaError> {
     AGENT_RUNS.with(|r| {
         let mut slab = r.borrow_mut();
@@ -9434,19 +9381,13 @@ fn agent_apply_step_response(token: u64, resp: ChatResponse) -> Result<Value, Se
     })
 }
 
-/// `__agent-step(token) → {:done bool :has-tools bool}`. One provider round: in async
-/// context it offloads + yields `AwaitIo` (the map is produced by the poller via the
-/// finalize closure and becomes the resolved value of the yield); otherwise it runs
-/// `do_complete` synchronously. If the loop is already done (round cap or consec-error
+/// `__agent-step(token) → {:done bool :has-tools bool}`. One provider round: in a
+/// runtime task it offloads and suspends on an External wait; the decoder uses the
+/// finalize closure to build the result map. Otherwise it runs `do_complete`
+/// synchronously. If the loop is already done (round cap or consecutive-error
 /// abort set by `__agent-exec-tools`), returns immediately without a provider call.
 fn agent_step(ctx: &EvalContext, token: u64) -> sema_core::runtime::NativeResult {
     use sema_core::runtime::NativeOutcome;
-    // A resumed AwaitIo yield lands here NOT re-invoked (the scheduler resumes the
-    // bytecode after the CALL); but drain any stray resume value defensively, as the
-    // other yielding natives do.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(NativeOutcome::Return(v));
-    }
 
     // Short-borrow: bail out if the loop is already done (round cap / consec-error
     // abort), else build the request + snapshot on_text; then drop the borrow.
@@ -9481,27 +9422,20 @@ fn agent_step(ctx: &EvalContext, token: u64) -> sema_core::runtime::NativeResult
         StepPrep::Run(req, on_text) => (*req, on_text),
     };
 
-    // Async context: a plain round offloads + yields; a streaming (`:on-text`)
+    // In a runtime quantum, a streaming (`:on-text`)
     // round opens a non-blocking stream run and hands the driver
     // `{:stream tok :on-text cb}` — the prelude drives `__stream-drive` in TASK
-    // context (so the callback may itself yield, and siblings interleave between
-    // delta batches), then applies the assembled response via
-    // `__agent-stream-apply`, feeding `agent_apply_step_response` unchanged.
-    // Async scheduler task OR unified-runtime VM quantum. A streaming (`:on-text`)
-    // round opens a non-blocking stream run and hands the driver
-    // `{:stream tok :on-text cb}` — the prelude drives `__stream-drive` in TASK
-    // context (so the callback may itself yield, and siblings interleave between
+    // context (so the callback may itself suspend, and siblings interleave between
     // delta batches), then applies the assembled response via
     // `__agent-stream-apply`, feeding `agent_apply_step_response` unchanged. A plain
-    // round offloads the provider call: on the legacy async path it yields `AwaitIo`
-    // (poller-accounted); under the runtime it SUSPENDS the active task on an
-    // External wait, so two spawned `agent/run`s overlap across rounds and
+    // round offloads the provider call and suspends the active task on an External
+    // wait, so two spawned `agent/run`s overlap across rounds and
     // `async/cancel` cuts the loop at an inter-round park.
     #[cfg(not(target_arch = "wasm32"))]
     if sema_core::in_runtime_quantum() {
         if let Some(cb) = on_text {
             // Mirror `do_complete_streaming`'s scope/span setup, detached (the
-            // span is finalized by the stream poller after the last park).
+            // span is finalized by the stream decoder after the last park).
             let _conv = (sema_otel::current_conversation_id().is_none()).then(|| {
                 sema_otel::set_conversation_scope(&sema_otel::new_conversation_id(), None, None)
             });
@@ -9536,8 +9470,8 @@ fn agent_step(ctx: &EvalContext, token: u64) -> sema_core::runtime::NativeResult
     agent_apply_step_response(token, response).map(NativeOutcome::Return)
 }
 
-/// `__agent-exec-tools(token) → nil`. Runs the pending tool calls in ordinary async
-/// task context (so yielding/async tools suspend correctly), pushing correlated
+/// `__agent-exec-tools(token) → nil`. Runs the pending tool calls in ordinary runtime
+/// task context (so async tools suspend correctly), pushing correlated
 /// tool-result messages. Never holds the slab borrow across a callback / tool call.
 fn agent_exec_tools(ctx: &EvalContext, token: u64) -> sema_core::runtime::NativeResult {
     use sema_core::runtime::NativeOutcome;
@@ -9555,8 +9489,7 @@ fn agent_exec_tools(ctx: &EvalContext, token: u64) -> sema_core::runtime::Native
     // Cooperative runtime path (Task 04/06): a tool handler may SUSPEND (e.g.
     // `mcp/call`'s runtime external wait, or an `async/await` inside the handler),
     // and the `:on-tool-call` callback may itself run a runtime op (the ticker test
-    // sends on a channel from it). The legacy re-entry bridge would force both
-    // synchronous; instead, drive each handler AND each callback as a
+    // sends on a channel from it). Drive each handler and callback as a
     // `NativeOutcome::Call` so they run as real cooperative work on the active task
     // and park/resume through the scheduler. The multi-round loop above
     // (`__agent-drive`) already runs turn-by-turn in bytecode; this makes the
@@ -10059,8 +9992,8 @@ fn agent_finish(token: u64, finish_error: Option<String>) -> Result<Value, SemaE
 // ── Non-blocking streaming (`llm/stream` + agent `:on-text` rounds) ──────────
 //
 // The streaming sibling of the `__agent-*` loop above, same ADR #68 shape: a
-// native cannot loop-yield (a yielded `AwaitIo` is not re-invoked, and a Sema
-// callback cannot run inside a poller), so the per-delta loop lives in bytecode
+// native cannot retain a Rust loop across suspension, and a Sema callback cannot
+// run inside a completion decoder, so the per-delta loop lives in bytecode
 // (`__stream-drive` in the prelude) over three natives — `__stream-begin` /
 // `__stream-next` / `__stream-finish` — coordinated by a slab entry that owns
 // the wire channel and the finalize context. The wire side (the provider's
@@ -10093,8 +10026,8 @@ struct StreamRunState {
     buffered: std::collections::VecDeque<StreamEvent>,
     /// Detached chat span (parent captured at begin), finalized when `Done` lands.
     span: Option<sema_otel::LlmSpan>,
-    /// This leaf's usage-accumulator frame, captured at begin (same reasoning as
-    /// `do_complete_async_yield`'s `usage_accum_slot`).
+    /// This leaf's usage-accumulator frame, captured at begin so accounting uses
+    /// the dispatch-time scope.
     usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
     /// The dispatch-time budget frame `Rc` (ASYNC-1), re-installed around the
     /// finalize's `track_usage`.
@@ -10221,8 +10154,7 @@ fn stream_wire_walk(
 }
 
 /// Resolve the active fallback chain (or the default provider) into owned `Arc`
-/// clones on the VM thread, so the offloaded wire walk touches no thread-locals
-/// (mirrors the resolution inside `do_complete_async_yield`).
+/// clones on the VM thread, so the offloaded wire walk touches no thread-locals.
 fn resolve_stream_chain() -> Result<Vec<ResolvedProvider>, SemaError> {
     PROVIDER_REGISTRY.with(|reg| {
         let reg = reg.borrow();
@@ -10265,16 +10197,13 @@ fn resolve_stream_chain() -> Result<Vec<ResolvedProvider>, SemaError> {
 /// VM thread (replay pre-fills the run — drained without parking; recording
 /// captures the key for finalize), then — for a real dispatch only — the
 /// rate-limit gate, chain resolution into `Arc` clones, and the wire walk
-/// offloaded onto the I/O pool with `notify_io_complete` after every send so
-/// the parked scheduler wakes per delta. `span` is the caller's DETACHED chat
-/// span (attributes already set); it is finalized when `Done` lands. Returns
-/// the slab token.
+/// offloaded onto the I/O pool. `__stream-next` scans the channel between short
+/// structural external waits. `span` is the caller's detached chat span and is
+/// finalized when `Done` lands. Returns the slab token.
 ///
 /// The rate-limit gate sits AFTER the cassette decision (unlike the sync
 /// `stream_with_dispatch`, which always calls `enforce_rate_limit` up front):
-/// a replay makes no provider call, so — mirroring `do_complete_async_yield`'s
-/// cache/cassette-hit paths, which skip the gate entirely — it doesn't
-/// consume a pacing slot either.
+/// a replay makes no provider call, so it does not consume a pacing slot.
 fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Value, SemaError> {
     stream_budget_pregate()?;
 
@@ -10385,9 +10314,8 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
     Ok(Value::int(token as i64))
 }
 
-/// Post-stream work on the VM thread when `Done` lands — the streaming analogue
-/// of `do_complete_async_yield`'s poller finalize: span finalize,
-/// serving-provider stamp, cassette record, per-leaf usage fold +
+/// Post-stream work on the VM thread when `Done` lands: span finalization,
+/// serving-provider stamp, cassette record, per-leaf usage fold, and
 /// budget-installed `track_usage` (exactly once per streamed completion).
 /// Returns the response, or the error message to surface.
 fn stream_finalize(
@@ -10420,7 +10348,7 @@ fn stream_finalize(
                 });
             }
             // Fold into THIS run's captured accumulator frame, then suppress
-            // `track_usage`'s own fold — the poller runs outside the per-task
+            // `track_usage`'s own fold — the finalizer runs outside the per-task
             // install boundary, so the thread-local may hold a sibling's scope.
             if let Some(slot) = &usage_accum_slot {
                 let cost = pricing::calculate_cost_for(&done.provider, &resp.usage);
@@ -10463,15 +10391,12 @@ fn stream_batch_map(deltas: Vec<Value>, done: bool) -> Value {
 /// Drain every currently-available wire event for `token` into one batch
 /// (batching amortizes park/resume over fast token streams), finalizing the run
 /// when `Done` arrives. `blocking` waits for the first event (the sync-context
-/// fallback and pre-filled runs); the poller path never blocks. `Ok(None)` =
+/// fallback and pre-filled runs); the nonblocking scan never blocks. `Ok(None)` =
 /// nothing available yet (stay parked).
 ///
-/// A failure is NEVER surfaced through the poller (an `IoPoll::Ready(Err)`
-/// rejects the whole task — an in-task `try` could not catch it, and which path
-/// fired would depend on batch timing): it is always stored as `pending_error`
-/// and raised by the NEXT `__stream-next` as an ordinary native error —
-/// deterministic, catchable in task context (matching the sync path), and the
-/// callback still sees every delta delivered before the failure.
+/// A failure is stored as `pending_error` and raised by the next `__stream-next`
+/// as an ordinary native error. This keeps it catchable in task context and lets
+/// the callback observe every delta delivered before the failure.
 fn stream_poll_batch(token: u64, blocking: bool) -> Result<Option<Value>, SemaError> {
     use std::sync::mpsc::TryRecvError;
 
@@ -10585,10 +10510,10 @@ fn stream_poll_batch(token: u64, blocking: bool) -> Result<Option<Value>, SemaEr
     }
 }
 
-/// `__stream-next(token) → {:deltas [str…] :done bool}`. In a scheduler task it
-/// parks on `AwaitIo`; the poller drains all currently-available deltas per wake
-/// (see `stream_poll_batch`). Pre-filled runs and non-async context drain
-/// blockingly without parking.
+/// `__stream-next(token) → {:deltas [str…] :done bool}`. In a runtime task it
+/// suspends on an External wait; the decoder drains all currently available
+/// deltas per wake (see `stream_poll_batch`). Pre-filled runs and synchronous
+/// contexts drain blockingly.
 /// Completion-kind tag for the `__stream-next` cooperative inter-scan sleep.
 #[cfg(not(target_arch = "wasm32"))]
 const STREAM_POLL_COMPLETION_KIND: u64 = 0x7374_726d; // "strm"
@@ -10697,11 +10622,6 @@ fn stream_next_runtime_step(token: u64) -> sema_core::runtime::NativeResult {
 fn stream_next(token: u64) -> sema_core::runtime::NativeResult {
     #[allow(unused_imports)]
     use sema_core::runtime::NativeOutcome;
-    // The scheduler resumes the bytecode after the CALL via `replace_stack_top`
-    // (this native is not re-invoked); drain a stray resume value defensively.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(NativeOutcome::Return(v));
-    }
 
     enum Pre {
         Err(String),
@@ -10733,9 +10653,8 @@ fn stream_next(token: u64) -> sema_core::runtime::NativeResult {
         Pre::Run { prefilled } => prefilled,
     };
 
-    // Pre-filled runs resolve without parking (nothing to overlap — mirrors the
-    // cassette-replay no-yield path of `do_complete_async_yield`); outside a
-    // scheduler task OR a unified-runtime quantum fall back to a blocking drain.
+    // Pre-filled runs resolve without parking because there is nothing to overlap;
+    // outside a runtime quantum, fall back to a blocking drain.
     if prefilled || !sema_core::in_runtime_quantum() {
         loop {
             if let Some(v) = stream_poll_batch(token, true)? {
@@ -10763,8 +10682,8 @@ fn stream_next(token: u64) -> sema_core::runtime::NativeResult {
 }
 
 /// `__stream-finish(token) → content-string`. Cleans the slab entry and returns
-/// the assembled content (usage was already accounted, exactly once, when the
-/// poller finalized the `Done`).
+/// the assembled content (usage was already accounted exactly once when the
+/// VM-thread finalizer handled `Done`).
 fn stream_finish(token: u64) -> Result<Value, SemaError> {
     let mut st = STREAM_RUNS
         .with(|r| r.borrow_mut().remove(&token))
@@ -10783,7 +10702,7 @@ fn stream_finish(token: u64) -> Result<Value, SemaError> {
 /// agent-path terminal for a driven streaming round: pops the stream slab entry
 /// and feeds the assembled `ChatResponse` to `agent_apply_step_response`
 /// unchanged (tool-call handling identical to a non-streaming round; usage was
-/// accounted by the stream poller).
+/// accounted by the stream finalizer).
 fn agent_stream_apply(agent_token: u64, stream_token: u64) -> Result<Value, SemaError> {
     let mut st = STREAM_RUNS
         .with(|r| r.borrow_mut().remove(&stream_token))

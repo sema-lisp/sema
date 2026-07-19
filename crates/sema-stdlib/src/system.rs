@@ -10,7 +10,7 @@ use sema_core::runtime::{
     NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation,
     ResumeInput, SendPayload, Trace, WaitKind,
 };
-use sema_core::{check_arity, in_runtime_quantum, take_resume_value, Caps, SemaError, Value};
+use sema_core::{check_arity, in_runtime_quantum, Caps, SemaError, Value};
 
 use crate::register_fn;
 
@@ -376,9 +376,6 @@ fn shell_runtime(
     cwd: Option<String>,
     env_vars: Vec<(String, String)>,
 ) -> NativeResult {
-    if let Some(v) = take_resume_value() {
-        return Ok(NativeOutcome::Return(v));
-    }
     let (cancel_tx, cancel_rx) = crate::runtime_offload::cancel_channel();
     let pid_slot = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let resource = InterruptibleResource::new(
@@ -459,11 +456,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             return shell_runtime(program, child_args, cwd, env_vars);
         }
 
-        // Legacy scheduler task: the retired `AwaitIo` offload, kept for the
-        // non-unified-runtime path.
-
-        // Top-level (not in any task): the original synchronous path,
-        // byte-identical in observable behavior to the pre-async implementation.
+        // Top-level (not in any task): run the subprocess synchronously.
         let mut command = std::process::Command::new(&program);
         command.args(&child_args);
         if let Some(dir) = &cwd {
@@ -528,9 +521,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // SUSPENDS (returning `NativeOutcome::Suspend`) so the worker runs it off the
     // VM thread — two `async/spawn`ed sleeps then overlap instead of serializing
     // on the VM thread (unlike `async/sleep`, which is a virtual timer). Outside
-    // the runtime (bare eval or the legacy scheduler) the legacy `func` runs: it
-    // yields the legacy `Sleep` signal inside an async scheduler task, else sleeps
-    // synchronously.
+    // a runtime quantum the plain value callback sleeps synchronously.
     env.set(
         sema_core::intern("sleep"),
         Value::native_fn(sema_core::NativeFn::simple_with_runtime(
@@ -540,11 +531,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 let ms = args[0]
                     .as_int()
                     .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
-                // In a legacy async scheduler task, blocking the VM thread would
-                // freeze every sibling task. Yield exactly like `async/sleep`
-                // (async_ops.rs) so the scheduler parks this task and drives
-                // siblings while the sleep elapses.
-                // Outside async (REPL/scripts/top level): unchanged real sleep.
+                // The plain value ABI is synchronous (REPL, scripts, and nested
+                // host callbacks); the runtime ABI below performs the offload.
                 std::thread::sleep(std::time::Duration::from_millis(ms as u64));
                 Ok(Value::nil())
             },

@@ -5,9 +5,7 @@ use sema_core::runtime::{
     PromiseSetMode, PromiseSetWait, ResumeInput, RuntimeRequest, RuntimeResponse, TaskOutcome,
     TaskSettlement, Trace, WaitKind,
 };
-use sema_core::{
-    check_arity, in_runtime_quantum, take_resume_value, Env, NativeFn, SemaError, Value, ValueView,
-};
+use sema_core::{check_arity, in_runtime_quantum, Env, NativeFn, SemaError, Value, ValueView};
 
 use crate::register_fn;
 
@@ -60,11 +58,11 @@ fn cancelled_error() -> SemaError {
 }
 
 /// Validate and cap `async/sleep`'s duration argument, returning the sleep in
-/// whole milliseconds. Shared by the legacy and runtime dispatch paths.
+/// whole milliseconds. Shared by the plain value and runtime ABIs.
 fn sleep_duration_ms(args: &[Value]) -> Result<u64, SemaError> {
     check_arity!(args, "async/sleep", 1);
     let ms = duration_ms(&args[0], "async/sleep")?;
-    // Cap the duration (mirrors async/timeout). The runtime/scheduler virtual
+    // Cap the duration (mirrors async/timeout). The runtime's virtual
     // clock jumps straight to a sleeper's wake time and, on native, waits that
     // whole delta in one `thread::sleep`; without a bound an out-of-range
     // duration would wedge the thread for years and could overflow the clock.
@@ -171,9 +169,8 @@ fn register_predicates(env: &Env) {
 
 // ── Promise operations ───────────────────────────────────────────
 
-/// Register a promise op as a structural runtime native. Its legacy value ABI
-/// (`func`) errors — the debug scheduler (DAP/wasm) cannot run promise ops until
-/// it gains a cooperative-debug runtime mode (see docs/deferred.md).
+/// Register a promise op as a structural runtime native. Plain value-ABI calls
+/// fail because promise operations require an active runtime task context.
 fn register_runtime_fn(env: &Env, name: &str, f: impl Fn(&[Value]) -> NativeResult + 'static) {
     env.set(
         sema_core::intern(name),
@@ -592,7 +589,7 @@ fn register_promise_ops(env: &Env) {
     // Under the unified cooperative runtime (a `TaskContext` is installed) the
     // native suspends structurally on a timer wait; `SleepCont` resumes the
     // parked frame with nil when it fires. That runtime ABI is ALWAYS preferred
-    // by `NativeFn::invoke_runtime` when present, so the legacy value ABI below
+    // by `NativeFn::invoke_runtime` when present, so the plain value ABI below
     // is reached only when a caller bypasses `invoke_runtime` and calls the
     // native's plain value closure directly — `call_function`/`call_value`
     // (a raw native passed straight to a single-ABI HOF like `any`/`every`, or
@@ -605,10 +602,9 @@ fn register_promise_ops(env: &Env) {
     //
     // This suspend is unconditional (no promise-driven check): unlike the wasm
     // http natives, the SAME structural timer wait is correct on every
-    // caller/target — the difference between "old" and "new" wasm entry
-    // points is entirely in how the DRIVE LOOP waits out an `Idle` turn with
-    // only a timer pending, which is fixed at the loop (`drive_handle_to_settlement`
-    // in `sema-eval`), not here. See that function's wasm32 branch.
+    // caller and target. Synchronous and promise-driven wasm entry points differ
+    // only in how their drive loops wait out an `Idle` turn with a timer pending;
+    // `drive_handle_to_settlement` owns that policy.
     env.set(
         sema_core::intern("async/sleep"),
         Value::native_fn(NativeFn::simple_with_runtime(
@@ -616,9 +612,6 @@ fn register_promise_ops(env: &Env) {
             |args| {
                 let ms = sleep_duration_ms(args)?;
                 if in_runtime_quantum() {
-                    if let Some(cached) = take_resume_value() {
-                        return Ok(cached);
-                    }
                     return Err(SemaError::eval(
                         "async/sleep: passed directly to a synchronous higher-order function \
                          or `apply` — wrap it in a lambda so it can suspend cleanly. For \

@@ -5,23 +5,15 @@
 //! subprocess, so every builtin is gated behind `Caps::PROCESS`.
 //!
 //! Inside an `async/spawn`'d task every builtin offloads the subprocess onto
-//! the process-wide I/O pool and yields `AwaitIo` (the `shell_async` pattern —
-//! see `system.rs`), so a slow `git log`/`git diff` doesn't stall sibling
-//! tasks on the cooperative scheduler. At top level (no scheduler) they stay
-//! exactly as they were: `git()`'s synchronous `.output()`.
+//! the process-wide I/O pool and suspends on a structural `External` wait, so
+//! a slow `git log`/`git diff` does not stall sibling tasks. At top level they
+//! use `git()`'s synchronous `.output()` path.
 //!
-//! The shared sync helper `git()` can't simply grow an async branch: a native
-//! that yields `AwaitIo` is NOT re-invoked on resume (the VM substitutes the
-//! call's return value directly), so any Rust code that would otherwise run
-//! AFTER `git()` returns (parsing `status --porcelain`, deduping `log
-//! --name-only`, …) would never execute for a parked call. Instead the async
-//! branches call [`git_offload`] / [`git_stdout_async`] directly, passing a
-//! `decode`/`finish` closure that does that post-processing — mirroring
-//! `fs_offload` (io.rs): only `Send` facts (raw stdout/stderr/exit code) cross
-//! the thread boundary, and the closure builds the final `Value` on the VM
-//! thread when the scheduler polls the completed offload. The parsing/dedup
-//! logic itself is factored into plain functions (`parse_status_entries`,
-//! `recent_files_value`, …) shared by both paths so sync and async can't drift.
+//! Runtime paths pass a `decode` closure to [`git_stdout_runtime`] so only
+//! `Send` facts (raw stdout/stderr/exit code) cross the thread boundary. The
+//! closure builds the final `Value` on the VM thread after the wait completes.
+//! Parsing and deduplication live in plain functions (`parse_status_entries`,
+//! `recent_files_value`, …) shared by synchronous and runtime paths.
 
 use std::collections::BTreeMap;
 
@@ -193,9 +185,6 @@ fn git_stdout_runtime(
     args: Vec<String>,
     decode: impl FnOnce(String) -> Value + 'static,
 ) -> NativeResult {
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(NativeOutcome::Return(v));
-    }
     let args_joined = args.join(" ");
     let mut full_args = vec!["-c".to_string(), "core.quotepath=false".to_string()];
     full_args.extend(args);
@@ -219,12 +208,9 @@ fn git_stdout_runtime(
 
 /// Unified-runtime counterpart to `git/ignore-matches?`'s `git_offload` use:
 /// needs the RAW exit code (0 = ignored, 1 = not, >1 = error), so it bypasses
-/// `git_stdout_runtime`'s zero-exit-only helper exactly like the sync/legacy
-/// paths bypass `git()`.
+/// `git_stdout_runtime`'s zero-exit-only helper exactly like the synchronous
+/// path bypasses `git()`.
 fn git_ignore_matches_runtime(path: String) -> NativeResult {
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(NativeOutcome::Return(v));
-    }
     let path_for_msg = path.clone();
     let full_args = vec!["check-ignore".to_string(), "-q".to_string(), path];
     let kind =
@@ -421,7 +407,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .to_string();
             // `git check-ignore -q` exits 0 if the path is ignored, 1 if not, and
             // >1 on a real error. We need the raw exit code, so bypass the
-            // helpers above (`git()`/`git_stdout_async`, which treat any non-zero
+            // helpers above (`git()`/`git_stdout_runtime`, which treat any non-zero
             // exit as failure) on ALL paths.
             if in_runtime_quantum() {
                 return git_ignore_matches_runtime(path);

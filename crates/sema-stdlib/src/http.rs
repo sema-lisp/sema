@@ -241,8 +241,6 @@ fn http_request(
         return http_request_runtime(method, url, body, opts);
     }
 
-    // Legacy scheduler task: the retired `AwaitIo` offload, kept for the
-    // non-unified-runtime path (mirrors io.rs `fs_offload`).
     #[cfg(not(target_arch = "wasm32"))]
     // Top-level (not in any task): the synchronous path. `io_block_on` drives the
     // round-trip ON THIS (VM) thread using the pool's reactor — observable
@@ -288,8 +286,8 @@ fn raw_http_to_value(raw: RawHttpResponse) -> Value {
 /// shared `external_io_async` decoder rebuilds the identical response `Value` on
 /// resume; cancellation (`async/cancel`/`async/timeout`) fires the wait's cancel
 /// signal, the job's `select!` drops the in-flight request future, and the
-/// connection is torn down (no wasted round-trip) — exactly the retired
-/// `IoHandle::with_abort` semantics.
+/// connection is torn down so a cancelled request does not consume a full
+/// round-trip.
 #[cfg(not(target_arch = "wasm32"))]
 fn http_request_runtime(
     method: &str,
@@ -297,12 +295,6 @@ fn http_request_runtime(
     body: Option<&Value>,
     opts: Option<&Value>,
 ) -> NativeResult {
-    // Defensive resume-value drain (the runtime resumes the parked frame in
-    // place; this native is not re-invoked). Mirrors the async path.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(NativeOutcome::Return(v));
-    }
-
     let want_bytes = opts_want_bytes(opts);
     let client = http_shared_client();
     // Build on the VM thread so a bad method / multipart / json body surfaces the

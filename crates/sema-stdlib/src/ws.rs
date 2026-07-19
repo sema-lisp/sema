@@ -9,7 +9,8 @@
 //! task runs on the shared tokio runtime, bridging the socket to two channels —
 //! an *unbounded* outgoing command channel and a *bounded* incoming event
 //! channel. Top-level ops block the VM thread; ops inside an `async/spawn` task
-//! yield `AwaitIo` so sibling tasks run while a recv/handshake is in flight.
+//! suspend on structural external waits so siblings run during a receive or
+//! handshake.
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -591,14 +592,8 @@ async fn pump(
 }
 
 /// `ws/connect`: spawn the pump, then await the handshake (block at top level,
-/// yield `AwaitIo` inside an async task). Returns the connection stream value.
+/// suspend structurally inside an async task). Returns the connection stream.
 fn ws_connect(url: &str, opts: ConnectOpts) -> NativeResult {
-    // Vestigial under CALL_NATIVE (the scheduler delivers the resume value), kept
-    // for symmetry with the shipped async yield pattern.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(NativeOutcome::Return(v));
-    }
-
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<WsFrame>();
     let (evt_tx, evt_rx) = mpsc::channel::<WsEvent>(EVENT_CAP);
     let (evt_generation_tx, evt_generation) = watch::channel(0_u64);
@@ -681,13 +676,8 @@ fn ws_recv(args: &[Value]) -> NativeResult {
     // Unified-runtime quantum: recheck the VM-owned queue after each lossless
     // generation wake. Cancellation drops only the watch-receiver clone.
     if sema_core::in_runtime_quantum() {
-        if let Some(v) = sema_core::take_resume_value() {
-            return Ok(NativeOutcome::Return(v));
-        }
         return suspend_ws_receive(evt_rx, evt_generation, None);
     }
-
-    // Legacy scheduler task: park on an `AwaitIo` poll.
 
     // Top level: block until an event arrives or the channel disconnects.
     let ev = evt_rx.borrow_mut().blocking_recv();
@@ -707,14 +697,9 @@ fn ws_recv_timeout(args: &[Value]) -> NativeResult {
     // Unified-runtime quantum: race the next generation wake against the exact
     // deadline, rechecking the queue before resolving a timeout.
     if sema_core::in_runtime_quantum() {
-        if let Some(v) = sema_core::take_resume_value() {
-            return Ok(NativeOutcome::Return(v));
-        }
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
         return suspend_ws_receive(evt_rx, evt_generation, Some(deadline));
     }
-
-    // Legacy scheduler task: park on an `AwaitIo` poll with the deadline.
 
     // Top level: poll on the shared runtime until an event arrives or the deadline
     // passes. We `try_recv` (dropping the RefCell borrow) and `sleep` between polls
@@ -844,8 +829,8 @@ fn parse_connect_opts(v: Option<&Value>) -> Result<ConnectOpts, SemaError> {
 }
 
 /// Register a non-gated dual-ABI ws native whose body returns `NativeResult` (so
-/// its runtime-quantum branch can `NativeOutcome::Suspend`). The legacy callback
-/// unwraps the plain `Return` it produces outside the runtime.
+/// its runtime-quantum branch can `NativeOutcome::Suspend`). The plain value
+/// callback unwraps the `Return` produced outside the runtime.
 fn register_runtime_fn(env: &sema_core::Env, name: &'static str, f: fn(&[Value]) -> NativeResult) {
     env.set(
         sema_core::intern(name),

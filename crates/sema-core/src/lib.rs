@@ -30,12 +30,12 @@ pub use async_signal::{
     set_interrupt_callback, set_llm_scope_empty_callbacks, set_llm_scope_task_callbacks,
     set_otel_empty_callbacks, set_otel_task_callbacks, set_promise_driven_quantum,
     set_runtime_quantum, set_task_reaped_callback, set_usage_scope_empty_callbacks,
-    set_usage_scope_task_callbacks, take_resume_value, take_task_llm_scope, take_task_otel,
-    take_task_usage_scope, usage_scope_ambient_is_empty, usage_scope_captured_is_empty,
-    BlockingSleepFn, InterruptCallbackFn, LlmScopeAmbientEmptyFn, LlmScopeCaptureFn,
-    LlmScopeInstallFn, LlmScopeIsEmptyFn, LlmScopeTakeFn, OtelAmbientEmptyFn, OtelInstallFn,
-    OtelIsEmptyFn, OtelScopeFn, OtelTakeFn, TaskReapedFn, UsageScopeAmbientEmptyFn,
-    UsageScopeCaptureFn, UsageScopeInstallFn, UsageScopeIsEmptyFn, UsageScopeTakeFn,
+    set_usage_scope_task_callbacks, take_task_llm_scope, take_task_otel, take_task_usage_scope,
+    usage_scope_ambient_is_empty, usage_scope_captured_is_empty, BlockingSleepFn,
+    InterruptCallbackFn, LlmScopeAmbientEmptyFn, LlmScopeCaptureFn, LlmScopeInstallFn,
+    LlmScopeIsEmptyFn, LlmScopeTakeFn, OtelAmbientEmptyFn, OtelInstallFn, OtelIsEmptyFn,
+    OtelScopeFn, OtelTakeFn, TaskReapedFn, UsageScopeAmbientEmptyFn, UsageScopeCaptureFn,
+    UsageScopeInstallFn, UsageScopeIsEmptyFn, UsageScopeTakeFn,
 };
 pub use context::{
     call_callback, call_callback_owned, eval_callback, set_call_callback, set_call_owned_callback,
@@ -65,9 +65,9 @@ pub use mcp_cassette::{
 };
 pub use mutable_ops::{mutable_array_get, mutable_array_set};
 pub use output_hook::{
-    capturing_root_count, mark_root_capturing, register_output_capture_sink, set_current_root,
-    set_stderr_hook, set_stdout_hook, unmark_root_capturing, unregister_output_capture_sink,
-    write_stderr, write_stdout, CapturedOutput,
+    capturing_root_count, current_root, mark_root_capturing, register_output_capture_sink,
+    set_current_root, set_stderr_hook, set_stdout_hook, unmark_root_capturing,
+    unregister_output_capture_sink, write_stderr, write_stdout, CapturedOutput,
 };
 pub use sandbox::{Caps, Sandbox};
 pub use text_util::truncate_chars;

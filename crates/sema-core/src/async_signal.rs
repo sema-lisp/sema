@@ -1,57 +1,28 @@
-//! Async yield/resume signaling infrastructure.
+//! Async runtime context and per-task signaling infrastructure.
 //!
-//! Thread-local signals and per-task context seams shared between `sema-core`,
-//! `sema-stdlib`, `sema-llm`, and the unified runtime (`sema-vm`). Lives in
-//! sema-core (not sema-vm) so `sema-stdlib` can use it without depending on
-//! sema-vm. Follows the same pattern as `set_eval_callback`.
-//!
-//! The unified cooperative runtime drives async ops structurally through the
-//! `NativeOutcome` ABI (`Suspend`/`Runtime`). The legacy TLS yield-signal
-//! bridge (`YieldReason`) that used to carry a ctx-less `async/sleep`'s
-//! sleep request to the VM has been retired: `async/sleep`'s runtime ABI
-//! (`WaitKind::Timer`) suspends structurally instead, and its legacy value
-//! ABI (reached when a raw native is invoked synchronously — a bare HOF
-//! callback or a nested/foreign VM re-entry) either actually sleeps
-//! (outside any runtime quantum) or raises a clear error (inside one, where
-//! it cannot suspend). See `docs/deferred.md`'s LEGACY-SCHEDULER residue note.
+//! These thread-local flags, host callbacks, and task-context seams live in
+//! `sema-core` so `sema-stdlib`, `sema-llm`, and the unified runtime can share
+//! them without introducing a dependency on `sema-vm`.
 
 use std::any::Any;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 
 use crate::runtime::RuntimeTaskId;
-use crate::value::Value;
-
 thread_local! {
-    /// Set by the runtime before resuming a yielded task. The native function
-    /// that previously yielded checks this first and returns it instead of
-    /// re-executing the operation. No producer remains registered (the sole
-    /// legacy-scheduler resume path this served was retired); consumers
-    /// (`git`, `http`, `ws`, `system`) always observe `None` today but keep
-    /// checking it as the wired seam for the pattern.
-    static RESUME_VALUE: RefCell<Option<Value>> = const { RefCell::new(None) };
-
     /// Whether a unified-runtime VM quantum is currently executing on this
     /// thread. Set for the lifetime of one `run_quantum` by the runtime's
     /// `RuntimeQuantumGuard`. Native functions that cannot suspend structurally
-    /// from a ctx-less callback (e.g. `async/sleep`'s legacy value ABI) check
+    /// from a ctx-less callback (e.g. `async/sleep`'s plain value ABI) check
     /// this to decide between raising a "cannot suspend here" error and
     /// running synchronously.
     static IN_RUNTIME_QUANTUM: Cell<bool> = const { Cell::new(false) };
 }
 
-// ── Resume value ────────────────────────────────────────────────
-
-/// Take the resume value (clearing it). Called by the native function that
-/// previously yielded, returning this instead of re-executing.
-pub fn take_resume_value() -> Option<Value> {
-    RESUME_VALUE.with(|r| r.borrow_mut().take())
-}
-
 // ── Runtime-quantum flag ────────────────────────────────────────
 
 /// True while a unified-runtime VM quantum is executing on this thread. A
-/// yielding native (`async/sleep`, …) surfaces the yield signal so the runtime
-/// can register a native wait, rather than running synchronously.
+/// dual-ABI native can use this to reject a synchronous value-ABI invocation
+/// that cannot suspend structurally.
 pub fn in_runtime_quantum() -> bool {
     IN_RUNTIME_QUANTUM.with(|c| c.get())
 }
@@ -81,7 +52,7 @@ thread_local! {
     /// ONLY by the macrotask driver's own drive turn, so a dual-ABI wasm
     /// native can suspend structurally when (and only when) something is
     /// actually pumping the runtime asynchronously across turns, and must
-    /// fall back to its legacy, synchronous behavior everywhere else —
+    /// fall back to its synchronous behavior everywhere else —
     /// including inside every OTHER live runtime quantum.
     static PROMISE_DRIVEN_QUANTUM: Cell<bool> = const { Cell::new(false) };
 }
@@ -97,7 +68,7 @@ pub fn promise_driven_quantum_active() -> bool {
 /// [`RuntimeQuantumGuard`](crate::context::RuntimeQuantumGuard)). Intended to
 /// be called only by the wasm macrotask driver around its own `drive_turn`
 /// call, symmetrically set/unset (including on unwind) so a panic mid-turn
-/// can never leave a subsequent, unrelated legacy `eval` call thinking it is
+/// can never leave a subsequent, unrelated synchronous `eval` call thinking it is
 /// promise-driven.
 pub fn set_promise_driven_quantum(val: bool) -> bool {
     PROMISE_DRIVEN_QUANTUM.with(|c| c.replace(val))

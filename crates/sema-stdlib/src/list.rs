@@ -1333,6 +1333,41 @@ impl Trace for IdentityContinuation {
     }
 }
 
+/// Cooperative teardown for `tap`: ignore the callback's value and return the
+/// exact original value after the callback settles. The original remains a GC
+/// root while the callback is parked.
+struct TapContinuation {
+    original: Value,
+}
+
+impl Trace for TapContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.original));
+        true
+    }
+}
+
+impl NativeContinuation for TapContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        resume_value(input, "tap")?;
+        Ok(NativeOutcome::Return(self.original.clone()))
+    }
+}
+
+fn tap_call(args: &[Value]) -> NativeResult {
+    check_arity!(args, "tap", 2);
+    let original = args[0].clone();
+    Ok(NativeOutcome::Call(NativeCall {
+        callable: args[1].clone(),
+        args: vec![original.clone()],
+        continuation: Box::new(TapContinuation { original }),
+    }))
+}
+
 impl NativeContinuation for IdentityContinuation {
     fn resume(
         self: Box<Self>,
@@ -1403,7 +1438,7 @@ impl NativeContinuation for CallWithValuesContinuation {
 /// returned value flows on; an error / cancellation aborts the whole HOF by
 /// propagating so the runtime resumes the parked parent VM with the raised error
 /// (catchable by an enclosing try/catch), matching the legacy path's fail-fast.
-fn resume_value(input: ResumeInput, hof: &str) -> Result<Value, SemaError> {
+pub(crate) fn resume_value(input: ResumeInput, hof: &str) -> Result<Value, SemaError> {
     match input {
         ResumeInput::Returned(value) => Ok(value),
         ResumeInput::Failed(error) => Err(error),
@@ -3003,11 +3038,16 @@ pub fn register(env: &sema_core::Env) {
     });
 
     // tap — side-effect then return original
-    register_fn(env, "tap", |args| {
-        check_arity!(args, "tap", 2);
-        call_function(&args[1], &[args[0].clone()])?;
-        Ok(args[0].clone())
-    });
+    register_hof(
+        env,
+        "tap",
+        |args| {
+            check_arity!(args, "tap", 2);
+            call_function(&args[1], &[args[0].clone()])?;
+            Ok(args[0].clone())
+        },
+        tap_call,
+    );
 
     // Car/cdr compositions (2-deep)
     register_fn(env, "caar", |args| first(&[first(args)?]));
@@ -3408,6 +3448,14 @@ mod continuation_trace_tests {
     fn identity_continuation_holds_no_value_edges() {
         // Only a `&'static str` tag — no `Value` state.
         assert_eq!(edge_count(&IdentityContinuation { hof: "apply" }), 0);
+    }
+
+    #[test]
+    fn tap_continuation_traces_the_original_value() {
+        let cont = TapContinuation {
+            original: Value::string("original"),
+        };
+        assert_eq!(edge_count(&cont), 1);
     }
 
     #[test]

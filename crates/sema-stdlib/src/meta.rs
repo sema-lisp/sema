@@ -1,5 +1,10 @@
 use std::collections::BTreeMap;
 
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{
+    NativeCall, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, ResumeInput,
+    Trace,
+};
 use sema_core::{check_arity, SemaError, Value};
 
 use crate::register_fn;
@@ -41,6 +46,64 @@ fn retry_opts(args: &[Value]) -> Result<(u32, u64, f64), SemaError> {
     }
 
     Ok((max_attempts, base_delay_ms, backoff))
+}
+
+#[derive(Clone, Copy)]
+enum TimingMode {
+    ReturnValue,
+    ReturnMillis,
+}
+
+impl TimingMode {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ReturnValue => "time",
+            Self::ReturnMillis => "time/ms",
+        }
+    }
+}
+
+/// Complete a timing wrapper after its thunk settles. Timing state contains no
+/// Sema values, so the continuation has no GC edges.
+struct TimingContinuation {
+    start: std::time::Instant,
+    mode: TimingMode,
+}
+
+impl Trace for TimingContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for TimingContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let value = crate::list::resume_value(input, self.mode.name())?;
+        let elapsed_ms = self.start.elapsed().as_secs_f64() * 1000.0;
+        match self.mode {
+            TimingMode::ReturnValue => {
+                eprintln!("Elapsed: {elapsed_ms:.3}ms");
+                Ok(NativeOutcome::Return(value))
+            }
+            TimingMode::ReturnMillis => Ok(NativeOutcome::Return(Value::float(elapsed_ms))),
+        }
+    }
+}
+
+fn timing_call(args: &[Value], mode: TimingMode) -> NativeResult {
+    check_arity!(args, mode.name(), 1);
+    Ok(NativeOutcome::Call(NativeCall {
+        callable: args[0].clone(),
+        args: Vec::new(),
+        continuation: Box::new(TimingContinuation {
+            start: std::time::Instant::now(),
+            mode,
+        }),
+    }))
 }
 
 pub fn register(env: &sema_core::Env) {
@@ -106,23 +169,33 @@ pub fn register(env: &sema_core::Env) {
     });
 
     // (time thunk) — calls zero-arg thunk, prints elapsed time to stderr, returns result
-    register_fn(env, "time", |args| {
-        check_arity!(args, "time", 1);
-        let start = std::time::Instant::now();
-        let result = crate::list::call_function(&args[0], &[])?;
-        let elapsed = start.elapsed();
-        eprintln!("Elapsed: {:.3}ms", elapsed.as_secs_f64() * 1000.0);
-        Ok(result)
-    });
+    crate::list::register_hof(
+        env,
+        "time",
+        |args| {
+            check_arity!(args, "time", 1);
+            let start = std::time::Instant::now();
+            let result = crate::list::call_function(&args[0], &[])?;
+            let elapsed = start.elapsed();
+            eprintln!("Elapsed: {:.3}ms", elapsed.as_secs_f64() * 1000.0);
+            Ok(result)
+        },
+        |args| timing_call(args, TimingMode::ReturnValue),
+    );
 
     // (time/ms thunk) — calls zero-arg thunk, returns elapsed time in ms as float
-    register_fn(env, "time/ms", |args| {
-        check_arity!(args, "time/ms", 1);
-        let start = std::time::Instant::now();
-        let _result = crate::list::call_function(&args[0], &[])?;
-        let elapsed = start.elapsed();
-        Ok(Value::float(elapsed.as_secs_f64() * 1000.0))
-    });
+    crate::list::register_hof(
+        env,
+        "time/ms",
+        |args| {
+            check_arity!(args, "time/ms", 1);
+            let start = std::time::Instant::now();
+            let _result = crate::list::call_function(&args[0], &[])?;
+            let elapsed = start.elapsed();
+            Ok(Value::float(elapsed.as_secs_f64() * 1000.0))
+        },
+        |args| timing_call(args, TimingMode::ReturnMillis),
+    );
 
     // (assert condition) or (assert condition message) — throws if condition is falsy
     register_fn(env, "assert", |args| {

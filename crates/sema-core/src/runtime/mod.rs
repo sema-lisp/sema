@@ -1,5 +1,6 @@
 pub mod cancel;
 pub mod completion;
+pub mod eval_task_context;
 pub mod executor;
 pub mod ids;
 pub mod native;
@@ -13,6 +14,7 @@ pub use completion::{
     downcast_send_payload, CompletionDecoder, CompletionDelivery, CompletionSender,
     DecodedCompletion, ExternalCompletion, ExternalFailure, ExternalFailureCode, SendPayload,
 };
+pub use eval_task_context::{DynamicMutation, DynamicTaskState, ModuleTaskState};
 pub use executor::{
     AsyncDispatchFuture, AsyncExecutorDispatch, BindCompletionError, BlockingDispatchClass,
     BlockingExecutorDispatch, CancelBeforeStart, CompletionRegistrar, ExecutorAttachError,

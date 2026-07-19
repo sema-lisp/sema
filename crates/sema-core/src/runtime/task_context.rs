@@ -41,6 +41,15 @@ impl TaskContext {
         })
     }
 
+    pub fn get_rc<T: TaskLocalValue + 'static>(&self) -> Option<Rc<T>> {
+        let value = Rc::clone(self.extensions.get(&TypeId::of::<T>())?);
+        let value: Rc<dyn Any> = value;
+        Some(
+            Rc::downcast::<T>(value)
+                .expect("task-local map key must match its concrete value type"),
+        )
+    }
+
     pub fn remove<T: TaskLocalValue + 'static>(&mut self) -> Option<Rc<T>> {
         self.extensions.remove(&TypeId::of::<T>()).map(|value| {
             let value: Rc<dyn Any> = value;
@@ -84,6 +93,10 @@ impl TaskContextHandle {
 
     pub fn borrow_mut(&self) -> RefMut<'_, TaskContext> {
         self.0.borrow_mut()
+    }
+
+    pub fn get_rc<T: TaskLocalValue + 'static>(&self) -> Option<Rc<T>> {
+        self.borrow().get_rc::<T>()
     }
 
     pub fn inherit_for_child(&self) -> Self {
@@ -182,6 +195,22 @@ mod tests {
         assert!(Rc::ptr_eq(&removed, &replacement));
         assert!(context.get::<Shared>().is_none());
         assert_eq!(context.get::<Resettable>().unwrap().value, 7);
+    }
+
+    #[test]
+    fn task_context_owned_lookup_outlives_the_context_borrow_and_entry() {
+        let handle = TaskContextHandle::default();
+        handle.borrow_mut().insert(Rc::new(Shared {
+            value: Rc::new("owned".into()),
+            inherit_calls: Rc::new(Cell::new(0)),
+        }));
+
+        let owned = handle.get_rc::<Shared>().expect("task-local value present");
+        let removed = handle.borrow_mut().remove::<Shared>();
+        drop(removed);
+        drop(handle);
+
+        assert_eq!(owned.value.as_str(), "owned");
     }
 
     #[test]

@@ -3496,10 +3496,85 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         agent_stream_apply(agent_token, stream_token_arg(&args[1])?)
     });
 
-    // The public `llm/pmap` is a prelude function composed from structural
-    // `map` and `llm/batch`. Keeping its arity error in Rust preserves the
-    // native's exact public diagnostic without retaining a blocking callback
-    // twin that could be called directly from an active runtime task.
+    // The public `llm/pmap` is a prelude dispatcher. Runtime tasks compose
+    // structural `map` + `llm/batch`; host callback entry routes here so the
+    // mapper receives the caller's explicit EvalContext rather than STDLIB_CTX.
+    // The guard makes this compatibility path impossible to use as a blocking
+    // escape hatch from an active runtime quantum.
+    register_fn_ctx(env, "__llm-pmap-blocking", |ctx, args| {
+        if sema_core::in_runtime_quantum() {
+            return Err(SemaError::eval(
+                "__llm-pmap-blocking cannot run inside the cooperative runtime",
+            )
+            .with_hint("call llm/pmap so its mapper can suspend cooperatively"));
+        }
+        if args.len() < 2 || args.len() > 3 {
+            return Err(SemaError::arity("llm/pmap", "2-3", args.len()));
+        }
+        let func = &args[0];
+        let items = args[1]
+            .as_seq()
+            .map(|items| items.to_vec())
+            .ok_or_else(|| SemaError::type_error("list or vector", args[1].type_name()))?;
+
+        let mut model = String::new();
+        let mut max_tokens = None;
+        let mut temperature = None;
+        let mut system = None;
+        if let Some(opts) = args.get(2).and_then(Value::as_map_rc) {
+            model = get_opt_string(&opts, "model").unwrap_or_default();
+            max_tokens = get_opt_u32(&opts, "max-tokens");
+            temperature = get_opt_f64(&opts, "temperature");
+            system = get_opt_string(&opts, "system");
+        }
+
+        let prompts = items
+            .iter()
+            .map(|item| {
+                let result = sema_core::call_callback(ctx, func, std::slice::from_ref(item))?;
+                Ok(result
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| result.to_string()))
+            })
+            .collect::<Result<Vec<_>, SemaError>>()?;
+        let requests = prompts
+            .into_iter()
+            .map(|prompt_text| {
+                let mut request =
+                    ChatRequest::new(model.clone(), vec![ChatMessage::new("user", prompt_text)]);
+                request.max_tokens = max_tokens.or(Some(4096));
+                request.temperature = temperature;
+                request.system = system.clone();
+                request
+            })
+            .collect::<Vec<_>>();
+
+        let responses = with_provider(|provider| {
+            let requests = requests
+                .into_iter()
+                .map(|mut request| {
+                    if request.model.is_empty() {
+                        request.model = provider.default_model().to_string();
+                    }
+                    request
+                })
+                .collect();
+            Ok(provider.batch_complete(requests))
+        })?;
+        responses
+            .into_iter()
+            .map(|response| {
+                let response = response.map_err(|error| SemaError::Llm(error.to_string()))?;
+                track_usage(&response.usage)?;
+                Ok(Value::string(&response.content))
+            })
+            .collect::<Result<Vec<_>, SemaError>>()
+            .map(Value::list)
+    });
+
+    // These non-blocking helpers preserve the public native's exact validation
+    // diagnostics while the prelude owns cooperative control flow.
     register_fn(env, "__llm-pmap-arity-error", |args| {
         Err(SemaError::arity("llm/pmap", "2-3", args.len()))
     });

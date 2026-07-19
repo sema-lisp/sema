@@ -274,6 +274,119 @@ fn pmap_preserves_synchronous_host_callback_behavior() {
 }
 
 #[test]
+fn pmap_host_mapper_sees_callers_user_hidden_and_stack_context() {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .reply("sync reply")
+        .build();
+    let recorder = fake.recorder();
+    register_test_provider(Box::new(fake));
+
+    interp
+        .ctx
+        .context_set(Value::keyword("caller-user"), Value::string("user-value"));
+    interp.ctx.hidden_set(
+        Value::keyword("caller-hidden"),
+        Value::string("hidden-value"),
+    );
+    interp
+        .ctx
+        .context_stack_push(Value::keyword("caller-stack"), Value::string("stack-value"));
+
+    let mapper = interp
+        .eval_str_compiled(
+            r#"
+            (fn (_)
+              (format "~a|~a|~a"
+                (context/get :caller-user)
+                (context/get-hidden :caller-hidden)
+                (first (context/stack :caller-stack))))
+            "#,
+        )
+        .expect("compile context-reading mapper");
+    let pmap = interp
+        .global_env
+        .get(sema_core::intern("llm/pmap"))
+        .expect("public pmap binding");
+    let value = sema_core::call_callback(
+        &interp.ctx,
+        &pmap,
+        &[
+            mapper,
+            Value::list(vec![Value::nil()]),
+            Value::map(std::collections::BTreeMap::from([(
+                Value::keyword("model"),
+                Value::string("fake-chat"),
+            )])),
+        ],
+    )
+    .expect("host pmap should retain the caller's EvalContext");
+
+    assert_eq!(strings(&value), vec!["sync reply"]);
+    let requests = recorder.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].messages[0].content.to_text(),
+        "user-value|hidden-value|stack-value"
+    );
+}
+
+#[test]
+fn pmap_stringifies_each_mutable_result_before_mapping_the_next_item() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .reply("r0")
+        .reply("r1")
+        .build();
+    let (result, recorder) = eval_with_fake(
+        r#"
+        (let ((shared (mutable-array/new)))
+          (llm/pmap
+            (fn (item)
+              (mutable-array/push! shared item)
+              shared)
+            [1 2]
+            {:model "fake-chat"}))
+        "#,
+        fake,
+    );
+
+    assert_eq!(
+        strings(&result.expect("mutable pmap should settle")),
+        vec!["r0", "r1"]
+    );
+    let prompts: Vec<String> = recorder
+        .requests()
+        .iter()
+        .map(|request| request.messages[0].content.to_text())
+        .collect();
+    assert_eq!(prompts, vec!["<mutable-array 1>", "<mutable-array 2>"]);
+}
+
+#[test]
+fn pmap_blocking_compatibility_native_rejects_runtime_entry() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .reply("must not dispatch")
+        .build();
+    let (result, recorder) = eval_with_fake(
+        r#"(__llm-pmap-blocking str [1] {:model "fake-chat"})"#,
+        fake,
+    );
+
+    let error = result.expect_err("blocking pmap native must reject runtime entry");
+    assert!(
+        error
+            .to_string()
+            .contains("__llm-pmap-blocking cannot run inside the cooperative runtime"),
+        "unexpected blocking-native error: {error}"
+    );
+    assert_eq!(recorder.call_count(), 0);
+}
+
+#[test]
 fn pmap_preserves_exact_arity_errors() {
     let fake = FakeProvider::builder("fake").model("fake-chat").build();
     let (zero_args, recorder) = eval_with_fake("(llm/pmap)", fake);

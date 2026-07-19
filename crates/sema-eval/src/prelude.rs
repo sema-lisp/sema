@@ -943,24 +943,37 @@ pub const PRELUDE: &str = r#"
     ((null? (cddr __args)) (__llm-chat-blocking (car __args) (cadr __args)))
     (else (apply __llm-chat-blocking __args))))
 
-;; llm/pmap: map the prompt builder sequentially, then submit the complete prompt
-;; list through llm/batch. Both calls use their structural runtime ABI, so a
-;; suspending mapper parks the active task and cancellation stops before the
-;; batch is dispatched. Outside the runtime their legacy value ABIs preserve the
-;; synchronous behavior. llm/batch owns prompt stringification and option/request
-;; shaping, keeping those semantics shared instead of duplicated here.
+;; llm/pmap: runtime tasks map the prompt builder sequentially, stringifying each
+;; returned value before the next mapper call, then submit the complete prompt list
+;; through llm/batch. Both calls use their structural runtime ABI, so a suspending
+;; mapper parks the active task and cancellation stops before batch dispatch. Host
+;; callback entry uses the guarded blocking compatibility native because it must
+;; pass the caller's explicit EvalContext through every mapper call.
+(define (__llm-pmap-map-prompts __mapper __items)
+  (map (fn (__item) (str (__mapper __item))) __items))
+
 (define (llm/pmap . __pmap-args)
-  (cond
-    ((= (length __pmap-args) 2)
-     (llm/batch
-       (map (car __pmap-args)
-            (__llm-pmap-validate-items (cadr __pmap-args)))))
-    ((= (length __pmap-args) 3)
-     (llm/batch
-       (map (car __pmap-args)
-            (__llm-pmap-validate-items (cadr __pmap-args)))
-       (caddr __pmap-args)))
-    (else (apply __llm-pmap-arity-error __pmap-args))))
+  (if (__runtime-quantum?)
+      (cond
+        ((= (length __pmap-args) 2)
+         (llm/batch
+           (__llm-pmap-map-prompts
+             (car __pmap-args)
+             (__llm-pmap-validate-items (cadr __pmap-args)))))
+        ((= (length __pmap-args) 3)
+         (llm/batch
+           (__llm-pmap-map-prompts
+             (car __pmap-args)
+             (__llm-pmap-validate-items (cadr __pmap-args)))
+           (caddr __pmap-args)))
+        (else (apply __llm-pmap-arity-error __pmap-args)))
+      (cond
+        ((= (length __pmap-args) 2)
+         (__llm-pmap-blocking (car __pmap-args) (cadr __pmap-args)))
+        ((= (length __pmap-args) 3)
+         (__llm-pmap-blocking
+           (car __pmap-args) (cadr __pmap-args) (caddr __pmap-args)))
+        (else (apply __llm-pmap-arity-error __pmap-args)))))
 
 ;; ── Non-blocking streaming (llm/stream + agent :on-text rounds, ADR #68) ──────
 ;; Same pivotal constraint as the agent loop: a native cannot retain a Rust loop

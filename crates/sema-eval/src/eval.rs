@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::{Rc, Weak};
 
 use sema_core::{
@@ -1899,6 +1899,523 @@ impl sema_core::runtime::NativeContinuation for EvalProgramContinuation {
     }
 }
 
+struct ForceThunkRoot(Value);
+
+impl sema_core::runtime::Trace for ForceThunkRoot {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        sink(sema_core::cycle::GcEdge::Value(&self.0));
+        true
+    }
+}
+
+struct ForceGateEntry {
+    thunk: Weak<Thunk>,
+    gate: sema_core::runtime::ResourceGateHandle,
+    active_calls: usize,
+}
+
+impl Drop for ForceGateEntry {
+    fn drop(&mut self) {
+        let _ = self.gate.close();
+    }
+}
+
+/// Per-interpreter resource gates serialize concurrent force calls for one
+/// thunk. One lease follows each call through its continuations; the last lease
+/// removes and closes the gate entry. Weak thunk identities prevent the
+/// registry itself from becoming an untraceable `Value` root.
+struct ForceRuntimeState {
+    force_env: Weak<Env>,
+    self_ref: Weak<Self>,
+    gates: RefCell<HashMap<sema_core::NodePtr, ForceGateEntry>>,
+    legacy_calls: RefCell<HashMap<sema_core::NodePtr, Weak<Thunk>>>,
+}
+
+struct ForceGateLease {
+    state: Weak<ForceRuntimeState>,
+    thunk: sema_core::NodePtr,
+    gate: sema_core::runtime::ResourceGateId,
+}
+
+struct LegacyForceLease {
+    state: Weak<ForceRuntimeState>,
+    thunk: sema_core::NodePtr,
+}
+
+impl Drop for LegacyForceLease {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.upgrade() {
+            state.legacy_calls.borrow_mut().remove(&self.thunk);
+        }
+    }
+}
+
+impl Drop for ForceGateLease {
+    fn drop(&mut self) {
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        let mut gates = state.gates.borrow_mut();
+        let remove = gates.get_mut(&self.thunk).is_some_and(|entry| {
+            if entry.gate.id() != self.gate {
+                return false;
+            }
+            entry.active_calls = entry.active_calls.saturating_sub(1);
+            entry.active_calls == 0
+        });
+        if remove {
+            gates.remove(&self.thunk);
+        }
+    }
+}
+
+impl ForceRuntimeState {
+    fn new(force_env: Weak<Env>) -> Rc<Self> {
+        Rc::new_cyclic(|self_ref| Self {
+            force_env,
+            self_ref: self_ref.clone(),
+            gates: RefCell::new(HashMap::new()),
+            legacy_calls: RefCell::new(HashMap::new()),
+        })
+    }
+
+    fn active_gate(
+        &self,
+        thunk: &Rc<Thunk>,
+    ) -> Result<Option<(sema_core::runtime::ResourceGateHandle, ForceGateLease)>, SemaError> {
+        let key = sema_core::NodePtr::of_rc(thunk);
+        if self.has_active_legacy_force(thunk) {
+            return Err(SemaError::eval(
+                "force: delayed promise is already active in the synchronous evaluator",
+            ));
+        }
+        let Some(runtime) = sema_core::current_root().map(|root| root.runtime()) else {
+            return Ok(None);
+        };
+        let mut gates = self.gates.borrow_mut();
+        let Some(entry) = gates.get_mut(&key) else {
+            return Ok(None);
+        };
+        if !Weak::ptr_eq(&entry.thunk, &Rc::downgrade(thunk)) {
+            gates.remove(&key);
+            return Ok(None);
+        }
+        if entry.gate.id().runtime() != runtime {
+            return Err(SemaError::eval(
+                "force: delayed promise is already active in another runtime",
+            ));
+        }
+        entry.active_calls += 1;
+        Ok(Some((
+            entry.gate.clone(),
+            ForceGateLease {
+                state: self.self_ref.clone(),
+                thunk: key,
+                gate: entry.gate.id(),
+            },
+        )))
+    }
+
+    fn install_gate(
+        &self,
+        thunk: &Rc<Thunk>,
+        gate: sema_core::runtime::ResourceGateHandle,
+    ) -> Result<(sema_core::runtime::ResourceGateHandle, ForceGateLease), SemaError> {
+        match self.active_gate(thunk) {
+            Ok(Some(existing)) => {
+                let _ = gate.close();
+                return Ok(existing);
+            }
+            Err(error) => {
+                let _ = gate.close();
+                return Err(error);
+            }
+            Ok(None) => {}
+        }
+        let key = sema_core::NodePtr::of_rc(thunk);
+        let gate_id = gate.id();
+        self.gates.borrow_mut().insert(
+            key,
+            ForceGateEntry {
+                thunk: Rc::downgrade(thunk),
+                gate: gate.clone(),
+                active_calls: 1,
+            },
+        );
+        Ok((
+            gate,
+            ForceGateLease {
+                state: self.self_ref.clone(),
+                thunk: key,
+                gate: gate_id,
+            },
+        ))
+    }
+
+    fn has_active_force(&self, thunk: &Rc<Thunk>) -> bool {
+        let key = sema_core::NodePtr::of_rc(thunk);
+        self.gates.borrow().get(&key).is_some_and(|entry| {
+            entry.active_calls > 0 && Weak::ptr_eq(&entry.thunk, &Rc::downgrade(thunk))
+        })
+    }
+
+    fn has_active_legacy_force(&self, thunk: &Rc<Thunk>) -> bool {
+        let key = sema_core::NodePtr::of_rc(thunk);
+        self.legacy_calls
+            .borrow()
+            .get(&key)
+            .is_some_and(|active| Weak::ptr_eq(active, &Rc::downgrade(thunk)))
+    }
+
+    fn begin_legacy_force(&self, thunk: &Rc<Thunk>) -> Result<LegacyForceLease, SemaError> {
+        if self.has_active_force(thunk) {
+            return Err(SemaError::eval(
+                "force: delayed promise is already active in the cooperative runtime",
+            ));
+        }
+        if self.has_active_legacy_force(thunk) {
+            return Err(SemaError::eval(
+                "force: delayed promise is already active in the synchronous evaluator",
+            ));
+        }
+        let key = sema_core::NodePtr::of_rc(thunk);
+        self.legacy_calls
+            .borrow_mut()
+            .insert(key, Rc::downgrade(thunk));
+        Ok(LegacyForceLease {
+            state: self.self_ref.clone(),
+            thunk: key,
+        })
+    }
+}
+
+struct ForceGateCreated {
+    state: Weak<ForceRuntimeState>,
+    thunk: ForceThunkRoot,
+}
+
+impl sema_core::runtime::Trace for ForceGateCreated {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        self.thunk.trace(sink)
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for ForceGateCreated {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{ResumeInput, RuntimeResponse};
+
+        let ResumeInput::Runtime(RuntimeResponse::ResourceGate(gate)) = input else {
+            return match input {
+                ResumeInput::Failed(error) => Err(error),
+                ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                    "force gate allocation was cancelled ({reason:?})"
+                ))),
+                _ => Err(SemaError::eval(
+                    "force gate allocation returned an unexpected runtime response",
+                )),
+            };
+        };
+        let Some(state) = self.state.upgrade() else {
+            let _ = gate.close();
+            return Err(SemaError::eval("force runtime state is unavailable"));
+        };
+        let thunk = self.thunk.0.as_thunk_rc().ok_or_else(|| {
+            let _ = gate.close();
+            SemaError::eval("force gate allocation lost its delayed promise")
+        })?;
+        let (gate, lease) = state.install_gate(&thunk, gate)?;
+        acquire_force_gate(self.thunk, gate.id(), state.force_env.clone(), lease)
+    }
+}
+
+fn acquire_force_gate(
+    thunk: ForceThunkRoot,
+    gate: sema_core::runtime::ResourceGateId,
+    force_env: Weak<Env>,
+    lease: ForceGateLease,
+) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::{NativeOutcome, NativeSuspend, WaitKind};
+
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::ResourceSlot(gate),
+        continuation: Box::new(ForceGateAcquired {
+            thunk,
+            gate,
+            force_env,
+            lease,
+        }),
+    }))
+}
+
+struct ForceGateAcquired {
+    thunk: ForceThunkRoot,
+    gate: sema_core::runtime::ResourceGateId,
+    force_env: Weak<Env>,
+    lease: ForceGateLease,
+}
+
+impl sema_core::runtime::Trace for ForceGateAcquired {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        self.thunk.trace(sink)
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for ForceGateAcquired {
+    fn resume(
+        self: Box<Self>,
+        context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{ResumeInput, RuntimeResponse};
+
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Value(_)) => {
+                start_forced_body(context, self.thunk, self.gate, self.force_env, self.lease)
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "force gate acquisition was cancelled ({reason:?})"
+            ))),
+            _ => Err(SemaError::eval(
+                "force gate acquisition returned an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+fn release_force_gate(
+    gate: sema_core::runtime::ResourceGateId,
+    outcome: sema_core::runtime::TaskOutcome,
+    lease: ForceGateLease,
+) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::{NativeOutcome, RuntimeRequest};
+
+    Ok(NativeOutcome::Runtime(
+        RuntimeRequest::ReleaseResourceGate {
+            gate,
+            continuation: Box::new(ForceReleaseContinuation {
+                outcome,
+                _lease: lease,
+            }),
+        },
+    ))
+}
+
+struct ForceReleaseContinuation {
+    outcome: sema_core::runtime::TaskOutcome,
+    _lease: ForceGateLease,
+}
+
+impl sema_core::runtime::Trace for ForceReleaseContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        self.outcome.trace(sink)
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for ForceReleaseContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeOutcome, ResumeInput, RuntimeResponse, TaskOutcome};
+
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Value(_)) => match self.outcome {
+                TaskOutcome::Returned(value) => Ok(NativeOutcome::Return(value)),
+                TaskOutcome::Failed(error) => Err(error),
+                TaskOutcome::Cancelled(reason) => Err(SemaError::eval(format!(
+                    "force body was cancelled ({reason:?})"
+                ))),
+            },
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "force gate release was cancelled ({reason:?})"
+            ))),
+            _ => Err(SemaError::eval(
+                "force gate release returned an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// Completes the single cooperative evaluation that owns a thunk's force gate.
+/// Only a normal return populates the memo cell; every terminal path releases
+/// the gate or lets runtime cancellation teardown transfer it to a waiter.
+struct ForceContinuation {
+    thunk: ForceThunkRoot,
+    gate: sema_core::runtime::ResourceGateId,
+    lease: ForceGateLease,
+}
+
+impl sema_core::runtime::Trace for ForceContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        self.thunk.trace(sink)
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for ForceContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+
+        match input {
+            ResumeInput::Returned(value) => {
+                let thunk = self.thunk.0.as_thunk_rc().ok_or_else(|| {
+                    SemaError::eval("force continuation lost its delayed promise")
+                })?;
+                let mut forced = thunk.forced.borrow_mut();
+                let value = forced.get_or_insert_with(|| value.clone()).clone();
+                drop(forced);
+                release_force_gate(
+                    self.gate,
+                    sema_core::runtime::TaskOutcome::Returned(value),
+                    self.lease,
+                )
+            }
+            ResumeInput::Failed(error) => release_force_gate(
+                self.gate,
+                sema_core::runtime::TaskOutcome::Failed(error),
+                self.lease,
+            ),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "force body was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "force continuation received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+fn force_thunk(args: &[Value]) -> Result<Rc<Thunk>, SemaError> {
+    if args.len() != 1 {
+        return Err(SemaError::arity("force", "1", args.len()));
+    }
+    args[0].as_thunk_rc().ok_or_else(|| {
+        SemaError::type_error("thunk", args[0].type_name()).with_hint(
+            "force: argument must be a (delay ...) or promise — non-promise values are an error",
+        )
+    })
+}
+
+fn force_runtime_call(
+    state: &ForceRuntimeState,
+    _context: &mut sema_core::runtime::NativeCallContext<'_>,
+    args: &[Value],
+) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::{NativeOutcome, RuntimeRequest};
+
+    let thunk = force_thunk(args)?;
+    if let Some(value) = thunk.forced.borrow().as_ref() {
+        return Ok(NativeOutcome::Return(value.clone()));
+    }
+
+    if let Some((gate, lease)) = state.active_gate(&thunk)? {
+        return acquire_force_gate(
+            ForceThunkRoot(args[0].clone()),
+            gate.id(),
+            state.force_env.clone(),
+            lease,
+        );
+    }
+
+    Ok(NativeOutcome::Runtime(RuntimeRequest::CreateResourceGate {
+        continuation: Box::new(ForceGateCreated {
+            state: state.self_ref.clone(),
+            thunk: ForceThunkRoot(args[0].clone()),
+        }),
+    }))
+}
+
+fn start_forced_body(
+    context: &mut sema_core::runtime::NativeCallContext<'_>,
+    thunk_root: ForceThunkRoot,
+    gate: sema_core::runtime::ResourceGateId,
+    force_env: Weak<Env>,
+    lease: ForceGateLease,
+) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::{NativeCall, NativeOutcome, TaskOutcome};
+
+    let prepared = (|| -> Result<Option<Value>, SemaError> {
+        let thunk = thunk_root
+            .0
+            .as_thunk_rc()
+            .ok_or_else(|| SemaError::eval("force gate lost its delayed promise"))?;
+        if thunk.forced.borrow().is_some() {
+            return Ok(None);
+        }
+
+        if thunk.body.as_native_fn_rc().is_some() || thunk.body.as_lambda_rc().is_some() {
+            return Ok(Some(thunk.body.clone()));
+        }
+        let force_env = upgrade_delegate_env(&force_env)?;
+        let expanded = expand_for_vm_in(context.eval_context, &force_env, &thunk.body)?;
+        if expanded.is_nil() {
+            let value = Value::nil();
+            *thunk.forced.borrow_mut() = Some(value);
+            return Ok(None);
+        }
+        let program = sema_vm::compile_program(std::slice::from_ref(&expanded), None)?;
+        sema_vm::program_as_callable(program, force_env).map(Some)
+    })();
+
+    let callable = match prepared {
+        Ok(Some(callable)) => callable,
+        Ok(None) => {
+            let thunk = thunk_root
+                .0
+                .as_thunk_rc()
+                .expect("prepared force retained its thunk");
+            let value = thunk.forced.borrow().as_ref().cloned().ok_or_else(|| {
+                SemaError::eval("force completed without a callable or memoized value")
+            });
+            return match value {
+                Ok(value) => release_force_gate(gate, TaskOutcome::Returned(value), lease),
+                Err(error) => release_force_gate(gate, TaskOutcome::Failed(error), lease),
+            };
+        }
+        Err(error) => return release_force_gate(gate, TaskOutcome::Failed(error), lease),
+    };
+
+    Ok(NativeOutcome::Call(NativeCall {
+        callable,
+        args: Vec::new(),
+        continuation: Box::new(ForceContinuation {
+            thunk: thunk_root,
+            gate,
+            lease,
+        }),
+    }))
+}
+
+fn force_legacy(
+    state: &ForceRuntimeState,
+    context: &EvalContext,
+    args: &[Value],
+) -> Result<Value, SemaError> {
+    let thunk = force_thunk(args)?;
+    if let Some(value) = thunk.forced.borrow().as_ref() {
+        return Ok(value.clone());
+    }
+    let _lease = state.begin_legacy_force(&thunk)?;
+    let value = if thunk.body.as_native_fn_rc().is_some() || thunk.body.as_lambda_rc().is_some() {
+        sema_core::call_callback(context, &thunk.body, &[])?
+    } else {
+        let force_env = upgrade_delegate_env(&state.force_env)?;
+        eval_value_vm(context, &thunk.body, &force_env)?
+    };
+    *thunk.forced.borrow_mut() = Some(value.clone());
+    Ok(value)
+}
+
 /// Register the `__vm-*` delegate natives into `env`.
 ///
 /// Invariant I2 (CORE-2): each delegate's boxed closure captures the env it is
@@ -2192,33 +2709,18 @@ pub fn register_vm_delegates(env: &Rc<Env>, ctx: &Rc<EvalContext>) {
     );
 
     // __vm-force: force a thunk
-    let force_env = Rc::downgrade(env);
+    let force_state = ForceRuntimeState::new(Rc::downgrade(env));
     env.set(
         intern("__vm-force"),
-        Value::native_fn(NativeFn::with_ctx("__vm-force", move |ctx, args| {
-            if args.len() != 1 {
-                return Err(SemaError::arity("force", "1", args.len()));
-            }
-            if let Some(thunk) = args[0].as_thunk_rc() {
-                if let Some(val) = thunk.forced.borrow().as_ref() {
-                    return Ok(val.clone());
-                }
-                let val = if thunk.body.as_native_fn_rc().is_some()
-                    || thunk.body.as_lambda_rc().is_some()
-                {
-                    sema_core::call_callback(ctx, &thunk.body, &[])?
-                } else {
-                    // Non-callable thunk body (a raw expr) — evaluate on the VM.
-                    let force_env = upgrade_delegate_env(&force_env)?;
-                    eval_value_vm(ctx, &thunk.body, &force_env)?
-                };
-                *thunk.forced.borrow_mut() = Some(val.clone());
-                Ok(val)
-            } else {
-                Err(SemaError::type_error("thunk", args[0].type_name())
-                    .with_hint("force: argument must be a (delay ...) or promise — non-promise values are an error"))
-            }
-        })),
+        Value::native_fn(
+            NativeFn::with_payload_ctx_runtime(
+                "__vm-force",
+                force_state,
+                force_legacy,
+                force_runtime_call,
+            )
+            .with_escaping_args(&[0]),
+        ),
     );
 
     // __vm-macroexpand: expand a macro form
@@ -2659,6 +3161,390 @@ mod runtime_eval_tests {
             .eval_str_via_runtime(program)
             .unwrap_or_else(|e| panic!("eval_str_via_runtime failed for {program:?}: {e:?}"));
         assert_eq!(got, expected, "runtime != oracle for {program:?}");
+    }
+
+    #[test]
+    fn runtime_force_drives_runtime_only_delayed_body() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(let ((ch (channel/new 1))) \
+                   (async/spawn (fn () (async/sleep 1) (channel/send ch 42))) \
+                   (force (delay (channel/recv ch))))",
+            )
+            .expect("force drives the delayed body on the active runtime task");
+
+        assert_eq!(result, Value::int(42));
+    }
+
+    #[test]
+    fn runtime_force_memoizes_success_exactly_once_after_suspension() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define force-count 0) \
+                   (define p \
+                     (delay (begin \
+                              (async/sleep 1) \
+                              (set! force-count (+ force-count 1)) \
+                              force-count))) \
+                   (list (force p) (force p) force-count (promise-forced? p)))",
+            )
+            .expect("a successfully forced promise is memoized");
+
+        assert_eq!(result, lit("(list 1 1 1 #t)"));
+    }
+
+    #[test]
+    fn concurrent_runtime_force_evaluates_the_delayed_body_once() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define force-count 0) \
+                   (define p \
+                     (delay (begin \
+                              (async/sleep 10) \
+                              (set! force-count (+ force-count 1)) \
+                              force-count))) \
+                   (list \
+                     (async/await \
+                       (async/all (list (async (force p)) (async (force p))))) \
+                     force-count))",
+            )
+            .expect("concurrent force calls share one delayed evaluation");
+
+        assert_eq!(result, lit("(list (list 1 1) 1)"));
+    }
+
+    #[test]
+    fn overlapping_force_from_a_shared_foreign_runtime_is_rejected() {
+        let (env, ctx) = Interpreter::new_parts();
+        let first = Interpreter::from_parts(Rc::clone(&env), Rc::clone(&ctx));
+        let second = Interpreter::from_parts(env, ctx);
+        first
+            .eval_str_via_runtime(
+                "(begin
+                   (define force-count 0)
+                   (define p
+                     (delay
+                       (begin
+                         (set! force-count (+ force-count 1))
+                         (async/sleep 20)
+                         force-count))))",
+            )
+            .expect("prepare a shared delayed promise");
+        let root = first
+            .submit_str("(force p)", RootOptions::default())
+            .expect("submit force on the first runtime");
+        first
+            .drive_roots(&[root.id()])
+            .expect("drive the first force to its timer");
+        assert!(matches!(root.poll_result(), RootPoll::Pending));
+
+        let error = second
+            .eval_str("(force p)")
+            .expect_err("a foreign runtime must not close or bypass the live force gate");
+        assert!(
+            error
+                .to_string()
+                .contains("already active in another runtime"),
+            "unexpected error: {error}"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let settlement = drive_selected_until_ready(&first, &root);
+        assert_eq!(returned_value(&settlement), Value::int(1));
+        assert_eq!(
+            first
+                .eval_str_via_runtime("force-count")
+                .expect("inspect exactly-once side effect"),
+            Value::int(1)
+        );
+    }
+
+    #[test]
+    fn runtime_force_failure_is_not_memoized() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define force-count 0) \
+                   (define p \
+                     (delay (begin \
+                              (async/sleep 1) \
+                              (set! force-count (+ force-count 1)) \
+                              (error \"expected force failure\")))) \
+                   (define first (try (force p) (catch e :failed))) \
+                   (define second (try (force p) (catch e :failed))) \
+                   (list first second force-count (promise-forced? p)))",
+            )
+            .expect("failed forcing remains catchable and retryable");
+
+        assert_eq!(result, lit("(list :failed :failed 2 #f)"));
+    }
+
+    #[test]
+    fn runtime_force_preserves_memoized_value_identity() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define p (delay (begin (async/sleep 1) (mutable-array/new)))) \
+                   (define first (force p)) \
+                   (mutable-array/push! first 99) \
+                   (mutable-array/get (force p) 0))",
+            )
+            .expect("force returns the exact memoized heap value");
+
+        assert_eq!(result, Value::int(99));
+    }
+
+    #[test]
+    fn runtime_force_cancellation_does_not_memoize() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define force-gate (channel/new 1)) \
+                   (define force-promise (delay (channel/recv force-gate))))",
+            )
+            .expect("prepare a promise whose body parks");
+        let root = interp
+            .submit_str("(force force-promise)", RootOptions::default())
+            .expect("submit force root");
+
+        interp
+            .drive_roots(&[root.id()])
+            .expect("drive force body to its channel wait");
+        assert!(matches!(root.poll_result(), RootPoll::Pending));
+        assert!(root.cancel(CancelReason::Explicit));
+        let settlement = drive_selected_until_ready(&interp, &root);
+        assert!(matches!(
+            settlement.outcome,
+            TaskOutcome::Cancelled(CancelReason::Explicit)
+        ));
+        assert_eq!(
+            interp
+                .eval_str_via_runtime("(promise-forced? force-promise)")
+                .expect("inspect cancelled force"),
+            Value::bool(false),
+        );
+    }
+
+    #[test]
+    fn cancelled_force_owner_releases_the_next_waiter_to_retry() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define entered (channel/new 2)) \
+                   (define body-gate (channel/new 1)) \
+                   (define force-count 0) \
+                   (define p \
+                     (delay (begin \
+                              (channel/send entered :entered) \
+                              (channel/recv body-gate) \
+                              (set! force-count (+ force-count 1)) \
+                              force-count))) \
+                   (define first (async (force p))) \
+                   (channel/recv entered) \
+                   (define second (async (force p))) \
+                   (async/sleep 1) \
+                   (async/cancel first) \
+                   (channel/send body-gate :continue) \
+                   (list \
+                     (try (await first) (catch error :cancelled)) \
+                     (await second) \
+                     force-count \
+                     (promise-forced? p)))",
+            )
+            .expect("a cancelled force owner hands the gate to its waiter");
+
+        assert_eq!(result, lit("(list :cancelled 1 1 #t)"));
+    }
+
+    #[test]
+    fn cancelling_nested_force_wait_releases_only_the_waited_gate() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin
+                   (define entered (channel/new 1))
+                   (define hold (channel/new 1))
+                   (define q
+                     (delay
+                       (begin
+                         (channel/send entered :q)
+                         (channel/recv hold)
+                         7)))
+                   (define q-owner (async (force q)))
+                   (channel/recv entered)
+                   (define p (delay (force q)))
+                   (define p-owner (async (force p)))
+                   (async/sleep 5)
+                   (async/cancel p-owner)
+                   (channel/send hold :go)
+                   (list
+                     (try (await p-owner) (catch error :cancelled))
+                     (await q-owner)))",
+            )
+            .expect("nested force cancellation preserves the independently owned gate");
+
+        assert_eq!(result, lit("(list :cancelled 7)"));
+    }
+
+    #[test]
+    fn recursive_force_fails_instead_of_waiting_on_its_own_gate() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define p (delay (force p))) \
+                   (list \
+                     (try (force p) (catch error :recursive-force)) \
+                     (promise-forced? p)))",
+            )
+            .expect("recursive force remains catchable rather than deadlocking");
+
+        assert_eq!(result, lit("(list :recursive-force #f)"));
+    }
+
+    #[test]
+    fn recursive_force_from_the_synchronous_bridge_fails_without_recursing() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str_via_runtime(
+                "(define legacy-recursive-p
+                   (delay (force legacy-recursive-p)))",
+            )
+            .expect("define a recursively forced promise");
+        let (exprs, _) = sema_reader::read_many_with_spans("(force legacy-recursive-p)")
+            .expect("parse legacy force expression");
+
+        let error = eval_value_vm(&interp.ctx, &exprs[0], &interp.global_env)
+            .expect_err("the synchronous bridge detects recursive force");
+        assert!(
+            error
+                .to_string()
+                .contains("already active in the synchronous evaluator"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn deadlocked_force_owner_releases_the_gate_for_a_later_root() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define force-deadlock-gate (channel/new 1)) \
+                   (define force-deadlock-promise \
+                     (delay (channel/recv force-deadlock-gate))))",
+            )
+            .expect("prepare a promise whose first force deadlocks");
+
+        let first = interp
+            .eval_str_via_runtime("(force force-deadlock-promise)")
+            .expect_err("the first root has no channel producer");
+        assert!(first.to_string().contains("channel is empty"));
+
+        let retried = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (async (channel/send force-deadlock-gate 9)) \
+                   (force force-deadlock-promise))",
+            )
+            .expect("a later root can acquire and retry the deadlocked force");
+        assert_eq!(retried, Value::int(9));
+    }
+
+    #[test]
+    fn force_continuations_trace_their_retained_thunk_root() {
+        let thunk = Value::thunk(Thunk {
+            body: Value::int(7),
+            forced: RefCell::new(None),
+        });
+        let expected = sema_core::NodePtr::of_value(&thunk).expect("thunk has a GC node");
+        let root = ForceThunkRoot(thunk.clone());
+        let mut traced = Vec::new();
+
+        assert!(sema_core::runtime::Trace::trace(&root, &mut |edge| {
+            if let sema_core::cycle::GcEdge::Value(value) = edge {
+                traced.push(sema_core::NodePtr::of_value(value));
+            }
+        },));
+        assert_eq!(traced, vec![Some(expected)]);
+    }
+
+    #[test]
+    fn active_force_lease_prevents_weak_pruning_and_aba_cleanup() {
+        let interp = Interpreter::new();
+        let root = interp
+            .submit_str("nil", RootOptions::default())
+            .expect("mint a runtime-scoped root identity");
+        let runtime = root.id().runtime();
+        let previous_root = sema_core::set_current_root(Some(root.id()));
+        let mut gate_ids = sema_core::runtime::RuntimeScopedIdCounter::<
+            sema_core::runtime::ResourceGateId,
+        >::new(runtime);
+        let closer = Rc::new(|_| Ok(true));
+        let first_handle = sema_core::runtime::ResourceGateHandle::new(
+            gate_ids.allocate().expect("first gate id"),
+            closer.clone(),
+        );
+        let replacement_handle = sema_core::runtime::ResourceGateHandle::new(
+            gate_ids.allocate().expect("replacement gate id"),
+            closer,
+        );
+        let state = ForceRuntimeState::new(Rc::downgrade(&interp.global_env));
+        let thunk = Rc::new(Thunk {
+            body: Value::int(1),
+            forced: RefCell::new(None),
+        });
+        let key = sema_core::NodePtr::of_rc(&thunk);
+        let (_, lease) = state
+            .install_gate(&thunk, first_handle)
+            .expect("install active force gate");
+
+        drop(thunk);
+        let unrelated = Rc::new(Thunk {
+            body: Value::int(2),
+            forced: RefCell::new(None),
+        });
+        assert!(state
+            .active_gate(&unrelated)
+            .expect("unrelated lookup")
+            .is_none());
+        assert_eq!(
+            state.gates.borrow().len(),
+            1,
+            "an active lease keeps its gate entry after the thunk root drops"
+        );
+
+        // A stale lease also carries the exact gate generation. If a map entry
+        // were replaced at the same node key, dropping the old lease must not
+        // decrement or remove the replacement.
+        state.gates.borrow_mut().insert(
+            key,
+            ForceGateEntry {
+                thunk: Rc::downgrade(&unrelated),
+                gate: replacement_handle,
+                active_calls: 1,
+            },
+        );
+        drop(lease);
+        assert_eq!(
+            state
+                .gates
+                .borrow()
+                .get(&key)
+                .map(|entry| entry.active_calls),
+            Some(1)
+        );
+        state.gates.borrow_mut().remove(&key);
+        sema_core::set_current_root(previous_root);
     }
 
     // Higher-order stdlib functions re-enter the evaluator through the

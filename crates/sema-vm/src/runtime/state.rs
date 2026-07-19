@@ -1573,15 +1573,12 @@ impl Runtime {
         };
         {
             let mut state = self.state.borrow_mut();
-            if let Some(task) = state.tasks.get_mut(&task_id) {
-                if task.record.request_cancellation(CancelReason::HostStop) {
-                    state.pending_cancel_waits.push_back(task_id);
-                }
-            }
             state.ready.enqueue(root, task_id);
         }
-        // Cancel the root's main task too so a parent parked on `await` (and any
-        // siblings) unwind rather than dangling once the paused child is dropped.
+        // The canonical root path records cancellation for the paused task and
+        // every sibling, then eagerly tears down their waits and owned resource
+        // gates. Recording it separately here would make the canonical path see
+        // an already-cancelled task and skip that teardown.
         self.cancel_root(root, CancelReason::HostStop);
         true
     }
@@ -3427,7 +3424,7 @@ impl Runtime {
                 let mut state = self.state.borrow_mut();
                 let result = state
                     .resource_gates
-                    .release(gate)
+                    .release_owned(gate, task_id)
                     .map(|()| RuntimeResponse::Value(sema_core::Value::nil()))
                     .map_err(registry_error);
                 // A release grants the FIFO head (if any) — deliver that wake.
@@ -4782,6 +4779,27 @@ impl Runtime {
                 })?
         };
 
+        // A task may park on a cycle-forming wait while retaining one or more
+        // outer resource slots. Deadlock settlement bypasses continuation
+        // resumption, so release those slots before dropping the task record;
+        // otherwise later roots can be stranded behind a reaped owner.
+        {
+            let mut state = self.state.borrow_mut();
+            let awaited_gate = state.protocol_waits.get(&key).and_then(|wait| {
+                if let ProtocolWaitKind::ResourceSlot { gate } = &wait.kind {
+                    Some(*gate)
+                } else {
+                    None
+                }
+            });
+            let owned_gates = state.resource_gates.owner_gates(task_id);
+            for gate in owned_gates {
+                if Some(gate) != awaited_gate {
+                    release_owned_gate(&mut state, task_id, gate)?;
+                }
+            }
+        }
+
         {
             let mut state = self.state.borrow_mut();
             let resource_gate = state.protocol_waits.get(&key).and_then(|wait| {
@@ -5151,6 +5169,44 @@ impl Runtime {
     }
 
     #[cfg(test)]
+    pub(super) fn has_pending_resource_slot_suspend_for_test(
+        &self,
+        task_id: TaskId,
+        gate: ResourceGateId,
+    ) -> bool {
+        self.state.borrow().pending.iter().any(|stage| {
+            matches!(
+                stage,
+                PendingStage::Action(TaskAction::Native(
+                    pending_task,
+                    Ok(NativeOutcome::Suspend(sema_core::runtime::NativeSuspend {
+                        wait: WaitKind::ResourceSlot(pending_gate),
+                        ..
+                    }))
+                )) if *pending_task == task_id && *pending_gate == gate
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_pending_resource_gate_release_for_test(
+        &self,
+        task_id: TaskId,
+        gate: ResourceGateId,
+    ) -> bool {
+        self.state.borrow().pending.iter().any(|stage| {
+            matches!(
+                stage,
+                PendingStage::DispatchRuntime(
+                    pending_task,
+                    _,
+                    RuntimeRequest::ReleaseResourceGate { gate: pending_gate, .. }
+                ) if *pending_task == task_id && *pending_gate == gate
+            )
+        })
+    }
+
+    #[cfg(test)]
     pub(super) fn origin_barrier_wait_count_for_test(&self) -> usize {
         self.state.borrow().origin_barrier_waits
     }
@@ -5362,25 +5418,30 @@ fn cancel_descendants(state: &mut RuntimeState, parent: TaskId) -> Vec<TaskId> {
     newly
 }
 
-/// Which eager wait teardown a cancelled task needs (DECISION C2). Only the
-/// in-flight kinds — External / ResourceSlot, plus a granted-but-not-run
-/// resource gate — are delivered eagerly; Promise / bare Timer / Channel waits
-/// carry no offloaded work to abort and are left to the per-drive-turn
-/// `cancel_waiting` scan.
-enum EagerTeardown {
+/// Which eager wait teardown a cancelled task needs (DECISION C2). Promise,
+/// bare Timer, and Channel waits carry no offloaded work to abort and are left
+/// to the per-drive-turn `cancel_waiting` scan.
+enum EagerWaitTeardown {
     ResourceSlot(super::WaitKey, ResourceGateId),
     External,
-    GrantedGate,
     None,
+}
+
+struct EagerTeardown {
+    wait: EagerWaitTeardown,
+    /// A callback may nest independently gated operations. Cancellation must
+    /// release every slot already owned before the task entered its current
+    /// wait, not just the registry's first match.
+    owned_gates: Vec<ResourceGateId>,
 }
 
 /// Deliver wait teardown for a task at cancellation-REQUEST time (DECISION C2).
 ///
-/// When a cancellation has just been recorded on a task parked on an External /
-/// ResourceSlot wait (or holding a granted-but-not-run resource gate), tear the
-/// wait down SYNCHRONOUSLY right now rather than waiting for the per-drive-turn
-/// `cancel_waiting` scan — so a settled root followed by process exit never
-/// leaves an in-flight subprocess/request/gate un-aborted
+/// When cancellation is recorded, tear down an External / ResourceSlot wait and
+/// release every resource gate the task already owns SYNCHRONOUSLY rather than
+/// waiting for the per-drive-turn `cancel_waiting` scan — so a settled root
+/// followed by process exit never leaves an in-flight subprocess/request/gate
+/// un-aborted
 /// (ASYNC-TIMEOUT-CANCEL-1).
 ///
 /// Exactly-once: the wait registration (`protocol_waits` / `WaitRuntime::active`
@@ -5391,7 +5452,7 @@ pub(super) fn deliver_cancel_teardown(
     cell: &RefCell<RuntimeState>,
     task_id: TaskId,
 ) -> Result<bool, RuntimeFault> {
-    let kind = {
+    let teardown = {
         let state = cell.borrow();
         let Some(task) = state.tasks.get(&task_id) else {
             return Ok(false);
@@ -5399,44 +5460,44 @@ pub(super) fn deliver_cancel_teardown(
         if task.record.cancellation().is_none() {
             return Ok(false);
         }
-        match task.record.state_name() {
+        let mut owned_gates = state.resource_gates.owner_gates(task_id);
+        let wait = match task.record.state_name() {
             super::StateName::Waiting => {
                 let key = task.record.wait_key().expect("waiting task has a wait key");
                 match state.protocol_waits.get(&key).map(|wait| &wait.kind) {
                     Some(ProtocolWaitKind::ResourceSlot { gate }) => {
-                        EagerTeardown::ResourceSlot(key, *gate)
+                        // A committed grant appears both as this protocol wait
+                        // and as an owned gate; the wait teardown releases it.
+                        owned_gates.retain(|owned| owned != gate);
+                        EagerWaitTeardown::ResourceSlot(key, *gate)
                     }
                     // Promise / bare Timer / Channel waits: nothing to abort.
-                    Some(_) => EagerTeardown::None,
+                    Some(_) => EagerWaitTeardown::None,
                     None if state
                         .waits
                         .as_ref()
                         .is_some_and(|waits| waits.is_active(key)) =>
                     {
-                        EagerTeardown::External
+                        EagerWaitTeardown::External
                     }
                     // A bare `Timer` key (in `timers` only, no protocol-wait
                     // entry): self-resolving, left to the scan.
-                    None => EagerTeardown::None,
+                    None => EagerWaitTeardown::None,
                 }
             }
-            // Granted-but-not-run: the task was handed a gate slot (it is the gate
-            // owner) but its acquire continuation has not run — that continuation
-            // raises on the cancellation WITHOUT releasing, so release for it.
-            super::StateName::Running if state.resource_gates.owner_gate(task_id).is_some() => {
-                EagerTeardown::GrantedGate
-            }
-            _ => EagerTeardown::None,
-        }
+            _ => EagerWaitTeardown::None,
+        };
+        EagerTeardown { wait, owned_gates }
     };
-    match kind {
-        EagerTeardown::None => Ok(false),
-        EagerTeardown::ResourceSlot(key, gate) => {
-            eager_resource_slot_teardown(cell, task_id, key, gate)
+    let wait_torn_down = match teardown.wait {
+        EagerWaitTeardown::None => false,
+        EagerWaitTeardown::ResourceSlot(key, gate) => {
+            eager_resource_slot_teardown(cell, task_id, key, gate)?
         }
-        EagerTeardown::External => eager_external_teardown(cell, task_id),
-        EagerTeardown::GrantedGate => eager_release_granted_gate(cell, task_id),
-    }
+        EagerWaitTeardown::External => eager_external_teardown(cell, task_id)?,
+    };
+    let gates_released = eager_release_owned_gates(cell, task_id, &teardown.owned_gates)?;
+    Ok(wait_torn_down || gates_released)
 }
 
 /// Eager teardown of a task parked on a `ResourceSlot` wait. If it is still
@@ -5512,21 +5573,17 @@ fn remove_resource_slot_wait(
         )
     });
     if !closed_wake_pending {
-        match state.resource_gates.owner_gate(task_id) {
-            Some(owner_gate) if owner_gate == gate => {
+        match state.resource_gates.gate_owner(gate) {
+            Ok(Some(owner)) if owner == task_id => {
                 // A grant was committed but its wake has not run. Releasing the
                 // live owner is infallible after the ownership check; any staged
                 // grant wake remains queued and becomes a harmless late no-op.
-                release_owned_gate(state, gate)?;
+                release_owned_gate(state, task_id, gate)?;
             }
-            Some(owner_gate) => {
-                return Err(RuntimeFault::Invariant {
-                    message: format!(
-                        "resource slot task {task_id:?} owns {owner_gate:?}, not registered gate {gate:?}"
-                    ),
-                });
-            }
-            None => match state.resource_gates.cancel_wait(gate, key) {
+            // Another task owns the gate, or the gate became free before this
+            // teardown ran. In either case this task must still be present in
+            // the FIFO queue for the registered wait to be valid.
+            Ok(Some(_)) | Ok(None) => match state.resource_gates.cancel_wait(gate, key) {
                 Ok(true) => {}
                 Ok(false) => {
                     return Err(RuntimeFault::Invariant {
@@ -5548,6 +5605,18 @@ fn remove_resource_slot_wait(
                     });
                 }
             },
+            Err(RegistryError::Unknown) => {
+                return Err(RuntimeFault::Invariant {
+                    message: format!(
+                        "resource slot gate {gate:?} disappeared without a pending Closed wake for task {task_id:?}, wait {key:?}"
+                    ),
+                });
+            }
+            Err(error) => {
+                return Err(RuntimeFault::Invariant {
+                    message: format!("resource slot teardown failed: {error:?}"),
+                });
+            }
         }
     }
 
@@ -5598,28 +5667,34 @@ fn eager_external_teardown(
     Ok(false)
 }
 
-/// Eager release of a gate whose slot a Running task HOLDS after being granted it
-/// but before running its acquire continuation (windows B/C). The task's pending
-/// grant resume will resolve to the cancellation and raise without releasing, so
-/// the runtime releases here to keep the gate from leaking.
-fn eager_release_granted_gate(
+/// Release every resource gate a cancelled task already owns. This covers both
+/// granted-but-not-run acquisitions and callbacks parked on another wait while
+/// retaining one or more outer slots.
+fn eager_release_owned_gates(
     cell: &RefCell<RuntimeState>,
     task_id: TaskId,
+    gates: &[ResourceGateId],
 ) -> Result<bool, RuntimeFault> {
-    let mut state = cell.borrow_mut();
-    let Some(gate) = state.resource_gates.owner_gate(task_id) else {
+    if gates.is_empty() {
         return Ok(false);
-    };
-    release_owned_gate(&mut state, gate)?;
+    }
+    let mut state = cell.borrow_mut();
+    for &gate in gates {
+        release_owned_gate(&mut state, task_id, gate)?;
+    }
     Ok(true)
 }
 
 /// Release a gate the runtime holds on behalf of a cancelled owner, forwarding
 /// any resulting grant wake (transfer to the FIFO head) into the pending queue.
-fn release_owned_gate(state: &mut RuntimeState, gate: ResourceGateId) -> Result<(), RuntimeFault> {
+fn release_owned_gate(
+    state: &mut RuntimeState,
+    task_id: TaskId,
+    gate: ResourceGateId,
+) -> Result<(), RuntimeFault> {
     state
         .resource_gates
-        .release(gate)
+        .release_owned(gate, task_id)
         .map_err(|error| RuntimeFault::Invariant {
             message: format!("resource gate release failed: {error:?}"),
         })?;
@@ -5649,6 +5724,8 @@ fn registry_error(error: super::RegistryError) -> sema_core::SemaError {
         super::RegistryError::WrongRuntime => "runtime handle belongs to another runtime",
         super::RegistryError::Unknown => "runtime handle is stale or unknown",
         super::RegistryError::AlreadySettled => "promise is already settled",
+        super::RegistryError::AlreadyOwned => "resource gate is already owned by this task",
+        super::RegistryError::NotOwned => "resource gate is not owned by this task",
         super::RegistryError::DuplicateWait => "runtime wait is already registered",
         super::RegistryError::IdExhausted => "runtime identity exhausted",
     })
@@ -6192,6 +6269,24 @@ fn install_resource_slot_wait(
     owner: ReturnOwner,
     frame: ContinuationFrame,
 ) -> Result<(), ProtocolInstallError> {
+    // Cancellation can land after the native continuation stages this suspend
+    // but before the pending stage installs it. Do not acquire a gate for an
+    // already-cancelled task: its sticky cancellation will be delivered when
+    // this rejected response resumes the continuation.
+    if state
+        .tasks
+        .get(&task_id)
+        .expect("protocol task exists")
+        .record
+        .cancellation()
+        .is_some()
+    {
+        return Err(Box::new((
+            owner,
+            frame,
+            sema_core::SemaError::eval("resource gate acquire cancelled"),
+        )));
+    }
     match state.resource_gates.acquire(gate, key, task_id) {
         Ok(AcquireResult::Acquired) => {
             state.pending.push_back(PendingStage::ApplyRuntimeResponse(

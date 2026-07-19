@@ -5515,6 +5515,64 @@ fn cancelling_between_resource_gate_allocation_and_store_closes_the_gate() {
 }
 
 #[test]
+fn cancelling_before_a_staged_resource_acquire_does_not_take_the_gate() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let gate = runtime.create_resource_gate_for_test();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let cancelled = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::ResourceSlot(gate),
+                continuation: Box::new(RecordGateGrant {
+                    label: "cancelled",
+                    events: Arc::clone(&events),
+                }),
+            },
+        ))))
+        .expect("gate acquirer admitted");
+    let cancelled_task = cancelled.main_task_for_test().expect("task is live");
+
+    let mut turns = 0;
+    while !runtime.has_pending_resource_slot_suspend_for_test(cancelled_task, gate) {
+        runtime.drive(&drive_budget(1)).expect("stage acquire");
+        turns += 1;
+        assert!(turns < 32, "resource acquire must become a pending action");
+    }
+    assert_eq!(runtime.resource_gate_owner_for_test(gate), None);
+    assert!(cancelled.cancel(CancelReason::Explicit));
+    while matches!(cancelled.poll_result(), RootPoll::Pending) {
+        runtime
+            .drive(&drive_budget(1))
+            .expect("settle cancellation");
+    }
+    assert_eq!(
+        runtime.resource_gate_owner_for_test(gate),
+        None,
+        "a cancelled pending acquire must not mutate the gate registry"
+    );
+
+    let survivor = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::ResourceSlot(gate),
+                continuation: Box::new(RecordGateGrant {
+                    label: "survivor",
+                    events: Arc::clone(&events),
+                }),
+            },
+        ))))
+        .expect("surviving acquirer admitted");
+    while matches!(survivor.poll_result(), RootPoll::Pending) {
+        runtime.drive(&drive_budget(4)).expect("survivor acquires");
+    }
+    assert!(events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event == "survivor-granted"));
+}
+
+#[test]
 fn resource_gate_handle_reports_a_dropped_runtime_instead_of_hiding_it() {
     let handle = {
         let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
@@ -5842,6 +5900,95 @@ fn cancelling_a_granted_but_not_run_gate_acquirer_releases_the_gate() {
     );
 }
 
+#[test]
+fn stale_staged_release_cannot_release_the_new_gate_owner() {
+    let clock = Rc::new(FakeClock::new());
+    let runtime = runtime_with_inline_executor(clock.clone());
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let gate_slot = Rc::new(Cell::new(None));
+    let owner = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::CreateResourceGate {
+                continuation: Box::new(GateHoldOwner {
+                    gate_slot: Rc::clone(&gate_slot),
+                    events: Arc::clone(&events),
+                    stage: 0,
+                    gate: None,
+                }),
+            },
+        ))))
+        .expect("owner admitted");
+    while gate_slot.get().is_none() || runtime.timer_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).expect("owner holds gate");
+    }
+    let gate = gate_slot.get().expect("gate created");
+
+    let waiter_b = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::ResourceSlot(gate),
+                continuation: Box::new(RecordGateGrant {
+                    label: "B",
+                    events: Arc::clone(&events),
+                }),
+            },
+        ))))
+        .expect("waiter B admitted");
+    let waiter_c = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::ResourceSlot(gate),
+                continuation: Box::new(RecordGateGrant {
+                    label: "C",
+                    events: Arc::clone(&events),
+                }),
+            },
+        ))))
+        .expect("waiter C admitted");
+    while runtime.protocol_wait_count_for_test() < 2 {
+        runtime.drive(&drive_budget(1)).expect("queue both waiters");
+    }
+
+    clock.advance(Duration::from_secs(7200));
+    let owner_task = owner.main_task_for_test().expect("owner task live");
+    let mut turns = 0;
+    while !runtime.has_pending_resource_gate_release_for_test(owner_task, gate) {
+        runtime
+            .drive(&drive_budget(1))
+            .expect("stage owner release");
+        turns += 1;
+        assert!(turns < 64, "release request must become pending");
+    }
+    assert!(owner.cancel(CancelReason::Explicit));
+    let b_task = waiter_b.main_task_for_test().expect("B task live");
+    assert_eq!(
+        runtime.resource_gate_owner_for_test(gate),
+        Some(b_task),
+        "eager cancellation transfers ownership to the FIFO head"
+    );
+
+    // Dispatch the stale release request. It belongs to the cancelled former
+    // owner and must not release B's newly transferred slot to C.
+    runtime
+        .drive(&drive_budget(1))
+        .expect("stale release is rejected");
+    assert_eq!(runtime.resource_gate_owner_for_test(gate), Some(b_task));
+
+    for _ in 0..24 {
+        runtime.drive(&drive_budget(2)).expect("deliver B grant");
+        if !matches!(waiter_b.poll_result(), RootPoll::Pending) {
+            break;
+        }
+    }
+    let log = events.lock().unwrap().clone();
+    assert!(log.iter().any(|event| event == "B-granted"), "{log:?}");
+    assert!(
+        !log.iter().any(|event| event == "C-granted"),
+        "stale release transferred B's live slot to C: {log:?}"
+    );
+    assert!(matches!(waiter_c.poll_result(), RootPoll::Pending));
+}
+
 /// Gate holder that acquires a resource gate and then parks FOREVER on an empty
 /// channel receive — holding the slot while blocked on a cycle-forming wait. This
 /// is the pathological topology behind the Reviewer-2 hole: a slot holder that is
@@ -5913,6 +6060,70 @@ impl NativeContinuation for BarrierReleaseCont {
         );
         Ok(NativeOutcome::Return(Value::NIL))
     }
+}
+
+#[test]
+fn cancelling_a_gate_owner_parked_on_a_channel_releases_the_next_waiter() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let gate_slot = Rc::new(Cell::new(None));
+    let channel = runtime.create_channel_for_test(1);
+    let owner = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::CreateResourceGate {
+                continuation: Box::new(GateHoldOnChannel {
+                    gate_slot: Rc::clone(&gate_slot),
+                    channel,
+                    stage: 0,
+                    gate: None,
+                }),
+            },
+        ))))
+        .expect("gate owner admitted");
+    while gate_slot.get().is_none()
+        || runtime
+            .resource_gate_owner_for_test(gate_slot.get().expect("gate created"))
+            .is_none()
+    {
+        runtime
+            .drive(&drive_budget(4))
+            .expect("owner acquires gate");
+    }
+    let gate = gate_slot.get().expect("gate created");
+    let waiter = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            NativeSuspend {
+                wait: WaitKind::ResourceSlot(gate),
+                continuation: Box::new(RecordGateGrant {
+                    label: "waiter",
+                    events: Arc::clone(&events),
+                }),
+            },
+        ))))
+        .expect("gate waiter admitted");
+    while runtime.protocol_wait_count_for_test() < 2 {
+        runtime.drive(&drive_budget(1)).expect("waiter queues");
+    }
+
+    assert!(owner.cancel(CancelReason::Explicit));
+    let mut turns = 0;
+    while matches!(waiter.poll_result(), RootPoll::Pending) {
+        runtime
+            .drive(&drive_budget(4))
+            .expect("cancelled owner releases gate");
+        turns += 1;
+        assert!(
+            turns < 64,
+            "gate waiter was stranded after owner cancellation"
+        );
+    }
+
+    assert!(events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event == "waiter-granted"));
+    assert!(matches!(waiter.poll_result(), RootPoll::Ready(_)));
 }
 
 /// Hang-detection (Reviewer-2 hole, closed): `WaitKind::ResourceSlot` MUST be

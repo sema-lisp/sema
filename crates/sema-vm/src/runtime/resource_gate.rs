@@ -126,6 +126,9 @@ impl ResourceGateRegistry {
         }
         let gate = self.gate_mut(id)?;
         if gate.busy {
+            if gate.owner == Some(task) {
+                return Err(RegistryError::AlreadyOwned);
+            }
             gate.waiters.push_back(Waiter { key, task });
             Ok(AcquireResult::Parked)
         } else {
@@ -141,20 +144,44 @@ impl ResourceGateRegistry {
     ///
     /// [`pop_wake`]: Self::pop_wake
     pub fn release(&mut self, id: ResourceGateId) -> Result<(), RegistryError> {
-        let gate = self.gate_mut(id)?;
+        let wake = Self::release_gate(self.gate_mut(id)?);
+        if let Some(wake) = wake {
+            self.wakes.push_back(wake);
+        }
+        Ok(())
+    }
+
+    /// Release `id` only when `task` is still its current owner. Staged
+    /// release requests use this form so a cancelled former owner cannot
+    /// release a slot after ownership has transferred to another task.
+    pub fn release_owned(&mut self, id: ResourceGateId, task: TaskId) -> Result<(), RegistryError> {
+        let wake = {
+            let gate = self.gate_mut(id)?;
+            if gate.owner != Some(task) {
+                return Err(RegistryError::NotOwned);
+            }
+            Self::release_gate(gate)
+        };
+        if let Some(wake) = wake {
+            self.wakes.push_back(wake);
+        }
+        Ok(())
+    }
+
+    fn release_gate(gate: &mut Gate) -> Option<ResourceGateWake> {
         if let Some(head) = gate.waiters.pop_front() {
             // Ownership transfers to the head waiter; the gate stays busy.
             gate.owner = Some(head.task);
-            self.wakes.push_back(ResourceGateWake {
+            Some(ResourceGateWake {
                 key: head.key,
                 task: head.task,
                 result: GateResult::Granted,
-            });
+            })
         } else {
             gate.busy = false;
             gate.owner = None;
+            None
         }
-        Ok(())
     }
 
     /// Close `id`: fail every parked waiter with `Closed` and drop the gate
@@ -194,21 +221,32 @@ impl ResourceGateRegistry {
         Ok(false)
     }
 
-    /// The gate whose slot `task` currently HOLDS (acquired or granted), if any.
-    /// Used to release a gate held by a task cancelled after being granted the
-    /// slot but before its acquire continuation ran (which would otherwise raise
-    /// on the cancellation without releasing — the granted-but-not-run leak).
-    pub fn owner_gate(&self, task: TaskId) -> Option<ResourceGateId> {
+    /// Every gate currently owned by `task`. Most resource operations hold one
+    /// slot, but user callbacks may nest independently gated operations; task
+    /// cancellation must release all of them.
+    pub fn owner_gates(&self, task: TaskId) -> Vec<ResourceGateId> {
         self.gates
             .iter()
-            .find_map(|(id, gate)| (gate.owner == Some(task)).then_some(*id))
+            .filter_map(|(id, gate)| (gate.owner == Some(task)).then_some(*id))
+            .collect()
+    }
+
+    /// The task currently holding `id`'s slot, if any.
+    pub fn gate_owner(&self, id: ResourceGateId) -> Result<Option<TaskId>, RegistryError> {
+        if id.runtime() != self.runtime {
+            return Err(RegistryError::WrongRuntime);
+        }
+        self.gates
+            .get(&id)
+            .map(|gate| gate.owner)
+            .ok_or(RegistryError::Unknown)
     }
 
     /// The task currently holding `id`'s slot, if any (test/observability oracle
     /// for the granted-but-not-run gate-release path).
     #[cfg(test)]
     pub(crate) fn owner_of(&self, id: ResourceGateId) -> Option<TaskId> {
-        self.gates.get(&id).and_then(|gate| gate.owner)
+        self.gate_owner(id).ok().flatten()
     }
 
     pub fn pop_wake(&mut self) -> Option<ResourceGateWake> {
@@ -311,6 +349,49 @@ mod tests {
             fx.registry.acquire(gate, k2, task(2)).unwrap(),
             AcquireResult::Acquired
         );
+    }
+
+    #[test]
+    fn reentrant_acquire_fails_instead_of_parking_behind_itself() {
+        let mut fx = Fixture::new();
+        let gate = fx.registry.allocate().unwrap();
+        let owner = task(1);
+        let first = fx.key();
+        let second = fx.key();
+        assert_eq!(
+            fx.registry.acquire(gate, first, owner),
+            Ok(AcquireResult::Acquired)
+        );
+        assert_eq!(
+            fx.registry.acquire(gate, second, owner),
+            Err(RegistryError::AlreadyOwned)
+        );
+    }
+
+    #[test]
+    fn stale_owner_cannot_release_a_transferred_gate() {
+        let mut fx = Fixture::new();
+        let gate = fx.registry.allocate().unwrap();
+        let first = task(1);
+        let second = task(2);
+        let first_key = fx.key();
+        let second_key = fx.key();
+        assert_eq!(
+            fx.registry.acquire(gate, first_key, first),
+            Ok(AcquireResult::Acquired)
+        );
+        assert_eq!(
+            fx.registry.acquire(gate, second_key, second),
+            Ok(AcquireResult::Parked)
+        );
+        fx.registry.release_owned(gate, first).unwrap();
+        assert_eq!(fx.registry.gate_owner(gate), Ok(Some(second)));
+
+        assert_eq!(
+            fx.registry.release_owned(gate, first),
+            Err(RegistryError::NotOwned)
+        );
+        assert_eq!(fx.registry.gate_owner(gate), Ok(Some(second)));
     }
 
     #[test]

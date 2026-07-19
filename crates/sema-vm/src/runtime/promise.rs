@@ -17,6 +17,8 @@ pub enum RegistryError {
     WrongRuntime,
     Unknown,
     AlreadySettled,
+    AlreadyOwned,
+    NotOwned,
     DuplicateWait,
     IdExhausted,
 }

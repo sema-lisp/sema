@@ -1155,6 +1155,28 @@ impl Runtime {
     }
 
     pub fn drive(&self, budget: &DriveBudget) -> Result<DriveState, RuntimeFault> {
+        self.drive_selected(budget, None)
+    }
+
+    /// Drive runtime housekeeping plus VM quanta belonging only to `roots`.
+    ///
+    /// Completion decoding, cancellation, cleanup, and wake staging remain
+    /// runtime-wide, but a ready task from another root is never executed. This
+    /// lets hosts with distinct scheduling contracts share one persistent
+    /// runtime without one host running another host's user code.
+    pub fn drive_roots(
+        &self,
+        budget: &DriveBudget,
+        roots: &[RootId],
+    ) -> Result<DriveState, RuntimeFault> {
+        self.drive_selected(budget, Some(roots))
+    }
+
+    fn drive_selected(
+        &self,
+        budget: &DriveBudget,
+        selected_roots: Option<&[RootId]>,
+    ) -> Result<DriveState, RuntimeFault> {
         // Publish this runtime for the whole drive so a cycle collection fired
         // inside a driven VM quantum (an explicit `(gc/collect)`, a `make_closure`
         // threshold, or the scheduler-idle safe point) can resolve channel/promise
@@ -1195,12 +1217,14 @@ impl Runtime {
         let mut completions = 0;
         let mut timers = 0;
         let mut no_progress = 0;
-        let reserved_roots = self
-            .state
-            .borrow()
-            .ready
-            .root_count()
-            .min(budget.root_visit_limit.get());
+        let reserved_roots = {
+            let state = self.state.borrow();
+            selected_roots.map_or_else(
+                || state.ready.root_count(),
+                |roots| state.ready.root_count_for(roots),
+            )
+        }
+        .min(budget.root_visit_limit.get());
         // Reserve credits for at most work_item_limit - 1 roots so a ready-root
         // storm always leaves at least one work item for completions, timers,
         // cleanup, and pending stages (spec: each storm leaves progress room).
@@ -1281,12 +1305,14 @@ impl Runtime {
                     true
                 }
                 2 => self.cancel_waiting()?,
-                3 => self.advance_pending()?,
+                3 => self.advance_pending_selected(selected_roots)?,
                 4 if timers < budget.timer_limit.get() && self.fire_timer(clock_now)? => {
                     timers += 1;
                     true
                 }
-                5 if root_visits < reserved_roots && self.visit_ready()? => {
+                5 if root_visits < reserved_roots
+                    && self.visit_ready_selected(selected_roots)? =>
+                {
                     root_visits += 1;
                     true
                 }
@@ -1327,15 +1353,20 @@ impl Runtime {
                 info: info.clone(),
             });
         }
-        let ready_remaining = state.ready.has_queued();
-        debug_assert_eq!(
-            ready_remaining,
-            state
-                .tasks
-                .values()
-                .any(|task| task.record.state_name() == super::StateName::Ready),
-            "ready-queue membership must mirror Ready task records at turn boundaries"
+        let ready_remaining = selected_roots.map_or_else(
+            || state.ready.has_queued(),
+            |roots| state.ready.has_queued_for(roots),
         );
+        if selected_roots.is_none() {
+            debug_assert_eq!(
+                ready_remaining,
+                state
+                    .tasks
+                    .values()
+                    .any(|task| task.record.state_name() == super::StateName::Ready),
+                "ready-queue membership must mirror Ready task records at turn boundaries"
+            );
+        }
         if work_items > 0 {
             Ok(DriveState::Progress {
                 work_items,
@@ -1951,8 +1982,21 @@ impl Runtime {
         false
     }
 
-    fn advance_pending(&self) -> Result<bool, RuntimeFault> {
-        let stage = self.state.borrow_mut().pending.pop_front();
+    fn advance_pending_selected(
+        &self,
+        selected_roots: Option<&[RootId]>,
+    ) -> Result<bool, RuntimeFault> {
+        let stage = {
+            let mut state = self.state.borrow_mut();
+            let position = match selected_roots {
+                Some(roots) => state
+                    .pending
+                    .iter()
+                    .position(|stage| stage.belongs_to_roots(&state, roots)),
+                None => (!state.pending.is_empty()).then_some(0),
+            };
+            position.and_then(|position| state.pending.remove(position))
+        };
         let Some(stage) = stage else {
             return Ok(false);
         };
@@ -2024,7 +2068,17 @@ impl Runtime {
                 return Ok(true);
             }
             PendingStage::PromiseWakes(mut wakes) => {
-                if let Some((key, task)) = wakes.pop_front() {
+                let wake = match selected_roots {
+                    Some(roots) => {
+                        let state = self.state.borrow();
+                        let position = wakes
+                            .iter()
+                            .position(|(_, task)| task_belongs_to_roots(&state, *task, roots));
+                        position.and_then(|position| wakes.remove(position))
+                    }
+                    None => wakes.pop_front(),
+                };
+                if let Some((key, task)) = wake {
                     self.consume_promise_wake(key, task)?;
                 }
                 if !wakes.is_empty() {
@@ -2036,7 +2090,14 @@ impl Runtime {
                 return Ok(true);
             }
             PendingStage::ChannelClose(mut close) => {
-                if let Some(wake) = close.next_wake() {
+                let wake = match selected_roots {
+                    Some(roots) => {
+                        let state = self.state.borrow();
+                        close.take_wake_for(|task| task_belongs_to_roots(&state, task, roots))
+                    }
+                    None => close.next_wake(),
+                };
+                if let Some(wake) = wake {
                     self.consume_channel_wake(wake)?;
                 }
                 if !close.is_empty() {
@@ -2428,10 +2489,17 @@ impl Runtime {
         }
     }
 
-    fn visit_ready(&self) -> Result<bool, RuntimeFault> {
+    fn visit_ready_selected(
+        &self,
+        selected_roots: Option<&[RootId]>,
+    ) -> Result<bool, RuntimeFault> {
         let (root, task_id, mut task) = {
             let mut state = self.state.borrow_mut();
-            let Some((root, task_id)) = state.ready.dequeue() else {
+            let next = match selected_roots {
+                Some(roots) => state.ready.dequeue_roots(roots),
+                None => state.ready.dequeue(),
+            };
+            let Some((root, task_id)) = next else {
                 return Ok(false);
             };
             #[cfg(test)]
@@ -6182,6 +6250,57 @@ enum PendingStage {
     ChannelClose(ChannelClose),
     ChannelWake(ChannelWake),
     ResourceGateWake(ResourceGateWake),
+}
+
+fn task_belongs_to_roots(state: &RuntimeState, task: TaskId, roots: &[RootId]) -> bool {
+    state
+        .tasks
+        .get(&task)
+        .is_some_and(|task| roots.contains(&task.record.relations().origin_root))
+}
+
+impl TaskAction {
+    fn belongs_to_roots(&self, state: &RuntimeState, roots: &[RootId]) -> bool {
+        match self {
+            Self::Yield(root, _) | Self::Settle(root, _, _) | Self::DebugStop(root, _, _) => {
+                roots.contains(root)
+            }
+            Self::Cancel(task, _, _) | Self::Native(task, _) | Self::VmResult(task, _, _) => {
+                task_belongs_to_roots(state, *task, roots)
+            }
+            #[cfg(test)]
+            Self::Timer(task, _) | Self::NativeCall(task, _) => {
+                task_belongs_to_roots(state, *task, roots)
+            }
+            Self::Resume(pending) => task_belongs_to_roots(state, pending.task_id(), roots),
+        }
+    }
+}
+
+impl PendingStage {
+    fn belongs_to_roots(&self, state: &RuntimeState, roots: &[RootId]) -> bool {
+        match self {
+            Self::Action(action) => action.belongs_to_roots(state, roots),
+            Self::Decode(pending) | Self::Continue(pending) => {
+                task_belongs_to_roots(state, pending.task_id(), roots)
+            }
+            Self::Invoke(task, _, _)
+            | Self::Resume(task, _, _, _)
+            | Self::Apply(task, _, _)
+            | Self::DispatchRuntime(task, _, _)
+            | Self::ApplyRuntimeResponse(task, _, _, _)
+            | Self::ChannelWake(ChannelWake { task, .. })
+            | Self::ResourceGateWake(ResourceGateWake { task, .. }) => {
+                task_belongs_to_roots(state, *task, roots)
+            }
+            Self::PromiseWakes(wakes) => wakes
+                .iter()
+                .any(|(_, task)| task_belongs_to_roots(state, *task, roots)),
+            Self::ChannelClose(close) => {
+                close.has_task(|task| task_belongs_to_roots(state, task, roots))
+            }
+        }
+    }
 }
 
 pub(super) enum ReturnOwner {

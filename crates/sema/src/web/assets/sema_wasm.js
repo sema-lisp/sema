@@ -23,9 +23,8 @@ export class SemaInterpreter {
      * [`Self::eval_promise`]'s `on_root_id` callback. Returns `false` if no
      * pending `evalPromise` root matches `root_id` (already settled, or
      * never existed) — a harmless no-op, same liveness contract as the
-     * underlying `RuntimeCommandHandle::cancel_root`. Has no effect on the
-     * OLD `eval`/`evalAsync`/`evalVM`/… entry points (they don't submit a
-     * cancellable root at all).
+     * underlying `RuntimeCommandHandle::cancel_root`. It only accepts roots
+     * registered with this Promise driver.
      * @param {number} root_id
      * @returns {boolean}
      */
@@ -50,10 +49,24 @@ export class SemaInterpreter {
         return ret;
     }
     /**
+     * @returns {Promise<any>}
+     */
+    debugContinuePromise() {
+        const ret = wasm.semainterpreter_debugContinuePromise(this.__wbg_ptr);
+        return ret;
+    }
+    /**
      * @returns {any}
      */
     debugGetLocals() {
         const ret = wasm.semainterpreter_debugGetLocals(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @returns {any}
+     */
+    debugGetLocalsPromise() {
+        const ret = wasm.semainterpreter_debugGetLocalsPromise(this.__wbg_ptr);
         return ret;
     }
     /**
@@ -64,6 +77,13 @@ export class SemaInterpreter {
         return ret;
     }
     /**
+     * @returns {any}
+     */
+    debugGetStackTracePromise() {
+        const ret = wasm.semainterpreter_debugGetStackTracePromise(this.__wbg_ptr);
+        return ret;
+    }
+    /**
      * @returns {boolean}
      */
     debugIsActive() {
@@ -71,17 +91,11 @@ export class SemaInterpreter {
         return ret !== 0;
     }
     /**
-     * Perform an HTTP fetch from a debug marker and cache the result.
-     * Called by JS in response to a "http_needed" status.
-     * Takes the marker JSON from the request field. Returns true on success.
-     * @param {string} marker_json
-     * @returns {Promise<boolean>}
+     * @returns {boolean}
      */
-    debugPerformFetch(marker_json) {
-        const ptr0 = passStringToWasm0(marker_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-        const len0 = WASM_VECTOR_LEN;
-        const ret = wasm.semainterpreter_debugPerformFetch(this.__wbg_ptr, ptr0, len0);
-        return ret;
+    debugIsActivePromise() {
+        const ret = wasm.semainterpreter_debugIsActivePromise(this.__wbg_ptr);
+        return ret !== 0;
     }
     /**
      * @returns {any}
@@ -97,9 +111,17 @@ export class SemaInterpreter {
         wasm.semainterpreter_debugSetBreakpoints(this.__wbg_ptr, lines);
     }
     /**
+     * @param {Array<any>} lines
+     * @returns {boolean}
+     */
+    debugSetBreakpointsPromise(lines) {
+        const ret = wasm.semainterpreter_debugSetBreakpointsPromise(this.__wbg_ptr, lines);
+        return ret !== 0;
+    }
+    /**
      * Start a debug session. Compiles the code, sets breakpoints on given lines,
      * and runs until the first stop or completion.
-     * Returns JSON: { status: "stopped"|"finished"|"error"|"http_needed", ... }
+     * Returns JSON: { status: "stopped"|"finished"|"error", ... }
      * @param {string} code
      * @param {Array<any>} breakpoint_lines
      * @returns {any}
@@ -111,10 +133,31 @@ export class SemaInterpreter {
         return ret;
     }
     /**
+     * Start a per-interpreter, Promise-driven debug session. The returned
+     * Promise settles only at a stable stop or terminal outcome; timer/HTTP
+     * waits yield to the browser and resume the same runtime root.
+     * @param {string} code
+     * @param {Array<any>} breakpoint_lines
+     * @returns {Promise<any>}
+     */
+    debugStartPromise(code, breakpoint_lines) {
+        const ptr0 = passStringToWasm0(code, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.semainterpreter_debugStartPromise(this.__wbg_ptr, ptr0, len0, breakpoint_lines);
+        return ret;
+    }
+    /**
      * @returns {any}
      */
     debugStepInto() {
         const ret = wasm.semainterpreter_debugStepInto(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @returns {Promise<any>}
+     */
+    debugStepIntoPromise() {
+        const ret = wasm.semainterpreter_debugStepIntoPromise(this.__wbg_ptr);
         return ret;
     }
     /**
@@ -125,14 +168,35 @@ export class SemaInterpreter {
         return ret;
     }
     /**
+     * @returns {Promise<any>}
+     */
+    debugStepOutPromise() {
+        const ret = wasm.semainterpreter_debugStepOutPromise(this.__wbg_ptr);
+        return ret;
+    }
+    /**
      * @returns {any}
      */
     debugStepOver() {
         const ret = wasm.semainterpreter_debugStepOver(this.__wbg_ptr);
         return ret;
     }
+    /**
+     * @returns {Promise<any>}
+     */
+    debugStepOverPromise() {
+        const ret = wasm.semainterpreter_debugStepOverPromise(this.__wbg_ptr);
+        return ret;
+    }
     debugStop() {
         wasm.semainterpreter_debugStop(this.__wbg_ptr);
+    }
+    /**
+     * @returns {boolean}
+     */
+    debugStopPromise() {
+        const ret = wasm.semainterpreter_debugStopPromise(this.__wbg_ptr);
+        return ret !== 0;
     }
     /**
      * Delete a file from the virtual filesystem. Returns true if the file existed.
@@ -172,8 +236,8 @@ export class SemaInterpreter {
      * Evaluate code with real (single-execution) async HTTP/sleep support in
      * the persistent global env (top-level defines persist across calls).
      *
-     * A thin Promise-returning wrapper over [`Self::eval_promise`] (P6-3
-     * step 5) — kept as its own entry point so existing JS callers
+     * A thin Promise-returning wrapper over [`Self::eval_promise`], kept as
+     * its own entry point so existing JS callers
      * (`sema-web.js`, the playground's `?no-worker` fallback) don't have to
      * change; the program body is submitted as ONE root and never replayed.
      * See [`Self::eval_once_via_promise_seam`].
@@ -200,10 +264,8 @@ export class SemaInterpreter {
     /**
      * Evaluate `code` as ONE root on the unified runtime and return a
      * `Promise` that resolves with its printed value (or `null`) and rejects
-     * with an `Error` on failure — never replays the program body, and
-     * (unlike every other `eval*` method) correctly supports a real
-     * `async/sleep` / `http/get` instead of hanging or panicking on the
-     * blocking legacy drive path. See `driver.rs` (P6-3 step 2). Output is
+     * with an `Error` on failure. The body runs once; `async/sleep` and
+     * `http/get` suspend the root in place. Output is
      * NOT included in the resolved value: install `setPromiseOutputSink` to
      * receive this root's `println`/`print-err` output, tagged with its
      * root id, as it happens.
@@ -211,8 +273,8 @@ export class SemaInterpreter {
      * `on_root_id`, if a function, is called SYNCHRONOUSLY (before this
      * method returns) with the new root's id as a JS `number` — the only way
      * a caller can learn it in time to route a later [`Self::cancel_root`]
-     * call at the exact root this call submitted (P6-3 step 3; the
-     * playground worker protocol uses this to implement "Stop"). Pass
+     * call at the exact root this call submitted. The playground worker
+     * protocol uses this to implement "Stop". Pass
      * `null`/`undefined` to skip.
      * @param {string} code
      * @param {any} on_root_id
@@ -270,19 +332,6 @@ export class SemaInterpreter {
         const len0 = WASM_VECTOR_LEN;
         const ret = wasm.semainterpreter_getValidBreakpointLines(this.__wbg_ptr, ptr0, len0);
         return ret;
-    }
-    /**
-     * Enable real wall-clock `async/sleep` via `Atomics.wait` on the given
-     * control buffer. Call this once from a Web Worker (where blocking is
-     * allowed), passing an `Int32Array` over a `SharedArrayBuffer` shared with
-     * the main thread. After this, the scheduler's virtual-clock advances also
-     * block the worker for the real duration. Do NOT call on the main thread —
-     * `Atomics.wait` is illegal there; leaving it uninstalled keeps the
-     * instant virtual-clock behavior.
-     * @param {Int32Array} view
-     */
-    installAtomicsSleep(view) {
-        wasm.semainterpreter_installAtomicsSleep(this.__wbg_ptr, view);
     }
     /**
      * Invoke a stored callback handle directly with JS arguments.
@@ -432,17 +481,11 @@ export class SemaInterpreter {
     }
     /**
      * Execute an embedded archive entry path with real (single-execution)
-     * async HTTP/sleep support (P6-3 step 5).
+     * async HTTP/sleep support.
      *
-     * A source-text entry is submitted as ONE root via
-     * [`Self::eval_once_via_promise_seam_at_path`] — the program body never
-     * replays, and `http/get`/`async/sleep` inside it get the real
-     * runtime-ABI suspend. A precompiled bytecode entry has no
-     * submit-a-root equivalent (`Interpreter::submit_str` only accepts
-     * source text), so it stays on the direct single-execution path
-     * `runEntry` already used; an `http/get` inside one now surfaces a
-     * clear, honest error instead of the deleted replay loop silently
-     * leaking the internal HTTP marker string.
+     * Source-text and precompiled entries are each submitted as one root and
+     * adopted by the same macrotask Promise driver. The program body never
+     * replays, and `http/get`/`async/sleep` resume the original root in place.
      * @param {string} path
      * @returns {Promise<any>}
      */
@@ -466,8 +509,8 @@ export class SemaInterpreter {
      * Install (or clear, passing `null`/`undefined`) the JS callback that
      * receives `evalPromise` roots' output as `(rootId, stream, text)`,
      * where `stream` is `"stdout"` or `"stderr"`. Independent of
-     * `setOutputSink` (the worker's line-batched sink for the OLD entry
-     * points) — the two never observe each other's output.
+     * `setOutputSink` (the synchronous line-batched sink) — the two never
+     * observe each other's output.
      * @param {any} sink
      */
     setPromiseOutputSink(sink) {
@@ -624,13 +667,6 @@ function __wbg_get_imports() {
             const ret = arg0.fetch(arg1);
             return ret;
         },
-        __wbg_getAllResponseHeaders_0d155233eff8d5a4: function() { return handleError(function (arg0, arg1) {
-            const ret = arg1.getAllResponseHeaders();
-            const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-            const len1 = WASM_VECTOR_LEN;
-            getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
-            getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
-        }, arguments); },
         __wbg_getRandomValues_76dfc69825c9c552: function() { return handleError(function (arg0, arg1) {
             globalThis.crypto.getRandomValues(getArrayU8FromWasm0(arg0, arg1));
         }, arguments); },
@@ -735,10 +771,6 @@ function __wbg_get_imports() {
             const ret = arg0.length;
             return ret;
         },
-        __wbg_load_d8bce92127bf3f7d: function() { return handleError(function (arg0, arg1) {
-            const ret = Atomics.load(arg0, arg1 >>> 0);
-            return ret;
-        }, arguments); },
         __wbg_new_0_1dcafdf5e786e876: function() {
             const ret = new Date();
             return ret;
@@ -757,10 +789,6 @@ function __wbg_get_imports() {
         },
         __wbg_new_c518c60af666645b: function() { return handleError(function () {
             const ret = new AbortController();
-            return ret;
-        }, arguments); },
-        __wbg_new_cb1d07f18f0aae72: function() { return handleError(function () {
-            const ret = new XMLHttpRequest();
             return ret;
         }, arguments); },
         __wbg_new_d098e265629cd10f: function(arg0, arg1) {
@@ -831,9 +859,6 @@ function __wbg_get_imports() {
             const ret = arg0.now();
             return ret;
         },
-        __wbg_open_ab5f9641f561c051: function() { return handleError(function (arg0, arg1, arg2, arg3, arg4, arg5) {
-            arg0.open(getStringFromWasm0(arg1, arg2), getStringFromWasm0(arg3, arg4), arg5 !== 0);
-        }, arguments); },
         __wbg_parse_e9eddd2a82c706eb: function() { return handleError(function (arg0, arg1) {
             const ret = JSON.parse(getStringFromWasm0(arg0, arg1));
             return ret;
@@ -871,22 +896,6 @@ function __wbg_get_imports() {
             const ret = Promise.resolve(arg0);
             return ret;
         },
-        __wbg_responseText_3ee457c31fe90e0e: function() { return handleError(function (arg0, arg1) {
-            const ret = arg1.responseText;
-            var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
-            var len1 = WASM_VECTOR_LEN;
-            getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
-            getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
-        }, arguments); },
-        __wbg_send_442fe07c698a9f29: function() { return handleError(function (arg0) {
-            arg0.send();
-        }, arguments); },
-        __wbg_send_7aad46f9e0f7ecca: function() { return handleError(function (arg0, arg1, arg2) {
-            arg0.send(arg1 === 0 ? undefined : getStringFromWasm0(arg1, arg2));
-        }, arguments); },
-        __wbg_setRequestHeader_4d392f8eb9f8a78b: function() { return handleError(function (arg0, arg1, arg2, arg3, arg4) {
-            arg0.setRequestHeader(getStringFromWasm0(arg1, arg2), getStringFromWasm0(arg3, arg4));
-        }, arguments); },
         __wbg_setTimeout_7f7035ad0b026458: function() { return handleError(function (arg0, arg1, arg2) {
             const ret = arg0.setTimeout(arg1, arg2);
             return ret;
@@ -944,10 +953,6 @@ function __wbg_get_imports() {
             const ret = arg0.status;
             return ret;
         },
-        __wbg_status_d5251b0ac97c56d5: function() { return handleError(function (arg0) {
-            const ret = arg0.status;
-            return ret;
-        }, arguments); },
         __wbg_stringify_5ae93966a84901ac: function() { return handleError(function (arg0) {
             const ret = JSON.stringify(arg0);
             return ret;
@@ -968,27 +973,23 @@ function __wbg_get_imports() {
             const ret = arg0.value;
             return ret;
         },
-        __wbg_wait_764625a35886f35b: function() { return handleError(function (arg0, arg1, arg2, arg3) {
-            const ret = Atomics.wait(arg0, arg1 >>> 0, arg2, arg3);
-            return ret;
-        }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 1, function: Function { arguments: [Externref], shim_idx: 66, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 9, function: Function { arguments: [Externref], shim_idx: 66, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_99a98757d426b094___closure__destroy___dyn_core_7d5f0a2ba6a62c33___ops__function__FnMut__wasm_bindgen_99a98757d426b094___JsValue____Output___core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_99a98757d426b094___JsError___, wasm_bindgen_99a98757d426b094___convert__closures_____invoke___wasm_bindgen_99a98757d426b094___JsValue__core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_99a98757d426b094___JsError___true_);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 1, function: Function { arguments: [F64, Externref, Externref], shim_idx: 14, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 9, function: Function { arguments: [F64, Externref, Externref], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_99a98757d426b094___closure__destroy___dyn_core_7d5f0a2ba6a62c33___ops__function__FnMut__wasm_bindgen_99a98757d426b094___JsValue____Output___core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_99a98757d426b094___JsError___, wasm_bindgen_99a98757d426b094___convert__closures_____invoke___f64__wasm_bindgen_99a98757d426b094___JsValue__wasm_bindgen_99a98757d426b094___JsValue______true_);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 1, function: Function { arguments: [F64], shim_idx: 12, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 9, function: Function { arguments: [F64], shim_idx: 10, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_99a98757d426b094___closure__destroy___dyn_core_7d5f0a2ba6a62c33___ops__function__FnMut__wasm_bindgen_99a98757d426b094___JsValue____Output___core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_99a98757d426b094___JsError___, wasm_bindgen_99a98757d426b094___convert__closures_____invoke___f64______true_);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 1, function: Function { arguments: [], shim_idx: 2, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 9, function: Function { arguments: [], shim_idx: 14, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen_99a98757d426b094___closure__destroy___dyn_core_7d5f0a2ba6a62c33___ops__function__FnMut__wasm_bindgen_99a98757d426b094___JsValue____Output___core_7d5f0a2ba6a62c33___result__Result_____wasm_bindgen_99a98757d426b094___JsError___, wasm_bindgen_99a98757d426b094___convert__closures_____invoke_______true_);
             return ret;
         },

@@ -474,6 +474,53 @@ test('synchronous evalVM points HTTP callers to evalPromise without leaking its 
   expect(result.error).not.toContain('__SEMA_WASM_HTTP__');
 });
 
+test('a synchronous re-entry cannot drive or capture a pending Promise HTTP root', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
+
+  const requestUrl = `${await page.evaluate(() => location.origin)}/index.html?promise-root-reentry=1`;
+  let requestCount = 0;
+  page.on('request', (request) => {
+    if (request.url() === requestUrl) requestCount += 1;
+  });
+
+  const result = await page.evaluate(async (url) => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+    const promiseEvents: Array<{ root: number; stream: string; text: string }> = [];
+    interp.setPromiseOutputSink((root: number, stream: string, text: string) => {
+      promiseEvents.push({ root, stream, text });
+    });
+
+    // Submission queues a macrotask. Re-enter synchronously before that task
+    // can fire: the synchronous drive must select only its own fresh root.
+    const pending = interp.evalPromise(
+      `(println "promise-before")\n(def response (http/get "${url}"))\n(println "promise-after")\n(:status response)`,
+      undefined,
+    );
+    const sync = interp.evalVM('(println "sync-only")\n(+ 1 2)');
+    let promised: string | null = null;
+    let promiseError: string | null = null;
+    try {
+      promised = await pending;
+    } catch (error) {
+      promiseError = error instanceof Error ? error.message : String(error);
+    }
+    return { sync, promised, promiseError, promiseEvents };
+  }, requestUrl);
+
+  expect(requestCount).toBe(1);
+  expect(result.sync).toMatchObject({ value: '3', output: ['sync-only'], error: null });
+  expect(result.promised).toBe('200');
+  expect(result.promiseError).toBeNull();
+  expect(result.promiseEvents.map(({ stream, text }) => [stream, text])).toEqual([
+    ['stdout', 'promise-before'],
+    ['stdout', 'promise-after'],
+  ]);
+});
+
 test('synchronous evalVM rejects timer suspension promptly and keeps the runtime reusable', async ({ page }) => {
   await page.goto('/');
 
@@ -566,6 +613,25 @@ test('the WASM crate has no replay cache, synchronous XHR, or Atomics host adapt
     expect(libSrc).not.toContain(marker);
   }
   expect(cargoSrc).not.toContain('XmlHttpRequest');
+});
+
+test('the RustEmbedded sema web artifacts omit retired blocking exports and host imports', () => {
+  const assetDir = path.join(REPO_ROOT, 'crates/sema/src/web/assets');
+  const glue = readFileSync(path.join(assetDir, 'sema_wasm.js'), 'utf8');
+  for (const marker of [
+    'debugPerformFetch',
+    'installAtomicsSleep',
+    'XMLHttpRequest',
+    'Atomics.wait',
+    'HTTP_AWAIT_MARKER',
+  ]) {
+    expect(glue).not.toContain(marker);
+  }
+
+  const wasm = new WebAssembly.Module(readFileSync(path.join(assetDir, 'sema_wasm_bg.wasm')));
+  const exports = WebAssembly.Module.exports(wasm).map(({ name }) => name);
+  expect(exports).not.toContain('semainterpreter_debugPerformFetch');
+  expect(exports).not.toContain('semainterpreter_installAtomicsSleep');
 });
 
 test('the shipped default worker protocol never reaches legacy Atomics/replay code (SAB deleted entirely)', async () => {

@@ -71,6 +71,35 @@ impl ChannelClose {
     pub(crate) fn is_empty(&self) -> bool {
         self.senders.is_empty() && self.receivers.is_empty()
     }
+
+    pub(crate) fn has_task(&self, matches: impl Fn(TaskId) -> bool) -> bool {
+        self.senders.iter().any(|sender| matches(sender.task))
+            || self.receivers.iter().any(|receiver| matches(receiver.task))
+    }
+
+    pub(crate) fn take_wake_for(
+        &mut self,
+        matches: impl Fn(TaskId) -> bool,
+    ) -> Option<ChannelWake> {
+        if let Some(position) = self.senders.iter().position(|sender| matches(sender.task)) {
+            let sender = self.senders.remove(position)?;
+            return Some(ChannelWake {
+                key: sender.key,
+                task: sender.task,
+                result: ChannelResult::Closed,
+            });
+        }
+        let position = self
+            .receivers
+            .iter()
+            .position(|receiver| matches(receiver.task))?;
+        let receiver = self.receivers.remove(position)?;
+        Some(ChannelWake {
+            key: receiver.key,
+            task: receiver.task,
+            result: ChannelResult::Closed,
+        })
+    }
 }
 struct Channel {
     capacity: usize,

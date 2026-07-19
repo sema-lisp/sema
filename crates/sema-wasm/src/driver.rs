@@ -11,10 +11,9 @@
 //!   (`schedule_drive`), which lets browser timer and fetch callbacks resume
 //!   the original root in place.
 //!
-//! `runtime_quantum_active()` is also true for synchronous WASM evaluations,
-//! so dual-ABI HTTP uses [`sema_core::promise_driven_quantum_active`] to admit
-//! structural fetch suspension only while this host can pump browser turns.
-//! Synchronous entry points reject suspension with a Promise-API hint.
+//! Each turn passes this driver's exact root set to the runtime. Dual-ABI HTTP
+//! and output routing likewise consult the currently executing `RootId`, so a
+//! synchronous re-entry cannot execute or capture a pending Promise root.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -99,6 +98,8 @@ pub(crate) struct PromiseDriver {
     active_retain: RefCell<Option<Rc<PromiseDriver>>>,
     output: PromiseOutput,
     debug_session: RefCell<Option<PromiseDebugSession>>,
+    debug_root: Cell<Option<RootId>>,
+    retiring_debug_roots: RefCell<HashMap<RootId, RootHandle>>,
 }
 
 impl PromiseDriver {
@@ -112,6 +113,8 @@ impl PromiseDriver {
             active_retain: RefCell::new(None),
             output: PromiseOutput::default(),
             debug_session: RefCell::new(None),
+            debug_root: Cell::new(None),
+            retiring_debug_roots: RefCell::new(HashMap::new()),
         })
     }
 
@@ -136,6 +139,9 @@ impl Drop for PromiseDriver {
                 self.interp.runtime().debug_cancel_paused_root(root);
             }
         }
+        for root in self.retiring_debug_roots.get_mut().keys().copied() {
+            let _ = self.interp.command_handle().cancel_root(root);
+        }
         if let Some(runtime_id) = self.runtime_id.get() {
             DRIVER_REGISTRY.with(|registry| {
                 registry.borrow_mut().remove(&runtime_id);
@@ -144,28 +150,36 @@ impl Drop for PromiseDriver {
     }
 }
 
-/// RAII guard marking the calling stack as inside THIS module's own
-/// `drive_turn` call — the ONLY caller that pumps the runtime
-/// non-blockingly across macrotasks and can therefore resolve a structural
-/// `WaitKind::External`/`WaitKind::Timer` suspend from a dual-ABI wasm
-/// native. Sets [`sema_core::promise_driven_quantum_active`] true for the
-/// guard's lifetime and restores the PREVIOUS value on drop (including on
-/// unwind, via `Drop`) rather than unconditionally clearing it, so a nested
-/// re-entry — should one ever occur — can't stomp an outer guard's flag.
-struct PromiseDrivenGuard {
-    previous: bool,
+/// Whether the currently executing runtime quantum belongs to the Promise
+/// driver registered for its exact runtime. `RootId` includes `RuntimeId`, so
+/// equal local ids in different interpreters cannot collide.
+pub(crate) fn promise_driven_root_active() -> bool {
+    let Some(root) = sema_core::current_root() else {
+        return false;
+    };
+    DRIVER_REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .get(&root.runtime())
+            .and_then(Weak::upgrade)
+            .is_some_and(|driver| driver.owns_root(root))
+    })
 }
 
-impl PromiseDrivenGuard {
-    fn enter() -> Self {
-        let previous = sema_core::set_promise_driven_quantum(true);
-        Self { previous }
+impl PromiseDriver {
+    fn owns_root(&self, root: RootId) -> bool {
+        self.promises.borrow().contains_key(&root)
+            || self.debug_root.get() == Some(root)
+            || self.retiring_debug_roots.borrow().contains_key(&root)
     }
-}
 
-impl Drop for PromiseDrivenGuard {
-    fn drop(&mut self) {
-        sema_core::set_promise_driven_quantum(self.previous);
+    fn owned_roots(&self) -> Vec<RootId> {
+        let mut roots: Vec<_> = self.promises.borrow().keys().copied().collect();
+        if let Some(root) = self.debug_root.get() {
+            roots.push(root);
+        }
+        roots.extend(self.retiring_debug_roots.borrow().keys().copied());
+        roots
     }
 }
 
@@ -322,6 +336,7 @@ pub(crate) fn start_debug(
                     valid_lines: valid_lines.clone(),
                     breakpoints: breakpoints.clone(),
                 });
+                driver.debug_root.set(Some(root));
                 retain_while_active(&driver);
                 schedule_drive(&driver);
             }
@@ -381,15 +396,14 @@ pub(crate) fn resume_debug(driver: &Rc<PromiseDriver>, mode: StepMode) -> js_sys
             let result = debug_error_result("The Promise debug session lost its paused root");
             let mut session = driver.debug_session.borrow_mut().take();
             let action = session.as_mut().and_then(|session| session.action.take());
-            let root = session.as_ref().map(|session| session.handle.id());
-            drop(session);
-            if let Some(root) = root {
-                let _ = driver.interp.command_handle().cancel_root(root);
+            if let Some(session) = session {
+                retire_debug_root(&driver, session.handle);
+            } else {
+                schedule_drive(&driver);
             }
             if let Some(action) = action {
                 resolve_debug_immediately(&action.resolve, result);
             }
-            schedule_drive(&driver);
             return;
         }
         retain_while_active(&driver);
@@ -405,19 +419,31 @@ pub(crate) fn stop_debug(driver: &Rc<PromiseDriver>) -> bool {
         return false;
     };
     let root = session.handle.id();
+    let action = session.action.take();
+    let result = debug_cancelled_result(root, std::mem::take(&mut session.output));
+    retire_debug_root(driver, session.handle);
+    if let Some(action) = action {
+        resolve_debug_immediately(&action.resolve, result);
+    }
+    true
+}
+
+/// Cancel a detached debugger session while preserving exact-root scheduling
+/// ownership until the runtime publishes its terminal result.
+fn retire_debug_root(driver: &Rc<PromiseDriver>, handle: RootHandle) {
+    let root = handle.id();
+    driver.debug_root.set(None);
     let runtime = driver.interp.runtime();
     let _ = driver.interp.command_handle().cancel_root(root);
     if runtime.is_debug_paused_for(root) {
         runtime.debug_cancel_paused_root(root);
     }
-    let action = session.action.take();
-    let result = debug_cancelled_result(root, std::mem::take(&mut session.output));
-    drop(session);
-    if let Some(action) = action {
-        resolve_debug_immediately(&action.resolve, result);
-    }
+    driver
+        .retiring_debug_roots
+        .borrow_mut()
+        .insert(root, handle);
+    retain_while_active(driver);
     schedule_drive(driver);
-    true
 }
 
 pub(crate) fn debug_is_active(driver: &PromiseDriver) -> bool {
@@ -642,16 +668,9 @@ fn drive_and_settle(driver: &Rc<PromiseDriver>) {
     // id cleanly rather than appearing to still have one pending.
     driver.drive_timeout_id.set(None);
     let interp = &driver.interp;
+    let owned_roots = driver.owned_roots();
 
     let drive_state = {
-        // Only this call is "promise-driven": dual-ABI WASM HTTP consults
-        // `sema_core::promise_driven_quantum_active()` to suspend
-        // structurally instead of rejecting the synchronous boundary. The
-        // guard is scoped tightly to this one
-        // `drive_turn` call and restores the previous value on drop
-        // (including on unwind), so it cannot leak into a synchronous JS call
-        // that re-enters the interpreter.
-        let _promise_guard = PromiseDrivenGuard::enter();
         let mut debug_slot = driver.debug_session.borrow_mut();
         if let Some(session) = debug_slot.as_mut() {
             session.debug.instructions_remaining = DEBUG_INSTRUCTION_BUDGET;
@@ -659,7 +678,7 @@ fn drive_and_settle(driver: &Rc<PromiseDriver>) {
         let _debug_guard = debug_slot.as_mut().map(|session| {
             sema_vm::ActiveDebugGuard::enter_for_root(&mut session.debug, session.handle.id())
         });
-        match interp.drive_turn() {
+        match interp.drive_roots(&owned_roots) {
             Ok(state) => state,
             Err(fault) => {
                 drop(_debug_guard);
@@ -674,15 +693,17 @@ fn drive_and_settle(driver: &Rc<PromiseDriver>) {
     pump_output(driver);
     settle_ready_roots(driver);
     settle_debug_action(driver, &drive_state);
+    settle_retiring_debug_roots(driver);
 
     let ordinary_pending = !driver.promises.borrow().is_empty();
+    let retiring_debug_pending = !driver.retiring_debug_roots.borrow().is_empty();
     let (debug_active, debug_action_pending) = driver
         .debug_session
         .borrow()
         .as_ref()
         .map(|session| (true, session.action.is_some()))
         .unwrap_or((false, false));
-    if !ordinary_pending && !debug_active {
+    if !ordinary_pending && !debug_active && !retiring_debug_pending {
         unregister_driver(driver);
         driver.active_retain.borrow_mut().take();
         return; // idle with nothing left to settle — stop scheduling, no busy loop
@@ -704,7 +725,7 @@ fn drive_and_settle(driver: &Rc<PromiseDriver>) {
             })
             && !debug_action_pending)
     {
-        if !ordinary_pending {
+        if !ordinary_pending && !retiring_debug_pending {
             // No Promise is awaiting progress while paused. Let the JS
             // interpreter wrapper own this stable session; retaining `self`
             // here would form a permanent cycle if that wrapper were dropped
@@ -875,6 +896,9 @@ fn settle_debug_action(driver: &PromiseDriver, drive_state: &DriveState) {
             },
         }
     };
+    if driver.debug_session.borrow().is_none() {
+        driver.debug_root.set(None);
+    }
     if let Some((resolve, result)) = delivery {
         resolve_debug_immediately(&resolve, result);
     }
@@ -920,6 +944,17 @@ fn settle_ready_roots(driver: &PromiseDriver) {
     }
 }
 
+/// Keep cancelled debugger roots in the driver's exact scheduling set until
+/// their terminal result is observable. The action Promise is settled
+/// separately; retaining only the handle lets cancellation and cleanup run
+/// without exposing the retiring root as an active debugger session.
+fn settle_retiring_debug_roots(driver: &PromiseDriver) {
+    driver
+        .retiring_debug_roots
+        .borrow_mut()
+        .retain(|_, handle| matches!(handle.poll_result(), RootPoll::Pending));
+}
+
 /// Reject every still-pending root the same way (a `Runtime::drive` fault is
 /// not root-specific) and clear the table, so no promise is left hanging.
 fn fail_all_pending(driver: &Rc<PromiseDriver>, message: &str) {
@@ -945,6 +980,8 @@ fn fail_all_pending(driver: &Rc<PromiseDriver>, message: &str) {
             );
             Some((action.resolve, result))
         });
+    driver.debug_root.set(None);
+    driver.retiring_debug_roots.borrow_mut().clear();
     if let Some((resolve, result)) = debug_delivery {
         resolve_debug_immediately(&resolve, result);
     }
@@ -1198,19 +1235,15 @@ pub(crate) type SyncHttpFn = Rc<dyn Fn(&[Value]) -> Result<Value, SemaError>>;
 /// into a dual-ABI native via
 /// [`sema_core::NativeFn::simple_with_runtime`].
 ///
-/// `runtime_quantum_active()` is true for every live runtime quantum, including
-/// synchronous WASM entry points, so it cannot identify a host that can pump
-/// browser callbacks. This checks
-/// [`sema_core::promise_driven_quantum_active`], set true only inside this
-/// module's own `drive_and_settle` turn: when true, suspend structurally on
-/// a real `WaitKind::External` fetch; otherwise run `synchronous`, which
-/// rejects the unsupported blocking call with an `evalPromise` hint.
+/// Runtime-quantum state alone cannot identify a host that can pump browser
+/// callbacks. The currently executing root must belong to this interpreter's
+/// Promise driver; otherwise `synchronous` rejects with an `evalPromise` hint.
 pub(crate) fn runtime_http_fn(
     method: &'static str,
     synchronous: SyncHttpFn,
 ) -> impl for<'a> Fn(&mut NativeCallContext<'a>, &[Value]) -> NativeResult + 'static {
     move |_ctx, args| {
-        if sema_core::promise_driven_quantum_active() {
+        if promise_driven_root_active() {
             runtime_http_call(method, args)
         } else {
             (synchronous)(args).map(NativeOutcome::Return)

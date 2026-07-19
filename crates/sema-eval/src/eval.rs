@@ -109,6 +109,22 @@ fn build_runtime_with(
         .expect("fresh unified runtime construction cannot fail")
 }
 
+fn drive_runtime_root(
+    runtime: &sema_vm::runtime::Runtime,
+    budget: &sema_vm::runtime::DriveBudget,
+    root: sema_core::runtime::RootId,
+) -> Result<sema_vm::runtime::DriveState, sema_vm::runtime::RuntimeFault> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        runtime.drive_roots(budget, &[root])
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = root;
+        runtime.drive(budget)
+    }
+}
+
 impl Default for Interpreter {
     fn default() -> Self {
         Self::new()
@@ -444,6 +460,23 @@ impl Interpreter {
             .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))
     }
 
+    /// Drive one bounded turn while executing VM quanta only for `roots`.
+    /// Runtime-wide completion and cancellation bookkeeping still advances,
+    /// but another host's ready root cannot execute under this host's policy.
+    pub fn drive_roots(
+        &self,
+        roots: &[sema_core::runtime::RootId],
+    ) -> Result<sema_vm::runtime::DriveState, SemaError> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("runtime is present outside of Drop");
+        let budget = sema_vm::runtime::DriveBudget::host_default();
+        runtime
+            .drive_roots(&budget, roots)
+            .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))
+    }
+
     /// Drain every [`OutputEvent`](sema_vm::runtime::OutputEvent) captured so
     /// far from roots submitted with `capture_output: true`. A root that
     /// didn't opt in still writes straight to process stdout/stderr, exactly
@@ -589,8 +622,7 @@ impl Interpreter {
                     // that the common case; this keeps the drain going for any
                     // teardown the drive scan still owes.
                     loop {
-                        match runtime
-                            .drive(&budget)
+                        match drive_runtime_root(runtime, &budget, handle.id())
                             .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))?
                         {
                             DriveState::Progress {
@@ -615,8 +647,7 @@ impl Interpreter {
                     return Err(SemaError::eval("runtime invariant violation"));
                 }
             }
-            match runtime
-                .drive(&budget)
+            match drive_runtime_root(runtime, &budget, handle.id())
                 .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))?
             {
                 DriveState::Progress { .. } => {}
@@ -632,9 +663,11 @@ impl Interpreter {
                             break;
                         }
                         if !matches!(
-                            runtime.drive(&budget).map_err(|e| SemaError::eval(format!(
-                                "runtime fault while cancelling suspended WASM root: {e:?}"
-                            )))?,
+                            drive_runtime_root(runtime, &budget, handle.id()).map_err(|e| {
+                                SemaError::eval(format!(
+                                    "runtime fault while cancelling suspended WASM root: {e:?}"
+                                ))
+                            })?,
                             DriveState::Progress { .. }
                         ) {
                             break;

@@ -33,47 +33,6 @@ pub fn set_runtime_quantum(val: bool) {
     IN_RUNTIME_QUANTUM.with(|c| c.set(val));
 }
 
-// ── Promise-driven quantum flag (wasm) ───────────────────────────
-
-thread_local! {
-    /// True only while a wasm macrotask-driven turn (`sema-wasm`'s
-    /// `driver.rs`, `evalPromise`) is pumping the runtime on this thread.
-    ///
-    /// `runtime_quantum_active()`/`in_runtime_quantum()` is true for EVERY
-    /// live runtime quantum, old and new alike — every `eval*` entry point
-    /// (wasm and native) drives the same `Runtime::drive`, so a dual-ABI
-    /// native cannot use that flag to tell "a genuinely non-blocking,
-    /// externally-driven caller that can suspend a wasm native on a real
-    /// external wait" apart from "a synchronous caller that is about to
-    /// block the calling thread waiting for this native's result"
-    /// (`drive_handle_to_settlement` → `block_on_inbox`, which cannot work
-    /// on wasm32: no OS threads to block, and no reactor to service the
-    /// suspended op). This flag is the explicit, narrower discriminator: set
-    /// ONLY by the macrotask driver's own drive turn, so a dual-ABI wasm
-    /// native can suspend structurally when (and only when) something is
-    /// actually pumping the runtime asynchronously across turns, and must
-    /// fall back to its synchronous behavior everywhere else —
-    /// including inside every OTHER live runtime quantum.
-    static PROMISE_DRIVEN_QUANTUM: Cell<bool> = const { Cell::new(false) };
-}
-
-/// True only inside a wasm macrotask driver's own drive turn (see
-/// [`PROMISE_DRIVEN_QUANTUM`]).
-pub fn promise_driven_quantum_active() -> bool {
-    PROMISE_DRIVEN_QUANTUM.with(|c| c.get())
-}
-
-/// Set the promise-driven-quantum flag, returning the PREVIOUS value so a
-/// caller can restore it (RAII guard pattern, mirroring
-/// [`RuntimeQuantumGuard`](crate::context::RuntimeQuantumGuard)). Intended to
-/// be called only by the wasm macrotask driver around its own `drive_turn`
-/// call, symmetrically set/unset (including on unwind) so a panic mid-turn
-/// can never leave a subsequent, unrelated synchronous `eval` call thinking it is
-/// promise-driven.
-pub fn set_promise_driven_quantum(val: bool) -> bool {
-    PROMISE_DRIVEN_QUANTUM.with(|c| c.replace(val))
-}
-
 // ── Task-reaped callback ────────────────────────────────────────
 
 /// Callback type for observing a task's transition into a terminal state it

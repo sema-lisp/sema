@@ -153,7 +153,7 @@ fn normalize_path(path: &str) -> Result<String, SemaError> {
 /// promise-driven program. Skip compatibility accumulation while a promise-
 /// driven turn is active; `write_stdout` below is this root's only real sink.
 fn append_output(s: &str) {
-    if !sema_core::promise_driven_quantum_active() {
+    if !driver::promise_driven_root_active() {
         LINE_BUF.with(|b| b.borrow_mut().push_str(s));
     }
     sema_core::write_stdout(s);
@@ -163,7 +163,7 @@ fn append_output(s: &str) {
 /// retain their single buffered `output` array, while a capturing runtime root emits
 /// a real stderr-tagged `OutputEvent` for Promise/debugger consumers.
 fn append_error_output(s: &str) {
-    if !sema_core::promise_driven_quantum_active() {
+    if !driver::promise_driven_root_active() {
         LINE_BUF.with(|b| b.borrow_mut().push_str(s));
     }
     sema_core::write_stderr(s);
@@ -178,7 +178,7 @@ fn append_error_output(s: &str) {
 /// Without this, every `println` from a long-running/looping promise-driven
 /// program would still push an (empty) line into `OUTPUT` forever.
 fn flush_line() {
-    if sema_core::promise_driven_quantum_active() {
+    if driver::promise_driven_root_active() {
         return;
     }
     let line = LINE_BUF.with(|b| {

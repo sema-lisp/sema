@@ -65,7 +65,10 @@ fi
 # git-tracked files. A stray .DS_Store / editor backup, or a required asset
 # someone forgot to `git add`, would then be embedded in dev yet MISSING from the
 # .crate: the exact ship-vs-dev divergence. Reject any untracked/ignored file.
-STRAY="$(git -C "$ROOT" status --porcelain --ignored -- crates/sema/src/web/assets)"
+STRAY="$(
+  git -C "$ROOT" status --porcelain --ignored -- crates/sema/src/web/assets \
+    | sed -n '/^?? /p;/^!! /p'
+)"
 if [[ -n "$STRAY" ]]; then
   echo "packaged web smoke: untracked/ignored files in the asset dir (embedded locally, NOT shipped):" >&2
   echo "$STRAY" >&2
@@ -79,6 +82,26 @@ while IFS= read -r tracked; do
     exit 1
   fi
 done <<< "$TRACKED_ASSETS"
+
+# Guard the generated artifacts themselves, not only the Rust sources that
+# produced them. These are the bytes cargo packages and rust-embed compiles
+# into the installed binary.
+PACKAGE_GLUE="$PACKAGE_DIR/src/web/assets/sema_wasm.js"
+PACKAGE_WASM="$PACKAGE_DIR/src/web/assets/sema_wasm_bg.wasm"
+for marker in debugPerformFetch installAtomicsSleep XMLHttpRequest 'Atomics.wait' HTTP_AWAIT_MARKER; do
+  if LC_ALL=C grep -F -q -- "$marker" "$PACKAGE_GLUE"; then
+    echo "packaged web smoke: retired marker '$marker' remains in packaged WASM glue" >&2
+    exit 1
+  fi
+done
+for export_name in semainterpreter_debugPerformFetch semainterpreter_installAtomicsSleep; do
+  if LC_ALL=C grep -a -F -q -- "$export_name" "$PACKAGE_WASM"; then
+    echo "packaged web smoke: retired export '$export_name' remains in packaged WASM" >&2
+    exit 1
+  fi
+done
+cp "$PACKAGE_GLUE" "$TMP/expected-sema_wasm.js"
+cp "$PACKAGE_WASM" "$TMP/expected-sema_wasm_bg.wasm"
 
 # Package manifests correctly replace workspace paths with registry versions.
 # Patch those packages back to this checkout so the smoke remains runnable on
@@ -170,6 +193,16 @@ curl -fsS "$WASM_URL" -o "$TMP/served.wasm"
 WASM_MAGIC="$(head -c4 "$TMP/served.wasm" | od -An -tx1 | tr -d ' \n')"
 if [[ "$WASM_MAGIC" != 0061736d ]]; then
   echo "packaged web smoke: served wasm is not a wasm module (magic=$WASM_MAGIC)" >&2
+  exit 1
+fi
+if ! cmp -s "$TMP/served.wasm" "$TMP/expected-sema_wasm_bg.wasm"; then
+  echo "packaged web smoke: served WASM differs from the packaged RustEmbedded asset" >&2
+  exit 1
+fi
+
+curl -fsS "http://127.0.0.1:$PORT/__sema/sema_wasm.js" -o "$TMP/served-sema_wasm.js"
+if ! cmp -s "$TMP/served-sema_wasm.js" "$TMP/expected-sema_wasm.js"; then
+  echo "packaged web smoke: served glue differs from the packaged RustEmbedded asset" >&2
   exit 1
 fi
 

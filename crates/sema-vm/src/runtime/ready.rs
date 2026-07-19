@@ -32,7 +32,18 @@ impl ReadyScheduler {
     }
 
     pub fn dequeue(&mut self) -> Option<(RootId, TaskId)> {
-        let root = self.roots.pop_front()?;
+        self.dequeue_where(|_| true)
+    }
+
+    /// Dequeue one task belonging to an explicitly host-owned root without
+    /// disturbing the relative round-robin order of every other root.
+    pub fn dequeue_roots(&mut self, roots: &[RootId]) -> Option<(RootId, TaskId)> {
+        self.dequeue_where(|root| roots.contains(&root))
+    }
+
+    fn dequeue_where(&mut self, allowed: impl Fn(RootId) -> bool) -> Option<(RootId, TaskId)> {
+        let position = self.roots.iter().position(|root| allowed(*root))?;
+        let root = self.roots.remove(position)?;
         let queue = self
             .tasks_by_root
             .get_mut(&root)
@@ -54,12 +65,23 @@ impl ReadyScheduler {
         self.roots.len()
     }
 
+    pub fn root_count_for(&self, roots: &[RootId]) -> usize {
+        self.roots
+            .iter()
+            .filter(|root| roots.contains(root))
+            .count()
+    }
+
     /// Whether any task is queued. O(1); equivalent to "some task's record is
     /// `Ready`" at drive-turn boundaries, where every `Ready` task is enqueued
     /// (a dequeued task runs to park/settle/re-enqueue within the same turn,
     /// and a debug-paused task's record leaves `Ready`).
     pub fn has_queued(&self) -> bool {
         !self.task_membership.is_empty()
+    }
+
+    pub fn has_queued_for(&self, roots: &[RootId]) -> bool {
+        self.roots.iter().any(|root| roots.contains(root))
     }
 
     pub fn remove_root(&mut self, root: RootId) -> Vec<TaskId> {

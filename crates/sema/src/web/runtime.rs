@@ -66,4 +66,22 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn embedded_wasm_glue_has_no_retired_blocking_compatibility_surface() {
+        let glue = WebRuntime::get("sema_wasm.js").expect("WASM glue is embedded");
+        let glue = std::str::from_utf8(&glue.data).expect("wasm-bindgen glue is UTF-8");
+        for retired in [
+            "debugPerformFetch",
+            "installAtomicsSleep",
+            "XMLHttpRequest",
+            "Atomics.wait",
+            "HTTP_AWAIT_MARKER",
+        ] {
+            assert!(
+                !glue.contains(retired),
+                "retired WASM compatibility marker {retired:?} remains in the embedded runtime",
+            );
+        }
+    }
 }

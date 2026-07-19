@@ -722,6 +722,40 @@ fn runtime_interleaves_two_real_vm_roots_independently() {
 }
 
 #[test]
+fn root_filtered_drive_leaves_an_earlier_foreign_root_queued() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let foreign = submit_vm_expr(&runtime, "(+ 1 2)");
+    let owned = submit_vm_expr(&runtime, "(+ 20 22)");
+
+    while matches!(owned.poll_result(), RootPoll::Pending) {
+        runtime
+            .drive_roots(&drive_budget(64), &[owned.id()])
+            .expect("owned root drives");
+    }
+
+    assert!(matches!(foreign.poll_result(), RootPoll::Pending));
+    assert_eq!(drive_root_to_int(&runtime, &owned), 42);
+    assert_eq!(drive_root_to_int(&runtime, &foreign), 3);
+}
+
+#[test]
+fn root_filtered_drive_leaves_a_later_foreign_root_queued() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let owned = submit_vm_expr(&runtime, "(+ 20 22)");
+    let foreign = submit_vm_expr(&runtime, "(+ 1 2)");
+
+    while matches!(owned.poll_result(), RootPoll::Pending) {
+        runtime
+            .drive_roots(&drive_budget(64), &[owned.id()])
+            .expect("owned root drives");
+    }
+
+    assert!(matches!(foreign.poll_result(), RootPoll::Pending));
+    assert_eq!(drive_root_to_int(&runtime, &owned), 42);
+    assert_eq!(drive_root_to_int(&runtime, &foreign), 3);
+}
+
+#[test]
 fn runtime_delayed_promise_wait_resumes_with_canonical_settlement() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
     let promise = runtime.create_pending_promise_for_test();
@@ -2872,6 +2906,56 @@ fn continuation_call_apply_invoke_resume_and_final_apply_are_distinct_turns() {
 }
 
 #[test]
+fn root_filtered_drive_does_not_invoke_a_foreign_pending_call() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let native_events = Arc::clone(&events);
+    let foreign = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Call(
+            NativeCall {
+                callable: Value::native_fn(sema_core::NativeFn::simple_result(
+                    "foreign-pending-native",
+                    move |_| {
+                        native_events.lock().unwrap().push("foreign-invoke");
+                        Ok(NativeOutcome::Return(Value::int(8)))
+                    },
+                )),
+                args: Vec::new(),
+                continuation: Box::new(RecordingContinuation(Arc::clone(&events))),
+            },
+        ))))
+        .expect("foreign root admitted");
+    let owned = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::int(42)))
+        .expect("owned root admitted");
+    let one = drive_budget(1);
+
+    // Advance the foreign root through Action -> Apply, leaving its Invoke as
+    // an already-staged item at the head of the runtime-wide pending queue.
+    for _ in 0..3 {
+        runtime.drive_roots(&one, &[foreign.id()]).unwrap();
+    }
+    assert!(events.lock().unwrap().is_empty());
+
+    while matches!(owned.poll_result(), RootPoll::Pending) {
+        runtime.drive_roots(&one, &[owned.id()]).unwrap();
+    }
+    assert_eq!(
+        *events.lock().unwrap(),
+        Vec::<&'static str>::new(),
+        "an owned drive must leave the foreign Invoke staged"
+    );
+
+    while matches!(foreign.poll_result(), RootPoll::Pending) {
+        runtime.drive_roots(&one, &[foreign.id()]).unwrap();
+    }
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["foreign-invoke", "resume-returned"]
+    );
+}
+
+#[test]
 fn panicking_runtime_native_restores_quantum_thread_local() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
     let invoked = Rc::new(Cell::new(false));
@@ -4652,6 +4736,82 @@ fn external_suspend(events: Arc<Mutex<Vec<&'static str>>>) -> NativeSuspend {
         ))),
         continuation: Box::new(CountingContinuation(events)),
     }
+}
+
+struct ExternalCallContinuation(Arc<Mutex<Vec<&'static str>>>);
+
+impl Trace for ExternalCallContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for ExternalCallContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        assert!(matches!(input, ResumeInput::Returned(_)));
+        let native_events = Arc::clone(&self.0);
+        Ok(NativeOutcome::Call(NativeCall {
+            callable: Value::native_fn(sema_core::NativeFn::simple_result(
+                "external-foreign-native",
+                move |_| {
+                    native_events.lock().unwrap().push("external-invoke");
+                    Ok(NativeOutcome::Return(Value::int(8)))
+                },
+            )),
+            args: Vec::new(),
+            continuation: Box::new(RecordingContinuation(self.0)),
+        }))
+    }
+}
+
+fn external_call_suspend(events: Arc<Mutex<Vec<&'static str>>>) -> NativeSuspend {
+    NativeSuspend {
+        wait: WaitKind::External(Box::new(PreparedExternalOperation::quarantined_blocking(
+            CompletionKind::try_from_raw(92).unwrap(),
+            Box::new(CountingDecoder(Arc::clone(&events))),
+            sema_core::runtime::QuarantineBound::hard_deadline(Duration::from_secs(1)).unwrap(),
+            || Ok(Box::new(())),
+        ))),
+        continuation: Box::new(ExternalCallContinuation(events)),
+    }
+}
+
+#[test]
+fn root_filtered_drive_stages_but_does_not_decode_a_foreign_external_completion() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let foreign = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
+            external_call_suspend(Arc::clone(&events)),
+        ))))
+        .expect("foreign root admitted");
+    let owned = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::int(42)))
+        .expect("owned root admitted");
+    let one = drive_budget(1);
+
+    while runtime.active_wait_count_for_test() == 0 {
+        runtime.drive_roots(&one, &[foreign.id()]).unwrap();
+    }
+    while matches!(owned.poll_result(), RootPoll::Pending) {
+        runtime.drive_roots(&one, &[owned.id()]).unwrap();
+    }
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "the owned drive may stage a foreign completion but cannot decode or resume it"
+    );
+
+    while matches!(foreign.poll_result(), RootPoll::Pending) {
+        runtime.drive_roots(&one, &[foreign.id()]).unwrap();
+    }
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["decode", "external-invoke", "resume-returned"]
+    );
 }
 
 /// A `WaitKind::Timer` parked FAR in the future under a `FakeClock` that is

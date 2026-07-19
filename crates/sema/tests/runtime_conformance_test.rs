@@ -286,7 +286,7 @@ fn unified_runtime_inventory_checker_rejects_invalid_fixture_states() {
     fs::write(&current, "crates/example/src/lib.rs:1:match\n").expect("write current fixture");
     fs::write(
         &inventory,
-        "| Area | Path |\n| --- | --- |\n| R01A valid row | R99 appears outside the ID column |\n",
+        "| Area | Path | Status |\n| --- | --- | --- |\n| R01A valid row | R99 appears outside the ID column | MIGRATED |\n",
     )
     .expect("write inventory fixture");
 
@@ -344,6 +344,37 @@ fn unified_runtime_inventory_checker_rejects_invalid_fixture_states() {
             "fixture {name} had unexpected status {}\nstdout:\n{}\nstderr:\n{}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fs::write(&mapping, "R01A\tcrates/example/src/lib.rs:1:match\n")
+        .expect("write mapped nonterminal fixture");
+    for status in ["LEGACY", "ADAPTER"] {
+        fs::write(
+            &inventory,
+            format!(
+                "| Area | Path | Status |\n| --- | --- | --- |\n| R01A valid row | match | {status} |\n"
+            ),
+        )
+        .expect("write nonterminal inventory fixture");
+        let output = Command::new(root.join("scripts/check-unified-runtime-inventory.sh"))
+            .args(["--check-files"])
+            .arg(&mapping)
+            .arg(&current)
+            .arg(&inventory)
+            .current_dir(&root)
+            .output()
+            .expect("run inventory checker nonterminal fixture");
+        assert!(
+            !output.status.success(),
+            "mapped {status} ledger row unexpectedly passed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("nonterminal ledger row R01A"),
+            "mapped {status} ledger row did not report its status\nstderr:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
     }

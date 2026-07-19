@@ -42,7 +42,7 @@ check_mapping_files() {
   local mapping_file="$1"
   local current_file="$2"
   local inventory_file="$3"
-  local payload_file row_file mapped_row_file
+  local payload_file ledger_status_file mapped_row_file
 
   if [[ ! -s "$current_file" ]]; then
     echo "runtime inventory scan returned no production matches" >&2
@@ -74,16 +74,16 @@ check_mapping_files() {
   fi
 
   payload_file="$(mktemp)"
-  row_file="$(mktemp)"
+  ledger_status_file="$(mktemp)"
   mapped_row_file="$(mktemp)"
   cut -f2- "$mapping_file" >"$payload_file"
   if ! LC_ALL=C sort -c -u "$payload_file"; then
-    rm -f "$payload_file" "$row_file" "$mapped_row_file"
+    rm -f "$payload_file" "$ledger_status_file" "$mapped_row_file"
     echo "runtime inventory mapping payload is not sorted and unique" >&2
     return 1
   fi
   if ! diff -u "$payload_file" "$current_file"; then
-    rm -f "$payload_file" "$row_file" "$mapped_row_file"
+    rm -f "$payload_file" "$ledger_status_file" "$mapped_row_file"
     echo "runtime inventory mapping has missing or stale exact matches" >&2
     return 1
   fi
@@ -94,23 +94,35 @@ check_mapping_files() {
       sub(/^[[:space:]]+/, "", cell)
       sub(/[[:space:]]+$/, "", cell)
       split(cell, parts, /[[:space:]]+/)
-      if (parts[1] ~ /^[A-Z][0-9][0-9][A-Z]?$/) print parts[1]
+      if (parts[1] ~ /^[A-Z][0-9][0-9][A-Z]?$/) {
+        status = $(NF - 1)
+        sub(/^[[:space:]]+/, "", status)
+        sub(/[[:space:]]+$/, "", status)
+        print parts[1] "\t" status
+      }
     }
-  ' "$inventory_file" | LC_ALL=C sort -u >"$row_file"
+  ' "$inventory_file" | LC_ALL=C sort -u >"$ledger_status_file"
   cut -f1 "$mapping_file" | LC_ALL=C sort -u >"$mapped_row_file"
-  if ! awk '
-    NR == FNR { ledger[$1] = 1; next }
+  if ! awk -F '\t' '
+    NR == FNR { ledger[$1] = $2; next }
     !($1 in ledger) {
       print "runtime inventory mapping references missing ledger row " $1 > "/dev/stderr"
-      missing = 1
+      invalid = 1
+      next
     }
-    END { exit missing }
-  ' "$row_file" "$mapped_row_file"; then
-    rm -f "$payload_file" "$row_file" "$mapped_row_file"
+    ledger[$1] != "MIGRATED" && ledger[$1] != "REMOVED" &&
+      ledger[$1] != "SYNCHRONOUS-PROOF" {
+      print "runtime inventory mapping references nonterminal ledger row " $1 \
+        " (" ledger[$1] ")" > "/dev/stderr"
+      invalid = 1
+    }
+    END { exit invalid }
+  ' "$ledger_status_file" "$mapped_row_file"; then
+    rm -f "$payload_file" "$ledger_status_file" "$mapped_row_file"
     return 1
   fi
 
-  rm -f "$payload_file" "$row_file" "$mapped_row_file"
+  rm -f "$payload_file" "$ledger_status_file" "$mapped_row_file"
   printf 'runtime inventory mapping covers %s exact production matches\n' \
     "$(wc -l <"$mapping_file" | tr -d ' ')"
 }

@@ -6,6 +6,7 @@
 
 #![cfg(unix)]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use sema_core::runtime::{CancelReason, TaskOutcome};
@@ -14,6 +15,70 @@ use sema_eval::Interpreter;
 use sema_vm::runtime::{DriveState, RootOptions, RootPoll};
 
 static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+static PRIOR_SIGWINCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn prior_sigwinch_handler(_: libc::c_int) {
+    PRIOR_SIGWINCH_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+struct SigactionRestore {
+    signal: libc::c_int,
+    previous: libc::sigaction,
+}
+
+impl Drop for SigactionRestore {
+    fn drop(&mut self) {
+        // SAFETY: `previous` was returned by `sigaction` for this exact signal
+        // in the same process and remains valid for process lifetime.
+        let restored =
+            unsafe { libc::sigaction(self.signal, &self.previous, std::ptr::null_mut()) };
+        assert_eq!(restored, 0, "restore test signal disposition");
+    }
+}
+
+fn install_prior_sigwinch_handler() -> SigactionRestore {
+    PRIOR_SIGWINCH_CALLS.store(0, Ordering::Relaxed);
+    // SAFETY: zero is a valid initial representation for `sigaction`; the mask
+    // is initialized before installation and the handler has the required C ABI.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = prior_sigwinch_handler as *const () as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        assert_eq!(libc::sigemptyset(&mut action.sa_mask), 0);
+        assert_eq!(libc::sigaddset(&mut action.sa_mask, libc::SIGTERM), 0);
+
+        let mut previous: libc::sigaction = std::mem::zeroed();
+        assert_eq!(
+            libc::sigaction(libc::SIGWINCH, &action, &mut previous),
+            0,
+            "install prior SIGWINCH disposition"
+        );
+        SigactionRestore {
+            signal: libc::SIGWINCH,
+            previous,
+        }
+    }
+}
+
+fn current_sigwinch_action() -> libc::sigaction {
+    // SAFETY: a null new-action pointer queries the current disposition, and
+    // `current` points to writable storage for the result.
+    unsafe {
+        let mut current: libc::sigaction = std::mem::zeroed();
+        assert_eq!(
+            libc::sigaction(libc::SIGWINCH, std::ptr::null(), &mut current),
+            0,
+            "query SIGWINCH disposition"
+        );
+        current
+    }
+}
+
+fn raise_sigwinch() {
+    // SAFETY: SIGWINCH is a valid signal and these tests always install a
+    // handler before raising it, so it cannot take the process default action.
+    assert_eq!(unsafe { libc::raise(libc::SIGWINCH) }, 0);
+}
 
 fn signal_test_guard() -> MutexGuard<'static, ()> {
     SIGNAL_TEST_LOCK
@@ -29,6 +94,82 @@ fn eval(interp: &Interpreter, source: &str) -> Value {
     interp
         .eval_str(source)
         .unwrap_or_else(|error| panic!("eval failed for {source:?}: {error}"))
+}
+
+#[test]
+fn dropping_last_registry_restores_exact_prior_sigaction_after_gc_sever() {
+    let _guard = signal_test_guard();
+    let _restore = install_prior_sigwinch_handler();
+
+    let weak_bindings = {
+        let interp = Interpreter::new();
+        eval(
+            &interp,
+            "(begin
+               (define signal-root :kept-until-drop)
+               (sys/on-signal :winch (fn () signal-root)))",
+        );
+        std::rc::Rc::downgrade(&interp.global_env.bindings)
+    };
+    assert_eq!(
+        weak_bindings.strong_count(),
+        0,
+        "teardown severs the registry callback cycle"
+    );
+
+    let restored = current_sigwinch_action();
+    assert_eq!(
+        restored.sa_sigaction, prior_sigwinch_handler as *const () as libc::sighandler_t,
+        "last registry drop restores the prior handler"
+    );
+    assert_ne!(
+        restored.sa_flags & libc::SA_RESTART,
+        0,
+        "last registry drop restores the prior flags"
+    );
+    // SAFETY: `restored.sa_mask` was initialized by the successful sigaction
+    // query above and SIGTERM is a valid signal number.
+    assert_eq!(
+        unsafe { libc::sigismember(&restored.sa_mask, libc::SIGTERM) },
+        1
+    );
+
+    raise_sigwinch();
+    assert_eq!(PRIOR_SIGWINCH_CALLS.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn dropping_one_of_two_registries_keeps_the_shared_handler_installed() {
+    let _guard = signal_test_guard();
+    let _restore = install_prior_sigwinch_handler();
+    let left = Interpreter::new();
+    let right = Interpreter::new();
+    eval(&left, "(sys/on-signal :winch (fn () nil))");
+    eval(
+        &right,
+        "(begin
+           (define right-signal-count 0)
+           (sys/on-signal :winch
+             (fn () (set! right-signal-count (+ right-signal-count 1)))))",
+    );
+
+    drop(left);
+    raise_sigwinch();
+    assert_eq!(
+        PRIOR_SIGWINCH_CALLS.load(Ordering::Relaxed),
+        0,
+        "the prior handler stays displaced while another registry owns the signal"
+    );
+    assert_eq!(eval(&right, "(sys/check-signals)"), Value::nil());
+    assert_eq!(eval(&right, "right-signal-count"), Value::int(1));
+
+    drop(right);
+    raise_sigwinch();
+    assert_eq!(
+        PRIOR_SIGWINCH_CALLS.load(Ordering::Relaxed),
+        1,
+        "the final registry drop restores the prior handler"
+    );
 }
 
 fn drive_until_idle(interp: &Interpreter) {

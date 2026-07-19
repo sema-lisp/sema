@@ -1,13 +1,15 @@
 use std::io::IsTerminal;
 
 #[cfg(unix)]
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 #[cfg(unix)]
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::rc::Rc;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(unix)]
+use std::sync::{Mutex, OnceLock};
 
 use sema_core::cycle::GcEdge;
 use sema_core::runtime::{
@@ -209,30 +211,112 @@ impl SignalKind {
         }
     }
 
-    fn install_handler(self) -> Result<(), SemaError> {
-        // Cast through a pointer to avoid the fn_to_numeric_cast lint. The
-        // installed handler touches only one lock-free atomic generation.
-        let handler: libc::sighandler_t = match self {
-            Self::Winch => handle_sigwinch as *const () as usize,
-            Self::Int => handle_sigint as *const () as usize,
-            Self::Term => handle_sigterm as *const () as usize,
-        };
-        let signal = match self {
+    fn signal_number(self) -> libc::c_int {
+        match self {
             Self::Winch => libc::SIGWINCH,
             Self::Int => libc::SIGINT,
             Self::Term => libc::SIGTERM,
-        };
-        // SAFETY: `handler` is an extern-C function with the exact platform
-        // signal-handler signature and has process lifetime.
-        let previous = unsafe { libc::signal(signal, handler) };
-        if previous == libc::SIG_ERR {
-            return Err(SemaError::eval(format!(
-                "sys/on-signal: failed to install signal handler: {}",
-                std::io::Error::last_os_error()
-            )));
         }
+    }
+
+    fn handler(self) -> libc::sighandler_t {
+        // Cast through a pointer to avoid the fn_to_numeric_cast lint. The
+        // installed handler touches only one lock-free atomic generation.
+        match self {
+            Self::Winch => handle_sigwinch as *const () as usize,
+            Self::Int => handle_sigint as *const () as usize,
+            Self::Term => handle_sigterm as *const () as usize,
+        }
+    }
+
+    fn install_handler(self) -> Result<libc::sigaction, SemaError> {
+        // SAFETY: zero-initialization is valid for `sigaction`; the mask is
+        // initialized before installation, and `handler` is an extern-C
+        // function with the exact platform signal-handler signature and
+        // process lifetime.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = self.handler();
+            action.sa_flags = libc::SA_RESTART;
+            if libc::sigemptyset(&mut action.sa_mask) != 0 {
+                return Err(signal_install_error());
+            }
+            let mut previous: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(self.signal_number(), &action, &mut previous) != 0 {
+                return Err(signal_install_error());
+            }
+            Ok(previous)
+        }
+    }
+
+    fn acquire(self) -> Result<(), SemaError> {
+        let mut ownership = process_signal_ownership().lock().map_err(|_| {
+            SemaError::eval("sys/on-signal: process signal ownership lock is poisoned")
+        })?;
+        let slot = &mut ownership[self.index()];
+        let next = slot.subscribers.checked_add(1).ok_or_else(|| {
+            SemaError::eval("sys/on-signal: process signal subscriber count overflow")
+        })?;
+        if slot.subscribers == 0 {
+            slot.previous = Some(self.install_handler()?);
+        }
+        slot.subscribers = next;
         Ok(())
     }
+
+    fn release(self) {
+        let mut ownership = process_signal_ownership()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = &mut ownership[self.index()];
+        assert!(
+            slot.subscribers > 0,
+            "signal registry released an unowned process handler"
+        );
+        if slot.subscribers > 1 {
+            slot.subscribers -= 1;
+            return;
+        }
+
+        let previous = slot
+            .previous
+            .as_ref()
+            .expect("owned process signal handler retains its prior sigaction");
+        // SAFETY: `previous` was returned by `sigaction` for this exact signal
+        // when the first subscriber installed the process handler. The global
+        // ownership mutex keeps a new first subscriber from racing this restore.
+        let restored =
+            unsafe { libc::sigaction(self.signal_number(), previous, std::ptr::null_mut()) };
+        assert_eq!(
+            restored,
+            0,
+            "failed to restore prior signal disposition: {}",
+            std::io::Error::last_os_error()
+        );
+        slot.subscribers = 0;
+        slot.previous = None;
+    }
+}
+
+#[cfg(unix)]
+fn signal_install_error() -> SemaError {
+    SemaError::eval(format!(
+        "sys/on-signal: failed to install signal handler: {}",
+        std::io::Error::last_os_error()
+    ))
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct ProcessSignalOwnership {
+    subscribers: usize,
+    previous: Option<libc::sigaction>,
+}
+
+#[cfg(unix)]
+fn process_signal_ownership() -> &'static Mutex<[ProcessSignalOwnership; 3]> {
+    static OWNERSHIP: OnceLock<Mutex<[ProcessSignalOwnership; 3]>> = OnceLock::new();
+    OWNERSHIP.get_or_init(|| Mutex::new(std::array::from_fn(|_| ProcessSignalOwnership::default())))
 }
 
 #[cfg(unix)]
@@ -249,14 +333,21 @@ struct SignalSlot {
 #[derive(Default)]
 struct SignalRegistry {
     slots: RefCell<[SignalSlot; 3]>,
+    /// Process handler ownership is independent of callback edges: cycle
+    /// collection may sever `SignalSlot::callbacks` before this registry drops,
+    /// but teardown must still release every signal it installed.
+    installed: Cell<[bool; 3]>,
 }
 
 #[cfg(unix)]
 impl SignalRegistry {
     fn register(&self, kind: SignalKind, callback: Value) -> Result<(), SemaError> {
         let index = kind.index();
-        if self.slots.borrow()[index].callbacks.is_empty() {
-            kind.install_handler()?;
+        let mut installed = self.installed.get();
+        if !installed[index] {
+            kind.acquire()?;
+            installed[index] = true;
+            self.installed.set(installed);
             // Registration linearizes at this load. Signals observed before it
             // are historical; a signal racing after it advances the generation
             // and is delivered on the next check.
@@ -284,6 +375,18 @@ impl SignalRegistry {
             }
         }
         Ok(callbacks)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SignalRegistry {
+    fn drop(&mut self) {
+        let installed = self.installed.get();
+        for kind in SignalKind::ALL {
+            if installed[kind.index()] {
+                kind.release();
+            }
+        }
     }
 }
 

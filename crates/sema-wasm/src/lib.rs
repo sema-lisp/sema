@@ -2174,9 +2174,10 @@ impl WasmInterpreter {
         code: &str,
         breakpoint_lines: &js_sys::Array,
     ) -> js_sys::Promise {
-        if let Err(message) = driver::ensure_promise_admission(&self.promise_driver) {
-            return js_sys::Promise::resolve(&self.debug_error_str(message));
-        }
+        let reservation = match driver::reserve_promise_admission(&self.promise_driver) {
+            Ok(reservation) => reservation,
+            Err(message) => return js_sys::Promise::resolve(&self.debug_error_str(message)),
+        };
         self.inner.ctx.eval_steps.set(0);
         let bp_lines: Vec<u32> = breakpoint_lines
             .iter()
@@ -2238,6 +2239,9 @@ impl WasmInterpreter {
             sema_vm::StepMode::Continue
         };
         debug.instructions_remaining = WASM_DEBUG_INSTRUCTION_BUDGET;
+        if let Err(message) = reservation.ensure_pending() {
+            return js_sys::Promise::resolve(&self.debug_error_str(message));
+        }
         driver::start_debug(&self.promise_driver, vm, debug, valid_lines, snapped)
     }
 
@@ -2295,7 +2299,7 @@ impl WasmInterpreter {
     /// Returns JSON: { status: "stopped"|"finished"|"error", ... }
     #[wasm_bindgen(js_name = debugStart)]
     pub fn debug_start(&self, code: &str, breakpoint_lines: &js_sys::Array) -> JsValue {
-        if self.promise_driver.has_active_roots() {
+        if self.promise_driver.blocks_legacy_debug_start() {
             return self.debug_error_str(
                 "the synchronous debugger cannot start while Promise-driven execution is active on this interpreter",
             );

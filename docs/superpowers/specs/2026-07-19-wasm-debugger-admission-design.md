@@ -14,13 +14,13 @@ Reentrant legacy operations are phase-safe. Starting/driving sessions report act
 
 Dropping a `WasmInterpreter` cancels and removes its legacy session. Admission also distinguishes a live foreign owner from a dead `Weak`: a stale session is cancelled and evicted before a new legacy root may be submitted, so garbage collection cannot permanently reserve the thread-local slot or leave a live root to be overwritten.
 
-The Promise driver exposes whether it owns any ordinary, active-debug, or retiring-debug roots. This includes all roots that its selected drive may need to settle or retire.
+The Promise driver exposes whether it owns any ordinary, active-debug, or retiring-debug roots. This includes all roots that its selected drive may need to settle or retire. It also counts scoped root preparations. Source compilation and Promise-debugger setup reserve preparation before parsing or expansion and release it only after failure or atomic handoff to an owned root. The counter is per interpreter and supports nested Promise preparation.
 
 ## Admission rules
 
-Promise source evaluation, adoption of an already-submitted compiled root, and Promise debugger start reject when a legacy debug session owns the same interpreter.
+Promise source evaluation, adoption of an already-submitted compiled root, and Promise debugger start reject when a legacy debug session owns the same interpreter. Source submission uses `Interpreter::submit_str_guarded` to recheck its reservation after macro expansion and compilation but immediately before runtime root creation. Adoption and Promise-debugger submission recheck immediately before their handoff. Scoped destruction releases reservations on parse, expansion, compilation, empty-program, error, and unwind paths.
 
-Legacy `debugStart` rejects when the same interpreter's Promise driver owns any root. The check runs before stopping an existing legacy session, clearing output, parsing, macro expansion, compilation, or root submission. A rejected start therefore cannot mutate macro state or disturb the active owner.
+Legacy `debugStart` rejects when the same interpreter's Promise driver owns a root or is preparing one. The check runs before stopping an existing legacy session, clearing output, parsing, macro expansion, compilation, or root submission. A rejected start therefore cannot mutate macro state or disturb the active owner.
 
 Ordinary `evalPromise` roots and the Promise debugger continue to coexist. The exclusion applies only across the legacy and Promise driving protocols.
 
@@ -30,7 +30,7 @@ Compiled archive execution checks admission before deserializing and submitting 
 
 Promise evaluation rejects its JavaScript Promise with an error that identifies the synchronous debugger conflict. Promise debugger and legacy debugger APIs retain their existing result-object convention and return `status: "error"`.
 
-The checks are synchronous and atomic in the browser's single-threaded WASM execution model. No lease or runtime-global lock is required.
+The checks are synchronous and atomic in the browser's single-threaded WASM execution model. Reservations use `Cell`, and no `RefCell` borrow crosses macro expansion or another user-code-capable boundary. No lease or runtime-global lock is required.
 
 ## Regression coverage
 
@@ -42,4 +42,6 @@ Browser tests cover:
 4. Legacy debugger operations on interpreter B cannot observe, replace, stop, or mutate interpreter A's session.
 5. JavaScript callbacks invoked during macro expansion cannot admit a Promise root or overwrite the starting debugger.
 6. JavaScript callbacks invoked from a driven debug root can re-enter every legacy API without a borrow panic; reentrant stop cancels deterministically without a late body mutation.
-7. Existing Promise-debugger concurrency tests remain green.
+7. JavaScript callbacks invoked during `evalPromise` and `debugStartPromise` macro expansion cannot admit a same-interpreter legacy root or register its macro. A foreign interpreter remains independently usable, the outer operation has its exact result, and later legacy reuse succeeds.
+8. Native tests cover nested reservation counts and unwind cleanup, and the guarded host-submission seam proves its check runs after expansion but before root creation.
+9. Existing Promise-debugger concurrency tests remain green.

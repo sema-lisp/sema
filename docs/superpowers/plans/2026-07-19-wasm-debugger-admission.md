@@ -264,3 +264,17 @@ Do not stage `crates/sema-vm/src/runtime/state.rs`, playground application/WebMC
 - [ ] **Step 4: Stop for independent re-review**
 
 Report the commit hash, RED/GREEN evidence, focused gate results, and preserved foreign files to the parent reviewer. Do not begin another slice until the same reviewer returns a verdict.
+
+### Task 4: Symmetric Promise preparation reservation
+
+**Files:**
+- Modify: `crates/sema-eval/src/eval.rs`
+- Modify: `crates/sema-wasm/src/driver.rs`
+- Modify: `crates/sema-wasm/src/lib.rs`
+- Modify: `crates/sema/tests/host_api_test.rs`
+- Modify: `playground/tests/unified-runtime.spec.ts`
+
+- [x] Add Playwright RED cases in which registered JavaScript functions re-enter same-interpreter legacy `debugStart` from `evalPromise` and `debugStartPromise` macro expansion. Assert rejection before root/macro creation, exact outer behavior, later reuse, and foreign-interpreter isolation.
+- [x] Add a per-interpreter scoped Promise preparation counter. Include preparations in legacy admission, support nesting, and release through RAII on every return or unwind.
+- [x] Add `Interpreter::submit_str_guarded` so the Promise source path rechecks after user-code-capable expansion and immediately before runtime submission. Recheck adoption and Promise-debugger submission at their handoff boundaries.
+- [x] Add native coverage for nested/unwinding reservations and guarded submission ordering, then rebuild WASM and run the focused Rust, Playwright, and clippy gates.

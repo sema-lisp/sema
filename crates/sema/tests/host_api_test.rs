@@ -1,10 +1,11 @@
 //! Coverage for the public `Interpreter` host surface (P6-1 Task 3):
-//! `submit_str`/`submit_value`, `drive_until_settled`/`drive_turn`,
+//! `submit_str`/`submit_str_guarded`/`submit_value`, `drive_until_settled`/`drive_turn`,
 //! `take_output` (root-tagged captured output), `command_handle`, and
 //! `shutdown`.
 
 mod common;
 
+use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use common::watchdog::run_sema_with_timeout;
@@ -188,6 +189,41 @@ fn parse_error_does_not_poison_the_runtime() {
         .drive_until_settled(&handle)
         .expect("subsequent submit drives to completion");
     assert_eq!(result, sema_core::Value::int(3));
+}
+
+/// A host admission check that protects re-entrant macro expansion runs after
+/// expansion has completed but before the prepared VM becomes a runtime root.
+#[test]
+fn guarded_submit_checks_admission_after_expansion_before_root_creation() {
+    let interp = Interpreter::new();
+    let guard_saw_macro = Cell::new(false);
+
+    let error = match interp.submit_str_guarded(
+        "(defmacro guarded-submit-macro () 7)\n(define guarded-submit-root-ran 1)",
+        RootOptions::default(),
+        || {
+            guard_saw_macro.set(
+                interp
+                    .global_env
+                    .get(sema_core::intern("guarded-submit-macro"))
+                    .is_some(),
+            );
+            Err(sema_core::SemaError::eval("host admission changed"))
+        },
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("the host guard must reject before root submission"),
+    };
+
+    assert!(guard_saw_macro.get(), "guard ran before macro expansion");
+    assert!(error.to_string().contains("host admission changed"));
+    assert!(
+        interp
+            .global_env
+            .get(sema_core::intern("guarded-submit-root-ran"))
+            .is_none(),
+        "rejected prepared VM must not execute"
+    );
 }
 
 /// A root submitted WITHOUT `capture_output` still writes straight to

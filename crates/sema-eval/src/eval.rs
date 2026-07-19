@@ -387,9 +387,26 @@ impl Interpreter {
         src: &str,
         opts: sema_vm::runtime::RootOptions,
     ) -> Result<sema_vm::runtime::RootHandle, SemaError> {
+        self.submit_str_guarded(src, opts, || Ok(()))
+    }
+
+    /// Parse and compile `src`, then run `before_submit` immediately before
+    /// creating its runtime root. Hosts whose macro expansion can re-enter
+    /// user callbacks use this seam to revalidate admission after every
+    /// user-code-capable preparation step without holding host state across
+    /// expansion.
+    pub fn submit_str_guarded<F>(
+        &self,
+        src: &str,
+        opts: sema_vm::runtime::RootOptions,
+        before_submit: F,
+    ) -> Result<sema_vm::runtime::RootHandle, SemaError>
+    where
+        F: FnOnce() -> Result<(), SemaError>,
+    {
         let (exprs, spans) = sema_reader::read_many_with_spans(src)?;
         self.ctx.merge_span_table(spans);
-        self.submit_exprs(&exprs, opts)
+        self.submit_exprs_guarded(&exprs, opts, before_submit)
     }
 
     /// Compile an already-parsed expression against this interpreter's
@@ -432,6 +449,18 @@ impl Interpreter {
         exprs: &[Value],
         opts: sema_vm::runtime::RootOptions,
     ) -> Result<sema_vm::runtime::RootHandle, SemaError> {
+        self.submit_exprs_guarded(exprs, opts, || Ok(()))
+    }
+
+    fn submit_exprs_guarded<F>(
+        &self,
+        exprs: &[Value],
+        opts: sema_vm::runtime::RootOptions,
+        before_submit: F,
+    ) -> Result<sema_vm::runtime::RootHandle, SemaError>
+    where
+        F: FnOnce() -> Result<(), SemaError>,
+    {
         let nil_placeholder = [Value::nil()];
         let exprs = if exprs.is_empty() {
             &nil_placeholder[..]
@@ -439,6 +468,7 @@ impl Interpreter {
             exprs
         };
         let vm = self.build_vm_for_exprs(exprs)?;
+        before_submit()?;
         let runtime = self
             .runtime
             .as_ref()

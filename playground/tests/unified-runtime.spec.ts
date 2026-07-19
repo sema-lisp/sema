@@ -969,6 +969,148 @@ test('legacy debug drive permits callback re-entry without borrowing or orphanin
   expect(result.reusableFinished).toMatchObject({ status: 'finished', value: '3' });
 });
 
+test('evalPromise reserves admission across macro-expansion JS re-entry', async ({ page }) => {
+  await page.goto('/');
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interpA = new mod.SemaInterpreter();
+    const interpB = new mod.SemaInterpreter();
+    let sameStart: Record<string, unknown> | null = null;
+    let sameActive: boolean | null = null;
+    let foreignStart: Record<string, unknown> | null = null;
+
+    interpA.registerFunction('reenter-promise-eval-preparation', () => {
+      sameStart = interpA.debugStart(
+        '(defmacro promise-eval-legacy-leak () 17)\n(+ 1 2)',
+        [],
+      );
+      sameActive = interpA.debugIsActive();
+      // Keep the pre-fix RED run finite. A reservation makes this unreachable.
+      if (sameStart.status !== 'error') interpA.debugStop();
+      foreignStart = interpB.debugStart('(+ 20 22)', []);
+      return null;
+    });
+
+    let outerRoot: number | null = null;
+    const outer = await interpA
+      .evalPromise(
+        "(defmacro trigger-promise-eval-preparation () (reenter-promise-eval-preparation) '(begin (context/set :promise-eval-outer-runs 1) 42))\n" +
+          '(trigger-promise-eval-preparation)',
+        (root: number) => { outerRoot = root; },
+      )
+      .then(
+        (value: string) => ({ value, error: null }),
+        (error: Error) => ({ value: null, error: error.message }),
+      );
+    const foreignFinished = foreignStart?.status === 'stopped'
+      ? interpB.debugContinue()
+      : foreignStart;
+    interpB.debugStop();
+
+    const outerRuns = interpA.evalVM('(context/get :promise-eval-outer-runs)');
+    const macroProbe = interpA.evalVM('(promise-eval-legacy-leak)');
+    const reusableEntry = interpA.debugStart('(+ 1 2)', []);
+    const reusableFinished = interpA.debugContinue();
+    interpA.debugStop();
+    return {
+      sameStart,
+      sameActive,
+      foreignStart,
+      foreignFinished,
+      outerRoot,
+      outer,
+      outerRuns,
+      macroProbe,
+      reusableEntry,
+      reusableFinished,
+    };
+  });
+
+  expect(result.sameStart).toMatchObject({ status: 'error' });
+  expect(result.sameStart.error).toContain('Promise-driven execution');
+  expect(result.sameActive).toBe(false);
+  expect(result.foreignStart).toMatchObject({ status: 'stopped' });
+  expect(result.foreignFinished).toMatchObject({ status: 'finished', value: '42' });
+  expect(result.outerRoot).not.toBeNull();
+  expect(result.outer).toEqual({ value: '42', error: null });
+  expect(result.outerRuns).toMatchObject({ value: '1', error: null });
+  expect(result.macroProbe.value).toBeNull();
+  expect(result.macroProbe.error.toLowerCase()).toContain('unbound variable');
+  expect(result.reusableEntry).toMatchObject({ status: 'stopped' });
+  expect(result.reusableFinished).toMatchObject({ status: 'finished', value: '3' });
+});
+
+test('debugStartPromise reserves admission across macro-expansion JS re-entry', async ({ page }) => {
+  await page.goto('/');
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interpA = new mod.SemaInterpreter();
+    const interpB = new mod.SemaInterpreter();
+    let sameStart: Record<string, unknown> | null = null;
+    let sameActive: boolean | null = null;
+    let foreignStart: Record<string, unknown> | null = null;
+
+    interpA.registerFunction('reenter-promise-debug-preparation', () => {
+      sameStart = interpA.debugStart(
+        '(defmacro promise-debug-legacy-leak () 23)\n(+ 1 2)',
+        [],
+      );
+      sameActive = interpA.debugIsActive();
+      // Keep the pre-fix RED run finite. A reservation makes this unreachable.
+      if (sameStart.status !== 'error') interpA.debugStop();
+      foreignStart = interpB.debugStart('(+ 39 3)', []);
+      return null;
+    });
+
+    const outerEntry = await interpA.debugStartPromise(
+      "(defmacro trigger-promise-debug-preparation () (reenter-promise-debug-preparation) '(+ 40 2))\n" +
+        '(trigger-promise-debug-preparation)',
+      [],
+    );
+    const outerFinished = outerEntry.status === 'stopped'
+      ? await interpA.debugContinuePromise()
+      : outerEntry;
+    const foreignFinished = foreignStart?.status === 'stopped'
+      ? interpB.debugContinue()
+      : foreignStart;
+    interpB.debugStop();
+
+    const macroProbe = interpA.evalVM('(promise-debug-legacy-leak)');
+    const reusableEntry = interpA.debugStart('(+ 1 2)', []);
+    const reusableFinished = interpA.debugContinue();
+    interpA.debugStop();
+    return {
+      sameStart,
+      sameActive,
+      foreignStart,
+      foreignFinished,
+      outerEntry,
+      outerFinished,
+      macroProbe,
+      reusableEntry,
+      reusableFinished,
+    };
+  });
+
+  expect(result.sameStart).toMatchObject({ status: 'error' });
+  expect(result.sameStart.error).toContain('Promise-driven execution');
+  expect(result.sameActive).toBe(false);
+  expect(result.foreignStart).toMatchObject({ status: 'stopped' });
+  expect(result.foreignFinished).toMatchObject({ status: 'finished', value: '42' });
+  expect(result.outerEntry).toMatchObject({ status: 'stopped' });
+  expect(result.outerFinished).toMatchObject({ status: 'finished', value: '42' });
+  expect(result.macroProbe.value).toBeNull();
+  expect(result.macroProbe.error.toLowerCase()).toContain('unbound variable');
+  expect(result.reusableEntry).toMatchObject({ status: 'stopped' });
+  expect(result.reusableFinished).toMatchObject({ status: 'finished', value: '3' });
+});
+
 test('a detached foreign timer does not delay promise-root deadlock settlement', async ({ page }) => {
   await page.goto('/');
 

@@ -212,17 +212,20 @@ test('compiled runEntryAsync adopts the deserialized program into the Promise dr
   expect(method).not.toContain('execute_compile_result');
 });
 
-test('compiled root adoption cancels before rejecting an admission conflict', () => {
+test('compiled root adoption reserves and cancels before an admission conflict can orphan it', () => {
   const source = readFileSync(path.join(REPO_ROOT, 'crates/sema-wasm/src/driver.rs'), 'utf8');
   const start = source.indexOf('pub(crate) fn adopt');
   const end = source.indexOf('fn retain_while_active', start);
   const method = source.slice(start, end);
-  const admission = method.indexOf('ensure_promise_admission');
+  const reservation = method.indexOf('reserve_promise_admission');
   const cancel = method.indexOf('handle.cancel');
+  const recheck = method.indexOf('reservation.ensure_pending');
   const insert = method.indexOf('driver.promises.borrow_mut().insert');
-  expect(admission).toBeGreaterThan(-1);
-  expect(cancel).toBeGreaterThan(admission);
+  expect(reservation).toBeGreaterThan(-1);
+  expect(cancel).toBeGreaterThan(reservation);
   expect(cancel).toBeLessThan(insert);
+  expect(recheck).toBeGreaterThan(reservation);
+  expect(recheck).toBeLessThan(insert);
 });
 
 test('legacy debugStart reserves before replacement cleanup and expansion', () => {

@@ -41,6 +41,8 @@ use crate::output::{PromiseOutput, PromiseOutputEvent};
 const DEBUG_INSTRUCTION_BUDGET: u32 = 500_000;
 const LEGACY_DEBUG_CONFLICT: &str =
     "Promise-driven execution cannot start while the synchronous debugger is active on this interpreter";
+const PROMISE_PREPARATION_LOST: &str =
+    "Promise-driven execution lost its admission reservation before root submission";
 
 // ─────────────────────────────────────────────────────────────────────────
 // Promise table + macrotask driver
@@ -91,6 +93,10 @@ thread_local! {
 pub(crate) struct PromiseDriver {
     interp: Rc<Interpreter>,
     promises: RefCell<HashMap<RootId, PromiseSettlers>>,
+    /// Source compilation and Promise-debugger setup can invoke registered JS
+    /// functions during macro expansion. A scoped count closes legacy-debugger
+    /// admission until that preparation either fails or hands off to a root.
+    preparing_roots: Cell<usize>,
     drive_scheduled: Cell<bool>,
     drive_timeout_id: Cell<Option<i32>>,
     runtime_id: Cell<Option<RuntimeId>>,
@@ -109,6 +115,7 @@ impl PromiseDriver {
         Rc::new(Self {
             interp,
             promises: RefCell::new(HashMap::new()),
+            preparing_roots: Cell::new(0),
             drive_scheduled: Cell::new(false),
             drive_timeout_id: Cell::new(None),
             runtime_id: Cell::new(None),
@@ -176,11 +183,54 @@ pub(crate) fn ensure_promise_admission(driver: &PromiseDriver) -> Result<(), &'s
     }
 }
 
+/// Scoped Promise-side ownership while source/debug preparation may re-enter
+/// JavaScript. The count supports nested Promise submissions on one
+/// interpreter; `Drop` closes every early-return and unwind path.
+pub(crate) struct PromiseAdmissionReservation {
+    driver: Rc<PromiseDriver>,
+}
+
+impl PromiseAdmissionReservation {
+    pub(crate) fn ensure_pending(&self) -> Result<(), &'static str> {
+        if self.driver.preparing_roots.get() == 0 {
+            return Err(PROMISE_PREPARATION_LOST);
+        }
+        ensure_promise_admission(&self.driver)
+    }
+}
+
+impl Drop for PromiseAdmissionReservation {
+    fn drop(&mut self) {
+        let preparing = self.driver.preparing_roots.get();
+        debug_assert!(preparing > 0, "Promise admission reservation underflow");
+        self.driver.preparing_roots.set(preparing.saturating_sub(1));
+    }
+}
+
+pub(crate) fn reserve_promise_admission(
+    driver: &Rc<PromiseDriver>,
+) -> Result<PromiseAdmissionReservation, &'static str> {
+    ensure_promise_admission(driver)?;
+    let preparing = driver
+        .preparing_roots
+        .get()
+        .checked_add(1)
+        .ok_or("too many nested Promise admission reservations")?;
+    driver.preparing_roots.set(preparing);
+    Ok(PromiseAdmissionReservation {
+        driver: Rc::clone(driver),
+    })
+}
+
 impl PromiseDriver {
     pub(crate) fn has_active_roots(&self) -> bool {
         !self.promises.borrow().is_empty()
             || self.debug_root.get().is_some()
             || !self.retiring_debug_roots.borrow().is_empty()
+    }
+
+    pub(crate) fn blocks_legacy_debug_start(&self) -> bool {
+        self.preparing_roots.get() > 0 || self.has_active_roots()
     }
 
     fn owns_root(&self, root: RootId) -> bool {
@@ -218,15 +268,20 @@ pub(crate) fn submit(
     reject: Function,
     on_root: Option<Function>,
 ) {
-    if let Err(message) = ensure_promise_admission(driver) {
-        reject_with_message(&reject, message);
-        return;
-    }
+    let reservation = match reserve_promise_admission(driver) {
+        Ok(reservation) => reservation,
+        Err(message) => {
+            reject_with_message(&reject, message);
+            return;
+        }
+    };
     let opts = RootOptions {
         name: None,
         capture_output: true,
     };
-    match driver.interp.submit_str(src, opts) {
+    match driver.interp.submit_str_guarded(src, opts, || {
+        reservation.ensure_pending().map_err(SemaError::eval)
+    }) {
         Ok(handle) => adopt(driver, handle, resolve, reject, on_root),
         Err(err) => {
             reject_with_error(&reject, &err);
@@ -245,7 +300,16 @@ pub(crate) fn adopt(
     reject: Function,
     on_root: Option<Function>,
 ) {
-    if let Err(message) = ensure_promise_admission(driver) {
+    let reservation = match reserve_promise_admission(driver) {
+        Ok(reservation) => reservation,
+        Err(message) => {
+            handle.cancel(sema_core::runtime::CancelReason::HostStop);
+            reject_with_message(&reject, message);
+            schedule_drive(driver);
+            return;
+        }
+    };
+    if let Err(message) = reservation.ensure_pending() {
         handle.cancel(sema_core::runtime::CancelReason::HostStop);
         reject_with_message(&reject, message);
         schedule_drive(driver);
@@ -321,10 +385,13 @@ pub(crate) fn start_debug(
     let mut vm = Some(vm);
     let mut debug = Some(debug);
     js_sys::Promise::new(&mut move |resolve, _reject| {
-        if let Err(message) = ensure_promise_admission(&driver) {
-            resolve_debug_immediately(&resolve, debug_error_result(message));
-            return;
-        }
+        let reservation = match reserve_promise_admission(&driver) {
+            Ok(reservation) => reservation,
+            Err(message) => {
+                resolve_debug_immediately(&resolve, debug_error_result(message));
+                return;
+            }
+        };
         let replaced_own_session = stop_debug(&driver);
         if !replaced_own_session && driver.interp.runtime().is_debug_paused() {
             resolve_debug_immediately(
@@ -351,6 +418,10 @@ pub(crate) fn start_debug(
             );
             return;
         };
+        if let Err(message) = reservation.ensure_pending() {
+            resolve_debug_immediately(&resolve, debug_error_result(message));
+            return;
+        }
         match driver.interp.runtime().submit_root_with_options(vm, &opts) {
             Ok(handle) => {
                 let root = handle.id();
@@ -1661,5 +1732,34 @@ mod trace_tests {
         assert_eq!(edge_count(&WasmHttpDecoder), 0);
         assert_eq!(edge_count(&WasmHttpContinuation), 0);
         assert_eq!(edge_count(&WasmHttpCancelHook { controller: None }), 0);
+    }
+
+    #[test]
+    fn nested_promise_admission_reservations_release_independently() {
+        let driver = PromiseDriver::new(Rc::new(Interpreter::new()));
+        let outer = reserve_promise_admission(&driver).unwrap();
+        let inner = reserve_promise_admission(&driver).unwrap();
+        assert!(driver.blocks_legacy_debug_start());
+
+        drop(inner);
+        assert!(driver.blocks_legacy_debug_start());
+        drop(outer);
+        assert!(!driver.blocks_legacy_debug_start());
+    }
+
+    #[test]
+    fn promise_admission_reservation_releases_while_unwinding() {
+        let driver = PromiseDriver::new(Rc::new(Interpreter::new()));
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let driver = Rc::clone(&driver);
+            move || {
+                let _reservation = reserve_promise_admission(&driver).unwrap();
+                assert!(driver.blocks_legacy_debug_start());
+                panic!("exercise reservation cleanup");
+            }
+        }));
+
+        assert!(unwind.is_err());
+        assert!(!driver.blocks_legacy_debug_start());
     }
 }

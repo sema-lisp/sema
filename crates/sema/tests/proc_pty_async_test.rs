@@ -120,6 +120,48 @@ fn proc_wait_async_matches_sync_exit_code() {
     );
 }
 
+#[test]
+fn proc_close_from_foreign_runtime_is_offloaded_and_closes_owner_gate() {
+    let owner = Interpreter::new();
+    let caller = Interpreter::new();
+    let handle = owner
+        .eval_str_via_runtime(
+            r#"
+            (define foreign-close-proc
+              (proc/spawn (list "sh" "-c" "exit 0")))
+            (proc/wait foreign-close-proc)
+            foreign-close-proc
+            "#,
+        )
+        .expect("owner runtime creates a process gate")
+        .as_int()
+        .expect("proc handle is an integer");
+    assert_eq!(owner.runtime_resource_gate_count(), 1);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+
+    let result = caller
+        .eval_str_via_runtime(&format!(
+            r#"
+            (let ((out (channel/new 2)))
+              (async/all
+                (list
+                  (async/spawn (fn ()
+                    (proc/close {handle})
+                    (channel/send out :proc)))
+                  (async/spawn (fn () (channel/send out :sibling)))))
+              (list (channel/recv out) (channel/recv out)))
+            "#
+        ))
+        .expect("foreign process close uses a caller-runtime External offload");
+    assert_eq!(
+        result.as_seq().expect("receive order"),
+        &[Value::keyword("sibling"), Value::keyword("proc")],
+        "the foreign terminal wait must yield the caller VM to its sibling"
+    );
+    assert_eq!(owner.runtime_resource_gate_count(), 0);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+}
+
 /// `proc/wait` called twice (sequentially) on the same handle inside one
 /// async task returns the same exit code both times — matching
 /// `proc.rs::tests::double_wait_returns_same_code_sync` exactly, just through
@@ -329,6 +371,52 @@ fn pty_wait_async_matches_sync_exit_code() {
         0,
         "pty/close must return the runtime's gate registry to baseline"
     );
+}
+
+#[test]
+fn pty_close_from_foreign_runtime_is_offloaded_and_closes_owner_gate() {
+    if !pty_available() {
+        eprintln!("skipping foreign-runtime pty close: no pty available");
+        return;
+    }
+    let owner = Interpreter::new();
+    let caller = Interpreter::new();
+    let handle = owner
+        .eval_str_via_runtime(
+            r#"
+            (define foreign-close-pty
+              (pty/spawn (list "sh" "-c" "exit 0")))
+            (pty/wait foreign-close-pty)
+            foreign-close-pty
+            "#,
+        )
+        .expect("owner runtime creates a pty gate")
+        .as_int()
+        .expect("pty handle is an integer");
+    assert_eq!(owner.runtime_resource_gate_count(), 1);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+
+    let result = caller
+        .eval_str_via_runtime(&format!(
+            r#"
+            (let ((out (channel/new 2)))
+              (async/all
+                (list
+                  (async/spawn (fn ()
+                    (pty/close {handle})
+                    (channel/send out :pty)))
+                  (async/spawn (fn () (channel/send out :sibling)))))
+              (list (channel/recv out) (channel/recv out)))
+            "#
+        ))
+        .expect("foreign pty close uses a caller-runtime External offload");
+    assert_eq!(
+        result.as_seq().expect("receive order"),
+        &[Value::keyword("sibling"), Value::keyword("pty")],
+        "the foreign pty terminal wait must yield the caller VM to its sibling"
+    );
+    assert_eq!(owner.runtime_resource_gate_count(), 0);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
 }
 
 /// Cancelling a spawned pty chain settles the task Cancelled and leaves the

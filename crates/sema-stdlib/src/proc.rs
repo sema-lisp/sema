@@ -42,11 +42,12 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateId};
+use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateHandle};
 use sema_core::{check_arity, in_runtime_quantum, Caps, SemaError, Value};
 
 use crate::runtime_offload::{
-    checkout_external, finish_terminal_gate, group_sigkill_abort, CheckoutOp,
+    checkout_external, finish_terminal_gate, group_sigkill_abort, prepare_terminal_gate,
+    suspend_terminal_external, CheckoutOp,
 };
 
 /// Completion-kind tag for `proc/*` external waits ("proc").
@@ -86,10 +87,10 @@ enum ProcSlot {
 thread_local! {
     static PROCS: RefCell<HashMap<i64, ProcSlot>> = RefCell::new(HashMap::new());
     static NEXT_ID: Cell<i64> = const { Cell::new(1) };
-    /// Per-handle [`ResourceGateId`], created lazily on the first offloaded op on
-    /// a handle and reused for its later ops (dropped on `proc/close`). The gate
+    /// Per-handle owning resource-gate capability, created lazily on the first
+    /// offloaded op and reused for later ops (dropped on `proc/close`). The gate
     /// provides FIFO mutual exclusion for the checkout slot.
-    static PROC_GATES: RefCell<HashMap<i64, ResourceGateId>> = RefCell::new(HashMap::new());
+    static PROC_GATES: RefCell<HashMap<i64, ResourceGateHandle>> = RefCell::new(HashMap::new());
 }
 
 /// Take `id`'s process out of its slot once its gate is owned, marking the slot
@@ -307,7 +308,7 @@ fn checkout_runtime<T: Send + 'static>(
 ) -> NativeResult {
     let kind = CompletionKind::try_from_raw(PROC_COMPLETION_KIND)
         .expect("proc completion kind is nonzero");
-    let gate = PROC_GATES.with(|g| g.borrow().get(&id).copied());
+    let gate = PROC_GATES.with(|g| g.borrow().get(&id).cloned());
     checkout_external(CheckoutOp {
         op_name,
         kind,
@@ -320,7 +321,7 @@ fn checkout_runtime<T: Send + 'static>(
         remove_gate: Rc::new(move |gid| {
             PROC_GATES.with(|g| {
                 let mut gates = g.borrow_mut();
-                if gates.get(&id).copied() == Some(gid) {
+                if gates.get(&id).map(ResourceGateHandle::id) == Some(gid) {
                     gates.remove(&id);
                 }
             });
@@ -409,37 +410,85 @@ fn proc_close_runtime(id: i64) -> NativeResult {
         Proceed,
     }
     let action = PROCS.with(|p| {
-        let mut procs = p.borrow_mut();
-        match procs.get_mut(&id) {
+        let procs = p.borrow();
+        match procs.get(&id) {
             Some(ProcSlot::CheckedOut) => CloseAction::Busy,
-            Some(ProcSlot::Available(pr)) => {
-                let _ = pr.child.kill(); // a signal send — cheap, non-blocking
-                CloseAction::Proceed
-            }
+            Some(ProcSlot::Available(_)) => CloseAction::Proceed,
             Some(ProcSlot::Tombstone(_)) | None => CloseAction::Noop,
         }
     });
-    match action {
-        CloseAction::Busy => Err(busy_err("proc/close", id)),
-        CloseAction::Noop => {
-            let gate = PROC_GATES.with(|g| g.borrow().get(&id).copied());
-            finish_terminal_gate(
-                gate,
-                Rc::new(move |gid| {
-                    PROC_GATES.with(|g| {
-                        let mut gates = g.borrow_mut();
-                        if gates.get(&id).copied() == Some(gid) {
-                            gates.remove(&id);
-                        }
-                    });
-                }),
-                Ok(Value::nil()),
-            )
+    let gate = PROC_GATES.with(|g| g.borrow().get(&id).cloned());
+    if matches!(action, CloseAction::Busy) {
+        return Err(busy_err("proc/close", id));
+    }
+    if prepare_terminal_gate(gate.as_ref(), "proc/close")? {
+        if let Some(gate) = gate.as_ref() {
+            PROC_GATES.with(|g| {
+                let mut gates = g.borrow_mut();
+                if gates.get(&id).map(ResourceGateHandle::id) == Some(gate.id()) {
+                    gates.remove(&id);
+                }
+            });
         }
+        if matches!(action, CloseAction::Noop) {
+            return Ok(NativeOutcome::Return(Value::nil()));
+        }
+        let mut proc = take_proc("proc/close", id)?;
+        let pid = proc.child.id();
+        let _ = proc.child.kill();
+        let kind = CompletionKind::try_from_raw(PROC_COMPLETION_KIND)
+            .expect("proc completion kind is nonzero");
+        return suspend_terminal_external(
+            "proc/close",
+            kind,
+            proc,
+            |proc| {
+                let _ = proc.child.wait();
+                if let Some(thread) = proc.out_thread.take() {
+                    let _ = thread.join();
+                }
+                if let Some(thread) = proc.err_thread.take() {
+                    let _ = thread.join();
+                }
+                Ok(())
+            },
+            move |_proc, result| {
+                PROCS.with(|p| {
+                    p.borrow_mut().remove(&id);
+                });
+                result.map_err(SemaError::Io)?;
+                Ok(Value::nil())
+            },
+            Rc::new(move |msg| {
+                PROCS.with(|p| {
+                    p.borrow_mut().insert(id, ProcSlot::Tombstone(msg));
+                });
+            }),
+            Some(group_sigkill_abort(pid)),
+        );
+    }
+    match action {
+        CloseAction::Busy => unreachable!("busy close returned above"),
+        CloseAction::Noop => finish_terminal_gate(
+            gate,
+            Rc::new(move |gid| {
+                PROC_GATES.with(|g| {
+                    let mut gates = g.borrow_mut();
+                    if gates.get(&id).map(ResourceGateHandle::id) == Some(gid) {
+                        gates.remove(&id);
+                    }
+                });
+            }),
+            Ok(Value::nil()),
+        ),
         CloseAction::Proceed => {
+            PROCS.with(|p| {
+                if let Some(ProcSlot::Available(proc)) = p.borrow_mut().get_mut(&id) {
+                    let _ = proc.child.kill();
+                }
+            });
             let kind = CompletionKind::try_from_raw(PROC_COMPLETION_KIND)
                 .expect("proc completion kind is nonzero");
-            let gate = PROC_GATES.with(|g| g.borrow().get(&id).copied());
             checkout_external(CheckoutOp {
                 op_name: "proc/close",
                 kind,
@@ -452,7 +501,7 @@ fn proc_close_runtime(id: i64) -> NativeResult {
                 remove_gate: Rc::new(move |gid| {
                     PROC_GATES.with(|g| {
                         let mut gates = g.borrow_mut();
-                        if gates.get(&id).copied() == Some(gid) {
+                        if gates.get(&id).map(ResourceGateHandle::id) == Some(gid) {
                             gates.remove(&id);
                         }
                     });
@@ -647,20 +696,30 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         if in_runtime_quantum() {
             return proc_close_runtime(id);
         }
+        let gate = PROC_GATES.with(|g| g.borrow().get(&id).cloned());
+        if PROCS.with(|p| matches!(p.borrow().get(&id), Some(ProcSlot::CheckedOut))) {
+            return Err(busy_err("proc/close", id));
+        }
+        prepare_terminal_gate(gate.as_ref(), "proc/close")?;
         PROCS.with(|p| {
             let mut procs = p.borrow_mut();
-            if matches!(procs.get(&id), Some(ProcSlot::CheckedOut)) {
-                return Err(busy_err("proc/close", id));
-            }
             if let Some(ProcSlot::Available(mut pr)) = procs.remove(&id) {
                 let _ = pr.child.kill();
                 let _ = pr.child.wait();
             }
-            PROC_GATES.with(|g| {
-                g.borrow_mut().remove(&id);
-            });
-            Ok(NativeOutcome::Return(Value::nil()))
-        })
+        });
+        finish_terminal_gate(
+            gate,
+            Rc::new(move |gate_id| {
+                PROC_GATES.with(|g| {
+                    let mut gates = g.borrow_mut();
+                    if gates.get(&id).map(ResourceGateHandle::id) == Some(gate_id) {
+                        gates.remove(&id);
+                    }
+                });
+            }),
+            Ok(Value::nil()),
+        )
     });
 }
 

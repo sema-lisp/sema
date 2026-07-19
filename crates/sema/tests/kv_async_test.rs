@@ -197,6 +197,33 @@ fn kv_gate_created_via_runtime_closes_through_compiled_entrypoint() {
     assert_eq!(interp.runtime_resource_gate_count(), 0);
 }
 
+#[test]
+fn kv_close_from_foreign_runtime_closes_the_owner_gate() {
+    let kv = TempKv::new("foreign-runtime-close");
+    let owner = Interpreter::new();
+    let caller = Interpreter::new();
+    owner
+        .eval_str_via_runtime(&format!(
+            r#"(kv/open "foreign-runtime-close" "{}")
+                (kv/set "foreign-runtime-close" "k" "v")"#,
+            kv.path()
+        ))
+        .expect("owner runtime creates and uses KV store");
+    assert_eq!(owner.runtime_resource_gate_count(), 1);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+
+    let result = caller
+        .eval_str_via_runtime(r#"(kv/close "foreign-runtime-close")"#)
+        .expect("foreign runtime routes close through the gate owner");
+    assert!(result.is_nil());
+    assert_eq!(owner.runtime_resource_gate_count(), 0);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+    let error = owner
+        .eval_str_via_runtime(r#"(kv/get "foreign-runtime-close" "k")"#)
+        .expect_err("accepted foreign close removes the KV resource");
+    assert!(error.to_string().contains("not open"), "{error}");
+}
+
 /// `kv/open` on a brand-new path offloads through `fs_offload` — a distinct
 /// code path from the checkout-based `kv/set`/`kv/delete` flush. Proves the
 /// "doesn't exist yet -> empty store" branch round-trips correctly inside

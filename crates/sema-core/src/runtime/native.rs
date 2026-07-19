@@ -499,6 +499,28 @@ mod tests {
     }
 
     #[test]
+    fn dropping_resource_gate_handle_clones_does_not_close_the_gate() {
+        let calls = Rc::new(Cell::new(0));
+        let calls_for_close = Rc::clone(&calls);
+        let handle = ResourceGateHandle::new(
+            resource_gate(),
+            Rc::new(move |_| {
+                calls_for_close.set(calls_for_close.get() + 1);
+                Ok(true)
+            }),
+        );
+
+        drop(handle.clone());
+        assert_eq!(
+            calls.get(),
+            0,
+            "temporary capability clones are inert on drop"
+        );
+        assert_eq!(handle.close(), Ok(true));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
     fn protocol_shapes_and_structural_trace_multiplicity() {
         let value = Value::string("same");
         assert_eq!(edge_count(&NativeOutcome::Return(value.clone())), 1);

@@ -707,6 +707,54 @@ fn public_close_handle_closes_a_runtime_created_connection_gate() {
 }
 
 #[test]
+fn foreign_runtime_mcp_close_is_offloaded_and_closes_owner_gate() {
+    let markers = Markers::new("foreign-runtime-close");
+    let (_server, port) = start_delayed_http_server(&markers);
+    let release = sema_str(&markers.release.to_string_lossy());
+    let owner = mcp_eval_interpreter();
+    let caller = mcp_eval_interpreter();
+    owner
+        .eval_str_via_runtime(&format!(
+            "(define server (mcp/connect {{:url \"http://127.0.0.1:{port}/mcp\"}}))"
+        ))
+        .expect("owner connects to delayed close server");
+    owner
+        .eval_str_via_runtime("(mcp/tools server)")
+        .expect("owner lazily creates the connection gate");
+    let handle = owner
+        .eval_str_via_runtime("server")
+        .expect("read opaque MCP handle")
+        .as_str()
+        .expect("MCP handle is a string")
+        .to_string();
+    let handle = sema_str(&handle);
+    assert_eq!(owner.runtime_resource_gate_count(), 1);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+
+    let result = caller
+        .eval_str_via_runtime(&format!(
+            r#"
+            (let ((operation (async/spawn (fn () (mcp/close {handle}))))
+                  (sibling (async/spawn (fn ()
+                    (file/write {release} "release")
+                    :sibling))))
+              (list (async/await operation) (async/await sibling)))
+            "#
+        ))
+        .expect("foreign MCP close uses a caller-runtime External offload");
+    let values = result.as_seq().expect("close result and sibling marker");
+    assert!(values[0].is_nil());
+    assert_eq!(values[1].as_keyword().as_deref(), Some("sibling"));
+    assert!(markers.entered.exists(), "server observed protocol close");
+    assert!(
+        !markers.timed_out.exists(),
+        "foreign close blocked the caller VM until the server fallback fired"
+    );
+    assert_eq!(owner.runtime_resource_gate_count(), 0);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+}
+
+#[test]
 fn runtime_generated_mcp_handler_wait_allows_sibling_progress() {
     let markers = Markers::new("generated-handler-progress");
     let config = delayed_stdio_config("call", &markers);

@@ -48,10 +48,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::rc::Rc;
 use std::time::Duration;
 
-use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateId};
+use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateHandle};
 use sema_core::{check_arity, in_runtime_quantum, Caps, SemaError, Value};
 
-use crate::runtime_offload::{checkout_external, finish_terminal_gate, CheckoutOp};
+use crate::runtime_offload::{
+    checkout_external, finish_terminal_gate, prepare_terminal_gate, CheckoutOp,
+};
 
 /// Completion-kind tag for `serial/*` external waits ("srl\0").
 const SERIAL_COMPLETION_KIND: u64 = 0x7372_6c00;
@@ -86,10 +88,10 @@ enum PortSlot {
 thread_local! {
     static PORTS: RefCell<HashMap<u64, PortSlot>> = RefCell::new(HashMap::new());
     static NEXT_ID: RefCell<u64> = const { RefCell::new(1) };
-    /// Per-handle [`ResourceGateId`], created lazily on the first offloaded op on
-    /// a handle and reused for its later ops (dropped on `serial/close`). The gate
+    /// Per-handle owning resource-gate capability, created lazily on the first
+    /// offloaded op and reused for later ops (dropped on `serial/close`). The gate
     /// provides FIFO mutual exclusion for the checkout slot.
-    static SERIAL_GATES: RefCell<HashMap<u64, ResourceGateId>> = RefCell::new(HashMap::new());
+    static SERIAL_GATES: RefCell<HashMap<u64, ResourceGateHandle>> = RefCell::new(HashMap::new());
 }
 
 /// Take `handle`'s port out of its slot once its gate is owned, marking the slot
@@ -191,7 +193,7 @@ fn checkout_runtime<T: Send + 'static>(
 ) -> NativeResult {
     let kind = CompletionKind::try_from_raw(SERIAL_COMPLETION_KIND)
         .expect("serial completion kind is nonzero");
-    let gate = SERIAL_GATES.with(|g| g.borrow().get(&handle).copied());
+    let gate = SERIAL_GATES.with(|g| g.borrow().get(&handle).cloned());
     checkout_external(CheckoutOp {
         op_name,
         kind,
@@ -204,7 +206,7 @@ fn checkout_runtime<T: Send + 'static>(
         remove_gate: Rc::new(move |gid| {
             SERIAL_GATES.with(|g| {
                 let mut gates = g.borrow_mut();
-                if gates.get(&handle).copied() == Some(gid) {
+                if gates.get(&handle).map(ResourceGateHandle::id) == Some(gid) {
                     gates.remove(&handle);
                 }
             });
@@ -327,29 +329,27 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .as_int()
             .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
             as u64;
-        PORTS.with(|ports| {
-            let mut ports = ports.borrow_mut();
-            match ports.get(&handle) {
-                Some(PortSlot::CheckedOut) => Err(busy_err("serial/close", handle)),
-                Some(_) => {
-                    ports.remove(&handle);
-                    Ok(())
-                }
-                None => Err(SemaError::eval(format!(
-                    "serial/close: invalid handle {handle}"
-                ))),
-            }
+        PORTS.with(|ports| match ports.borrow().get(&handle) {
+            Some(PortSlot::CheckedOut) => Err(busy_err("serial/close", handle)),
+            Some(_) => Ok(()),
+            None => Err(SemaError::eval(format!(
+                "serial/close: invalid handle {handle}"
+            ))),
         })?;
+        let gate = SERIAL_GATES.with(|g| g.borrow().get(&handle).cloned());
+        prepare_terminal_gate(gate.as_ref(), "serial/close")?;
+        PORTS.with(|ports| {
+            ports.borrow_mut().remove(&handle);
+        });
         // The handle's resource gate is dropped here too; a successful close
         // implies the gate is idle (a busy gate means CheckedOut, which errors
         // above), so no waiter is stranded.
-        let gate = SERIAL_GATES.with(|g| g.borrow().get(&handle).copied());
         finish_terminal_gate(
             gate,
             Rc::new(move |id| {
                 SERIAL_GATES.with(|g| {
                     let mut gates = g.borrow_mut();
-                    if gates.get(&handle).copied() == Some(id) {
+                    if gates.get(&handle).map(ResourceGateHandle::id) == Some(id) {
                         gates.remove(&handle);
                     }
                 });

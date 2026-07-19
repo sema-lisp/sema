@@ -39,10 +39,12 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateId};
+use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateHandle};
 use sema_core::{check_arity, in_runtime_quantum, SemaError, Value};
 
-use crate::runtime_offload::{checkout_external, finish_terminal_gate, CheckoutOp};
+use crate::runtime_offload::{
+    checkout_external, finish_terminal_gate, prepare_terminal_gate, CheckoutOp,
+};
 
 /// Completion-kind tag for `kv/*` external waits ("kv\0\0").
 const KV_COMPLETION_KIND: u64 = 0x6b76_0000;
@@ -76,10 +78,10 @@ enum KvSlot {
 
 thread_local! {
     static KV_STORES: RefCell<HashMap<String, KvSlot>> = RefCell::new(HashMap::new());
-    /// Per-store [`ResourceGateId`], created lazily on the first offloaded
-    /// mutation on a store and reused for its later mutations (dropped on
+    /// Per-store owning resource-gate capability, created lazily on the first
+    /// offloaded mutation and reused for later mutations (dropped on
     /// `kv/close`). The gate provides FIFO mutual exclusion for the checkout slot.
-    static KV_GATES: RefCell<HashMap<String, ResourceGateId>> = RefCell::new(HashMap::new());
+    static KV_GATES: RefCell<HashMap<String, ResourceGateHandle>> = RefCell::new(HashMap::new());
 }
 
 /// Take `name`'s store out of its slot once its gate is owned. A tombstoned or
@@ -195,7 +197,7 @@ fn checkout_runtime<R: Send + 'static>(
 ) -> NativeResult {
     let kind =
         CompletionKind::try_from_raw(KV_COMPLETION_KIND).expect("kv completion kind is nonzero");
-    let gate = KV_GATES.with(|g| g.borrow().get(&name).copied());
+    let gate = KV_GATES.with(|g| g.borrow().get(&name).cloned());
     let n_take = name.clone();
     let n_reinstall = name.clone();
     let n_tomb = name.clone();
@@ -213,7 +215,7 @@ fn checkout_runtime<R: Send + 'static>(
         remove_gate: Rc::new(move |id| {
             KV_GATES.with(|g| {
                 let mut gates = g.borrow_mut();
-                if gates.get(&n_remove).copied() == Some(id) {
+                if gates.get(&n_remove).map(ResourceGateHandle::id) == Some(id) {
                     gates.remove(&n_remove);
                 }
             });
@@ -419,28 +421,31 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         check_arity!(args, "kv/close", 1);
         let name = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+            .to_string();
+        let gate = KV_GATES.with(|g| g.borrow().get(&name).cloned());
+        if KV_STORES.with(|s| matches!(s.borrow().get(&name), Some(KvSlot::CheckedOut))) {
+            return Err(busy_err("kv/close", &name));
+        }
+        prepare_terminal_gate(gate.as_ref(), "kv/close")?;
         KV_STORES.with(|s| {
             let mut stores = s.borrow_mut();
-            match stores.get(name) {
-                Some(KvSlot::CheckedOut) => return Err(busy_err("kv/close", name)),
+            match stores.get(&name) {
+                Some(KvSlot::CheckedOut) => unreachable!("busy state checked above"),
                 Some(KvSlot::Available(store)) => {
                     let _ = flush_store(store);
                 }
                 Some(KvSlot::Tombstone(_)) | None => {}
             }
-            stores.remove(name);
-            Ok(())
-        })?;
-        let name = name.to_string();
-        let gate = KV_GATES.with(|g| g.borrow().get(&name).copied());
+            stores.remove(&name);
+        });
         let remove_name = name;
         finish_terminal_gate(
             gate,
             Rc::new(move |id| {
                 KV_GATES.with(|g| {
                     let mut gates = g.borrow_mut();
-                    if gates.get(&remove_name).copied() == Some(id) {
+                    if gates.get(&remove_name).map(ResourceGateHandle::id) == Some(id) {
                         gates.remove(&remove_name);
                     }
                 });

@@ -4386,8 +4386,8 @@ impl Runtime {
         Ok(())
     }
 
-    /// Force-settle the requested `root` as `Failed` with a legacy-parity
-    /// deadlock error. Called by the host drive loop when the runtime has gone
+    /// Force-settle the requested `root` as `Failed` with the public deadlock
+    /// diagnostic. Called by the host drive loop when the runtime has gone
     /// fully idle — `DriveState::Idle { next_deadline: None,
     /// inbox_wakeup_required: false }` — yet
     /// the root is still `Running`: no task made progress this turn and there is
@@ -4395,8 +4395,8 @@ impl Runtime {
     /// that, so the root is parked on an intra-runtime wait (channel/promise)
     /// that nothing runnable can satisfy. That is a genuine deadlock.
     ///
-    /// The error text mirrors what the legacy scheduler / synchronous channel
-    /// ops produce, so `eval_str_via_runtime` matches the `eval_str` oracle:
+    /// The error text distinguishes synchronous channel exhaustion from an
+    /// async task graph with no runnable producer:
     /// - root main task parked directly on `channel/recv` (top-level, no sender)
     ///   → "channel/recv: channel is empty";
     /// - root main task parked directly on `channel/send` (full, no receiver)
@@ -4404,9 +4404,8 @@ impl Runtime {
     /// - otherwise (awaiting a never-settling promise, mutual await, a spawned
     ///   task that is itself blocked, …) → "async scheduler: all tasks blocked
     ///   (deadlock detected)". A channel op *inside* a spawn parks a child task,
-    ///   leaving the root main task on a promise wait — so it falls here, exactly
-    ///   like the legacy path where only a top-level (non-async) channel op errors
-    ///   with the channel-specific message.
+    ///   leaving the root main task on a promise wait, so it uses the async
+    ///   deadlock diagnostic rather than a direct channel error.
     ///
     /// Returns `Ok(true)` when it settled the root; `Ok(false)` when the root was
     /// not force-settleable (already settled/aborted, or its main task was not
@@ -4430,8 +4429,8 @@ impl Runtime {
             }
             // The root main task parked directly on a `channel/recv`/`channel/send`
             // is a `protocol_waits` Channel entry keyed by its wait key. Name the
-            // deadlock with the legacy synchronous message (empty/full) so
-            // `eval_str_via_runtime` matches the `eval_str` oracle.
+            // deadlock with the channel's synchronous message (empty/full),
+            // which is the most specific diagnostic available.
             let channel_receive = state
                 .tasks
                 .get(&main_task)

@@ -175,6 +175,41 @@ fn stream_file_async_read_matches_sync() {
     assert_eq!(async_v, Value::string("hello"));
 }
 
+#[test]
+fn used_file_streams_dropped_without_close_release_their_runtime_gates() {
+    let input = TempFile::with_contents("drop-input-gate", "hello\n");
+    let output = TempFile::new("drop-output-gate");
+    let interp = Interpreter::new();
+
+    interp
+        .eval_str_via_runtime(&format!(
+            r#"(let ((s (stream/open-input "{}")))
+                  (stream/read-line s)
+                  nil)"#,
+            input.path()
+        ))
+        .expect("used input stream drops at the end of the runtime root");
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "dropping a used file-input stream must close its owner runtime gate"
+    );
+
+    interp
+        .eval_str_via_runtime(&format!(
+            r#"(let ((s (stream/open-output "{}")))
+                  (stream/write-string s "hello")
+                  nil)"#,
+            output.path()
+        ))
+        .expect("used output stream drops at the end of the runtime root");
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "dropping a used file-output stream must close its owner runtime gate"
+    );
+}
+
 /// `stream/open-output` + `stream/write-string` + `stream/flush` +
 /// `stream/close` inside `async/spawn` produces byte-identical file content
 /// to the synchronous path.

@@ -122,6 +122,13 @@ pub fn set_current_root(root: Option<RootId>) -> Option<RootId> {
     CURRENT_ROOT.with(|cell| cell.replace(root))
 }
 
+/// Return the root published for the currently executing runtime quantum.
+/// Every runtime-driven VM quantum, including a root's main task, publishes
+/// this identity; host and ordinary compiled evaluation return `None`.
+pub fn current_root() -> Option<RootId> {
+    CURRENT_ROOT.with(Cell::get)
+}
+
 /// Append to the capture sink if the current quantum's root is capturing.
 /// Returns `true` if the text was captured (caller must not also print it).
 /// The `CAPTURING_COUNT == 0` check is a single cheap `Cell` read that keeps

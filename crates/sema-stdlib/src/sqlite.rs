@@ -43,10 +43,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
-use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateId};
+use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateHandle};
 use sema_core::{check_arity, in_runtime_quantum, SemaError, Value};
 
-use crate::runtime_offload::{checkout_external, finish_terminal_gate, CheckoutOp};
+use crate::runtime_offload::{
+    checkout_external, finish_terminal_gate, prepare_terminal_gate, CheckoutOp,
+};
 
 /// Completion-kind tag for `db/*` external waits ("db\0\0").
 const DB_COMPLETION_KIND: u64 = 0x6462_0000;
@@ -75,10 +77,10 @@ enum DbSlot {
 
 thread_local! {
     static DB_CONNECTIONS: RefCell<HashMap<String, DbSlot>> = RefCell::new(HashMap::new());
-    /// Per-handle [`ResourceGateId`], created lazily on the first offloaded op on
-    /// a handle and reused for its later ops (dropped on `db/close`). The gate
+    /// Per-handle owning resource-gate capability, created lazily on the first
+    /// offloaded op and reused for later ops (dropped on `db/close`). The gate
     /// provides FIFO mutual exclusion for the checkout slot.
-    static DB_GATES: RefCell<HashMap<String, ResourceGateId>> = RefCell::new(HashMap::new());
+    static DB_GATES: RefCell<HashMap<String, ResourceGateHandle>> = RefCell::new(HashMap::new());
 }
 
 fn sema_to_sql(v: &Value) -> SqlValue {
@@ -194,7 +196,7 @@ fn checkout_runtime<T: Send + 'static>(
 ) -> NativeResult {
     let kind =
         CompletionKind::try_from_raw(DB_COMPLETION_KIND).expect("db completion kind is nonzero");
-    let gate = DB_GATES.with(|g| g.borrow().get(&handle).copied());
+    let gate = DB_GATES.with(|g| g.borrow().get(&handle).cloned());
     let h_take = handle.clone();
     let h_reinstall = handle.clone();
     let h_tomb = handle.clone();
@@ -212,7 +214,7 @@ fn checkout_runtime<T: Send + 'static>(
         remove_gate: Rc::new(move |id| {
             DB_GATES.with(|g| {
                 let mut gates = g.borrow_mut();
-                if gates.get(&h_remove).copied() == Some(id) {
+                if gates.get(&h_remove).map(ResourceGateHandle::id) == Some(id) {
                     gates.remove(&h_remove);
                 }
             });
@@ -675,24 +677,23 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         check_arity!(args, "db/close", 1);
         let handle = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+            .to_string();
+        let gate = DB_GATES.with(|g| g.borrow().get(&handle).cloned());
+        if DB_CONNECTIONS.with(|c| matches!(c.borrow().get(&handle), Some(DbSlot::CheckedOut))) {
+            return Err(busy_err("db/close", &handle));
+        }
+        prepare_terminal_gate(gate.as_ref(), "db/close")?;
         DB_CONNECTIONS.with(|c| {
-            let mut conns = c.borrow_mut();
-            if matches!(conns.get(handle), Some(DbSlot::CheckedOut)) {
-                return Err(busy_err("db/close", handle));
-            }
-            conns.remove(handle);
-            Ok(())
-        })?;
-        let handle = handle.to_string();
-        let gate = DB_GATES.with(|g| g.borrow().get(&handle).copied());
+            c.borrow_mut().remove(&handle);
+        });
         let remove_handle = handle;
         finish_terminal_gate(
             gate,
             Rc::new(move |id| {
                 DB_GATES.with(|g| {
                     let mut gates = g.borrow_mut();
-                    if gates.get(&remove_handle).copied() == Some(id) {
+                    if gates.get(&remove_handle).map(ResourceGateHandle::id) == Some(id) {
                         gates.remove(&remove_handle);
                     }
                 });

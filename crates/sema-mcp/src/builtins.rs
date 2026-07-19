@@ -240,9 +240,9 @@ enum Slot {
 struct ConnEntry {
     meta: ConnMeta,
     slot: RefCell<Slot>,
-    /// The connection's per-handle [`ResourceGateId`] under the unified runtime,
-    /// created lazily on the first `in_runtime_quantum` `mcp/call` and reused for
-    /// its later calls. The gate provides FIFO mutual exclusion over the serial
+    /// The connection's owning per-handle resource-gate capability, created
+    /// lazily on the first `in_runtime_quantum` `mcp/call` and reused for its
+    /// later calls. The gate provides FIFO mutual exclusion over the serial
     /// JSON-RPC transport, replacing the old executor poll+retry queue: a second
     /// runtime-quantum `mcp/call` on a busy connection parks FIFO on the gate
     /// (no polling) instead of re-attempting the checkout every executor tick.
@@ -334,8 +334,8 @@ fn next_handle() -> String {
 /// Build a dual-ABI native from an op body that speaks the runtime native ABI
 /// (`NativeResult`). Under the unified runtime the runtime callback returns the
 /// body's `NativeOutcome` (so an External-wait suspend surfaces
-/// structurally); outside it (bare eval / legacy scheduler) the legacy value
-/// callback unwraps the plain `Return` the body produces there.
+/// structurally); outside a runtime quantum, the value callback accepts the
+/// plain `Return` produced by the synchronous path.
 fn dual_native(name: String, body: impl Fn(&[Value]) -> NativeResult + 'static) -> NativeFn {
     let body = Rc::new(body);
     let for_func = body.clone();
@@ -1045,6 +1045,18 @@ fn lookup_entry(handle: &str) -> Result<Rc<ConnEntry>, SemaError> {
         })
 }
 
+fn remove_connection_entry(handle: &str, entry: &Rc<ConnEntry>) {
+    CONNECTIONS.with(|connections| {
+        let mut connections = connections.borrow_mut();
+        if connections
+            .get(handle)
+            .is_some_and(|stored| Rc::ptr_eq(stored, entry))
+        {
+            connections.remove(handle);
+        }
+    });
+}
+
 /// Cassette key for one MCP `tools/call`: a hash of the server identity + tool +
 /// (canonical) arguments. Stable across runs so record/replay correlate.
 fn cassette_key(identity: &str, tool: &str, args: &serde_json::Value) -> String {
@@ -1274,9 +1286,8 @@ fn call_tool(
         _ => {}
     }
 
-    // Unified-runtime path: a spawned task runs in a "runtime quantum", not the
-    // legacy cooperative scheduler. Route the blocking JSON-RPC round trip
-    // through the runtime's thread-pool executor as an external wait (the same
+    // A runtime quantum routes the blocking JSON-RPC round trip through the
+    // thread-pool executor as an external wait (the same
     // `NativeOutcome::Suspend` mechanism `sleep` uses) so two `mcp/call`s to
     // DIFFERENT connections overlap on separate workers instead of serializing
     // on the VM thread.
@@ -1465,16 +1476,16 @@ struct McpGatedState {
 }
 
 /// Close-once state shared by the connection decoder, cancel hook, and final
-/// continuation. Clearing the mapping compares the exact gate id so late
+/// continuation. Clearing the mapping compares the exact capability id so late
 /// teardown cannot erase a replacement gate.
 struct McpGateLifecycle {
     entry: Rc<ConnEntry>,
-    gate: ResourceGateId,
+    gate: ResourceGateHandle,
     terminal: Cell<bool>,
 }
 
 impl McpGateLifecycle {
-    fn new(entry: Rc<ConnEntry>, gate: ResourceGateId) -> Rc<Self> {
+    fn new(entry: Rc<ConnEntry>, gate: ResourceGateHandle) -> Rc<Self> {
         Rc::new(Self {
             entry,
             gate,
@@ -1489,7 +1500,7 @@ impl McpGateLifecycle {
         let mut stored = self.entry.gate.borrow_mut();
         if stored
             .as_ref()
-            .is_some_and(|handle| handle.id() == self.gate)
+            .is_some_and(|handle| handle.id() == self.gate.id())
         {
             stored.take();
         }
@@ -1498,12 +1509,12 @@ impl McpGateLifecycle {
     fn finish_request(&self, continuation: Box<dyn NativeContinuation>) -> RuntimeRequest {
         if self.terminal.get() {
             RuntimeRequest::CloseResourceGate {
-                gate: self.gate,
+                gate: self.gate.id(),
                 continuation,
             }
         } else {
             RuntimeRequest::ReleaseResourceGate {
-                gate: self.gate,
+                gate: self.gate.id(),
                 continuation,
             }
         }
@@ -1611,8 +1622,8 @@ impl NativeContinuation for McpCreateGateCont {
         match input {
             ResumeInput::Runtime(RuntimeResponse::ResourceGate(handle)) => {
                 let gate = handle.id();
-                *state.entry.gate.borrow_mut() = Some(handle);
-                let lifecycle = McpGateLifecycle::new(Rc::clone(&state.entry), gate);
+                *state.entry.gate.borrow_mut() = Some(handle.clone());
+                let lifecycle = McpGateLifecycle::new(Rc::clone(&state.entry), handle);
                 Ok(NativeOutcome::Suspend(NativeSuspend {
                     wait: WaitKind::ResourceSlot(gate),
                     continuation: Box::new(McpAcquireCont { state, lifecycle }),
@@ -1773,8 +1784,22 @@ impl NativeContinuation for McpFinalCont {
     fn resume(
         self: Box<Self>,
         _context: &mut NativeCallContext<'_>,
-        _input: ResumeInput,
+        input: ResumeInput,
     ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Value(_)) => {}
+            ResumeInput::Failed(error) => return Err(error),
+            ResumeInput::Cancelled(reason) => {
+                return Err(SemaError::eval(format!(
+                    "MCP resource-gate transition was cancelled ({reason:?})"
+                )))
+            }
+            ResumeInput::Returned(_) | ResumeInput::Runtime(_) => {
+                return Err(SemaError::eval(
+                    "MCP resource-gate transition returned an unexpected response",
+                ))
+            }
+        }
         match *self {
             McpFinalCont::Value(value) => Ok(NativeOutcome::Return(value)),
             McpFinalCont::Fail(error) => Err(error),
@@ -1813,17 +1838,13 @@ fn mcp_gated_runtime_outcome(
     action: Box<dyn McpGatedAction>,
 ) -> NativeResult {
     let state = McpGatedState { entry, action };
-    let gate = state
-        .entry
-        .gate
-        .borrow()
-        .as_ref()
-        .map(ResourceGateHandle::id);
+    let gate = state.entry.gate.borrow().clone();
     match gate {
         Some(gate) => {
+            let gate_id = gate.id();
             let lifecycle = McpGateLifecycle::new(Rc::clone(&state.entry), gate);
             Ok(NativeOutcome::Suspend(NativeSuspend {
-                wait: WaitKind::ResourceSlot(gate),
+                wait: WaitKind::ResourceSlot(gate_id),
                 continuation: Box::new(McpAcquireCont { state, lifecycle }),
             }))
         }
@@ -1861,14 +1882,16 @@ enum McpConnectionFinish {
         label: &'static str,
         materialize: ToolsMaterialize,
     },
-    Close,
+    Close {
+        handle: String,
+    },
 }
 
 impl McpConnectionFinish {
     fn label(&self) -> &'static str {
         match self {
             Self::Tools { label, .. } => label,
-            Self::Close => "mcp/close",
+            Self::Close { .. } => "mcp/close",
         }
     }
 }
@@ -1952,12 +1975,16 @@ impl CompletionDecoder for McpConnectionDecoder {
                 let tools = result.map_err(|error| SemaError::eval(format!("{label}: {error}")))?;
                 Ok(materialize(tools, &entry.meta))
             }
-            (McpConnectionFinish::Close, McpConnectionOperationResult::Close(result)) => {
+            (
+                McpConnectionFinish::Close { handle },
+                McpConnectionOperationResult::Close(result),
+            ) => {
                 tombstone_slot(&entry, "connection closed");
                 drop(conn);
                 // The handle and transport are terminal even when the protocol
                 // close itself reported an error.
                 lifecycle.mark_terminal();
+                remove_connection_entry(&handle, &entry);
                 result.map_err(|error| SemaError::eval(format!("mcp/close: {error}")))?;
                 Ok(Value::nil())
             }
@@ -2244,6 +2271,140 @@ fn fetch_tools(
 
 // ── `mcp/close` ─────────────────────────────────────────────────────────────
 
+fn gate_belongs_to_current_runtime(gate: &ResourceGateHandle) -> bool {
+    sema_core::current_root().is_some_and(|root| root.runtime() == gate.id().runtime())
+}
+
+fn close_gate_through_owner(gate: &ResourceGateHandle) -> Result<(), SemaError> {
+    match gate.close() {
+        Ok(_) | Err(ResourceGateCloseError::RuntimeUnavailable) => Ok(()),
+        Err(error) => Err(SemaError::eval(format!(
+            "mcp/close: could not close the connection gate through its owning runtime: {error}"
+        ))),
+    }
+}
+
+fn clear_entry_gate(entry: &ConnEntry, gate_id: ResourceGateId) {
+    let mut stored = entry.gate.borrow_mut();
+    if stored.as_ref().is_some_and(|gate| gate.id() == gate_id) {
+        stored.take();
+    }
+}
+
+struct McpForeignCloseDecoder {
+    entry: Rc<ConnEntry>,
+}
+
+impl Trace for McpForeignCloseDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CompletionDecoder for McpForeignCloseDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        let payload = result.map_err(|failure| {
+            tombstone_slot(&self.entry, "mcp/close terminal worker failed");
+            SemaError::eval(format!("mcp/close: {}", failure.message()))
+        })?;
+        let McpConnectionOperationPayload { conn, result } = downcast_send_payload::<
+            McpConnectionOperationPayload,
+        >(payload, "mcp/close")
+        .map_err(|failure| {
+            tombstone_slot(&self.entry, "mcp/close terminal payload decode failed");
+            SemaError::eval(format!("mcp/close: {}", failure.message()))
+        })?;
+        tombstone_slot(&self.entry, "connection closed");
+        drop(conn);
+        match result {
+            McpConnectionOperationResult::Close(result) => {
+                result.map_err(|error| SemaError::eval(format!("mcp/close: {error}")))?;
+                Ok(Value::nil())
+            }
+            McpConnectionOperationResult::Tools(_) => Err(SemaError::eval(
+                "mcp/close: terminal worker returned an unexpected result",
+            )),
+        }
+    }
+}
+
+struct McpForeignCloseCancelHook {
+    entry: Rc<ConnEntry>,
+    signal: Option<McpCancelSignal>,
+}
+
+impl Trace for McpForeignCloseCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CancelHook for McpForeignCloseCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        fire_cancel_signal(&mut self.signal);
+        tombstone_slot(&self.entry, "cancelled during mcp/close");
+        Ok(CancelDisposition::Reaped)
+    }
+
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+}
+
+fn foreign_runtime_close(
+    handle: &str,
+    entry: Rc<ConnEntry>,
+    gate: ResourceGateHandle,
+) -> NativeResult {
+    let mut conn = try_checkout(&entry)?.ok_or_else(|| busy_sync_error(handle, "mcp/close"))?;
+    if let Err(error) = close_gate_through_owner(&gate) {
+        checkin(&entry, conn);
+        return Err(error);
+    }
+    clear_entry_gate(&entry, gate.id());
+    remove_connection_entry(handle, &entry);
+
+    let (cancel_tx, cancel_rx) = mcp_cancel_channel();
+    let decoder = Box::new(McpForeignCloseDecoder {
+        entry: Rc::clone(&entry),
+    });
+    let resource = InterruptibleResource::new(
+        "mcp/close",
+        Box::new(McpForeignCloseCancelHook {
+            entry,
+            signal: Some(cancel_tx),
+        }),
+    );
+    let prepared = PreparedExternalOperation::interruptible_blocking(
+        CompletionKind::try_from_raw(MCP_CONNECTION_OP_COMPLETION_KIND)
+            .expect("MCP connection operation completion kind is nonzero"),
+        decoder,
+        resource,
+        move || {
+            let close = close_async(&mut conn);
+            let result = sema_io::io_block_on(async move {
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx => Err("cancelled".to_string()),
+                    result = close => result,
+                }
+            });
+            Ok(Box::new(McpConnectionOperationPayload {
+                conn,
+                result: McpConnectionOperationResult::Close(result),
+            }) as SendPayload)
+        },
+    );
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(McpReturnContinuation { label: "mcp/close" }),
+    }))
+}
+
 /// Best-effort close of a connection by its opaque handle `Value`, same
 /// semantics as the `mcp/close` builtin but NEVER errors (a missing/already-closed
 /// handle, a busy/tombstoned slot, or a close-protocol failure, is silently
@@ -2257,45 +2418,61 @@ pub fn close_handle(handle: &Value) {
     let Some(handle_str) = handle.as_str() else {
         return;
     };
-    let entry = CONNECTIONS.with(|connections| connections.borrow_mut().remove(handle_str));
+    let entry = CONNECTIONS.with(|connections| connections.borrow().get(handle_str).cloned());
     let Some(entry) = entry else {
         return;
     };
-    if let Ok(Some(mut conn)) = try_checkout(&entry) {
-        let _ = block_on(close_async(&mut conn));
-    }
-    // Host-only cleanup has no native continuation in which to emit a
-    // `CloseResourceGate` request. Exercise the per-allocation weak closer. A
-    // dropped runtime is already clean; live-runtime coordination failures are
-    // reported because the best-effort API has no error return.
-    let gate = entry.gate.borrow_mut().take();
-    if let Some(gate) = gate {
-        match gate.close() {
-            Ok(_) | Err(ResourceGateCloseError::RuntimeUnavailable) => {}
-            Err(error) => eprintln!(
-                "mcp close_handle could not close its live runtime resource gate: {error}"
-            ),
+    let mut conn = match try_checkout(&entry) {
+        Ok(Some(conn)) => Some(conn),
+        Ok(None) => return,
+        Err(_) => None,
+    };
+    let gate = entry.gate.borrow().clone();
+    if let Some(gate) = gate.as_ref() {
+        if let Err(error) = close_gate_through_owner(gate) {
+            if let Some(conn) = conn.take() {
+                checkin(&entry, conn);
+            }
+            eprintln!("mcp close_handle could not close its live runtime resource gate: {error}");
+            return;
         }
+        clear_entry_gate(&entry, gate.id());
+    }
+    remove_connection_entry(handle_str, &entry);
+    if let Some(mut conn) = conn {
+        let _ = block_on(close_async(&mut conn));
     }
 }
 
 fn close_connection(args: &[Value]) -> NativeResult {
     check_arity!(args, "mcp/close", 1);
     let handle = require_handle(args, "mcp/close")?;
-    let entry = CONNECTIONS.with(|connections| connections.borrow_mut().remove(handle));
-    let Some(entry) = entry else {
-        return Err(SemaError::eval(format!(
-            "mcp connection {handle} is not registered; it may have already been closed"
-        )));
-    };
+    let entry = lookup_entry(handle)?;
     if in_runtime_quantum() {
+        let gate = entry.gate.borrow().clone();
+        if let Some(gate) = gate {
+            if !gate_belongs_to_current_runtime(&gate) {
+                return foreign_runtime_close(handle, entry, gate);
+            }
+        }
         return mcp_connection_runtime_outcome(
             entry,
             McpConnectionOperation::Close,
-            McpConnectionFinish::Close,
+            McpConnectionFinish::Close {
+                handle: handle.to_string(),
+            },
         );
     }
     let mut conn = try_checkout(&entry)?.ok_or_else(|| busy_sync_error(handle, "mcp/close"))?;
+    let gate = entry.gate.borrow().clone();
+    if let Some(gate) = gate.as_ref() {
+        if let Err(error) = close_gate_through_owner(gate) {
+            checkin(&entry, conn);
+            return Err(error);
+        }
+        clear_entry_gate(&entry, gate.id());
+    }
+    remove_connection_entry(handle, &entry);
     let result = block_on(close_async(&mut conn));
     result.map_err(|err| SemaError::eval(format!("mcp/close: {err}")))?;
     Ok(NativeOutcome::Return(Value::nil()))
@@ -2383,6 +2560,10 @@ mod tests {
         let (runtime, _registrar, _issuers) =
             CompletionRegistrar::register(Arc::new(ClosedInbox)).unwrap();
         RuntimeScopedIdCounter::new(runtime).allocate().unwrap()
+    }
+
+    fn gate_handle(id: ResourceGateId) -> ResourceGateHandle {
+        ResourceGateHandle::new(id, Rc::new(|_| Ok(true)))
     }
 
     #[test]
@@ -2492,7 +2673,7 @@ mod tests {
         let decoder = McpConnectionDecoder {
             entry: Rc::clone(&decoder_entry),
             finish: tools_finish(),
-            lifecycle: McpGateLifecycle::new(decoder_entry, gate_id()),
+            lifecycle: McpGateLifecycle::new(decoder_entry, gate_handle(gate_id())),
         };
         let mut edges = 0;
         assert!(decoder.trace(&mut |_| edges += 1));
@@ -2510,11 +2691,29 @@ mod tests {
     }
 
     #[test]
+    fn mcp_final_cont_does_not_swallow_runtime_transition_failure() {
+        let mut task_context = sema_core::runtime::TaskContext::default();
+        let mut context = NativeCallContext {
+            task_context: &mut task_context,
+            cancellation: sema_core::runtime::CancellationView::default(),
+        };
+        let error = match Box::new(McpFinalCont::Value(Value::nil())).resume(
+            &mut context,
+            ResumeInput::Failed(SemaError::eval("wrong runtime close")),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("failed MCP gate transition must override stored success"),
+        };
+        assert!(error.to_string().contains("wrong runtime close"), "{error}");
+    }
+
+    #[test]
     fn mcp_worker_loss_clears_mapping_and_closes_gate() {
         let entry = checked_out_entry();
         let gate = gate_id();
-        *entry.gate.borrow_mut() = Some(ResourceGateHandle::new(gate, Rc::new(|_| Ok(true))));
-        let lifecycle = McpGateLifecycle::new(Rc::clone(&entry), gate);
+        let handle = gate_handle(gate);
+        *entry.gate.borrow_mut() = Some(handle.clone());
+        let lifecycle = McpGateLifecycle::new(Rc::clone(&entry), handle);
         let decoder = McpConnectionDecoder {
             entry: Rc::clone(&entry),
             finish: tools_finish(),
@@ -2552,7 +2751,7 @@ mod tests {
     fn queued_close_cancellation_is_terminal_but_queued_tools_cancellation_is_not() {
         fn entry_with_gate(gate: ResourceGateId) -> Rc<ConnEntry> {
             let entry = checked_out_entry();
-            *entry.gate.borrow_mut() = Some(ResourceGateHandle::new(gate, Rc::new(|_| Ok(true))));
+            *entry.gate.borrow_mut() = Some(gate_handle(gate));
             entry
         }
 
@@ -2564,13 +2763,18 @@ mod tests {
 
         let close_gate = gate_id();
         let close_entry = entry_with_gate(close_gate);
-        let close_lifecycle = McpGateLifecycle::new(Rc::clone(&close_entry), close_gate);
+        let close_lifecycle = McpGateLifecycle::new(
+            Rc::clone(&close_entry),
+            close_entry.gate.borrow().as_ref().unwrap().clone(),
+        );
         let close = McpAcquireCont {
             state: McpGatedState {
                 entry: Rc::clone(&close_entry),
                 action: Box::new(McpConnectionAction {
                     operation: McpConnectionOperation::Close,
-                    finish: McpConnectionFinish::Close,
+                    finish: McpConnectionFinish::Close {
+                        handle: "test-close".to_string(),
+                    },
                 }),
             },
             lifecycle: close_lifecycle,
@@ -2590,7 +2794,10 @@ mod tests {
 
         let tools_gate = gate_id();
         let tools_entry = entry_with_gate(tools_gate);
-        let tools_lifecycle = McpGateLifecycle::new(Rc::clone(&tools_entry), tools_gate);
+        let tools_lifecycle = McpGateLifecycle::new(
+            Rc::clone(&tools_entry),
+            tools_entry.gate.borrow().as_ref().unwrap().clone(),
+        );
         let tools = McpAcquireCont {
             state: McpGatedState {
                 entry: Rc::clone(&tools_entry),

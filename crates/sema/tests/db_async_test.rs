@@ -157,6 +157,33 @@ fn db_gate_created_via_runtime_closes_through_compiled_entrypoint() {
     assert_eq!(interp.runtime_resource_gate_count(), 0);
 }
 
+#[test]
+fn db_close_from_foreign_runtime_closes_the_owner_gate() {
+    let owner = Interpreter::new();
+    let caller = Interpreter::new();
+    owner
+        .eval_str_via_runtime(
+            r#"
+            (db/open-memory "foreign-runtime-close")
+            (db/exec "foreign-runtime-close" "CREATE TABLE t (v INTEGER)")
+            "#,
+        )
+        .expect("owner runtime creates and uses database");
+    assert_eq!(owner.runtime_resource_gate_count(), 1);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+
+    let result = caller
+        .eval_str_via_runtime(r#"(db/close "foreign-runtime-close")"#)
+        .expect("foreign runtime routes close through the gate owner");
+    assert!(result.is_nil());
+    assert_eq!(owner.runtime_resource_gate_count(), 0);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+    let error = owner
+        .eval_str_via_runtime(r#"(db/tables "foreign-runtime-close")"#)
+        .expect_err("accepted foreign close removes the database resource");
+    assert!(error.to_string().contains("no open database"), "{error}");
+}
+
 /// `db/open` (real file, not `:memory:`) offloads through `fs_offload` — a
 /// distinct code path from the checkout-based statement ops. Proves the file
 /// variant round-trips correctly inside async context.

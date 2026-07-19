@@ -55,8 +55,7 @@ use crate::register_fn;
 /// `crate::register_runtime_fn_path_gated` minus the sandbox/path gating (the
 /// `stream/*` builtins are ungated). The body is exposed under BOTH ABIs: the
 /// runtime callback returns the body's `NativeOutcome` structurally, and the
-/// legacy value callback unwraps a plain `Return` (or a legacy `AwaitIo` armed
-/// by an `fs_offload` sub-path, which the VM bridges) for a bare/top-level eval.
+/// value callback accepts the plain `Return` produced for bare/top-level eval.
 fn register_runtime_fn(
     env: &sema_core::Env,
     name: &'static str,
@@ -501,10 +500,14 @@ mod io_streams {
     use std::io::{BufRead, BufReader, BufWriter, Read, Write};
     use std::rc::Rc;
 
-    use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateId};
+    use sema_core::runtime::{
+        CompletionKind, NativeOutcome, NativeResult, ResourceGateHandle, ResourceGateId,
+    };
     use sema_core::{in_runtime_quantum, StreamBox};
 
-    use crate::runtime_offload::{checkout_external, finish_terminal_gate, CheckoutOp};
+    use crate::runtime_offload::{
+        checkout_external, finish_terminal_gate, prepare_terminal_gate, CheckoutOp,
+    };
 
     /// Completion-kind tag for file-stream `stream/*` external waits ("stf\0").
     const STREAM_COMPLETION_KIND: u64 = 0x7374_6600;
@@ -555,11 +558,10 @@ mod io_streams {
     #[derive(Debug)]
     pub struct FileInputStream {
         slot: RefCell<FileInSlot>,
-        /// This stream's [`ResourceGateId`], minted on its first offloaded op and
-        /// reused for later ops. The gate provides FIFO mutual exclusion for the
-        /// checkout slot (the `Rc<StreamBox>` is the handle — there is no keyed
-        /// registry, so the gate id lives on the stream object).
-        gate: Cell<Option<ResourceGateId>>,
+        /// Owning resource-gate capability minted on the first offloaded op.
+        /// The stream object itself is the lifecycle owner; its `Drop` closes
+        /// this gate when Sema code omits an explicit `stream/close`.
+        gate: RefCell<Option<ResourceGateHandle>>,
     }
 
     #[derive(Debug)]
@@ -579,7 +581,15 @@ mod io_streams {
         fn from_reader(reader: BufReader<std::fs::File>) -> Self {
             FileInputStream {
                 slot: RefCell::new(FileInSlot::Available(reader)),
-                gate: Cell::new(None),
+                gate: RefCell::new(None),
+            }
+        }
+    }
+
+    impl Drop for FileInputStream {
+        fn drop(&mut self) {
+            if let Some(gate) = self.gate.get_mut().take() {
+                let _ = gate.close();
             }
         }
     }
@@ -634,7 +644,7 @@ mod io_streams {
     pub struct FileOutputStream {
         slot: RefCell<FileOutSlot>,
         /// See [`FileInputStream::gate`].
-        gate: Cell<Option<ResourceGateId>>,
+        gate: RefCell<Option<ResourceGateHandle>>,
     }
 
     #[derive(Debug)]
@@ -655,7 +665,15 @@ mod io_streams {
         fn from_writer(writer: BufWriter<std::fs::File>) -> Self {
             FileOutputStream {
                 slot: RefCell::new(FileOutSlot::Available(writer)),
-                gate: Cell::new(None),
+                gate: RefCell::new(None),
+            }
+        }
+    }
+
+    impl Drop for FileOutputStream {
+        fn drop(&mut self) {
+            if let Some(gate) = self.gate.get_mut().take() {
+                let _ = gate.close();
             }
         }
     }
@@ -739,50 +757,52 @@ mod io_streams {
     // (best-effort — the resource cannot be reclaimed). There is no process to
     // signal, so cancellation runs no abort.
 
-    fn input_gate(stream: &Rc<StreamBox>) -> Option<ResourceGateId> {
+    fn input_gate(stream: &Rc<StreamBox>) -> Option<ResourceGateHandle> {
         let inner = stream.borrow_inner();
         inner
             .as_any()
             .downcast_ref::<FileInputStream>()
-            .and_then(|fis| fis.gate.get())
+            .and_then(|fis| fis.gate.borrow().clone())
     }
 
-    fn store_input_gate(stream: &Rc<StreamBox>, id: ResourceGateId) {
+    fn store_input_gate(stream: &Rc<StreamBox>, gate: ResourceGateHandle) {
         let inner = stream.borrow_inner();
         if let Some(fis) = inner.as_any().downcast_ref::<FileInputStream>() {
-            fis.gate.set(Some(id));
+            *fis.gate.borrow_mut() = Some(gate);
         }
     }
 
     fn remove_input_gate(stream: &Rc<StreamBox>, id: ResourceGateId) {
         let inner = stream.borrow_inner();
         if let Some(fis) = inner.as_any().downcast_ref::<FileInputStream>() {
-            if fis.gate.get() == Some(id) {
-                fis.gate.set(None);
+            let mut gate = fis.gate.borrow_mut();
+            if gate.as_ref().map(ResourceGateHandle::id) == Some(id) {
+                gate.take();
             }
         }
     }
 
-    fn output_gate(stream: &Rc<StreamBox>) -> Option<ResourceGateId> {
+    fn output_gate(stream: &Rc<StreamBox>) -> Option<ResourceGateHandle> {
         let inner = stream.borrow_inner();
         inner
             .as_any()
             .downcast_ref::<FileOutputStream>()
-            .and_then(|fos| fos.gate.get())
+            .and_then(|fos| fos.gate.borrow().clone())
     }
 
-    fn store_output_gate(stream: &Rc<StreamBox>, id: ResourceGateId) {
+    fn store_output_gate(stream: &Rc<StreamBox>, gate: ResourceGateHandle) {
         let inner = stream.borrow_inner();
         if let Some(fos) = inner.as_any().downcast_ref::<FileOutputStream>() {
-            fos.gate.set(Some(id));
+            *fos.gate.borrow_mut() = Some(gate);
         }
     }
 
     fn remove_output_gate(stream: &Rc<StreamBox>, id: ResourceGateId) {
         let inner = stream.borrow_inner();
         if let Some(fos) = inner.as_any().downcast_ref::<FileOutputStream>() {
-            if fos.gate.get() == Some(id) {
-                fos.gate.set(None);
+            let mut gate = fos.gate.borrow_mut();
+            if gate.as_ref().map(ResourceGateHandle::id) == Some(id) {
+                gate.take();
             }
         }
     }
@@ -1219,6 +1239,32 @@ mod io_streams {
         stream: &Rc<StreamBox>,
     ) -> Result<Option<NativeOutcome>, SemaError> {
         if !in_runtime_quantum() {
+            let (gate, remove): (Option<ResourceGateHandle>, Rc<dyn Fn(ResourceGateId)>) =
+                match stream.stream_type() {
+                    "file-input" => {
+                        let remove_stream = stream.clone();
+                        (
+                            input_gate(stream),
+                            Rc::new(move |id| remove_input_gate(&remove_stream, id)),
+                        )
+                    }
+                    "file-output" => {
+                        let remove_stream = stream.clone();
+                        (
+                            output_gate(stream),
+                            Rc::new(move |id| remove_output_gate(&remove_stream, id)),
+                        )
+                    }
+                    _ => return Ok(None),
+                };
+            if gate.is_none() {
+                return Ok(None);
+            }
+            prepare_terminal_gate(gate.as_ref(), "stream/close")?;
+            stream.close()?;
+            return finish_terminal_gate(gate, remove, Ok(Value::nil())).map(Some);
+        }
+        if stream.stream_type() != "file-input" && stream.stream_type() != "file-output" {
             return Ok(None);
         }
         if stream.stream_type() == "file-input" {

@@ -30,11 +30,12 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateId};
+use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateHandle};
 use sema_core::{check_arity, in_runtime_quantum, Caps, SemaError, Value};
 
 use crate::runtime_offload::{
-    checkout_external, finish_terminal_gate, group_sigkill_abort, CheckoutOp,
+    checkout_external, finish_terminal_gate, group_sigkill_abort, prepare_terminal_gate,
+    suspend_terminal_external, CheckoutOp,
 };
 
 /// Completion-kind tag for `pty/*` external waits ("pty\0").
@@ -66,10 +67,10 @@ enum PtySlot {
 thread_local! {
     static PTYS: RefCell<HashMap<i64, PtySlot>> = RefCell::new(HashMap::new());
     static NEXT_ID: Cell<i64> = const { Cell::new(1) };
-    /// Per-handle [`ResourceGateId`], created lazily on the first offloaded op on
-    /// a handle and reused for its later ops (dropped on `pty/close`). The gate
+    /// Per-handle owning resource-gate capability, created lazily on the first
+    /// offloaded op and reused for later ops (dropped on `pty/close`). The gate
     /// provides FIFO mutual exclusion for the checkout slot.
-    static PTY_GATES: RefCell<HashMap<i64, ResourceGateId>> = RefCell::new(HashMap::new());
+    static PTY_GATES: RefCell<HashMap<i64, ResourceGateHandle>> = RefCell::new(HashMap::new());
 }
 
 /// Take `id`'s pty out of its slot once its gate is owned, marking the slot
@@ -273,7 +274,7 @@ fn checkout_runtime<T: Send + 'static>(
 ) -> NativeResult {
     let kind =
         CompletionKind::try_from_raw(PTY_COMPLETION_KIND).expect("pty completion kind is nonzero");
-    let gate = PTY_GATES.with(|g| g.borrow().get(&id).copied());
+    let gate = PTY_GATES.with(|g| g.borrow().get(&id).cloned());
     checkout_external(CheckoutOp {
         op_name,
         kind,
@@ -286,7 +287,7 @@ fn checkout_runtime<T: Send + 'static>(
         remove_gate: Rc::new(move |gid| {
             PTY_GATES.with(|g| {
                 let mut gates = g.borrow_mut();
-                if gates.get(&id).copied() == Some(gid) {
+                if gates.get(&id).map(ResourceGateHandle::id) == Some(gid) {
                     gates.remove(&id);
                 }
             });
@@ -368,37 +369,82 @@ fn pty_close_runtime(id: i64) -> NativeResult {
         Proceed,
     }
     let action = PTYS.with(|p| {
-        let mut ptys = p.borrow_mut();
-        match ptys.get_mut(&id) {
+        let ptys = p.borrow();
+        match ptys.get(&id) {
             Some(PtySlot::CheckedOut) => CloseAction::Busy,
-            Some(PtySlot::Available(pt)) => {
-                let _ = pt.child.kill(); // a signal send — cheap, non-blocking
-                CloseAction::Proceed
-            }
+            Some(PtySlot::Available(_)) => CloseAction::Proceed,
             Some(PtySlot::Tombstone(_)) | None => CloseAction::Noop,
         }
     });
-    match action {
-        CloseAction::Busy => Err(busy_err("pty/close", id)),
-        CloseAction::Noop => {
-            let gate = PTY_GATES.with(|g| g.borrow().get(&id).copied());
-            finish_terminal_gate(
-                gate,
-                Rc::new(move |gid| {
-                    PTY_GATES.with(|g| {
-                        let mut gates = g.borrow_mut();
-                        if gates.get(&id).copied() == Some(gid) {
-                            gates.remove(&id);
-                        }
-                    });
-                }),
-                Ok(Value::nil()),
-            )
+    let gate = PTY_GATES.with(|g| g.borrow().get(&id).cloned());
+    if matches!(action, CloseAction::Busy) {
+        return Err(busy_err("pty/close", id));
+    }
+    if prepare_terminal_gate(gate.as_ref(), "pty/close")? {
+        if let Some(gate) = gate.as_ref() {
+            PTY_GATES.with(|g| {
+                let mut gates = g.borrow_mut();
+                if gates.get(&id).map(ResourceGateHandle::id) == Some(gate.id()) {
+                    gates.remove(&id);
+                }
+            });
         }
+        if matches!(action, CloseAction::Noop) {
+            return Ok(NativeOutcome::Return(Value::nil()));
+        }
+        let pid = peek_pid(id);
+        let mut pty = take_pty("pty/close", id)?;
+        let _ = pty.child.kill();
+        let kind = CompletionKind::try_from_raw(PTY_COMPLETION_KIND)
+            .expect("pty completion kind is nonzero");
+        return suspend_terminal_external(
+            "pty/close",
+            kind,
+            pty,
+            |pty| {
+                let _ = pty.child.wait();
+                if let Some(thread) = pty.reader_thread.take() {
+                    let _ = thread.join();
+                }
+                Ok(())
+            },
+            move |_pty, result| {
+                PTYS.with(|p| {
+                    p.borrow_mut().remove(&id);
+                });
+                result.map_err(SemaError::Io)?;
+                Ok(Value::nil())
+            },
+            Rc::new(move |msg| {
+                PTYS.with(|p| {
+                    p.borrow_mut().insert(id, PtySlot::Tombstone(msg));
+                });
+            }),
+            pid.map(group_sigkill_abort),
+        );
+    }
+    match action {
+        CloseAction::Busy => unreachable!("busy close returned above"),
+        CloseAction::Noop => finish_terminal_gate(
+            gate,
+            Rc::new(move |gid| {
+                PTY_GATES.with(|g| {
+                    let mut gates = g.borrow_mut();
+                    if gates.get(&id).map(ResourceGateHandle::id) == Some(gid) {
+                        gates.remove(&id);
+                    }
+                });
+            }),
+            Ok(Value::nil()),
+        ),
         CloseAction::Proceed => {
+            PTYS.with(|p| {
+                if let Some(PtySlot::Available(pty)) = p.borrow_mut().get_mut(&id) {
+                    let _ = pty.child.kill();
+                }
+            });
             let kind = CompletionKind::try_from_raw(PTY_COMPLETION_KIND)
                 .expect("pty completion kind is nonzero");
-            let gate = PTY_GATES.with(|g| g.borrow().get(&id).copied());
             checkout_external(CheckoutOp {
                 op_name: "pty/close",
                 kind,
@@ -411,7 +457,7 @@ fn pty_close_runtime(id: i64) -> NativeResult {
                 remove_gate: Rc::new(move |gid| {
                     PTY_GATES.with(|g| {
                         let mut gates = g.borrow_mut();
-                        if gates.get(&id).copied() == Some(gid) {
+                        if gates.get(&id).map(ResourceGateHandle::id) == Some(gid) {
                             gates.remove(&id);
                         }
                     });
@@ -579,20 +625,30 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         if in_runtime_quantum() {
             return pty_close_runtime(id);
         }
+        let gate = PTY_GATES.with(|g| g.borrow().get(&id).cloned());
+        if PTYS.with(|p| matches!(p.borrow().get(&id), Some(PtySlot::CheckedOut))) {
+            return Err(busy_err("pty/close", id));
+        }
+        prepare_terminal_gate(gate.as_ref(), "pty/close")?;
         PTYS.with(|p| {
             let mut ptys = p.borrow_mut();
-            if matches!(ptys.get(&id), Some(PtySlot::CheckedOut)) {
-                return Err(busy_err("pty/close", id));
-            }
             if let Some(PtySlot::Available(mut pt)) = ptys.remove(&id) {
                 let _ = pt.child.kill();
                 let _ = pt.child.wait();
             }
-            PTY_GATES.with(|g| {
-                g.borrow_mut().remove(&id);
-            });
-            Ok(NativeOutcome::Return(Value::nil()))
-        })
+        });
+        finish_terminal_gate(
+            gate,
+            Rc::new(move |gate_id| {
+                PTY_GATES.with(|g| {
+                    let mut gates = g.borrow_mut();
+                    if gates.get(&id).map(ResourceGateHandle::id) == Some(gate_id) {
+                        gates.remove(&id);
+                    }
+                });
+            }),
+            Ok(Value::nil()),
+        )
     });
 }
 

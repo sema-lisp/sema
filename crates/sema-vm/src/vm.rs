@@ -994,6 +994,15 @@ fn snapshot_native_escaping_args(native: &NativeFn, args: &[Value]) {
     }
 }
 
+/// Snapshot a native's declared escaping arguments against the currently
+/// registered VM stack. Synchronous callback adapters use this before calling
+/// a native's value ABI directly, where ordinary VM dispatch cannot enforce
+/// the metadata for them.
+#[doc(hidden)]
+pub fn snapshot_native_escaping_args_for_current_vm(native: &NativeFn, args: &[Value]) {
+    snapshot_native_escaping_args(native, args);
+}
+
 /// Snapshot only the arguments a native declares it will retain, using the
 /// parked caller VM as the defining-frame owner.
 pub(crate) fn snapshot_native_escaping_args_with_owner(

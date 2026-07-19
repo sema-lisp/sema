@@ -2076,6 +2076,41 @@ fn applied_channel_send_after_spawn_snapshots_sent_closure() {
 }
 
 #[test]
+fn synchronous_apply_hof_snapshots_target_native_escaping_args() {
+    assert_eq!(
+        eval(
+            r#"(let ((x 41)
+                     (callbacks (mutable-array/new)))
+                 (let ((pending
+                         (async
+                           (async/sleep 10)
+                           ((mutable-array/get callbacks 0)))))
+                   (foldr apply
+                     (list callbacks (fn () (+ x 1)))
+                     (list mutable-array/push!))
+                   (await pending)))"#
+        ),
+        Value::int(42)
+    );
+}
+
+#[test]
+fn context_set_after_spawn_snapshots_inserted_closure() {
+    assert_eq!(
+        eval(
+            r#"(let ((x 41))
+                 (let ((pending
+                         (async
+                           (async/sleep 10)
+                           ((context/get :cb)))))
+                   (context/set :cb (fn () (+ x 1)))
+                   (await pending)))"#
+        ),
+        Value::int(42)
+    );
+}
+
+#[test]
 fn blocked_channel_send_after_spawn_snapshots_handed_off_closure() {
     assert_eq!(
         eval(

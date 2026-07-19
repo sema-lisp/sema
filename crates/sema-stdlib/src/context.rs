@@ -1,7 +1,7 @@
 use sema_core::{check_arity, EvalContext, NativeFn, SemaError, Value};
 
 pub fn register(env: &sema_core::Env) {
-    register_fn_ctx(env, "context/set", |ctx, args| {
+    register_fn_ctx_with_escaping_args(env, "context/set", &[0, 1], |ctx, args| {
         check_arity!(args, "context/set", 2);
         ctx.context_set(args[0].clone(), args[1].clone());
         Ok(Value::nil())
@@ -32,7 +32,7 @@ pub fn register(env: &sema_core::Env) {
         Ok(ctx.context_remove(&args[0]).unwrap_or_else(Value::nil))
     });
 
-    register_fn_ctx(env, "context/push", |ctx, args| {
+    register_fn_ctx_with_escaping_args(env, "context/push", &[0, 1], |ctx, args| {
         check_arity!(args, "context/push", 2);
         ctx.context_stack_push(args[0].clone(), args[1].clone());
         Ok(Value::nil())
@@ -48,7 +48,7 @@ pub fn register(env: &sema_core::Env) {
         Ok(ctx.context_stack_pop(&args[0]).unwrap_or_else(Value::nil))
     });
 
-    register_fn_ctx(env, "context/set-hidden", |ctx, args| {
+    register_fn_ctx_with_escaping_args(env, "context/set-hidden", &[0, 1], |ctx, args| {
         check_arity!(args, "context/set-hidden", 2);
         ctx.hidden_set(args[0].clone(), args[1].clone());
         Ok(Value::nil())
@@ -64,7 +64,7 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::bool(ctx.hidden_has(&args[0])))
     });
 
-    register_fn_ctx(env, "context/merge", |ctx, args| {
+    register_fn_ctx_with_escaping_args(env, "context/merge", &[0], |ctx, args| {
         check_arity!(args, "context/merge", 1);
         let map = args[0]
             .as_map_rc()
@@ -111,5 +111,17 @@ fn register_fn_ctx(
     env.set(
         sema_core::intern(name),
         Value::native_fn(NativeFn::with_ctx(name, f)),
+    );
+}
+
+fn register_fn_ctx_with_escaping_args(
+    env: &sema_core::Env,
+    name: &str,
+    escaping_args: &'static [usize],
+    f: impl Fn(&EvalContext, &[Value]) -> Result<Value, SemaError> + 'static,
+) {
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(NativeFn::with_ctx(name, f).with_escaping_args(escaping_args)),
     );
 }

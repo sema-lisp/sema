@@ -1508,7 +1508,10 @@ pub fn eval_value_vm(ctx: &EvalContext, expr: &Value, env: &Env) -> EvalResult {
 /// frames.  This is critical for WASM where the call stack is limited (~5 MB).
 pub fn call_value(ctx: &EvalContext, func: &Value, args: &[Value]) -> EvalResult {
     match func.view() {
-        ValueView::NativeFn(native) => (native.func)(ctx, args),
+        ValueView::NativeFn(native) => {
+            sema_vm::snapshot_native_escaping_args_for_current_vm(&native, args);
+            (native.func)(ctx, args)
+        }
         ValueView::Lambda(_) => {
             // Raw `Lambda` values never occur on the VM path (user lambdas are
             // NativeFn-wrapped VM closures).

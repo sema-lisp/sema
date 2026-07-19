@@ -2127,7 +2127,13 @@ fn is_callable(v: &Value) -> bool {
 /// closure in `sema-stdlib::async_ops`.
 pub fn call_function(func: &Value, args: &[Value]) -> Result<Value, SemaError> {
     if let Some(native) = func.as_native_fn_rc() {
-        sema_core::with_stdlib_ctx(|ctx| (native.func)(ctx, args))
+        sema_core::with_stdlib_ctx(|ctx| {
+            if native.escaping_args().is_empty() {
+                (native.func)(ctx, args)
+            } else {
+                sema_core::call_callback(ctx, func, args)
+            }
+        })
     } else {
         sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback(ctx, func, args))
     }

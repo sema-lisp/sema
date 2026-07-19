@@ -35,7 +35,7 @@ pub use vm::{
     call_closure_owned, compile_program, compile_program_with_spans,
     compile_program_with_spans_and_natives, current_vm_globals, extract_vm_closure,
     is_debug_session_active, program_as_callable, run_closure_foreign_sync, snap_breakpoint_line,
-    snapshot_escaping_closure, valid_breakpoint_lines, valid_breakpoint_lines_by_file,
-    with_active_debug, ActiveDebugGuard, Closure, CompiledProgram, DebugStopResume, UpvalueCell,
-    UpvalueState, VM,
+    snapshot_escaping_closure, snapshot_native_escaping_args_for_current_vm,
+    valid_breakpoint_lines, valid_breakpoint_lines_by_file, with_active_debug, ActiveDebugGuard,
+    Closure, CompiledProgram, DebugStopResume, UpvalueCell, UpvalueState, VM,
 };

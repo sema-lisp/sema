@@ -506,7 +506,8 @@ mod io_streams {
     use sema_core::{in_runtime_quantum, StreamBox};
 
     use crate::runtime_offload::{
-        checkout_external, finish_terminal_gate, prepare_terminal_gate, CheckoutOp,
+        checkout_external, finish_terminal_gate, prepare_terminal_gate, suspend_terminal_external,
+        CheckoutOp,
     };
 
     /// Completion-kind tag for file-stream `stream/*` external waits ("stf\0").
@@ -805,6 +806,77 @@ mod io_streams {
                 gate.take();
             }
         }
+    }
+
+    fn gate_belongs_to_current_runtime(gate: &ResourceGateHandle) -> bool {
+        sema_core::current_root().is_some_and(|root| root.runtime() == gate.id().runtime())
+    }
+
+    fn ensure_close_is_not_checked_out(stream: &Rc<StreamBox>) -> Result<(), SemaError> {
+        let inner = stream.borrow_inner();
+        let checked_out = match stream.stream_type() {
+            "file-input" => inner
+                .as_any()
+                .downcast_ref::<FileInputStream>()
+                .is_some_and(|stream| matches!(*stream.slot.borrow(), FileInSlot::CheckedOut)),
+            "file-output" => inner
+                .as_any()
+                .downcast_ref::<FileOutputStream>()
+                .is_some_and(|stream| matches!(*stream.slot.borrow(), FileOutSlot::CheckedOut)),
+            _ => false,
+        };
+        if checked_out {
+            Err(busy_err("stream/close"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn close_foreign_input(stream: &Rc<StreamBox>) -> NativeResult {
+        let tombstone = {
+            let inner = stream.borrow_inner();
+            let input = inner
+                .as_any()
+                .downcast_ref::<FileInputStream>()
+                .expect("caller already verified stream_type() == \"file-input\"");
+            let result = match &*input.slot.borrow() {
+                FileInSlot::Tombstone(message) => Some(message.clone()),
+                FileInSlot::Available(_) => None,
+                FileInSlot::CheckedOut => unreachable!("busy state checked before owner close"),
+            };
+            result
+        };
+        if let Some(message) = tombstone {
+            return Err(tombstone_err("stream/close", &message));
+        }
+        stream.close()?;
+        Ok(NativeOutcome::Return(Value::nil()))
+    }
+
+    fn close_foreign_output(stream: &Rc<StreamBox>) -> NativeResult {
+        let writer = take_output(stream, "stream/close")?;
+        let kind = CompletionKind::try_from_raw(STREAM_COMPLETION_KIND)
+            .expect("stream completion kind is nonzero");
+        let stream_for_finish = stream.clone();
+        let stream_for_tombstone = stream.clone();
+        suspend_terminal_external(
+            "stream/close",
+            kind,
+            writer,
+            |writer| {
+                writer
+                    .flush()
+                    .map_err(|error| render(format!("stream/close: I/O error: {error}")))
+            },
+            move |writer, result| {
+                reinstall_output(&stream_for_finish, writer);
+                result.map_err(SemaError::Io)?;
+                stream_for_finish.close()?;
+                Ok(Value::nil())
+            },
+            Rc::new(move |message| tombstone_output(&stream_for_tombstone, message)),
+            None,
+        )
     }
 
     /// Offload one blocking op against a file-INPUT stream's `BufReader` through
@@ -1238,6 +1310,9 @@ mod io_streams {
     pub(super) fn maybe_async_close(
         stream: &Rc<StreamBox>,
     ) -> Result<Option<NativeOutcome>, SemaError> {
+        if stream.stream_type() != "file-input" && stream.stream_type() != "file-output" {
+            return Ok(None);
+        }
         if !in_runtime_quantum() {
             let (gate, remove): (Option<ResourceGateHandle>, Rc<dyn Fn(ResourceGateId)>) =
                 match stream.stream_type() {
@@ -1264,8 +1339,31 @@ mod io_streams {
             stream.close()?;
             return finish_terminal_gate(gate, remove, Ok(Value::nil())).map(Some);
         }
-        if stream.stream_type() != "file-input" && stream.stream_type() != "file-output" {
-            return Ok(None);
+
+        let gate = match stream.stream_type() {
+            "file-input" => input_gate(stream),
+            "file-output" => output_gate(stream),
+            _ => unreachable!("file stream type checked above"),
+        };
+        if let Some(gate) = gate
+            .as_ref()
+            .filter(|gate| !gate_belongs_to_current_runtime(gate))
+        {
+            ensure_close_is_not_checked_out(stream)?;
+            prepare_terminal_gate(Some(gate), "stream/close")?;
+            match stream.stream_type() {
+                "file-input" => remove_input_gate(stream, gate.id()),
+                "file-output" => remove_output_gate(stream, gate.id()),
+                _ => unreachable!("file stream type checked above"),
+            }
+            if stream.is_closed() {
+                return Ok(Some(NativeOutcome::Return(Value::nil())));
+            }
+            return match stream.stream_type() {
+                "file-input" => close_foreign_input(stream).map(Some),
+                "file-output" => close_foreign_output(stream).map(Some),
+                _ => unreachable!("file stream type checked above"),
+            };
         }
         if stream.stream_type() == "file-input" {
             if stream.is_closed() {

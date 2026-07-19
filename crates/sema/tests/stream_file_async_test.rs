@@ -210,6 +210,60 @@ fn used_file_streams_dropped_without_close_release_their_runtime_gates() {
     );
 }
 
+#[test]
+fn file_input_close_from_foreign_runtime_closes_the_owner_gate() {
+    let input = TempFile::with_contents("foreign-close-input", "hello\n");
+    let owner = Interpreter::new();
+    let caller = Interpreter::new();
+    let stream = owner
+        .eval_str_via_runtime(&format!(
+            r#"(define foreign-input (stream/open-input "{}"))
+                (stream/read-line foreign-input)
+                foreign-input"#,
+            input.path()
+        ))
+        .expect("owner runtime creates and uses file-input stream");
+    caller.global_env.set_str("foreign-input", stream);
+    assert_eq!(owner.runtime_resource_gate_count(), 1);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+
+    let result = caller
+        .eval_str_via_runtime("(stream/close foreign-input)")
+        .expect("foreign runtime routes file-input close through the gate owner");
+    assert!(result.is_nil());
+    assert_eq!(owner.runtime_resource_gate_count(), 0);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+}
+
+#[test]
+fn buffered_file_output_close_from_foreign_runtime_flushes_and_closes_owner_gate() {
+    let output = TempFile::new("foreign-close-output");
+    let owner = Interpreter::new();
+    let caller = Interpreter::new();
+    let stream = owner
+        .eval_str_via_runtime(&format!(
+            r#"(define foreign-output (stream/open-output "{}"))
+                (stream/write-string foreign-output "buffered output")
+                foreign-output"#,
+            output.path()
+        ))
+        .expect("owner runtime creates and writes buffered file-output stream");
+    caller.global_env.set_str("foreign-output", stream);
+    assert_eq!(owner.runtime_resource_gate_count(), 1);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+
+    let result = caller
+        .eval_str_via_runtime("(stream/close foreign-output)")
+        .expect("foreign runtime offloads buffered output teardown without the owner gate");
+    assert!(result.is_nil());
+    assert_eq!(owner.runtime_resource_gate_count(), 0);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+    assert_eq!(
+        std::fs::read_to_string(&output.0).expect("read flushed foreign output"),
+        "buffered output"
+    );
+}
+
 /// `stream/open-output` + `stream/write-string` + `stream/flush` +
 /// `stream/close` inside `async/spawn` produces byte-identical file content
 /// to the synchronous path.

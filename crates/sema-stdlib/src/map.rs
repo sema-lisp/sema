@@ -197,6 +197,135 @@ fn map_traversal_call(
     }))
 }
 
+struct MapUpdateFrame {
+    container: Value,
+    key: Value,
+}
+
+impl MapUpdateFrame {
+    fn rebuild(self, value: Value) -> Value {
+        match self.container.view_ref() {
+            ValueViewRef::Map(map) => {
+                let mut map = map.clone();
+                map.insert(self.key, value);
+                Value::map(map)
+            }
+            ValueViewRef::HashMap(map) => {
+                let mut map = map.clone();
+                map.insert(self.key, value);
+                Value::hashmap_from_rc(Rc::new(map))
+            }
+            _ => {
+                let mut map = BTreeMap::new();
+                map.insert(self.key, value);
+                Value::map(map)
+            }
+        }
+    }
+
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) {
+        sink(GcEdge::Value(&self.container));
+        sink(GcEdge::Value(&self.key));
+    }
+}
+
+struct MapUpdateContinuation {
+    hof: &'static str,
+    frames: Vec<MapUpdateFrame>,
+}
+
+impl Trace for MapUpdateContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        for frame in &self.frames {
+            frame.trace(sink);
+        }
+        true
+    }
+}
+
+impl NativeContinuation for MapUpdateContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let mut value = map_resume_value(input, self.hof)?;
+        for frame in self.frames.drain(..).rev() {
+            value = frame.rebuild(value);
+        }
+        Ok(NativeOutcome::Return(value))
+    }
+}
+
+fn start_map_update(
+    callback: &Value,
+    current: Value,
+    frames: Vec<MapUpdateFrame>,
+    hof: &'static str,
+) -> NativeOutcome {
+    NativeOutcome::Call(NativeCall {
+        callable: callback.clone(),
+        args: vec![current],
+        continuation: Box::new(MapUpdateContinuation { hof, frames }),
+    })
+}
+
+fn map_update_call(source: &Value, key: &Value, callback: &Value) -> NativeResult {
+    check_map_key(key, "map/update")?;
+    let current = match source.view_ref() {
+        ValueViewRef::Map(map) => map.get(key).cloned().unwrap_or(Value::nil()),
+        ValueViewRef::HashMap(map) => map.get(key).cloned().unwrap_or(Value::nil()),
+        _ => {
+            return Err(SemaError::type_error("map or hashmap", source.type_name())
+                .with_hint("map/update: argument 1 must be a map; applies fn to the value at key"))
+        }
+    };
+    Ok(start_map_update(
+        callback,
+        current,
+        vec![MapUpdateFrame {
+            container: source.clone(),
+            key: key.clone(),
+        }],
+        "map/update",
+    ))
+}
+
+fn update_in_call(base: &Value, path: &[Value], callback: &Value) -> NativeResult {
+    for key in path {
+        check_map_key(key, "update-in")?;
+    }
+    if path.is_empty() {
+        return Ok(start_map_update(
+            callback,
+            base.clone(),
+            Vec::new(),
+            "update-in",
+        ));
+    }
+
+    let mut frames = Vec::with_capacity(path.len());
+    let mut current = base.clone();
+    for (index, key) in path.iter().enumerate() {
+        frames.push(MapUpdateFrame {
+            container: current.clone(),
+            key: key.clone(),
+        });
+        let default = if index + 1 == path.len() {
+            Value::nil()
+        } else {
+            Value::map(BTreeMap::new())
+        };
+        current = match current.view_ref() {
+            ValueViewRef::Map(map) => map.get(key).cloned().unwrap_or(default),
+            ValueViewRef::HashMap(map) => map.get(key).cloned().unwrap_or(default),
+            _ => default,
+        };
+    }
+
+    Ok(start_map_update(callback, current, frames, "update-in"))
+}
+
 /// Reject interior-mutable containers (mutable arrays/cells) as map keys:
 /// their contents can change after insertion, which would silently corrupt
 /// the map's lookup invariants (hash bucket / sort position). The check is
@@ -670,34 +799,42 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::map(map))
     });
 
-    register_fn(env, "map/update", |args| {
-        check_arity!(args, "map/update", 3);
-        check_map_key(&args[1], "map/update")?;
-        if let Some(rc) = args[0].as_map_rc() {
-            let mut map = match Rc::try_unwrap(rc) {
-                Ok(map) => map,
-                Err(m) => (*m).clone(),
-            };
-            let key = &args[1];
-            let current = map.get(key).cloned().unwrap_or(Value::nil());
-            let new_val = call_function(&args[2], &[current])?;
-            map.insert(key.clone(), new_val);
-            return Ok(Value::map(map));
-        }
-        if let Some(rc) = args[0].as_hashmap_rc() {
-            let mut map = match Rc::try_unwrap(rc) {
-                Ok(map) => map,
-                Err(m) => (*m).clone(),
-            };
-            let key = &args[1];
-            let current = map.get(key).cloned().unwrap_or(Value::nil());
-            let new_val = call_function(&args[2], &[current])?;
-            map.insert(key.clone(), new_val);
-            return Ok(Value::hashmap_from_rc(Rc::new(map)));
-        }
-        Err(SemaError::type_error("map or hashmap", args[0].type_name())
-            .with_hint("map/update: argument 1 must be a map; applies fn to the value at key"))
-    });
+    register_hof(
+        env,
+        "map/update",
+        |args| {
+            check_arity!(args, "map/update", 3);
+            check_map_key(&args[1], "map/update")?;
+            if let Some(rc) = args[0].as_map_rc() {
+                let mut map = match Rc::try_unwrap(rc) {
+                    Ok(map) => map,
+                    Err(m) => (*m).clone(),
+                };
+                let key = &args[1];
+                let current = map.get(key).cloned().unwrap_or(Value::nil());
+                let new_val = call_function(&args[2], &[current])?;
+                map.insert(key.clone(), new_val);
+                return Ok(Value::map(map));
+            }
+            if let Some(rc) = args[0].as_hashmap_rc() {
+                let mut map = match Rc::try_unwrap(rc) {
+                    Ok(map) => map,
+                    Err(m) => (*m).clone(),
+                };
+                let key = &args[1];
+                let current = map.get(key).cloned().unwrap_or(Value::nil());
+                let new_val = call_function(&args[2], &[current])?;
+                map.insert(key.clone(), new_val);
+                return Ok(Value::hashmap_from_rc(Rc::new(map)));
+            }
+            Err(SemaError::type_error("map or hashmap", args[0].type_name())
+                .with_hint("map/update: argument 1 must be a map; applies fn to the value at key"))
+        },
+        |args| {
+            check_arity!(args, "map/update", 3);
+            map_update_call(&args[0], &args[1], &args[2])
+        },
+    );
 
     register_fn(env, "hashmap/new", |args| {
         if args.len() % 2 != 0 {
@@ -967,75 +1104,95 @@ pub fn register(env: &sema_core::Env) {
         assoc_in_recursive(&args[0], &path, &args[2])
     });
 
-    register_fn(env, "update-in", |args| {
-        check_arity!(args, "update-in", 3);
-        let path = match args[1].view_ref() {
-            ValueViewRef::List(l) => l.to_vec(),
-            ValueViewRef::Vector(v) => v.to_vec(),
-            _ => {
-                return Err(SemaError::type_error("list or vector", args[1].type_name())
-                    .with_hint("update-in: argument 2 must be a list/vector path of keys"))
+    register_hof(
+        env,
+        "update-in",
+        |args| {
+            check_arity!(args, "update-in", 3);
+            let path = match args[1].view_ref() {
+                ValueViewRef::List(l) => l.to_vec(),
+                ValueViewRef::Vector(v) => v.to_vec(),
+                _ => {
+                    return Err(SemaError::type_error("list or vector", args[1].type_name())
+                        .with_hint("update-in: argument 2 must be a list/vector path of keys"))
+                }
+            };
+            if path.is_empty() {
+                return call_function(&args[2], &[args[0].clone()]);
             }
-        };
-        if path.is_empty() {
-            return call_function(&args[2], &[args[0].clone()]);
-        }
-        for key in &path {
-            check_map_key(key, "update-in")?;
-        }
-        fn update_in_recursive(m: &Value, path: &[Value], f: &Value) -> Result<Value, SemaError> {
-            let key = &path[0];
-            if path.len() == 1 {
-                let current = if let Some(map) = m.as_map_ref() {
-                    map.get(key).cloned().unwrap_or(Value::nil())
-                } else if let Some(map) = m.as_hashmap_ref() {
-                    map.get(key).cloned().unwrap_or(Value::nil())
-                } else {
-                    Value::nil()
-                };
-                let new_val = call_function(f, &[current])?;
-                if let Some(map) = m.as_map_ref() {
-                    let mut map = map.clone();
+            for key in &path {
+                check_map_key(key, "update-in")?;
+            }
+            fn update_in_recursive(
+                m: &Value,
+                path: &[Value],
+                f: &Value,
+            ) -> Result<Value, SemaError> {
+                let key = &path[0];
+                if path.len() == 1 {
+                    let current = if let Some(map) = m.as_map_ref() {
+                        map.get(key).cloned().unwrap_or(Value::nil())
+                    } else if let Some(map) = m.as_hashmap_ref() {
+                        map.get(key).cloned().unwrap_or(Value::nil())
+                    } else {
+                        Value::nil()
+                    };
+                    let new_val = call_function(f, &[current])?;
+                    if let Some(map) = m.as_map_ref() {
+                        let mut map = map.clone();
+                        map.insert(key.clone(), new_val);
+                        return Ok(Value::map(map));
+                    }
+                    if let Some(map) = m.as_hashmap_ref() {
+                        let mut map = map.clone();
+                        map.insert(key.clone(), new_val);
+                        return Ok(Value::hashmap_from_rc(Rc::new(map)));
+                    }
+                    let mut map = BTreeMap::new();
                     map.insert(key.clone(), new_val);
                     return Ok(Value::map(map));
                 }
-                if let Some(map) = m.as_hashmap_ref() {
+                let nested = if let Some(map) = m.as_map_ref() {
+                    map.get(key)
+                        .cloned()
+                        .unwrap_or_else(|| Value::map(BTreeMap::new()))
+                } else if let Some(map) = m.as_hashmap_ref() {
+                    map.get(key)
+                        .cloned()
+                        .unwrap_or_else(|| Value::map(BTreeMap::new()))
+                } else {
+                    Value::map(BTreeMap::new())
+                };
+                let new_nested = update_in_recursive(&nested, &path[1..], f)?;
+                if let Some(map) = m.as_map_ref() {
                     let mut map = map.clone();
-                    map.insert(key.clone(), new_val);
-                    return Ok(Value::hashmap_from_rc(Rc::new(map)));
+                    map.insert(key.clone(), new_nested);
+                    Ok(Value::map(map))
+                } else if let Some(map) = m.as_hashmap_ref() {
+                    let mut map = map.clone();
+                    map.insert(key.clone(), new_nested);
+                    Ok(Value::hashmap_from_rc(Rc::new(map)))
+                } else {
+                    let mut map = BTreeMap::new();
+                    map.insert(key.clone(), new_nested);
+                    Ok(Value::map(map))
                 }
-                let mut map = BTreeMap::new();
-                map.insert(key.clone(), new_val);
-                return Ok(Value::map(map));
             }
-            let nested = if let Some(map) = m.as_map_ref() {
-                map.get(key)
-                    .cloned()
-                    .unwrap_or_else(|| Value::map(BTreeMap::new()))
-            } else if let Some(map) = m.as_hashmap_ref() {
-                map.get(key)
-                    .cloned()
-                    .unwrap_or_else(|| Value::map(BTreeMap::new()))
-            } else {
-                Value::map(BTreeMap::new())
+            update_in_recursive(&args[0], &path, &args[2])
+        },
+        |args| {
+            check_arity!(args, "update-in", 3);
+            let path = match args[1].view_ref() {
+                ValueViewRef::List(path) => path.to_vec(),
+                ValueViewRef::Vector(path) => path.to_vec(),
+                _ => {
+                    return Err(SemaError::type_error("list or vector", args[1].type_name())
+                        .with_hint("update-in: argument 2 must be a list/vector path of keys"))
+                }
             };
-            let new_nested = update_in_recursive(&nested, &path[1..], f)?;
-            if let Some(map) = m.as_map_ref() {
-                let mut map = map.clone();
-                map.insert(key.clone(), new_nested);
-                Ok(Value::map(map))
-            } else if let Some(map) = m.as_hashmap_ref() {
-                let mut map = map.clone();
-                map.insert(key.clone(), new_nested);
-                Ok(Value::hashmap_from_rc(Rc::new(map)))
-            } else {
-                let mut map = BTreeMap::new();
-                map.insert(key.clone(), new_nested);
-                Ok(Value::map(map))
-            }
-        }
-        update_in_recursive(&args[0], &path, &args[2])
-    });
+            update_in_call(&args[0], &path, &args[2])
+        },
+    );
 
     register_fn(env, "deep-merge", |args| {
         if args.is_empty() {
@@ -1131,5 +1288,28 @@ mod continuation_trace_tests {
 
         // callback + current key/value + pending key/value + output key/value
         assert_eq!(edge_count, 7);
+    }
+
+    #[test]
+    fn map_update_continuation_traces_every_rebuild_frame() {
+        let continuation = MapUpdateContinuation {
+            hof: "update-in",
+            frames: vec![
+                MapUpdateFrame {
+                    container: Value::map(BTreeMap::new()),
+                    key: Value::keyword("outer"),
+                },
+                MapUpdateFrame {
+                    container: Value::hashmap(Vec::new()),
+                    key: Value::keyword("value"),
+                },
+            ],
+        };
+
+        let mut edge_count = 0;
+        assert!(continuation.trace(&mut |_| edge_count += 1));
+
+        // Each rebuild frame retains its container and insertion key.
+        assert_eq!(edge_count, 4);
     }
 }

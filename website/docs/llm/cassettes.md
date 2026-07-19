@@ -70,7 +70,7 @@ your tool code. That's usually what you want: deterministic model output, real t
 ### `llm/with-cassette` — record/replay for a block
 
 The usual way: wrap the calls you want recorded in a function. The tape is saved when the
-block finishes, and everything goes back to normal afterwards.
+block finishes, and the caller's prior cassette is restored.
 
 ```sema
 (llm/with-cassette "tapes/weather-agent.jsonl" {:mode :auto}
@@ -82,6 +82,10 @@ block finishes, and everything goes back to normal afterwards.
 The options map is optional and currently takes `:mode` (`:auto`, `:record`, or
 `:replay`, default `:auto`). The file — and any missing folders — is created when the tape
 is written.
+
+A task spawned inside the block captures its cassette scope. It can finish after the
+block returns or be awaited later; any recordings it produces are flushed when the last
+task using that captured scope finishes.
 
 ### Turning it on by hand
 
@@ -95,11 +99,14 @@ notebook — use the imperative trio:
 (llm/cassette-eject)   ; write the tape and turn it back off
 ```
 
-`llm/cassette-load` installs the cassette for everything that follows, until you eject it.
+`llm/cassette-load` affects subsequent calls in the current evaluation. Tasks spawned
+after the load inherit the cassette; tasks already spawned keep the scope they captured.
+Ejecting removes the cassette from the current scope but does not detach it from those
+existing tasks.
 
 ### Forcing replay across a whole run (CI)
 
-Two environment variables turn on a cassette for an entire process, so a whole suite — or
+Two environment variables initialize the cassette for a Sema run, so a whole suite — or
 a whole notebook — runs offline without changing any code:
 
 ```bash

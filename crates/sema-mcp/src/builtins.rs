@@ -1275,16 +1275,16 @@ fn call_tool(
     check_tool_allowed(&entry.meta.allowed_tools, tool_name)?;
     let key = cassette_key(&entry.meta.identity, tool_name, &arguments_json);
 
-    match sema_core::mcp_cassette_decide(&key) {
+    let cassette_recorder = match sema_core::mcp_cassette_decide(&key) {
         Some(sema_core::McpCassetteDecision::Replay(recorded)) => {
             return materialize(recorded)
                 .map(NativeOutcome::Return)
                 .map_err(|e| SemaError::eval(format!("mcp/call: {e}")));
         }
         Some(sema_core::McpCassetteDecision::Miss) => return Err(replay_miss_error()),
-        // Record mode or no cassette → perform the real call, then record it.
-        _ => {}
-    }
+        Some(sema_core::McpCassetteDecision::Record(recorder)) => Some(recorder),
+        None => None,
+    };
 
     // A runtime quantum routes the blocking JSON-RPC round trip through the
     // thread-pool executor as an external wait (the same
@@ -1296,7 +1296,7 @@ fn call_tool(
         let browser_allowed = browser_open_allowed();
         return mcp_call_runtime_outcome(
             entry,
-            key,
+            cassette_recorder,
             tool_name.to_string(),
             arguments_json,
             Box::new(materialize),
@@ -1315,7 +1315,9 @@ fn call_tool(
     ));
     checkin(&entry, conn);
     let raw = result.map_err(|e| SemaError::eval(format!("mcp/call: {e}")))?;
-    sema_core::mcp_cassette_record(&key, &raw);
+    if let Some(recorder) = cassette_recorder {
+        recorder.record(&raw);
+    }
     materialize(raw)
         .map(NativeOutcome::Return)
         .map_err(|e| SemaError::eval(format!("mcp/call: {e}")))
@@ -1403,15 +1405,16 @@ impl CancelHook for McpCallCancelHook {
 /// connection is lost) and surfaces as an evaluation error.
 struct McpCallDecoder {
     entry: Rc<ConnEntry>,
-    cassette_key: String,
+    cassette_recorder: Option<sema_core::McpCassetteRecorder>,
     materialize: Materialize,
     lifecycle: Rc<McpGateLifecycle>,
 }
 
 impl Trace for McpCallDecoder {
     fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
-        // `entry` (a checked-out slot) owns no connection and `materialize`
-        // captures no `Value` (see [`Materialize`]) — nothing to trace.
+        // `entry` owns no checked-out connection, the recorder retains only a
+        // host JSON tape, and `materialize` captures no `Value` (see
+        // [`Materialize`]) — nothing to trace.
         true
     }
 }
@@ -1424,7 +1427,7 @@ impl CompletionDecoder for McpCallDecoder {
     ) -> DecodedCompletion {
         let McpCallDecoder {
             entry,
-            cassette_key,
+            cassette_recorder,
             materialize,
             lifecycle,
         } = *self;
@@ -1449,7 +1452,9 @@ impl CompletionDecoder for McpCallDecoder {
             };
         checkin(&entry, conn);
         let raw = result.map_err(|e| SemaError::eval(format!("mcp/call: {e}")))?;
-        sema_core::mcp_cassette_record(&cassette_key, &raw);
+        if let Some(recorder) = cassette_recorder {
+            recorder.record(&raw);
+        }
         materialize(raw).map_err(|e| SemaError::eval(format!("mcp/call: {e}")))
     }
 }
@@ -1528,7 +1533,7 @@ impl Trace for McpGateLifecycle {
 }
 
 struct McpCallAction {
-    cassette_key: String,
+    cassette_recorder: Option<sema_core::McpCassetteRecorder>,
     tool_name: String,
     arguments_json: serde_json::Value,
     materialize: Materialize,
@@ -1538,6 +1543,8 @@ struct McpCallAction {
 
 impl Trace for McpCallAction {
     fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        // The recorder capability owns host cassette state only; `materialize`
+        // is constrained by [`Materialize`] to avoid Sema graph captures.
         true
     }
 }
@@ -1554,7 +1561,7 @@ impl McpGatedAction for McpCallAction {
         lifecycle: Rc<McpGateLifecycle>,
     ) -> PreparedExternalOperation {
         let McpCallAction {
-            cassette_key,
+            cassette_recorder,
             tool_name,
             arguments_json,
             materialize,
@@ -1565,7 +1572,7 @@ impl McpGatedAction for McpCallAction {
             .expect("mcp/call completion kind is nonzero");
         let decoder = Box::new(McpCallDecoder {
             entry: entry.clone(),
-            cassette_key,
+            cassette_recorder,
             materialize,
             lifecycle: Rc::clone(&lifecycle),
         });
@@ -1815,7 +1822,7 @@ impl NativeContinuation for McpFinalCont {
 /// executor polling is involved.
 fn mcp_call_runtime_outcome(
     entry: Rc<ConnEntry>,
-    cassette_key: String,
+    cassette_recorder: Option<sema_core::McpCassetteRecorder>,
     tool_name: String,
     arguments_json: serde_json::Value,
     materialize: Materialize,
@@ -1823,7 +1830,7 @@ fn mcp_call_runtime_outcome(
     browser_allowed: bool,
 ) -> NativeResult {
     let action = McpCallAction {
-        cassette_key,
+        cassette_recorder,
         tool_name,
         arguments_json,
         materialize,

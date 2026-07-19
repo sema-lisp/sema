@@ -19,8 +19,10 @@
 
 use sema_eval::Interpreter;
 use sema_llm::builtins::{
-    io_peak_inflight, register_test_provider, reset_io_inflight, reset_runtime_state,
+    install_cassette, io_peak_inflight, register_test_provider, reset_io_inflight,
+    reset_runtime_state, take_cassette,
 };
+use sema_llm::cassette::{Cassette, CassetteMode};
 use sema_llm::fake::FakeProvider;
 use serial_test::serial;
 
@@ -383,8 +385,10 @@ fn async_cache_hit_returns_zero_usage_without_yield() {
     );
 }
 
-/// Cassette replay in an async context returns the recorded content WITHOUT calling
-/// the provider (and without a real round-trip yield path that touches the network).
+/// Cassette replay follows the task spawned inside `llm/with-cassette` even when the
+/// task is awaited only after the dynamic extent has unwound. The provider errors if
+/// touched, so returning the taped response proves cassette selection belongs to the
+/// captured task scope rather than whichever cassette is ambient when the task runs.
 #[test]
 #[serial]
 fn async_cassette_replay_serves_recorded_without_provider() {
@@ -396,7 +400,8 @@ fn async_cassette_replay_serves_recorded_without_provider() {
     ));
     let _ = std::fs::remove_file(&path);
 
-    // Record one interaction synchronously.
+    // Record from a task that outlives the `with-cassette` body. The tape must be
+    // retained by that task and flushed when its final scope owner is dropped.
     let rec = FakeProvider::builder("fake")
         .model("m")
         .reply("taped")
@@ -407,11 +412,15 @@ fn async_cassette_replay_serves_recorded_without_provider() {
         register_test_provider(Box::new(rec));
         interp
             .eval_str_compiled(&format!(
-                r#"(llm/with-cassette "{}" {{:mode :record}}
-                     (fn () (llm/complete "the prompt" {{:model "m"}})))"#,
+                r#"(define pending
+                     (llm/with-cassette "{}" {{:mode :record}}
+                       (fn ()
+                         (async/spawn
+                           (fn () (llm/complete "the prompt" {{:model "m"}}))))))
+                   (async/await pending)"#,
                 path.display()
             ))
-            .expect("record run should succeed");
+            .expect("deferred record task should retain and flush its cassette scope");
     }
 
     // Replay concurrently: a fake that ERRORS if actually called. Getting "taped"
@@ -428,17 +437,345 @@ fn async_cassette_replay_serves_recorded_without_provider() {
     register_test_provider(Box::new(replay_fake));
     let val = interp
         .eval_str_compiled(&format!(
-            r#"(llm/with-cassette "{}" {{:mode :replay}}
-                 (fn ()
-                   (first (async/all
-                            (list (async/spawn
-                                    (fn () (llm/complete "the prompt" {{:model "m"}}))))))))"#,
+            r#"(define pending
+                 (llm/with-cassette "{}" {{:mode :replay}}
+                   (fn ()
+                     (async/spawn
+                       (fn () (llm/complete "the prompt" {{:model "m"}}))))))
+               (async/await pending)"#,
             path.display()
         ))
-        .expect("async replay run should succeed without touching the provider");
+        .expect("deferred replay task should retain its cassette scope");
     assert_eq!(val.as_str(), Some("taped"));
 
     let _ = std::fs::remove_file(&path);
+}
+
+/// Deferred embeddings retain the exact cassette selected at dispatch. Both the
+/// record and replay tasks are awaited only after `llm/with-cassette` restores the
+/// ambient scope; the replay provider has no embedding script, so any scope leak is
+/// a hard error.
+#[test]
+#[serial]
+fn async_embed_cassette_outlives_dynamic_scope() {
+    let _cap = sema_otel::testing::install();
+    reset_io_inflight();
+    let path = std::env::temp_dir().join(format!(
+        "sema-cassette-async-embed-{}-{}.jsonl",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(
+        FakeProvider::builder("fake")
+            .model("m")
+            .embed_delay(25)
+            .embed(vec![vec![0.1, 0.2, 0.3]])
+            .build(),
+    ));
+    let recorded = interp
+        .eval_str_compiled(&format!(
+            r#"(define pending
+                 (llm/with-cassette "{}" {{:mode :record}}
+                   (fn ()
+                     (async/spawn
+                       (fn () (llm/embed "deferred text" {{:model "m"}}))))))
+               (async/await pending)"#,
+            path.display()
+        ))
+        .expect("deferred embedding should record after its dynamic scope unwinds");
+    assert_eq!(recorded.type_name(), "bytevector");
+
+    reset_runtime_state();
+    register_test_provider(Box::new(FakeProvider::builder("fake").model("m").build()));
+    let replayed = interp
+        .eval_str_compiled(&format!(
+            r#"(define pending
+                 (llm/with-cassette "{}" {{:mode :replay}}
+                   (fn ()
+                     (async/spawn
+                       (fn () (llm/embed "deferred text" {{:model "m"}}))))))
+               (async/await pending)"#,
+            path.display()
+        ))
+        .expect("deferred embedding replay should not reach the provider");
+    assert_eq!(replayed.type_name(), "bytevector");
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// A streaming run keeps its dispatch-time cassette through every parked chunk
+/// wait and through finalization. The callback output proves recorded chunks are
+/// replayed after the dynamic cassette extent has already unwound.
+#[test]
+#[serial]
+fn async_stream_cassette_outlives_dynamic_scope() {
+    let _cap = sema_otel::testing::install();
+    reset_io_inflight();
+    let path = std::env::temp_dir().join(format!(
+        "sema-cassette-async-stream-{}-{}.jsonl",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(
+        FakeProvider::builder("fake")
+            .model("m")
+            .stream(&["deferred ", "stream"])
+            .stream_chunk_delay(25)
+            .build(),
+    ));
+    let recorded = interp
+        .eval_str_compiled(&format!(
+            r#"(define out "")
+               (define pending
+                 (llm/with-cassette "{}" {{:mode :record}}
+                   (fn ()
+                     (async/spawn
+                       (fn ()
+                         (llm/stream "deferred prompt"
+                           (fn (chunk) (set! out (string-append out chunk)))
+                           {{:model "m"}}))))))
+               (async/await pending)
+               out"#,
+            path.display()
+        ))
+        .expect("deferred stream should record after its dynamic scope unwinds");
+    assert_eq!(recorded.as_str(), Some("deferred stream"));
+
+    reset_runtime_state();
+    register_test_provider(Box::new(
+        FakeProvider::builder("fake")
+            .model("m")
+            .error(sema_llm::types::LlmError::Api {
+                status: 500,
+                message: "provider must not be called on stream replay".into(),
+            })
+            .build(),
+    ));
+    let replayed = interp
+        .eval_str_compiled(&format!(
+            r#"(set! out "")
+               (define pending
+                 (llm/with-cassette "{}" {{:mode :replay}}
+                   (fn ()
+                     (async/spawn
+                       (fn ()
+                         (llm/stream "deferred prompt"
+                           (fn (chunk) (set! out (string-append out chunk)))
+                           {{:model "m"}}))))))
+               (async/await pending)
+               out"#,
+            path.display()
+        ))
+        .expect("deferred stream replay should not reach the provider");
+    assert_eq!(replayed.as_str(), Some("deferred stream"));
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Ejecting the ambient cassette cannot detach it from tasks that already captured
+/// the scope. One sibling is cancelled before dispatch; the surviving task records
+/// after ejection, and reaping both tasks drops the final shared owner and flushes
+/// the surviving interaction.
+#[test]
+#[serial]
+fn cassette_eject_and_cancel_flush_on_last_task_owner() {
+    let _cap = sema_otel::testing::install();
+    reset_io_inflight();
+    let path = std::env::temp_dir().join(format!(
+        "sema-cassette-eject-cancel-{}-{}.jsonl",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(
+        FakeProvider::builder("fake").model("m").echo().build(),
+    ));
+    install_cassette(Cassette::load(path.clone(), CassetteMode::Record));
+    interp
+        .eval_str_compiled(
+            r#"(define kept
+                 (async/spawn
+                   (fn ()
+                     (async/sleep 25)
+                     (llm/complete "kept prompt" {:model "m"}))))
+               (define cancelled
+                 (async/spawn
+                   (fn ()
+                     (async/sleep 500)
+                     (llm/complete "cancelled prompt" {:model "m"}))))"#,
+        )
+        .expect("spawn two tasks under the installed cassette");
+
+    drop(take_cassette().expect("eject the ambient cassette snapshot"));
+    let kept = interp
+        .eval_str_compiled(
+            r#"(async/cancel cancelled)
+               (define kept-value (async/await kept))
+               (try (async/await cancelled) (catch error nil))
+               kept-value"#,
+        )
+        .expect("cancel one captured task and reap both");
+    assert_eq!(kept.as_str(), Some("kept prompt"));
+
+    reset_runtime_state();
+    register_test_provider(Box::new(
+        FakeProvider::builder("fake")
+            .model("m")
+            .error(sema_llm::types::LlmError::Api {
+                status: 500,
+                message: "provider must not be called after last-owner flush".into(),
+            })
+            .build(),
+    ));
+    install_cassette(Cassette::load(path.clone(), CassetteMode::Replay));
+    let replayed = interp
+        .eval_str_compiled(r#"(llm/complete "kept prompt" {:model "m"})"#)
+        .expect("last task owner should have flushed the surviving interaction");
+    assert_eq!(replayed.as_str(), Some("kept prompt"));
+    drop(take_cassette());
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Sibling tasks spawned under different cassette extents retain distinct tape
+/// identities after both extents unwind. A provider call is a hard failure, so the
+/// ordered pair also proves one sibling cannot read the other's ambient cassette.
+#[test]
+#[serial]
+fn async_cassette_scopes_are_isolated_between_siblings() {
+    let _cap = sema_otel::testing::install();
+    reset_io_inflight();
+    let base = format!("sema-cassette-siblings-{}", std::process::id());
+    let path_a = std::env::temp_dir().join(format!("{base}-a.jsonl"));
+    let path_b = std::env::temp_dir().join(format!("{base}-b.jsonl"));
+    let _ = std::fs::remove_file(&path_a);
+    let _ = std::fs::remove_file(&path_b);
+
+    let recorder = FakeProvider::builder("fake")
+        .model("m")
+        .reply("alpha")
+        .reply("beta")
+        .build();
+    {
+        let interp = Interpreter::new();
+        reset_runtime_state();
+        register_test_provider(Box::new(recorder));
+        interp
+            .eval_str_compiled(&format!(
+                r#"(llm/with-cassette "{}" {{:mode :record}}
+                     (fn () (llm/complete "prompt-a" {{:model "m"}})))
+                   (llm/with-cassette "{}" {{:mode :record}}
+                     (fn () (llm/complete "prompt-b" {{:model "m"}})))"#,
+                path_a.display(),
+                path_b.display()
+            ))
+            .expect("record sibling cassette fixtures");
+    }
+
+    let fail_if_called = FakeProvider::builder("fake")
+        .model("m")
+        .error(sema_llm::types::LlmError::Api {
+            status: 500,
+            message: "provider must not be called on sibling replay".into(),
+        })
+        .build();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fail_if_called));
+    let value = interp
+        .eval_str_compiled(&format!(
+            r#"(define a
+                 (llm/with-cassette "{}" {{:mode :replay}}
+                   (fn () (async/spawn
+                            (fn () (llm/complete "prompt-a" {{:model "m"}}))))))
+               (define b
+                 (llm/with-cassette "{}" {{:mode :replay}}
+                   (fn () (async/spawn
+                            (fn () (llm/complete "prompt-b" {{:model "m"}}))))))
+               (async/all (list a b))"#,
+            path_a.display(),
+            path_b.display()
+        ))
+        .expect("sibling replay tasks should retain distinct cassette scopes");
+    let values = value.as_list().expect("two replay results");
+    assert_eq!(values[0].as_str(), Some("alpha"));
+    assert_eq!(values[1].as_str(), Some("beta"));
+
+    let _ = std::fs::remove_file(path_a);
+    let _ = std::fs::remove_file(path_b);
+}
+
+/// Two deferred recording scopes can target the same tape without last-writer-wins
+/// data loss. Each scope loads before either task completes, so only append-only
+/// persistence can retain both interactions.
+#[test]
+#[serial]
+fn async_cassette_siblings_append_to_one_tape() {
+    let _cap = sema_otel::testing::install();
+    reset_io_inflight();
+    let path = std::env::temp_dir().join(format!(
+        "sema-cassette-shared-{}-{}.jsonl",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(
+        FakeProvider::builder("fake").model("m").echo().build(),
+    ));
+    interp
+        .eval_str_compiled(&format!(
+            r#"(define a
+                 (llm/with-cassette "{}" {{:mode :record}}
+                   (fn () (async/spawn
+                            (fn () (llm/complete "prompt-a" {{:model "m"}}))))))
+               (define b
+                 (llm/with-cassette "{}" {{:mode :record}}
+                   (fn () (async/spawn
+                            (fn () (llm/complete "prompt-b" {{:model "m"}}))))))
+               (async/all (list a b))"#,
+            path.display(),
+            path.display()
+        ))
+        .expect("both sibling recorders should finish");
+
+    reset_runtime_state();
+    register_test_provider(Box::new(
+        FakeProvider::builder("fake")
+            .model("m")
+            .error(sema_llm::types::LlmError::Api {
+                status: 500,
+                message: "provider must not be called on shared-tape replay".into(),
+            })
+            .build(),
+    ));
+    let replayed = interp
+        .eval_str_compiled(&format!(
+            r#"(llm/with-cassette "{}" {{:mode :replay}}
+                 (fn ()
+                   (list (llm/complete "prompt-a" {{:model "m"}})
+                         (llm/complete "prompt-b" {{:model "m"}}))))"#,
+            path.display()
+        ))
+        .expect("one tape should retain both sibling recordings");
+    let values = replayed.as_list().expect("two replayed values");
+    assert_eq!(values[0].as_str(), Some("prompt-a"));
+    assert_eq!(values[1].as_str(), Some("prompt-b"));
+
+    let _ = std::fs::remove_file(path);
 }
 
 /// `llm/extract` (single-attempt, validation off) is offloaded and overlaps when

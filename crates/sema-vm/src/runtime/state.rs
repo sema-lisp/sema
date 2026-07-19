@@ -228,7 +228,7 @@ struct ScopeSeam {
 /// entry's three seams reach a type-erased `sema-llm` / `sema-otel` thread-local; the
 /// registrations are installed at interpreter startup and no-op (empty box) until then.
 const TASK_SCOPE_SEAMS: [ScopeSeam; 3] = [
-    // LLM dynamic scope (`llm/with-cache` / `with-budget` flags + shared budget `Rc`).
+    // LLM dynamic scope (cache/call snapshots + shared budget/cassette state).
     ScopeSeam {
         capture: sema_core::current_llm_scope_boxed,
         take: sema_core::take_task_llm_scope,
@@ -289,7 +289,7 @@ impl TaskScopes {
 /// order across them is immaterial; each is self-contained.
 ///
 /// EMPTY-SCOPE FAST PATH: for a program that never touches a given seam's feature
-/// (no LLM cache/budget, no OTel span, no leaf-usage attribution), every spawned
+/// (no LLM cache/budget/cassette, no OTel span, no leaf-usage attribution), every spawned
 /// task's captured scope for that seam is a "default" value — and the swap would
 /// box/unbox that default on every single quantum for nothing (malloc/free churn
 /// visible in profiles even when the feature is unused). `install` skips the

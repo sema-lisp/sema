@@ -60,8 +60,8 @@ pub use io_backend::{
 pub use json::{json_to_value, key_to_string, value_to_json, value_to_json_lossy};
 pub use lasso::Spur;
 pub use mcp_cassette::{
-    clear_mcp_cassette_hook, mcp_cassette_decide, mcp_cassette_record, set_mcp_cassette_hook,
-    McpCassetteDecision,
+    clear_mcp_cassette_hook, mcp_cassette_decide, set_mcp_cassette_hook, McpCassetteDecision,
+    McpCassetteRecordTarget, McpCassetteRecorder,
 };
 pub use mutable_ops::{mutable_array_get, mutable_array_set};
 pub use output_hook::{

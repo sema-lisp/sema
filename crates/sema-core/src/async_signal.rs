@@ -389,8 +389,8 @@ pub fn install_task_usage_scope(ctx: Box<dyn Any>) -> Box<dyn Any> {
 // fn-pointer callbacks (mirroring the usage-scope seam). No-ops returning an empty
 // box when unregistered.
 
-/// Capture the current thread's LLM dynamic scope (cloning read-only values and the
-/// budget `Rc`) to seed onto a freshly-spawned task. `Box::new(())` when unregistered.
+/// Capture the current thread's LLM dynamic scope (cloning read-only values and shared
+/// budget/cassette state) to seed a spawned task. `Box::new(())` when unregistered.
 pub type LlmScopeCaptureFn = fn() -> Box<dyn Any>;
 /// Take (mem::take) the current thread's LLM dynamic scope, leaving defaults.
 pub type LlmScopeTakeFn = fn() -> Box<dyn Any>;
@@ -398,7 +398,7 @@ pub type LlmScopeTakeFn = fn() -> Box<dyn Any>;
 pub type LlmScopeInstallFn = fn(Box<dyn Any>) -> Box<dyn Any>;
 
 /// Check whether a captured LLM dynamic scope carries no overrides (cache off,
-/// no tags/metadata, no active budget) — fast-path predicate for the runtime's
+/// no tags/metadata, no active budget/cassette) — fast-path predicate for the runtime's
 /// `TaskScopeSwap`. `true` when unregistered (nothing to isolate).
 pub type LlmScopeIsEmptyFn = fn(&Box<dyn Any>) -> bool;
 /// Peek (no mutation, no allocation) whether the CURRENT thread's LLM dynamic
@@ -435,7 +435,7 @@ pub fn set_llm_scope_empty_callbacks(
     LLM_SCOPE_AMBIENT_EMPTY_CALLBACK.with(|cb| cb.set(Some(ambient_empty)));
 }
 
-/// Whether a captured LLM dynamic scope is empty (no cache/budget/tags
+/// Whether a captured LLM dynamic scope is empty (no cache/budget/cassette/tags
 /// overrides). `true` when no callback is registered.
 pub fn llm_scope_captured_is_empty(ctx: &Box<dyn Any>) -> bool {
     match LLM_SCOPE_IS_EMPTY_CALLBACK.with(|cb| cb.get()) {

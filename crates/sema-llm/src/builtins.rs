@@ -251,16 +251,59 @@ pub fn register_usage_scope_task_callbacks() {
     );
 }
 
-// ── Per-task LLM dynamic scope (cache / budget / tags) — ASYNC-1 ─────
+// ── Per-task LLM dynamic scope (cache / budget / cassette / tags) ────
 //
-// `llm/with-cache`, `llm/with-budget`, and per-call `:tags`/`:metadata` set
-// dynamically-scoped thread-locals for the extent of a thunk, then reset them. A task
-// spawned inside that thunk reads them WHEN IT RUNS — which the cooperative scheduler
-// can defer past the reset. The scheduler captures this scope at `async/spawn` and
-// swaps it in/out at each task step (like the otel context and leaf-usage scope), so
-// concurrent siblings stay isolated. Read-only flags ride as a value snapshot; the
-// budget frame rides as a shared `Rc` so all siblings in one `with-budget` charge one
-// aggregate. Reached from `sema-core` through the type-erased fn-pointer seam.
+// Dynamic LLM builtins install thread-local state for the extent of a thunk. A spawned
+// task may run after that extent has unwound, so the scheduler captures the scope at
+// `async/spawn` and swaps it around every task step. Read-only flags ride as value
+// snapshots; budget and cassette state use shared `Rc`s so siblings in one scope charge
+// one aggregate or record into one tape. Reached from `sema-core` through the
+// type-erased fn-pointer seam.
+
+struct CassetteState {
+    cassette: RefCell<Option<crate::cassette::Cassette>>,
+}
+
+impl CassetteState {
+    fn new(cassette: crate::cassette::Cassette) -> Self {
+        Self {
+            cassette: RefCell::new(Some(cassette)),
+        }
+    }
+
+    fn borrow(&self) -> std::cell::Ref<'_, crate::cassette::Cassette> {
+        std::cell::Ref::map(self.cassette.borrow(), |cassette| {
+            cassette
+                .as_ref()
+                .expect("live cassette scope always owns its tape")
+        })
+    }
+
+    fn borrow_mut(&self) -> std::cell::RefMut<'_, crate::cassette::Cassette> {
+        std::cell::RefMut::map(self.cassette.borrow_mut(), |cassette| {
+            cassette
+                .as_mut()
+                .expect("live cassette scope always owns its tape")
+        })
+    }
+}
+
+impl Drop for CassetteState {
+    fn drop(&mut self) {
+        if let Some(cassette) = self.cassette.get_mut().as_mut() {
+            let _ = cassette.save();
+        }
+    }
+}
+
+impl sema_core::McpCassetteRecordTarget for CassetteState {
+    fn record(&self, key: &str, value: &serde_json::Value) {
+        self.borrow_mut()
+            .record_entry(crate::cassette::TapeEntry::from_mcp_call(key, value));
+    }
+}
+
+type CassetteScope = Rc<CassetteState>;
 
 /// The dynamically-scoped LLM state captured onto a task and swapped in/out per step.
 struct LlmDynScope {
@@ -271,6 +314,9 @@ struct LlmDynScope {
     call_meta: Vec<(String, String)>,
     /// The active budget frame, shared by `Rc` so concurrent siblings charge one aggregate.
     budget: Option<Rc<RefCell<BudgetFrame>>>,
+    /// The cassette selected by this scope. Spawned siblings share one tape so
+    /// replay and recording remain coherent across quantum boundaries.
+    cassette: Option<CassetteScope>,
 }
 
 impl Default for LlmDynScope {
@@ -282,6 +328,7 @@ impl Default for LlmDynScope {
             call_tags: Vec::new(),
             call_meta: Vec::new(),
             budget: None,
+            cassette: None,
         }
     }
 }
@@ -295,6 +342,7 @@ fn read_llm_scope() -> LlmDynScope {
         call_tags: CALL_TAGS.with(|t| t.borrow().clone()),
         call_meta: CALL_META.with(|m| m.borrow().clone()),
         budget: ACTIVE_BUDGET.with(|b| b.borrow().clone()),
+        cassette: CASSETTE.with(|c| c.borrow().clone()),
     }
 }
 
@@ -307,6 +355,7 @@ fn write_llm_scope(s: LlmDynScope) -> LlmDynScope {
     CALL_TAGS.with(|t| *t.borrow_mut() = s.call_tags);
     CALL_META.with(|m| *m.borrow_mut() = s.call_meta);
     ACTIVE_BUDGET.with(|b| *b.borrow_mut() = s.budget);
+    CASSETTE.with(|c| *c.borrow_mut() = s.cassette);
     prev
 }
 
@@ -330,7 +379,7 @@ fn install_llm_scope(ctx: Box<dyn std::any::Any>) -> Box<dyn std::any::Any> {
 }
 
 /// Fast-path predicate (`TaskScopeSwap`, sema-vm `state.rs`): a captured LLM
-/// dynamic scope is empty when it carries no cache/budget/tag overrides — i.e.
+/// dynamic scope is empty when it carries no cache/budget/cassette/tag overrides — i.e.
 /// it is bytewise the same as [`LlmDynScope::default`]. No allocation (field
 /// reads only, no clone).
 fn llm_scope_captured_is_empty(ctx: &Box<dyn std::any::Any>) -> bool {
@@ -341,12 +390,13 @@ fn llm_scope_captured_is_empty(ctx: &Box<dyn std::any::Any>) -> bool {
 }
 
 /// Peek (no mutation, no allocation) whether the thread-local LLM dynamic scope
-/// is currently at its default (no cache/budget/tag overrides active).
+/// is currently at its default (no cache/budget/cassette/tag overrides active).
 fn llm_scope_ambient_is_empty() -> bool {
     !CACHE_ENABLED.with(Cell::get)
         && !ACTIVE_BUDGET.with(|b| b.borrow().is_some())
         && CALL_TAGS.with(|t| t.borrow().is_empty())
         && CALL_META.with(|m| m.borrow().is_empty())
+        && CASSETTE.with(|c| c.borrow().is_none())
 }
 
 /// Shared field-by-field default check for [`LlmDynScope`] (avoids requiring
@@ -356,7 +406,11 @@ fn llm_scope_ambient_is_empty() -> bool {
 /// (correctness-safe: it means the fast path is skipped slightly less often,
 /// never more).
 fn llm_dyn_scope_is_default(s: &LlmDynScope) -> bool {
-    !s.cache_enabled && s.budget.is_none() && s.call_tags.is_empty() && s.call_meta.is_empty()
+    !s.cache_enabled
+        && s.budget.is_none()
+        && s.cassette.is_none()
+        && s.call_tags.is_empty()
+        && s.call_meta.is_empty()
 }
 
 /// Register the per-task LLM dynamic-scope callbacks with sema-core. Called once at startup.
@@ -406,9 +460,9 @@ thread_local! {
     static CACHE_TTL_SECS: Cell<i64> = const { Cell::new(3600) };
     static CACHE_HITS: Cell<u64> = const { Cell::new(0) };
     static CACHE_MISSES: Cell<u64> = const { Cell::new(0) };
-    // Active LLM cassette (record/replay). Sits below the otel span + response
-    // cache, above the real provider — see crate::cassette.
-    static CASSETTE: RefCell<Option<crate::cassette::Cassette>> = const { RefCell::new(None) };
+    // Active LLM cassette (record/replay). The shared scope is captured onto
+    // spawned tasks with the rest of `LlmDynScope`.
+    static CASSETTE: RefCell<Option<CassetteScope>> = const { RefCell::new(None) };
     static FALLBACK_CHAIN: RefCell<Option<Vec<FallbackEntry>>> = const { RefCell::new(None) };
     static VECTOR_STORES: RefCell<std::collections::HashMap<String, VectorStore>> =
         RefCell::new(std::collections::HashMap::new());
@@ -419,6 +473,36 @@ thread_local! {
     // the same model id at a different rate). Set at the dispatch choke points, consumed +
     // cleared by `track_usage`. `None` → canonical first-party price.
     static LAST_SERVING_PROVIDER: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+fn current_cassette_scope() -> Option<CassetteScope> {
+    CASSETTE.with(|c| c.borrow().clone())
+}
+
+fn install_cassette_scope(scope: Option<CassetteScope>) -> Option<CassetteScope> {
+    CASSETTE.with(|c| std::mem::replace(&mut *c.borrow_mut(), scope))
+}
+
+fn cassette_scope(cassette: crate::cassette::Cassette) -> CassetteScope {
+    Rc::new(CassetteState::new(cassette))
+}
+
+fn cassette_decide(key: &str) -> Option<crate::cassette::Decision> {
+    let scope = current_cassette_scope()?;
+    let decision = scope.borrow().decide(key);
+    Some(decision)
+}
+
+fn cassette_record(entry: crate::cassette::TapeEntry) {
+    if let Some(scope) = current_cassette_scope() {
+        scope.borrow_mut().record_entry(entry);
+    }
+}
+
+fn cassette_scope_record(scope: &Option<CassetteScope>, entry: crate::cassette::TapeEntry) {
+    if let Some(scope) = scope {
+        scope.borrow_mut().record_entry(entry);
+    }
 }
 
 // ── I/O-overlap instrumentation ─────────────────────────────────
@@ -505,8 +589,8 @@ pub fn reset_runtime_state() {
     // Idempotently register the per-task usage-scope seam (fn-pointer thread-locals)
     // so the scheduler can swap the active leaf scope in/out per task step.
     register_usage_scope_task_callbacks();
-    // Idempotently register the per-task LLM dynamic-scope seam (cache/budget/tags) so
-    // the scheduler can swap it in/out per task step (ASYNC-1).
+    // Register the per-task LLM dynamic-scope seam so the scheduler can swap
+    // cache, budget, cassette, and call metadata in/out per task step.
     register_llm_scope_task_callbacks();
     SESSION_COST.with(|c| *c.borrow_mut() = 0.0);
     ACTIVE_BUDGET.with(|b| *b.borrow_mut() = None);
@@ -523,7 +607,7 @@ pub fn reset_runtime_state() {
     VECTOR_STORES.with(|s| s.borrow_mut().clear());
     RATE_LIMIT_RPS.with(|r| r.set(None));
     RATE_LIMIT_LAST.with(|r| r.set(0));
-    CASSETTE.with(|c| *c.borrow_mut() = None);
+    install_cassette_scope(None);
     LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = None);
     RETRY_BASE_MS.with(|c| c.set(500));
     NETWORK_MAX_RETRIES.with(|c| c.set(3));
@@ -533,46 +617,47 @@ pub fn reset_runtime_state() {
 }
 
 // ── MCP-call cassette bridge ─────────────────────────────────
-// The LLM cassette (thread-local `CASSETTE`) also serves MCP `tools/call`
-// interactions so agent-over-MCP flows replay deterministically. These fns are
-// registered into `sema-core` (fn pointers) so `sema-mcp` can consult the tape
-// without depending on `sema-llm`.
+// The task-scoped LLM cassette also serves MCP `tools/call` interactions. The
+// hook returns a recorder capability that retains the selected tape across an
+// asynchronous call, without introducing a sema-mcp → sema-llm dependency.
 
-fn mcp_cassette_decide(key: &str) -> sema_core::McpCassetteDecision {
+fn mcp_cassette_decide(key: &str) -> Option<sema_core::McpCassetteDecision> {
     use crate::cassette::Decision;
-    CASSETTE.with(|c| match c.borrow().as_ref() {
-        // No active cassette → behave as passthrough (real call, no recording).
-        None => sema_core::McpCassetteDecision::Record,
-        Some(cass) => match cass.decide(key) {
-            Decision::Replay(entry) => match entry.mcp_result {
-                Some(value) => sema_core::McpCassetteDecision::Replay(value),
-                // Present under this key but not an mcp-call entry — treat as drift.
-                None => sema_core::McpCassetteDecision::Miss,
-            },
-            Decision::Miss(_) => sema_core::McpCassetteDecision::Miss,
-            Decision::Record => sema_core::McpCassetteDecision::Record,
+    let scope = current_cassette_scope()?;
+    let decision = scope.borrow().decide(key);
+    Some(match decision {
+        Decision::Replay(entry) => match entry.mcp_result {
+            Some(value) => sema_core::McpCassetteDecision::Replay(value),
+            // Present under this key but not an mcp-call entry — treat as drift.
+            None => sema_core::McpCassetteDecision::Miss,
         },
+        Decision::Miss(_) => sema_core::McpCassetteDecision::Miss,
+        Decision::Record => sema_core::McpCassetteDecision::Record(
+            sema_core::McpCassetteRecorder::new(scope, key.to_string()),
+        ),
     })
 }
 
-fn mcp_cassette_record(key: &str, value: &serde_json::Value) {
-    CASSETTE.with(|c| {
-        if let Some(cass) = c.borrow_mut().as_mut() {
-            cass.record_entry(crate::cassette::TapeEntry::from_mcp_call(key, value));
-        }
-    });
-}
-
-/// Install a cassette on the current thread (programmatic/test entry point;
-/// the env path `SEMA_LLM_CASSETTE` uses the same thread-local).
+/// Install a cassette in the current ambient LLM scope. Tasks spawned afterward
+/// inherit it; the `SEMA_LLM_CASSETTE` path uses the same baseline.
 pub fn install_cassette(cassette: crate::cassette::Cassette) {
-    CASSETTE.with(|c| *c.borrow_mut() = Some(cassette));
+    install_cassette_scope(Some(cassette_scope(cassette)));
 }
 
-/// Remove and return the active cassette (e.g. to flush it to disk after
-/// recording).
+/// Remove the cassette from the current ambient scope and return an owned
+/// snapshot. Already-spawned tasks retain their shared scope and flush any later
+/// recordings when its final owner is dropped.
 pub fn take_cassette() -> Option<crate::cassette::Cassette> {
-    CASSETTE.with(|c| c.borrow_mut().take())
+    let scope = install_cassette_scope(None)?;
+    match Rc::try_unwrap(scope) {
+        Ok(mut state) => state.cassette.get_mut().take(),
+        Err(scope) => {
+            let mut active = scope.borrow_mut();
+            let _ = active.save();
+            let cassette = active.clone();
+            Some(cassette)
+        }
+    }
 }
 
 /// Test-only: register `provider` as the default LLM provider, bypassing
@@ -1716,9 +1801,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // a plain `fn` (captures nothing; invariant I2). Idempotent.
     sema_core::set_gc_observer(Some(gc_otel_observer));
 
-    // Bridge the LLM cassette to MCP tool calls (sema-mcp consults this via
-    // sema-core). Idempotent — just sets two thread-local fn pointers.
-    sema_core::set_mcp_cassette_hook(mcp_cassette_decide, mcp_cassette_record);
+    // Bridge the task-scoped LLM cassette to MCP tool calls through sema-core.
+    // Idempotent: interpreter setup replaces one thread-local function pointer.
+    sema_core::set_mcp_cassette_hook(mcp_cassette_decide);
 
     // Reclaim non-blocking agent-run slab entries owned by a CANCELLED task
     // (whose `__agent-finish` can never run) the moment the scheduler reaps it —
@@ -1728,10 +1813,11 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // a plain `fn`, captures nothing.
     sema_core::set_task_reaped_callback(reap_cancelled_agent_runs);
 
-    // CI/global cassette: SEMA_LLM_CASSETTE=path [+ SEMA_LLM_CASSETTE_MODE=replay|
-    // record|auto] installs a cassette for the whole process, so a suite can be
-    // forced into deterministic replay without touching test source. Only honored
-    // outside the sandbox (it reads/writes a file path from the environment).
+    // CI cassette baseline: SEMA_LLM_CASSETTE=path
+    // [+ SEMA_LLM_CASSETTE_MODE=replay|record|auto] installs a cassette in the
+    // current ambient LLM scope, so tasks spawned afterward inherit deterministic
+    // replay without touching test source. Only honored outside the sandbox (it
+    // reads/writes a file path from the environment).
     if unrestricted {
         if let Ok(path) = std::env::var("SEMA_LLM_CASSETTE") {
             if !path.is_empty() {
@@ -1740,7 +1826,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     .unwrap_or(crate::cassette::CassetteMode::Auto);
                 let cassette =
                     crate::cassette::Cassette::load(std::path::PathBuf::from(path), mode);
-                CASSETTE.with(|c| *c.borrow_mut() = Some(cassette));
+                install_cassette(cassette);
             }
         }
     }
@@ -3808,8 +3894,10 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             span.set_embedding_input(&request.texts);
 
             // Cassette decision — SYNCHRONOUSLY, pre-spawn, on the VM thread.
-            let decision =
-                CASSETTE.with(|c| c.borrow().as_ref().map(|cass| cass.decide(&cassette_key)));
+            let cassette_scope = current_cassette_scope();
+            let decision = cassette_scope
+                .as_ref()
+                .map(|scope| scope.borrow().decide(&cassette_key));
             match decision {
                 Some(crate::cassette::Decision::Replay(entry)) => {
                     // Replay made no provider call: finalize the span inline,
@@ -3879,6 +3967,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     req_model: req_model.clone(),
                     recording,
                     key: cassette_key.clone(),
+                    cassette_scope,
                     single,
                     usage_accum_slot: usage_accum_slot.clone(),
                     budget_slot: budget_slot.clone(),
@@ -3928,8 +4017,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         // Advertise the input texts (content-gated; OpenInference embedding.* keys).
         span.set_embedding_input(&request.texts);
         // Cassette interception (mirrors run_completion, for the embeddings seam).
-        let decision =
-            CASSETTE.with(|c| c.borrow().as_ref().map(|cass| cass.decide(&cassette_key)));
+        let decision = cassette_decide(&cassette_key);
         let response = match decision {
             Some(crate::cassette::Decision::Replay(entry)) => {
                 let resp = EmbedResponse {
@@ -3972,16 +4060,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     Ok(resp)
                 })?;
                 if recording {
-                    CASSETTE.with(|c| {
-                        if let Some(cass) = c.borrow_mut().as_mut() {
-                            cass.record_entry(crate::cassette::TapeEntry::from_embed(
-                                &cassette_key,
-                                &resp.model,
-                                &resp.embeddings,
-                                resp.usage.prompt_tokens,
-                            ));
-                        }
-                    });
+                    cassette_record(crate::cassette::TapeEntry::from_embed(
+                        &cassette_key,
+                        &resp.model,
+                        &resp.embeddings,
+                        resp.usage.prompt_tokens,
+                    ));
                 }
                 resp
             }
@@ -5532,25 +5616,24 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         let cassette = crate::cassette::Cassette::load(std::path::PathBuf::from(path), mode);
         // Swap in the cassette and disable the response cache for the dynamic extent
         // (a cache hit would short-circuit before the tape — see crate::cassette).
-        let prev_cassette = CASSETTE.with(|c| c.borrow_mut().replace(cassette));
+        let active_cassette = cassette_scope(cassette);
+        let prev_cassette = install_cassette_scope(Some(Rc::clone(&active_cassette)));
         let prev_cache = CACHE_ENABLED.with(|c| c.replace(false));
         Ok((
             body_fn.clone(),
             Box::new(move || {
                 // Flush the tape, then restore the prior cassette + cache state.
-                CASSETTE.with(|c| {
-                    if let Some(cass) = c.borrow().as_ref() {
-                        let _ = cass.save();
-                    }
-                });
-                CASSETTE.with(|c| *c.borrow_mut() = prev_cassette);
+                let _ = active_cassette.borrow_mut().save();
+                install_cassette_scope(prev_cassette);
                 CACHE_ENABLED.with(|c| c.set(prev_cache));
             }),
         ))
     });
 
     register_fn(env, "llm/cassette-load", |args| {
-        // (llm/cassette-load "path" [{:mode :replay}]) — install globally.
+        // (llm/cassette-load "path" [{:mode :replay}]) — install in the current
+        // ambient scope. Tasks spawned afterward inherit this cassette; tasks that
+        // already exist retain the scope they captured at spawn time.
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/cassette-load", "1 or 2", args.len()));
         }
@@ -5568,12 +5651,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             crate::cassette::CassetteMode::Auto
         };
         let cassette = crate::cassette::Cassette::load(std::path::PathBuf::from(path), mode);
-        CASSETTE.with(|c| *c.borrow_mut() = Some(cassette));
+        install_cassette(cassette);
         Ok(Value::nil())
     });
 
     register_fn(env, "llm/cassette-save", |_args| {
-        let saved = CASSETTE.with(|c| c.borrow().as_ref().map(|cass| cass.save()));
+        let saved = current_cassette_scope().map(|scope| scope.borrow_mut().save());
         match saved {
             Some(Ok(())) => Ok(Value::bool(true)),
             Some(Err(e)) => Err(SemaError::eval(format!("cassette save failed: {e}"))),
@@ -5582,8 +5665,8 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     register_fn(env, "llm/cassette-eject", |_args| {
-        let cass = CASSETTE.with(|c| c.borrow_mut().take());
-        if let Some(cass) = cass {
+        let cass = take_cassette();
+        if let Some(mut cass) = cass {
             let _ = cass.save();
             Ok(Value::bool(true))
         } else {
@@ -6800,6 +6883,7 @@ struct CompleteOffloadPlan {
     span: sema_otel::LlmSpan,
     cache_key: Option<String>,
     cassette_record_key: Option<String>,
+    cassette_scope: Option<CassetteScope>,
     request_for_messages: ChatRequest,
 }
 
@@ -6919,11 +7003,10 @@ fn complete_offload_prep(request: ChatRequest) -> Result<CompletePrep, SemaError
     // ── Cassette decision (replay → Inline; miss → Err) ──────────────────
     // Keyed by the request as-is (no default-model resolution), matching
     // `run_completion`'s key so record/replay agree with the sync path.
-    let cassette_decision = CASSETTE.with(|c| {
-        c.borrow().as_ref().map(|cass| {
-            let key = compute_cache_key(&request);
-            (key.clone(), cass.decide(&key))
-        })
+    let cassette_scope = current_cassette_scope();
+    let cassette_decision = cassette_scope.as_ref().map(|scope| {
+        let key = compute_cache_key(&request);
+        (key.clone(), scope.borrow().decide(&key))
     });
     match cassette_decision {
         Some((_, crate::cassette::Decision::Replay(entry))) => {
@@ -6998,6 +7081,7 @@ fn complete_offload_prep(request: ChatRequest) -> Result<CompletePrep, SemaError
         span,
         cache_key,
         cassette_record_key,
+        cassette_scope,
         request_for_messages,
     })))
 }
@@ -7015,6 +7099,7 @@ fn finalize_complete_success(
     span: sema_otel::LlmSpan,
     cache_key: Option<String>,
     cassette_record_key: Option<String>,
+    cassette_scope: Option<CassetteScope>,
     usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
     budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
     request_for_messages: &ChatRequest,
@@ -7049,11 +7134,10 @@ fn finalize_complete_success(
         store_cached(key, &resp);
     }
     if let Some(key) = &cassette_record_key {
-        CASSETTE.with(|c| {
-            if let Some(cass) = c.borrow_mut().as_mut() {
-                cass.record_entry(crate::cassette::TapeEntry::from_response(key, &resp));
-            }
-        });
+        cassette_scope_record(
+            &cassette_scope,
+            crate::cassette::TapeEntry::from_response(key, &resp),
+        );
     }
     // Fold this completion into the LEAF'S OWN captured accumulator frame — the
     // `Rc` snapshotted at dispatch, not whatever scope is active when the offload
@@ -7161,6 +7245,7 @@ fn do_complete_runtime_suspend(
         span,
         cache_key,
         cassette_record_key,
+        cassette_scope,
         request_for_messages,
     } = plan;
 
@@ -7170,6 +7255,7 @@ fn do_complete_runtime_suspend(
         span: Some(span),
         cache_key,
         cassette_record_key,
+        cassette_scope,
         usage_accum_slot: current_usage_accum(),
         budget_slot: active_budget(),
         request_for_messages,
@@ -7226,6 +7312,7 @@ struct AgentCompleteDecoder {
     span: Option<sema_otel::LlmSpan>,
     cache_key: Option<String>,
     cassette_record_key: Option<String>,
+    cassette_scope: Option<CassetteScope>,
     usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
     budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
     request_for_messages: ChatRequest,
@@ -7252,6 +7339,7 @@ impl sema_core::runtime::CompletionDecoder for AgentCompleteDecoder {
             span,
             cache_key,
             cassette_record_key,
+            cassette_scope,
             usage_accum_slot,
             budget_slot,
             request_for_messages,
@@ -7299,6 +7387,7 @@ impl sema_core::runtime::CompletionDecoder for AgentCompleteDecoder {
                     span,
                     cache_key,
                     cassette_record_key,
+                    cassette_scope,
                     usage_accum_slot,
                     budget_slot,
                     &request_for_messages,
@@ -7462,6 +7551,7 @@ struct EmbedDecoder {
     req_model: String,
     recording: bool,
     key: String,
+    cassette_scope: Option<CassetteScope>,
     single: bool,
     usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
     budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
@@ -7514,16 +7604,15 @@ impl sema_core::runtime::CompletionDecoder for EmbedDecoder {
                     });
                 }
                 if self.recording {
-                    CASSETTE.with(|c| {
-                        if let Some(cass) = c.borrow_mut().as_mut() {
-                            cass.record_entry(crate::cassette::TapeEntry::from_embed(
-                                &self.key,
-                                &resp.model,
-                                &resp.embeddings,
-                                resp.usage.prompt_tokens,
-                            ));
-                        }
-                    });
+                    cassette_scope_record(
+                        &self.cassette_scope,
+                        crate::cassette::TapeEntry::from_embed(
+                            &self.key,
+                            &resp.model,
+                            &resp.embeddings,
+                            resp.usage.prompt_tokens,
+                        ),
+                    );
                 }
                 if let Some(slot) = &self.usage_accum_slot {
                     let cost = pricing::calculate_cost_for(&self.provider_name, &resp.usage);
@@ -7733,14 +7822,14 @@ fn run_completion(
     request: ChatRequest,
     span: &sema_otel::LlmSpan,
 ) -> Result<ChatResponse, SemaError> {
-    if CASSETTE.with(|c| c.borrow().is_none()) {
+    if current_cassette_scope().is_none() {
         return do_complete_inner(request, span);
     }
     // Key by the request as-is (no default-model resolution) so record and replay
     // produce the same key for an identical call, even with no provider configured
     // (keyless replay). Shares the hashing with the response cache.
     let key = compute_cache_key(&request);
-    let decision = CASSETTE.with(|c| c.borrow().as_ref().unwrap().decide(&key));
+    let decision = cassette_decide(&key).expect("cassette scope checked above");
     match decision {
         crate::cassette::Decision::Replay(entry) => {
             // A replayed call is a stand-in for a real one: emit the span with the
@@ -7754,11 +7843,7 @@ fn run_completion(
         crate::cassette::Decision::Miss(k) => Err(cassette_miss_error(&k)),
         crate::cassette::Decision::Record => {
             let resp = do_complete_inner(request, span)?;
-            CASSETTE.with(|c| {
-                if let Some(cass) = c.borrow_mut().as_mut() {
-                    cass.record_entry(crate::cassette::TapeEntry::from_response(&key, &resp));
-                }
-            });
+            cassette_record(crate::cassette::TapeEntry::from_response(&key, &resp));
             Ok(resp)
         }
     }
@@ -7802,7 +7887,7 @@ fn stream_with_cassette(
         })
     };
 
-    if CASSETTE.with(|c| c.borrow().is_none()) {
+    if current_cassette_scope().is_none() {
         let resp = stream_real(request.clone(), chunk_cb)?;
         span.set_dispatch(p.name(), &request.model);
         span.set_response(&response_facts(p.name(), &resp));
@@ -7810,7 +7895,7 @@ fn stream_with_cassette(
     }
 
     let key = compute_cache_key(&request);
-    let decision = CASSETTE.with(|c| c.borrow().as_ref().unwrap().decide(&key));
+    let decision = cassette_decide(&key).expect("cassette scope checked above");
     match decision {
         crate::cassette::Decision::Replay(entry) => {
             for ch in &entry.chunks {
@@ -7829,13 +7914,9 @@ fn stream_with_cassette(
                 chunk_cb(chunk)
             };
             let resp = stream_real(request.clone(), &mut wrap)?;
-            CASSETTE.with(|c| {
-                if let Some(cass) = c.borrow_mut().as_mut() {
-                    cass.record_entry(crate::cassette::TapeEntry::from_stream(
-                        &key, &collected, &resp,
-                    ));
-                }
-            });
+            cassette_record(crate::cassette::TapeEntry::from_stream(
+                &key, &collected, &resp,
+            ));
             span.set_dispatch(p.name(), &request.model);
             span.set_response(&response_facts(p.name(), &resp));
             Ok(resp)
@@ -10035,6 +10116,9 @@ struct StreamRunState {
     /// Set when a cassette is recording; the entry is written at finalize with
     /// the collected chunk boundaries.
     cassette_record_key: Option<String>,
+    /// The exact cassette selected at dispatch, retained because finalization can
+    /// run after the task's dynamic scope has been swapped out.
+    cassette_scope: Option<CassetteScope>,
     /// Every delta drained so far (cassette recording preserves boundaries).
     collected: Vec<String>,
     first_token_seen: bool,
@@ -10209,11 +10293,10 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
 
     // Keyed by the request as-is (no default-model resolution), matching the
     // synchronous `stream_with_cassette` so record/replay agree across paths.
-    let cassette_decision = CASSETTE.with(|c| {
-        c.borrow().as_ref().map(|cass| {
-            let key = compute_cache_key(&request);
-            (key.clone(), cass.decide(&key))
-        })
+    let cassette_scope = current_cassette_scope();
+    let cassette_decision = cassette_scope.as_ref().map(|scope| {
+        let key = compute_cache_key(&request);
+        (key.clone(), scope.borrow().decide(&key))
     });
     let mut buffered = std::collections::VecDeque::new();
     let mut cassette_record_key = None;
@@ -10298,6 +10381,7 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
         usage_accum_slot: current_usage_accum(),
         budget_slot: active_budget(),
         cassette_record_key,
+        cassette_scope,
         collected: Vec::new(),
         first_token_seen: false,
         response: None,
@@ -10324,6 +10408,7 @@ fn stream_finalize(
     usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
     budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
     cassette_record_key: Option<String>,
+    cassette_scope: Option<CassetteScope>,
     collected: &[String],
 ) -> Result<ChatResponse, String> {
     match done.result {
@@ -10339,13 +10424,10 @@ fn stream_finalize(
                 set_serving_provider(&done.provider);
             }
             if let Some(key) = &cassette_record_key {
-                CASSETTE.with(|c| {
-                    if let Some(cass) = c.borrow_mut().as_mut() {
-                        cass.record_entry(crate::cassette::TapeEntry::from_stream(
-                            key, collected, &resp,
-                        ));
-                    }
-                });
+                cassette_scope_record(
+                    &cassette_scope,
+                    crate::cassette::TapeEntry::from_stream(key, collected, &resp),
+                );
             }
             // Fold into THIS run's captured accumulator frame, then suppress
             // `track_usage`'s own fold — the finalizer runs outside the per-task
@@ -10482,14 +10564,23 @@ fn stream_poll_batch(token: u64, blocking: bool) -> Result<Option<Value>, SemaEr
                 st.usage_accum_slot.take(),
                 st.budget_slot.take(),
                 st.cassette_record_key.take(),
+                st.cassette_scope.take(),
                 std::mem::take(&mut st.collected),
             )
         })
     });
-    let Some((span, usage_slot, budget_slot, record_key, collected)) = ctx else {
+    let Some((span, usage_slot, budget_slot, record_key, cassette_scope, collected)) = ctx else {
         return Err(SemaError::Llm("stream-run handle not found".to_string()));
     };
-    match stream_finalize(*done, span, usage_slot, budget_slot, record_key, &collected) {
+    match stream_finalize(
+        *done,
+        span,
+        usage_slot,
+        budget_slot,
+        record_key,
+        cassette_scope,
+        &collected,
+    ) {
         Ok(resp) => {
             STREAM_RUNS.with(|r| {
                 if let Some(st) = r.borrow_mut().get_mut(&token) {

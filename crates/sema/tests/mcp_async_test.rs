@@ -14,8 +14,6 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sema::{Interpreter, Value};
-use sema_llm::builtins::{install_cassette, take_cassette};
-use sema_llm::cassette::{Cassette, CassetteMode};
 use sema_mcp::{connect_from_config, ConnectOpts};
 
 /// A unique path under the system temp dir for one test's scratch file(s).
@@ -511,32 +509,41 @@ fn cassette_replay_stays_synchronous_inside_async_task() {
         ))
         .expect("connect");
 
-    // --- Record (sync, top level): the real call runs and is taped. ---
-    install_cassette(Cassette::load(tape.clone(), CassetteMode::Record));
+    // --- Record from a task that outlives the `with-cassette` body. The
+    //     completion decoder must retain the dispatch-time recorder capability. ---
     let r1 = interp
-        .eval_str(r#"(mcp/call server "count" {})"#)
-        .expect("record call");
+        .eval_str(&format!(
+            r#"(define pending-record
+                 (llm/with-cassette "{}" {{:mode :record}}
+                   (fn ()
+                     (async/spawn (fn () (mcp/call server "count" {{}}))))))
+               (await pending-record)"#,
+            tape.display()
+        ))
+        .expect("deferred MCP record task should retain its cassette recorder");
     assert_eq!(r1.as_str(), Some("call-1"));
-    take_cassette()
-        .expect("cassette installed")
-        .save()
-        .expect("save tape");
 
-    // --- Replay INSIDE an async task: must resolve without ever offloading
-    //     (no live server touch — the counter must NOT advance). ---
-    install_cassette(Cassette::load(tape, CassetteMode::Replay));
+    // --- Replay from a task spawned inside `llm/with-cassette` but awaited only
+    //     after that dynamic extent has unwound. The MCP hook must resolve the
+    //     cassette selected by the task, never the ambient thread scope. ---
     let r2 = interp
-        .eval_str(r#"(await (async/spawn (fn () (mcp/call server "count" {}))))"#)
-        .expect("replay call inside async task");
+        .eval_str(&format!(
+            r#"(define pending
+                 (llm/with-cassette "{}" {{:mode :replay}}
+                   (fn ()
+                     (async/spawn (fn () (mcp/call server "count" {{}}))))))
+               (await pending)"#,
+            tape.display()
+        ))
+        .expect("deferred MCP replay task should retain its cassette scope");
     assert_eq!(
         r2.as_str(),
         Some("call-1"),
         "replay in async context must return the recorded value, not re-hit the server"
     );
 
-    // --- Proof: drop the cassette and call for real → the server advances to
-    //     call-2, confirming the async replay above did NOT touch it. ---
-    take_cassette();
+    // --- Proof: call for real after the dynamic scope unwound → the server
+    //     advances to call-2, confirming the replay above did NOT touch it. ---
     let r3 = interp
         .eval_str(r#"(mcp/call server "count" {})"#)
         .expect("live call");

@@ -4563,7 +4563,7 @@
     {
       "name": "llm/cassette-load",
       "module": "llm",
-      "summary": "Install a cassette globally (record/replay of LLM calls) from a tape file. The opts map is optional and accepts `:mode` (`:auto` default, `:record`, or `:replay`). Use `llm/cassette-save` to flush and `llm/cassette-eject` to remove it. For scoped use prefer `llm/with-cassette`.",
+      "summary": "Install a cassette for subsequent calls in the current evaluation. Tasks spawned after the load inherit it; tasks already spawned keep the cassette they captured. The opts map is optional and accepts `:mode` (`:auto` default, `:record`, or `:replay`). Use `llm/cassette-save` to flush and `llm/cassette-eject` to remove it from the current scope. For scoped use prefer `llm/with-cassette`.",
       "params": [
         {
           "name": "path",
@@ -4578,7 +4578,7 @@
       "examples": [
         "(llm/cassette-load \"tapes/suite.jsonl\" {:mode :replay})"
       ],
-      "body": "Install a cassette globally (record/replay of LLM calls) from a tape file. The opts map is optional and accepts `:mode` (`:auto` default, `:record`, or `:replay`). Use `llm/cassette-save` to flush and `llm/cassette-eject` to remove it. For scoped use prefer `llm/with-cassette`.\n\n```sema\n(llm/cassette-load \"tapes/suite.jsonl\" {:mode :replay})\n```"
+      "body": "Install a cassette for subsequent calls in the current evaluation. Tasks spawned after the load inherit it; tasks already spawned keep the cassette they captured. The opts map is optional and accepts `:mode` (`:auto` default, `:record`, or `:replay`). Use `llm/cassette-save` to flush and `llm/cassette-eject` to remove it from the current scope. For scoped use prefer `llm/with-cassette`.\n\n```sema\n(llm/cassette-load \"tapes/suite.jsonl\" {:mode :replay})\n```"
     },
     {
       "name": "llm/cassette-save",
@@ -5142,7 +5142,7 @@
     {
       "name": "llm/with-cassette",
       "module": "llm",
-      "summary": "Record or replay LLM calls against a tape file for the duration of a zero-argument function — for deterministic, keyless tests and reproducible demos. `:mode` is `:auto` (default — replay if recorded, else record), `:record`, or `:replay` (a miss is a hard error). The opts map is optional. The response cache is disabled for the scope, and the tape is flushed on exit. Covers `llm/complete`, `llm/chat`, `llm/embed`, `llm/stream`, and agent loops. Returns the thunk's result.",
+      "summary": "Record or replay LLM calls against a tape file for the duration of a zero-argument function — for deterministic, keyless tests and reproducible demos. `:mode` is `:auto` (default — replay if recorded, else record), `:record`, or `:replay` (a miss is a hard error). The opts map is optional. The response cache is disabled for the scope, and the tape is flushed when the function exits. A task spawned inside the function retains the cassette after that exit; later recordings flush when the final task using the captured scope finishes. Covers `llm/complete`, `llm/chat`, `llm/embed`, `llm/stream`, and agent loops. Returns the thunk's result.",
       "params": [
         {
           "name": "path",
@@ -5160,7 +5160,7 @@
       "examples": [
         "(llm/with-cassette \"tapes/greeting.jsonl\" {:mode :auto}\n  (fn () (llm/complete \"Say hello in one word.\" {:model \"gpt-5-mini\"})))"
       ],
-      "body": "Record or replay LLM calls against a tape file for the duration of a zero-argument function — for deterministic, keyless tests and reproducible demos. `:mode` is `:auto` (default — replay if recorded, else record), `:record`, or `:replay` (a miss is a hard error). The opts map is optional. The response cache is disabled for the scope, and the tape is flushed on exit. Covers `llm/complete`, `llm/chat`, `llm/embed`, `llm/stream`, and agent loops. Returns the thunk's result.\n\n```sema\n(llm/with-cassette \"tapes/greeting.jsonl\" {:mode :auto}\n  (fn () (llm/complete \"Say hello in one word.\" {:model \"gpt-5-mini\"})))\n```"
+      "body": "Record or replay LLM calls against a tape file for the duration of a zero-argument function — for deterministic, keyless tests and reproducible demos. `:mode` is `:auto` (default — replay if recorded, else record), `:record`, or `:replay` (a miss is a hard error). The opts map is optional. The response cache is disabled for the scope, and the tape is flushed when the function exits. A task spawned inside the function retains the cassette after that exit; later recordings flush when the final task using the captured scope finishes. Covers `llm/complete`, `llm/chat`, `llm/embed`, `llm/stream`, and agent loops. Returns the thunk's result.\n\n```sema\n(llm/with-cassette \"tapes/greeting.jsonl\" {:mode :auto}\n  (fn () (llm/complete \"Say hello in one word.\" {:model \"gpt-5-mini\"})))\n```"
     },
     {
       "name": "llm/with-fallback",

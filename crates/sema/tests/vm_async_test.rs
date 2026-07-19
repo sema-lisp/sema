@@ -2281,17 +2281,19 @@ fn escaping_closure_matches_its_exact_owner_upvalue_cell() {
     let inner = sema_eval::Interpreter::new();
     inner.global_env.set(
         intern("__snapshot-owner-collision"),
-        Value::native_fn(NativeFn::simple("__snapshot-owner-collision", |args| {
-            if args.len() != 1 {
-                return Err(SemaError::arity(
-                    "__snapshot-owner-collision",
-                    "1",
-                    args.len(),
-                ));
-            }
-            sema_vm::snapshot_escaping_closure(&args[0]);
-            Ok(Value::nil())
-        })),
+        Value::native_fn(
+            NativeFn::simple("__snapshot-owner-collision", |args| {
+                if args.len() != 1 {
+                    return Err(SemaError::arity(
+                        "__snapshot-owner-collision",
+                        "1",
+                        args.len(),
+                    ));
+                }
+                Ok(Value::nil())
+            })
+            .with_escaping_args(&[0]),
+        ),
     );
     OWNER_COLLISION_INNER.with(|slot| {
         *slot.borrow_mut() = Some(inner);
@@ -2300,26 +2302,29 @@ fn escaping_closure_matches_its_exact_owner_upvalue_cell() {
     let outer = sema_eval::Interpreter::new();
     outer.global_env.set(
         intern("__run-owner-collision"),
-        Value::native_fn(NativeFn::simple("__run-owner-collision", |args| {
-            if args.len() != 1 {
-                return Err(SemaError::arity("__run-owner-collision", "1", args.len()));
-            }
-            OWNER_COLLISION_INNER.with(|slot| {
-                let inner = slot.borrow();
-                let inner = inner
-                    .as_ref()
-                    .ok_or_else(|| SemaError::eval("owner-collision inner VM is missing"))?;
-                inner
-                    .global_env
-                    .set(intern("__collision-target"), args[0].clone());
-                inner.eval_str_compiled(
-                    r#"(let ((x 900))
-                         (let ((keep-open (fn () x)))
-                           (__snapshot-owner-collision __collision-target)
-                           (list (__collision-target) (keep-open))))"#,
-                )
+        Value::native_fn(
+            NativeFn::simple("__run-owner-collision", |args| {
+                if args.len() != 1 {
+                    return Err(SemaError::arity("__run-owner-collision", "1", args.len()));
+                }
+                OWNER_COLLISION_INNER.with(|slot| {
+                    let inner = slot.borrow();
+                    let inner = inner
+                        .as_ref()
+                        .ok_or_else(|| SemaError::eval("owner-collision inner VM is missing"))?;
+                    inner
+                        .global_env
+                        .set(intern("__collision-target"), args[0].clone());
+                    inner.eval_str_compiled(
+                        r#"(let ((x 900))
+                             (let ((keep-open (fn () x)))
+                               (__snapshot-owner-collision __collision-target)
+                               (list (__collision-target) (keep-open))))"#,
+                    )
+                })
             })
-        })),
+            .with_escaping_args(&[0]),
+        ),
     );
 
     let result = outer.eval_str_compiled(

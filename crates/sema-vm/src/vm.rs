@@ -766,8 +766,9 @@ pub fn call_closure_owned(
     {
         return Some(result);
     }
-    // Foreign fresh VM: snapshot open upvalues against the owning VM (if any)
-    // before running on a different stack.
+    // No authoritative owner is available in this fallback. Traverse values
+    // that were already detached by the explicit caller; an Open cell is
+    // rejected when the foreign VM tries to dereference it.
     close_closure_upvalues_for_foreign_run(&closure);
     let mut vm = VM::new_with_rc_functions(globals, functions, native_fns);
     if let Err(e) = vm.setup_for_call_args(closure, CallArgs::Owned(args)) {
@@ -914,74 +915,29 @@ pub(crate) fn with_active_debug_for_root<R>(
     Some(f(debug))
 }
 
-/// Detach `closure`'s still-open upvalue cells from the stack of the VM(s)
-/// currently running a native call on this thread, giving each cell an owned
-/// value read from that owning VM's live stack.
-///
-/// MUST be called before a VM closure is dispatched onto a *foreign* stack — a
-/// fresh fallback VM, or an async task VM created by `spawn` /
-/// `run_closure_as_inline_task`. An Open cell holds `{ frame_base, slot }`
-/// indices into the VM that created it; reading it on a different VM's stack is
-/// out-of-bounds. Detaching here (while the owning VM is paused at its native
-/// call) makes the cells safe to read on the foreign stack (C1).
-///
-/// A detached cell becomes `Tracked` — NOT fully `Closed` — while its defining
-/// frame is still live, and its `open_upvalues` entry is deliberately KEPT: the
-/// frame's later `StoreLocal`/`StoreUpvalue` writes propagate into the tracked
-/// value (so a task observes post-spawn mutations of a captured local, issue
-/// #104), and the frame promotes it to a real `Closed` when it exits
-/// (`close_open_upvalues`). This preserves capture-by-cell semantics across the
-/// spawn boundary without ever letting a cell dangle onto a foreign stack.
-///
-/// A no-op for cells that are already Closed/Tracked or whose owning frame is no
-/// longer on any registered VM's stack.
-/// Snapshot an escaping VM closure's still-open upvalues (`Open` → `Tracked`)
-/// while its defining frame is CURRENT, so it can be safely invoked later on a
-/// foreign or suspended-task VM. This is the seam a streaming stdlib native
-/// (`file/for-each-line` / `fold-lines` / `fold-lines-bytes`) uses: it yields,
-/// then invokes the caller's per-line callback from a deferred I/O poll — by
-/// which point the owning task has suspended and is no longer on `CURRENT_VM`,
-/// too late to read the stack slot. Calling this from inside the native (while
-/// the owning VM is still current, exactly like `async/spawn` at spawn time)
-/// captures the values up front. No-op for non-closures / already-detached cells.
-pub fn snapshot_escaping_closure(func: &Value) {
-    snapshot_escaping_value(func);
-}
-
-/// Deep-walk `value`, snapshotting the open upvalues of every VM closure
-/// reachable through its traceable value graph. This is the value-level
-/// counterpart of [`snapshot_escaping_closure`]: the cooperative HOF-callback
-/// ABI runs a callback on a FOREIGN callback VM, and closures with open
-/// upvalues reach it not only as the callable but also as argument data or
-/// behind a multimethod, record, mutable container, channel, or promise. Every
-/// such closure's cells must be closed against the still-live parent VM up
-/// front, or dereferencing them on the callback VM reads a foreign stack slot.
-/// Allocation identity is visited once, so self-referential multimethod and
-/// mutable-container graphs terminate. The caller must have the owning VM
-/// registered on `CURRENT_VM` (see [`snapshot_escaping_call_with_owner`]).
-pub fn snapshot_escaping_value(value: &Value) {
-    EscapingValueWalker::new().visit_value(value);
-}
-
 /// Snapshot the open upvalues of a cooperative HOF callback (and any closures
 /// carried in its `args`) against `owner_vm` — the parent (HOF-invoking) VM
 /// whose stack those cells point into — before the callback runs on a foreign
-/// callback VM. Mirrors [`close_closure_upvalues_with_owner`] but for the whole
-/// call: it registers `owner_vm` as current so [`snapshot_escaping_value`] can
-/// find the (paused) owning stack, then closes each escaping cell to a SHARED,
-/// still-live `Tracked` cell — so a `set!` write-back performed on the callback
-/// VM remains visible to the defining frame (mutation visibility), exactly as
-/// `async/spawn` preserves it.
+/// callback VM. The walker reads only this explicit borrowed owner and turns
+/// matching open cells into shared `Tracked` cells. A `set!` performed on the
+/// callback VM therefore remains visible after the parent synchronizes its
+/// tracked cells back to the stack.
 pub fn snapshot_escaping_call_with_owner(owner_vm: &mut VM, callable: &Value, args: &[Value]) {
-    let _guard = CurrentVmGuard::enter(owner_vm);
-    let mut walker = EscapingValueWalker::new();
+    let mut walker = EscapingValueWalker::with_owner(owner_vm);
     walker.visit_value(callable);
     for arg in args {
         walker.visit_value(arg);
     }
 }
 
-fn snapshot_native_escaping_args(native: &NativeFn, args: &[Value]) {
+fn snapshot_escaping_args_with_owner(owner_vm: &VM, args: &[Value]) {
+    let mut walker = EscapingValueWalker::with_owner(owner_vm);
+    for arg in args {
+        walker.visit_value(arg);
+    }
+}
+
+fn snapshot_native_escaping_args(owner_vm: &VM, native: &NativeFn, args: &[Value]) {
     let indices = native.escaping_args();
     if indices.is_empty()
         || !indices
@@ -991,21 +947,12 @@ fn snapshot_native_escaping_args(native: &NativeFn, args: &[Value]) {
     {
         return;
     }
-    let mut walker = EscapingValueWalker::new();
+    let mut walker = EscapingValueWalker::with_owner(owner_vm);
     for &index in indices {
         if let Some(value) = args.get(index) {
             walker.visit_value(value);
         }
     }
-}
-
-/// Snapshot a native's declared escaping arguments against the currently
-/// registered VM stack. Synchronous callback adapters use this before calling
-/// a native's value ABI directly, where ordinary VM dispatch cannot enforce
-/// the metadata for them.
-#[doc(hidden)]
-pub fn snapshot_native_escaping_args_for_current_vm(native: &NativeFn, args: &[Value]) {
-    snapshot_native_escaping_args(native, args);
 }
 
 /// Snapshot only the arguments a native declares it will retain, using the
@@ -1018,23 +965,30 @@ pub(crate) fn snapshot_native_escaping_args_with_owner(
     if native.escaping_args().is_empty() {
         return;
     }
-    let _guard = CurrentVmGuard::enter(owner_vm);
-    snapshot_native_escaping_args(native, args);
+    snapshot_native_escaping_args(owner_vm, native, args);
 }
 
-struct EscapingValueWalker {
+struct EscapingValueWalker<'a> {
     visited_values: HashSet<NodePtr>,
     visited_closures: HashSet<*const Closure>,
-    owner_vms: Vec<*mut VM>,
+    owner_vm: Option<&'a VM>,
 }
 
-impl EscapingValueWalker {
-    fn new() -> Self {
+impl<'a> EscapingValueWalker<'a> {
+    fn new(owner_vm: Option<&'a VM>) -> Self {
         Self {
             visited_values: HashSet::new(),
             visited_closures: HashSet::new(),
-            owner_vms: CURRENT_VM.with(|stack| stack.borrow().clone()),
+            owner_vm,
         }
+    }
+
+    fn with_owner(owner_vm: &'a VM) -> Self {
+        Self::new(Some(owner_vm))
+    }
+
+    fn without_owner() -> Self {
+        Self::new(None)
     }
 
     fn visit_value(&mut self, value: &Value) {
@@ -1090,12 +1044,7 @@ impl EscapingValueWalker {
                 continue;
             };
 
-            // Find the registered VM that owns this cell (its frame is on that
-            // VM's stack). Walk most-recent first.
-            for &ptr in self.owner_vms.iter().rev() {
-                // SAFETY: pointers are registered by live CurrentVmGuards. The
-                // guards outlive this scoped walker, and their VMs are paused.
-                let vm = unsafe { &*ptr };
+            if let Some(vm) = self.owner_vm {
                 let owns_cell = vm.frames.iter().any(|frame| {
                     frame.base == frame_base
                         && frame
@@ -1118,38 +1067,32 @@ impl EscapingValueWalker {
                     // Marking Tracked precedes recursion; the allocation set
                     // terminates cycles that return through this cell's value.
                     self.visit_value(&nested);
-                    break;
                 }
             }
         }
     }
 }
 
+/// Traverse an already-detached closure graph without an owner stack.
+///
+/// Open cells remain open because there is no authoritative stack to read.
+/// Closed and tracked values are still traversed so nested closure graphs are
+/// normalized without consulting ambient VM state.
 pub fn close_closure_upvalues_for_foreign_run(closure: &Closure) {
-    EscapingValueWalker::new().visit_closure(closure);
+    EscapingValueWalker::without_owner().visit_closure(closure);
 }
 
-/// Snapshot `closure`'s still-open upvalue cells with `owner_vm` temporarily
-/// registered as the current VM, so `close_closure_upvalues_for_foreign_run` can
-/// find the (paused) owning stack the cells point into.
-///
-/// Synchronous native-call paths register the running VM via a
-/// `CurrentVmGuard` before invoking the native. Runtime spawn is deferred to
-/// `spawn_detached`, after `run_quantum` has returned and dropped that guard,
-/// leaving `CURRENT_VM` empty.
-/// Without this, a spawned closure that captures an enclosing frame's locals
-/// keeps Open cells that later dereference the wrong (task-VM) stack: a silent
-/// wrong-slot read (deadlock) or an escaped inner closure re-run synchronously
-/// off the scheduler ("async yield outside of scheduler context"). Re-register
-/// the spawning VM for the duration of the snapshot to restore the invariant.
+/// Snapshot `closure`'s still-open upvalue cells against the explicit paused VM
+/// that owns their stack slots. This is used before spawn and other foreign-VM
+/// handoffs, where retaining an `Open` cell would make the new VM index the
+/// owner's stack coordinates.
 pub fn close_closure_upvalues_with_owner(owner_vm: &mut VM, closure: &Closure) {
-    let _guard = CurrentVmGuard::enter(owner_vm);
-    EscapingValueWalker::new().visit_closure(closure);
+    EscapingValueWalker::with_owner(owner_vm).visit_closure(closure);
 }
 
 /// Error for dereferencing an Open upvalue cell whose stack slot is not on the
 /// executing VM's stack — a closure with open upvalues escaped its owning VM
-/// without being snapshotted (see `close_closure_upvalues_for_foreign_run`).
+/// without an explicit-owner snapshot (see `close_closure_upvalues_with_owner`).
 #[cold]
 #[inline(never)]
 fn foreign_upvalue_error() -> SemaError {
@@ -1942,7 +1885,7 @@ impl VM {
                 };
                 let outcome = {
                     let _vm_guard = CurrentVmGuard::enter(self);
-                    snapshot_native_escaping_args(func, call_args);
+                    snapshot_native_escaping_args(self, func, call_args);
                     func.invoke_runtime(&mut native_ctx, call_args)
                 }?;
                 drop(_installed);
@@ -1952,12 +1895,14 @@ impl VM {
                 });
             }
         }
-        let value = {
+        let result = {
             let _call_env = ctx.scope_legacy_call_env(&self.globals);
             let _vm_guard = CurrentVmGuard::enter(self);
-            snapshot_native_escaping_args(func, call_args);
+            snapshot_escaping_args_with_owner(self, call_args);
             (func.func)(ctx, call_args)
-        }?;
+        };
+        self.sync_tracked_upvalues_to_stack();
+        let value = result?;
         Ok(NativeDispatchResult::Value(value))
     }
 
@@ -2950,9 +2895,8 @@ impl VM {
                         // C1: keep open upvalues open across the call so a
                         // re-entrant in-VM HOF callback (routed via
                         // try_run_on_current_vm) can write `set!` back through
-                        // them. Closures that instead cross onto a foreign stack
-                        // (fresh fallback VM / async task VM) are snapshotted at
-                        // that crossing point (see close_closure_upvalues_for_foreign_run).
+                        // them. Explicit-owner handoffs snapshot closures before
+                        // they cross onto a fresh callback or async task VM.
                         let native = self.native_fns[native_id].clone();
                         let args_start = self.stack.len() - argc;
                         // Move args into an owned buffer and drop them from the
@@ -3791,8 +3735,7 @@ impl VM {
                         let idx = unsafe { pop_unchecked(&mut self.stack) };
                         let arr = unsafe { pop_unchecked(&mut self.stack) };
                         if NodePtr::of_value(&val).is_some() {
-                            let _vm_guard = CurrentVmGuard::enter(self);
-                            EscapingValueWalker::new().visit_value(&val);
+                            EscapingValueWalker::with_owner(self).visit_value(&val);
                         }
                         match sema_core::mutable_array_set(&arr, &idx, val) {
                             // The Sema-level contract returns the array itself;
@@ -3904,10 +3847,12 @@ impl VM {
             ));
             return Ok(());
         }
+        snapshot_escaping_call_with_owner(self, &func_val, &call_args);
         let result = {
             let _vm_guard = CurrentVmGuard::enter(self);
             sema_core::call_callback(ctx, &func_val, &call_args)
         };
+        self.sync_tracked_upvalues_to_stack();
         let result = result?;
         self.stack.push(result);
         Ok(())
@@ -4286,8 +4231,8 @@ impl VM {
     /// Mirror a captured local's write into a detached-but-live `Tracked`
     /// upvalue cell (issue #104). When a closure escaped this frame onto a
     /// foreign stack (an `async/spawn` task, a fresh fallback VM, an inline-task
-    /// HOF), `close_closure_upvalues_for_foreign_run` detached the shared cell
-    /// to `Tracked` but left it registered in this frame's `open_upvalues`; the
+    /// HOF), an explicit-owner snapshot detached the shared cell to `Tracked`
+    /// but left it registered in this frame's `open_upvalues`; the
     /// cell no longer reads this stack slot, so a plain stack write would be
     /// invisible to the task. Propagate the write into the cell's owned value so
     /// the task observes post-spawn mutations. Cheap no-op for the common cases:
@@ -4454,8 +4399,8 @@ impl VM {
                     return result;
                 }
 
-                // Foreign fresh VM: snapshot open upvalues against the owning
-                // VM (if any) before running on a different stack.
+                // The explicit caller snapshots reachable Open cells before
+                // this ownerless foreign-VM fallback is entered.
                 close_closure_upvalues_for_foreign_run(closure);
                 let mut vm = VM::new_with_rc_functions(
                     globals.clone(),
@@ -5983,6 +5928,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ownerless_escape_snapshot_does_not_consult_the_ambient_vm() {
+        let (mut owner, closure, cell) = open_upvalue_fixture(Value::int(7));
+        let _ambient = CurrentVmGuard::enter(&mut owner);
+
+        close_closure_upvalues_for_foreign_run(&closure);
+
+        assert!(
+            matches!(&*cell.state.borrow(), UpvalueState::Open { .. }),
+            "an ownerless snapshot must not discover an owner through CURRENT_VM"
+        );
+    }
+
+    #[test]
+    fn explicit_escape_owner_does_not_snapshot_a_colliding_interpreter() {
+        let (mut first_owner, first_closure, first_cell) = open_upvalue_fixture(Value::int(11));
+        let (mut second_owner, second_closure, second_cell) = open_upvalue_fixture(Value::int(22));
+        let first = vm_closure_value(&first_owner, first_closure);
+        let second = vm_closure_value(&second_owner, second_closure);
+        let graph = Value::list(vec![first, second]);
+        let _foreign_ambient = CurrentVmGuard::enter(&mut second_owner);
+
+        snapshot_escaping_call_with_owner(&mut first_owner, &graph, &[]);
+
+        assert!(matches!(
+            &*first_cell.state.borrow(),
+            UpvalueState::Tracked { value, .. } if value == &Value::int(11)
+        ));
+        assert!(
+            matches!(&*second_cell.state.borrow(), UpvalueState::Open { .. }),
+            "an explicit owner must not inspect a colliding ambient interpreter"
+        );
+    }
+
+    #[test]
+    fn legacy_native_dispatch_snapshots_all_callback_arguments() {
+        let globals = make_test_env();
+        globals.set(
+            intern("callback-is-tracked?"),
+            Value::native_fn(NativeFn::simple("callback-is-tracked?", |args| {
+                let (closure, _, _) =
+                    extract_vm_closure(&args[0]).expect("probe argument must be a VM closure");
+                let is_tracked = matches!(
+                    &*closure.upvalues[0].state.borrow(),
+                    UpvalueState::Tracked { .. }
+                );
+                Ok(Value::bool(is_tracked))
+            })),
+        );
+        let ctx = EvalContext::new();
+
+        let value = eval_str(
+            "(let ((captured 7)) (callback-is-tracked? (fn () captured)))",
+            &globals,
+            &ctx,
+        )
+        .expect("probe executes");
+
+        assert_eq!(
+            value,
+            Value::bool(true),
+            "legacy value-ABI calls must snapshot every reachable callback before entry"
+        );
+    }
+
     /// A synchronous in-VM callback re-entry (e.g. `http/serve` invoking its
     /// request handler) must not inherit the parent runtime quantum's
     /// instruction budget. The nested closure runs to completion synchronously;
@@ -6088,6 +6098,50 @@ mod tests {
             })),
         );
         env
+    }
+
+    fn open_upvalue_fixture(value: Value) -> (VM, Rc<Closure>, Rc<UpvalueCell>) {
+        let globals = make_test_env();
+        let forms = sema_reader::read_many("nil").expect("fixture source parses");
+        let program = compile_program(&forms, None).expect("fixture source compiles");
+        let mut owner = VM::new(
+            globals.clone(),
+            program.functions,
+            &program.native_table,
+            program.main_cache_slots,
+        )
+        .expect("fixture VM constructs");
+        let cell = Rc::new(UpvalueCell::new_open(0, 0));
+        owner.stack.push(value);
+        owner.frames.push(CallFrame {
+            closure: program.closure.clone(),
+            pc: 0,
+            base: 0,
+            open_upvalues: Some(vec![Some(cell.clone())]),
+            cache_base: 0,
+        });
+        let closure = Rc::new(Closure {
+            func: program.closure.func.clone(),
+            upvalues: vec![cell.clone()],
+            globals: Some(globals),
+            functions: Some(owner.functions.clone()),
+        });
+        (owner, closure, cell)
+    }
+
+    fn vm_closure_value(owner: &VM, closure: Rc<Closure>) -> Value {
+        let payload = Rc::new(VmClosurePayload {
+            closure,
+            functions: owner.functions.clone(),
+            native_fns: owner.native_fns.clone(),
+        });
+        let mut native = NativeFn::with_payload(
+            "<escaping-owner-fixture>",
+            payload as Rc<dyn std::any::Any>,
+            |_, _| Ok(Value::nil()),
+        );
+        native.is_closure = true;
+        Value::native_fn(native)
     }
 
     fn eval(input: &str) -> Result<Value, SemaError> {

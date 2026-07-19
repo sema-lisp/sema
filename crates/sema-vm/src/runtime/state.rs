@@ -14,7 +14,7 @@ use web_time::Instant;
 
 use crate::vm::{
     close_closure_upvalues_for_foreign_run, close_closure_upvalues_with_owner,
-    snapshot_escaping_call_with_owner,
+    snapshot_escaping_call_with_owner, snapshot_native_escaping_args_with_owner,
 };
 use crate::{
     extract_vm_closure, Closure, Function, VmExecResult, VmPendingOutcome, VmQuantumResult, VM,
@@ -3495,7 +3495,7 @@ impl Runtime {
     fn invoke_callable(
         &self,
         task_id: TaskId,
-        owner: ReturnOwner,
+        mut owner: ReturnOwner,
         call: NativeCall,
     ) -> Result<(), RuntimeFault> {
         let (eval_context, context, cancellation) = {
@@ -3550,6 +3550,11 @@ impl Runtime {
                 return self
                     .invoke_vm_callback_loop(task_id, owner, call, closure, functions, native_fns);
             } else if let Some(native) = call.callable.as_native_fn_rc() {
+                if !native.escaping_args().is_empty() {
+                    if let Some(parent_vm) = owner.parked_parent_vm_mut() {
+                        snapshot_native_escaping_args_with_owner(parent_vm, &native, &call.args);
+                    }
+                }
                 let _installed = eval_context.scope_task_context(context.clone());
                 let mut task_context = context.borrow_mut();
                 let mut native_context = NativeCallContext {

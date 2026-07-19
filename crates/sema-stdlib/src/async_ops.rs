@@ -172,9 +172,18 @@ fn register_predicates(env: &Env) {
 /// Register a promise op as a structural runtime native. Plain value-ABI calls
 /// fail because promise operations require an active runtime task context.
 fn register_runtime_fn(env: &Env, name: &str, f: impl Fn(&[Value]) -> NativeResult + 'static) {
+    register_runtime_fn_with_escaping_args(env, name, &[], f);
+}
+
+fn register_runtime_fn_with_escaping_args(
+    env: &Env,
+    name: &str,
+    escaping_args: &'static [usize],
+    f: impl Fn(&[Value]) -> NativeResult + 'static,
+) {
     env.set(
         sema_core::intern(name),
-        Value::native_fn(NativeFn::simple_result(name, f)),
+        Value::native_fn(NativeFn::simple_result(name, f).with_escaping_args(escaping_args)),
     );
 }
 
@@ -870,7 +879,7 @@ fn register_channel_ops(env: &Env) {
     // channel/send — send a value; suspend until buffered/handed to a receiver.
     // A full channel BLOCKS until space (the runtime parks the frame); a
     // send-to-closed raises the closed error naming the dropped value.
-    register_runtime_fn(env, "channel/send", |args| {
+    register_runtime_fn_with_escaping_args(env, "channel/send", &[1], |args| {
         check_arity!(args, "channel/send", 2);
         let channel = expect_channel(args, "channel/send", 0)?;
         Ok(NativeOutcome::Suspend(NativeSuspend {

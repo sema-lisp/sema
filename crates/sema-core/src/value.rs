@@ -157,6 +157,10 @@ pub struct NativeFn {
     /// use this to reject only shapes whose value ABI is an error stub; runtime
     /// callback drivers route all callables through `NativeOutcome::Call`.
     runtime_only: bool,
+    /// Argument positions whose values the native retains beyond this call.
+    /// The VM snapshots closures reachable from only these arguments while the
+    /// owning frame is known, avoiding an all-native graph walk.
+    escaping_args: &'static [usize],
 }
 
 impl NativeFn {
@@ -177,6 +181,7 @@ impl NativeFn {
             is_closure: false,
             runtime_func: None,
             runtime_only: false,
+            escaping_args: &[],
         }
     }
 
@@ -197,6 +202,7 @@ impl NativeFn {
             is_closure: false,
             runtime_func: None,
             runtime_only: false,
+            escaping_args: &[],
         }
     }
 
@@ -218,6 +224,7 @@ impl NativeFn {
             is_closure: false,
             runtime_func: None,
             runtime_only: false,
+            escaping_args: &[],
         }
     }
 
@@ -244,6 +251,7 @@ impl NativeFn {
             param_names: None,
             is_closure: false,
             runtime_only: true,
+            escaping_args: &[],
         }
     }
 
@@ -271,6 +279,7 @@ impl NativeFn {
             param_names: None,
             is_closure: false,
             runtime_only: true,
+            escaping_args: &[],
         }
     }
 
@@ -307,6 +316,7 @@ impl NativeFn {
                 f(&payload, context, args)
             })),
             runtime_only: true,
+            escaping_args: &[],
         }
     }
 
@@ -331,6 +341,7 @@ impl NativeFn {
             param_names: None,
             is_closure: false,
             runtime_only: false,
+            escaping_args: &[],
         }
     }
 
@@ -356,7 +367,21 @@ impl NativeFn {
             param_names: None,
             is_closure: false,
             runtime_only: false,
+            escaping_args: &[],
         }
+    }
+
+    /// Mark the argument positions whose values this native stores into a
+    /// longer-lived object or runtime wait. The metadata is static and carries
+    /// no traceable state, preserving invariant I2.
+    pub fn with_escaping_args(mut self, indices: &'static [usize]) -> Self {
+        self.escaping_args = indices;
+        self
+    }
+
+    /// Argument positions that must be snapshotted before this native runs.
+    pub fn escaping_args(&self) -> &'static [usize] {
+        self.escaping_args
     }
 
     #[doc(hidden)]

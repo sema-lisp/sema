@@ -2408,26 +2408,29 @@ pub fn register_vm_delegates(env: &Rc<Env>, ctx: &Rc<EvalContext>) {
     // __vm-defmethod: add a method to an existing MultiMethod
     env.set(
         intern("__vm-defmethod"),
-        Value::native_fn(NativeFn::simple("__vm-defmethod", |args| {
-            if args.len() != 3 {
-                return Err(SemaError::arity("__vm-defmethod", "3", args.len()));
-            }
-            let mm = args[0]
-                .as_multimethod_rc()
-                .ok_or_else(|| SemaError::eval("defmethod: first argument is not a multimethod"))?;
-            let dispatch_val = &args[1];
-            let handler = &args[2];
-            if let Some(kw) = dispatch_val.as_keyword_spur() {
-                if resolve(kw) == "default" {
-                    *mm.default.borrow_mut() = Some(handler.clone());
-                    return Ok(Value::nil());
+        Value::native_fn(
+            NativeFn::simple("__vm-defmethod", |args| {
+                if args.len() != 3 {
+                    return Err(SemaError::arity("__vm-defmethod", "3", args.len()));
                 }
-            }
-            mm.methods
-                .borrow_mut()
-                .insert(dispatch_val.clone(), handler.clone());
-            Ok(Value::nil())
-        })),
+                let mm = args[0].as_multimethod_rc().ok_or_else(|| {
+                    SemaError::eval("defmethod: first argument is not a multimethod")
+                })?;
+                let dispatch_val = &args[1];
+                let handler = &args[2];
+                if let Some(kw) = dispatch_val.as_keyword_spur() {
+                    if resolve(kw) == "default" {
+                        *mm.default.borrow_mut() = Some(handler.clone());
+                        return Ok(Value::nil());
+                    }
+                }
+                mm.methods
+                    .borrow_mut()
+                    .insert(dispatch_val.clone(), handler.clone());
+                Ok(Value::nil())
+            })
+            .with_escaping_args(&[1, 2]),
+        ),
     );
 
     // gc/collect: run a full cycle collection now (CORE-2). User-facing —

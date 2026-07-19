@@ -311,6 +311,18 @@ fn register_fn(
     );
 }
 
+fn register_fn_with_escaping_args(
+    env: &Env,
+    name: &str,
+    escaping_args: &'static [usize],
+    f: impl Fn(&[Value]) -> Result<Value, sema_core::SemaError> + 'static,
+) {
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(sema_core::NativeFn::simple(name, f).with_escaping_args(escaping_args)),
+    );
+}
+
 /// Like [`register_fn`], but the op body speaks the runtime native ABI
 /// (`NativeResult`) so its `in_runtime_quantum` branch can return a
 /// `NativeOutcome::Suspend` (an external-wait offload) directly. The single body

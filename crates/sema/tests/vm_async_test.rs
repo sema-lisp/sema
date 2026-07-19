@@ -1,9 +1,17 @@
 mod common;
 
+use std::cell::RefCell;
+
 use common::eval;
 use sema_core::runtime::{CancelReason, TaskOutcome};
-use sema_core::{Caps, Sandbox, Value};
+use sema_core::{intern, Caps, NativeFn, Sandbox, SemaError, Value};
 use sema_vm::runtime::{RootOptions, RootPoll};
+
+thread_local! {
+    static OWNER_COLLISION_INNER: RefCell<Option<sema_eval::Interpreter>> = const {
+        RefCell::new(None)
+    };
+}
 
 fn eval_vm_err(input: &str) -> String {
     let interp = sema_eval::Interpreter::new();
@@ -1909,6 +1917,42 @@ fn async_multimethod_preserves_defining_frame_capture() {
 }
 
 #[test]
+fn method_added_after_spawn_snapshots_its_defining_frame_capture() {
+    assert_eq!(
+        eval(
+            r#"(let ((x 41))
+                 (defmulti late-method-multimethod (fn (key) key))
+                 (let ((pending
+                         (async
+                           (async/sleep 10)
+                           (late-method-multimethod :go))))
+                   (defmethod late-method-multimethod :go
+                     (fn (key) (+ x 1)))
+                   (await pending)))"#
+        ),
+        Value::int(42)
+    );
+}
+
+#[test]
+fn default_method_added_after_spawn_snapshots_its_defining_frame_capture() {
+    assert_eq!(
+        eval(
+            r#"(let ((x 41))
+                 (defmulti late-default-multimethod (fn (key) key))
+                 (let ((pending
+                         (async
+                           (async/sleep 10)
+                           (late-default-multimethod :missing))))
+                   (defmethod late-default-multimethod :default
+                     (fn (key) (+ x 1)))
+                   (await pending)))"#
+        ),
+        Value::int(42)
+    );
+}
+
+#[test]
 fn snapshotting_multimethod_self_cycle_terminates() {
     assert_eq!(
         eval(
@@ -1926,6 +1970,128 @@ fn snapshotting_multimethod_self_cycle_terminates() {
                    (list (await pending) seen)))"#
         ),
         Value::list(vec![Value::int(1), Value::int(1)])
+    );
+}
+
+#[test]
+fn mutable_array_push_after_spawn_snapshots_inserted_closure() {
+    assert_eq!(
+        eval(
+            r#"(let ((x 41)
+                     (callbacks (mutable-array/new)))
+                 (let ((pending
+                         (async
+                           (async/sleep 10)
+                           ((mutable-array/get callbacks 0)))))
+                   (mutable-array/push! callbacks (fn () (+ x 1)))
+                   (await pending)))"#
+        ),
+        Value::int(42)
+    );
+}
+
+#[test]
+fn intrinsic_mutable_array_set_after_spawn_snapshots_inserted_closure() {
+    assert_eq!(
+        eval(
+            r#"(let ((x 41)
+                     (callbacks (mutable-array/new 1 nil)))
+                 (let ((pending
+                         (async
+                           (async/sleep 10)
+                           ((mutable-array/get callbacks 0)))))
+                   (mutable-array/set! callbacks 0 (fn () (+ x 1)))
+                   (await pending)))"#
+        ),
+        Value::int(42)
+    );
+}
+
+#[test]
+fn aliased_mutable_array_set_after_spawn_snapshots_inserted_closure() {
+    assert_eq!(
+        eval(
+            r#"(let ((x 41)
+                     (callbacks (mutable-array/new 1 nil))
+                     (set-callback! mutable-array/set!))
+                 (let ((pending
+                         (async
+                           (async/sleep 10)
+                           ((mutable-array/get callbacks 0)))))
+                   (set-callback! callbacks 0 (fn () (+ x 1)))
+                   (await pending)))"#
+        ),
+        Value::int(42)
+    );
+}
+
+#[test]
+fn mutable_cell_set_after_spawn_snapshots_inserted_closure() {
+    assert_eq!(
+        eval(
+            r#"(let ((x 41)
+                     (callback (mutable-cell/new nil)))
+                 (let ((pending
+                         (async
+                           (async/sleep 10)
+                           ((mutable-cell/get callback)))))
+                   (mutable-cell/set! callback (fn () (+ x 1)))
+                   (await pending)))"#
+        ),
+        Value::int(42)
+    );
+}
+
+#[test]
+fn buffered_channel_send_after_spawn_snapshots_sent_closure() {
+    assert_eq!(
+        eval(
+            r#"(let ((x 41)
+                     (callbacks (channel/new 1)))
+                 (let ((pending
+                         (async
+                           ((channel/recv callbacks)))))
+                   (channel/send callbacks (fn () (+ x 1)))
+                   (await pending)))"#
+        ),
+        Value::int(42)
+    );
+}
+
+#[test]
+fn applied_channel_send_after_spawn_snapshots_sent_closure() {
+    assert_eq!(
+        eval(
+            r#"(let ((x 41)
+                     (callbacks (channel/new 1)))
+                 (let ((pending
+                         (async
+                           ((channel/recv callbacks)))))
+                   (apply channel/send
+                     (list callbacks (fn () (+ x 1))))
+                   (await pending)))"#
+        ),
+        Value::int(42)
+    );
+}
+
+#[test]
+fn blocked_channel_send_after_spawn_snapshots_handed_off_closure() {
+    assert_eq!(
+        eval(
+            r#"(let ((x 41)
+                     (callbacks (channel/new 1)))
+                 (channel/send callbacks (fn () :primed))
+                 (let ((receiver
+                         (async
+                           (async/sleep 10)
+                           ((begin
+                              (channel/recv callbacks)
+                              (channel/recv callbacks))))))
+                   (channel/send callbacks (fn () (+ x 1)))
+                   (await receiver)))"#
+        ),
+        Value::int(42)
     );
 }
 
@@ -1999,6 +2165,92 @@ fn cancelling_async_multimethod_preserves_captured_mutation() {
                    (list seen (async/cancelled? pending))))"#
         ),
         Value::list(vec![Value::int(1), Value::bool(true)])
+    );
+}
+
+#[test]
+fn cancelling_late_method_preserves_captured_mutation() {
+    assert_eq!(
+        eval(
+            r#"(let ((x 41)
+                     (started (channel/new 1)))
+                 (defmulti late-cancellable-multimethod (fn (key) key))
+                 (let ((pending
+                         (async
+                           (async/sleep 10)
+                           (late-cancellable-multimethod :go))))
+                   (defmethod late-cancellable-multimethod :go
+                     (fn (key)
+                       (set! x (+ x 1))
+                       (channel/send started :started)
+                       (async/sleep 1000)
+                       :unreachable))
+                   (await (async (channel/recv started)))
+                   (async/cancel pending)
+                   (try (await pending) (catch error nil))
+                   (list x (async/cancelled? pending))))"#
+        ),
+        Value::list(vec![Value::int(42), Value::bool(true)])
+    );
+}
+
+#[test]
+fn escaping_closure_matches_its_exact_owner_upvalue_cell() {
+    let inner = sema_eval::Interpreter::new();
+    inner.global_env.set(
+        intern("__snapshot-owner-collision"),
+        Value::native_fn(NativeFn::simple("__snapshot-owner-collision", |args| {
+            if args.len() != 1 {
+                return Err(SemaError::arity(
+                    "__snapshot-owner-collision",
+                    "1",
+                    args.len(),
+                ));
+            }
+            sema_vm::snapshot_escaping_closure(&args[0]);
+            Ok(Value::nil())
+        })),
+    );
+    OWNER_COLLISION_INNER.with(|slot| {
+        *slot.borrow_mut() = Some(inner);
+    });
+
+    let outer = sema_eval::Interpreter::new();
+    outer.global_env.set(
+        intern("__run-owner-collision"),
+        Value::native_fn(NativeFn::simple("__run-owner-collision", |args| {
+            if args.len() != 1 {
+                return Err(SemaError::arity("__run-owner-collision", "1", args.len()));
+            }
+            OWNER_COLLISION_INNER.with(|slot| {
+                let inner = slot.borrow();
+                let inner = inner
+                    .as_ref()
+                    .ok_or_else(|| SemaError::eval("owner-collision inner VM is missing"))?;
+                inner
+                    .global_env
+                    .set(intern("__collision-target"), args[0].clone());
+                inner.eval_str_compiled(
+                    r#"(let ((x 900))
+                         (let ((keep-open (fn () x)))
+                           (__snapshot-owner-collision __collision-target)
+                           (list (__collision-target) (keep-open))))"#,
+                )
+            })
+        })),
+    );
+
+    let result = outer.eval_str_compiled(
+        r#"(let ((x 41))
+             (__run-owner-collision (fn () (+ x 1))))"#,
+    );
+    OWNER_COLLISION_INNER.with(|slot| {
+        slot.borrow_mut().take();
+    });
+
+    assert_eq!(
+        result.unwrap(),
+        Value::list(vec![Value::int(42), Value::int(900)])
     );
 }
 

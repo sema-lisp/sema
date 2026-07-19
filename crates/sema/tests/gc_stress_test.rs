@@ -458,6 +458,24 @@ fn async_multimethod_capture_survives_collections_while_parked() {
     assert_eq!(v, Value::list(vec![Value::int(11), Value::int(11)]));
 }
 
+#[test]
+fn late_mutable_cell_closure_survives_collections_while_parked() {
+    let v = eval_ok(
+        "(let ((x 41)
+               (callback (mutable-cell/new nil)))
+           (let ((pending
+                   (async
+                     (async/sleep 50)
+                     ((mutable-cell/get callback)))))
+             (mutable-cell/set! callback (fn () (+ x 1)))
+             (gc/collect)
+             (let ((result (await pending)))
+               (gc/collect)
+               result)))",
+    );
+    assert_eq!(v, Value::int(42));
+}
+
 // ── Collections from inside foreign frames ─────────────────────────
 
 #[test]

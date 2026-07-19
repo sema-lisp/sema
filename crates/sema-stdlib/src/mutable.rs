@@ -8,7 +8,7 @@
 
 use sema_core::{check_arity, SemaError, Value};
 
-use crate::register_fn;
+use crate::{register_fn, register_fn_with_escaping_args};
 
 fn as_array<'a>(v: &'a Value, name: &str) -> Result<&'a sema_core::MutableArray, SemaError> {
     v.as_mutable_array().ok_or_else(|| {
@@ -47,7 +47,7 @@ pub fn register(env: &sema_core::Env) {
         }
     });
 
-    register_fn(env, "mutable-array/push!", |args| {
+    register_fn_with_escaping_args(env, "mutable-array/push!", &[1], |args| {
         check_arity!(args, "mutable-array/push!", 2);
         let arr = as_array(&args[0], "mutable-array/push!")?;
         arr.items.borrow_mut().push(args[1].clone());
@@ -61,7 +61,7 @@ pub fn register(env: &sema_core::Env) {
         sema_core::mutable_array_get(&args[0], &args[1], args.get(2))
     });
 
-    register_fn(env, "mutable-array/set!", |args| {
+    register_fn_with_escaping_args(env, "mutable-array/set!", &[2], |args| {
         check_arity!(args, "mutable-array/set!", 3);
         sema_core::mutable_array_set(&args[0], &args[1], args[2].clone())?;
         Ok(args[0].clone())
@@ -91,7 +91,7 @@ pub fn register(env: &sema_core::Env) {
         Ok(slot.clone())
     });
 
-    register_fn(env, "mutable-cell/set!", |args| {
+    register_fn_with_escaping_args(env, "mutable-cell/set!", &[1], |args| {
         check_arity!(args, "mutable-cell/set!", 2);
         let cell = as_cell(&args[0], "mutable-cell/set!")?;
         *cell.value.borrow_mut() = args[1].clone();

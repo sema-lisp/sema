@@ -976,6 +976,38 @@ pub fn snapshot_escaping_call_with_owner(owner_vm: &mut VM, callable: &Value, ar
     }
 }
 
+fn snapshot_native_escaping_args(native: &NativeFn, args: &[Value]) {
+    let indices = native.escaping_args();
+    if indices.is_empty()
+        || !indices
+            .iter()
+            .filter_map(|&index| args.get(index))
+            .any(|value| NodePtr::of_value(value).is_some())
+    {
+        return;
+    }
+    let mut walker = EscapingValueWalker::new();
+    for &index in indices {
+        if let Some(value) = args.get(index) {
+            walker.visit_value(value);
+        }
+    }
+}
+
+/// Snapshot only the arguments a native declares it will retain, using the
+/// parked caller VM as the defining-frame owner.
+pub(crate) fn snapshot_native_escaping_args_with_owner(
+    owner_vm: &mut VM,
+    native: &NativeFn,
+    args: &[Value],
+) {
+    if native.escaping_args().is_empty() {
+        return;
+    }
+    let _guard = CurrentVmGuard::enter(owner_vm);
+    snapshot_native_escaping_args(native, args);
+}
+
 struct EscapingValueWalker {
     visited_values: HashSet<NodePtr>,
     visited_closures: HashSet<*const Closure>,
@@ -1050,9 +1082,16 @@ impl EscapingValueWalker {
                 // SAFETY: pointers are registered by live CurrentVmGuards. The
                 // guards outlive this scoped walker, and their VMs are paused.
                 let vm = unsafe { &*ptr };
-                if frame_base + slot < vm.stack.len()
-                    && vm.frames.iter().any(|frame| frame.base == frame_base)
-                {
+                let owns_cell = vm.frames.iter().any(|frame| {
+                    frame.base == frame_base
+                        && frame
+                            .open_upvalues
+                            .as_ref()
+                            .and_then(|open| open.get(slot))
+                            .and_then(Option::as_ref)
+                            .is_some_and(|candidate| Rc::ptr_eq(candidate, cell))
+                });
+                if frame_base + slot < vm.stack.len() && owns_cell {
                     let value = vm.stack[frame_base + slot].clone();
                     let nested = value.clone();
                     // Keep the cell associated with its live defining frame so
@@ -1885,6 +1924,7 @@ impl VM {
                 };
                 let outcome = {
                     let _vm_guard = CurrentVmGuard::enter(self);
+                    snapshot_native_escaping_args(func, call_args);
                     func.invoke_runtime(&mut native_ctx, call_args)
                 }?;
                 drop(task_context);
@@ -1897,6 +1937,7 @@ impl VM {
         }
         let value = {
             let _vm_guard = CurrentVmGuard::enter(self);
+            snapshot_native_escaping_args(func, call_args);
             (func.func)(ctx, call_args)
         }?;
         Ok(NativeDispatchResult::Value(value))
@@ -3719,6 +3760,10 @@ impl VM {
                         let val = unsafe { pop_unchecked(&mut self.stack) };
                         let idx = unsafe { pop_unchecked(&mut self.stack) };
                         let arr = unsafe { pop_unchecked(&mut self.stack) };
+                        if NodePtr::of_value(&val).is_some() {
+                            let _vm_guard = CurrentVmGuard::enter(self);
+                            EscapingValueWalker::new().visit_value(&val);
+                        }
                         match sema_core::mutable_array_set(&arr, &idx, val) {
                             // The Sema-level contract returns the array itself;
                             // the popped handle goes straight back — no clone.

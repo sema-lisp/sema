@@ -989,15 +989,23 @@ pub const PRELUDE: &str = r#"
       (for-each __cb (:deltas __r))
       (if (:done __r) nil (__stream-drive __tok __cb)))))
 
-;; llm/stream: inside a runtime task, route through the non-blocking
-;; stream machinery (offloaded wire + per-batch parks) so siblings interleave
-;; between deltas; at top level / sync context the byte-identical blocking native
-;; runs. With no callback the deltas print to stdout, trailing newline included —
-;; matching the blocking native's default display.
+;; llm/stream: inside any runtime quantum (the root included), route through the
+;; non-blocking stream machinery so siblings interleave between deltas. Dispatch
+;; valid begin arities directly: generic apply uses the host callback compatibility
+;; context, outside the caller's task-local cassette/context/id scopes. With no
+;; callback the deltas print to stdout, trailing newline included — matching the
+;; blocking native's default display.
 (define (llm/stream . __args)
   (if (and (or (__async-context?) (__runtime-quantum?)) (not (null? __args)))
       (let ((__cbs (filter procedure? (cdr __args)))
-            (__tok (apply __stream-begin __args)))
+            (__tok (cond
+                     ((= (length __args) 1)
+                      (__stream-begin (car __args)))
+                     ((= (length __args) 2)
+                      (__stream-begin (car __args) (cadr __args)))
+                     ((= (length __args) 3)
+                      (__stream-begin (car __args) (cadr __args) (caddr __args)))
+                     (else (apply __stream-begin __args)))))
         (let ((__cb (if (null? __cbs) (fn (__c) (display __c)) (car __cbs))))
           (__stream-drive __tok __cb)
           (let ((__out (__stream-finish __tok)))

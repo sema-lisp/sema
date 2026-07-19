@@ -6942,27 +6942,6 @@ struct CompleteOffloadPlan {
 /// runtime completion paths use this stage to keep cache, cassette, and retry
 /// behavior aligned.
 #[cfg(not(target_arch = "wasm32"))]
-/// Whether the resolved default completion chain can run wholly on the IO pool
-/// (every target is a native/Send provider) versus requiring VM-thread callbacks.
-/// Streaming uses this to choose its driver. A missing/unconfigured provider is
-/// treated as offloadable so the selected path surfaces the usual configuration
-/// error unchanged.
-#[cfg(not(target_arch = "wasm32"))]
-fn completion_chain_offloadable() -> bool {
-    PROVIDER_REGISTRY.with(|reg| {
-        let reg = reg.borrow();
-        let fallback = FALLBACK_CHAIN.with(|c| c.borrow().clone());
-        match fallback {
-            Some(entries) if !entries.is_empty() => entries
-                .iter()
-                .all(|e| reg.get(&e.provider).is_none_or(|p| !p.runs_on_vm_thread())),
-            _ => reg
-                .default_provider()
-                .is_none_or(|p| !p.runs_on_vm_thread()),
-        }
-    })
-}
-
 fn complete_offload_prep(request: ChatRequest) -> Result<CompletePrep, SemaError> {
     // Standalone completions get their own conversation scope (so the chat span
     // carries gen_ai.conversation.id); agent-nested ones inherit. The detached span
@@ -8554,6 +8533,7 @@ fn complete_with_retry(
 /// clone (off the thread-local registry, cloned on the VM thread before offload),
 /// the provider's registry name, and an optional per-entry model override.
 #[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
 struct ResolvedProvider {
     provider: std::sync::Arc<dyn LlmProvider>,
     name: String,
@@ -10326,6 +10306,18 @@ struct StreamDone {
     provider: String,
 }
 
+/// Provider-at-a-time dispatch state retained between `__stream-next` calls.
+/// It contains host data only; Sema callbacks are looked up immediately before
+/// a structural `NativeOutcome::Call` and are traced by that call itself.
+#[cfg(not(target_arch = "wasm32"))]
+struct StreamDispatchState {
+    chain: Vec<ResolvedProvider>,
+    request: ChatRequest,
+    next_provider: usize,
+    last_error: Option<(LlmError, String)>,
+    rate_limit_wait_ms: u64,
+}
+
 /// Per-run state for a non-blocking stream, keyed by an integer token in the
 /// thread-local `STREAM_RUNS` slab (its own slab — agent-loop state is not
 /// touched). Owns the wire receiver and everything the finalize needs on the VM
@@ -10335,6 +10327,11 @@ struct StreamRunState {
     rx: Option<std::sync::mpsc::Receiver<StreamEvent>>,
     /// Pre-filled events, drained before `rx`.
     buffered: std::collections::VecDeque<StreamEvent>,
+    /// Real provider dispatch. `Some` + no receiver means the next provider is
+    /// ready to start; `Some` + a receiver means one native stream is active.
+    /// `None` means cassette replay or a terminal event is already buffered.
+    #[cfg(not(target_arch = "wasm32"))]
+    dispatch: Option<StreamDispatchState>,
     /// Detached chat span (parent captured at begin), finalized when `Done` lands.
     span: Option<sema_otel::LlmSpan>,
     /// This leaf's usage-accumulator frame, captured at begin so accounting uses
@@ -10447,10 +10444,6 @@ fn stream_wire_walk(
                 return;
             }
             Err(e) => {
-                eprintln!(
-                    "Provider '{}' failed to open stream: {e}, trying next...",
-                    entry.name
-                );
                 last = Some((e, entry.name.clone()));
             }
         }
@@ -10465,6 +10458,18 @@ fn stream_wire_walk(
         result: Err(e),
         provider: name,
     })));
+}
+
+/// Drive one native provider attempt on the I/O pool. Fallback selection stays
+/// on the VM thread, so this helper reports exactly one terminal event and does
+/// not inspect or log the remainder of the chain.
+#[cfg(not(target_arch = "wasm32"))]
+fn stream_wire_attempt(
+    entry: &ResolvedProvider,
+    request: &ChatRequest,
+    emit: &mut dyn FnMut(StreamEvent),
+) {
+    stream_wire_walk(std::slice::from_ref(entry), request, emit);
 }
 
 /// Resolve the active fallback chain (or the default provider) into owned `Arc`
@@ -10507,13 +10512,10 @@ fn resolve_stream_chain() -> Result<Vec<ResolvedProvider>, SemaError> {
     })
 }
 
-/// Start a non-blocking stream run: budget pre-gate, cassette decision on the
-/// VM thread (replay pre-fills the run — drained without parking; recording
-/// captures the key for finalize), then — for a real dispatch only — the
-/// rate-limit gate, chain resolution into `Arc` clones, and the wire walk
-/// offloaded onto the I/O pool. `__stream-next` scans the channel between short
-/// structural external waits. `span` is the caller's detached chat span and is
-/// finalized when `Done` lands. Returns the slab token.
+/// Start a non-blocking stream run: budget pre-gate and cassette decision happen
+/// on the VM thread. Replay pre-fills the run; a real dispatch stores an owned
+/// provider plan for `__stream-next` to drive one provider at a time. `span` is
+/// the caller's detached chat span and is finalized when `Done` lands.
 ///
 /// The rate-limit gate sits AFTER the cassette decision (unlike the sync
 /// `stream_with_dispatch`, which always calls `enforce_rate_limit` up front):
@@ -10547,66 +10549,44 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
         _ => {}
     }
 
-    // A lisp provider's `:stream` closure runs Sema on the VM thread and cannot move
-    // to a pool worker (its callbacks are VM-thread-local), so an unoffloadable chain
-    // must run the wire walk INLINE and buffer every event — drained without parking,
-    // like the cassette-replay path. Mirrors `llm/complete`'s `completion_chain_offloadable`
-    // gate; the callback still fires per delta, just without sibling overlap for that
-    // provider. (wasm has no I/O pool and always runs inline below.)
     #[cfg(not(target_arch = "wasm32"))]
-    let inline_wire = !prefilled && !completion_chain_offloadable();
+    let dispatch = if prefilled {
+        None
+    } else {
+        Some(StreamDispatchState {
+            chain: resolve_stream_chain()?,
+            request,
+            next_provider: 0,
+            last_error: None,
+            rate_limit_wait_ms: reserve_rate_limit_wait_ms(),
+        })
+    };
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let rx = None;
+
     #[cfg(target_arch = "wasm32")]
-    let inline_wire = false;
-    if inline_wire {
-        let rate_limit_wait_ms = reserve_rate_limit_wait_ms();
-        if rate_limit_wait_ms > 0 {
-            sema_core::blocking_sleep_ms(rate_limit_wait_ms);
-        }
-        let chain = resolve_stream_chain()?;
-        stream_wire_walk(&chain, &request, &mut |ev| buffered.push_back(ev));
-        prefilled = true;
-    }
     let rx = if prefilled {
         None
     } else {
-        // Reserve this dispatch's rate-limit slot HERE, synchronously, before
-        // the offload starts (see `reserve_rate_limit_wait_ms`). The wait
-        // itself is spent on the I/O pool worker below, never the VM thread.
         let rate_limit_wait_ms = reserve_rate_limit_wait_ms();
         let chain = resolve_stream_chain()?;
         let (tx, rx) = std::sync::mpsc::channel::<StreamEvent>();
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            sema_io::io_spawn_blocking(move || {
-                if rate_limit_wait_ms > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(rate_limit_wait_ms));
-                }
-                let mut emit = |ev: StreamEvent| {
-                    let _ = tx.send(ev);
-                };
-                stream_wire_walk(&chain, &request, &mut emit);
-            });
+        if rate_limit_wait_ms > 0 {
+            sema_core::blocking_sleep_ms(rate_limit_wait_ms);
         }
-        #[cfg(target_arch = "wasm32")]
-        {
-            // No I/O pool on wasm: run the walk inline (blocking) — deltas are
-            // delivered after the stream completes, in order, exactly once.
-            // Single-threaded (no siblings to stall), so the reserved wait is
-            // spent inline too, unlike the pool-offloaded path above.
-            if rate_limit_wait_ms > 0 {
-                sema_core::blocking_sleep_ms(rate_limit_wait_ms);
-            }
-            let mut emit = |ev: StreamEvent| {
-                let _ = tx.send(ev);
-            };
-            stream_wire_walk(&chain, &request, &mut emit);
-        }
+        let mut emit = |ev: StreamEvent| {
+            let _ = tx.send(ev);
+        };
+        stream_wire_walk(&chain, &request, &mut emit);
         Some(rx)
     };
 
     let state = StreamRunState {
         rx,
         buffered,
+        #[cfg(not(target_arch = "wasm32"))]
+        dispatch,
         span: Some(span),
         usage_accum_slot: current_usage_accum(),
         budget_slot: active_budget(),
@@ -10626,6 +10606,259 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
     });
     STREAM_RUNS.with(|r| r.borrow_mut().insert(token, state));
     Ok(Value::int(token as i64))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+enum RuntimeStreamPhase {
+    Ready,
+    Pacing,
+    Sema { provider: String, model: String },
+}
+
+/// Token-only continuation that advances one stream provider at a time. The run
+/// slab owns all host state; `NativeCall` owns and traces each Sema callback and
+/// request value while that call is active.
+#[cfg(not(target_arch = "wasm32"))]
+struct RuntimeStreamDriver {
+    token: u64,
+    phase: RuntimeStreamPhase,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for RuntimeStreamDriver {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RuntimeStreamDriver {
+    fn advance(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome, NativeSuspend, WaitKind};
+
+        enum Action {
+            Pace(u64),
+            Sema {
+                provider: String,
+                model: String,
+                request: ChatRequest,
+            },
+            Native {
+                entry: ResolvedProvider,
+                request: ChatRequest,
+            },
+            Terminal,
+        }
+
+        loop {
+            let action = STREAM_RUNS.with(|runs| -> Result<Action, SemaError> {
+                let mut runs = runs.borrow_mut();
+                let state = runs
+                    .get_mut(&self.token)
+                    .ok_or_else(|| SemaError::Llm("stream-run handle not found".to_string()))?;
+                let dispatch = state.dispatch.as_mut().ok_or_else(|| {
+                    SemaError::eval("stream dispatch resumed after reaching a terminal state")
+                })?;
+
+                if dispatch.rate_limit_wait_ms > 0 {
+                    let wait_ms = std::mem::take(&mut dispatch.rate_limit_wait_ms);
+                    return Ok(Action::Pace(wait_ms));
+                }
+
+                let Some(entry) = dispatch.chain.get(dispatch.next_provider).cloned() else {
+                    let (error, provider) = dispatch.last_error.take().unwrap_or_else(|| {
+                        (
+                            LlmError::Config("all providers failed".to_string()),
+                            String::new(),
+                        )
+                    });
+                    state.dispatch = None;
+                    state
+                        .buffered
+                        .push_back(StreamEvent::Done(Box::new(StreamDone {
+                            result: Err(error),
+                            provider,
+                        })));
+                    return Ok(Action::Terminal);
+                };
+                dispatch.next_provider += 1;
+
+                let mut request = dispatch.request.clone();
+                if let Some(model) = &entry.model {
+                    request.model = model.clone();
+                } else if request.model.is_empty() {
+                    request.model = entry.provider.default_model().to_string();
+                }
+
+                if entry.provider.runs_on_vm_thread() {
+                    Ok(Action::Sema {
+                        provider: entry.name,
+                        model: request.model.clone(),
+                        request,
+                    })
+                } else {
+                    Ok(Action::Native { entry, request })
+                }
+            })?;
+
+            match action {
+                Action::Pace(wait_ms) => {
+                    self.phase = RuntimeStreamPhase::Pacing;
+                    return Ok(NativeOutcome::Suspend(NativeSuspend {
+                        wait: WaitKind::Timer(std::time::Duration::from_millis(wait_ms)),
+                        continuation: self,
+                    }));
+                }
+                Action::Sema {
+                    provider,
+                    model,
+                    request,
+                } => {
+                    let callback = match lisp_provider_complete_callback(&provider) {
+                        Ok(callback) => callback,
+                        Err(error) => {
+                            stream_note_open_failure(self.token, provider, error)?;
+                            continue;
+                        }
+                    };
+                    self.phase = RuntimeStreamPhase::Sema { provider, model };
+                    return Ok(NativeOutcome::Call(NativeCall {
+                        callable: callback,
+                        args: vec![chat_request_to_value(&request)],
+                        continuation: self,
+                    }));
+                }
+                Action::Native { entry, request } => {
+                    let (tx, rx) = std::sync::mpsc::channel::<StreamEvent>();
+                    STREAM_RUNS.with(|runs| -> Result<(), SemaError> {
+                        let mut runs = runs.borrow_mut();
+                        let state = runs.get_mut(&self.token).ok_or_else(|| {
+                            SemaError::Llm("stream-run handle not found".to_string())
+                        })?;
+                        state.rx = Some(rx);
+                        Ok(())
+                    })?;
+                    sema_io::io_spawn_blocking(move || {
+                        let mut emit = |event| {
+                            let _ = tx.send(event);
+                        };
+                        stream_wire_attempt(&entry, &request, &mut emit);
+                    });
+                    return stream_next_runtime_step(self.token);
+                }
+                Action::Terminal => return stream_next_runtime_step(self.token),
+            }
+        }
+    }
+
+    fn sema_succeeded(
+        &self,
+        provider: String,
+        response: ChatResponse,
+    ) -> sema_core::runtime::NativeResult {
+        STREAM_RUNS.with(|runs| -> Result<(), SemaError> {
+            let mut runs = runs.borrow_mut();
+            let state = runs
+                .get_mut(&self.token)
+                .ok_or_else(|| SemaError::Llm("stream-run handle not found".to_string()))?;
+            state.dispatch = None;
+            state
+                .buffered
+                .push_back(StreamEvent::Delta(response.content.clone()));
+            state
+                .buffered
+                .push_back(StreamEvent::Done(Box::new(StreamDone {
+                    result: Ok(response),
+                    provider,
+                })));
+            Ok(())
+        })?;
+        stream_next_runtime_step(self.token)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::NativeContinuation for RuntimeStreamDriver {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+
+        match (&self.phase, input) {
+            (RuntimeStreamPhase::Pacing, ResumeInput::Returned(_)) => {
+                let mut this = self;
+                this.phase = RuntimeStreamPhase::Ready;
+                this.advance()
+            }
+            (RuntimeStreamPhase::Sema { provider, model }, ResumeInput::Returned(value)) => {
+                let provider = provider.clone();
+                let model = model.clone();
+                match parse_lisp_provider_response(&value, &model) {
+                    Ok(response) => self.sema_succeeded(provider, response),
+                    Err(error) => {
+                        stream_note_open_failure(self.token, provider, error)?;
+                        self.advance()
+                    }
+                }
+            }
+            (RuntimeStreamPhase::Sema { provider, .. }, ResumeInput::Failed(error)) => {
+                let provider = provider.clone();
+                stream_note_open_failure(
+                    self.token,
+                    provider,
+                    LlmError::Api {
+                        status: 0,
+                        message: error.to_string(),
+                    },
+                )?;
+                self.advance()
+            }
+            (_, ResumeInput::Failed(error)) => Err(error),
+            (_, ResumeInput::Cancelled(reason)) => Err(SemaError::eval(format!(
+                "stream provider dispatch was cancelled ({reason:?})"
+            ))),
+            (_, ResumeInput::Runtime(_)) => Err(SemaError::eval(
+                "stream provider driver received an unexpected runtime response",
+            )),
+            (RuntimeStreamPhase::Ready, ResumeInput::Returned(_)) => Err(SemaError::eval(
+                "stream provider driver resumed without an active attempt",
+            )),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stream_note_open_failure(
+    token: u64,
+    provider: String,
+    error: LlmError,
+) -> Result<(), SemaError> {
+    eprintln!("Provider '{provider}' failed to open stream: {error}, trying next...");
+    STREAM_RUNS.with(|runs| {
+        let mut runs = runs.borrow_mut();
+        let state = runs
+            .get_mut(&token)
+            .ok_or_else(|| SemaError::Llm("stream-run handle not found".to_string()))?;
+        let dispatch = state.dispatch.as_mut().ok_or_else(|| {
+            SemaError::eval("stream provider failed after reaching a terminal state")
+        })?;
+        dispatch.last_error = Some((error, provider));
+        state.rx = None;
+        Ok(())
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stream_dispatch_ready(token: u64) -> Result<bool, SemaError> {
+    STREAM_RUNS.with(|runs| {
+        let runs = runs.borrow();
+        let state = runs
+            .get(&token)
+            .ok_or_else(|| SemaError::Llm("stream-run handle not found".to_string()))?;
+        Ok(state.dispatch.is_some() && state.rx.is_none())
+    })
 }
 
 /// Post-stream work on the VM thread when `Done` lands: span finalization,
@@ -10784,11 +11017,31 @@ fn stream_poll_batch(token: u64, blocking: bool) -> Result<Option<Value>, SemaEr
         };
     };
 
+    #[cfg(not(target_arch = "wasm32"))]
+    let should_fallback = STREAM_RUNS.with(|runs| {
+        let runs = runs.borrow();
+        runs.get(&token)
+            .is_some_and(|state| !state.first_token_seen && state.dispatch.is_some())
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    if should_fallback && done.result.is_err() {
+        let StreamDone { result, provider } = *done;
+        let error = result.expect_err("stream fallback branch requires an error");
+        stream_note_open_failure(token, provider, error)?;
+        debug_assert!(batch.is_empty());
+        return Ok(None);
+    }
+
     // Done landed: take the finalize context out (short-borrow), run the
     // finalize outside the slab borrow, then write the outcome back.
     let ctx = STREAM_RUNS.with(|r| {
         let mut slab = r.borrow_mut();
         slab.get_mut(&token).map(|st| {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                st.dispatch = None;
+            }
+            st.rx = None;
             (
                 st.span.take(),
                 st.usage_accum_slot.take(),
@@ -10921,6 +11174,13 @@ fn stream_next_runtime_step(token: u64) -> sema_core::runtime::NativeResult {
         Ok(None) => {}
         Err(e) => return Err(e),
     }
+    if stream_dispatch_ready(token)? {
+        return Box::new(RuntimeStreamDriver {
+            token,
+            phase: RuntimeStreamPhase::Ready,
+        })
+        .advance();
+    }
     let kind = CompletionKind::try_from_raw(STREAM_POLL_COMPLETION_KIND)
         .expect("stream poll completion kind is nonzero");
     let bound = QuarantineBound::hard_deadline(STREAM_POLL_CLEANUP_DEADLINE)
@@ -10963,9 +11223,11 @@ fn stream_next(token: u64) -> sema_core::runtime::NativeResult {
         if st.done {
             return Ok(Pre::Done);
         }
-        Ok::<_, SemaError>(Pre::Run {
-            prefilled: st.rx.is_none(),
-        })
+        #[cfg(not(target_arch = "wasm32"))]
+        let prefilled = st.dispatch.is_none() && st.rx.is_none();
+        #[cfg(target_arch = "wasm32")]
+        let prefilled = st.rx.is_none();
+        Ok::<_, SemaError>(Pre::Run { prefilled })
     })?;
 
     let prefilled = match pre {
@@ -10973,6 +11235,11 @@ fn stream_next(token: u64) -> sema_core::runtime::NativeResult {
         Pre::Done => return Ok(NativeOutcome::Return(stream_batch_map(Vec::new(), true))),
         Pre::Run { prefilled } => prefilled,
     };
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if stream_dispatch_ready(token)? {
+        return stream_next_runtime_step(token);
+    }
 
     // Pre-filled runs resolve without parking because there is nothing to overlap;
     // outside a runtime quantum, fall back to a blocking drain.

@@ -6,8 +6,8 @@
 //! duration (the sema-web dev-server head-of-line blocking). The fix applies the
 //! ADR #68 "lift the loop to bytecode" pattern to streaming: the wire side runs
 //! on the I/O pool sending deltas over a channel, and the prelude
-//! `__stream-drive` loop parks on `AwaitIo` between delta batches, calling the
-//! Sema callback per delta in TASK context.
+//! `__stream-drive` loop parks on bounded external waits between delta batches,
+//! calling the Sema callback per delta in task context.
 //!
 //! Deterministic + keyless: `FakeProvider` with `stream_chunk_delay` (a real
 //! thread sleep between chunks on the wire side) is what gives a sibling ticker
@@ -16,6 +16,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use sema_core::Value;
 use sema_eval::Interpreter;
@@ -34,6 +35,299 @@ fn eval_with_fake(
     register_test_provider(Box::new(fake));
     let result = interp.eval_str_compiled(src);
     (result, recorder)
+}
+
+#[test]
+#[serial_test::serial]
+fn sema_stream_provider_can_suspend_and_observes_caller_context() {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (llm/define-provider :sema-provider
+              {:complete (fn (_request)
+                           (define nested
+                             (async/spawn (fn () (sleep 20) "nested")))
+                           (string-append (context/get :prefix) "-"
+                             (async/await nested)))
+               :default-model "sema-model"})
+            (let ((out (channel/new 2)))
+              (context/with {:prefix "context"}
+                (fn ()
+                  (async/spawn (fn () (sleep 5) (channel/send out "sibling")))
+                  (llm/stream "root" (fn (chunk) (channel/send out chunk)))))
+              (list (channel/recv out) (channel/recv out)))
+            "#,
+        )
+        .expect("Sema stream provider and sibling settle");
+
+    let items = value.as_list().expect("ordered channel values");
+    assert_eq!(items[0].as_str(), Some("sibling"));
+    assert_eq!(items[1].as_str(), Some("context-nested"));
+}
+
+#[test]
+#[serial_test::serial]
+fn native_to_sema_stream_fallback_is_cooperative() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .error(LlmError::Config("fall through".to_string()))
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (llm/define-provider :sema-provider
+              {:complete (fn (_request)
+                           (define nested
+                             (async/spawn (fn () (sleep 10) "sema")))
+                           (async/await nested))
+               :default-model "sema-model"})
+            (define got "")
+            (define result
+              (llm/with-fallback [:fake :sema-provider]
+                (fn ()
+                  (llm/stream "root"
+                    (fn (chunk) (set! got (string-append got chunk)))))))
+            (list result got)
+            "#,
+        )
+        .expect("native-to-Sema stream fallback settles");
+
+    let items = value.as_list().expect("stream result and callback output");
+    assert_eq!(items[0].as_str(), Some("sema"));
+    assert_eq!(items[1].as_str(), Some("sema"));
+    assert_eq!(recorder.call_count(), 1);
+}
+
+#[test]
+#[serial_test::serial]
+fn sema_to_native_stream_fallback_parks_before_native_io() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .stream(&["warmup", "native"])
+        .stream_chunk_delay(100)
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (llm/define-provider :sema-provider
+              {:complete (fn (_request) (error "fall through"))
+               :default-model "sema-model"})
+            (let ((out (channel/new 2)))
+              (llm/with-fallback [:sema-provider :fake]
+                (fn ()
+                  (async/spawn (fn () (sleep 10) (channel/send out "sibling")))
+                  (llm/stream "root"
+                    (fn (chunk)
+                      (when (= chunk "native") (channel/send out chunk))))))
+              (list (channel/recv out) (channel/recv out)))
+            "#,
+        )
+        .expect("Sema-to-native stream fallback and sibling settle");
+
+    let items = value.as_list().expect("ordered channel values");
+    assert_eq!(items[0].as_str(), Some("sibling"));
+    assert_eq!(items[1].as_str(), Some("native"));
+    assert_eq!(recorder.call_count(), 1);
+}
+
+#[test]
+#[serial_test::serial]
+fn sema_stream_provider_drives_agent_on_text() {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (llm/define-provider :sema-provider
+              {:complete (fn (_request)
+                           (define nested
+                             (async/spawn (fn () (sleep 10) "agent")))
+                           (string-append "sema-" (async/await nested)))
+               :default-model "sema-model"})
+            (defagent bot {:model "sema-model"})
+            (define chunks "")
+            (define chunk-count 0)
+            (define result
+              (agent/run bot "root"
+                {:on-text (fn (chunk)
+                            (set! chunk-count (+ chunk-count 1))
+                            (set! chunks (string-append chunks chunk)))}))
+            (list (:response result) chunks chunk-count)
+            "#,
+        )
+        .expect("Sema provider drives an agent on-text round");
+
+    let items = value.as_list().expect("agent response and callback output");
+    assert_eq!(items[0].as_str(), Some("sema-agent"));
+    assert_eq!(items[1].as_str(), Some("sema-agent"));
+    assert_eq!(items[2].as_int(), Some(1));
+}
+
+#[test]
+#[serial_test::serial]
+fn cancelling_sema_stream_callback_does_not_fall_back_or_charge_usage() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .reply("must-not-dispatch")
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let started = Instant::now();
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (llm/define-provider :sema-provider
+              {:complete (fn (_request) (sleep 1000) "late")
+               :default-model "sema-model"})
+            (llm/with-fallback [:sema-provider :fake]
+              (fn ()
+                (define pending
+                  (async/spawn
+                    (fn () (llm/stream "root" (fn (_chunk) nil)))))
+                (async/spawn (fn () (sleep 20) (async/cancel pending)))
+                (list (try (async/await pending) (catch error :cancelled))
+                      (:total-tokens (llm/session-usage)))))
+            "#,
+        )
+        .expect("cancelled Sema stream callback settles");
+
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "cancellation must not wait out the provider callback's sleep"
+    );
+    let items = value.as_list().expect("cancel result and usage");
+    assert_eq!(items[0], Value::keyword("cancelled"));
+    assert_eq!(items[1].as_int(), Some(0));
+    assert_eq!(
+        recorder.call_count(),
+        0,
+        "cancellation must not advance into the fallback provider"
+    );
+    assert_eq!(
+        sema_llm::builtins::stream_runs_len(),
+        0,
+        "cancellation must reap the Sema-backed stream run"
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn sema_stream_rate_pacing_uses_a_structural_timer() {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (llm/define-provider :sema-provider
+              {:complete (fn (request) (:content (first (:messages request))))
+               :default-model "sema-model"})
+            (let ((out (channel/new 2)))
+              (llm/with-rate-limit 10.0
+                (fn ()
+                  (llm/stream "first" (fn (_chunk) nil))
+                  (async/spawn (fn () (sleep 10) (channel/send out "sibling")))
+                  (llm/stream "provider"
+                    (fn (chunk) (channel/send out chunk)))))
+              (list (channel/recv out) (channel/recv out)))
+            "#,
+        )
+        .expect("Sema stream pacing and sibling settle");
+
+    let items = value.as_list().expect("ordered channel values");
+    assert_eq!(items[0].as_str(), Some("sibling"));
+    assert_eq!(items[1].as_str(), Some("provider"));
+}
+
+#[test]
+#[serial_test::serial]
+fn native_mid_stream_failure_never_invokes_sema_fallback() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .stream_then_error(
+            &["par", "tial"],
+            LlmError::Http("connection dropped".to_string()),
+        )
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (define fallback-calls 0)
+            (define got "")
+            (llm/define-provider :sema-provider
+              {:complete (fn (_request)
+                           (set! fallback-calls (+ fallback-calls 1))
+                           "duplicate")
+               :default-model "sema-model"})
+            (llm/with-fallback [:fake :sema-provider]
+              (fn ()
+                (try
+                  (llm/stream "root"
+                    (fn (chunk) (set! got (string-append got chunk))))
+                  (catch error nil))))
+            (list got fallback-calls)
+            "#,
+        )
+        .expect("mid-stream error is catchable");
+
+    let items = value.as_list().expect("partial output and fallback count");
+    assert_eq!(items[0].as_str(), Some("partial"));
+    assert_eq!(items[1].as_int(), Some(0));
+    assert_eq!(recorder.call_count(), 1);
+}
+
+#[test]
+#[serial_test::serial]
+fn sema_stream_accounts_usage_once_and_emits_one_delta() {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (llm/define-provider :sema-provider
+              {:complete (fn (_request)
+                           {:content "whole"
+                            :usage {:prompt-tokens 3 :completion-tokens 2}})
+               :default-model "sema-model"})
+            (define chunks '())
+            (define before (:total-tokens (llm/session-usage)))
+            (define result
+              (llm/stream "root" (fn (chunk) (set! chunks (cons chunk chunks)))))
+            (list result (reverse chunks)
+                  (- (:total-tokens (llm/session-usage)) before))
+            "#,
+        )
+        .expect("Sema stream usage is accounted");
+
+    let items = value.as_list().expect("result, chunks, and usage");
+    assert_eq!(items[0].as_str(), Some("whole"));
+    let chunks = items[1].as_list().expect("one whole-content chunk");
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].as_str(), Some("whole"));
+    assert_eq!(items[2].as_int(), Some(5));
 }
 
 /// THE oracle: a sibling ticker task advances DURING a streaming completion.
@@ -150,7 +444,7 @@ fn async_stream_deltas_arrive_in_order_exactly_once() {
 }
 
 /// Usage is accounted exactly once per streamed completion in async context
-/// (the poller's finalize tracks; `__stream-finish` must not recharge).
+/// (the stream finalizer tracks; `__stream-finish` must not recharge).
 #[test]
 fn async_stream_accounts_usage_exactly_once() {
     let fake = FakeProvider::builder("fake")

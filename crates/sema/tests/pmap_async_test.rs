@@ -372,17 +372,31 @@ fn pmap_blocking_compatibility_native_rejects_runtime_entry() {
         .reply("must not dispatch")
         .build();
     let (result, recorder) = eval_with_fake(
-        r#"(__llm-pmap-blocking str [1] {:model "fake-chat"})"#,
+        r#"
+        (let ((mapper-calls 0))
+          (try
+            (__llm-pmap-blocking
+              (fn (item)
+                (set! mapper-calls (+ mapper-calls 1))
+                (str item))
+              [1]
+              {:model "fake-chat"})
+            (catch error (list (:message error) mapper-calls))))
+        "#,
         fake,
     );
 
-    let error = result.expect_err("blocking pmap native must reject runtime entry");
+    let result = result
+        .expect("runtime guard error should be catchable")
+        .as_list()
+        .expect("guard result list")
+        .to_vec();
+    let error = result[0].as_str().expect("guard error message");
     assert!(
-        error
-            .to_string()
-            .contains("__llm-pmap-blocking cannot run inside the cooperative runtime"),
+        error.contains("__llm-pmap-blocking cannot run inside the cooperative runtime"),
         "unexpected blocking-native error: {error}"
     );
+    assert_eq!(result[1], Value::int(0), "guard must run before the mapper");
     assert_eq!(recorder.call_count(), 0);
 }
 

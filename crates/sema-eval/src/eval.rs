@@ -375,6 +375,30 @@ impl Interpreter {
         self.submit_exprs(std::slice::from_ref(&expr), opts)
     }
 
+    /// Build a root from a deserialized `.semac` program and submit it to this
+    /// interpreter's persistent runtime without driving it. The program uses
+    /// this interpreter's global environment, so top-level definitions become
+    /// visible to later evaluations once the host drives the root.
+    ///
+    /// Nested module loading continues to use [`execute_compile_result`], whose
+    /// synchronous execution boundary is intentionally separate from this host
+    /// API.
+    pub fn submit_compile_result(
+        &self,
+        result: sema_vm::CompileResult,
+        opts: sema_vm::runtime::RootOptions,
+    ) -> Result<sema_vm::runtime::RootHandle, SemaError> {
+        let (mut vm, closure) = build_vm_for_compile_result(Rc::clone(&self.global_env), result)?;
+        vm.seed_main_frame(closure);
+        let runtime = self
+            .runtime
+            .as_ref()
+            .expect("runtime is present outside of Drop");
+        runtime
+            .submit_root_with_options(vm, &opts)
+            .map_err(|e| SemaError::eval(format!("root submission failed: {e:?}")))
+    }
+
     fn submit_exprs(
         &self,
         exprs: &[Value],
@@ -1363,17 +1387,16 @@ fn expand_match_form(
     Ok(rebuilt_list(expr, items, expanded))
 }
 
-/// Run deserialized bytecode/// Run deserialized bytecode (a `.semac` payload) on a fresh VM rooted at
-/// `globals`. Used to `load`/`import` precompiled bytecode modules (e.g.
-/// embedded in a standalone-executable or web-archive VFS) the same way
-/// `eval_module_body_vm` runs source modules. Does NOT (re)initialize the
-/// async scheduler — callers nest this inside an already-running program and
-/// reuse the scheduler installed by the top-level VM driver.
-pub fn execute_compile_result(
-    ctx: &EvalContext,
+/// Build a fresh VM and main closure from a deserialized `.semac` payload.
+///
+/// The bytecode format intentionally omits the in-process direct-native table,
+/// so loaded programs resolve native calls through their global environment.
+/// Returning the closure separately lets the nested synchronous entry execute
+/// it directly while the host-root entry seeds it without running a quantum.
+fn build_vm_for_compile_result(
     globals: Rc<Env>,
     result: sema_vm::CompileResult,
-) -> Result<Value, SemaError> {
+) -> Result<(sema_vm::VM, Rc<sema_vm::Closure>), SemaError> {
     let functions: Vec<Rc<sema_vm::Function>> = result.functions.into_iter().map(Rc::new).collect();
     let main_cache_slots = result.chunk.n_global_cache_slots;
     let closure = Rc::new(sema_vm::Closure {
@@ -1394,8 +1417,22 @@ pub fn execute_compile_result(
         globals: None,
         functions: None,
     });
+    let vm = sema_vm::VM::new(globals, functions, &[], main_cache_slots)?;
+    Ok((vm, closure))
+}
 
-    let mut vm = sema_vm::VM::new(globals, functions, &[], main_cache_slots)?;
+/// Run deserialized bytecode (a `.semac` payload) on a fresh VM rooted at
+/// `globals`. Used to `load`/`import` precompiled bytecode modules (e.g.
+/// embedded in a standalone-executable or web-archive VFS) the same way
+/// `eval_module_body_vm` runs source modules. Does NOT (re)initialize the
+/// async scheduler — callers nest this inside an already-running program and
+/// reuse the scheduler installed by the top-level VM driver.
+pub fn execute_compile_result(
+    ctx: &EvalContext,
+    globals: Rc<Env>,
+    result: sema_vm::CompileResult,
+) -> Result<Value, SemaError> {
+    let (mut vm, closure) = build_vm_for_compile_result(globals, result)?;
     vm.execute(closure, ctx)
 }
 

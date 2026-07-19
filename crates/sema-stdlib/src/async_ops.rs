@@ -598,16 +598,10 @@ fn register_promise_ops(env: &Env) {
     // Under the unified cooperative runtime (a `TaskContext` is installed) the
     // native suspends structurally on a timer wait; `SleepCont` resumes the
     // parked frame with nil when it fires. That runtime ABI is ALWAYS preferred
-    // by `NativeFn::invoke_runtime` when present, so the plain value ABI below
-    // is reached only when a caller bypasses `invoke_runtime` and calls the
-    // native's plain value closure directly — `call_function`/`call_value`
-    // (a raw native passed straight to a single-ABI HOF like `any`/`every`, or
-    // to `apply`), or a nested/foreign synchronous VM re-entry (a callback
-    // crossing a context boundary, which suspends the runtime-quantum flag —
-    // see `EvalContext::suspend_runtime_quantum`). In the former case there is
-    // no way to suspend from here, so it raises a clear error; in the latter,
-    // the calling context is contractually synchronous-only, so it actually
-    // blocks the thread.
+    // by `NativeFn::invoke_runtime` when present. The plain value ABI below is
+    // for host-only synchronous callbacks and foreign synchronous VM re-entry.
+    // If a synchronous helper bypasses `invoke_runtime` while a runtime quantum
+    // is active, it cannot carry a suspension and fails explicitly.
     //
     // This suspend is unconditional (no promise-driven check): unlike the wasm
     // http natives, the SAME structural timer wait is correct on every
@@ -622,10 +616,9 @@ fn register_promise_ops(env: &Env) {
                 let ms = sleep_duration_ms(args)?;
                 if in_runtime_quantum() {
                     return Err(SemaError::eval(
-                        "async/sleep: passed directly to a synchronous higher-order function \
-                         or `apply` — wrap it in a lambda so it can suspend cleanly. For \
-                         example, `(any (fn (x) (async/sleep x)) ...)` instead of \
-                         `(any async/sleep ...)`.",
+                        "async/sleep: entered through a synchronous callback path while the \
+                         cooperative runtime is active — invoke it through a structural \
+                         runtime call so it can suspend cleanly",
                     ));
                 }
                 // Outside any runtime quantum (a nested/foreign synchronous VM

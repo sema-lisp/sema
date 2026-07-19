@@ -2379,22 +2379,13 @@ fn apply_channel_send_callback_runs() {
     );
 }
 
-// `async/sleep` is DUAL-ABI (unlike `async/spawn`/`channel/*`/`async/resolved`,
-// which are runtime-only): its structural Timer suspend is always preferred by
-// `invoke_runtime`, so these only exercise the LEGACY value-ABI closure, which
-// is reached when a raw native bypasses `invoke_runtime` entirely through a
-// single-ABI (`register_fn`-only) HOF like `any`/`every`.
-// That closure cannot suspend from a bare Rust callback, so (post
-// YieldReason::Sleep retirement) it raises a clear error instead of silently
-// skipping the sleep. See `docs/deferred.md`'s LEGACY-SCHEDULER residue note.
+// `async/sleep` is dual-ABI: cooperative callback drivers structurally invoke
+// its Timer suspend, while host-only synchronous entry points use its plain
+// value ABI. No TLS yield signal bridges the two paths.
 
 #[test]
-fn sleep_passed_directly_to_single_abi_hof_is_graceful_error() {
-    let err = eval_vm_err(r#"(any async/sleep (list 500))"#);
-    assert!(
-        err.contains("async/sleep") && err.contains("wrap it in a lambda"),
-        "expected a graceful 'wrap it in a lambda' error, got: {err}"
-    );
+fn sleep_passed_directly_to_cooperative_predicate_hof_suspends() {
+    assert_eq!(eval(r#"(any async/sleep (list 5))"#), Value::bool(false));
 }
 
 #[test]

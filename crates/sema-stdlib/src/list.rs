@@ -819,6 +819,142 @@ fn sort_by_call(key_fn: &Value, items: &[Value]) -> NativeOutcome {
     })
 }
 
+/// Bottom-up stable merge-sort state. A comparator call is always represented
+/// by a runtime `NativeCall`; the continuation retains the unfinished runs and
+/// resumes the merge after that one comparison settles.
+struct SortComparatorContinuation {
+    comparator: Value,
+    runs: VecDeque<VecDeque<Value>>,
+    next_runs: Vec<Vec<Value>>,
+    left: VecDeque<Value>,
+    right: VecDeque<Value>,
+    merged: Vec<Value>,
+}
+
+impl Trace for SortComparatorContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.comparator));
+        for run in &self.runs {
+            for item in run {
+                sink(GcEdge::Value(item));
+            }
+        }
+        for run in &self.next_runs {
+            for item in run {
+                sink(GcEdge::Value(item));
+            }
+        }
+        for item in &self.left {
+            sink(GcEdge::Value(item));
+        }
+        for item in &self.right {
+            sink(GcEdge::Value(item));
+        }
+        for item in &self.merged {
+            sink(GcEdge::Value(item));
+        }
+        true
+    }
+}
+
+impl SortComparatorContinuation {
+    fn issue_comparison(self: Box<Self>) -> NativeOutcome {
+        let left = self
+            .left
+            .front()
+            .expect("sort merge has a left item")
+            .clone();
+        let right = self
+            .right
+            .front()
+            .expect("sort merge has a right item")
+            .clone();
+        NativeOutcome::Call(NativeCall {
+            callable: self.comparator.clone(),
+            args: vec![left, right],
+            continuation: self,
+        })
+    }
+
+    fn continue_sort(mut self: Box<Self>) -> NativeOutcome {
+        loop {
+            if !self.left.is_empty() && !self.right.is_empty() {
+                return self.issue_comparison();
+            }
+
+            self.merged.extend(self.left.drain(..));
+            self.merged.extend(self.right.drain(..));
+            if !self.merged.is_empty() {
+                self.next_runs.push(std::mem::take(&mut self.merged));
+            }
+
+            if self.runs.len() >= 2 {
+                self.left = self.runs.pop_front().expect("run count checked");
+                self.right = self.runs.pop_front().expect("run count checked");
+                self.merged = Vec::with_capacity(self.left.len() + self.right.len());
+                continue;
+            }
+
+            if let Some(unpaired) = self.runs.pop_front() {
+                self.next_runs.push(unpaired.into_iter().collect());
+            }
+            if self.next_runs.len() == 1 {
+                return NativeOutcome::Return(Value::list(
+                    self.next_runs.pop().expect("one completed run"),
+                ));
+            }
+
+            self.runs = std::mem::take(&mut self.next_runs)
+                .into_iter()
+                .map(VecDeque::from)
+                .collect();
+        }
+    }
+}
+
+impl NativeContinuation for SortComparatorContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let ordering = sort_comparator_ordering(&resume_value(input, "sort")?);
+        let next = match ordering {
+            std::cmp::Ordering::Greater => self
+                .right
+                .pop_front()
+                .expect("active comparison has a right item"),
+            std::cmp::Ordering::Less | std::cmp::Ordering::Equal => self
+                .left
+                .pop_front()
+                .expect("active comparison has a left item"),
+        };
+        self.merged.push(next);
+        Ok(self.continue_sort())
+    }
+}
+
+fn sort_comparator_call(comparator: &Value, items: Vec<Value>) -> NativeOutcome {
+    if items.len() < 2 {
+        return NativeOutcome::Return(Value::list(items));
+    }
+    let mut runs: VecDeque<VecDeque<Value>> = items
+        .into_iter()
+        .map(|item| VecDeque::from([item]))
+        .collect();
+    let left = runs.pop_front().expect("sort has at least two runs");
+    let right = runs.pop_front().expect("sort has at least two runs");
+    Box::new(SortComparatorContinuation {
+        comparator: comparator.clone(),
+        runs,
+        next_runs: Vec::new(),
+        merged: Vec::with_capacity(left.len() + right.len()),
+        left,
+        right,
+    })
+    .issue_comparison()
+}
+
 enum KeyProjectionMode {
     GroupBy { groups: Vec<(Value, Vec<Value>)> },
     KeyBy { keyed: BTreeMap<Value, Value> },
@@ -1481,6 +1617,94 @@ fn sort_category(v: &Value) -> SortCategory {
     }
 }
 
+fn sort_comparator_ordering(value: &Value) -> std::cmp::Ordering {
+    if let Some(integer) = value.as_int() {
+        integer.cmp(&0)
+    } else {
+        match value.as_bool() {
+            Some(true) => std::cmp::Ordering::Less,
+            Some(false) => std::cmp::Ordering::Greater,
+            None => std::cmp::Ordering::Equal,
+        }
+    }
+}
+
+fn sort_default(mut items: Vec<Value>) -> Result<Value, SemaError> {
+    // Reject heterogeneous input up front: comparing across unrelated types
+    // would silently fall back to `Value`'s arbitrary tag order. Pass an
+    // explicit comparator (`sort-by` / 2-arg `sort`) to order mixed types.
+    if let Some(first) = items.first() {
+        let category = sort_category(first);
+        if let Some(bad) = items.iter().find(|value| sort_category(value) != category) {
+            return Err(
+                SemaError::type_error(first.type_name(), bad.type_name()).with_hint(
+                    "sort orders one type at a time; use `sort-by` or `(sort xs cmp)` \
+                 with a comparator to order mixed types",
+                ),
+            );
+        }
+    }
+    // All-number lists compare by numeric value. `Value`'s `Ord` orders every
+    // int before every float regardless of magnitude; `cmp_real` instead spans
+    // the real tower exactly, with NaN values ordered after non-NaN values.
+    if matches!(items.first().map(sort_category), Some(SortCategory::Number)) {
+        items.sort_by(|a, b| {
+            let x = a.as_number().expect("number category checked");
+            let y = b.as_number().expect("number category checked");
+            x.cmp_real(&y).unwrap_or_else(|| {
+                let x_nan = matches!(x, SemaNumber::Real(f) if f.is_nan());
+                let y_nan = matches!(y, SemaNumber::Real(f) if f.is_nan());
+                match (x_nan, y_nan) {
+                    (true, true) => std::cmp::Ordering::Equal,
+                    (true, false) => std::cmp::Ordering::Greater,
+                    (false, true) => std::cmp::Ordering::Less,
+                    (false, false) => std::cmp::Ordering::Equal,
+                }
+            })
+        });
+    } else {
+        items.sort();
+    }
+    Ok(Value::list(items))
+}
+
+fn sort_legacy(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "sort", 1..=2);
+    let mut items = get_sequence(&args[0], "sort")?.to_vec();
+    if args.len() == 1 {
+        return sort_default(items);
+    }
+
+    let mut error = None;
+    items.sort_by(|a, b| {
+        if error.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+        match call_function(&args[1], &[a.clone(), b.clone()]) {
+            Ok(value) => sort_comparator_ordering(&value),
+            Err(cause) => {
+                error = Some(cause);
+                std::cmp::Ordering::Equal
+            }
+        }
+    });
+    if let Some(error) = error {
+        Err(error)
+    } else {
+        Ok(Value::list(items))
+    }
+}
+
+fn sort_runtime(args: &[Value]) -> NativeResult {
+    check_arity!(args, "sort", 1..=2);
+    let items = get_sequence(&args[0], "sort")?.to_vec();
+    if args.len() == 1 {
+        Ok(NativeOutcome::Return(sort_default(items)?))
+    } else {
+        Ok(sort_comparator_call(&args[1], items))
+    }
+}
+
 fn repeat_impl(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "list/repeat", 2);
     let n = args[0].as_index("list/repeat")?;
@@ -2110,85 +2334,10 @@ pub fn register(env: &sema_core::Env) {
         },
     );
 
-    register_fn(env, "sort", |args| {
-        check_arity!(args, "sort", 1..=2);
-        let mut items = get_sequence(&args[0], "sort")?.to_vec();
-        if args.len() == 1 {
-            // Reject heterogeneous input up front: comparing across unrelated
-            // types would silently fall back to `Value`'s arbitrary tag order.
-            // Pass an explicit comparator (`sort-by` / 2-arg `sort`) to order
-            // mixed types deliberately.
-            if let Some(first) = items.first() {
-                let cat = sort_category(first);
-                if let Some(bad) = items.iter().find(|v| sort_category(v) != cat) {
-                    return Err(SemaError::type_error(first.type_name(), bad.type_name())
-                        .with_hint(
-                            "sort orders one type at a time; use `sort-by` or `(sort xs cmp)` \
-                             with a comparator to order mixed types",
-                        ));
-                }
-            }
-            // All-number lists must compare by numeric value: `Value`'s `Ord`
-            // orders every int before every float regardless of magnitude, so
-            // `(sort (list 3 1.5))` would otherwise misorder. `cmp_real` compares
-            // across the whole real tower (fixnum/bignum/rational/float) exactly,
-            // without narrowing bignums through a lossy f64 cast; a NaN float
-            // sorts last (matching the pre-tower `f64::total_cmp` behavior).
-            if matches!(items.first().map(sort_category), Some(SortCategory::Number)) {
-                items.sort_by(|a, b| {
-                    let x = a.as_number().unwrap();
-                    let y = b.as_number().unwrap();
-                    x.cmp_real(&y).unwrap_or_else(|| {
-                        // `cmp_real` returns `None` only for a NaN operand here
-                        // (this branch excludes complex numbers); break the tie
-                        // so every NaN lands after every non-NaN, and NaNs are
-                        // mutually equal (a valid total order for sorting).
-                        let x_nan = matches!(x, SemaNumber::Real(f) if f.is_nan());
-                        let y_nan = matches!(y, SemaNumber::Real(f) if f.is_nan());
-                        match (x_nan, y_nan) {
-                            (true, true) => std::cmp::Ordering::Equal,
-                            (true, false) => std::cmp::Ordering::Greater,
-                            (false, true) => std::cmp::Ordering::Less,
-                            (false, false) => std::cmp::Ordering::Equal,
-                        }
-                    })
-                });
-            } else {
-                items.sort();
-            }
-        } else {
-            // Sort with comparator
-            let mut err = None;
-            items.sort_by(|a, b| {
-                if err.is_some() {
-                    return std::cmp::Ordering::Equal;
-                }
-                match call_function(&args[1], &[a.clone(), b.clone()]) {
-                    Ok(ref v) if v.is_int() => {
-                        let n = v.as_int().unwrap();
-                        if n < 0 {
-                            std::cmp::Ordering::Less
-                        } else if n > 0 {
-                            std::cmp::Ordering::Greater
-                        } else {
-                            std::cmp::Ordering::Equal
-                        }
-                    }
-                    Ok(ref v) if v.as_bool() == Some(true) => std::cmp::Ordering::Less,
-                    Ok(ref v) if v.as_bool() == Some(false) => std::cmp::Ordering::Greater,
-                    Ok(_) => std::cmp::Ordering::Equal,
-                    Err(e) => {
-                        err = Some(e);
-                        std::cmp::Ordering::Equal
-                    }
-                }
-            });
-            if let Some(e) = err {
-                return Err(e);
-            }
-        }
-        Ok(Value::list(items))
-    });
+    // Comparator-driven sorting uses a resumable stable merge under the runtime:
+    // each comparison is one structural call, while comparator-free sorting stays
+    // synchronous. The plain value ABI retains the host/synchronous implementation.
+    register_hof(env, "sort", sort_legacy, sort_runtime);
 
     register_fn(env, "list/index-of", |args| {
         check_arity!(args, "list/index-of", 2);
@@ -3242,13 +3391,10 @@ fn is_callable(v: &Value) -> bool {
 /// Call a Sema function (lambda or native) with given args.
 /// Delegates to the real evaluator via the registered callback.
 ///
-/// VM closures called from inside an async task route through the scheduler
-/// (see `run_closure_as_inline_task` in sema-vm), so yields suspend cleanly.
-/// Plain native callbacks (e.g. `(any async/sleep ...)`) don't have that
-/// affordance: a runtime-only native's value ABI is the "requires runtime
-/// invocation" stub, and a dual-ABI native (`async/sleep`) that cannot
-/// suspend from here raises its own clear error — see `async/sleep`'s legacy
-/// closure in `sema-stdlib::async_ops`.
+/// This is the synchronous callback seam used by dual-ABI builtins' plain value
+/// implementations and host-only entry points. Runtime callback drivers issue a
+/// structural `NativeOutcome::Call` instead, which lets runtime-only and dual-ABI
+/// natives suspend on the active task.
 pub fn call_function(func: &Value, args: &[Value]) -> Result<Value, SemaError> {
     if let Some(native) = func.as_native_fn_rc() {
         sema_core::with_stdlib_ctx(|ctx| {
@@ -3464,5 +3610,20 @@ mod continuation_trace_tests {
             consumer: Value::string("consumer"),
         };
         assert_eq!(edge_count(&cont), 1);
+    }
+
+    #[test]
+    fn sort_comparator_continuation_traces_every_unfinished_value() {
+        let cont = SortComparatorContinuation {
+            comparator: Value::string("comparator"),
+            runs: VecDeque::from([VecDeque::from([Value::int(1), Value::int(2)])]),
+            next_runs: vec![vec![Value::int(3)]],
+            left: VecDeque::from([Value::int(4)]),
+            right: VecDeque::from([Value::int(5)]),
+            merged: vec![Value::int(6)],
+        };
+        // Comparator + two pending-run items + one completed-run item + both
+        // active fronts + one merged item.
+        assert_eq!(edge_count(&cont), 7);
     }
 }

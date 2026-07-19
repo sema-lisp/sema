@@ -1,9 +1,12 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, HashMap};
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use crate::runtime::TaskContextHandle;
+use crate::runtime::{
+    apply_dynamic_mutations, DynamicStackIdentities, DynamicTaskState, TaskContextHandle,
+};
 use crate::{CallFrame, Env, Sandbox, SemaError, Span, SpanMap, StackTrace, Value};
 
 const MAX_SPAN_TABLE_ENTRIES: usize = 200_000;
@@ -20,6 +23,71 @@ pub type CallCallbackFn = fn(&EvalContext, &Value, &[Value]) -> Result<Value, Se
 pub type CallOwnedCallbackFn = fn(&EvalContext, &Value, &mut [Value]) -> Result<Value, SemaError>;
 
 type SignalTeardownHook = Box<dyn Fn()>;
+
+pub type ContextStackMap = BTreeMap<Value, Vec<Value>>;
+
+/// Legacy-compatible dynamic stack storage whose mutable guard renews opaque
+/// entry identities on drop. Direct mutation therefore cannot bypass the ABA
+/// protection used by task-root snapshots.
+#[derive(Default)]
+pub struct ContextStacks {
+    values: RefCell<ContextStackMap>,
+    identities: RefCell<DynamicStackIdentities>,
+}
+
+impl ContextStacks {
+    pub fn borrow(&self) -> Ref<'_, ContextStackMap> {
+        self.values.borrow()
+    }
+
+    pub fn borrow_mut(&self) -> ContextStacksMut<'_> {
+        ContextStacksMut {
+            values: self.values.borrow_mut(),
+            identities: self.identities.borrow_mut(),
+        }
+    }
+
+    fn snapshot(&self) -> (ContextStackMap, DynamicStackIdentities) {
+        (
+            self.values.borrow().clone(),
+            self.identities.borrow().clone(),
+        )
+    }
+
+    fn borrow_parts_mut(
+        &self,
+    ) -> (
+        RefMut<'_, ContextStackMap>,
+        RefMut<'_, DynamicStackIdentities>,
+    ) {
+        (self.values.borrow_mut(), self.identities.borrow_mut())
+    }
+}
+
+pub struct ContextStacksMut<'a> {
+    values: RefMut<'a, ContextStackMap>,
+    identities: RefMut<'a, DynamicStackIdentities>,
+}
+
+impl Deref for ContextStacksMut<'_> {
+    type Target = ContextStackMap;
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl DerefMut for ContextStacksMut<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.values
+    }
+}
+
+impl Drop for ContextStacksMut<'_> {
+    fn drop(&mut self) {
+        *self.identities = DynamicStackIdentities::from_stacks(&self.values);
+    }
+}
 
 pub struct EvalContext {
     pub module_cache: RefCell<BTreeMap<PathBuf, BTreeMap<String, Value>>>,
@@ -41,7 +109,7 @@ pub struct EvalContext {
     pub sandbox: Sandbox,
     pub user_context: RefCell<Vec<BTreeMap<Value, Value>>>,
     pub hidden_context: RefCell<Vec<BTreeMap<Value, Value>>>,
-    pub context_stacks: RefCell<BTreeMap<Value, Vec<Value>>>,
+    pub context_stacks: ContextStacks,
     /// Interpreter-wide roots for callbacks registered by `sys/on-signal`.
     /// This store is intentionally separate from task-local dynamic context:
     /// any root may dispatch a subscription installed by another root.
@@ -100,7 +168,7 @@ impl EvalContext {
             sandbox: Sandbox::allow_all(),
             user_context: RefCell::new(vec![BTreeMap::new()]),
             hidden_context: RefCell::new(vec![BTreeMap::new()]),
-            context_stacks: RefCell::new(BTreeMap::new()),
+            context_stacks: ContextStacks::default(),
             signal_callbacks: RefCell::default(),
             signal_teardown_hooks: RefCell::default(),
             eval_fn: Cell::new(None),
@@ -129,7 +197,7 @@ impl EvalContext {
             sandbox,
             user_context: RefCell::new(vec![BTreeMap::new()]),
             hidden_context: RefCell::new(vec![BTreeMap::new()]),
-            context_stacks: RefCell::new(BTreeMap::new()),
+            context_stacks: ContextStacks::default(),
             signal_callbacks: RefCell::default(),
             signal_teardown_hooks: RefCell::default(),
             eval_fn: Cell::new(None),
@@ -544,12 +612,50 @@ impl EvalContext {
 
     // --- Stack methods ---
 
+    /// Capture an independent root-authority snapshot of the interpreter-wide
+    /// dynamic state. Stack entry identities are shared with the publication
+    /// baseline so a stale root cannot remove an equal replacement entry.
+    #[doc(hidden)]
+    pub fn snapshot_dynamic_task_state(&self) -> DynamicTaskState {
+        let user_frames = self.user_context.borrow().clone();
+        let hidden_frames = self.hidden_context.borrow().clone();
+        let (stacks, identities) = self.context_stacks.snapshot();
+        DynamicTaskState::root_with_stack_identities(
+            user_frames,
+            hidden_frames,
+            stacks,
+            &identities,
+        )
+    }
+
+    /// Publish and drain one root snapshot's mutation journal. Child snapshots
+    /// carry no journal and return `false` without changing interpreter state.
+    #[doc(hidden)]
+    pub fn publish_dynamic_task_state(&self, state: &DynamicTaskState) -> bool {
+        let mut user_frames = self.user_context.borrow_mut();
+        let mut hidden_frames = self.hidden_context.borrow_mut();
+        let (mut stacks, mut identities) = self.context_stacks.borrow_parts_mut();
+        assert!(
+            identities.matches_stacks(&stacks),
+            "dynamic stack identities must match their value entries"
+        );
+        let Some(mutations) = state.drain_mutations() else {
+            return false;
+        };
+        apply_dynamic_mutations(
+            &mut user_frames,
+            &mut hidden_frames,
+            &mut stacks,
+            &mut identities,
+            &mutations,
+        );
+        true
+    }
+
     pub fn context_stack_push(&self, key: Value, value: Value) {
-        self.context_stacks
-            .borrow_mut()
-            .entry(key)
-            .or_default()
-            .push(value);
+        let (mut stacks, mut identities) = self.context_stacks.borrow_parts_mut();
+        stacks.entry(key.clone()).or_default().push(value);
+        identities.push(key);
     }
 
     pub fn context_stack_get(&self, key: &Value) -> Vec<Value> {
@@ -561,9 +667,15 @@ impl EvalContext {
     }
 
     pub fn context_stack_pop(&self, key: &Value) -> Option<Value> {
-        let mut stacks = self.context_stacks.borrow_mut();
+        let (mut stacks, mut identities) = self.context_stacks.borrow_parts_mut();
         let stack = stacks.get_mut(key)?;
         let val = stack.pop();
+        if val.is_some() {
+            assert!(
+                identities.pop(key),
+                "dynamic stack identity must have a matching value entry"
+            );
+        }
         if stack.is_empty() {
             stacks.remove(key);
         }
@@ -642,6 +754,78 @@ mod tests {
         assert_eq!(handle.borrow().get::<TestTaskLocal>().unwrap().0, 4);
         assert!(context.take_task_context().is_some());
         assert!(context.task_context().is_none());
+    }
+
+    #[test]
+    fn dynamic_snapshot_publication_rejects_an_equal_value_aba_pop() {
+        let context = EvalContext::new();
+        let key = Value::keyword("stack");
+        let value = Value::keyword("same");
+        context.context_stack_push(key.clone(), value.clone());
+        let stale = context.snapshot_dynamic_task_state();
+        let recreating = context.snapshot_dynamic_task_state();
+
+        assert_eq!(stale.stack_pop(&key), Some(value.clone()));
+        assert_eq!(recreating.stack_pop(&key), Some(value.clone()));
+        recreating
+            .stack_push(key.clone(), value.clone())
+            .expect("scope ID available");
+
+        assert!(context.publish_dynamic_task_state(&recreating));
+        assert!(context.publish_dynamic_task_state(&stale));
+        assert_eq!(context.context_stack_get(&key), vec![value]);
+    }
+
+    #[test]
+    fn legacy_stack_mutation_renews_identity_seen_by_later_snapshots() {
+        let context = EvalContext::new();
+        let key = Value::keyword("stack");
+        let value = Value::keyword("same");
+        context.context_stack_push(key.clone(), value.clone());
+        let stale = context.snapshot_dynamic_task_state();
+        assert_eq!(stale.stack_pop(&key), Some(value.clone()));
+
+        assert_eq!(context.context_stack_pop(&key), Some(value.clone()));
+        context.context_stack_push(key.clone(), value.clone());
+        assert!(context.publish_dynamic_task_state(&stale));
+
+        assert_eq!(context.context_stack_get(&key), vec![value]);
+    }
+
+    #[test]
+    fn direct_equal_stack_replacement_invalidates_stale_snapshot_identity() {
+        let context = EvalContext::new();
+        let key = Value::keyword("stack");
+        let value = Value::keyword("same");
+        context.context_stack_push(key.clone(), value.clone());
+        let stale = context.snapshot_dynamic_task_state();
+        assert_eq!(stale.stack_pop(&key), Some(value.clone()));
+
+        context
+            .context_stacks
+            .borrow_mut()
+            .insert(key.clone(), vec![value.clone()]);
+        assert!(context.publish_dynamic_task_state(&stale));
+
+        assert_eq!(context.context_stack_get(&key), vec![value]);
+    }
+
+    #[test]
+    fn publication_borrow_conflict_leaves_the_root_journal_retryable() {
+        let context = EvalContext::new();
+        let key = Value::keyword("retry");
+        let root = context.snapshot_dynamic_task_state();
+        root.user_set(key.clone(), Value::int(42));
+        let held = context.user_context.borrow_mut();
+
+        let conflicted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            context.publish_dynamic_task_state(&root)
+        }));
+        assert!(conflicted.is_err());
+        drop(held);
+
+        assert!(context.publish_dynamic_task_state(&root));
+        assert_eq!(context.context_get(&key), Some(Value::int(42)));
     }
 
     #[test]

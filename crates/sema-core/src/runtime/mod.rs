@@ -14,9 +14,8 @@ pub use completion::{
     downcast_send_payload, CompletionDecoder, CompletionDelivery, CompletionSender,
     DecodedCompletion, ExternalCompletion, ExternalFailure, ExternalFailureCode, SendPayload,
 };
-pub use eval_task_context::{
-    apply_dynamic_mutations, DynamicMutation, DynamicTaskState, ModuleTaskState,
-};
+pub(crate) use eval_task_context::{apply_dynamic_mutations, DynamicStackIdentities};
+pub use eval_task_context::{DynamicTaskState, ModuleTaskState};
 pub use executor::{
     AsyncDispatchFuture, AsyncExecutorDispatch, BindCompletionError, BlockingDispatchClass,
     BlockingExecutorDispatch, CancelBeforeStart, CompletionRegistrar, ExecutorAttachError,

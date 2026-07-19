@@ -2013,9 +2013,14 @@ impl Runtime {
                     .position(|stage| stage.belongs_to_roots(&state, roots)),
                 None => (!state.pending.is_empty()).then_some(0),
             };
-            position.and_then(|position| state.pending.remove(position))
+            position.and_then(|position| {
+                state
+                    .pending
+                    .remove(position)
+                    .map(|stage| (position, stage))
+            })
         };
-        let Some(stage) = stage else {
+        let Some((stage_position, stage)) = stage else {
             return Ok(false);
         };
         let next = match stage {
@@ -2100,10 +2105,14 @@ impl Runtime {
                     self.consume_promise_wake(key, task)?;
                 }
                 if !wakes.is_empty() {
-                    self.state
-                        .borrow_mut()
-                        .pending
-                        .push_back(PendingStage::PromiseWakes(wakes));
+                    let mut state = self.state.borrow_mut();
+                    let remainder = PendingStage::PromiseWakes(wakes);
+                    if selected_roots.is_some() {
+                        let position = stage_position.min(state.pending.len());
+                        state.pending.insert(position, remainder);
+                    } else {
+                        state.pending.push_back(remainder);
+                    }
                 }
                 return Ok(true);
             }
@@ -2119,10 +2128,14 @@ impl Runtime {
                     self.consume_channel_wake(wake)?;
                 }
                 if !close.is_empty() {
-                    self.state
-                        .borrow_mut()
-                        .pending
-                        .push_back(PendingStage::ChannelClose(close));
+                    let mut state = self.state.borrow_mut();
+                    let remainder = PendingStage::ChannelClose(close);
+                    if selected_roots.is_some() {
+                        let position = stage_position.min(state.pending.len());
+                        state.pending.insert(position, remainder);
+                    } else {
+                        state.pending.push_back(remainder);
+                    }
                 }
                 return Ok(true);
             }
@@ -4990,6 +5003,19 @@ impl Runtime {
     #[cfg(test)]
     pub(super) fn protocol_wait_count_for_test(&self) -> usize {
         self.state.borrow().protocol_waits.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn pending_stage_positions_for_root_for_test(&self, root: RootId) -> Vec<usize> {
+        let state = self.state.borrow();
+        state
+            .pending
+            .iter()
+            .enumerate()
+            .filter_map(|(position, stage)| {
+                stage.belongs_to_roots(&state, &[root]).then_some(position)
+            })
+            .collect()
     }
 
     #[cfg(test)]

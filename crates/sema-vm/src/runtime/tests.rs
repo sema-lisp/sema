@@ -868,6 +868,141 @@ fn root_filtered_idle_ignores_a_foreign_external_wait() {
 }
 
 #[test]
+fn root_filtered_mixed_promise_wake_preserves_the_foreign_stage_position() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let promise = runtime.create_pending_promise_for_test();
+    let promise_wait = || {
+        TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::PromiseSetWait {
+                wait: sema_core::runtime::PromiseSetWait {
+                    promises: vec![promise],
+                    mode: sema_core::runtime::PromiseSetMode::Race,
+                },
+                continuation: Box::new(CaptureRuntimeContinuation(Rc::new(RefCell::new(
+                    Vec::new(),
+                )))),
+            },
+        )))
+    };
+    let foreign = runtime
+        .submit_test_root(promise_wait())
+        .expect("foreign promise observer admitted");
+    let selected = runtime
+        .submit_test_root(promise_wait())
+        .expect("selected promise observer admitted");
+    let one = drive_budget(1);
+
+    while runtime.protocol_wait_count_for_test() < 1 {
+        runtime.drive_roots(&one, &[foreign.id()]).unwrap();
+    }
+    while runtime.protocol_wait_count_for_test() < 2 {
+        runtime.drive_roots(&one, &[selected.id()]).unwrap();
+    }
+    runtime.settle_promise_for_test(promise, TaskOutcome::Returned(Value::int(7)));
+
+    let later = runtime
+        .submit_test_root(TestPreparedTask::returned(Value::int(9)))
+        .expect("later root admitted");
+    while runtime
+        .pending_stage_positions_for_root_for_test(later.id())
+        .is_empty()
+    {
+        runtime.drive_roots(&one, &[later.id()]).unwrap();
+    }
+
+    assert_eq!(
+        runtime.pending_stage_positions_for_root_for_test(foreign.id()),
+        vec![0]
+    );
+    assert_eq!(
+        runtime.pending_stage_positions_for_root_for_test(selected.id()),
+        vec![0]
+    );
+    assert_eq!(
+        runtime.pending_stage_positions_for_root_for_test(later.id()),
+        vec![1]
+    );
+
+    runtime.drive_roots(&one, &[selected.id()]).unwrap();
+
+    assert_eq!(
+        runtime.pending_stage_positions_for_root_for_test(foreign.id()),
+        vec![0],
+        "the foreign remainder retains the mixed wake's original queue position"
+    );
+    assert_eq!(
+        runtime.pending_stage_positions_for_root_for_test(later.id()),
+        vec![1],
+        "the later stage cannot overtake the foreign wake"
+    );
+}
+
+#[test]
+fn root_filtered_mixed_channel_close_preserves_the_foreign_stage_position() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let channel = runtime.create_channel_for_test(0);
+    let receive = || {
+        TestPreparedTask::native(Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::Channel(sema_core::runtime::ChannelWait::Receive { channel }),
+            continuation: Box::new(CountingContinuation(Arc::new(Mutex::new(Vec::new())))),
+        })))
+    };
+    let foreign = runtime
+        .submit_test_root(receive())
+        .expect("foreign channel receiver admitted");
+    let selected = runtime
+        .submit_test_root(receive())
+        .expect("selected channel receiver admitted");
+    let one = drive_budget(1);
+
+    while runtime.channel_receiver_queue_len_for_test(channel) < 1 {
+        runtime.drive_roots(&one, &[foreign.id()]).unwrap();
+    }
+    while runtime.channel_receiver_queue_len_for_test(channel) < 2 {
+        runtime.drive_roots(&one, &[selected.id()]).unwrap();
+    }
+
+    let closer = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::ChannelOp {
+                channel,
+                operation: sema_core::runtime::ChannelOperation::Close,
+                continuation: Box::new(CountingContinuation(Arc::new(Mutex::new(Vec::new())))),
+            },
+        ))))
+        .expect("channel closer admitted");
+    while runtime.channel_receiver_queue_len_for_test(channel) > 0 {
+        runtime.drive_roots(&one, &[closer.id()]).unwrap();
+    }
+
+    assert_eq!(
+        runtime.pending_stage_positions_for_root_for_test(foreign.id()),
+        vec![0]
+    );
+    assert_eq!(
+        runtime.pending_stage_positions_for_root_for_test(selected.id()),
+        vec![0]
+    );
+    assert_eq!(
+        runtime.pending_stage_positions_for_root_for_test(closer.id()),
+        vec![1]
+    );
+
+    runtime.drive_roots(&one, &[selected.id()]).unwrap();
+
+    assert_eq!(
+        runtime.pending_stage_positions_for_root_for_test(foreign.id()),
+        vec![0],
+        "the foreign remainder retains the channel close's original queue position"
+    );
+    assert_eq!(
+        runtime.pending_stage_positions_for_root_for_test(closer.id()),
+        vec![1],
+        "the close response cannot overtake the foreign receiver wake"
+    );
+}
+
+#[test]
 fn runtime_delayed_promise_wait_resumes_with_canonical_settlement() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
     let promise = runtime.create_pending_promise_for_test();

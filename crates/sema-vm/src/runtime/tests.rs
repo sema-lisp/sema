@@ -609,6 +609,22 @@ fn submit_vm_expr(runtime: &Runtime, src: &str) -> RootHandle {
     runtime.submit_root(vm).expect("root admitted")
 }
 
+fn submit_debuggable_vm_expr(runtime: &Runtime, src: &str, source: &str) -> RootHandle {
+    let (vals, spans) = sema_reader::read_many_with_spans(src).expect("parse");
+    let prog =
+        crate::compile_program_with_spans(&vals, &spans, Some(std::path::PathBuf::from(source)))
+            .expect("compile");
+    let mut vm = crate::VM::new(
+        Rc::new(sema_core::Env::new()),
+        prog.functions,
+        &prog.native_table,
+        prog.main_cache_slots,
+    )
+    .expect("VM construction");
+    vm.seed_main_frame(prog.closure);
+    runtime.submit_root(vm).expect("root admitted")
+}
+
 fn drive_root_to_int(runtime: &Runtime, handle: &RootHandle) -> i64 {
     let mut guard = 0;
     while matches!(handle.poll_result(), RootPoll::Pending) {
@@ -623,6 +639,61 @@ fn drive_root_to_int(runtime: &Runtime, handle: &RootHandle) -> i64 {
         TaskOutcome::Returned(v) => v.as_int().expect("integer result"),
         other => panic!("expected Returned, got {other:?}"),
     }
+}
+
+#[test]
+fn active_debugger_stops_only_its_target_root() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let ordinary = submit_debuggable_vm_expr(
+        &runtime,
+        "(begin (define ordinary-only 40) (+ ordinary-only 2))",
+        "ordinary.sema",
+    );
+    let debugged = submit_debuggable_vm_expr(
+        &runtime,
+        "(begin (define debug-only 40) (+ debug-only 2))",
+        "debugged.sema",
+    );
+
+    let mut debug = crate::DebugState::new_headless();
+    debug.step_mode = crate::StepMode::StepInto;
+    debug.instructions_remaining = 500_000;
+    let _active = crate::ActiveDebugGuard::enter_for_root(&mut debug, debugged.id());
+
+    let stopped_root = loop {
+        match runtime.drive(&drive_budget(64)).expect("debug drive") {
+            super::DriveState::DebugStopped { root, .. } => break root,
+            _ => {
+                assert!(
+                    matches!(debugged.poll_result(), RootPoll::Pending),
+                    "debug root must stop before settling"
+                );
+            }
+        }
+    };
+    assert_eq!(
+        stopped_root,
+        debugged.id(),
+        "the debugger must not claim the earlier ordinary root"
+    );
+    assert!(runtime.is_debug_paused_for(debugged.id()));
+    assert!(!runtime.is_debug_paused_for(ordinary.id()));
+    assert!(
+        runtime.with_paused_root_vm(ordinary.id(), |_| ()).is_none(),
+        "an unrelated root cannot inspect the paused VM"
+    );
+    assert!(!runtime.debug_resume_root(ordinary.id()));
+    assert!(!runtime.debug_cancel_paused_root(ordinary.id()));
+    assert!(
+        runtime.is_debug_paused_for(debugged.id()),
+        "mismatched controls leave the target barrier intact"
+    );
+    assert!(runtime.debug_cancel_paused_root(debugged.id()));
+    assert_eq!(
+        drive_root_to_int(&runtime, &ordinary),
+        42,
+        "the ordinary root completes outside the target debugger"
+    );
 }
 
 #[test]

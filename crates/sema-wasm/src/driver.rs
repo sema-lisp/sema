@@ -150,12 +150,10 @@ impl Drop for PromiseDriver {
             clear_timeout(timeout);
         }
         if let Some(session) = self.debug_session.get_mut().take() {
-            let _ = self
-                .interp
-                .command_handle()
-                .cancel_root(session.handle.id());
-            if self.interp.runtime().is_debug_paused() {
-                self.interp.runtime().debug_cancel_paused();
+            let root = session.handle.id();
+            let _ = self.interp.command_handle().cancel_root(root);
+            if self.interp.runtime().is_debug_paused_for(root) {
+                self.interp.runtime().debug_cancel_paused_root(root);
             }
         }
         if let Some(runtime_id) = self.runtime_id.get() {
@@ -369,13 +367,16 @@ pub(crate) fn resume_debug(driver: &Rc<PromiseDriver>, mode: StepMode) -> js_sys
                 Some(session) if session.action.is_some() => {
                     Some("A Promise debug action is already running")
                 }
-                Some(_session) if !runtime.is_debug_paused() => {
+                Some(session) if !runtime.is_debug_paused_for(session.handle.id()) => {
                     Some("The Promise debug session is not paused")
                 }
                 Some(session) => {
+                    let root = session.handle.id();
                     session.debug.step_mode = mode;
                     if mode != StepMode::Continue {
-                        if let Some(depth) = runtime.with_paused_task_vm(|vm| vm.frame_count()) {
+                        if let Some(depth) =
+                            runtime.with_paused_root_vm(root, |vm| vm.frame_count())
+                        {
                             session.debug.step_frame_depth = depth;
                         }
                     }
@@ -391,7 +392,26 @@ pub(crate) fn resume_debug(driver: &Rc<PromiseDriver>, mode: StepMode) -> js_sys
             resolve_debug_immediately(&resolve, debug_error_result(message));
             return;
         }
-        runtime.debug_resume();
+        let root = driver
+            .debug_session
+            .borrow()
+            .as_ref()
+            .map(|session| session.handle.id());
+        if root.is_none_or(|root| !runtime.debug_resume_root(root)) {
+            let result = debug_error_result("The Promise debug session lost its paused root");
+            let mut session = driver.debug_session.borrow_mut().take();
+            let action = session.as_mut().and_then(|session| session.action.take());
+            let root = session.as_ref().map(|session| session.handle.id());
+            drop(session);
+            if let Some(root) = root {
+                let _ = driver.interp.command_handle().cancel_root(root);
+            }
+            if let Some(action) = action {
+                resolve_debug_immediately(&action.resolve, result);
+            }
+            schedule_drive(&driver);
+            return;
+        }
         retain_while_active(&driver);
         schedule_drive(&driver);
     })
@@ -407,8 +427,8 @@ pub(crate) fn stop_debug(driver: &Rc<PromiseDriver>) -> bool {
     let root = session.handle.id();
     let runtime = driver.interp.runtime();
     let _ = driver.interp.command_handle().cancel_root(root);
-    if runtime.is_debug_paused() {
-        runtime.debug_cancel_paused();
+    if runtime.is_debug_paused_for(root) {
+        runtime.debug_cancel_paused_root(root);
     }
     let action = session.action.take();
     let result = debug_cancelled_result(root, std::mem::take(&mut session.output));
@@ -425,13 +445,18 @@ pub(crate) fn debug_is_active(driver: &PromiseDriver) -> bool {
 }
 
 pub(crate) fn debug_locals(driver: &PromiseDriver) -> JsValue {
-    if driver.debug_session.borrow().is_none() {
+    let Some(root) = driver
+        .debug_session
+        .borrow()
+        .as_ref()
+        .map(|session| session.handle.id())
+    else {
         return JsValue::NULL;
-    }
+    };
     let locals = driver
         .interp
         .runtime()
-        .with_paused_task_vm(|vm| {
+        .with_paused_root_vm(root, |vm| {
             let frame = vm.frame_count().saturating_sub(1);
             vm.debug_locals(frame)
         })
@@ -448,13 +473,18 @@ pub(crate) fn debug_locals(driver: &PromiseDriver) -> JsValue {
 }
 
 pub(crate) fn debug_stack_trace(driver: &PromiseDriver) -> JsValue {
-    if driver.debug_session.borrow().is_none() {
+    let Some(root) = driver
+        .debug_session
+        .borrow()
+        .as_ref()
+        .map(|session| session.handle.id())
+    else {
         return js_sys::Array::new().into();
-    }
+    };
     let frames = driver
         .interp
         .runtime()
-        .with_paused_task_vm(|vm| vm.debug_stack_trace())
+        .with_paused_root_vm(root, |vm| vm.debug_stack_trace())
         .unwrap_or_default();
     let array = js_sys::Array::new();
     for frame in frames {
@@ -648,9 +678,9 @@ fn drive_and_settle(driver: &Rc<PromiseDriver>) {
         if let Some(session) = debug_slot.as_mut() {
             session.debug.instructions_remaining = DEBUG_INSTRUCTION_BUDGET;
         }
-        let _debug_guard = debug_slot
-            .as_mut()
-            .map(|session| sema_vm::ActiveDebugGuard::enter(&mut session.debug));
+        let _debug_guard = debug_slot.as_mut().map(|session| {
+            sema_vm::ActiveDebugGuard::enter_for_root(&mut session.debug, session.handle.id())
+        });
         match interp.drive_turn() {
             Ok(state) => state,
             Err(fault) => {
@@ -684,7 +714,17 @@ fn drive_and_settle(driver: &Rc<PromiseDriver>) {
     // an explicit continue/step call; scheduling here would busy-spin on the
     // same `DebugStopped` forever.
     if matches!(drive_state, DriveState::DebugStopped { .. })
-        || (driver.interp.runtime().is_debug_paused() && !debug_action_pending)
+        || (driver
+            .debug_session
+            .borrow()
+            .as_ref()
+            .is_some_and(|session| {
+                driver
+                    .interp
+                    .runtime()
+                    .is_debug_paused_for(session.handle.id())
+            })
+            && !debug_action_pending)
     {
         if !ordinary_pending {
             // No Promise is awaiting progress while paused. Let the JS
@@ -837,7 +877,7 @@ fn settle_debug_action(driver: &PromiseDriver, drive_state: &DriveState) {
                 delivery
             }
             RootPoll::Pending => match drive_state {
-                DriveState::DebugStopped { info, .. } => {
+                DriveState::DebugStopped { root, info, .. } if *root == session.handle.id() => {
                     let root = session.handle.id();
                     let action = session.action.take();
                     action.map(|action| {

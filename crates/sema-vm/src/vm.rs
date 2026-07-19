@@ -6,7 +6,7 @@ use smallvec::SmallVec;
 
 use sema_core::runtime::{
     multimethod_call, CancellationView, NativeCallContext, NativeContinuation, NativeOutcome,
-    NativeResult, ResumeInput, Trace,
+    NativeResult, ResumeInput, RootId, Trace,
 };
 use sema_core::{
     bits_to_spur,
@@ -857,8 +857,13 @@ thread_local! {
     /// `&mut DebugState` it owns is DORMANT (not otherwise touched) — the scheduler
     /// reborrows it through this raw pointer for the duration of one task step and
     /// drops the borrow before returning, so no two live `&mut` ever alias.
-    static ACTIVE_DEBUG: RefCell<Vec<*mut crate::debug::DebugState>> =
-        const { RefCell::new(Vec::new()) };
+    static ACTIVE_DEBUG: RefCell<Vec<ActiveDebugTarget>> = const { RefCell::new(Vec::new()) };
+}
+
+#[derive(Clone, Copy)]
+struct ActiveDebugTarget {
+    state: *mut crate::debug::DebugState,
+    root: Option<RootId>,
 }
 
 /// RAII guard registering a `DebugState` as the active debug session for the
@@ -872,8 +877,21 @@ pub struct ActiveDebugGuard;
 
 impl ActiveDebugGuard {
     pub fn enter(debug: &mut crate::debug::DebugState) -> Self {
-        let ptr = debug as *mut crate::debug::DebugState;
-        ACTIVE_DEBUG.with(|stack| stack.borrow_mut().push(ptr));
+        Self::enter_target(debug, None)
+    }
+
+    /// Register a debugger that applies only to `root`. Other ready roots in
+    /// the same runtime continue through ordinary non-debug quanta.
+    pub fn enter_for_root(debug: &mut crate::debug::DebugState, root: RootId) -> Self {
+        Self::enter_target(debug, Some(root))
+    }
+
+    fn enter_target(debug: &mut crate::debug::DebugState, root: Option<RootId>) -> Self {
+        ACTIVE_DEBUG.with(|stack| {
+            stack
+                .borrow_mut()
+                .push(ActiveDebugTarget { state: debug, root });
+        });
         ActiveDebugGuard
     }
 }
@@ -893,6 +911,17 @@ pub fn is_debug_session_active() -> bool {
     ACTIVE_DEBUG.with(|stack| !stack.borrow().is_empty())
 }
 
+/// True when the innermost active debugger applies to `root`. An unscoped
+/// debugger applies to every root, preserving the native DAP contract.
+pub(crate) fn is_debug_session_active_for(root: RootId) -> bool {
+    ACTIVE_DEBUG.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .is_some_and(|target| target.root.is_none_or(|expected| expected == root))
+    })
+}
+
 /// Run `f` with a mutable borrow of the innermost active `DebugState`, if any.
 /// Returns `None` when no debug session is active on this thread (the scheduler's
 /// non-debug path). Used by the scheduler to reach the `DebugState` it cannot
@@ -903,8 +932,26 @@ pub fn is_debug_session_active() -> bool {
 /// native call that re-entered the scheduler and does not touch its
 /// `&mut DebugState` while blocked. The reborrow does not escape `f`.
 pub fn with_active_debug<R>(f: impl FnOnce(&mut crate::debug::DebugState) -> R) -> Option<R> {
-    let ptr = ACTIVE_DEBUG.with(|stack| stack.borrow().last().copied())?;
+    let ptr = ACTIVE_DEBUG.with(|stack| stack.borrow().last().map(|target| target.state))?;
     // SAFETY: as documented above.
+    let debug = unsafe { &mut *ptr };
+    Some(f(debug))
+}
+
+pub(crate) fn with_active_debug_for_root<R>(
+    root: RootId,
+    f: impl FnOnce(&mut crate::debug::DebugState) -> R,
+) -> Option<R> {
+    let ptr = ACTIVE_DEBUG.with(|stack| {
+        stack.borrow().last().and_then(|target| {
+            target
+                .root
+                .is_none_or(|expected| expected == root)
+                .then_some(target.state)
+        })
+    })?;
+    // SAFETY: see `ACTIVE_DEBUG`. Root filtering does not change the guard's
+    // lifetime or permit the pointer to escape this call.
     let debug = unsafe { &mut *ptr };
     Some(f(debug))
 }

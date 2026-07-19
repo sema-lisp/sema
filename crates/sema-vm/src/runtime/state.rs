@@ -1392,6 +1392,15 @@ impl Runtime {
         self.state.borrow().debug_paused.is_some()
     }
 
+    /// Whether the cooperative debug barrier belongs to `root`.
+    pub fn is_debug_paused_for(&self, root: RootId) -> bool {
+        self.state
+            .borrow()
+            .debug_paused
+            .as_ref()
+            .is_some_and(|(paused_root, _, _)| *paused_root == root)
+    }
+
     /// Clear the cooperative debug barrier and re-enqueue the paused task so the
     /// next [`drive`] resumes its frame. The host sets the step mode on its
     /// `DebugState` (reached via `ACTIVE_DEBUG` during the quantum) BEFORE calling
@@ -1402,7 +1411,24 @@ impl Runtime {
     ///
     /// [`drive`]: Self::drive
     pub fn debug_resume(&self) -> bool {
+        self.debug_resume_matching(None)
+    }
+
+    /// Resume only when the paused task belongs to `root`. A mismatched root
+    /// leaves the barrier and task untouched.
+    pub fn debug_resume_root(&self, root: RootId) -> bool {
+        self.debug_resume_matching(Some(root))
+    }
+
+    fn debug_resume_matching(&self, expected_root: Option<RootId>) -> bool {
         let mut state = self.state.borrow_mut();
+        if state
+            .debug_paused
+            .as_ref()
+            .is_none_or(|(root, _, _)| expected_root.is_some_and(|expected| expected != *root))
+        {
+            return false;
+        }
         let Some((root, task_id, _info)) = state.debug_paused.take() else {
             return false;
         };
@@ -1421,8 +1447,24 @@ impl Runtime {
     /// is set). The paused task's VM never leaves the runtime — this borrows it in
     /// place, so resume is an ordinary quantum re-entry.
     pub fn with_paused_task_vm<R>(&self, f: impl FnOnce(&mut VM) -> R) -> Option<R> {
+        self.with_paused_vm_matching(None, f)
+    }
+
+    /// Inspect the paused VM only when its task belongs to `root`.
+    pub fn with_paused_root_vm<R>(&self, root: RootId, f: impl FnOnce(&mut VM) -> R) -> Option<R> {
+        self.with_paused_vm_matching(Some(root), f)
+    }
+
+    fn with_paused_vm_matching<R>(
+        &self,
+        expected_root: Option<RootId>,
+        f: impl FnOnce(&mut VM) -> R,
+    ) -> Option<R> {
         let mut state = self.state.borrow_mut();
-        let (_root, task_id, _info) = state.debug_paused.as_ref()?;
+        let (root, task_id, _info) = state.debug_paused.as_ref()?;
+        if expected_root.is_some_and(|expected| expected != *root) {
+            return None;
+        }
         let task_id = *task_id;
         let vm = state.tasks.get_mut(&task_id)?.vm_call.as_mut()?;
         Some(f(vm))
@@ -1441,7 +1483,26 @@ impl Runtime {
     ///
     /// [`drive`]: Self::drive
     pub fn debug_cancel_paused(&self) -> bool {
-        let paused = self.state.borrow_mut().debug_paused.take();
+        self.debug_cancel_paused_matching(None)
+    }
+
+    /// Cancel only when the paused task belongs to `root`. A mismatched root
+    /// cannot clear or cancel another debugger's barrier.
+    pub fn debug_cancel_paused_root(&self, root: RootId) -> bool {
+        self.debug_cancel_paused_matching(Some(root))
+    }
+
+    fn debug_cancel_paused_matching(&self, expected_root: Option<RootId>) -> bool {
+        let paused =
+            {
+                let mut state = self.state.borrow_mut();
+                if state.debug_paused.as_ref().is_none_or(|(root, _, _)| {
+                    expected_root.is_some_and(|expected| expected != *root)
+                }) {
+                    return false;
+                }
+                state.debug_paused.take()
+            };
         let Some((root, task_id, _info)) = paused else {
             return false;
         };
@@ -2168,11 +2229,11 @@ impl Runtime {
             // `run_parked_quantum` as enqueued callback-VM quanta — stop and serve
             // inspection against the stopped task's own VM. Otherwise the byte-
             // identical non-debug quantum.
-            let quantum = if crate::vm::is_debug_session_active() {
-                crate::vm::with_active_debug(|debug| {
+            let quantum = if crate::vm::is_debug_session_active_for(root) {
+                crate::vm::with_active_debug_for_root(root, |debug| {
                     vm.run_quantum_debug(&context, remaining_budget, cancellation, debug)
                 })
-                .expect("debug session active but no DebugState registered")
+                .expect("debug session active for root but no DebugState registered")
             } else {
                 vm.run_quantum(&context, remaining_budget, cancellation)
             };
@@ -3864,11 +3925,11 @@ impl Runtime {
                 break ElementOutcome::Settled(resumed);
             }
             let cancellation_view = CancellationView::default();
-            let quantum = if crate::vm::is_debug_session_active() {
-                crate::vm::with_active_debug(|debug| {
+            let quantum = if crate::vm::is_debug_session_active_for(root) {
+                crate::vm::with_active_debug_for_root(root, |debug| {
                     vm.run_quantum_debug(&eval_context, remaining_budget, cancellation_view, debug)
                 })
-                .expect("debug session active but no DebugState registered")
+                .expect("debug session active for root but no DebugState registered")
             } else {
                 vm.run_quantum(&eval_context, remaining_budget, cancellation_view)
             };

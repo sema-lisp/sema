@@ -61,6 +61,37 @@ test('promise debugger preserves the fetch frame and executes the request once',
   expect(result.ordinaryOutput).toEqual([]);
 });
 
+test('promise debugger stops and cancels only its target root in one interpreter', async ({ page }) => {
+  await page.goto('/');
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the playground server at runtime.
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+    let ordinaryRoot = 0;
+    const ordinary = interp
+      .evalPromise('(+ 40 2)', (root: number) => {
+        ordinaryRoot = root;
+      })
+      .then(
+        (value: string) => ({ ok: true, value }),
+        (error: Error) => ({ ok: false, error: error.message }),
+      );
+    const debugCode = [...Array(19).fill('; line padding'), '(+ 1 2)'].join('\n');
+
+    const stopped = await interp.debugStartPromise(debugCode, []);
+    const stopAccepted = interp.debugStopPromise();
+    const ordinaryResult = await ordinary;
+    return { ordinaryRoot, stopped, stopAccepted, ordinaryResult };
+  });
+
+  expect(result.stopped).toMatchObject({ status: 'stopped', line: 20 });
+  expect(result.stopped.rootId).not.toBe(result.ordinaryRoot);
+  expect(result.stopAccepted).toBe(true);
+  expect(result.ordinaryResult).toEqual({ ok: true, value: '42' });
+});
+
 test('stopping one promise debugger cancels only its colliding interpreter root', async ({ page }) => {
   await page.route('**/debug-promise-isolation', async (route) => {
     await new Promise((resolve) => setTimeout(resolve, 60));

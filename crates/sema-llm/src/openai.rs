@@ -189,6 +189,7 @@ impl OpenAiProvider {
                 content: Some(serde_json::Value::String(system.clone())),
                 tool_calls: None,
                 tool_call_id: None,
+                name: None,
             });
         }
 
@@ -218,14 +219,21 @@ impl OpenAiProvider {
                             .collect(),
                     ),
                     tool_call_id: None,
+                    name: None,
                 });
             } else if m.role == "tool" {
-                // Tool result — must be role:"tool" with the matching tool_call_id.
+                // Mistral also requires the originating function name on a
+                // correlated tool result; OpenAI-compatible peers do not.
                 messages.push(OpenAiMessage {
                     role: "tool".to_string(),
                     content: Some(serialize_openai_content(&m.content)),
                     tool_calls: None,
                     tool_call_id: m.tool_call_id.clone(),
+                    name: if self.name == "mistral" {
+                        m.tool_name.clone()
+                    } else {
+                        None
+                    },
                 });
             } else {
                 messages.push(OpenAiMessage {
@@ -233,6 +241,7 @@ impl OpenAiProvider {
                     content: Some(serialize_openai_content(&m.content)),
                     tool_calls: None,
                     tool_call_id: None,
+                    name: None,
                 });
             }
         }
@@ -723,6 +732,9 @@ struct OpenAiMessage {
     /// Set on `role: "tool"` messages to correlate the result with the call.
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    /// Required by Mistral on `role: "tool"` messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1210,5 +1222,43 @@ mod tests {
             .find(|m| m.role == "tool")
             .expect("tool result message present");
         assert_eq!(tool.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(tool.name, None);
+    }
+
+    #[test]
+    fn mistral_tool_results_serialize_name_and_correlation() {
+        let p = OpenAiProvider::named(
+            "mistral".into(),
+            "k".into(),
+            "https://api.mistral.ai/v1".into(),
+            "mistral-small-latest".into(),
+            false,
+        )
+        .expect("Mistral provider configuration is valid");
+        let r = ChatRequest::new(
+            "mistral-small-latest".into(),
+            vec![
+                ChatMessage::new("user", "weather?"),
+                ChatMessage::assistant_with_tool_calls(
+                    "",
+                    vec![ToolCall {
+                        id: "VvvODy9mT".into(),
+                        name: "get_weather".into(),
+                        arguments: serde_json::json!({"city": "Oslo"}),
+                        thought_signature: None,
+                    }],
+                ),
+                ChatMessage::tool_result("VvvODy9mT", "get_weather", "sunny"),
+            ],
+        );
+        let body = p.build_request_body(&r);
+
+        let tool = body
+            .messages
+            .iter()
+            .find(|message| message.role == "tool")
+            .expect("tool result message present");
+        assert_eq!(tool.tool_call_id.as_deref(), Some("VvvODy9mT"));
+        assert_eq!(tool.name.as_deref(), Some("get_weather"));
     }
 }

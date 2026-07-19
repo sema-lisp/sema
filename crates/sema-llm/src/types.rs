@@ -79,8 +79,8 @@ pub struct ChatMessage {
     /// result answers. `None` for ordinary messages. Providers use this to match
     /// the result to the call (`tool_call_id` / `tool_use_id` / `functionResponse`).
     pub tool_call_id: Option<String>,
-    /// For a tool-result message: the name of the tool that produced it (Gemini's
-    /// `functionResponse` keys results by name).
+    /// For a tool-result message: the name of the tool that produced it (Mistral
+    /// requires it on tool messages; Gemini keys `functionResponse` by name).
     pub tool_name: Option<String>,
 }
 

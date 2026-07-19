@@ -130,6 +130,31 @@ fn db_async_query_matches_sync() {
         )
         .expect("async db chain");
     assert_eq!(sync_v, async_v);
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "db/close must return the runtime's gate registry to baseline"
+    );
+}
+
+#[test]
+fn db_gate_created_via_runtime_closes_through_compiled_entrypoint() {
+    let interp = Interpreter::new();
+    interp
+        .eval_str_via_runtime(
+            r#"
+            (db/open-memory "mixed-entry-close")
+            (db/exec "mixed-entry-close" "CREATE TABLE t (v INTEGER)")
+            "#,
+        )
+        .expect("runtime entry creates and uses database");
+    assert_eq!(interp.runtime_resource_gate_count(), 1);
+
+    let result = interp
+        .eval_str_compiled(r#"(db/close "mixed-entry-close")"#)
+        .expect("compiled entry closes the runtime-created gate");
+    assert!(result.is_nil());
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
 }
 
 /// `db/open` (real file, not `:memory:`) offloads through `fs_offload` — a
@@ -286,6 +311,7 @@ fn db_cancelled_chain_settles_cancelled_and_registry_stays_usable() {
         Some(1),
         "a fresh handle must work after the cancellation (registry not wedged)"
     );
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
 }
 
 // A cancelled sibling must not corrupt a shared handle for the others. `mid` is
@@ -326,4 +352,5 @@ fn db_cancelled_sibling_does_not_corrupt_shared_handle() {
         vec!["a".to_string(), "c".to_string()],
         "both non-cancelled writers must land and the cancelled one must not, got {got:?}"
     );
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
 }

@@ -33,7 +33,9 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateId};
 use sema_core::{check_arity, in_runtime_quantum, Caps, SemaError, Value};
 
-use crate::runtime_offload::{checkout_external, group_sigkill_abort, CheckoutOp};
+use crate::runtime_offload::{
+    checkout_external, finish_terminal_gate, group_sigkill_abort, CheckoutOp,
+};
 
 /// Completion-kind tag for `pty/*` external waits ("pty\0").
 const PTY_COMPLETION_KIND: u64 = 0x7074_7900;
@@ -281,6 +283,14 @@ fn checkout_runtime<T: Send + 'static>(
                 g.borrow_mut().insert(id, gid);
             });
         }),
+        remove_gate: Rc::new(move |gid| {
+            PTY_GATES.with(|g| {
+                let mut gates = g.borrow_mut();
+                if gates.get(&id).copied() == Some(gid) {
+                    gates.remove(&id);
+                }
+            });
+        }),
         take: Box::new(move || take_pty(op_name, id)),
         op: Box::new(op),
         reinstall: Box::new(move |pt| {
@@ -296,6 +306,7 @@ fn checkout_runtime<T: Send + 'static>(
             });
         }),
         abort,
+        terminal_on_success: false,
     })
 }
 
@@ -369,7 +380,21 @@ fn pty_close_runtime(id: i64) -> NativeResult {
     });
     match action {
         CloseAction::Busy => Err(busy_err("pty/close", id)),
-        CloseAction::Noop => Ok(NativeOutcome::Return(Value::nil())),
+        CloseAction::Noop => {
+            let gate = PTY_GATES.with(|g| g.borrow().get(&id).copied());
+            finish_terminal_gate(
+                gate,
+                Rc::new(move |gid| {
+                    PTY_GATES.with(|g| {
+                        let mut gates = g.borrow_mut();
+                        if gates.get(&id).copied() == Some(gid) {
+                            gates.remove(&id);
+                        }
+                    });
+                }),
+                Ok(Value::nil()),
+            )
+        }
         CloseAction::Proceed => {
             let kind = CompletionKind::try_from_raw(PTY_COMPLETION_KIND)
                 .expect("pty completion kind is nonzero");
@@ -381,6 +406,14 @@ fn pty_close_runtime(id: i64) -> NativeResult {
                 store_gate: Box::new(move |gid| {
                     PTY_GATES.with(|g| {
                         g.borrow_mut().insert(id, gid);
+                    });
+                }),
+                remove_gate: Rc::new(move |gid| {
+                    PTY_GATES.with(|g| {
+                        let mut gates = g.borrow_mut();
+                        if gates.get(&id).copied() == Some(gid) {
+                            gates.remove(&id);
+                        }
                     });
                 }),
                 take: Box::new(move || take_pty("pty/close", id)),
@@ -398,9 +431,6 @@ fn pty_close_runtime(id: i64) -> NativeResult {
                     PTYS.with(|p| {
                         p.borrow_mut().remove(&id);
                     });
-                    PTY_GATES.with(|g| {
-                        g.borrow_mut().remove(&id);
-                    });
                 }),
                 decode: Box::new(|()| Ok(Value::nil())),
                 success_value: None,
@@ -410,6 +440,7 @@ fn pty_close_runtime(id: i64) -> NativeResult {
                     });
                 }),
                 abort: None,
+                terminal_on_success: true,
             })
         }
     }

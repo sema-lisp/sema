@@ -481,6 +481,14 @@ impl Interpreter {
             .map_or(0, sema_vm::runtime::Runtime::live_task_count)
     }
 
+    /// Number of live per-resource runtime gates. Terminal resource teardown
+    /// returns this count to its previous baseline.
+    pub fn runtime_resource_gate_count(&self) -> usize {
+        self.runtime
+            .as_ref()
+            .map_or(0, sema_vm::runtime::Runtime::resource_gate_count)
+    }
+
     /// The interpreter's single persistent unified runtime. Present outside of
     /// `Drop`. A host that needs finer control than [`drive_vm_on_runtime`] — the
     /// cooperative (headless) debugger, which drives bounded turns and maps

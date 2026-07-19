@@ -221,6 +221,11 @@ impl Interpreter {
         self.inner.runtime_live_task_count()
     }
 
+    /// Number of live per-resource gates on the persistent runtime.
+    pub fn runtime_resource_gate_count(&self) -> usize {
+        self.inner.runtime_resource_gate_count()
+    }
+
     /// Register a native function that can be called from Sema code.
     ///
     /// # Example

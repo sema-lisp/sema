@@ -170,6 +170,31 @@ fn kv_async_open_set_get_delete_matches_sync() {
         .expect("async kv chain");
 
     assert_eq!(sync_v, async_v);
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "kv/close must return the runtime's gate registry to baseline"
+    );
+}
+
+#[test]
+fn kv_gate_created_via_runtime_closes_through_compiled_entrypoint() {
+    let kv = TempKv::new("mixed-entry-close");
+    let interp = Interpreter::new();
+    interp
+        .eval_str_via_runtime(&format!(
+            r#"(kv/open "mixed-entry-close" "{}")
+                (kv/set "mixed-entry-close" "k" "v")"#,
+            kv.path()
+        ))
+        .expect("runtime entry creates and mutates store");
+    assert_eq!(interp.runtime_resource_gate_count(), 1);
+
+    let result = interp
+        .eval_str_compiled(r#"(kv/close "mixed-entry-close")"#)
+        .expect("compiled entry closes the runtime-created gate");
+    assert!(result.is_nil());
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
 }
 
 /// `kv/open` on a brand-new path offloads through `fs_offload` — a distinct
@@ -312,6 +337,7 @@ fn kv_cancelled_chain_settles_and_registry_stays_usable() {
     let parts: Vec<Value> = result.as_list().expect("list").to_vec();
     assert_eq!(parts[0], Value::keyword("caught"));
     assert_eq!(parts[1], Value::string("ok"));
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
     let _ = std::fs::remove_file(&p1);
     let _ = std::fs::remove_file(&p2);
 }
@@ -347,5 +373,6 @@ fn kv_cancelled_sibling_does_not_corrupt_shared_store() {
         Some(2),
         "both non-cancelled writers must land; the cancelled one must not"
     );
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
     let _ = std::fs::remove_file(&path);
 }

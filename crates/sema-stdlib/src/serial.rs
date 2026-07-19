@@ -26,7 +26,7 @@
 //! `serial/*` op on the SAME handle either errors clearly (the sync path, and
 //! `serial/close`, on `CheckedOut`) or parks FIFO on the gate. A mid-flight
 //! cancel tombstones the slot (best-effort — the port cannot be reclaimed) and
-//! releases the gate; there is no process to signal, so no abort runs.
+//! closes the gate; there is no process to signal, so no abort runs.
 //!
 //! `serial/write`'s `flush()` is included in its offload — on most serialport
 //! backends flush maps to `tcdrain(3)`, which blocks until every queued byte
@@ -51,7 +51,7 @@ use std::time::Duration;
 use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateId};
 use sema_core::{check_arity, in_runtime_quantum, Caps, SemaError, Value};
 
-use crate::runtime_offload::{checkout_external, CheckoutOp};
+use crate::runtime_offload::{checkout_external, finish_terminal_gate, CheckoutOp};
 
 /// Completion-kind tag for `serial/*` external waits ("srl\0").
 const SERIAL_COMPLETION_KIND: u64 = 0x7372_6c00;
@@ -181,7 +181,7 @@ fn with_port<R>(
 /// `Port` and decode the result on the VM thread before releasing the gate. A
 /// second `serial/*` op on a busy handle parks FIFO on the gate; a mid-flight
 /// cancel tombstones the slot (best-effort — the blocking call keeps running
-/// unattended, so the port cannot be reclaimed) and releases the gate. There is
+/// unattended, so the port cannot be reclaimed) and closes the gate. There is
 /// no process to signal, so — unlike proc/pty — cancellation runs no abort.
 fn checkout_runtime<T: Send + 'static>(
     op_name: &'static str,
@@ -201,6 +201,14 @@ fn checkout_runtime<T: Send + 'static>(
                 g.borrow_mut().insert(handle, gid);
             });
         }),
+        remove_gate: Rc::new(move |gid| {
+            SERIAL_GATES.with(|g| {
+                let mut gates = g.borrow_mut();
+                if gates.get(&handle).copied() == Some(gid) {
+                    gates.remove(&handle);
+                }
+            });
+        }),
         take: Box::new(move || take_port(op_name, handle)),
         op: Box::new(op),
         reinstall: Box::new(move |port| {
@@ -216,6 +224,7 @@ fn checkout_runtime<T: Send + 'static>(
             });
         }),
         abort: None,
+        terminal_on_success: false,
     })
 }
 
@@ -312,7 +321,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // a tombstoned handle is a silent no-op removal — `serial/close` remains
     // the documented way to free either. A missing handle keeps the original
     // synchronous error text verbatim.
-    crate::register_fn_gated(env, sandbox, Caps::SERIAL, "serial/close", |args| {
+    crate::register_runtime_fn_gated(env, sandbox, Caps::SERIAL, "serial/close", |args| {
         check_arity!(args, "serial/close", 1);
         let handle = args[0]
             .as_int()
@@ -334,10 +343,19 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         // The handle's resource gate is dropped here too; a successful close
         // implies the gate is idle (a busy gate means CheckedOut, which errors
         // above), so no waiter is stranded.
-        SERIAL_GATES.with(|g| {
-            g.borrow_mut().remove(&handle);
-        });
-        Ok(Value::nil())
+        let gate = SERIAL_GATES.with(|g| g.borrow().get(&handle).copied());
+        finish_terminal_gate(
+            gate,
+            Rc::new(move |id| {
+                SERIAL_GATES.with(|g| {
+                    let mut gates = g.borrow_mut();
+                    if gates.get(&handle).copied() == Some(id) {
+                        gates.remove(&handle);
+                    }
+                });
+            }),
+            Ok(Value::nil()),
+        )
     });
 
     // (serial/write handle string) => nil

@@ -215,6 +215,11 @@ fn stream_file_async_write_flush_close_matches_sync() {
     let async_contents = std::fs::read_to_string(&async_path).unwrap();
     assert_eq!(sync_contents, "hello world");
     assert_eq!(async_contents, "hello world");
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "stream/close must return both file stream gates to baseline"
+    );
 
     let _ = std::fs::remove_file(&sync_path);
     let _ = std::fs::remove_file(&async_path);
@@ -557,4 +562,5 @@ fn stream_file_async_cancel_settles_and_fresh_stream_works() {
         Value::string("a"),
         "a freshly opened stream must read normally after the cancellation (runtime not wedged)"
     );
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
 }

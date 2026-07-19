@@ -113,6 +113,11 @@ fn proc_wait_async_matches_sync_exit_code() {
         .expect("async proc/wait");
     assert_eq!(sync_v, async_v);
     assert_eq!(sync_v, Value::int(5));
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "proc/close must return the runtime's gate registry to baseline"
+    );
 }
 
 /// `proc/wait` called twice (sequentially) on the same handle inside one
@@ -204,6 +209,7 @@ fn proc_cancelled_wait_settles_cancelled_and_registry_stays_usable() {
         Some(4),
         "a fresh proc handle must work after the cancellation (registry not wedged)"
     );
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
 }
 
 // A sibling queued behind a busy handle: `slow` holds the gate on a long
@@ -318,6 +324,11 @@ fn pty_wait_async_matches_sync_exit_code() {
         .expect("async pty/wait");
     assert_eq!(sync_v, async_v);
     assert_eq!(sync_v, Value::int(5));
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "pty/close must return the runtime's gate registry to baseline"
+    );
 }
 
 /// Cancelling a spawned pty chain settles the task Cancelled and leaves the
@@ -356,6 +367,7 @@ fn pty_cancelled_wait_settles_cancelled_and_registry_stays_usable() {
         Some(4),
         "a fresh pty handle must work after the cancellation"
     );
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
 }
 
 /// A queued pty waiter cancelled while parked behind a busy handle, then the

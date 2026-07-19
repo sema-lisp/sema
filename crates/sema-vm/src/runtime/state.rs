@@ -23,9 +23,10 @@ use crate::{
 use sema_core::runtime::ExternalFailure;
 use sema_core::runtime::{
     CancelReason, CancellationView, IdCounter, IoExecutor, NativeCall, NativeCallContext,
-    NativeOutcome, NativeResult, ResourceGateId, ResumeInput, RootId, RuntimeId, RuntimeRequest,
-    RuntimeResponse, RuntimeScopedIdCounter, RuntimeTaskId, SettlementSeq, TaskContextHandle,
-    TaskId, TaskOutcome, TaskSettlement, Trace, WaitKind,
+    NativeContinuation, NativeOutcome, NativeResult, ResourceGateCloseError, ResourceGateHandle,
+    ResourceGateId, ResumeInput, RootId, RuntimeId, RuntimeRequest, RuntimeResponse,
+    RuntimeScopedIdCounter, RuntimeTaskId, SettlementSeq, TaskContextHandle, TaskId, TaskOutcome,
+    TaskSettlement, Trace, WaitKind,
 };
 use sema_core::runtime::{CancellationParent, LifetimeOwner, TaskRelations};
 #[cfg(test)]
@@ -58,6 +59,72 @@ pub enum RuntimeFault {
 pub struct Runtime {
     runtime_id: RuntimeId,
     pub(super) state: Rc<RefCell<RuntimeState>>,
+}
+
+/// Owns a freshly allocated gate until its response reaches the requesting
+/// continuation. Sticky cancellation replaces that response before module code
+/// can observe the id, so this wrapper closes the gate first and only then
+/// forwards cancellation to the original continuation.
+struct ResourceGateAllocationDelivery {
+    gate: ResourceGateHandle,
+    continuation: Box<dyn NativeContinuation>,
+}
+
+impl Trace for ResourceGateAllocationDelivery {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        self.gate.trace(sink) && self.continuation.trace(sink)
+    }
+}
+
+impl NativeContinuation for ResourceGateAllocationDelivery {
+    fn resume(
+        self: Box<Self>,
+        context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let Self { gate, continuation } = *self;
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::ResourceGate(delivered))
+                if delivered.id() == gate.id() =>
+            {
+                continuation.resume(
+                    context,
+                    ResumeInput::Runtime(RuntimeResponse::ResourceGate(delivered)),
+                )
+            }
+            ResumeInput::Cancelled(reason) => {
+                gate.close().map_err(|error| {
+                    sema_core::SemaError::eval(format!(
+                        "failed to close a cancelled resource-gate allocation: {error}"
+                    ))
+                })?;
+                continuation.resume(context, ResumeInput::Cancelled(reason))
+            }
+            other => {
+                gate.close().map_err(|error| {
+                    sema_core::SemaError::eval(format!(
+                        "failed to close an undeliverable resource-gate allocation: {error}"
+                    ))
+                })?;
+                continuation.resume(context, other)
+            }
+        }
+    }
+}
+
+/// Remove one gate and stage every Closed wake. Runtime requests and the
+/// host-only weak capability share this exact registry transition.
+fn close_resource_gate(
+    state: &mut RuntimeState,
+    gate: ResourceGateId,
+) -> Result<bool, RegistryError> {
+    let removed = state.resource_gates.close(gate)?;
+    while let Some(wake) = state.resource_gates.pop_wake() {
+        state
+            .pending
+            .push_back(PendingStage::ResourceGateWake(wake));
+    }
+    Ok(removed)
 }
 
 impl Trace for Runtime {
@@ -814,6 +881,23 @@ impl Runtime {
         })
     }
 
+    fn resource_gate_handle(&self, gate: ResourceGateId) -> ResourceGateHandle {
+        let state = Rc::downgrade(&self.state);
+        ResourceGateHandle::new(
+            gate,
+            Rc::new(move |gate| {
+                let state = state
+                    .upgrade()
+                    .ok_or(ResourceGateCloseError::RuntimeUnavailable)?;
+                let mut state = state
+                    .try_borrow_mut()
+                    .map_err(|_| ResourceGateCloseError::RuntimeBusy)?;
+                close_resource_gate(&mut state, gate)
+                    .map_err(|_| ResourceGateCloseError::WrongRuntime)
+            }),
+        )
+    }
+
     #[cfg(test)]
     pub(super) fn set_drive_cursor_for_test(&self, cursor: usize) {
         self.state.borrow_mut().drive_cursor = cursor;
@@ -1048,6 +1132,13 @@ impl Runtime {
     /// analogue of the retired legacy `scheduler_task_count()`.
     pub fn live_task_count(&self) -> usize {
         self.state.borrow().tasks.len()
+    }
+
+    /// Number of live per-handle resource gates. This is a lifecycle
+    /// observability oracle: terminal resource teardown returns it to its prior
+    /// baseline, while ordinary operations retain their reusable gate.
+    pub fn resource_gate_count(&self) -> usize {
+        self.state.borrow().resource_gates.len()
     }
 
     /// Whether any task is still parked on a wait with a cancellation recorded —
@@ -3096,23 +3187,29 @@ impl Runtime {
             return Ok(());
         }
         if let RuntimeRequest::CreateResourceGate { continuation } = request {
-            let response = self
-                .state
-                .borrow_mut()
-                .resource_gates
-                .allocate()
-                .map(RuntimeResponse::ResourceGate)
-                .map_err(|_| {
-                    sema_core::SemaError::eval("runtime resource gate identity exhausted")
-                });
+            let allocated = self.state.borrow_mut().resource_gates.allocate();
+            let (frame, response) = match allocated {
+                Ok(gate) => {
+                    let gate = self.resource_gate_handle(gate);
+                    let frame =
+                        ContinuationFrame::native(Box::new(ResourceGateAllocationDelivery {
+                            gate: gate.clone(),
+                            continuation,
+                        }));
+                    (frame, Ok(RuntimeResponse::ResourceGate(gate)))
+                }
+                Err(_) => (
+                    ContinuationFrame::native(continuation),
+                    Err(sema_core::SemaError::eval(
+                        "runtime resource gate identity exhausted",
+                    )),
+                ),
+            };
             self.state
                 .borrow_mut()
                 .pending
                 .push_back(PendingStage::ApplyRuntimeResponse(
-                    task_id,
-                    owner,
-                    ContinuationFrame::native(continuation),
-                    response,
+                    task_id, owner, frame, response,
                 ));
             return Ok(());
         }
@@ -3146,18 +3243,9 @@ impl Runtime {
         if let RuntimeRequest::CloseResourceGate { gate, continuation } = request {
             let response = {
                 let mut state = self.state.borrow_mut();
-                let result = state
-                    .resource_gates
-                    .close(gate)
-                    .map(|()| RuntimeResponse::Value(sema_core::Value::nil()))
-                    .map_err(registry_error);
-                // Every parked waiter fails `Closed`.
-                while let Some(wake) = state.resource_gates.pop_wake() {
-                    state
-                        .pending
-                        .push_back(PendingStage::ResourceGateWake(wake));
-                }
-                result
+                close_resource_gate(&mut state, gate)
+                    .map(|_| RuntimeResponse::Value(sema_core::Value::nil()))
+                    .map_err(registry_error)
             };
             self.state
                 .borrow_mut()
@@ -4562,6 +4650,22 @@ impl Runtime {
     #[cfg(test)]
     pub(super) fn resource_gate_owner_for_test(&self, gate: ResourceGateId) -> Option<TaskId> {
         self.state.borrow().resource_gates.owner_of(gate)
+    }
+
+    #[cfg(test)]
+    pub(super) fn resource_gate_count_for_test(&self) -> usize {
+        self.resource_gate_count()
+    }
+
+    #[cfg(test)]
+    pub(super) fn create_resource_gate_handle_for_test(&self) -> ResourceGateHandle {
+        let gate = self
+            .state
+            .borrow_mut()
+            .resource_gates
+            .allocate()
+            .expect("test resource-gate identity");
+        self.resource_gate_handle(gate)
     }
 
     #[cfg(test)]

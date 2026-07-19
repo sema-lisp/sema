@@ -41,6 +41,11 @@ fn serial_write_async_missing_handle_matches_sync() {
         async_err.contains("serial/write: invalid handle 999"),
         "async rejection must carry the byte-identical missing-handle text\n  sync:  {sync_err}\n  async: {async_err}"
     );
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "a missing handle discovered after acquire must close its lazy gate"
+    );
 }
 
 #[test]
@@ -116,4 +121,5 @@ fn serial_cancelled_chain_settles_and_registry_stays_usable() {
         sema_core::Value::keyword("after-errored"),
         "a fresh serial op must still error cleanly after the cancellation (registry not wedged)"
     );
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
 }

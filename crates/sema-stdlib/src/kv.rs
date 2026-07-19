@@ -25,7 +25,7 @@
 //! on a busy store parks FIFO on the gate; a concurrent `kv/get`/`kv/keys` sees
 //! `CheckedOut` and reports a clear busy error. A mid-flight cancel tombstones the
 //! slot (best-effort — the write completes unattended, never torn mid-write) and
-//! releases the gate so a queued sibling fails fast.
+//! closes the gate so every queued sibling wakes with a terminal error.
 //!
 //! `kv/get`/`kv/keys` are pure in-memory reads — no I/O — so they never
 //! offload, but stay checkout-aware (`with_store`) so a store busy with an
@@ -42,7 +42,7 @@ use std::rc::Rc;
 use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateId};
 use sema_core::{check_arity, in_runtime_quantum, SemaError, Value};
 
-use crate::runtime_offload::{checkout_external, CheckoutOp};
+use crate::runtime_offload::{checkout_external, finish_terminal_gate, CheckoutOp};
 
 /// Completion-kind tag for `kv/*` external waits ("kv\0\0").
 const KV_COMPLETION_KIND: u64 = 0x6b76_0000;
@@ -185,7 +185,7 @@ fn read_or_init_store(path: &str) -> Result<serde_json::Map<String, serde_json::
 /// gate. `mutate` runs on the worker while the gate is held, so no other `kv/*`
 /// call can observe the store mid-flush (they see `CheckedOut` and queue/error).
 /// A mid-flight cancel tombstones the slot (best-effort — the write completes
-/// unattended, never torn down mid-write) and releases the gate.
+/// unattended, never torn down mid-write) and closes the gate.
 fn checkout_runtime<R: Send + 'static>(
     op_name: &'static str,
     name: String,
@@ -199,6 +199,7 @@ fn checkout_runtime<R: Send + 'static>(
     let n_take = name.clone();
     let n_reinstall = name.clone();
     let n_tomb = name.clone();
+    let n_remove = name.clone();
     let n_store = name;
     checkout_external(CheckoutOp {
         op_name,
@@ -207,6 +208,14 @@ fn checkout_runtime<R: Send + 'static>(
         store_gate: Box::new(move |id| {
             KV_GATES.with(|g| {
                 g.borrow_mut().insert(n_store, id);
+            });
+        }),
+        remove_gate: Rc::new(move |id| {
+            KV_GATES.with(|g| {
+                let mut gates = g.borrow_mut();
+                if gates.get(&n_remove).copied() == Some(id) {
+                    gates.remove(&n_remove);
+                }
             });
         }),
         take: Box::new(move || take_store(op_name, &n_take)),
@@ -228,6 +237,7 @@ fn checkout_runtime<R: Send + 'static>(
             });
         }),
         abort: None,
+        terminal_on_success: false,
     })
 }
 
@@ -405,7 +415,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // remains the documented way to free either. The store's resource gate is
     // dropped here too; a successful `kv/close` implies the gate is idle (a busy
     // gate means CheckedOut, which errors above), so no waiter is stranded.
-    crate::register_fn(env, "kv/close", |args| {
+    crate::register_runtime_fn(env, "kv/close", |args| {
         check_arity!(args, "kv/close", 1);
         let name = args[0]
             .as_str()
@@ -422,10 +432,21 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             stores.remove(name);
             Ok(())
         })?;
-        KV_GATES.with(|g| {
-            g.borrow_mut().remove(name);
-        });
-        Ok(Value::nil())
+        let name = name.to_string();
+        let gate = KV_GATES.with(|g| g.borrow().get(&name).copied());
+        let remove_name = name;
+        finish_terminal_gate(
+            gate,
+            Rc::new(move |id| {
+                KV_GATES.with(|g| {
+                    let mut gates = g.borrow_mut();
+                    if gates.get(&remove_name).copied() == Some(id) {
+                        gates.remove(&remove_name);
+                    }
+                });
+            }),
+            Ok(Value::nil()),
+        )
     });
 }
 

@@ -4517,11 +4517,12 @@ impl NativeContinuation for GateHoldOwner {
         match self.stage {
             // Stage 0: the freshly-created gate arrived — record it, then acquire.
             0 => {
-                let ResumeInput::Runtime(sema_core::runtime::RuntimeResponse::ResourceGate(gate)) =
+                let ResumeInput::Runtime(sema_core::runtime::RuntimeResponse::ResourceGate(handle)) =
                     _input
                 else {
                     panic!("gate owner stage 0 expected a ResourceGate response");
                 };
+                let gate = handle.id();
                 self.gate_slot.set(Some(gate));
                 self.gate = Some(gate);
                 self.stage = 1;
@@ -4565,6 +4566,85 @@ impl NativeContinuation for GateDone {
     fn resume(self: Box<Self>, _: &mut NativeCallContext<'_>, _: ResumeInput) -> NativeResult {
         Ok(NativeOutcome::Return(Value::NIL))
     }
+}
+
+struct RecordCreatedGate(Rc<Cell<Option<sema_core::runtime::ResourceGateId>>>);
+
+impl Trace for RecordCreatedGate {
+    fn trace(&self, _: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for RecordCreatedGate {
+    fn resume(self: Box<Self>, _: &mut NativeCallContext<'_>, input: ResumeInput) -> NativeResult {
+        if let ResumeInput::Runtime(sema_core::runtime::RuntimeResponse::ResourceGate(handle)) =
+            input
+        {
+            self.0.set(Some(handle.id()));
+        }
+        Ok(NativeOutcome::Return(Value::NIL))
+    }
+}
+
+/// A cancellation recorded after gate allocation but before its allocation
+/// response reaches the caller must not strand an unnameable registry entry.
+#[test]
+fn cancelling_between_resource_gate_allocation_and_store_closes_the_gate() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let delivered = Rc::new(Cell::new(None));
+    let handle = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::CreateResourceGate {
+                continuation: Box::new(RecordCreatedGate(Rc::clone(&delivered))),
+            },
+        ))))
+        .expect("gate creator admitted");
+
+    let mut turns = 0;
+    while runtime.resource_gate_count_for_test() == 0 {
+        runtime.drive(&drive_budget(1)).expect("allocate gate");
+        turns += 1;
+        assert!(turns < 32, "gate allocation must be staged");
+    }
+    assert_eq!(
+        delivered.get(),
+        None,
+        "allocation response is still pending"
+    );
+
+    assert!(handle.cancel(CancelReason::Explicit));
+    while matches!(handle.poll_result(), RootPoll::Pending) {
+        runtime
+            .drive(&drive_budget(1))
+            .expect("settle cancellation");
+    }
+
+    assert_eq!(
+        delivered.get(),
+        None,
+        "cancelled caller never stores the gate"
+    );
+    assert_eq!(
+        runtime.resource_gate_count_for_test(),
+        0,
+        "the allocation delivery guard closes its owned gate"
+    );
+}
+
+#[test]
+fn resource_gate_handle_reports_a_dropped_runtime_instead_of_hiding_it() {
+    let handle = {
+        let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+        let handle = runtime.create_resource_gate_handle_for_test();
+        assert_eq!(runtime.resource_gate_count(), 1);
+        handle
+    };
+
+    assert_eq!(
+        handle.close(),
+        Err(sema_core::runtime::ResourceGateCloseError::RuntimeUnavailable)
+    );
 }
 
 struct RecordGateGrant {
@@ -4650,6 +4730,11 @@ fn command_cancellation_settles_resource_waiter_after_close_wake_is_committed() 
         guard += 1;
         assert!(guard < 64, "close request must remove the gate");
     }
+    assert_eq!(
+        runtime.resource_gate_count(),
+        0,
+        "close removes the gate before any Closed wake is delivered"
+    );
     assert!(
         matches!(waiter.poll_result(), RootPoll::Pending),
         "the one-item close turn leaves its Closed wake pending"
@@ -4898,11 +4983,12 @@ impl NativeContinuation for GateHoldOnChannel {
     ) -> NativeResult {
         match self.stage {
             0 => {
-                let ResumeInput::Runtime(sema_core::runtime::RuntimeResponse::ResourceGate(gate)) =
+                let ResumeInput::Runtime(sema_core::runtime::RuntimeResponse::ResourceGate(handle)) =
                     input
                 else {
                     panic!("gate holder stage 0 expected a ResourceGate response");
                 };
+                let gate = handle.id();
                 self.gate_slot.set(Some(gate));
                 self.gate = Some(gate);
                 self.stage = 1;

@@ -504,7 +504,7 @@ mod io_streams {
     use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateId};
     use sema_core::{in_runtime_quantum, StreamBox};
 
-    use crate::runtime_offload::{checkout_external, CheckoutOp};
+    use crate::runtime_offload::{checkout_external, finish_terminal_gate, CheckoutOp};
 
     /// Completion-kind tag for file-stream `stream/*` external waits ("stf\0").
     const STREAM_COMPLETION_KIND: u64 = 0x7374_6600;
@@ -754,6 +754,15 @@ mod io_streams {
         }
     }
 
+    fn remove_input_gate(stream: &Rc<StreamBox>, id: ResourceGateId) {
+        let inner = stream.borrow_inner();
+        if let Some(fis) = inner.as_any().downcast_ref::<FileInputStream>() {
+            if fis.gate.get() == Some(id) {
+                fis.gate.set(None);
+            }
+        }
+    }
+
     fn output_gate(stream: &Rc<StreamBox>) -> Option<ResourceGateId> {
         let inner = stream.borrow_inner();
         inner
@@ -769,6 +778,15 @@ mod io_streams {
         }
     }
 
+    fn remove_output_gate(stream: &Rc<StreamBox>, id: ResourceGateId) {
+        let inner = stream.borrow_inner();
+        if let Some(fos) = inner.as_any().downcast_ref::<FileOutputStream>() {
+            if fos.gate.get() == Some(id) {
+                fos.gate.set(None);
+            }
+        }
+    }
+
     /// Offload one blocking op against a file-INPUT stream's `BufReader` through
     /// the gate-guarded checkout. `op` runs off the VM thread; `decode` builds the
     /// final `Value` on the VM thread (fallible — e.g. `stream/copy` writes into
@@ -779,11 +797,22 @@ mod io_streams {
         op: impl FnOnce(&mut BufReader<std::fs::File>) -> Result<T, String> + Send + 'static,
         decode: impl FnOnce(T) -> Result<Value, SemaError> + 'static,
     ) -> NativeResult {
+        checkout_input_lifecycle(op_name, stream, op, decode, false)
+    }
+
+    fn checkout_input_lifecycle<T: Send + 'static>(
+        op_name: &'static str,
+        stream: &Rc<StreamBox>,
+        op: impl FnOnce(&mut BufReader<std::fs::File>) -> Result<T, String> + Send + 'static,
+        decode: impl FnOnce(T) -> Result<Value, SemaError> + 'static,
+        terminal_on_success: bool,
+    ) -> NativeResult {
         let kind = CompletionKind::try_from_raw(STREAM_COMPLETION_KIND)
             .expect("stream completion kind is nonzero");
         let gate = input_gate(stream);
         let s_store = stream.clone();
         let s_take = stream.clone();
+        let s_remove = stream.clone();
         let s_reinstall = stream.clone();
         let s_tomb = stream.clone();
         checkout_external(CheckoutOp {
@@ -791,6 +820,7 @@ mod io_streams {
             kind,
             gate,
             store_gate: Box::new(move |id| store_input_gate(&s_store, id)),
+            remove_gate: Rc::new(move |id| remove_input_gate(&s_remove, id)),
             take: Box::new(move || take_input(&s_take, op_name)),
             op: Box::new(op),
             reinstall: Box::new(move |r| reinstall_input(&s_reinstall, r)),
@@ -798,6 +828,7 @@ mod io_streams {
             success_value: None,
             tombstone: Rc::new(move |msg| tombstone_input(&s_tomb, msg)),
             abort: None,
+            terminal_on_success,
         })
     }
 
@@ -815,6 +846,7 @@ mod io_streams {
         let gate = output_gate(stream);
         let s_store = stream.clone();
         let s_take = stream.clone();
+        let s_remove = stream.clone();
         let s_reinstall = stream.clone();
         let s_tomb = stream.clone();
         checkout_external(CheckoutOp {
@@ -822,6 +854,7 @@ mod io_streams {
             kind,
             gate,
             store_gate: Box::new(move |id| store_output_gate(&s_store, id)),
+            remove_gate: Rc::new(move |id| remove_output_gate(&s_remove, id)),
             take: Box::new(move || take_output(&s_take, take_op)),
             op: Box::new(op),
             reinstall: Box::new(move |w| reinstall_output(&s_reinstall, w)),
@@ -829,6 +862,7 @@ mod io_streams {
             success_value: None,
             tombstone: Rc::new(move |msg| tombstone_output(&s_tomb, msg)),
             abort: None,
+            terminal_on_success: op_name == "stream/close",
         })
     }
 
@@ -1184,12 +1218,42 @@ mod io_streams {
     pub(super) fn maybe_async_close(
         stream: &Rc<StreamBox>,
     ) -> Result<Option<NativeOutcome>, SemaError> {
-        if !in_runtime_quantum() || stream.stream_type() != "file-output" {
+        if !in_runtime_quantum() {
+            return Ok(None);
+        }
+        if stream.stream_type() == "file-input" {
+            if stream.is_closed() {
+                let s_remove = stream.clone();
+                return finish_terminal_gate(
+                    input_gate(stream),
+                    Rc::new(move |id| remove_input_gate(&s_remove, id)),
+                    Ok(Value::nil()),
+                )
+                .map(Some);
+            }
+            let stream_for_finish = stream.clone();
+            return Ok(Some(checkout_input_lifecycle(
+                "stream/close",
+                stream,
+                |_reader| Ok(()),
+                move |()| {
+                    stream_for_finish.close()?;
+                    Ok(Value::nil())
+                },
+                true,
+            )?));
+        }
+        if stream.stream_type() != "file-output" {
             return Ok(None);
         }
         if stream.is_closed() {
-            // Matches `StreamBox::close`'s own idempotency.
-            return Ok(Some(NativeOutcome::Return(Value::nil())));
+            let s_remove = stream.clone();
+            return finish_terminal_gate(
+                output_gate(stream),
+                Rc::new(move |id| remove_output_gate(&s_remove, id)),
+                Ok(Value::nil()),
+            )
+            .map(Some);
         }
         let stream_for_finish = stream.clone();
         Ok(Some(checkout_output(

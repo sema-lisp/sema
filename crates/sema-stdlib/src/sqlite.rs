@@ -46,7 +46,7 @@ use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
 use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateId};
 use sema_core::{check_arity, in_runtime_quantum, SemaError, Value};
 
-use crate::runtime_offload::{checkout_external, CheckoutOp};
+use crate::runtime_offload::{checkout_external, finish_terminal_gate, CheckoutOp};
 
 /// Completion-kind tag for `db/*` external waits ("db\0\0").
 const DB_COMPLETION_KIND: u64 = 0x6462_0000;
@@ -184,8 +184,8 @@ fn take_conn(op_name: &'static str, handle: &str) -> Result<Connection, SemaErro
 /// executor's blocking tier, reinstall the `Connection` and decode the result on
 /// the VM thread, then release the gate. `op` runs on the blocking worker;
 /// `decode` builds the final `Value`. A mid-op cancel tombstones the slot
-/// (best-effort — the blocking statement keeps running unattended) and releases
-/// the gate so a queued sibling fails fast.
+/// (best-effort — the blocking statement keeps running unattended) and closes
+/// the gate so every queued sibling wakes with a terminal error.
 fn checkout_runtime<T: Send + 'static>(
     op_name: &'static str,
     handle: String,
@@ -198,6 +198,7 @@ fn checkout_runtime<T: Send + 'static>(
     let h_take = handle.clone();
     let h_reinstall = handle.clone();
     let h_tomb = handle.clone();
+    let h_remove = handle.clone();
     let h_store = handle;
     checkout_external(CheckoutOp {
         op_name,
@@ -206,6 +207,14 @@ fn checkout_runtime<T: Send + 'static>(
         store_gate: Box::new(move |id| {
             DB_GATES.with(|g| {
                 g.borrow_mut().insert(h_store, id);
+            });
+        }),
+        remove_gate: Rc::new(move |id| {
+            DB_GATES.with(|g| {
+                let mut gates = g.borrow_mut();
+                if gates.get(&h_remove).copied() == Some(id) {
+                    gates.remove(&h_remove);
+                }
             });
         }),
         take: Box::new(move || take_conn(op_name, &h_take)),
@@ -224,6 +233,7 @@ fn checkout_runtime<T: Send + 'static>(
             });
         }),
         abort: None,
+        terminal_on_success: false,
     })
 }
 
@@ -661,7 +671,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // remains the documented way to free either. The handle's resource gate is
     // dropped here too; when `db/close` succeeds the gate is idle (a busy gate
     // means CheckedOut, which errors above), so no waiter can be stranded.
-    crate::register_fn(env, "db/close", |args| {
+    crate::register_runtime_fn(env, "db/close", |args| {
         check_arity!(args, "db/close", 1);
         let handle = args[0]
             .as_str()
@@ -674,9 +684,20 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             conns.remove(handle);
             Ok(())
         })?;
-        DB_GATES.with(|g| {
-            g.borrow_mut().remove(handle);
-        });
-        Ok(Value::nil())
+        let handle = handle.to_string();
+        let gate = DB_GATES.with(|g| g.borrow().get(&handle).copied());
+        let remove_handle = handle;
+        finish_terminal_gate(
+            gate,
+            Rc::new(move |id| {
+                DB_GATES.with(|g| {
+                    let mut gates = g.borrow_mut();
+                    if gates.get(&remove_handle).copied() == Some(id) {
+                        gates.remove(&remove_handle);
+                    }
+                });
+            }),
+            Ok(Value::nil()),
+        )
     });
 }

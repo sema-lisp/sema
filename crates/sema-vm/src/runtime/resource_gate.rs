@@ -94,7 +94,6 @@ impl ResourceGateRegistry {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.gates.len()
     }
@@ -160,11 +159,11 @@ impl ResourceGateRegistry {
 
     /// Close `id`: fail every parked waiter with `Closed` and drop the gate
     /// record. Idempotent by absence (an unknown/closed id is a no-op).
-    pub fn close(&mut self, id: ResourceGateId) -> Result<(), RegistryError> {
+    pub fn close(&mut self, id: ResourceGateId) -> Result<bool, RegistryError> {
         if id.runtime() != self.runtime {
             return Err(RegistryError::WrongRuntime);
         }
-        if let Some(mut gate) = self.gates.remove(&id) {
+        let removed = if let Some(mut gate) = self.gates.remove(&id) {
             for waiter in gate.waiters.drain(..) {
                 self.wakes.push_back(ResourceGateWake {
                     key: waiter.key,
@@ -172,8 +171,11 @@ impl ResourceGateRegistry {
                     result: GateResult::Closed,
                 });
             }
-        }
-        Ok(())
+            true
+        } else {
+            false
+        };
+        Ok(removed)
     }
 
     /// Remove a parked waiter (a task cancelled while queued behind a busy gate).

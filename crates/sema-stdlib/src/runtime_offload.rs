@@ -36,6 +36,7 @@
 
 use std::future::Future;
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use sema_core::cycle::GcEdge;
@@ -470,10 +471,9 @@ pub(crate) fn group_sigkill_abort(pid: u32) -> Box<dyn FnOnce()> {
 //
 // Six stdlib modules (sqlite, kv, proc, pty, serial, stream) own one resource per
 // open handle that at most one offloaded op may hold at a time (a `rusqlite`
-// connection, a sled db, a child process, a pty, a serial port, a stream). The
-// legacy design open-coded an `Available/CheckedOut/Tombstone` slot + an
-// `Acquire`-phase poll loop that re-attempted the checkout on every `AwaitIo`
-// poll. `checkout_external` replaces that with two first-class runtime waits:
+// connection, a key-value store, a child process, a pty, a serial port, or a
+// stream). `checkout_external` coordinates each module's
+// `Available/CheckedOut/Tombstone` slot with two first-class runtime waits:
 //
 //   1. `WaitKind::ResourceSlot(gate)` — a per-handle [`ResourceGate`] provides
 //      FIFO mutual exclusion. A free gate grants immediately; a busy one parks
@@ -481,7 +481,7 @@ pub(crate) fn group_sigkill_abort(pid: u32) -> Box<dyn FnOnce()> {
 //   2. `WaitKind::External` — once the gate is owned, the `Send` resource is
 //      taken out of the module's thread-local slot and moved onto the executor's
 //      blocking tier with the op; the decoder checks it back in on the VM thread
-//      and the continuation releases the gate.
+//      when possible and the continuation releases or closes the gate.
 //
 // Lifecycle across a single call:
 //   * (optional) `Runtime(CreateResourceGate)` if the handle has no gate yet;
@@ -489,7 +489,9 @@ pub(crate) fn group_sigkill_abort(pid: u32) -> Box<dyn FnOnce()> {
 //   * `Suspend(ResourceSlot(gate))` → on grant, `take` the resource from the slot.
 //   * `Suspend(External)` → job runs `op(&mut res)` off the VM thread and returns
 //     `(res, Result<T, String>)`; the decoder `reinstall`s `res` and decodes `T`.
-//   * `Runtime(ReleaseResourceGate)` → wake the FIFO head, then return / raise.
+//   * `Runtime(ReleaseResourceGate)` for a reusable resource, or
+//     `Runtime(CloseResourceGate)` after terminal teardown → wake the FIFO
+//     head, then return / raise.
 //
 // Cancellation:
 //   * cancelled while QUEUED behind a busy gate → the runtime's `ResourceSlot`
@@ -499,15 +501,8 @@ pub(crate) fn group_sigkill_abort(pid: u32) -> Box<dyn FnOnce()> {
 //     hook `tombstone`s the slot (the resource is stuck in the blocking worker
 //     and cannot be reclaimed — best-effort, matching the retired `IoHandle`
 //     policy) and runs the optional `abort` (e.g. proc process-group SIGKILL);
-//     `ReleaseReturnCont` then releases the gate so queued acquirers wake and
-//     fail fast on the tombstone.
-//
-// KNOWN NARROW RACE (documented, same class as UCR-3 for channel rendezvous):
-// a cancellation recorded in the exact window between a `release` granting this
-// task the slot and its `AcquireCont` running is delivered as `Cancelled`, which
-// `AcquireCont` treats as a queued-cancel (no release) — leaking the gate busy.
-// Reaching it requires another task to cancel this one in the same drive tick the
-// prior owner releases. C2's eager-cancellation delivery closes this window.
+//     the shared lifecycle removes the exact module mapping and closes the gate,
+//     so every queued acquirer wakes with `Closed`.
 //
 // GC: none of the continuations capture a live `Value`/`Env` (the `decode`
 // closure builds a `Value` but must not capture one, same rule the file/http
@@ -534,6 +529,10 @@ pub(crate) struct CheckoutOp<Res: Send + 'static, T: Send + 'static> {
     pub gate: Option<ResourceGateId>,
     /// Records a freshly-created gate id against the handle (VM thread).
     pub store_gate: Box<dyn FnOnce(ResourceGateId)>,
+    /// Removes this exact id from the handle mapping. The callback must compare
+    /// the current stored id before removal so late teardown cannot erase a
+    /// replacement gate.
+    pub remove_gate: Rc<dyn Fn(ResourceGateId)>,
     /// Take the resource out of the slot once the gate is owned (VM thread).
     /// Returns a clear domain error for a tombstoned/missing slot.
     pub take: Box<dyn FnOnce() -> Result<Res, SemaError>>,
@@ -557,6 +556,74 @@ pub(crate) struct CheckoutOp<Res: Send + 'static, T: Send + 'static> {
     /// Extra teardown to run on cancel besides the tombstone (e.g. a
     /// process-group SIGKILL). Runs on the VM thread.
     pub abort: Option<Box<dyn FnOnce()>>,
+    /// Close the gate when both the worker op and VM-thread decode succeed.
+    /// Recoverable op/flush/decode errors retain and release the gate.
+    pub terminal_on_success: bool,
+}
+
+/// Shared close-once state for every callback in one checked-out operation.
+/// It carries only scalar gate identity and a module-local removal callback,
+/// never a `Value` or `Env`.
+struct GateLifecycle {
+    gate: ResourceGateId,
+    terminal: Cell<bool>,
+    remove_gate: Rc<dyn Fn(ResourceGateId)>,
+}
+
+impl GateLifecycle {
+    fn new(gate: ResourceGateId, remove_gate: Rc<dyn Fn(ResourceGateId)>) -> Rc<Self> {
+        Rc::new(Self {
+            gate,
+            terminal: Cell::new(false),
+            remove_gate,
+        })
+    }
+
+    fn mark_terminal(&self) {
+        if !self.terminal.replace(true) {
+            (self.remove_gate)(self.gate);
+        }
+    }
+
+    fn finish_request(&self, continuation: Box<dyn NativeContinuation>) -> RuntimeRequest {
+        if self.terminal.get() {
+            RuntimeRequest::CloseResourceGate {
+                gate: self.gate,
+                continuation,
+            }
+        } else {
+            RuntimeRequest::ReleaseResourceGate {
+                gate: self.gate,
+                continuation,
+            }
+        }
+    }
+}
+
+impl Trace for GateLifecycle {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+/// Close a terminal resource's existing gate without a blocking checkout.
+pub(crate) fn finish_terminal_gate(
+    gate: Option<ResourceGateId>,
+    remove_gate: Rc<dyn Fn(ResourceGateId)>,
+    outcome: Result<Value, SemaError>,
+) -> NativeResult {
+    let Some(gate) = gate else {
+        return outcome.map(NativeOutcome::Return);
+    };
+    let lifecycle = GateLifecycle::new(gate, remove_gate);
+    lifecycle.mark_terminal();
+    let continuation: Box<dyn NativeContinuation> = match outcome {
+        Ok(value) => Box::new(FinalCont::Value(value)),
+        Err(error) => Box::new(FinalCont::Fail(error)),
+    };
+    Ok(NativeOutcome::Runtime(
+        lifecycle.finish_request(continuation),
+    ))
 }
 
 /// Entry point: build the gate-acquire suspension (creating the gate first if the
@@ -597,7 +664,8 @@ impl<Res: Send + 'static, T: Send + 'static> NativeContinuation for CreateGateCo
             .op
             .expect("checkout gate-create continuation is resumed exactly once");
         match input {
-            ResumeInput::Runtime(RuntimeResponse::ResourceGate(gate)) => {
+            ResumeInput::Runtime(RuntimeResponse::ResourceGate(handle)) => {
+                let gate = handle.id();
                 (op.store_gate)(gate);
                 op.store_gate = Box::new(|_| {});
                 op.gate = Some(gate);
@@ -644,6 +712,7 @@ impl<Res: Send + 'static, T: Send + 'static> NativeContinuation for AcquireCont<
         match input {
             // Slot granted: we now own `gate`.
             ResumeInput::Runtime(RuntimeResponse::Value(_)) => {
+                let lifecycle = GateLifecycle::new(gate, Rc::clone(&op.remove_gate));
                 let CheckoutOp {
                     op_name,
                     kind,
@@ -654,6 +723,7 @@ impl<Res: Send + 'static, T: Send + 'static> NativeContinuation for AcquireCont<
                     tombstone,
                     abort,
                     success_value,
+                    terminal_on_success,
                     ..
                 } = op;
                 match take() {
@@ -668,6 +738,8 @@ impl<Res: Send + 'static, T: Send + 'static> NativeContinuation for AcquireCont<
                             decode: Some(decode),
                             success_value,
                             tombstone: tombstone.clone(),
+                            lifecycle: Rc::clone(&lifecycle),
+                            terminal_on_success,
                         });
                         let resource_handle = InterruptibleResource::new(
                             op_name,
@@ -675,6 +747,7 @@ impl<Res: Send + 'static, T: Send + 'static> NativeContinuation for AcquireCont<
                                 tombstone,
                                 abort,
                                 op_name,
+                                lifecycle: Rc::clone(&lifecycle),
                             }),
                         );
                         let prepared = PreparedExternalOperation::interruptible_blocking(
@@ -688,17 +761,18 @@ impl<Res: Send + 'static, T: Send + 'static> NativeContinuation for AcquireCont<
                         );
                         Ok(NativeOutcome::Suspend(NativeSuspend {
                             wait: WaitKind::External(Box::new(prepared)),
-                            continuation: Box::new(ReleaseReturnCont { op_name, gate }),
+                            continuation: Box::new(ReleaseReturnCont { op_name, lifecycle }),
                         }))
                     }
-                    // Slot is tombstoned/missing: we own the gate, so release it
-                    // (waking the next acquirer, who also fails fast) then raise.
-                    Err(error) => Ok(NativeOutcome::Runtime(
-                        RuntimeRequest::ReleaseResourceGate {
-                            gate,
-                            continuation: Box::new(FinalCont::Fail(error)),
-                        },
-                    )),
+                    // The mapping no longer names an available resource. Close
+                    // its gate so every queued acquirer fails instead of walking
+                    // a stale tombstone/missing mapping in turn.
+                    Err(error) => {
+                        lifecycle.mark_terminal();
+                        Ok(NativeOutcome::Runtime(
+                            lifecycle.finish_request(Box::new(FinalCont::Fail(error))),
+                        ))
+                    }
                 }
             }
             // Gate closed while we were queued: never owned it, just raise.
@@ -725,6 +799,8 @@ struct CheckoutDecoder<Res: Send + 'static, T: Send + 'static> {
     decode: Option<CheckoutDecode<T>>,
     success_value: Option<Value>,
     tombstone: Rc<dyn Fn(String)>,
+    lifecycle: Rc<GateLifecycle>,
+    terminal_on_success: bool,
 }
 
 impl<Res: Send + 'static, T: Send + 'static> Trace for CheckoutDecoder<Res, T> {
@@ -750,25 +826,31 @@ impl<Res: Send + 'static, T: Send + 'static> CompletionDecoder for CheckoutDecod
                 match downcast_send_payload::<(Res, Result<T, String>)>(payload, op_name) {
                     Ok((resource, op_result)) => {
                         (self.reinstall.take().expect("reinstall once"))(resource);
-                        match op_result {
+                        let decoded = match op_result {
                             Ok(value) => match self.success_value.take() {
                                 Some(literal) => Ok(literal),
                                 None => (self.decode.take().expect("decode once"))(value),
                             },
                             Err(message) => Err(SemaError::Io(message)),
+                        };
+                        if decoded.is_ok() && self.terminal_on_success {
+                            self.lifecycle.mark_terminal();
                         }
+                        decoded
                     }
                     Err(failure) => {
                         (self.tombstone)(format!(
                             "{op_name} lost its resource: {}",
                             failure.message()
                         ));
+                        self.lifecycle.mark_terminal();
                         Err(SemaError::eval(failure.message().to_string()))
                     }
                 }
             }
             Err(failure) => {
                 (self.tombstone)(format!("{op_name} worker failed: {}", failure.message()));
+                self.lifecycle.mark_terminal();
                 Err(SemaError::eval(format!("{op_name}: {}", failure.message())))
             }
         }
@@ -782,6 +864,7 @@ struct CheckoutCancelHook {
     op_name: &'static str,
     tombstone: Rc<dyn Fn(String)>,
     abort: Option<Box<dyn FnOnce()>>,
+    lifecycle: Rc<GateLifecycle>,
 }
 
 impl Trace for CheckoutCancelHook {
@@ -796,6 +879,7 @@ impl CancelHook for CheckoutCancelHook {
             "{} was cancelled while in flight; the resource cannot be reclaimed",
             self.op_name
         ));
+        self.lifecycle.mark_terminal();
         if let Some(abort) = self.abort.take() {
             abort();
         }
@@ -806,11 +890,12 @@ impl CancelHook for CheckoutCancelHook {
     }
 }
 
-/// Stage 2: the op completed / failed / was cancelled — release the gate (waking
-/// the FIFO head), then deliver the resolved value or raise. Holds no `Value`.
+/// Stage 2: the op completed / failed / was cancelled — release a reusable gate
+/// or close a terminal one, then deliver the resolved value or raise. Holds no
+/// `Value`.
 struct ReleaseReturnCont {
     op_name: &'static str,
-    gate: ResourceGateId,
+    lifecycle: Rc<GateLifecycle>,
 }
 
 impl Trace for ReleaseReturnCont {
@@ -825,6 +910,7 @@ impl NativeContinuation for ReleaseReturnCont {
         _context: &mut NativeCallContext<'_>,
         input: ResumeInput,
     ) -> NativeResult {
+        let cancelled = matches!(input, ResumeInput::Cancelled(_));
         let final_cont: Box<dyn NativeContinuation> = match input {
             ResumeInput::Returned(value) => Box::new(FinalCont::Value(value)),
             ResumeInput::Failed(error) => Box::new(FinalCont::Fail(error)),
@@ -836,16 +922,16 @@ impl NativeContinuation for ReleaseReturnCont {
                 self.op_name
             )))),
         };
+        if cancelled {
+            self.lifecycle.mark_terminal();
+        }
         Ok(NativeOutcome::Runtime(
-            RuntimeRequest::ReleaseResourceGate {
-                gate: self.gate,
-                continuation: final_cont,
-            },
+            self.lifecycle.finish_request(final_cont),
         ))
     }
 }
 
-/// Stage 3: the gate is released; deliver the resolved outcome to the caller.
+/// Stage 3: the gate transition completed; deliver the resolved outcome.
 enum FinalCont {
     Value(Value),
     Fail(SemaError),
@@ -871,9 +957,8 @@ impl NativeContinuation for FinalCont {
         _context: &mut NativeCallContext<'_>,
         _input: ResumeInput,
     ) -> NativeResult {
-        // The gate release always succeeds; deliver the stored outcome. (If the
-        // task carries a sticky cancellation, the runtime settles it Cancelled
-        // regardless of what we return here.)
+        // Deliver the stored outcome. If the task carries a sticky cancellation,
+        // the runtime settles it Cancelled regardless of what we return here.
         match *self {
             FinalCont::Value(value) => Ok(NativeOutcome::Return(value)),
             FinalCont::Fail(error) => Err(error),
@@ -887,6 +972,40 @@ impl NativeContinuation for FinalCont {
 #[cfg(test)]
 mod checkout_trace_tests {
     use super::*;
+    use sema_core::runtime::{
+        CompletionDelivery, CompletionRegistrar, CompletionSender, ExternalCompletion,
+        RuntimeScopedIdCounter,
+    };
+    use std::sync::Arc;
+
+    struct ClosedInbox;
+
+    impl CompletionSender for ClosedInbox {
+        fn send(&self, _: ExternalCompletion) -> CompletionDelivery {
+            CompletionDelivery::InboxClosed
+        }
+    }
+
+    fn lifecycle() -> Rc<GateLifecycle> {
+        lifecycle_with_removal(Rc::new(Cell::new(0)))
+    }
+
+    fn lifecycle_with_removal(removals: Rc<Cell<usize>>) -> Rc<GateLifecycle> {
+        let (runtime, _registrar, _issuers) =
+            CompletionRegistrar::register(Arc::new(ClosedInbox)).unwrap();
+        let gate = RuntimeScopedIdCounter::new(runtime).allocate().unwrap();
+        GateLifecycle::new(gate, Rc::new(move |_| removals.set(removals.get() + 1)))
+    }
+
+    fn context() -> (
+        sema_core::runtime::TaskContext,
+        sema_core::runtime::CancellationView,
+    ) {
+        (
+            sema_core::runtime::TaskContext::default(),
+            sema_core::runtime::CancellationView::default(),
+        )
+    }
 
     fn edge_count(trace: &dyn Trace) -> usize {
         let mut count = 0;
@@ -908,6 +1027,7 @@ mod checkout_trace_tests {
                 op_name: "t",
                 tombstone: Rc::new(|_| {}),
                 abort: None,
+                lifecycle: lifecycle(),
             }),
             0
         );
@@ -927,6 +1047,8 @@ mod checkout_trace_tests {
             decode: Some(Box::new(|_| Ok(Value::nil()))),
             success_value: None,
             tombstone: Rc::new(|_| {}),
+            lifecycle: lifecycle(),
+            terminal_on_success: false,
         };
         assert_eq!(edge_count(&decoder), 0);
         // A carried success value is a traced edge (kv/set's return value).
@@ -936,7 +1058,91 @@ mod checkout_trace_tests {
             decode: Some(Box::new(|_| Ok(Value::nil()))),
             success_value: Some(Value::int(9)),
             tombstone: Rc::new(|_| {}),
+            lifecycle: lifecycle(),
+            terminal_on_success: false,
         };
         assert_eq!(edge_count(&decoder_with_value), 1);
+    }
+
+    #[test]
+    fn worker_loss_marks_terminal_once_and_finalizes_with_close() {
+        let removals = Rc::new(Cell::new(0));
+        let lifecycle = lifecycle_with_removal(Rc::clone(&removals));
+        let decoder: CheckoutDecoder<(), ()> = CheckoutDecoder {
+            op_name: "test/op",
+            reinstall: Some(Box::new(|_| {})),
+            decode: Some(Box::new(|_| Ok(Value::nil()))),
+            success_value: None,
+            tombstone: Rc::new(|_| {}),
+            lifecycle: Rc::clone(&lifecycle),
+            terminal_on_success: false,
+        };
+        let (mut task_context, cancellation) = context();
+        let mut native_context = NativeCallContext {
+            task_context: &mut task_context,
+            cancellation,
+        };
+        let decoded =
+            Box::new(decoder).decode(&mut native_context, Err(ExternalFailure::rejected()));
+        assert!(decoded.is_err());
+        assert!(lifecycle.terminal.get());
+        assert_eq!(removals.get(), 1);
+
+        let result = Box::new(ReleaseReturnCont {
+            op_name: "test/op",
+            lifecycle: Rc::clone(&lifecycle),
+        })
+        .resume(
+            &mut native_context,
+            ResumeInput::Failed(SemaError::eval("worker failed")),
+        )
+        .unwrap();
+        let NativeOutcome::Runtime(RuntimeRequest::CloseResourceGate { gate, .. }) = result else {
+            panic!("worker loss must close the terminal gate")
+        };
+        assert_eq!(gate, lifecycle.gate);
+        lifecycle.mark_terminal();
+        assert_eq!(removals.get(), 1, "terminal marking is idempotent");
+    }
+
+    #[test]
+    fn recoverable_worker_result_reinstalls_and_releases() {
+        let removals = Rc::new(Cell::new(0));
+        let lifecycle = lifecycle_with_removal(Rc::clone(&removals));
+        let decoder: CheckoutDecoder<(), ()> = CheckoutDecoder {
+            op_name: "test/op",
+            reinstall: Some(Box::new(|_| {})),
+            decode: Some(Box::new(|_| Ok(Value::nil()))),
+            success_value: None,
+            tombstone: Rc::new(|_| {}),
+            lifecycle: Rc::clone(&lifecycle),
+            terminal_on_success: false,
+        };
+        let (mut task_context, cancellation) = context();
+        let mut native_context = NativeCallContext {
+            task_context: &mut task_context,
+            cancellation,
+        };
+        let payload = Box::new(((), Err::<(), String>("domain error".into()))) as SendPayload;
+        assert!(Box::new(decoder)
+            .decode(&mut native_context, Ok(payload))
+            .is_err());
+        assert!(!lifecycle.terminal.get());
+        assert_eq!(removals.get(), 0);
+
+        let result = Box::new(ReleaseReturnCont {
+            op_name: "test/op",
+            lifecycle: Rc::clone(&lifecycle),
+        })
+        .resume(
+            &mut native_context,
+            ResumeInput::Failed(SemaError::eval("domain error")),
+        )
+        .unwrap();
+        let NativeOutcome::Runtime(RuntimeRequest::ReleaseResourceGate { gate, .. }) = result
+        else {
+            panic!("a recoverable domain failure must release the reusable gate")
+        };
+        assert_eq!(gate, lifecycle.gate);
     }
 }

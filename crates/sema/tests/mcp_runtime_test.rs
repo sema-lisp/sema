@@ -367,6 +367,11 @@ fn assert_cancelled_before_server_fallback(
         0,
         "cancelled MCP operation left a runtime task behind"
     );
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "cancelled MCP terminal paths must close their connection gate"
+    );
 }
 
 fn generated_echo_handler(defs: &Value) -> Value {
@@ -659,7 +664,46 @@ fn runtime_mcp_tools_wait_allows_sibling_progress() {
         !markers.timed_out.exists(),
         "tools/list blocked the VM until the server's fallback fired"
     );
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        1,
+        "mcp/tools lazily creates one connection gate"
+    );
     interp.eval_str_via_runtime("(mcp/close server)").ok();
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "mcp/close must close the connection gate"
+    );
+}
+
+#[test]
+fn public_close_handle_closes_a_runtime_created_connection_gate() {
+    let markers = Markers::new("host-close-gate");
+    let config = delayed_stdio_config("immediate", &markers);
+    let interp = mcp_eval_interpreter();
+    interp
+        .eval_str_via_runtime(&format!("(define server (mcp/connect {config}))"))
+        .expect("connect immediate MCP server");
+    interp
+        .eval_str_via_runtime("(mcp/tools server)")
+        .expect("create the connection gate through mcp/tools");
+    let handle = interp
+        .eval_str_via_runtime("server")
+        .expect("read opaque connection handle");
+    assert_eq!(interp.runtime_resource_gate_count(), 1);
+
+    sema_mcp::close_handle(&handle);
+
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "the host-only close capability must remove the live runtime gate"
+    );
+    let error = interp
+        .eval_str_via_runtime("(mcp/tools server)")
+        .expect_err("close_handle removes the connection registry entry");
+    assert!(error.to_string().contains("not registered"), "{error}");
 }
 
 #[test]

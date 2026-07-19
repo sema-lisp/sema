@@ -45,7 +45,9 @@ use std::thread::JoinHandle;
 use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateId};
 use sema_core::{check_arity, in_runtime_quantum, Caps, SemaError, Value};
 
-use crate::runtime_offload::{checkout_external, group_sigkill_abort, CheckoutOp};
+use crate::runtime_offload::{
+    checkout_external, finish_terminal_gate, group_sigkill_abort, CheckoutOp,
+};
 
 /// Completion-kind tag for `proc/*` external waits ("proc").
 const PROC_COMPLETION_KIND: u64 = 0x7072_6f63;
@@ -315,6 +317,14 @@ fn checkout_runtime<T: Send + 'static>(
                 g.borrow_mut().insert(id, gid);
             });
         }),
+        remove_gate: Rc::new(move |gid| {
+            PROC_GATES.with(|g| {
+                let mut gates = g.borrow_mut();
+                if gates.get(&id).copied() == Some(gid) {
+                    gates.remove(&id);
+                }
+            });
+        }),
         take: Box::new(move || take_proc(op_name, id)),
         op: Box::new(op),
         reinstall: Box::new(move |pr| {
@@ -330,6 +340,7 @@ fn checkout_runtime<T: Send + 'static>(
             });
         }),
         abort,
+        terminal_on_success: false,
     })
 }
 
@@ -410,7 +421,21 @@ fn proc_close_runtime(id: i64) -> NativeResult {
     });
     match action {
         CloseAction::Busy => Err(busy_err("proc/close", id)),
-        CloseAction::Noop => Ok(NativeOutcome::Return(Value::nil())),
+        CloseAction::Noop => {
+            let gate = PROC_GATES.with(|g| g.borrow().get(&id).copied());
+            finish_terminal_gate(
+                gate,
+                Rc::new(move |gid| {
+                    PROC_GATES.with(|g| {
+                        let mut gates = g.borrow_mut();
+                        if gates.get(&id).copied() == Some(gid) {
+                            gates.remove(&id);
+                        }
+                    });
+                }),
+                Ok(Value::nil()),
+            )
+        }
         CloseAction::Proceed => {
             let kind = CompletionKind::try_from_raw(PROC_COMPLETION_KIND)
                 .expect("proc completion kind is nonzero");
@@ -422,6 +447,14 @@ fn proc_close_runtime(id: i64) -> NativeResult {
                 store_gate: Box::new(move |gid| {
                     PROC_GATES.with(|g| {
                         g.borrow_mut().insert(id, gid);
+                    });
+                }),
+                remove_gate: Rc::new(move |gid| {
+                    PROC_GATES.with(|g| {
+                        let mut gates = g.borrow_mut();
+                        if gates.get(&id).copied() == Some(gid) {
+                            gates.remove(&id);
+                        }
                     });
                 }),
                 take: Box::new(move || take_proc("proc/close", id)),
@@ -443,9 +476,6 @@ fn proc_close_runtime(id: i64) -> NativeResult {
                     PROCS.with(|p| {
                         p.borrow_mut().remove(&id);
                     });
-                    PROC_GATES.with(|g| {
-                        g.borrow_mut().remove(&id);
-                    });
                 }),
                 decode: Box::new(|()| Ok(Value::nil())),
                 success_value: None,
@@ -455,6 +485,7 @@ fn proc_close_runtime(id: i64) -> NativeResult {
                     });
                 }),
                 abort: None,
+                terminal_on_success: true,
             })
         }
     }

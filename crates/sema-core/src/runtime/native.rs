@@ -1,3 +1,5 @@
+use std::cell::Cell;
+use std::fmt;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -125,11 +127,90 @@ pub struct PromiseSetWait {
     pub mode: PromiseSetMode,
 }
 
+/// A VM-thread capability for one runtime resource gate.
+///
+/// Native checkout paths use [`ResourceGateHandle::id`] with the ordinary
+/// `WaitKind::ResourceSlot` / `RuntimeRequest` protocol. The close capability
+/// exists for lifecycle edges that cannot first store the id (allocation
+/// delivery cancelled) and host-only cleanup that runs outside a native
+/// continuation. Clones share the close-once state.
+#[derive(Clone)]
+pub struct ResourceGateHandle {
+    id: ResourceGateId,
+    closed: Rc<Cell<bool>>,
+    closer: Rc<ResourceGateCloser>,
+}
+
+type ResourceGateCloser = dyn Fn(ResourceGateId) -> Result<bool, ResourceGateCloseError> + 'static;
+
+impl ResourceGateHandle {
+    /// Construct a gate capability around the owning runtime's weak closer.
+    /// Runtime implementations are the intended callers.
+    #[doc(hidden)]
+    pub fn new(id: ResourceGateId, closer: Rc<ResourceGateCloser>) -> Self {
+        Self {
+            id,
+            closed: Rc::new(Cell::new(false)),
+            closer,
+        }
+    }
+
+    pub fn id(&self) -> ResourceGateId {
+        self.id
+    }
+
+    /// Close the gate through its owning runtime. Returns `Ok(true)` when this
+    /// call removed the live gate, `Ok(false)` when it was already closed, and
+    /// leaves the capability retryable when runtime coordination fails.
+    pub fn close(&self) -> Result<bool, ResourceGateCloseError> {
+        if self.closed.get() {
+            return Ok(false);
+        }
+        let removed = (self.closer)(self.id)?;
+        self.closed.set(true);
+        Ok(removed)
+    }
+}
+
+impl fmt::Debug for ResourceGateHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResourceGateHandle")
+            .field("id", &self.id)
+            .field("closed", &self.closed.get())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Trace for ResourceGateHandle {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResourceGateCloseError {
+    RuntimeUnavailable,
+    RuntimeBusy,
+    WrongRuntime,
+}
+
+impl fmt::Display for ResourceGateCloseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RuntimeUnavailable => f.write_str("resource gate runtime is no longer available"),
+            Self::RuntimeBusy => f.write_str("resource gate runtime is already mutably borrowed"),
+            Self::WrongRuntime => f.write_str("resource gate belongs to a different runtime"),
+        }
+    }
+}
+
+impl std::error::Error for ResourceGateCloseError {}
+
 #[derive(Clone, Debug)]
 pub enum RuntimeResponse {
     Promise(PromiseId),
     Channel(ChannelId),
-    ResourceGate(ResourceGateId),
+    ResourceGate(ResourceGateHandle),
     Value(Value),
     Cancelled(bool),
     Settlement(Option<Rc<TaskSettlement>>),
@@ -363,10 +444,58 @@ mod tests {
         RuntimeScopedIdCounter::new(runtime).allocate().unwrap()
     }
 
+    fn resource_gate() -> ResourceGateId {
+        let runtime = RuntimeId::allocate().unwrap();
+        RuntimeScopedIdCounter::new(runtime).allocate().unwrap()
+    }
+
     fn edge_count(trace: &impl Trace) -> usize {
         let mut count = 0;
         assert!(trace.trace(&mut |_| count += 1));
         count
+    }
+
+    #[test]
+    fn resource_gate_handle_is_trace_trivial_and_closes_once_across_clones() {
+        let gate = resource_gate();
+        let calls = Rc::new(Cell::new(0));
+        let calls_for_close = Rc::clone(&calls);
+        let handle = ResourceGateHandle::new(
+            gate,
+            Rc::new(move |_| {
+                calls_for_close.set(calls_for_close.get() + 1);
+                Ok(true)
+            }),
+        );
+        let clone = handle.clone();
+
+        assert_eq!(handle.id(), gate);
+        assert_eq!(edge_count(&handle), 0);
+        assert_eq!(handle.close(), Ok(true));
+        assert_eq!(clone.close(), Ok(false));
+        assert_eq!(calls.get(), 1, "the underlying closer runs exactly once");
+    }
+
+    #[test]
+    fn resource_gate_handle_remains_retryable_after_coordination_failure() {
+        let calls = Rc::new(Cell::new(0));
+        let calls_for_close = Rc::clone(&calls);
+        let handle = ResourceGateHandle::new(
+            resource_gate(),
+            Rc::new(move |_| {
+                calls_for_close.set(calls_for_close.get() + 1);
+                if calls_for_close.get() == 1 {
+                    Err(ResourceGateCloseError::RuntimeBusy)
+                } else {
+                    Ok(true)
+                }
+            }),
+        );
+
+        assert_eq!(handle.close(), Err(ResourceGateCloseError::RuntimeBusy));
+        assert_eq!(handle.close(), Ok(true));
+        assert_eq!(handle.close(), Ok(false));
+        assert_eq!(calls.get(), 2);
     }
 
     #[test]

@@ -2700,10 +2700,11 @@ mod tests {
     #[test]
     fn mcp_final_cont_does_not_swallow_runtime_transition_failure() {
         let eval_context = sema_core::EvalContext::new();
-        let mut task_context = sema_core::runtime::TaskContext::default();
+        let task_context = sema_core::runtime::TaskContextHandle::default();
         let mut context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation: sema_core::runtime::CancellationView::default(),
         };
         let error = match Box::new(McpFinalCont::Value(Value::nil())).resume(
@@ -2729,10 +2730,11 @@ mod tests {
             lifecycle: Rc::clone(&lifecycle),
         };
         let eval_context = sema_core::EvalContext::new();
-        let mut task_context = sema_core::runtime::TaskContext::default();
+        let task_context = sema_core::runtime::TaskContextHandle::default();
         let mut context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation: sema_core::runtime::CancellationView::default(),
         };
         assert!(Box::new(decoder)
@@ -2767,10 +2769,11 @@ mod tests {
         }
 
         let eval_context = sema_core::EvalContext::new();
-        let mut task_context = sema_core::runtime::TaskContext::default();
+        let task_context = sema_core::runtime::TaskContextHandle::default();
         let mut context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation: sema_core::runtime::CancellationView::default(),
         };
 

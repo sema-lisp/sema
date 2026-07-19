@@ -878,7 +878,7 @@ mod tests {
     use crate::cycle::GcEdge;
     use crate::runtime::{
         CancelDisposition, CancelHook, CancelHookError, CancellationView, CompletionDecoder,
-        ExternalFailureCode, NativeCallContext, TaskContext, Trace,
+        ExternalFailureCode, NativeCallContext, TaskContextHandle, Trace,
     };
     use crate::Value;
 
@@ -1176,10 +1176,11 @@ mod tests {
         let count = Rc::new(Cell::new(0));
         let decoder: Box<dyn CompletionDecoder> = Box::new(LocalDecoder(Rc::clone(&count)));
         let eval_context = crate::EvalContext::new();
-        let mut task_context = TaskContext::empty();
+        let task_context = TaskContextHandle::default();
         let mut context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation: CancellationView::default(),
         };
         assert_eq!(
@@ -1755,10 +1756,11 @@ mod tests {
             registration(prepared, kind(1), CompletionDelivery::Delivered);
         let (decoder, _, _) = runtime.into_parts();
         let eval_context = crate::EvalContext::new();
-        let mut task = TaskContext::empty();
+        let task = TaskContextHandle::default();
         let mut context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task,
+            task_context: task,
+            call_env: None,
             cancellation: CancellationView::default(),
         };
         decoder.decode(&mut context, Ok(Box::new(1_u8))).unwrap();

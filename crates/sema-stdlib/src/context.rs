@@ -52,7 +52,7 @@ impl NativeContinuation for ContextWithContinuation {
     ) -> NativeResult {
         let state = context
             .task_context
-            .get::<DynamicTaskState>()
+            .get_rc::<DynamicTaskState>()
             .ok_or_else(|| SemaError::eval("context/with resumed without dynamic task state"))?;
         // `context/clear` deliberately removes every frame, including this
         // owned one. Teardown is exact and idempotent: remove this identity if
@@ -76,7 +76,7 @@ fn context_with_runtime(context: &mut NativeCallContext<'_>, args: &[Value]) -> 
     let (frame, thunk) = context_with_args(args)?;
     let state = context
         .task_context
-        .get::<DynamicTaskState>()
+        .get_rc::<DynamicTaskState>()
         .ok_or_else(|| SemaError::eval("context/with requires dynamic task state"))?;
     let scope = state
         .push_user_frame(frame)
@@ -206,7 +206,7 @@ fn register_fn_ctx_with_escaping_args(
 mod tests {
     use std::rc::Rc;
 
-    use sema_core::runtime::{CancellationView, RuntimeResponse, TaskContext};
+    use sema_core::runtime::{CancellationView, RuntimeResponse, TaskContextHandle};
 
     use super::*;
 
@@ -232,11 +232,12 @@ mod tests {
         assert_eq!(scope_a, scope_b, "fresh task-local counters collide");
 
         let eval_a = EvalContext::new();
-        let mut task_a = TaskContext::empty();
-        task_a.insert(Rc::clone(&state_a));
+        let task_a = TaskContextHandle::default();
+        task_a.borrow_mut().insert(Rc::clone(&state_a));
         let mut call_a = NativeCallContext {
             eval_context: &eval_a,
-            task_context: &mut task_a,
+            task_context: task_a,
+            call_env: None,
             cancellation: CancellationView::default(),
         };
         let result = Box::new(ContextWithContinuation { scope: scope_a }).resume(
@@ -249,11 +250,12 @@ mod tests {
         assert_eq!(state_b.user_get(&key), Some(Value::keyword("inner-b")));
 
         let eval_b = EvalContext::new();
-        let mut task_b = TaskContext::empty();
-        task_b.insert(Rc::clone(&state_b));
+        let task_b = TaskContextHandle::default();
+        task_b.borrow_mut().insert(Rc::clone(&state_b));
         let mut call_b = NativeCallContext {
             eval_context: &eval_b,
-            task_context: &mut task_b,
+            task_context: task_b,
+            call_env: None,
             cancellation: CancellationView::default(),
         };
         let result = Box::new(ContextWithContinuation { scope: scope_b })
@@ -271,11 +273,12 @@ mod tests {
             BTreeMap::new(),
         ));
         let eval = EvalContext::new();
-        let mut task = TaskContext::empty();
-        task.insert(Rc::clone(&state));
+        let task = TaskContextHandle::default();
+        task.borrow_mut().insert(Rc::clone(&state));
         let mut call_context = NativeCallContext {
             eval_context: &eval,
-            task_context: &mut task,
+            task_context: task.clone(),
+            call_env: None,
             cancellation: CancellationView::default(),
         };
         let outcome = context_with_runtime(

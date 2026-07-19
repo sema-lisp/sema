@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 
 use hashbrown::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use sema_core::runtime::{
     NativeSuspend, OperationId, ResourceClass, ResumeInput, RootId, RuntimeId, TaskContextHandle,
     TaskId, Trace, WaitGeneration, WaitId, WaitKind,
 };
+use sema_core::Env;
 
 use super::{TaskRecord, WaitKey};
 
@@ -121,6 +123,7 @@ struct RegisteredExternalWait {
     queue_cancel: ExecutorCancelHandle,
     continuation: Box<dyn NativeContinuation>,
     context: TaskContextHandle,
+    call_env: Option<Rc<Env>>,
 }
 
 impl Trace for RegisteredExternalWait {
@@ -129,6 +132,10 @@ impl Trace for RegisteredExternalWait {
             && self.resource.trace(sink)
             && self.continuation.trace(sink)
             && self.context.trace(sink)
+            && self.call_env.as_ref().is_none_or(|env| {
+                sink(sema_core::cycle::GcEdge::Env(env));
+                true
+            })
     }
 }
 
@@ -161,6 +168,7 @@ pub struct PendingResume {
     decoder: Option<Box<dyn CompletionDecoder>>,
     continuation: Box<dyn NativeContinuation>,
     context: TaskContextHandle,
+    call_env: Option<Rc<Env>>,
     raw: Option<Result<sema_core::runtime::SendPayload, ExternalFailure>>,
     input: Option<ResumeInput>,
     cancellation: CancellationView,
@@ -173,6 +181,10 @@ impl Trace for PendingResume {
             .is_none_or(|decoder| decoder.trace(sink))
             && self.continuation.trace(sink)
             && self.context.trace(sink)
+            && self.call_env.as_ref().is_none_or(|env| {
+                sink(sema_core::cycle::GcEdge::Env(env));
+                true
+            })
             && self.input.as_ref().is_none_or(|input| input.trace(sink))
     }
 }
@@ -189,10 +201,10 @@ impl PendingResume {
     pub fn invoke_decoder(mut self, eval_context: &sema_core::EvalContext) -> Self {
         if let Some(decoder) = self.decoder.take() {
             let _installed = eval_context.scope_task_context(self.context.clone());
-            let mut task_context = self.context.borrow_mut();
             let mut context = NativeCallContext {
                 eval_context,
-                task_context: &mut task_context,
+                task_context: self.context.clone(),
+                call_env: self.call_env.clone(),
                 cancellation: self.cancellation.clone(),
             };
             let decoded = decoder.decode(
@@ -208,10 +220,10 @@ impl PendingResume {
 
     pub fn invoke_continuation(self, eval_context: &sema_core::EvalContext) -> NativeResult {
         let _installed = eval_context.scope_task_context(self.context.clone());
-        let mut task_context = self.context.borrow_mut();
         let mut context = NativeCallContext {
             eval_context,
-            task_context: &mut task_context,
+            task_context: self.context,
+            call_env: self.call_env,
             cancellation: self.cancellation,
         };
         self.continuation.resume(
@@ -335,6 +347,7 @@ impl WaitRuntime {
         task: &mut TaskRecord,
         suspend: NativeSuspend,
         context: TaskContextHandle,
+        call_env: Option<Rc<Env>>,
     ) -> Result<WaitKey, RegisterExternalError> {
         let WaitKind::External(prepared) = &suspend.wait else {
             panic!("external wait required");
@@ -391,6 +404,7 @@ impl WaitRuntime {
                 queue_cancel,
                 continuation: suspend.continuation,
                 context,
+                call_env,
             },
         );
         if let Err(rejected) = self
@@ -419,6 +433,7 @@ impl WaitRuntime {
             decoder: Some(wait.decoder),
             continuation: wait.continuation,
             context: wait.context,
+            call_env: wait.call_env,
             raw: Some(Err(ExternalFailure::rejected())),
             input: None,
             cancellation: CancellationView::default(),
@@ -537,6 +552,7 @@ impl WaitRuntime {
                     decoder: Some(wait.decoder),
                     continuation: wait.continuation,
                     context: wait.context,
+                    call_env: wait.call_env,
                     raw: Some(completion.result),
                     input: None,
                     cancellation: CancellationView::default(),
@@ -658,6 +674,7 @@ impl WaitRuntime {
             decoder: None,
             continuation: wait.continuation,
             context: wait.context,
+            call_env: wait.call_env,
             raw: None,
             input: Some(ResumeInput::Cancelled(reason)),
             cancellation: CancellationView::new(true, Some(reason)),

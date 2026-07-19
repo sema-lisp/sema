@@ -3491,11 +3491,11 @@ impl NativeContinuation for ChannelDeferContinuation {
         input: ResumeInput,
     ) -> NativeResult {
         assert!(
-            context.task_context.get::<DynamicTaskState>().is_some(),
+            context.task_context.get_rc::<DynamicTaskState>().is_some(),
             "inline channel continuation requires a seeded dynamic task state"
         );
         assert!(
-            context.task_context.get::<ModuleTaskState>().is_some(),
+            context.task_context.get_rc::<ModuleTaskState>().is_some(),
             "inline channel continuation requires a seeded module task state"
         );
         assert!(
@@ -3532,11 +3532,11 @@ fn channel_defer_native(
 ) -> sema_core::NativeFn {
     sema_core::NativeFn::with_context_result("chan-send-defer", move |context, _args| {
         assert!(
-            context.task_context.get::<DynamicTaskState>().is_some(),
+            context.task_context.get_rc::<DynamicTaskState>().is_some(),
             "inline channel native requires a seeded dynamic task state"
         );
         assert!(
-            context.task_context.get::<ModuleTaskState>().is_some(),
+            context.task_context.get_rc::<ModuleTaskState>().is_some(),
             "inline channel native requires a seeded module task state"
         );
         context.eval_context.context_set(
@@ -4788,18 +4788,18 @@ impl CompletionDecoder for ContextIdentityDecoder {
         _result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
     ) -> Result<Value, SemaError> {
         assert!(
-            context.task_context.get::<DynamicTaskState>().is_some(),
+            context.task_context.get_rc::<DynamicTaskState>().is_some(),
             "external decoder requires a seeded dynamic task state"
         );
         assert!(
-            context.task_context.get::<ModuleTaskState>().is_some(),
+            context.task_context.get_rc::<ModuleTaskState>().is_some(),
             "external decoder requires a seeded module task state"
         );
         let key = Value::keyword("runtime-context-seam");
         assert_eq!(
             context.eval_context.context_get(&key),
             Some(Value::keyword("native")),
-            "external decoder observes the task state while NativeCallContext owns its mutable loan"
+            "external decoder observes the task state through the installed handle"
         );
         context
             .eval_context
@@ -4830,11 +4830,11 @@ impl NativeContinuation for ContextIdentityContinuation {
         input: ResumeInput,
     ) -> NativeResult {
         assert!(
-            context.task_context.get::<DynamicTaskState>().is_some(),
+            context.task_context.get_rc::<DynamicTaskState>().is_some(),
             "external continuation requires a seeded dynamic task state"
         );
         assert!(
-            context.task_context.get::<ModuleTaskState>().is_some(),
+            context.task_context.get_rc::<ModuleTaskState>().is_some(),
             "external continuation requires a seeded module task state"
         );
         assert!(matches!(input, ResumeInput::Returned(_)));
@@ -4847,7 +4847,7 @@ impl NativeContinuation for ContextIdentityContinuation {
         assert_eq!(
             context.eval_context.context_get(&key),
             Some(Value::keyword(expected)),
-            "continuation observes the task state while NativeCallContext owns its mutable loan"
+            "continuation observes the task state through the installed handle"
         );
         context.eval_context.context_set(key, Value::keyword(next));
         self.seen.borrow_mut().push((
@@ -4871,6 +4871,216 @@ fn context_identity_suspend(seen: Rc<RefCell<Vec<(&'static str, usize)>>>) -> Na
             seen,
         }),
     }
+}
+
+fn assert_native_call_ownership(
+    context: &NativeCallContext<'_>,
+    expected_marker: i64,
+    task_context_address: &Cell<usize>,
+) {
+    let call_env = context
+        .call_env
+        .as_ref()
+        .expect("VM-backed native call carries its exact call environment");
+    assert_eq!(
+        call_env
+            .get(sema_core::intern("call-env-marker"))
+            .and_then(|value| value.as_int()),
+        Some(expected_marker),
+        "native seam must not observe another interpreter's globals"
+    );
+
+    let address = {
+        let borrowed = context.task_context.borrow();
+        std::ptr::from_ref(&*borrowed) as usize
+    };
+    let installed = context
+        .eval_context
+        .task_context()
+        .expect("runtime task context is installed");
+    let installed_address = {
+        let borrowed = installed.borrow();
+        std::ptr::from_ref(&*borrowed) as usize
+    };
+    assert_eq!(address, installed_address);
+    match task_context_address.get() {
+        0 => task_context_address.set(address),
+        expected => assert_eq!(address, expected, "park/resume changed task context"),
+    }
+}
+
+struct CallEnvDecoder {
+    expected_marker: i64,
+    task_context_address: Rc<Cell<usize>>,
+}
+
+impl Trace for CallEnvDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CompletionDecoder for CallEnvDecoder {
+    fn decode(
+        self: Box<Self>,
+        context: &mut NativeCallContext<'_>,
+        _result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> Result<Value, SemaError> {
+        assert_native_call_ownership(context, self.expected_marker, &self.task_context_address);
+        Ok(Value::int(self.expected_marker))
+    }
+}
+
+struct CallEnvContinuation {
+    expected_marker: i64,
+    task_context_address: Rc<Cell<usize>>,
+}
+
+impl Trace for CallEnvContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for CallEnvContinuation {
+    fn resume(
+        self: Box<Self>,
+        context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        assert_native_call_ownership(context, self.expected_marker, &self.task_context_address);
+        let ResumeInput::Returned(value) = input else {
+            panic!("external completion should return a decoded value")
+        };
+        assert_eq!(value.as_int(), Some(self.expected_marker));
+        Ok(NativeOutcome::Return(value))
+    }
+}
+
+#[test]
+fn vm_native_dispatch_does_not_hold_a_task_context_borrow_during_invocation() {
+    let eval_context = Rc::new(sema_core::EvalContext::new());
+    let runtime = Runtime::new(
+        Rc::clone(&eval_context),
+        Rc::new(FakeClock::new()),
+        Arc::new(FakeExecutor {
+            mode: FakeSubmit::Inline,
+            failure: None,
+        }),
+    )
+    .expect("runtime");
+    let globals = Rc::new(sema_core::Env::new());
+    globals.set(
+        sema_core::intern("reborrow-task-context"),
+        Value::native_fn(sema_core::NativeFn::with_context_result(
+            "reborrow-task-context",
+            |context, _| {
+                let handle = context
+                    .eval_context
+                    .task_context()
+                    .expect("runtime task context is installed");
+                let _task_context = handle.borrow_mut();
+                Ok(NativeOutcome::Return(Value::int(17)))
+            },
+        )),
+    );
+    let known = [sema_core::intern("reborrow-task-context")]
+        .into_iter()
+        .collect();
+    let forms = sema_reader::read_many("(reborrow-task-context)").expect("parse");
+    let program = crate::compile_program(&forms, Some(known)).expect("compile");
+    let mut vm = crate::VM::new(
+        globals,
+        program.functions,
+        &program.native_table,
+        program.main_cache_slots,
+    )
+    .expect("VM construction");
+    vm.seed_main_frame(program.closure);
+    let handle = runtime.submit_root(vm).expect("root admitted");
+
+    assert_eq!(drive_root_to_int(&runtime, &handle), 17);
+}
+
+#[test]
+fn vm_native_call_ownership_isolated_across_runtimes_and_external_resume() {
+    let make_runtime = || {
+        Runtime::new(
+            Rc::new(sema_core::EvalContext::new()),
+            Rc::new(FakeClock::new()),
+            Arc::new(FakeExecutor {
+                mode: FakeSubmit::Inline,
+                failure: None,
+            }),
+        )
+        .expect("runtime")
+    };
+    let runtime_a = make_runtime();
+    let runtime_b = make_runtime();
+
+    let submit = |runtime: &Runtime, marker: i64| {
+        let task_context_address = Rc::new(Cell::new(0));
+        let native_address = Rc::clone(&task_context_address);
+        let decoder_address = Rc::clone(&task_context_address);
+        let continuation_address = Rc::clone(&task_context_address);
+        let globals = Rc::new(sema_core::Env::new());
+        globals.set(sema_core::intern("call-env-marker"), Value::int(marker));
+        globals.set(
+            sema_core::intern("suspend-with-call-env"),
+            Value::native_fn(sema_core::NativeFn::with_context_result(
+                "suspend-with-call-env",
+                move |context, _| {
+                    assert_native_call_ownership(context, marker, &native_address);
+                    Ok(NativeOutcome::Suspend(NativeSuspend {
+                        wait: WaitKind::External(Box::new(
+                            PreparedExternalOperation::quarantined_blocking(
+                                CompletionKind::try_from_raw(92).unwrap(),
+                                Box::new(CallEnvDecoder {
+                                    expected_marker: marker,
+                                    task_context_address: Rc::clone(&decoder_address),
+                                }),
+                                sema_core::runtime::QuarantineBound::hard_deadline(
+                                    Duration::from_secs(1),
+                                )
+                                .unwrap(),
+                                || Ok(Box::new(())),
+                            ),
+                        )),
+                        continuation: Box::new(CallEnvContinuation {
+                            expected_marker: marker,
+                            task_context_address: Rc::clone(&continuation_address),
+                        }),
+                    }))
+                },
+            )),
+        );
+        let known = [sema_core::intern("suspend-with-call-env")]
+            .into_iter()
+            .collect();
+        let forms = sema_reader::read_many("(suspend-with-call-env)").expect("parse");
+        let program = crate::compile_program(&forms, Some(known)).expect("compile");
+        let mut vm = crate::VM::new(
+            globals,
+            program.functions,
+            &program.native_table,
+            program.main_cache_slots,
+        )
+        .expect("VM construction");
+        vm.seed_main_frame(program.closure);
+        let handle = runtime.submit_root(vm).expect("root admitted");
+        (handle, task_context_address)
+    };
+
+    // Each runtime allocates its first root/task from its own local ID space.
+    // Interleaving them proves those colliding local IDs do not select the
+    // other runtime's task context or VM globals across an external wait.
+    let (handle_a, task_context_a) = submit(&runtime_a, 11);
+    let (handle_b, task_context_b) = submit(&runtime_b, 22);
+    assert_eq!(drive_root_to_int(&runtime_b, &handle_b), 22);
+    assert_eq!(drive_root_to_int(&runtime_a, &handle_a), 11);
+    assert_ne!(task_context_a.get(), 0);
+    assert_ne!(task_context_b.get(), 0);
+    assert_ne!(task_context_a.get(), task_context_b.get());
 }
 
 #[test]
@@ -4906,11 +5116,11 @@ fn runtime_native_external_decoder_and_continuations_keep_owning_eval_context() 
             "context-identity",
             move |context, _| {
                 assert!(
-                    context.task_context.get::<DynamicTaskState>().is_some(),
+                    context.task_context.get_rc::<DynamicTaskState>().is_some(),
                     "runtime native requires a seeded dynamic task state"
                 );
                 assert!(
-                    context.task_context.get::<ModuleTaskState>().is_some(),
+                    context.task_context.get_rc::<ModuleTaskState>().is_some(),
                     "runtime native requires a seeded module task state"
                 );
                 let key = Value::keyword("runtime-context-seam");
@@ -6239,6 +6449,7 @@ fn wait_inline_completion_observes_registered_state_then_consumes_owners_once() 
             &mut task,
             external_suspend(Arc::clone(&events)),
             TaskContextHandle::default(),
+            None,
         )
         .is_ok());
     assert_eq!(task.state_name(), StateName::Waiting);
@@ -6280,6 +6491,7 @@ fn wait_submit_rejection_traverses_decoder_then_continuation() {
         &mut task,
         external_suspend(Arc::clone(&events)),
         TaskContextHandle::default(),
+        None,
     );
     let Err(RegisterExternalError::Rejected(pending)) = result else {
         panic!("submission rejection expected")
@@ -6326,6 +6538,7 @@ fn wait_submit_rejection_cancels_interruptible_resource_before_resume() {
                 },
             ),
             TaskContextHandle::default(),
+            None,
         );
         let Err(RegisterExternalError::Rejected(pending)) = result else {
             panic!("submission rejection expected")
@@ -6354,6 +6567,7 @@ fn wait_submit_rejection_drops_unadmitted_quarantine() {
         &mut task,
         external_suspend(Arc::new(Mutex::new(Vec::new()))),
         TaskContextHandle::default(),
+        None,
     );
     assert!(matches!(result, Err(RegisterExternalError::Rejected(_))));
     assert_eq!(runtime.cleanup_len(), 0);
@@ -6383,6 +6597,7 @@ fn wait_trace_includes_cleanup_resource_edges_and_short_circuits() {
                 },
             ),
             TaskContextHandle::default(),
+            None,
         )
         .unwrap();
     task.request_cancellation(CancelReason::Explicit);
@@ -6416,6 +6631,7 @@ fn wait_trace_propagates_cleanup_resource_trace_failure() {
                 },
             ),
             TaskContextHandle::default(),
+            None,
         )
         .unwrap();
     task.request_cancellation(CancelReason::Explicit);
@@ -6444,6 +6660,7 @@ fn wait_completion_for_wrong_task_preserves_active_wait() {
             &mut owner,
             external_suspend(events),
             TaskContextHandle::default(),
+            None,
         )
         .unwrap();
 
@@ -6473,7 +6690,7 @@ fn wait_trace_reports_exact_owned_edges_and_fails_on_borrowed_context() {
         .borrow_mut()
         .insert(Rc::new(EdgeLocal(Value::string("context"))));
     runtime
-        .register_external(&mut task, edge_suspend(), context.clone())
+        .register_external(&mut task, edge_suspend(), context.clone(), None)
         .unwrap();
     let mut edges = 0;
     assert!(runtime.trace(&mut |_| edges += 1));
@@ -6515,6 +6732,7 @@ fn wait_cancel_requires_canonical_request_and_exact_owner_key() {
             &mut owner,
             external_suspend(events),
             TaskContextHandle::default(),
+            None,
         )
         .unwrap();
     let _ = ids.wait_key();
@@ -6562,6 +6780,7 @@ fn wait_cancel_uses_first_task_reason_and_only_quarantine_completion_reaps_clean
         &mut quarantine_task,
         external_suspend(events.clone()),
         TaskContextHandle::default(),
+        None,
     ) else {
         panic!("registration accepted")
     };
@@ -6592,6 +6811,7 @@ fn wait_cancel_uses_first_task_reason_and_only_quarantine_completion_reaps_clean
         &mut interruptible_task,
         interruptible_suspend(events),
         TaskContextHandle::default(),
+        None,
     ) else {
         panic!("registration accepted")
     };
@@ -6627,6 +6847,7 @@ fn exact_quarantine_removal_leaves_one_charged_tombstone_without_scanning_predec
                 &mut task,
                 external_suspend(Arc::new(Mutex::new(Vec::new()))),
                 TaskContextHandle::default(),
+                None,
             )
             .unwrap();
         task.request_cancellation(CancelReason::Explicit);

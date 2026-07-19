@@ -879,7 +879,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 mod tests {
     use super::*;
     use sema_core::runtime::{
-        CancellationView, NativeCallContext, NativeContinuation, ResumeInput, TaskContext, WaitKind,
+        CancellationView, NativeCallContext, NativeContinuation, ResumeInput, TaskContextHandle,
+        WaitKind,
     };
     use std::time::Instant;
     use tokio::sync::watch;
@@ -992,10 +993,11 @@ mod tests {
         assert_eq!(edges, 1);
 
         let eval_context = sema_core::EvalContext::new();
-        let mut task_context = TaskContext::empty();
+        let task_context = TaskContextHandle::default();
         let mut native_context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation: CancellationView::default(),
         };
         let outcome = Box::new(continuation)
@@ -1096,10 +1098,11 @@ mod tests {
             deadline: None,
         };
         let eval_context = sema_core::EvalContext::new();
-        let mut task_context = TaskContext::empty();
+        let task_context = TaskContextHandle::default();
         let mut native_context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation: CancellationView::default(),
         };
 

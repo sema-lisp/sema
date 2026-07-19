@@ -4,11 +4,11 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::cycle::GcEdge;
-use crate::{EvalContext, SemaError, Value};
+use crate::{Env, EvalContext, SemaError, Value};
 
 use super::{
-    CancelReason, ChannelId, PreparedExternalOperation, PromiseId, ResourceGateId, TaskContext,
-    TaskOutcome, TaskSettlement, Trace,
+    CancelReason, ChannelId, PreparedExternalOperation, PromiseId, ResourceGateId,
+    TaskContextHandle, TaskOutcome, TaskSettlement, Trace,
 };
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -34,7 +34,8 @@ impl CancellationView {
 
 pub struct NativeCallContext<'a> {
     pub eval_context: &'a EvalContext,
-    pub task_context: &'a mut TaskContext,
+    pub task_context: TaskContextHandle,
+    pub call_env: Option<Rc<Env>>,
     pub cancellation: CancellationView,
 }
 
@@ -679,10 +680,11 @@ mod tests {
         );
 
         let eval_context = EvalContext::new();
-        let mut task_context = TaskContext::default();
+        let task_context = TaskContextHandle::default();
         let mut context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation: CancellationView::default(),
         };
         let outcome = dispatch
@@ -720,10 +722,11 @@ mod tests {
         }
 
         let eval_context = EvalContext::new();
-        let mut task_context = TaskContext::default();
+        let task_context = TaskContextHandle::default();
         let mut context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation: CancellationView::default(),
         };
 
@@ -801,10 +804,11 @@ mod tests {
     fn continuation_is_consumed_for_each_resume_input() {
         let seen = Rc::new(RefCell::new(Vec::new()));
         let eval_context = EvalContext::new();
-        let mut task_context = TaskContext::default();
+        let task_context = TaskContextHandle::default();
         let mut context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation: CancellationView::default(),
         };
         for input in [
@@ -831,10 +835,11 @@ mod tests {
             observed_by_native.set(context);
             Ok(Value::NIL)
         });
-        let mut task_context = TaskContext::default();
+        let task_context = TaskContextHandle::default();
         let mut runtime_context = NativeCallContext {
             eval_context: &embedded,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation: CancellationView::default(),
         };
 
@@ -849,10 +854,11 @@ mod tests {
     fn native_fn_dual_abi_preserves_legacy_and_runtime_paths() {
         let eval = EvalContext::new();
         let seen_eval = Rc::new(Cell::new(std::ptr::null::<EvalContext>()));
-        let mut task_context = TaskContext::default();
+        let task_context = TaskContextHandle::default();
         let mut runtime = NativeCallContext {
             eval_context: &eval,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation: CancellationView::default(),
         };
         let legacy = NativeFn::simple("legacy", |_| Ok(Value::int(7)));
@@ -890,7 +896,7 @@ mod tests {
 
         let contextual = NativeFn::with_context_result("contextual", |runtime, args| {
             assert!(!runtime.cancellation.is_requested());
-            let _task_context = &mut runtime.task_context;
+            let _task_context = runtime.task_context.borrow_mut();
             Ok(NativeOutcome::Return(args[0].clone()))
         });
         assert!(
@@ -931,10 +937,11 @@ mod tests {
             .is_some());
 
         let eval = EvalContext::new();
-        let mut task_context = TaskContext::default();
+        let task_context = TaskContextHandle::default();
         let mut runtime = NativeCallContext {
             eval_context: &eval,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation: CancellationView::default(),
         };
         assert!(matches!(

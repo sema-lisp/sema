@@ -3293,13 +3293,16 @@ mod tests {
     fn resume_server_ws_continuation(
         continuation: Box<dyn sema_core::runtime::NativeContinuation>,
     ) -> NativeOutcome {
-        use sema_core::runtime::{CancellationView, NativeCallContext, ResumeInput, TaskContext};
+        use sema_core::runtime::{
+            CancellationView, NativeCallContext, ResumeInput, TaskContextHandle,
+        };
 
         let eval_context = sema_core::EvalContext::new();
-        let mut task_context = TaskContext::empty();
+        let task_context = TaskContextHandle::default();
         let mut native_context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation: CancellationView::default(),
         };
         continuation
@@ -3486,8 +3489,8 @@ mod tests {
     #[test]
     fn server_ws_generation_continuation_rearms_after_coalesced_empty_wake() {
         use sema_core::runtime::{
-            CancellationView, NativeCallContext, NativeContinuation, ResumeInput, TaskContext,
-            WaitKind,
+            CancellationView, NativeCallContext, NativeContinuation, ResumeInput,
+            TaskContextHandle, WaitKind,
         };
 
         let (_incoming_tx, incoming_rx) = tokio::sync::mpsc::channel::<WsMsg>(1);
@@ -3498,10 +3501,11 @@ mod tests {
             incoming_generation,
         };
         let eval_context = sema_core::EvalContext::new();
-        let mut task_context = TaskContext::empty();
+        let task_context = TaskContextHandle::default();
         let mut native_context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation: CancellationView::default(),
         };
 

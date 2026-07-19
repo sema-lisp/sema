@@ -1171,11 +1171,11 @@ mod checkout_trace_tests {
     }
 
     fn context() -> (
-        sema_core::runtime::TaskContext,
+        sema_core::runtime::TaskContextHandle,
         sema_core::runtime::CancellationView,
     ) {
         (
-            sema_core::runtime::TaskContext::default(),
+            sema_core::runtime::TaskContextHandle::default(),
             sema_core::runtime::CancellationView::default(),
         )
     }
@@ -1240,10 +1240,11 @@ mod checkout_trace_tests {
     #[test]
     fn final_cont_does_not_swallow_runtime_transition_failure() {
         let eval_context = sema_core::EvalContext::new();
-        let (mut task_context, cancellation) = context();
+        let (task_context, cancellation) = context();
         let mut context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation,
         };
         let error = match Box::new(FinalCont::Value(Value::nil())).resume(
@@ -1297,10 +1298,11 @@ mod checkout_trace_tests {
             terminal_on_success: false,
         };
         let eval_context = sema_core::EvalContext::new();
-        let (mut task_context, cancellation) = context();
+        let (task_context, cancellation) = context();
         let mut native_context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation,
         };
         let decoded =
@@ -1340,10 +1342,11 @@ mod checkout_trace_tests {
             terminal_on_success: false,
         };
         let eval_context = sema_core::EvalContext::new();
-        let (mut task_context, cancellation) = context();
+        let (task_context, cancellation) = context();
         let mut native_context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation,
         };
         let payload = Box::new(((), Err::<(), String>("domain error".into()))) as SendPayload;

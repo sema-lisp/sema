@@ -2407,7 +2407,13 @@ impl Runtime {
                     },
                 );
             }
-            match self.try_channel_handoff(task_id, task, wait, continuation)? {
+            match self.try_channel_handoff(
+                task_id,
+                task,
+                wait,
+                continuation,
+                vm.active_globals(),
+            )? {
                 ChannelHandoffOutcome::Applied(resume) => {
                     apply_vm_resume(&mut vm, resume);
                     // Credits mirror `complete_channel_rendezvous`'s exact
@@ -2912,8 +2918,13 @@ impl Runtime {
                         })?;
                         (task, waits)
                     };
-                let registration =
-                    waits.register_external(&mut task.record, suspend, task.context.clone());
+                let call_env = owner.call_env();
+                let registration = waits.register_external(
+                    &mut task.record,
+                    suspend,
+                    task.context.clone(),
+                    call_env,
+                );
                 task.suspended_owner = Some(owner);
                 let mut state = self.state.borrow_mut();
                 state.waits = Some(waits);
@@ -3134,7 +3145,9 @@ impl Runtime {
         let input = resume
             .response
             .map_or_else(ResumeInput::Failed, ResumeInput::Runtime);
-        let resumed = self.resume_continuation_value(resume.task_id, resume.frame, input)?;
+        let call_env = resume.owner.call_env();
+        let resumed =
+            self.resume_continuation_value(resume.task_id, resume.frame, input, call_env)?;
         let mut state = self.state.borrow_mut();
         if apply_native_result_now(&mut state, resume.task_id, resume.owner, resumed)? {
             state.channel_fast_path_credit += 1;
@@ -3165,6 +3178,7 @@ impl Runtime {
         task: &mut RuntimeTask,
         wait: sema_core::runtime::ChannelWait,
         continuation: Box<dyn sema_core::runtime::NativeContinuation>,
+        call_env: Rc<Env>,
     ) -> Result<ChannelHandoffOutcome, RuntimeFault> {
         let key = {
             let state = self.state.borrow();
@@ -3196,7 +3210,12 @@ impl Runtime {
         let result = match result {
             Ok(result) => result,
             Err(error) => {
-                return self.resume_this_inline(task, continuation, Err(registry_error(error)))
+                return self.resume_this_inline(
+                    task,
+                    continuation,
+                    Err(registry_error(error)),
+                    call_env,
+                )
             }
         };
         // The caller only reaches here after `would_resolve_immediately` said
@@ -3256,7 +3275,7 @@ impl Runtime {
                 }
             }
         }
-        self.resume_this_inline(task, continuation, Ok(response))
+        self.resume_this_inline(task, continuation, Ok(response), call_env)
     }
 
     /// Resume `this` task's own channel continuation with `response` against
@@ -3271,6 +3290,7 @@ impl Runtime {
         task: &mut RuntimeTask,
         continuation: Box<dyn sema_core::runtime::NativeContinuation>,
         response: ChannelResponse,
+        call_env: Rc<Env>,
     ) -> Result<ChannelHandoffOutcome, RuntimeFault> {
         let cancel = task.record.cancellation();
         let input = match cancel {
@@ -3279,14 +3299,13 @@ impl Runtime {
         };
         let eval_context = Rc::clone(&self.state.borrow()._context);
         let _installed = eval_context.scope_task_context(task.context.clone());
-        let mut task_context = task.context.borrow_mut();
         let mut native_context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task_context,
+            task_context: task.context.clone(),
+            call_env: Some(call_env),
             cancellation: CancellationView::new(cancel.is_some(), cancel.map(|c| c.reason)),
         };
         let resumed = continuation.resume(&mut native_context, input);
-        drop(task_context);
         Ok(match resumed {
             Ok(NativeOutcome::Return(value)) => {
                 ChannelHandoffOutcome::Applied(VmResume::Value(value))
@@ -3764,16 +3783,17 @@ impl Runtime {
                 return self
                     .invoke_vm_callback_loop(task_id, owner, call, closure, functions, native_fns);
             } else if let Some(native) = call.callable.as_native_fn_rc() {
+                let call_env = owner.call_env();
                 if !native.escaping_args().is_empty() {
                     if let Some(parent_vm) = owner.parked_parent_vm_mut() {
                         snapshot_native_escaping_args_with_owner(parent_vm, &native, &call.args);
                     }
                 }
                 let _installed = eval_context.scope_task_context(context.clone());
-                let mut task_context = context.borrow_mut();
                 let mut native_context = NativeCallContext {
                     eval_context: &eval_context,
-                    task_context: &mut task_context,
+                    task_context: context.clone(),
+                    call_env,
                     cancellation: CancellationView::new(
                         cancellation.is_some(),
                         cancellation.map(|request| request.reason),
@@ -3984,6 +4004,7 @@ impl Runtime {
         let mut loaded_globals = globals;
         let mut loaded_functions = functions;
         let mut loaded_native_fns = native_fns;
+        let call_env = owner.call_env();
 
         let quantum_guard = match eval_context.enter_runtime_quantum() {
             Ok(guard) => guard,
@@ -4037,10 +4058,10 @@ impl Runtime {
         let mut current_call = call;
         let outcome = loop {
             if let Some(cancel) = task.record.cancellation() {
-                let mut task_context = task.context.borrow_mut();
                 let mut native_context = NativeCallContext {
                     eval_context: &eval_context,
-                    task_context: &mut task_context,
+                    task_context: task.context.clone(),
+                    call_env: call_env.clone(),
                     cancellation: CancellationView::new(true, Some(cancel.reason)),
                 };
                 let resumed = current_call
@@ -4054,10 +4075,10 @@ impl Runtime {
                 break ElementOutcome::Handoff(current_call);
             };
             let Some(next_globals) = next_closure.globals.clone() else {
-                let mut task_context = task.context.borrow_mut();
                 let mut native_context = NativeCallContext {
                     eval_context: &eval_context,
-                    task_context: &mut task_context,
+                    task_context: task.context.clone(),
+                    call_env: call_env.clone(),
                     cancellation: CancellationView::default(),
                 };
                 let resumed = current_call.continuation.resume(
@@ -4093,10 +4114,10 @@ impl Runtime {
                 );
             }
             if let Err(error) = vm.setup_for_call_owned(next_closure, &mut current_call.args) {
-                let mut task_context = task.context.borrow_mut();
                 let mut native_context = NativeCallContext {
                     eval_context: &eval_context,
-                    task_context: &mut task_context,
+                    task_context: task.context.clone(),
+                    call_env: call_env.clone(),
                     cancellation: CancellationView::default(),
                 };
                 let resumed = current_call
@@ -4117,10 +4138,10 @@ impl Runtime {
             remaining_budget = remaining_budget.saturating_sub(quantum.instructions);
             match quantum.outcome {
                 Ok(VmExecResult::Finished(value)) => {
-                    let mut task_context = task.context.borrow_mut();
                     let mut native_context = NativeCallContext {
                         eval_context: &eval_context,
-                        task_context: &mut task_context,
+                        task_context: task.context.clone(),
+                        call_env: call_env.clone(),
                         cancellation: CancellationView::default(),
                     };
                     let resumed = current_call
@@ -4135,10 +4156,10 @@ impl Runtime {
                     }
                 }
                 Err(error) => {
-                    let mut task_context = task.context.borrow_mut();
                     let mut native_context = NativeCallContext {
                         eval_context: &eval_context,
-                        task_context: &mut task_context,
+                        task_context: task.context.clone(),
+                        call_env: call_env.clone(),
                         cancellation: CancellationView::default(),
                     };
                     let resumed = current_call
@@ -4235,7 +4256,8 @@ impl Runtime {
         frame: ContinuationFrame,
         input: ResumeInput,
     ) -> Result<(), RuntimeFault> {
-        let resumed = self.resume_continuation_value(task_id, frame, input)?;
+        let call_env = owner.call_env();
+        let resumed = self.resume_continuation_value(task_id, frame, input, call_env)?;
         self.state
             .borrow_mut()
             .pending
@@ -4260,6 +4282,7 @@ impl Runtime {
         task_id: TaskId,
         frame: ContinuationFrame,
         input: ResumeInput,
+        call_env: Option<Rc<Env>>,
     ) -> Result<NativeResult, RuntimeFault> {
         let (eval_context, context, cancellation, root, published_task_id) = {
             let state = self.state.borrow();
@@ -4303,10 +4326,10 @@ impl Runtime {
             TaskScopeSwap::install(task)
         };
         let mut id_guard = QuantumIdGuard::install(published_task_id, root);
-        let mut task_context = context.borrow_mut();
         let mut native_context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task_context,
+            task_context: context,
+            call_env,
             cancellation: CancellationView::new(
                 cancellation.is_some(),
                 cancellation.map(|request| request.reason),
@@ -4316,7 +4339,6 @@ impl Runtime {
             .map(|request| ResumeInput::Cancelled(request.reason))
             .unwrap_or(input);
         let resumed = frame.resume(&mut native_context, input);
-        drop(task_context);
         id_guard.restore();
         {
             let mut state = self.state.borrow_mut();
@@ -6592,6 +6614,14 @@ pub(super) enum ReturnOwner {
 }
 
 impl ReturnOwner {
+    fn call_env(&self) -> Option<Rc<Env>> {
+        match self {
+            ReturnOwner::VmResume { vm, .. } => Some(vm.active_globals()),
+            ReturnOwner::Continuation(parent, _) => parent.call_env(),
+            ReturnOwner::Root => None,
+        }
+    }
+
     /// The parked parent (HOF-invoking) VM this owner carries, if any. A
     /// cooperative HOF parks its VM in a `VmResume` (possibly under
     /// `Continuation` frames while its callback continuation is driven); that VM

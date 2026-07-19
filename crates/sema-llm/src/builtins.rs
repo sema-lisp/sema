@@ -12302,14 +12302,17 @@ mod tests {
     }
 
     fn invoke_context_probe(env: &Env, name: &str, eval_context: &EvalContext) -> Value {
-        use sema_core::runtime::{CancellationView, NativeCallContext, NativeOutcome, TaskContext};
+        use sema_core::runtime::{
+            CancellationView, NativeCallContext, NativeOutcome, TaskContextHandle,
+        };
 
         let callable = env.get(intern(name)).expect("registered context probe");
         let native = callable.as_native_fn_rc().expect("probe is a native");
-        let mut task_context = TaskContext::empty();
+        let task_context = TaskContextHandle::default();
         let mut call_context = NativeCallContext {
             eval_context,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation: CancellationView::default(),
         };
         match native
@@ -12833,7 +12836,7 @@ mod tests {
     #[test]
     fn complete_attempt_decoder_delivers_one_owned_result() {
         use sema_core::runtime::{
-            CancellationView, CompletionDecoder, NativeCallContext, SendPayload, TaskContext,
+            CancellationView, CompletionDecoder, NativeCallContext, SendPayload, TaskContextHandle,
         };
 
         let slot = Rc::new(RefCell::new(None));
@@ -12854,10 +12857,11 @@ mod tests {
             retry_events: Vec::new(),
         };
         let eval_context = EvalContext::new();
-        let mut task_context = TaskContext::empty();
+        let task_context = TaskContextHandle::default();
         let mut call_context = NativeCallContext {
             eval_context: &eval_context,
-            task_context: &mut task_context,
+            task_context,
+            call_env: None,
             cancellation: CancellationView::default(),
         };
 

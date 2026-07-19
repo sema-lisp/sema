@@ -130,9 +130,9 @@ pub struct EvalContext {
 #[derive(Clone)]
 struct InstalledTaskContext {
     handle: TaskContextHandle,
-    // Native dispatch lends the whole TaskContext mutably to NativeCallContext.
-    // Cache the typed Rc at installation so EvalContext compatibility methods
-    // remain usable during that loan without re-borrowing the context map.
+    // Cache the typed Rcs at installation so EvalContext compatibility methods
+    // do not need to re-borrow the task-local extension map during a native's
+    // own short, scoped task-context operation.
     // The canonical state is still the extension owned by `handle`; every
     // installation refreshes this cached clone of the same Rc.
     dynamic: Option<Rc<DynamicTaskState>>,

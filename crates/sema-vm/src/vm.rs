@@ -1702,6 +1702,10 @@ impl VM {
         self.frames.len()
     }
 
+    pub(crate) fn active_globals(&self) -> Rc<Env> {
+        self.globals.clone()
+    }
+
     fn run(&mut self, ctx: &EvalContext) -> Result<Value, SemaError> {
         if ctx.runtime_quantum_active() {
             return Err(legacy_vm_entry_during_quantum_error());
@@ -1912,15 +1916,15 @@ impl VM {
     /// (nested, synchronous, or wasm entry) the native runs through the legacy
     /// value ABI.
     ///
-    /// The `TaskContext` borrow is confined to the native call itself and dropped
-    /// before returning, so a converted native that suspends — or a legacy
-    /// re-entrant native — never holds it while the frame parks.
+    /// The native receives a cloned task-context handle and borrows it only for
+    /// individual task-local operations, so re-entrant setup can access the same
+    /// context without an invocation-wide `RefMut`.
     ///
     /// The runtime ABI is spoken ONLY at the top of a live runtime quantum
     /// (`runtime_quantum_active`). A nested synchronous re-entry (a module body
     /// run via `execute`, or a legacy callback) suspends that flag precisely so
-    /// its natives take the value ABI and never re-borrow the `TaskContext` the
-    /// enclosing native already holds.
+    /// its natives take the value ABI and cannot install a second task-owned
+    /// runtime wait while the enclosing call is unresolved.
     fn dispatch_native(
         &mut self,
         func: &Rc<NativeFn>,
@@ -1930,10 +1934,10 @@ impl VM {
         if ctx.runtime_quantum_active() {
             if let Some(handle) = ctx.task_context() {
                 let _installed = ctx.scope_task_context(handle.clone());
-                let mut task_context = handle.borrow_mut();
                 let mut native_ctx = NativeCallContext {
                     eval_context: ctx,
-                    task_context: &mut task_context,
+                    task_context: handle,
+                    call_env: Some(self.globals.clone()),
                     cancellation: self.quantum_cancellation.clone(),
                 };
                 let outcome = {
@@ -1941,7 +1945,6 @@ impl VM {
                     snapshot_native_escaping_args(func, call_args);
                     func.invoke_runtime(&mut native_ctx, call_args)
                 }?;
-                drop(task_context);
                 drop(_installed);
                 return Ok(match outcome {
                     NativeOutcome::Return(value) => NativeDispatchResult::Value(value),

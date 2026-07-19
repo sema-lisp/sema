@@ -1763,8 +1763,8 @@ impl VM {
         // The nested run's frame activations re-point `self.globals` /
         // `self.functions` (M1 + M4) and nothing re-activates the paused
         // caller's frame until it resumes. Save/restore them so the VM's live
-        // state stays coherent with the paused frame while the native call is
-        // still in progress (e.g. `current_vm_globals()` for nested imports).
+        // state stays coherent with the paused frame while the nested call is
+        // in progress and after control returns to the caller.
         let saved_globals = self.globals.clone();
         let saved_functions = self.functions.clone();
         self.setup_for_call_args(closure, args)?;
@@ -1953,6 +1953,7 @@ impl VM {
             }
         }
         let value = {
+            let _call_env = ctx.scope_legacy_call_env(&self.globals);
             let _vm_guard = CurrentVmGuard::enter(self);
             snapshot_native_escaping_args(func, call_args);
             (func.func)(ctx, call_args)

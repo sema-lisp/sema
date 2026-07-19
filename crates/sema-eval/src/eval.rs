@@ -2578,11 +2578,23 @@ fn start_runtime_module(
     .drive(context)
 }
 
-fn runtime_delegate_target(fallback: &Weak<Env>) -> Result<Rc<Env>, SemaError> {
-    match sema_vm::current_vm_globals() {
-        Some(target) => Ok(target),
-        None => upgrade_delegate_env(fallback),
-    }
+fn runtime_delegate_target(
+    context: &sema_core::runtime::NativeCallContext<'_>,
+    fallback: &Weak<Env>,
+) -> Result<Rc<Env>, SemaError> {
+    context
+        .call_env
+        .clone()
+        .map_or_else(|| upgrade_delegate_env(fallback), Ok)
+}
+
+fn legacy_delegate_target(
+    context: &EvalContext,
+    fallback: &Weak<Env>,
+) -> Result<Rc<Env>, SemaError> {
+    context
+        .legacy_call_env()
+        .map_or_else(|| upgrade_delegate_env(fallback), Ok)
 }
 
 fn runtime_load(
@@ -2590,7 +2602,7 @@ fn runtime_load(
     context: &mut sema_core::runtime::NativeCallContext<'_>,
     args: &[Value],
 ) -> sema_core::runtime::NativeResult {
-    let target = runtime_delegate_target(fallback)?;
+    let target = runtime_delegate_target(context, fallback)?;
     let module = special_forms::prepare_load(args, context.eval_context)?;
     start_runtime_module(context, module, target, RuntimeModuleCompletion::Load)
 }
@@ -2613,7 +2625,7 @@ fn runtime_import(
 ) -> sema_core::runtime::NativeResult {
     use sema_core::runtime::{NativeOutcome, RuntimeRequest};
 
-    let target = runtime_delegate_target(&state.import_env)?;
+    let target = runtime_delegate_target(context, &state.import_env)?;
     let args = import_args(args)?;
     match special_forms::prepare_import(&args, context.eval_context)? {
         special_forms::ImportPreparation::Cached { exports, selective } => {
@@ -2676,10 +2688,7 @@ fn legacy_import(
     args: &[Value],
 ) -> Result<Value, SemaError> {
     let args = import_args(args)?;
-    let target = match sema_vm::current_vm_globals() {
-        Some(target) => target,
-        None => upgrade_delegate_env(&state.import_env)?,
-    };
+    let target = legacy_delegate_target(context, &state.import_env)?;
     let result = match special_forms::prepare_import(&args, context)? {
         special_forms::ImportPreparation::Cached { exports, selective } => {
             special_forms::copy_exports_to_env(&exports, &selective, &target)?;
@@ -3218,12 +3227,10 @@ fn force_legacy(
 /// Invariant I2 (CORE-2): each delegate's boxed closure captures the env it is
 /// registered into WEAKLY (`Weak<Env>`), never strongly — a strong capture
 /// would form an uncollectable `Env → NativeFn → Box<dyn Fn> → Env` cycle that
-/// pins the entire environment past Interpreter teardown. `__vm-eval`'s
-/// runtime-ABI closure additionally captures `ctx` WEAKLY for the same
-/// reason: `EvalContext` transitively owns `Value`s (module cache, user
-/// context), so a strong capture would form the same kind of uncollectable
-/// cycle.
-pub fn register_vm_delegates(env: &Rc<Env>, ctx: &Rc<EvalContext>) {
+/// pins the entire environment past Interpreter teardown. Runtime delegates
+/// receive the exact evaluator context and call environment through their
+/// invocation context rather than capturing either owner.
+pub fn register_vm_delegates(env: &Rc<Env>, _ctx: &Rc<EvalContext>) {
     // __vm-eval: macro-expand, compile, and run the expression on the bytecode
     // VM (rooted at the global env so top-level `define`s persist). The runtime
     // `(eval ...)` meta path is thus VM-native.
@@ -3245,7 +3252,6 @@ pub fn register_vm_delegates(env: &Rc<Env>, ctx: &Rc<EvalContext>) {
     // fresh VM hitting a dead end with no scheduler attached.
     let eval_env = Rc::downgrade(env);
     let eval_env_runtime = Rc::downgrade(env);
-    let eval_ctx_runtime = Rc::downgrade(ctx);
     env.set(
         intern("__vm-eval"),
         Value::native_fn(NativeFn::with_ctx_runtime(
@@ -3265,15 +3271,12 @@ pub fn register_vm_delegates(env: &Rc<Env>, ctx: &Rc<EvalContext>) {
                     sema_vm::VM::new(eval_env, prog.functions, &[], prog.main_cache_slots)?;
                 vm.execute(prog.closure, ctx)
             },
-            move |_native_ctx, args| {
+            move |native_ctx, args| {
                 if args.len() != 1 {
                     return Err(SemaError::arity("eval", "1", args.len()));
                 }
-                let eval_env = upgrade_delegate_env(&eval_env_runtime)?;
-                let eval_ctx = eval_ctx_runtime
-                    .upgrade()
-                    .ok_or_else(|| SemaError::eval("evaluator context has been torn down"))?;
-                let expanded = expand_for_vm_in(&eval_ctx, &eval_env, &args[0])?;
+                let eval_env = runtime_delegate_target(native_ctx, &eval_env_runtime)?;
+                let expanded = expand_for_vm_in(native_ctx.eval_context, &eval_env, &args[0])?;
                 if expanded.is_nil() {
                     return Ok(sema_core::runtime::NativeOutcome::Return(Value::nil()));
                 }
@@ -3334,10 +3337,7 @@ pub fn register_vm_delegates(env: &Rc<Env>, ctx: &Rc<EvalContext>) {
                 if args.len() != 1 {
                     return Err(SemaError::arity("load", "1", args.len()));
                 }
-                let target = match sema_vm::current_vm_globals() {
-                    Some(target) => target,
-                    None => upgrade_delegate_env(&load_env)?,
-                };
+                let target = legacy_delegate_target(ctx, &load_env)?;
                 match special_forms::eval_load(std::slice::from_ref(&args[0]), &target, ctx)? {
                     Trampoline::Value(value) => Ok(value),
                     Trampoline::Eval(..) => Ok(Value::nil()),
@@ -3779,30 +3779,34 @@ pub fn register_vm_delegates(env: &Rc<Env>, ctx: &Rc<EvalContext>) {
     );
 
     // gc/collect: run a full cycle collection now (CORE-2). User-facing —
-    // registered here (not sema-stdlib) because pin computation needs
-    // sema-vm's current-VM introspection. Pins skip descent into the live
-    // global namespace of the executing VM (or of this interpreter when
-    // called outside one); correctness never depends on pins — live objects
-    // are protected by their external strong counts.
+    // registered here (not sema-stdlib) because pin computation needs the
+    // native call environment. Pins skip descent into the live namespace of
+    // the executing VM, with the interpreter env as the direct-host fallback;
+    // correctness never depends on pins — live objects are protected by their
+    // external strong counts.
     let gc_env = Rc::downgrade(env);
+    let gc_env_runtime = Rc::downgrade(env);
     env.set(
         intern("gc/collect"),
-        Value::native_fn(NativeFn::simple("gc/collect", move |args| {
-            if !args.is_empty() {
-                return Err(SemaError::arity("gc/collect", "0", args.len()));
-            }
-            let pins = match sema_vm::current_vm_globals() {
-                Some(globals) => sema_core::gc_env_chain_pins(&globals),
-                None => match gc_env.upgrade() {
-                    Some(env) => sema_core::gc_env_chain_pins(&env),
-                    None => Vec::new(),
-                },
-            };
-            Ok(gc_stats_map(&sema_core::gc_collect(
-                &pins,
-                sema_core::GcTrigger::Explicit,
-            )))
-        })),
+        Value::native_fn(NativeFn::with_ctx_runtime(
+            "gc/collect",
+            move |context, args| {
+                validate_gc_collect_args(args)?;
+                Ok(gc_collect_with_pins(gc_delegate_pins(
+                    context.legacy_call_env().as_ref(),
+                    &gc_env,
+                )))
+            },
+            move |context, args| {
+                validate_gc_collect_args(args)?;
+                Ok(sema_core::runtime::NativeOutcome::Return(
+                    gc_collect_with_pins(gc_delegate_pins(
+                        context.call_env.as_ref(),
+                        &gc_env_runtime,
+                    )),
+                ))
+            },
+        )),
     );
 
     // gc/stats: report the last completed collection's stats plus the current
@@ -3843,11 +3847,35 @@ fn gc_stats_map(stats: &sema_core::GcStats) -> Value {
     Value::map(gc_stats_btree(stats))
 }
 
+fn gc_delegate_pins(call_env: Option<&Rc<Env>>, fallback: &Weak<Env>) -> Vec<sema_core::NodePtr> {
+    call_env
+        .cloned()
+        .or_else(|| fallback.upgrade())
+        .map_or_else(Vec::new, |env| sema_core::gc_env_chain_pins(&env))
+}
+
+fn validate_gc_collect_args(args: &[Value]) -> Result<(), SemaError> {
+    if !args.is_empty() {
+        return Err(SemaError::arity("gc/collect", "0", args.len()));
+    }
+    Ok(())
+}
+
+fn gc_collect_with_pins(pins: Vec<sema_core::NodePtr>) -> Value {
+    gc_stats_map(&sema_core::gc_collect(
+        &pins,
+        sema_core::GcTrigger::Explicit,
+    ))
+}
+
 #[cfg(test)]
 mod runtime_eval_tests {
     use super::*;
 
-    use sema_core::runtime::{CancelReason, TaskOutcome, TaskSettlement};
+    use sema_core::runtime::{
+        CancelReason, CancellationView, NativeCallContext, NativeOutcome, TaskContextHandle,
+        TaskOutcome, TaskSettlement,
+    };
     use sema_vm::runtime::{RootHandle, RootOptions, RootPoll};
 
     fn drive_selected_until_ready(interp: &Interpreter, root: &RootHandle) -> Rc<TaskSettlement> {
@@ -3895,6 +3923,182 @@ mod runtime_eval_tests {
         assert!(interp.ctx.current_file.borrow().is_empty());
         assert!(interp.ctx.module_exports.borrow().is_empty());
         assert!(interp.ctx.module_load_stack.borrow().is_empty());
+    }
+
+    fn invoke_runtime_delegate(
+        interp: &Interpreter,
+        name: &str,
+        call_env: Rc<Env>,
+        args: &[Value],
+    ) -> NativeOutcome {
+        let delegate = interp
+            .global_env
+            .get_str(name)
+            .and_then(|value| value.as_native_fn_rc())
+            .unwrap_or_else(|| panic!("missing runtime delegate {name}"));
+        let task_context = TaskContextHandle::default();
+        task_context
+            .borrow_mut()
+            .insert(Rc::new(sema_core::runtime::ModuleTaskState::default()));
+        let mut context = NativeCallContext {
+            eval_context: &interp.ctx,
+            task_context,
+            call_env: Some(call_env),
+            cancellation: CancellationView::default(),
+        };
+        delegate
+            .invoke_runtime(&mut context, args)
+            .unwrap_or_else(|error| panic!("runtime delegate {name} failed: {error}"))
+    }
+
+    #[test]
+    fn direct_runtime_eval_callable_uses_explicit_call_environment() {
+        let interp = Interpreter::new();
+        let call_env = Rc::new(Env::with_parent(Rc::clone(&interp.global_env)));
+        call_env.set_str("call-env-only", Value::int(41));
+        let expression = sema_reader::read_many("(+ call-env-only 1)")
+            .expect("parse runtime eval expression")
+            .remove(0);
+
+        let outcome =
+            invoke_runtime_delegate(&interp, "__vm-eval", Rc::clone(&call_env), &[expression]);
+        let NativeOutcome::Call(call) = outcome else {
+            panic!("runtime eval did not produce a structural call");
+        };
+        let (closure, _, _) = sema_vm::extract_vm_closure(&call.callable)
+            .expect("runtime eval produces a VM closure");
+        let home = closure
+            .globals
+            .as_ref()
+            .expect("runtime eval closure has explicit globals");
+
+        assert!(
+            Rc::ptr_eq(home, &call_env),
+            "runtime eval must compile against the exact caller environment"
+        );
+    }
+
+    #[test]
+    fn direct_runtime_load_callable_uses_explicit_call_environment() {
+        let interp = Interpreter::new();
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from("call-env-load.sema"),
+            b"(define loaded-into-call-env 42)".to_vec(),
+        );
+        let call_env = Rc::new(Env::with_parent(Rc::clone(&interp.global_env)));
+
+        let outcome = invoke_runtime_delegate(
+            &interp,
+            "__vm-load",
+            Rc::clone(&call_env),
+            &[Value::string("call-env-load.sema")],
+        );
+        let NativeOutcome::Call(call) = outcome else {
+            panic!("runtime load did not produce a structural call");
+        };
+        let (closure, _, _) = sema_vm::extract_vm_closure(&call.callable)
+            .expect("runtime load produces a VM closure");
+        let home = closure
+            .globals
+            .as_ref()
+            .expect("runtime load closure has explicit globals");
+
+        assert!(
+            Rc::ptr_eq(home, &call_env),
+            "runtime load must execute definitions in the exact caller environment"
+        );
+    }
+
+    #[test]
+    fn cached_runtime_imports_with_colliding_root_ids_do_not_cross_environments() {
+        fn prepare(value: i64) -> Interpreter {
+            let interp = Interpreter::new();
+            interp.ctx.set_embedded_file(
+                std::path::PathBuf::from("colliding-call-env.sema"),
+                format!(
+                    "(module colliding-call-env (export imported-answer) (define imported-answer {value}))"
+                )
+                .into_bytes(),
+            );
+            interp
+                .eval_str_via_runtime(r#"(import "colliding-call-env.sema" imported-answer)"#)
+                .expect("seed interpreter-local module cache");
+            assert_eq!(
+                interp.global_env.take(intern("imported-answer")),
+                Some(Value::int(value))
+            );
+            interp
+        }
+
+        let interp_a = prepare(11);
+        let interp_b = prepare(22);
+        let env_a = Rc::new(Env::with_parent(Rc::clone(&interp_a.global_env)));
+        let env_b = Rc::new(Env::with_parent(Rc::clone(&interp_b.global_env)));
+        let args = [
+            Value::string("colliding-call-env.sema"),
+            Value::list(vec![Value::symbol("imported-answer")]),
+        ];
+
+        assert!(matches!(
+            invoke_runtime_delegate(&interp_a, "__vm-import", Rc::clone(&env_a), &args),
+            NativeOutcome::Return(value) if value.is_nil()
+        ));
+        assert!(matches!(
+            invoke_runtime_delegate(&interp_b, "__vm-import", Rc::clone(&env_b), &args),
+            NativeOutcome::Return(value) if value.is_nil()
+        ));
+
+        assert_eq!(env_a.get_str("imported-answer"), Some(Value::int(11)));
+        assert_eq!(env_b.get_str("imported-answer"), Some(Value::int(22)));
+        assert!(interp_a.global_env.get_str("imported-answer").is_none());
+        assert!(interp_b.global_env.get_str("imported-answer").is_none());
+    }
+
+    #[test]
+    fn gc_delegate_pins_prefer_exact_call_environment_over_fallback() {
+        let fallback = Rc::new(Env::new());
+        let call_env = Rc::new(Env::with_parent(Rc::new(Env::new())));
+        let fallback_weak = Rc::downgrade(&fallback);
+
+        assert_eq!(
+            gc_delegate_pins(Some(&call_env), &fallback_weak),
+            sema_core::gc_env_chain_pins(&call_env)
+        );
+        assert_eq!(
+            gc_delegate_pins(None, &fallback_weak),
+            sema_core::gc_env_chain_pins(&fallback)
+        );
+    }
+
+    #[test]
+    fn preload_style_module_keeps_nested_load_and_import_in_isolated_environment() {
+        let interp = Interpreter::new();
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from("preload-nested-load.sema"),
+            b"(define loaded-only 10)".to_vec(),
+        );
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from("preload-nested-import.sema"),
+            b"(module preload-nested-import (export imported-only) (define imported-only 32))"
+                .to_vec(),
+        );
+        let module_env = Rc::new(Env::with_parent(Rc::clone(&interp.global_env)));
+        let (expressions, spans) = sema_reader::read_many_with_spans(
+            r#"(load "preload-nested-load.sema")
+               (import "preload-nested-import.sema" imported-only)
+               (list loaded-only imported-only)"#,
+        )
+        .expect("parse preload-style module");
+
+        let result = eval_module_body_vm(&interp.ctx, &module_env, &expressions, &spans, None)
+            .expect("evaluate preload-style module");
+
+        assert_eq!(result, Value::list(vec![Value::int(10), Value::int(32)]));
+        assert_eq!(module_env.get_str("loaded-only"), Some(Value::int(10)));
+        assert_eq!(module_env.get_str("imported-only"), Some(Value::int(32)));
+        assert!(interp.global_env.get_str("loaded-only").is_none());
+        assert!(interp.global_env.get_str("imported-only").is_none());
+        assert!(interp.ctx.legacy_call_env().is_none());
     }
 
     // Full-flip blocker (native-stack): routing eval through the runtime

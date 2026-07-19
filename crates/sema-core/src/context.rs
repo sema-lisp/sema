@@ -2,7 +2,7 @@ use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::Instant;
 
 use crate::runtime::{
@@ -124,6 +124,7 @@ pub struct EvalContext {
     pub call_owned_fn: Cell<Option<CallOwnedCallbackFn>>,
     pub interactive: Cell<bool>,
     task_context: RefCell<Option<InstalledTaskContext>>,
+    legacy_call_env: RefCell<Option<Weak<Env>>>,
     runtime_quantum_active: Cell<bool>,
 }
 
@@ -173,9 +174,25 @@ pub struct TaskContextGuard<'a> {
     previous: Option<InstalledTaskContext>,
 }
 
+/// Restores the value-ABI native call environment when a VM dispatch returns
+/// or unwinds. The weak handle avoids making `EvalContext` an owner of an
+/// interpreter or isolated module environment.
+#[doc(hidden)]
+#[must_use = "the call environment guard must live for the native invocation"]
+pub struct LegacyCallEnvGuard<'a> {
+    ctx: &'a EvalContext,
+    previous: Option<Weak<Env>>,
+}
+
 impl Drop for TaskContextGuard<'_> {
     fn drop(&mut self) {
         self.ctx.task_context.replace(self.previous.take());
+    }
+}
+
+impl Drop for LegacyCallEnvGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx.legacy_call_env.replace(self.previous.take());
     }
 }
 
@@ -231,6 +248,7 @@ impl EvalContext {
             call_owned_fn: Cell::new(None),
             interactive: Cell::new(false),
             task_context: RefCell::new(None),
+            legacy_call_env: RefCell::new(None),
             runtime_quantum_active: Cell::new(false),
         }
     }
@@ -260,6 +278,7 @@ impl EvalContext {
             call_owned_fn: Cell::new(None),
             interactive: Cell::new(false),
             task_context: RefCell::new(None),
+            legacy_call_env: RefCell::new(None),
             runtime_quantum_active: Cell::new(false),
         }
     }
@@ -284,6 +303,27 @@ impl EvalContext {
                 .task_context
                 .replace(Some(InstalledTaskContext::new(handle))),
         }
+    }
+
+    /// Installs the globals of the VM invoking a native through its synchronous
+    /// value ABI. Nested VM dispatches replace this weak handle for their scope
+    /// and the guard restores the previous environment on every exit path.
+    #[doc(hidden)]
+    pub fn scope_legacy_call_env(&self, env: &Rc<Env>) -> LegacyCallEnvGuard<'_> {
+        LegacyCallEnvGuard {
+            ctx: self,
+            previous: self.legacy_call_env.replace(Some(Rc::downgrade(env))),
+        }
+    }
+
+    /// Returns the synchronous VM environment installed for the current native
+    /// invocation. Direct host calls have no installed environment.
+    #[doc(hidden)]
+    pub fn legacy_call_env(&self) -> Option<Rc<Env>> {
+        self.legacy_call_env
+            .borrow()
+            .as_ref()
+            .and_then(Weak::upgrade)
     }
 
     fn dynamic_task_state(&self) -> Option<Rc<DynamicTaskState>> {
@@ -907,9 +947,51 @@ impl Default for EvalContext {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::path::PathBuf;
 
     use crate::{Caps, Sandbox, Value};
+
+    #[test]
+    fn scoped_legacy_call_env_restores_nested_environments() {
+        let context = EvalContext::new();
+        let outer = Rc::new(Env::new());
+        let inner = Rc::new(Env::new());
+
+        assert!(context.legacy_call_env().is_none());
+        let outer_guard = context.scope_legacy_call_env(&outer);
+        assert!(Rc::ptr_eq(
+            &context.legacy_call_env().expect("outer call env"),
+            &outer
+        ));
+        {
+            let _inner_guard = context.scope_legacy_call_env(&inner);
+            assert!(Rc::ptr_eq(
+                &context.legacy_call_env().expect("inner call env"),
+                &inner
+            ));
+        }
+        assert!(Rc::ptr_eq(
+            &context.legacy_call_env().expect("restored outer call env"),
+            &outer
+        ));
+        drop(outer_guard);
+        assert!(context.legacy_call_env().is_none());
+    }
+
+    #[test]
+    fn scoped_legacy_call_env_restores_after_panic() {
+        let context = EvalContext::new();
+        let call_env = Rc::new(Env::new());
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = context.scope_legacy_call_env(&call_env);
+            panic!("expected test panic");
+        }));
+
+        assert!(result.is_err());
+        assert!(context.legacy_call_env().is_none());
+    }
 
     #[test]
     fn task_context_handle_lifecycle_and_child_inheritance() {

@@ -7609,7 +7609,7 @@ impl RuntimeCompleteDriver {
                 });
                 self.plan
                     .span
-                    .record_error(llm_error_kind(&error), &error.to_string());
+                    .record_error("provider_error", &error.to_string());
                 return Err(SemaError::Llm(error.to_string()));
             };
             self.next_provider += 1;

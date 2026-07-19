@@ -12,9 +12,22 @@ use sema_llm::types::LlmError;
 fn provider_error_tags_span_error() {
     let cap = sema_otel::testing::install();
 
-    // A non-retryable 400 fails fast (no retries).
-    let fake = FakeProvider::builder("fake")
+    // Non-retryable 400s fail fast (no retries). Cover both the default-provider
+    // path and explicit fallback-chain exhaustion: both are provider-dispatch
+    // failures at the public chat-span boundary.
+    let p1 = FakeProvider::builder("p1")
         .model("fake-model")
+        .error(LlmError::Api {
+            status: 400,
+            message: "bad request".into(),
+        })
+        .build();
+    let p2 = FakeProvider::builder("p2")
+        .model("fake-model")
+        .error(LlmError::Api {
+            status: 400,
+            message: "bad request".into(),
+        })
         .error(LlmError::Api {
             status: 400,
             message: "bad request".into(),
@@ -22,22 +35,32 @@ fn provider_error_tags_span_error() {
         .build();
     let interp = Interpreter::new();
     reset_runtime_state();
-    register_test_provider(Box::new(fake));
+    register_test_provider(Box::new(p1));
+    register_test_provider(Box::new(p2));
 
-    let res = interp.eval_str_compiled(r#"(llm/complete "boom")"#);
-    assert!(res.is_err(), "the completion should fail");
+    let direct = interp.eval_str_compiled(r#"(llm/complete "direct")"#);
+    assert!(
+        direct.is_err(),
+        "the default-provider completion should fail"
+    );
+    let fallback = interp
+        .eval_str_compiled(r#"(llm/with-fallback [:p1 :p2] (fn () (llm/complete "fallback")))"#);
+    assert!(fallback.is_err(), "the fallback chain should be exhausted");
 
-    let chat = cap
+    let chats: Vec<_> = cap
         .spans_json()
         .into_iter()
-        .find(|s| s["attributes"]["gen_ai.operation.name"] == "chat")
-        .expect("a chat span should still be emitted on error");
-    assert_eq!(chat["attributes"]["error.type"], "provider_error");
-    assert!(
-        chat["status"]
-            .as_str()
-            .is_some_and(|s| s.starts_with("error")),
-        "span status should be Error, got {:?}",
-        chat["status"]
-    );
+        .filter(|s| s["attributes"]["gen_ai.operation.name"] == "chat")
+        .collect();
+    assert_eq!(chats.len(), 2, "both failed calls should emit a chat span");
+    for chat in chats {
+        assert_eq!(chat["attributes"]["error.type"], "provider_error");
+        assert!(
+            chat["status"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("error")),
+            "span status should be Error, got {:?}",
+            chat["status"]
+        );
+    }
 }

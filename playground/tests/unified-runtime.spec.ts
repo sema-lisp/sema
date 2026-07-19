@@ -469,29 +469,64 @@ test('synchronous evalVM points HTTP callers to evalPromise without leaking its 
   });
 
   expect(result.error).toContain(
-    'http/get: evalVM cannot perform HTTP requests synchronously; use evalPromise',
+    'http/get: synchronous WebAssembly evaluation cannot perform HTTP requests; use evalPromise',
   );
   expect(result.error).not.toContain('__SEMA_WASM_HTTP__');
 });
 
+test('synchronous evalVM rejects timer suspension promptly and keeps the runtime reusable', async ({ page }) => {
+  await page.goto('/');
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+    const started = performance.now();
+    const suspended = interp.evalVM('(async/sleep 750) 99');
+    const elapsed = performance.now() - started;
+    const next = interp.evalVM('(+ 1 2)');
+    return { suspended, elapsed, next };
+  });
+
+  expect(result.elapsed).toBeLessThan(250);
+  expect(result.suspended.error).toContain('synchronous WebAssembly evaluation cannot suspend');
+  expect(result.suspended.error).toContain('evalPromise');
+  expect(result.next).toMatchObject({ value: '3', error: null });
+});
+
+test('synchronous debugger rejects suspension and clears only its session', async ({ page }) => {
+  await page.goto('/');
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+    const entry = interp.debugStart('(async/sleep 750)\n99', []);
+    const started = performance.now();
+    const suspended = interp.debugContinue();
+    const elapsed = performance.now() - started;
+    const activeAfterError = interp.debugIsActive();
+    const next = interp.debugStart('(+ 1 2)', []);
+    interp.debugStop();
+    return { entry, suspended, elapsed, activeAfterError, next };
+  });
+
+  expect(result.entry.status).toBe('stopped');
+  expect(result.elapsed).toBeLessThan(250);
+  expect(result.suspended.status).toBe('error');
+  expect(result.suspended.error).toContain('debugStartPromise');
+  expect(result.activeAfterError).toBe(false);
+  expect(result.next.status).toBe('stopped');
+});
+
 // ── Gate (f), un-scoped (P6-3 step 5 —
 // `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md`): the replay loops and
-// the JS-side SAB/`legacySab` fallback are now actually deleted, so this
-// scans the FULL sources, not just `driver.rs`/the shipped bundle's default
-// branch as step 4 scoped it. It is NOT a claim that `HTTP_AWAIT_MARKER`/
-// `installAtomicsSleep` are gone from the Rust crate entirely — they aren't:
-// `crates/sema-wasm/src/lib.rs` keeps both, narrowed to two still-live,
-// verified consumers documented in `docs/deferred.md`'s P6-3 entry and
-// `scripts/check-unified-runtime-legacy.sh`'s zero-tolerance list comment —
-// (1) the wasm debugger's own `http_needed`/`debugPerformFetch` flow (not
-// promise-driven; has no other way to surface a pending fetch to JS), and (2)
-// `check_interrupt`/blocking-sleep support for every still-synchronous entry
-// point (`eval`/`evalGlobal`/`evalVM`, a precompiled bytecode archive entry)
-// via `crates/sema-eval/src/eval.rs`'s `drive_handle_to_settlement`, which a
-// bare `(async/sleep ...)` reaches on ANY path (not dual-ABI-gated). What
-// full-repo deletion actually removed: the three replay loops themselves,
-// `MAX_REPLAYS` (no remaining caller anywhere), and the worker's SAB
-// allocation/`legacySab` branch (JS) entirely.
+// the JS-side SAB/`legacySab` fallback are deleted, so this scans the full
+// production sources rather than one reachable branch. Promise-driven HTTP,
+// sleep, and debugging now own every admissible suspension; synchronous WASM
+// entry points reject suspension instead of retaining a blocking fallback.
 test('the replay loops and MAX_REPLAYS are gone repo-wide', async () => {
   const roots = ['crates', 'playground/src'];
   for (const marker of ['MAX_REPLAYS', 'legacySab', 'new SharedArrayBuffer(']) {
@@ -513,6 +548,24 @@ test('driver.rs (the promise-driven path itself) is free of the legacy replay/At
   for (const marker of ['HTTP_AWAIT_MARKER', 'MAX_REPLAYS', 'installAtomicsSleep', 'Atomics.wait']) {
     expect(driverSrc).not.toContain(marker);
   }
+});
+
+test('the WASM crate has no replay cache, synchronous XHR, or Atomics host adapter', () => {
+  const libSrc = readFileSync(path.join(REPO_ROOT, 'crates/sema-wasm/src/lib.rs'), 'utf8');
+  const cargoSrc = readFileSync(path.join(REPO_ROOT, 'crates/sema-wasm/Cargo.toml'), 'utf8');
+  for (const marker of [
+    'HTTP_AWAIT_MARKER',
+    'HTTP_CACHE',
+    'DEBUG_HTTP_REPLAY_ARMED',
+    'debugPerformFetch',
+    'installAtomicsSleep',
+    'worker_atomics_sleep',
+    'worker_check_interrupt',
+    'XmlHttpRequest',
+  ]) {
+    expect(libSrc).not.toContain(marker);
+  }
+  expect(cargoSrc).not.toContain('XmlHttpRequest');
 });
 
 test('the shipped default worker protocol never reaches legacy Atomics/replay code (SAB deleted entirely)', async () => {

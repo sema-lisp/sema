@@ -4,9 +4,8 @@
 // eval seam, P6-3 step 2 — `crates/sema-wasm/src/driver.rs`) submits the
 // program as ONE root on the unified runtime and settles it via a macrotask
 // driver; `async/sleep` and `http/get` complete through real `setTimeout`/
-// `fetch` callbacks, so a real wall-clock sleep no longer needs to block this
-// thread on `Atomics.wait` — the worker stays free to pump its own macrotask
-// queue and to receive a `cancel` message mid-run. Message protocol:
+// `fetch` callbacks, so the worker stays free to pump its own macrotask queue
+// and to receive a `cancel` message mid-run. Message protocol:
 //   main -> { type:'init' }
 //   worker -> { type:'ready' }
 //   main -> { type:'eval', id, code, vfs }
@@ -14,10 +13,8 @@
 //   worker -> { type:'result', id, result:{value,output,error}, vfs }
 //   main -> { type:'cancel', id }   Stop: cancels root `id`'s in-flight eval
 //
-// The control `SharedArrayBuffer`/`installAtomicsSleep`/`Atomics.wait` replay
-// path is gone (P6-3 step 5 — `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md`):
-// this worker never allocates a SAB and cancellation routes exclusively
-// through `cancelRoot`.
+// The blocking worker fallback is gone: this worker stays event-loop driven,
+// and cancellation routes exclusively through `cancelRoot`.
 import init, { SemaInterpreter } from '../pkg/sema_wasm.js';
 
 let interp = null;

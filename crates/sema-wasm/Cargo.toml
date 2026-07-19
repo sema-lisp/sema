@@ -34,7 +34,6 @@ web-sys = { workspace = true, features = [
     "Response",
     "AbortController",
     "AbortSignal",
-    "XmlHttpRequest",
     "MessageChannel",
     "MessagePort",
     "MessageEvent",

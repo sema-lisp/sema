@@ -1,40 +1,20 @@
-//! Macrotask-driven Promise seam for the unified runtime (P6-3 step 2 —
-//! `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md`).
+//! Macrotask-driven Promise host for the unified runtime.
 //!
-//! This is a SECOND, additive way to evaluate Sema in the wasm build, exposed
-//! as `WasmInterpreter::evalPromise`. It shares the same `sema_eval::Interpreter`
-//! (and therefore the same global env / persistent runtime / detached tasks)
-//! as every pre-existing entry point (`eval`, `evalAsync`, `evalVM`,
-//! `evalVMAsync`, `runEntryAsync`, …), but drives it differently:
+//! `WasmInterpreter::evalPromise`, the async compatibility wrappers, compiled
+//! archive entry points, and the Promise debugger share one interpreter and
+//! persistent runtime. This module drives their roots without blocking:
 //!
 //! * one call submits ONE root via `Interpreter::submit_str` and returns a
 //!   `js_sys::Promise` immediately — the program body is never replayed;
 //! * settlement is pumped by repeated, BOUNDED, NON-BLOCKING
 //!   `Interpreter::drive_turn` calls scheduled across browser macrotasks
-//!   (`schedule_drive`), never by blocking the calling thread. This is the
-//!   part the shipped `eval*` entry points cannot do: their
-//!   `drive_vm_on_runtime` → `drive_handle_to_settlement` path BLOCKS the
-//!   calling thread on `WaitRuntime::block_on_inbox`, which internally calls
-//!   `Receiver::recv_timeout` — unconditionally unsupported on
-//!   wasm32-unknown-unknown (confirmed: it hits `Instant::now()` inside
-//!   std's own `mpmc` channel and panics) the moment a program actually
-//!   suspends on a timer or external wait. `evalPromise` is therefore also
-//!   the FIRST wasm entry point that can correctly run `async/sleep` or a
-//!   real `http/get` at all — not just a Promise-flavored return type.
+//!   (`schedule_drive`), which lets browser timer and fetch callbacks resume
+//!   the original root in place.
 //!
-//! Old paths are untouched: they never call anything in this module directly.
-//! But they DO share the same `Runtime::drive`, so `runtime_quantum_active()`/
-//! `in_runtime_quantum()` is true for old and new paths alike — that flag
-//! CANNOT be used to gate the dual-ABI http natives below, because it would
-//! (and, before this module added [`PromiseDrivenGuard`], did)
-//! hijack an old entry point's http call into a structural `External` suspend
-//! it can never resolve (the old path's only recovery, `block_on_inbox`,
-//! cannot work on wasm32 — see above). The dual-ABI http natives (and, on
-//! wasm32, `async/sleep`) instead gate on
-//! [`sema_core::promise_driven_quantum_active`], which THIS module sets true
-//! only for the duration of its own `drive_turn` call — the only caller that
-//! actually pumps the runtime non-blockingly across turns and can resolve a
-//! structural suspend.
+//! `runtime_quantum_active()` is also true for synchronous WASM evaluations,
+//! so dual-ABI HTTP uses [`sema_core::promise_driven_quantum_active`] to admit
+//! structural fetch suspension only while this host can pump browser turns.
+//! Synchronous entry points reject suspension with a Promise-API hint.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -664,15 +644,13 @@ fn drive_and_settle(driver: &Rc<PromiseDriver>) {
     let interp = &driver.interp;
 
     let drive_state = {
-        // Only this call is "promise-driven": the dual-ABI natives (wasm
-        // http, and `async/sleep` on wasm32) consult
+        // Only this call is "promise-driven": dual-ABI WASM HTTP consults
         // `sema_core::promise_driven_quantum_active()` to suspend
-        // structurally instead of running their legacy synchronous/marker-
-        // throw fallback. The guard is scoped tightly to this one
+        // structurally instead of rejecting the synchronous boundary. The
+        // guard is scoped tightly to this one
         // `drive_turn` call and restores the previous value on drop
-        // (including on unwind), so it can never leak into an unrelated old
-        // `eval`/`evalAsync` call made from a JS callback re-entering the
-        // interpreter.
+        // (including on unwind), so it cannot leak into a synchronous JS call
+        // that re-enters the interpreter.
         let _promise_guard = PromiseDrivenGuard::enter();
         let mut debug_slot = driver.debug_session.borrow_mut();
         if let Some(session) = debug_slot.as_mut() {
@@ -1210,46 +1188,40 @@ struct RawHttpResponse {
     body: String,
 }
 
-/// The legacy (marker-throw) value-ABI closure a dual-ABI wasm http native
-/// falls back to outside a promise-driven turn. Named to keep
+/// The rejecting value-ABI closure a dual-ABI wasm HTTP native uses outside a
+/// Promise-driven turn. Named to keep
 /// `runtime_http_fn`'s signature (and `lib.rs`'s call site) under clippy's
 /// `type_complexity` threshold.
-pub(crate) type LegacyHttpFn = Rc<dyn Fn(&[Value]) -> Result<Value, SemaError>>;
+pub(crate) type SyncHttpFn = Rc<dyn Fn(&[Value]) -> Result<Value, SemaError>>;
 
-/// Register the runtime ABI onto an existing wasm http `NativeFn` built with
-/// [`sema_core::NativeFn::simple`] (the legacy marker-throw closure), turning
-/// it into a dual-ABI native via
+/// Register the runtime ABI onto an existing wasm HTTP `NativeFn`, turning it
+/// into a dual-ABI native via
 /// [`sema_core::NativeFn::simple_with_runtime`].
 ///
-/// `runtime_quantum_active()` is true for EVERY live runtime quantum — old
-/// wasm entry points included, since they all drive the same
-/// `Runtime::drive` — so it cannot gate this closure (see the module doc
-/// comment). Instead this checks
+/// `runtime_quantum_active()` is true for every live runtime quantum, including
+/// synchronous WASM entry points, so it cannot identify a host that can pump
+/// browser callbacks. This checks
 /// [`sema_core::promise_driven_quantum_active`], set true only inside this
 /// module's own `drive_and_settle` turn: when true, suspend structurally on
-/// a real `WaitKind::External` fetch; otherwise run `legacy` (the exact
-/// marker-throw closure every pre-existing entry point always got) and wrap
-/// its result as a plain `Return`, matching what `NativeFn::invoke_runtime`
-/// does automatically for a native with no `runtime_func` at all — i.e. old
-/// entry points see byte-for-byte the same behavior as before this native
-/// became dual-ABI.
+/// a real `WaitKind::External` fetch; otherwise run `synchronous`, which
+/// rejects the unsupported blocking call with an `evalPromise` hint.
 pub(crate) fn runtime_http_fn(
     method: &'static str,
-    legacy: LegacyHttpFn,
+    synchronous: SyncHttpFn,
 ) -> impl for<'a> Fn(&mut NativeCallContext<'a>, &[Value]) -> NativeResult + 'static {
     move |_ctx, args| {
         if sema_core::promise_driven_quantum_active() {
             runtime_http_call(method, args)
         } else {
-            (legacy)(args).map(NativeOutcome::Return)
+            (synchronous)(args).map(NativeOutcome::Return)
         }
     }
 }
 
 fn runtime_http_call(default_method: &'static str, args: &[Value]) -> NativeResult {
-    // Mirrors `wasm_http_request`'s calling conventions per verb: `http/get`
-    // and `http/delete` take (url, opts?); `http/post`/`http/put` take (url,
-    // body, opts?); `http/request` takes (method, url, body?, opts?).
+    // Preserve the public calling conventions per verb: `http/get` and
+    // `http/delete` take (url, opts?); `http/post`/`http/put` take (url, body,
+    // opts?); `http/request` takes (method, url, body?, opts?).
     let (method, url, body, opts): (String, String, Option<&Value>, Option<&Value>) =
         if default_method == "REQUEST" {
             let method = args
@@ -1504,9 +1476,8 @@ fn js_err(e: &JsValue) -> String {
         .unwrap_or_else(|| "error".to_string())
 }
 
-/// Decodes the job's `Result<RawHttpResponse, String>` payload into the same
-/// `{:status :headers :body}` map shape `wasm_http_request`'s legacy path
-/// (via the JS marker replay) produces. Runs on the VM thread; holds no
+/// Decodes the job's `Result<RawHttpResponse, String>` payload into the public
+/// `{:status :headers :body}` map shape. Runs on the VM thread; holds no
 /// `Value`/`Env` (only builds one), matching Invariant I2.
 struct WasmHttpDecoder;
 

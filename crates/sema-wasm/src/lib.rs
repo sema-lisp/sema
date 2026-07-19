@@ -8,12 +8,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
-// P6-3 step 2 (`docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md`): the
-// macrotask-driven Promise seam (`evalPromise`) and its root-tagged output
-// pump. Additive — nothing below this point in the file changes except the
-// http registration (dual-ABI'd so its runtime-suspend variant is reachable
-// only under `evalPromise`) and `WasmInterpreter.inner`'s type (now `Rc`, so
-// the driver's detached macrotask callback can share it).
+// The Promise driver owns browser-turn scheduling, root-tagged output, and the
+// runtime-ABI HTTP adapter used by Promise-based evaluation and debugging.
 mod driver;
 mod output;
 
@@ -32,48 +28,14 @@ thread_local! {
         s.insert("/".to_string());
         s
     });
-    /// In-memory HTTP response cache for the replay-with-cache strategy
-    static HTTP_CACHE: RefCell<BTreeMap<String, Value>> = const { RefCell::new(BTreeMap::new()) };
     /// Total bytes currently stored in the VFS
     static VFS_TOTAL_BYTES: Cell<usize> = const { Cell::new(0) };
-    /// Int32Array view over the control SharedArrayBuffer used for real
-    /// `Atomics.wait` sleep when running inside a Web Worker (installed via
-    /// `installAtomicsSleep`). `None` on the main thread (sleep stays an
-    /// instant virtual-clock advance — `Atomics.wait` is illegal there anyway).
-    static SLEEP_I32: RefCell<Option<js_sys::Int32Array>> = const { RefCell::new(None) };
     /// Optional sink called with each completed output line as it is produced
     /// (installed via `setOutputSink`). The Web Worker uses it to stream
     /// `println` output to the main thread live, so a long-running program
     /// (e.g. one that really sleeps) shows output as it happens instead of all
     /// at once at the end. `None` on the main thread (output is batched).
     static OUTPUT_SINK: RefCell<Option<js_sys::Function>> = const { RefCell::new(None) };
-}
-
-/// Blocking-sleep callback installed in the Web Worker: block this (worker)
-/// thread for `ms` real milliseconds via `Atomics.wait` on the control SAB. The
-/// cell value stays 0, so the wait simply times out after `ms` (a later cancel
-/// can store a non-zero value + `Atomics.notify` to wake it early — see M6).
-/// A plain `fn` (no captures) so it fits `sema_core::BlockingSleepFn`; it reads
-/// the SAB view from the thread-local. Never called on the main thread.
-fn worker_atomics_sleep(ms: u64) {
-    SLEEP_I32.with(|s| {
-        if let Some(arr) = s.borrow().as_ref() {
-            // Slot 0 == 0 → block for `ms`; a cancel stores 1 + notifies, which
-            // wakes this wait immediately so a Stop interrupts a sleep promptly.
-            let _ = js_sys::Atomics::wait_with_timeout(arr, 0, 0, ms as f64);
-        }
-    });
-}
-
-/// Interrupt callback installed in the Web Worker: the main thread requests a
-/// cancel by storing a non-zero value in control slot 0 (+ `Atomics.notify`).
-/// The VM loop guard polls this so a Stop button aborts a running program.
-fn worker_check_interrupt() -> bool {
-    SLEEP_I32.with(|s| {
-        s.borrow()
-            .as_ref()
-            .is_some_and(|arr| js_sys::Atomics::load(arr, 0).unwrap_or(0) != 0)
-    })
 }
 
 /// Active debug session state for cooperative execution on the unified runtime.
@@ -86,18 +48,24 @@ struct DebugSession {
     handle: sema_vm::runtime::RootHandle,
 }
 
+fn cancel_debug_root(runtime: &sema_vm::runtime::Runtime, handle: &sema_vm::runtime::RootHandle) {
+    handle.cancel(sema_core::runtime::CancelReason::HostStop);
+    let budget = sema_vm::runtime::DriveBudget::host_default();
+    for _ in 0..10_000 {
+        if !matches!(handle.poll_result(), sema_vm::runtime::RootPoll::Pending) {
+            break;
+        }
+        if !matches!(
+            runtime.drive(&budget),
+            Ok(sema_vm::runtime::DriveState::Progress { .. })
+        ) {
+            break;
+        }
+    }
+}
+
 thread_local! {
     static DEBUG_SESSION: RefCell<Option<DebugSession>> = const { RefCell::new(None) };
-    /// Distinguishes a same-session `debugStart` replay restart (triggered by
-    /// `debugPerformFetch` right after it caches a response) from a genuine
-    /// fresh session start. `debugPerformFetch` arms this after a successful
-    /// cache insert; the very next `debugStart` consumes it (`replace(false)`)
-    /// and, if it was armed, skips `clear_http_cache()` so the response it just
-    /// fetched survives the replay instead of being wiped and re-fetched in a
-    /// loop. `debugStop` also resets it so an abandoned http_needed exchange
-    /// (Stop clicked instead of letting the replay happen) can't leak an
-    /// arming into an unrelated later fresh session.
-    static DEBUG_HTTP_REPLAY_ARMED: Cell<bool> = const { Cell::new(false) };
 }
 
 const VFS_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024; // 16 MB total
@@ -175,19 +143,14 @@ fn normalize_path(path: &str) -> Result<String, SemaError> {
 
 /// Append text to the current line buffer (no newline).
 ///
-/// Also forwards `s` through `sema_core::write_stdout`, which is a no-op here
-/// for every pre-existing entry point (see `install_noop_core_output_hooks`)
-/// — its ONLY live effect is for a root submitted with
-/// `RootOptions::capture_output` (i.e. `evalPromise`, P6-3 step 2): such a
-/// root has no other way to reach the JS side, since it never runs
-/// `take_output`/`OUTPUT`/`LINE_BUF` below (those are drained by the OLD
-/// entry points' own `eval`/`evalAsync`/… methods, not by `evalPromise`).
+/// Also forwards `s` through `sema_core::write_stdout`. The fallback hook is a
+/// no-op; a root submitted with `RootOptions::capture_output` routes it to the
+/// Promise driver's root-tagged sink instead.
 ///
 /// A promise-driven root's own output therefore has no business in
-/// `LINE_BUF`/`OUTPUT` at all: nothing ever drains those for it (only the OLD
-/// entry points' `take_output()` does, and `evalPromise` never calls that),
+/// `LINE_BUF`/`OUTPUT` at all: nothing ever drains those for it,
 /// so appending there would grow unboundedly for a long-running/looping
-/// promise-driven program. Skip the legacy accumulation while a promise-
+/// promise-driven program. Skip compatibility accumulation while a promise-
 /// driven turn is active; `write_stdout` below is this root's only real sink.
 fn append_output(s: &str) {
     if !sema_core::promise_driven_quantum_active() {
@@ -196,8 +159,8 @@ fn append_output(s: &str) {
     sema_core::write_stdout(s);
 }
 
-/// Error-channel counterpart to [`append_output`]. Legacy entry points retain
-/// their single buffered `output` array, while a capturing runtime root emits
+/// Error-channel counterpart to [`append_output`]. Synchronous entry points
+/// retain their single buffered `output` array, while a capturing runtime root emits
 /// a real stderr-tagged `OutputEvent` for Promise/debugger consumers.
 fn append_error_output(s: &str) {
     if !sema_core::promise_driven_quantum_active() {
@@ -210,7 +173,7 @@ fn append_error_output(s: &str) {
 ///
 /// A no-op while a promise-driven turn is active — `LINE_BUF` is never
 /// populated for such a root either (see `append_output`), and `OUTPUT`/
-/// `OUTPUT_SINK` are exclusively the OLD entry points' output channel; a
+/// `OUTPUT_SINK` are exclusively the synchronous output channel; a
 /// promise-driven root's output goes out through `output.rs`'s own sink.
 /// Without this, every `println` from a long-running/looping promise-driven
 /// program would still push an (empty) line into `OUTPUT` forever.
@@ -247,392 +210,25 @@ fn take_output() -> Vec<String> {
     OUTPUT.with(|o| o.borrow_mut().drain(..).collect())
 }
 
-// `HTTP_AWAIT_MARKER`/the replay-with-cache mechanism it drove is deleted
-// everywhere EXCEPT the debugger's own HTTP flow (P6-3 step 5 — see the
-// deletion inventory note at `docs/deferred.md`'s P6-3 entry): `debugStart`'s
-// synchronous drive and `debugPerformFetch`/`debug_maybe_http_error` below
-// still catch this marker to implement the debugger's "http_needed" pause —
-// that flow is not promise-driven and has no other way to surface a pending
-// fetch to JS. Every OTHER caller (`evalAsync`/`evalVMAsync`/`runEntryAsync`'s
-// source branch) now submits through `evalPromise` instead, where `http/get`
-// never throws this marker at all (see the dual-ABI gate in
-// `register_wasm_io`) — so it's a live, narrower-scoped primitive, not dead
-// code.
-const HTTP_AWAIT_MARKER: &str = "__SEMA_WASM_HTTP__";
-
 /// Instruction budget per cooperative VM yield. The VM will execute up to this
 /// many instructions before yielding back to the browser event loop.
 const WASM_DEBUG_INSTRUCTION_BUDGET: u32 = 500_000;
 
-/// Build a deterministic cache key from HTTP request parameters.
-fn http_cache_key(
-    method: &str,
-    url: &str,
-    body: Option<&str>,
-    headers: &[(String, String)],
-) -> String {
-    use std::fmt::Write;
-    let mut key = format!("{method}\n{url}\n");
-    match body {
-        Some(b) => {
-            write!(key, "{b}").unwrap();
-        }
-        None => {
-            key.push_str("<nil>");
-        }
-    }
-    key.push('\n');
-    for (k, v) in headers {
-        writeln!(key, "{k}:{v}").unwrap();
-    }
-    key
-}
-
-/// Create a marker error whose message encodes an HTTP request as JSON.
-fn http_await_marker(
-    method: &str,
-    url: &str,
-    body: Option<&str>,
-    headers: &[(String, String)],
-    timeout_ms: Option<i64>,
-) -> SemaError {
-    let key = http_cache_key(method, url, body, headers);
-    let body_json = match body {
-        Some(b) => format!("\"{}\"", escape_json(b)),
-        None => "null".to_string(),
-    };
-    let timeout_json = match timeout_ms {
-        Some(t) => format!("{t}"),
-        None => "null".to_string(),
-    };
-    let headers_json = headers
-        .iter()
-        .map(|(k, v)| format!("[\"{}\",\"{}\"]", escape_json(k), escape_json(v)))
-        .collect::<Vec<_>>()
-        .join(",");
-    let payload = format!(
-        "{}{{\"key\":\"{}\",\"method\":\"{}\",\"url\":\"{}\",\"body\":{},\"headers\":[{}],\"timeout\":{}}}",
-        HTTP_AWAIT_MARKER,
-        escape_json(&key),
-        escape_json(method),
-        escape_json(url),
-        body_json,
-        headers_json,
-        timeout_json,
-    );
-    SemaError::eval(payload)
-}
-
-/// Check whether an error is an HTTP await marker.
-fn is_http_await_marker(err: &SemaError) -> bool {
-    match err.inner() {
-        SemaError::Eval(msg) => msg.starts_with(HTTP_AWAIT_MARKER),
-        _ => false,
-    }
-}
-
-/// Extract the JSON payload from an HTTP await marker error.
-fn parse_http_marker(err: &SemaError) -> Option<String> {
-    match err.inner() {
-        SemaError::Eval(msg) if msg.starts_with(HTTP_AWAIT_MARKER) => {
-            Some(msg[HTTP_AWAIT_MARKER.len()..].to_string())
-        }
-        _ => None,
-    }
-}
-
-/// Clear the HTTP response cache.
-fn clear_http_cache() {
-    HTTP_CACHE.with(|c| c.borrow_mut().clear());
-}
-
-/// Perform an HTTP request via the replay-with-cache strategy.
-/// On cache hit, returns the cached response. On cache miss, returns a marker error.
-fn wasm_http_request(
-    method: &str,
-    url: &str,
-    body: Option<&Value>,
-    opts: Option<&Value>,
-) -> Result<Value, SemaError> {
-    let mut headers: Vec<(String, String)> = Vec::new();
-    let mut timeout_ms: Option<i64> = None;
-    let mut has_content_type = false;
-
-    if let Some(opts_val) = opts {
-        if let Some(opts_map) = opts_val.as_map_rc() {
-            if let Some(headers_val) = opts_map.get(&Value::keyword("headers")) {
-                if let Some(hmap) = headers_val.as_map_rc() {
-                    for (k, v) in hmap.iter() {
-                        let key = match k.view() {
-                            ValueView::String(s) => s.to_string(),
-                            ValueView::Keyword(s) => sema_core::resolve(s),
-                            _ => k.to_string(),
-                        };
-                        let val = match v.as_str() {
-                            Some(s) => s.to_string(),
-                            None => v.to_string(),
-                        };
-                        if key.eq_ignore_ascii_case("content-type") {
-                            has_content_type = true;
-                        }
-                        headers.push((key, val));
-                    }
-                }
-            }
-            if let Some(timeout_val) = opts_map.get(&Value::keyword("timeout")) {
-                if let Some(ms) = timeout_val.as_int() {
-                    timeout_ms = Some(ms);
-                }
-            }
-        }
-    }
-
-    let body_str = match body {
-        Some(val) => {
-            if let Some(s) = val.as_str() {
-                Some(s.to_string())
-            } else if val.as_map_rc().is_some() {
-                let json = sema_core::value_to_json_lossy(val);
-                let json_str = serde_json::to_string(&json)
-                    .map_err(|e| SemaError::eval(format!("http: json encode: {e}")))?;
-                if !has_content_type {
-                    headers.push(("Content-Type".to_string(), "application/json".to_string()));
-                }
-                Some(json_str)
-            } else if val.is_nil() {
-                None
-            } else {
-                Some(val.to_string())
-            }
-        }
-        None => None,
-    };
-
-    headers.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-    let key = http_cache_key(method, url, body_str.as_deref(), &headers);
-
-    // In a Web Worker there is no `window`. Do a real *synchronous* XHR: it
-    // blocks the worker thread and returns the response directly, so http works
-    // without the main-thread replay-the-whole-program hack — and it composes
-    // correctly with real `Atomics.wait` sleeps (no re-runs). Cross-origin
-    // targets still need CORS/CORP (a same-origin proxy covers the rest).
-    if web_sys::window().is_none() {
-        return perform_fetch_sync(method, url, body_str.as_deref(), &headers);
-    }
-
-    let cached = HTTP_CACHE.with(|c| c.borrow().get(&key).cloned());
-    if let Some(val) = cached {
-        return Ok(val);
-    }
-
-    Err(http_await_marker(
-        method,
-        url,
-        body_str.as_deref(),
-        &headers,
-        timeout_ms,
+fn synchronous_http_error(name: &str) -> SemaError {
+    SemaError::eval(format!(
+        "{name}: synchronous WebAssembly evaluation cannot perform HTTP requests; use evalPromise"
     ))
 }
 
-/// Synchronous HTTP via `XMLHttpRequest` (worker-only — sync XHR is illegal on
-/// the main thread). Blocks the calling (worker) thread until the response,
-/// returning the same `{:status :headers :body}` map shape as `perform_fetch`.
-/// (Per-request timeout is not applied on this path; the worker can be cancelled
-/// via the M6 control buffer instead.)
-fn perform_fetch_sync(
-    method: &str,
-    url: &str,
-    body: Option<&str>,
-    headers: &[(String, String)],
-) -> Result<Value, SemaError> {
-    let xhr = web_sys::XmlHttpRequest::new()
-        .map_err(|_| SemaError::Io("failed to create XMLHttpRequest".to_string()))?;
-    // async = false → synchronous (blocks this worker thread).
-    xhr.open_with_async(method, url, false)
-        .map_err(|e| SemaError::Io(format!("http: open failed: {}", js_err(&e))))?;
-    for (k, v) in headers {
-        let _ = xhr.set_request_header(k, v);
-    }
-    let send = match body {
-        Some(b) => xhr.send_with_opt_str(Some(b)),
-        None => xhr.send(),
-    };
-    send.map_err(|e| SemaError::Io(format!("http: request failed: {}", js_err(&e))))?;
-
-    let status = xhr.status().unwrap_or(0) as i64;
-    let body_text = xhr.response_text().ok().flatten().unwrap_or_default();
-
-    let mut resp_headers = BTreeMap::new();
-    if let Ok(raw) = xhr.get_all_response_headers() {
-        for line in raw.split("\r\n").filter(|l| !l.is_empty()) {
-            if let Some((k, v)) = line.split_once(':') {
-                resp_headers.insert(Value::keyword(k.trim()), Value::string(v.trim()));
-            }
-        }
-    }
-
-    let mut result = BTreeMap::new();
-    result.insert(Value::keyword("status"), Value::int(status));
-    result.insert(Value::keyword("headers"), Value::map(resp_headers));
-    result.insert(Value::keyword("body"), Value::string(&body_text));
-    Ok(Value::map(result))
-}
-
-/// Best-effort string for a JS error value.
-fn js_err(e: &JsValue) -> String {
-    e.as_string()
+fn js_err(error: &JsValue) -> String {
+    error
+        .as_string()
         .or_else(|| {
-            js_sys::Reflect::get(e, &JsValue::from_str("message"))
+            js_sys::Reflect::get(error, &JsValue::from_str("message"))
                 .ok()
-                .and_then(|m| m.as_string())
+                .and_then(|message| message.as_string())
         })
         .unwrap_or_else(|| "error".to_string())
-}
-
-/// Perform an HTTP fetch via the browser's `fetch()` API.
-async fn perform_fetch(
-    method: &str,
-    url: &str,
-    body: Option<&str>,
-    headers: &[(String, String)],
-    timeout_ms: Option<u64>,
-) -> Result<Value, SemaError> {
-    let window = web_sys::window()
-        .ok_or_else(|| SemaError::Io("no global `window` available".to_string()))?;
-
-    let opts = web_sys::RequestInit::new();
-    opts.set_method(method);
-    opts.set_mode(web_sys::RequestMode::Cors);
-
-    if let Some(body_str) = body {
-        opts.set_body(&JsValue::from_str(body_str));
-    }
-
-    let abort_controller = if timeout_ms.is_some() {
-        let controller = web_sys::AbortController::new()
-            .map_err(|_| SemaError::Io("failed to create AbortController".to_string()))?;
-        opts.set_signal(Some(&controller.signal()));
-        Some(controller)
-    } else {
-        None
-    };
-
-    let request = web_sys::Request::new_with_str_and_init(url, &opts).map_err(|e| {
-        SemaError::Io(format!(
-            "failed to create request: {}",
-            e.as_string().unwrap_or_default()
-        ))
-    })?;
-
-    for (k, v) in headers {
-        request.headers().set(k, v).map_err(|e| {
-            SemaError::Io(format!(
-                "failed to set header: {}",
-                e.as_string().unwrap_or_default()
-            ))
-        })?;
-    }
-
-    if let (Some(ms), Some(controller)) = (timeout_ms, &abort_controller) {
-        let c = controller.clone();
-        let closure = wasm_bindgen::closure::Closure::once(move || {
-            c.abort();
-        });
-        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-            closure.as_ref().unchecked_ref(),
-            clamp_timeout_ms(ms),
-        );
-        closure.forget();
-    }
-
-    let resp_jsvalue = JsFuture::from(window.fetch_with_request(&request))
-        .await
-        .map_err(|e| {
-            let msg = e
-                .as_string()
-                .or_else(|| {
-                    js_sys::Reflect::get(&e, &JsValue::from_str("message"))
-                        .ok()
-                        .and_then(|m| m.as_string())
-                })
-                .unwrap_or_else(|| "fetch failed".to_string());
-            SemaError::Io(msg)
-        })?;
-
-    let response: web_sys::Response = resp_jsvalue
-        .dyn_into()
-        .map_err(|_| SemaError::Io("fetch did not return a Response".to_string()))?;
-
-    let status = response.status() as i64;
-
-    let mut resp_headers = BTreeMap::new();
-    if let Ok(Some(iter)) = js_sys::try_iter(&response.headers()) {
-        for entry in iter.flatten() {
-            let arr: js_sys::Array = entry.into();
-            if arr.length() >= 2 {
-                let k = arr.get(0).as_string().unwrap_or_default();
-                let v = arr.get(1).as_string().unwrap_or_default();
-                resp_headers.insert(Value::keyword(&k), Value::string(&v));
-            }
-        }
-    }
-
-    let body_promise = response.text().map_err(|e| {
-        SemaError::Io(format!(
-            "failed to read response body: {}",
-            e.as_string().unwrap_or_default()
-        ))
-    })?;
-    let body_jsvalue = JsFuture::from(body_promise).await.map_err(|e| {
-        SemaError::Io(format!(
-            "failed to read response body: {}",
-            e.as_string().unwrap_or_default()
-        ))
-    })?;
-    let body_text = body_jsvalue.as_string().unwrap_or_default();
-
-    let mut result = BTreeMap::new();
-    result.insert(Value::keyword("status"), Value::int(status));
-    result.insert(Value::keyword("headers"), Value::map(resp_headers));
-    result.insert(Value::keyword("body"), Value::string(&body_text));
-
-    Ok(Value::map(result))
-}
-
-/// Parse an HTTP marker JSON and perform the fetch, returning (cache_key, response).
-async fn perform_fetch_from_marker(json_str: &str) -> Result<(String, Value), SemaError> {
-    let parsed: serde_json::Value = serde_json::from_str(json_str)
-        .map_err(|e| SemaError::eval(format!("failed to parse HTTP marker JSON: {e}")))?;
-
-    let key = parsed["key"]
-        .as_str()
-        .ok_or_else(|| SemaError::eval("HTTP marker missing 'key'"))?
-        .to_string();
-    let method = parsed["method"]
-        .as_str()
-        .ok_or_else(|| SemaError::eval("HTTP marker missing 'method'"))?;
-    let url = parsed["url"]
-        .as_str()
-        .ok_or_else(|| SemaError::eval("HTTP marker missing 'url'"))?;
-    let body = parsed["body"].as_str();
-    let timeout_ms = parsed["timeout"].as_u64();
-
-    let mut headers = Vec::new();
-    if let Some(arr) = parsed["headers"].as_array() {
-        for pair in arr {
-            if let Some(pair_arr) = pair.as_array() {
-                if pair_arr.len() >= 2 {
-                    let k = pair_arr[0].as_str().unwrap_or_default().to_string();
-                    let v = pair_arr[1].as_str().unwrap_or_default().to_string();
-                    headers.push((k, v));
-                }
-            }
-        }
-    }
-
-    let response = perform_fetch(method, url, body, &headers, timeout_ms).await?;
-    Ok((key, response))
 }
 
 /// Register print/println/display/newline that write to the output buffer instead of stdout
@@ -640,8 +236,8 @@ type WasmNativeFn = Box<dyn Fn(&[Value]) -> Result<Value, SemaError>>;
 
 /// Make `sema_core::write_stdout`/`write_stderr`'s NON-capturing fallback
 /// (`STDOUT_HOOK`/`STDERR_HOOK`) an inert no-op, so `append_output`'s new
-/// `write_stdout` forward (above) has zero effect on every pre-existing entry
-/// point. Without this, the fallback is `print!`/`eprint!` — real syscalls
+/// `write_stdout` forward has zero effect outside a capturing runtime root.
+/// Without this, the fallback is `print!`/`eprint!` — real syscalls
 /// that are `unsupported` on wasm32-unknown-unknown and `.expect()`-panic
 /// there (the same class of bug this session already found and fixed for
 /// `Instant::now()`/`std::thread::spawn`). Idempotent; called once per
@@ -660,27 +256,18 @@ fn register_wasm_io(env: &Env) {
         );
     };
 
-    // Dual-ABI registration for the http natives below: `f` is the existing
-    // marker-throw legacy closure (unchanged — still exactly what every
-    // pre-existing eval entry point gets), and `method` selects the NEW
-    // runtime-ABI closure (`driver::runtime_http_fn`). That closure activates
-    // its `WaitKind::External` suspend ONLY when
-    // `sema_core::promise_driven_quantum_active()` is true (set only by
-    // `driver.rs`'s own drive turn, i.e. only reachable via `evalPromise`) —
-    // NOT merely "under a runtime quantum", which is true for every
-    // pre-existing entry point too and would (did, before this discriminator
-    // existed) hijack them into a suspend they can never resolve. Outside a
-    // promise-driven turn `runtime_http_fn` calls this same `f`, so old
-    // entry points are unaffected. See P6-3 step 2 + the driver.rs fix.
+    // HTTP is structurally suspending in a Promise-driven quantum. The value
+    // ABI remains present for synchronous JS entry points, but it rejects with
+    // an actionable boundary error instead of blocking or replaying the root.
     let register_http = |name: &str, method: &'static str, f: WasmNativeFn| {
-        let f: driver::LegacyHttpFn = Rc::from(f);
-        let legacy = Rc::clone(&f);
+        let f: driver::SyncHttpFn = Rc::from(f);
+        let synchronous = Rc::clone(&f);
         env.set(
             sema_core::intern(name),
             Value::native_fn(NativeFn::simple_with_runtime(
                 name,
                 move |args| (f)(args),
-                driver::runtime_http_fn(method, legacy),
+                driver::runtime_http_fn(method, synchronous),
             )),
         );
     };
@@ -1139,7 +726,7 @@ fn register_wasm_io(env: &Env) {
         }),
     );
 
-    // --- HTTP via replay-with-cache (async eval catches markers and performs fetch) ---
+    // --- HTTP via Promise-driven runtime suspension ---
 
     register_http(
         "http/get",
@@ -1151,7 +738,8 @@ fn register_wasm_io(env: &Env) {
             let url = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            wasm_http_request("GET", url, None, args.get(1))
+            let _ = url;
+            Err(synchronous_http_error("http/get"))
         }),
     );
 
@@ -1165,7 +753,8 @@ fn register_wasm_io(env: &Env) {
             let url = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            wasm_http_request("POST", url, Some(&args[1]), args.get(2))
+            let _ = url;
+            Err(synchronous_http_error("http/post"))
         }),
     );
 
@@ -1179,7 +768,8 @@ fn register_wasm_io(env: &Env) {
             let url = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            wasm_http_request("PUT", url, Some(&args[1]), args.get(2))
+            let _ = url;
+            Err(synchronous_http_error("http/put"))
         }),
     );
 
@@ -1193,7 +783,8 @@ fn register_wasm_io(env: &Env) {
             let url = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            wasm_http_request("DELETE", url, None, args.get(1))
+            let _ = url;
+            Err(synchronous_http_error("http/delete"))
         }),
     );
 
@@ -1210,9 +801,8 @@ fn register_wasm_io(env: &Env) {
             let url = args[1]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-            let body = args.get(2);
-            let opts = args.get(3);
-            wasm_http_request(method, url, body, opts)
+            let _ = (method, url);
+            Err(synchronous_http_error("http/request"))
         }),
     );
 
@@ -1778,10 +1368,9 @@ fn register_wasm_io(env: &Env) {
     );
 }
 
-/// Bridges one [`WasmInterpreter::eval_promise`] call back into the OLD
-/// `{"value":...,"output":[...],"error":...}` JSON shape (P6-3 step 5,
-/// `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md` §2.1) — shared by
-/// `evalAsync`/`evalVMAsync`/`runEntryAsync`'s wrapper methods.
+/// Bridges one [`WasmInterpreter::eval_promise`] call into the compatibility
+/// `{"value":...,"output":[...],"error":...}` JSON shape shared by
+/// `evalAsync`, `evalVMAsync`, and `runEntryAsync`.
 ///
 /// Installs a private `Closure`-backed `setPromiseOutputSink` for the
 /// duration of one call, collecting only the lines tagged with the root id
@@ -1852,7 +1441,7 @@ impl PromiseCapture {
     }
 
     /// Await `promise` to settlement, restore the previous output sink, and
-    /// build the OLD JSON result shape from the resolved/rejected value plus
+    /// build the compatibility JSON result from the resolved/rejected value plus
     /// whatever output was captured for this call's root.
     async fn await_as_old_json(self, promise: js_sys::Promise) -> JsValue {
         let _ = &self.target_root; // kept alive for the sink closure's Weak-free capture
@@ -1919,14 +1508,9 @@ type LoadedArchiveInfo = (
 impl WasmInterpreter {
     #[wasm_bindgen(constructor)]
     pub fn new() -> WasmInterpreter {
-        // `new_with_executor` (not `new()`): wasm32's platform-default
-        // executor is `NullExecutor` (see `sema_eval::build_runtime`) — correct
-        // for every pre-existing entry point (none of them suspend on
-        // `WaitKind::External`), but `evalPromise`'s http natives need a real
-        // one. Sharing ONE interpreter/runtime across old and new entry points
-        // is safe either way: only natives invoked from inside a
-        // `Runtime::drive` quantum (i.e. only reachable via `evalPromise`)
-        // ever touch the executor at all.
+        // Promise-based HTTP parks on an External wait, so the WASM interpreter
+        // needs the browser-backed executor rather than the platform-default
+        // NullExecutor.
         let interp =
             sema_eval::Interpreter::new_with_executor(std::sync::Arc::new(driver::WasmExecutor));
 
@@ -1999,10 +1583,8 @@ impl WasmInterpreter {
 
     /// Evaluate `code` as ONE root on the unified runtime and return a
     /// `Promise` that resolves with its printed value (or `null`) and rejects
-    /// with an `Error` on failure — never replays the program body, and
-    /// (unlike every other `eval*` method) correctly supports a real
-    /// `async/sleep` / `http/get` instead of hanging or panicking on the
-    /// blocking legacy drive path. See `driver.rs` (P6-3 step 2). Output is
+    /// with an `Error` on failure. The body runs once; `async/sleep` and
+    /// `http/get` suspend the root in place. Output is
     /// NOT included in the resolved value: install `setPromiseOutputSink` to
     /// receive this root's `println`/`print-err` output, tagged with its
     /// root id, as it happens.
@@ -2010,8 +1592,8 @@ impl WasmInterpreter {
     /// `on_root_id`, if a function, is called SYNCHRONOUSLY (before this
     /// method returns) with the new root's id as a JS `number` — the only way
     /// a caller can learn it in time to route a later [`Self::cancel_root`]
-    /// call at the exact root this call submitted (P6-3 step 3; the
-    /// playground worker protocol uses this to implement "Stop"). Pass
+    /// call at the exact root this call submitted. The playground worker
+    /// protocol uses this to implement "Stop". Pass
     /// `null`/`undefined` to skip.
     #[wasm_bindgen(js_name = evalPromise)]
     pub fn eval_promise(&self, code: &str, on_root_id: JsValue) -> js_sys::Promise {
@@ -2027,9 +1609,8 @@ impl WasmInterpreter {
     /// [`Self::eval_promise`]'s `on_root_id` callback. Returns `false` if no
     /// pending `evalPromise` root matches `root_id` (already settled, or
     /// never existed) — a harmless no-op, same liveness contract as the
-    /// underlying `RuntimeCommandHandle::cancel_root`. Has no effect on the
-    /// OLD `eval`/`evalAsync`/`evalVM`/… entry points (they don't submit a
-    /// cancellable root at all).
+    /// underlying `RuntimeCommandHandle::cancel_root`. It only accepts roots
+    /// registered with this Promise driver.
     #[wasm_bindgen(js_name = cancelRoot)]
     pub fn cancel_root(&self, root_id: f64) -> bool {
         driver::cancel_root(&self.promise_driver, root_id)
@@ -2038,21 +1619,20 @@ impl WasmInterpreter {
     /// Install (or clear, passing `null`/`undefined`) the JS callback that
     /// receives `evalPromise` roots' output as `(rootId, stream, text)`,
     /// where `stream` is `"stdout"` or `"stderr"`. Independent of
-    /// `setOutputSink` (the worker's line-batched sink for the OLD entry
-    /// points) — the two never observe each other's output.
+    /// `setOutputSink` (the synchronous line-batched sink) — the two never
+    /// observe each other's output.
     #[wasm_bindgen(js_name = setPromiseOutputSink)]
     pub fn set_promise_output_sink(&self, sink: JsValue) {
         self.promise_driver
             .set_output_sink(sink.dyn_into::<js_sys::Function>().ok());
     }
 
-    /// Shared body for the OLD `evalAsync`/`evalVMAsync`/`runEntryAsync`
-    /// entry points (P6-3 step 5,
-    /// `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md` §2.1): submits
-    /// `src` as ONE root via [`Self::eval_promise`] and awaits it, so
+    /// Shared body for the compatibility `evalAsync`, `evalVMAsync`, and
+    /// `runEntryAsync` entry points. Submits `src` as one root via
+    /// [`Self::eval_promise`] and awaits it, so
     /// `http/get`/`async/sleep` inside it get the real, single-execution
-    /// runtime-ABI suspend (no HTTP replay, no `Atomics.wait`) — but rebuilds
-    /// the OLD `{"value":...,"output":[...],"error":...}` JSON shape these
+    /// runtime-ABI suspend (no replay or blocking host wait) — but rebuilds
+    /// their `{"value":...,"output":[...],"error":...}` JSON shape these
     /// callers (the playground's `?no-worker` fallback, `sema-web.js`) still
     /// expect, so this is a behavior-preserving wrapper, not a signature
     /// change.
@@ -2065,13 +1645,13 @@ impl WasmInterpreter {
     /// call that only collects lines tagged with THIS call's root id, then
     /// restores whatever sink was previously installed — so a concurrent real
     /// `evalPromise`/`setPromiseOutputSink` caller on the same interpreter
-    /// (not a supported combination for the OLD entry points, but not
+    /// (not a supported combination for the compatibility wrappers, but not
     /// corrupted either) gets its sink back exactly as it left it.
     ///
     /// Error fidelity: `eval_promise` rejects with a plain JS `Error`, but
     /// `driver::reject_with_error` bakes the full inner message + stack trace
-    /// + hint + note into its `.message` (P6-3 step 5), so extracting that
-    /// text reproduces the OLD entry points' `"error"` field exactly.
+    /// + hint + note into its `.message`, so extracting that text reproduces
+    /// the compatibility entry points' `"error"` field exactly.
     async fn eval_once_via_promise_seam(&self, code: &str) -> JsValue {
         let capture = PromiseCapture::install(&self.promise_driver);
         let promise = self.eval_promise(code, capture.on_root_id());
@@ -2085,7 +1665,7 @@ impl WasmInterpreter {
     /// stack-trace file attribution — matching what
     /// `run_embedded_entry_result`'s direct-eval path did with
     /// `push_file_path`/`pop_file_path`. Used only by `runEntryAsync`'s
-    /// source-file branch (P6-3 step 5); a precompiled bytecode entry has no
+    /// source-file branch; a precompiled bytecode entry has no
     /// submit-a-root equivalent and stays on the direct single-execution path.
     async fn eval_once_via_promise_seam_at_path(
         &self,
@@ -2198,22 +1778,16 @@ impl WasmInterpreter {
             }
             Err(e) => {
                 let output = take_output();
-                let err_str = if is_http_await_marker(&e) {
-                    "http/get: evalVM cannot perform HTTP requests synchronously; use evalPromise"
-                        .to_string()
-                } else {
-                    let mut message = format!("{}", e.inner());
-                    if let Some(trace) = e.stack_trace() {
-                        message.push_str(&format!("\n{trace}"));
-                    }
-                    if let Some(hint) = e.hint() {
-                        message.push_str(&format!("\n  hint: {hint}"));
-                    }
-                    if let Some(note) = e.note() {
-                        message.push_str(&format!("\n  note: {note}"));
-                    }
-                    message
-                };
+                let mut err_str = format!("{}", e.inner());
+                if let Some(trace) = e.stack_trace() {
+                    err_str.push_str(&format!("\n{trace}"));
+                }
+                if let Some(hint) = e.hint() {
+                    err_str.push_str(&format!("\n  hint: {hint}"));
+                }
+                if let Some(note) = e.note() {
+                    err_str.push_str(&format!("\n  note: {note}"));
+                }
                 format!(
                     "{{\"value\":null,\"output\":[{}],\"error\":\"{}\"}}",
                     output
@@ -2231,8 +1805,8 @@ impl WasmInterpreter {
     /// Evaluate code with real (single-execution) async HTTP/sleep support in
     /// the persistent global env (top-level defines persist across calls).
     ///
-    /// A thin Promise-returning wrapper over [`Self::eval_promise`] (P6-3
-    /// step 5) — kept as its own entry point so existing JS callers
+    /// A thin Promise-returning wrapper over [`Self::eval_promise`], kept as
+    /// its own entry point so existing JS callers
     /// (`sema-web.js`, the playground's `?no-worker` fallback) don't have to
     /// change; the program body is submitted as ONE root and never replayed.
     /// See [`Self::eval_once_via_promise_seam`].
@@ -2373,30 +1947,12 @@ impl WasmInterpreter {
 
     /// Start a debug session. Compiles the code, sets breakpoints on given lines,
     /// and runs until the first stop or completion.
-    /// Returns JSON: { status: "stopped"|"finished"|"error"|"http_needed", ... }
+    /// Returns JSON: { status: "stopped"|"finished"|"error", ... }
     #[wasm_bindgen(js_name = debugStart)]
     pub fn debug_start(&self, code: &str, breakpoint_lines: &js_sys::Array) -> JsValue {
         // The debugger always executes on the VM, so a `(load ...)` runs the
         // loaded body on the VM regardless of which eval the playground ran last.
-        // End any existing session
-        DEBUG_SESSION.with(|s| {
-            *s.borrow_mut() = None;
-        });
-        // The debugger's `http_needed`/`debugPerformFetch` flow is the sole
-        // remaining consumer of the HTTP replay cache (P6-3 step 5). A genuine
-        // fresh session must never observe a stale response cached by an
-        // earlier one, so it clears the cache here — but a same-session
-        // replay restart (JS re-calling debugStart right after
-        // debugPerformFetch cached a response, to replay the program up to
-        // the newly-cached response) must NOT clear it, or the response just
-        // fetched is wiped before the replay can use it, producing another
-        // cache miss and an unbounded fetch loop. `DEBUG_HTTP_REPLAY_ARMED`
-        // distinguishes the two: `debugPerformFetch` arms it right after
-        // inserting into the cache, and this consumes it.
-        if !DEBUG_HTTP_REPLAY_ARMED.with(|f| f.replace(false)) {
-            clear_http_cache();
-        }
-
+        self.debug_stop();
         OUTPUT.with(|o| o.borrow_mut().clear());
         LINE_BUF.with(|b| b.borrow_mut().clear());
         // Reset the loop-guard step counter so the limit is per debug session.
@@ -2458,24 +2014,9 @@ impl WasmInterpreter {
         };
         vm.seed_main_frame(prog.closure);
 
-        // Scrub any state left by an abandoned prior session on this persistent
-        // runtime (Stop while paused): clear the debug barrier + cancel the
-        // orphaned root so its stale `DebugStopped` can never freeze this drive.
         let runtime = self.inner.runtime();
         if runtime.is_debug_paused() {
-            runtime.debug_cancel_paused();
-            let budget = sema_vm::runtime::DriveBudget::host_default();
-            for _ in 0..10_000 {
-                if self.inner.runtime_live_task_count() == 0 {
-                    break;
-                }
-                if !matches!(
-                    runtime.drive(&budget),
-                    Ok(sema_vm::runtime::DriveState::Progress { .. })
-                ) {
-                    break;
-                }
-            }
+            return self.debug_error_str("Another debug session is already paused");
         }
 
         let mut debug = sema_vm::DebugState::new_headless();
@@ -2545,7 +2086,7 @@ impl WasmInterpreter {
                                 self.debug_finished_result(v)
                             }
                             sema_core::runtime::TaskOutcome::Failed(e) => {
-                                self.debug_maybe_http_error(e)
+                                self.debug_error_result(e)
                             }
                             sema_core::runtime::TaskOutcome::Cancelled(r) => {
                                 self.debug_error_str(&format!("debug run cancelled: {r:?}"))
@@ -2566,8 +2107,9 @@ impl WasmInterpreter {
                     }
                 }
                 sess.debug.instructions_remaining = WASM_DEBUG_INSTRUCTION_BUDGET;
+                let root = sess.handle.id();
                 let state = {
-                    let _guard = sema_vm::ActiveDebugGuard::enter(&mut sess.debug);
+                    let _guard = sema_vm::ActiveDebugGuard::enter_for_root(&mut sess.debug, root);
                     match runtime.drive(&budget) {
                         Ok(state) => state,
                         Err(fault) => {
@@ -2578,44 +2120,34 @@ impl WasmInterpreter {
                     }
                 };
                 match state {
-                    sema_vm::runtime::DriveState::DebugStopped { info, .. } => {
+                    sema_vm::runtime::DriveState::DebugStopped {
+                        root: stopped_root,
+                        info,
+                        ..
+                    } if stopped_root == root => {
                         return self.debug_stopped_result(&info);
+                    }
+                    sema_vm::runtime::DriveState::DebugStopped { .. } => {
+                        cancel_debug_root(runtime, &sess.handle);
+                        *session = None;
+                        return self.debug_error_str(
+                            "another debug root paused this runtime; use the Promise debugger methods",
+                        );
                     }
                     sema_vm::runtime::DriveState::Progress { .. }
                     | sema_vm::runtime::DriveState::Quiescent
                     | sema_vm::runtime::DriveState::ShutdownComplete => {}
-                    // A task parked on a timer/external inbox: the browser thread
-                    // cannot block, so yield back to JS to re-poll (fetch/timer
-                    // completions land between turns). Full Promise-driven roots
-                    // are P6.
                     sema_vm::runtime::DriveState::Idle { .. } => {
-                        return self.debug_yielded_result();
+                        cancel_debug_root(runtime, &sess.handle);
+                        *session = None;
+                        return self.debug_error_str(
+                            "synchronous debug APIs cannot suspend; use debugStartPromise and the Promise debugger methods",
+                        );
                     }
                 }
             }
             self.debug_yielded_result()
         })
-    }
-
-    /// Perform an HTTP fetch from a debug marker and cache the result.
-    /// Called by JS in response to a "http_needed" status.
-    /// Takes the marker JSON from the request field. Returns true on success.
-    #[wasm_bindgen(js_name = debugPerformFetch)]
-    pub async fn debug_perform_fetch(&self, marker_json: &str) -> bool {
-        match perform_fetch_from_marker(marker_json).await {
-            Ok((key, response)) => {
-                HTTP_CACHE.with(|c| {
-                    c.borrow_mut().insert(key, response);
-                });
-                // Arm the replay flag: JS is about to re-call `debugStart` to
-                // replay this same session up through the response just
-                // cached, and that restart must not clear the cache out from
-                // under it.
-                DEBUG_HTTP_REPLAY_ARMED.with(|f| f.set(true));
-                true
-            }
-            Err(_) => false,
-        }
     }
 
     #[wasm_bindgen(js_name = debugContinue)]
@@ -2651,32 +2183,26 @@ impl WasmInterpreter {
 
     #[wasm_bindgen(js_name = debugStop)]
     pub fn debug_stop(&self) {
-        // Clear the runtime-wide debug barrier and cancel the abandoned root so a
-        // Stop while paused cannot freeze a future session's drive, then forget
-        // the session.
-        self.inner.runtime().debug_cancel_paused();
-        DEBUG_SESSION.with(|s| {
-            *s.borrow_mut() = None;
-        });
-        // If Stop is clicked instead of letting an in-flight http_needed
-        // exchange replay (see `DEBUG_HTTP_REPLAY_ARMED`), don't let that
-        // arming survive into an unrelated later fresh session.
-        DEBUG_HTTP_REPLAY_ARMED.with(|f| f.set(false));
+        let session = DEBUG_SESSION.with(|slot| slot.borrow_mut().take());
+        if let Some(session) = session {
+            cancel_debug_root(self.inner.runtime(), &session.handle);
+        }
     }
 
     #[wasm_bindgen(js_name = debugGetLocals)]
     pub fn debug_get_locals(&self) -> JsValue {
         DEBUG_SESSION.with(|s| {
-            if s.borrow().is_none() {
+            let session = s.borrow();
+            let Some(ref session) = *session else {
                 return JsValue::NULL;
-            }
+            };
             // Inspect the paused task's own VM (its frames hold the task-locals);
             // it never leaves the runtime, so `with_paused_task_vm` borrows it in
             // place. Empty when nothing is paused.
             let locals = self
                 .inner
                 .runtime()
-                .with_paused_task_vm(|tvm| {
+                .with_paused_root_vm(session.handle.id(), |tvm| {
                     let frame_idx = tvm.frame_count().saturating_sub(1);
                     tvm.debug_locals(frame_idx)
                 })
@@ -2698,7 +2224,7 @@ impl WasmInterpreter {
     pub fn debug_get_stack_trace(&self) -> JsValue {
         DEBUG_SESSION.with(|s| {
             let session = s.borrow();
-            let Some(ref _sess) = *session else {
+            let Some(ref session) = *session else {
                 return js_sys::Array::new().into();
             };
             // Mirror debug_get_locals: at an async stop, show the PAUSED TASK's
@@ -2706,7 +2232,7 @@ impl WasmInterpreter {
             let frames = self
                 .inner
                 .runtime()
-                .with_paused_task_vm(|tvm| tvm.debug_stack_trace())
+                .with_paused_root_vm(session.handle.id(), |tvm| tvm.debug_stack_trace())
                 .unwrap_or_default();
             let arr = js_sys::Array::new();
             for frame in &frames {
@@ -3182,7 +2708,7 @@ impl WasmInterpreter {
     }
 
     /// Execute an embedded archive entry path with real (single-execution)
-    /// async HTTP/sleep support (P6-3 step 5).
+    /// async HTTP/sleep support.
     ///
     /// Source-text and precompiled entries are each submitted as one root and
     /// adopted by the same macrotask Promise driver. The program body never
@@ -3463,22 +2989,6 @@ impl WasmInterpreter {
         env!("CARGO_PKG_VERSION").to_string()
     }
 
-    /// Enable real wall-clock `async/sleep` via `Atomics.wait` on the given
-    /// control buffer. Call this once from a Web Worker (where blocking is
-    /// allowed), passing an `Int32Array` over a `SharedArrayBuffer` shared with
-    /// the main thread. After this, the scheduler's virtual-clock advances also
-    /// block the worker for the real duration. Do NOT call on the main thread —
-    /// `Atomics.wait` is illegal there; leaving it uninstalled keeps the
-    /// instant virtual-clock behavior.
-    #[wasm_bindgen(js_name = installAtomicsSleep)]
-    pub fn install_atomics_sleep(&self, view: js_sys::Int32Array) {
-        SLEEP_I32.with(|s| *s.borrow_mut() = Some(view));
-        sema_core::set_blocking_sleep_callback(worker_atomics_sleep);
-        // The same control buffer carries the cancel flag (slot 0): the VM loop
-        // guard polls this so a Stop aborts a running program (incl. mid-sleep).
-        sema_core::set_interrupt_callback(worker_check_interrupt);
-    }
-
     /// Install a sink called with each completed output line as it is produced,
     /// so the Web Worker can stream `println` output to the main thread live
     /// (a long-running / sleeping program shows output as it happens). Pass a
@@ -3570,26 +3080,34 @@ impl WasmInterpreter {
     }
 
     fn debug_resume(&self, mode: sema_vm::StepMode) -> JsValue {
-        if DEBUG_SESSION.with(|s| s.borrow().is_none()) {
-            return self.debug_error_str("No active debug session");
-        }
         let runtime = self.inner.runtime();
-        DEBUG_SESSION.with(|s| {
-            if let Some(ref mut sess) = *s.borrow_mut() {
-                sess.debug.step_mode = mode;
-                if mode != sema_vm::StepMode::Continue {
-                    // Step depth must be measured against the paused task's own VM
-                    // (the one that resumes), not any parent parked at the await —
-                    // so StepOver/StepOut depth comparisons are task-correct.
-                    if let Some(depth) = runtime.with_paused_task_vm(|tvm| tvm.frame_count()) {
-                        sess.debug.step_frame_depth = depth;
-                    }
+        let root = DEBUG_SESSION.with(|slot| {
+            let mut session = slot.borrow_mut();
+            let sess = session.as_mut()?;
+            let root = sess.handle.id();
+            if !runtime.is_debug_paused_for(root) {
+                return None;
+            }
+            sess.debug.step_mode = mode;
+            if mode != sema_vm::StepMode::Continue {
+                // Step depth must be measured against the paused task's own VM
+                // (the one that resumes), not any parent parked at the await —
+                // so StepOver/StepOut depth comparisons are task-correct.
+                if let Some(depth) = runtime.with_paused_root_vm(root, |tvm| tvm.frame_count()) {
+                    sess.debug.step_frame_depth = depth;
                 }
             }
+            Some(root)
         });
+        let Some(root) = root else {
+            return self.debug_error_str("No paused synchronous debug session");
+        };
         // Clear the debug barrier (re-enqueue the paused task) with the step mode
         // now set, then drive to the next stop/settlement.
-        runtime.debug_resume();
+        if !runtime.debug_resume_root(root) {
+            self.debug_stop();
+            return self.debug_error_str("The synchronous debugger lost its paused root");
+        }
         self.debug_drive()
     }
 
@@ -3641,29 +3159,6 @@ impl WasmInterpreter {
             .collect::<Vec<_>>()
             .join(",");
         let json_str = format!("{{\"status\":\"yielded\",\"output\":[{}]}}", output_json,);
-        js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
-    }
-
-    /// Check if an error is an HTTP await marker; if so, return an "http_needed"
-    /// result so JS can perform the fetch and restart the debug session.
-    fn debug_maybe_http_error(&self, e: &sema_core::SemaError) -> JsValue {
-        if let Some(json_payload) = parse_http_marker(e) {
-            return self.debug_http_needed_result(&json_payload);
-        }
-        self.debug_error_result(e)
-    }
-
-    fn debug_http_needed_result(&self, marker_json: &str) -> JsValue {
-        let output = take_output();
-        let output_json = output
-            .iter()
-            .map(|s| format!("\"{}\"", escape_json(s)))
-            .collect::<Vec<_>>()
-            .join(",");
-        let json_str = format!(
-            "{{\"status\":\"http_needed\",\"output\":[{}],\"request\":{}}}",
-            output_json, marker_json,
-        );
         js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
     }
 
@@ -3886,25 +3381,9 @@ fn escape_json(s: &str) -> String {
     out
 }
 
-/// Clamp a user-supplied timeout (milliseconds, u64) to a valid setTimeout
-/// delay. A bare `as i32` wrapped values > ~2.1e9 ms to negative/zero, which
-/// made the abort controller fire immediately and break the request.
-fn clamp_timeout_ms(ms: u64) -> i32 {
-    i32::try_from(ms).unwrap_or(i32::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn clamp_timeout_ms_does_not_wrap_to_negative() {
-        // ~ 3 billion ms is well past i32::MAX; old `as i32` wrapped negative.
-        assert_eq!(clamp_timeout_ms(3_000_000_000), i32::MAX);
-        assert_eq!(clamp_timeout_ms(u64::MAX), i32::MAX);
-        assert_eq!(clamp_timeout_ms(5000), 5000);
-        assert!(clamp_timeout_ms(3_000_000_000) > 0);
-    }
 
     #[test]
     fn escape_json_handles_basic_escapes() {

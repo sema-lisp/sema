@@ -90,18 +90,10 @@ fn build_runtime(ctx: &Rc<EvalContext>) -> Runtime {
     // concurrent external ops overlap without a per-op worker ceiling.
     #[cfg(not(target_arch = "wasm32"))]
     let executor = sema_io::process_executor();
-    // wasm32-unknown-unknown has no OS threads: `ThreadPoolExecutor::new()`
-    // calls `std::thread::spawn`, which panics at construction time on that
-    // target ("failed to spawn thread") — confirmed live (any
-    // `Interpreter::new()`/`from_parts` on a real wasm build aborted before
-    // this fix). `NullExecutor` just rejects `WaitKind::External` submissions
-    // instead of crashing, which is behavior-neutral for every wasm eval path
-    // that existed before this module: none of them ever suspend on the
-    // runtime's I/O tier (`http`/`sleep` there use a JS-marker replay and a
-    // ctx-less virtual clock, entirely outside `WaitKind::External`). A host
-    // that needs a real external tier on wasm (the Promise-driven driver in
-    // `sema-wasm`) must construct via [`from_parts_with_executor`] with its
-    // own `IoExecutor` instead of relying on this default.
+    // wasm32-unknown-unknown has no OS threads, so the default runtime cannot
+    // construct a ThreadPoolExecutor. NullExecutor rejects External waits; a
+    // browser host that supports them must use [`from_parts_with_executor`]
+    // with an event-loop-backed IoExecutor, as `sema-wasm` does.
     #[cfg(target_arch = "wasm32")]
     let executor: std::sync::Arc<dyn sema_core::runtime::IoExecutor> =
         std::sync::Arc::new(sema_vm::runtime::NullExecutor);
@@ -623,12 +615,40 @@ impl Interpreter {
                 .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))?
             {
                 DriveState::Progress { .. } => {}
+                #[cfg(target_arch = "wasm32")]
+                DriveState::Idle { .. } => {
+                    // A synchronous JS call stack cannot let fetch/timer
+                    // callbacks run. Cancel this exact root before returning so
+                    // its parked VM, continuation, and wait registration cannot
+                    // leak into the interpreter's next evaluation.
+                    runtime.cancel_root(handle.id(), sema_core::runtime::CancelReason::HostStop);
+                    for _ in 0..10_000 {
+                        if !matches!(handle.poll_result(), RootPoll::Pending) {
+                            break;
+                        }
+                        if !matches!(
+                            runtime.drive(&budget).map_err(|e| SemaError::eval(format!(
+                                "runtime fault while cancelling suspended WASM root: {e:?}"
+                            )))?,
+                            DriveState::Progress { .. }
+                        ) {
+                            break;
+                        }
+                    }
+                    return Err(SemaError::eval(
+                        "synchronous WebAssembly evaluation cannot suspend",
+                    )
+                    .with_hint(
+                        "Use evalPromise or another Promise-based entry point for async work",
+                    ));
+                }
                 // A task is parked on an external operation running on a worker
                 // thread (a blocking op submitted to the executor). Block-wait on
                 // the completion inbox — bounded by the earliest timer deadline if
                 // one exists — then drive again so `drain_completion` delivers the
                 // worker's result and resumes the task. Wakeable and never
                 // busy-spins: an arriving completion returns immediately.
+                #[cfg(not(target_arch = "wasm32"))]
                 DriveState::Idle {
                     next_deadline,
                     inbox_wakeup_required: true,
@@ -655,64 +675,17 @@ impl Interpreter {
                 // drives again so `fire_timer` wakes the VM (or the drained
                 // command cancels it first).
                 //
-                // wasm32 has no OS threads to park on: `block_on_inbox`'s
-                // `Receiver::recv_timeout` is unconditionally unsupported
-                // there (see `sema-wasm/src/driver.rs`'s module doc — this is
-                // exactly the mechanism a promise-driven caller avoids by
-                // never blocking at all). Every OTHER wasm entry point still
-                // needs to synchronously wait out an `async/sleep`, so it
-                // waits out the remaining time via `blocking_sleep_ms`
-                // instead — bounded by the (capped) sleep duration, and —
-                // unlike a synchronous "skip the wait and return immediately"
-                // shortcut — this preserves correct relative ordering across
-                // multiple concurrent timers, since a timer wait still
-                // structurally suspends the task and each outer-loop
-                // iteration re-drives and re-checks, so the nearest deadline
-                // reliably fires first. On the playground Web Worker this is
-                // a real, INTERRUPTIBLE `Atomics.wait` (`installAtomicsSleep`
-                // → `worker_atomics_sleep`): a Stop's `Atomics.notify` wakes
-                // it early, exactly as it did before this native became
-                // dual-ABI. With no callback installed (the main thread) it
-                // is a documented no-op, so this arm is re-entered on the
-                // next outer-loop iteration until real wall-clock time
-                // (`Instant::now()`) naturally reaches the deadline —
-                // bounded, never an unbounded hang, though not "instant"
-                // (a genuine main-thread virtual clock is tracked
-                // separately, not part of this fix).
+                // A native host can park the calling thread until the timer or
+                // a cross-thread cancellation command wakes the shared inbox.
+                // WASM is handled by the fail-fast arm above because a
+                // synchronous JS stack cannot pump browser callbacks.
+                #[cfg(not(target_arch = "wasm32"))]
                 DriveState::Idle {
                     next_deadline: Some(deadline),
                     inbox_wakeup_required: false,
                     ..
                 } => {
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        let remaining_ms = deadline
-                            .saturating_duration_since(web_time::Instant::now())
-                            .as_millis()
-                            .min(u64::MAX as u128)
-                            as u64;
-                        sema_core::blocking_sleep_ms(remaining_ms);
-                        // wasm32 is single-threaded: there is no second
-                        // thread to deliver a `RuntimeCommandHandle::
-                        // cancel_root` command the way native's Ctrl-C
-                        // handler thread does while this thread sleeps. The
-                        // only signal that CAN cross is the Atomics-notify
-                        // wake itself, so after it (or a main-thread no-op)
-                        // explicitly check the same interrupt flag the VM's
-                        // own loop guard polls (`check_loop_interrupt` →
-                        // `check_interrupt`) and enqueue the cancellation
-                        // directly — the next `drive()` call at the top of
-                        // this outer loop applies it and settles the root
-                        // `Cancelled`, exactly like a native Ctrl-C landing
-                        // mid-sleep.
-                        if sema_core::check_interrupt() {
-                            runtime.command_handle().cancel_root(handle.id());
-                        }
-                    }
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        runtime.block_on_inbox(Some(deadline));
-                    }
+                    runtime.block_on_inbox(Some(deadline));
                 }
                 // Fully idle: no task made progress this turn, no timer deadline,
                 // and no pending external completion — nothing can ever change
@@ -723,6 +696,7 @@ impl Interpreter {
                 // `channel/send: channel is full` for a top-level channel op, or
                 // the generic all-blocked deadlock otherwise) so the next
                 // `poll_result` returns it. Bounded — never hangs.
+                #[cfg(not(target_arch = "wasm32"))]
                 DriveState::Idle {
                     next_deadline: None,
                     inbox_wakeup_required: false,

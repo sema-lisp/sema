@@ -2178,6 +2178,11 @@ impl WasmInterpreter {
             Ok(reservation) => reservation,
             Err(message) => return js_sys::Promise::resolve(&self.debug_error_str(message)),
         };
+        if driver::debug_action_is_driving(&self.promise_driver) {
+            return js_sys::Promise::resolve(
+                &self.debug_error_str("A Promise debug action is already running"),
+            );
+        }
         self.inner.ctx.eval_steps.set(0);
         let bp_lines: Vec<u32> = breakpoint_lines
             .iter()

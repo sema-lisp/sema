@@ -106,6 +106,8 @@ pub(crate) struct PromiseDriver {
     active_retain: RefCell<Option<Rc<PromiseDriver>>>,
     output: PromiseOutput,
     debug_session: RefCell<Option<PromiseDebugSession>>,
+    debug_stop_requested: Cell<Option<RootId>>,
+    debug_breakpoints_pending: RefCell<Option<Vec<u32>>>,
     debug_root: Cell<Option<RootId>>,
     retiring_debug_roots: RefCell<HashMap<RootId, RootHandle>>,
 }
@@ -122,6 +124,8 @@ impl PromiseDriver {
             active_retain: RefCell::new(None),
             output: PromiseOutput::default(),
             debug_session: RefCell::new(None),
+            debug_stop_requested: Cell::new(None),
+            debug_breakpoints_pending: RefCell::new(None),
             debug_root: Cell::new(None),
             retiring_debug_roots: RefCell::new(HashMap::new()),
         })
@@ -133,6 +137,57 @@ impl PromiseDriver {
 
     pub(crate) fn take_output_sink(&self) -> Option<Function> {
         self.output.take_sink()
+    }
+}
+
+/// Owns the Promise debugger session outside its `RefCell` while the runtime
+/// can invoke arbitrary JavaScript. Re-entrant debugger calls communicate
+/// through the driver's scalar/pending-command fields; dropping this guard
+/// restores the session on every Rust exit path.
+struct PromiseDebugDrive<'a> {
+    driver: &'a PromiseDriver,
+    session: Option<PromiseDebugSession>,
+}
+
+impl<'a> PromiseDebugDrive<'a> {
+    fn begin(driver: &'a PromiseDriver) -> Self {
+        let session = driver.debug_session.borrow_mut().take();
+        debug_assert!(driver.debug_stop_requested.replace(None).is_none());
+        driver.debug_breakpoints_pending.borrow_mut().take();
+        Self { driver, session }
+    }
+
+    fn session_mut(&mut self) -> Option<&mut PromiseDebugSession> {
+        self.session.as_mut()
+    }
+
+    fn restore(&mut self) {
+        let Some(mut session) = self.session.take() else {
+            self.driver.debug_breakpoints_pending.borrow_mut().take();
+            return;
+        };
+        if let Some(lines) = self.driver.debug_breakpoints_pending.borrow_mut().take() {
+            set_session_breakpoints(&mut session, &lines);
+        }
+        let mut slot = self.driver.debug_session.borrow_mut();
+        assert!(
+            slot.is_none(),
+            "Promise debug session cannot be replaced during a drive"
+        );
+        *slot = Some(session);
+    }
+
+    fn finish(mut self) -> Option<RootId> {
+        let stop_requested = self.driver.debug_stop_requested.replace(None);
+        self.restore();
+        stop_requested
+    }
+}
+
+impl Drop for PromiseDebugDrive<'_> {
+    fn drop(&mut self) {
+        self.restore();
+        self.driver.debug_stop_requested.set(None);
     }
 }
 
@@ -392,6 +447,13 @@ pub(crate) fn start_debug(
                 return;
             }
         };
+        if debug_action_is_driving(&driver) {
+            resolve_debug_immediately(
+                &resolve,
+                debug_error_result("A Promise debug action is already running"),
+            );
+            return;
+        }
         let replaced_own_session = stop_debug(&driver);
         if !replaced_own_session && driver.interp.runtime().is_debug_paused() {
             resolve_debug_immediately(
@@ -455,6 +517,13 @@ pub(crate) fn start_debug(
 pub(crate) fn resume_debug(driver: &Rc<PromiseDriver>, mode: StepMode) -> js_sys::Promise {
     let driver = Rc::clone(driver);
     js_sys::Promise::new(&mut move |resolve, _reject| {
+        if debug_action_is_driving(&driver) {
+            resolve_debug_immediately(
+                &resolve,
+                debug_error_result("A Promise debug action is already running"),
+            );
+            return;
+        }
         let runtime = driver.interp.runtime();
         let install_error = {
             let mut slot = driver.debug_session.borrow_mut();
@@ -516,8 +585,18 @@ pub(crate) fn resume_debug(driver: &Rc<PromiseDriver>, mode: StepMode) -> js_sys
 /// timer/fetch, settle it immediately as cancelled; the runtime cancellation
 /// command is still scheduled for the next turn so resources are reaped.
 pub(crate) fn stop_debug(driver: &Rc<PromiseDriver>) -> bool {
-    let Some(mut session) = driver.debug_session.borrow_mut().take() else {
-        return false;
+    let session = driver.debug_session.borrow_mut().take();
+    let Some(mut session) = session else {
+        let Some(root) = driver.debug_root.get() else {
+            return false;
+        };
+        driver.debug_stop_requested.set(Some(root));
+        let _ = sema_vm::with_active_debug(|debug| {
+            debug.pause_requested = true;
+            debug.instructions_remaining = debug.instructions_remaining.clamp(1, 128);
+        });
+        let _ = driver.interp.command_handle().cancel_root(root);
+        return true;
     };
     let root = session.handle.id();
     let action = session.action.take();
@@ -548,16 +627,18 @@ fn retire_debug_root(driver: &Rc<PromiseDriver>, handle: RootHandle) {
 }
 
 pub(crate) fn debug_is_active(driver: &PromiseDriver) -> bool {
-    driver.debug_session.borrow().is_some()
+    driver.debug_root.get().is_some()
+}
+
+pub(crate) fn debug_action_is_driving(driver: &PromiseDriver) -> bool {
+    driver.debug_root.get().is_some() && driver.debug_session.borrow().is_none()
 }
 
 pub(crate) fn debug_locals(driver: &PromiseDriver) -> JsValue {
-    let Some(root) = driver
-        .debug_session
-        .borrow()
-        .as_ref()
-        .map(|session| session.handle.id())
-    else {
+    if debug_action_is_driving(driver) {
+        return JsValue::NULL;
+    }
+    let Some(root) = driver.debug_root.get() else {
         return JsValue::NULL;
     };
     let locals = driver
@@ -580,12 +661,10 @@ pub(crate) fn debug_locals(driver: &PromiseDriver) -> JsValue {
 }
 
 pub(crate) fn debug_stack_trace(driver: &PromiseDriver) -> JsValue {
-    let Some(root) = driver
-        .debug_session
-        .borrow()
-        .as_ref()
-        .map(|session| session.handle.id())
-    else {
+    if debug_action_is_driving(driver) {
+        return js_sys::Array::new().into();
+    }
+    let Some(root) = driver.debug_root.get() else {
         return js_sys::Array::new().into();
     };
     let frames = driver
@@ -605,14 +684,22 @@ pub(crate) fn debug_stack_trace(driver: &PromiseDriver) -> JsValue {
 }
 
 pub(crate) fn set_debug_breakpoints(driver: &PromiseDriver, lines: &[u32]) -> bool {
+    if debug_action_is_driving(driver) {
+        *driver.debug_breakpoints_pending.borrow_mut() = Some(lines.to_vec());
+        return true;
+    }
     let mut slot = driver.debug_session.borrow_mut();
     let Some(session) = slot.as_mut() else {
         return false;
     };
+    set_session_breakpoints(session, lines);
+    true
+}
+
+fn set_session_breakpoints(session: &mut PromiseDebugSession, lines: &[u32]) {
     let source = std::path::PathBuf::from("<playground>");
     session.debug.set_breakpoints(&source, lines);
     session.breakpoints = lines.to_vec();
-    true
 }
 
 fn register_driver(driver: &Rc<PromiseDriver>, runtime_id: RuntimeId) {
@@ -771,19 +858,20 @@ fn drive_and_settle(driver: &Rc<PromiseDriver>) {
     let interp = &driver.interp;
     let owned_roots = driver.owned_roots();
 
-    let drive_state = {
-        let mut debug_slot = driver.debug_session.borrow_mut();
-        if let Some(session) = debug_slot.as_mut() {
+    let (drive_state, debug_stop_requested) = {
+        let mut debug_drive = PromiseDebugDrive::begin(driver);
+        if let Some(session) = debug_drive.session_mut() {
             session.debug.instructions_remaining = DEBUG_INSTRUCTION_BUDGET;
         }
-        let _debug_guard = debug_slot.as_mut().map(|session| {
+        let debug_guard = debug_drive.session_mut().map(|session| {
             sema_vm::ActiveDebugGuard::enter_for_root(&mut session.debug, session.handle.id())
         });
-        match interp.drive_roots(&owned_roots) {
-            Ok(state) => state,
+        let drive_result = interp.drive_roots(&owned_roots);
+        drop(debug_guard);
+        let stop_requested = debug_drive.finish();
+        match drive_result {
+            Ok(state) => (state, stop_requested),
             Err(fault) => {
-                drop(_debug_guard);
-                drop(debug_slot);
                 pump_output(driver);
                 fail_all_pending(driver, &format!("runtime fault: {fault:?}"));
                 return;
@@ -792,6 +880,9 @@ fn drive_and_settle(driver: &Rc<PromiseDriver>) {
     };
 
     pump_output(driver);
+    if debug_stop_requested.is_some_and(|root| driver.debug_root.get() == Some(root)) {
+        let _ = stop_debug(driver);
+    }
     settle_ready_roots(driver);
     settle_debug_action(driver, &drive_state);
     settle_retiring_debug_roots(driver);

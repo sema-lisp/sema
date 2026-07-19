@@ -1111,6 +1111,124 @@ test('debugStartPromise reserves admission across macro-expansion JS re-entry', 
   expect(result.reusableFinished).toMatchObject({ status: 'finished', value: '3' });
 });
 
+test('Promise debugger controls are reentrant-safe inside a registered JS callback', async ({ page }) => {
+  await page.goto('/');
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+    let activeDuringDrive: boolean | null = null;
+    let localsDuringDrive: unknown = undefined;
+    let stackDuringDrive: unknown = undefined;
+    let breakpointsAccepted: boolean | null = null;
+    let nestedContinue: Promise<Record<string, unknown>> | null = null;
+    let nestedStart: Promise<Record<string, unknown>> | null = null;
+
+    interp.registerFunction('promise-debug-status-reentry', () => {
+      activeDuringDrive = interp.debugIsActivePromise();
+      localsDuringDrive = interp.debugGetLocalsPromise();
+      stackDuringDrive = interp.debugGetStackTracePromise();
+      breakpointsAccepted = interp.debugSetBreakpointsPromise([3]);
+      nestedContinue = interp.debugContinuePromise();
+      nestedStart = interp.debugStartPromise('99', []);
+      return 41;
+    });
+
+    const entry = await interp.debugStartPromise(
+      '(promise-debug-status-reentry)\n(+ 20 21)\n(context/set :queued-breakpoint 42)\n42',
+      [2],
+    );
+    const queuedBreakpoint = entry.status === 'stopped'
+      ? await interp.debugContinuePromise()
+      : entry;
+    const finished = queuedBreakpoint.status === 'stopped'
+      ? await interp.debugContinuePromise()
+      : queuedBreakpoint;
+    return {
+      activeDuringDrive,
+      localsDuringDrive,
+      stackDuringDrive,
+      breakpointsAccepted,
+      nestedContinue: await nestedContinue,
+      nestedStart: await nestedStart,
+      entry,
+      queuedBreakpoint,
+      finished,
+    };
+  });
+
+  expect(result.activeDuringDrive).toBe(true);
+  expect(result.localsDuringDrive).toBeNull();
+  expect(result.stackDuringDrive).toEqual([]);
+  expect(result.breakpointsAccepted).toBe(true);
+  expect(result.nestedContinue).toMatchObject({ status: 'error' });
+  expect(String(result.nestedContinue?.error)).toContain('already running');
+  expect(result.nestedStart).toMatchObject({ status: 'error' });
+  expect(String(result.nestedStart?.error)).toContain('already running');
+  expect(result.entry).toMatchObject({ status: 'stopped', line: 2 });
+  expect(result.queuedBreakpoint).toMatchObject({ status: 'stopped', line: 3 });
+  expect(result.finished).toMatchObject({ status: 'finished', value: '42' });
+});
+
+test('Promise debugger stop is reentrant-safe inside a registered JS callback', async ({ page }) => {
+  await page.goto('/');
+
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+    let stopAccepted: boolean | null = null;
+    let replacementAction: Promise<Record<string, unknown>> | null = null;
+
+    interp.setPromiseOutputSink((_root: number, _stream: string, text: string) => {
+      if (text.includes('START-REPLACEMENT') && replacementAction === null) {
+        replacementAction = interp.debugStartPromise('(+ 39 3)', []);
+      }
+    });
+
+    interp.registerFunction('promise-debug-stop-reentry', () => {
+      stopAccepted = interp.debugStopPromise();
+      return null;
+    });
+
+    const stopped = await interp.debugStartPromise(
+      '(define before 41)\n(promise-debug-stop-reentry)\n(context/set :after-stop 1)\n42',
+      [2],
+    );
+    const ordinary = interp.evalPromise('(println "START-REPLACEMENT") 7', undefined);
+    const cancelled = await interp.debugContinuePromise();
+    const ordinaryValue = await ordinary;
+    const replacementEntry = await replacementAction;
+    const replacementFinished = replacementEntry?.status === 'stopped'
+      ? await interp.debugContinuePromise()
+      : replacementEntry;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const afterStop = interp.evalVM('(context/get :after-stop)');
+    return {
+      stopped,
+      cancelled,
+      ordinaryValue,
+      replacementEntry,
+      replacementFinished,
+      stopAccepted,
+      active: interp.debugIsActivePromise(),
+      afterStop,
+    };
+  });
+
+  expect(result.stopped).toMatchObject({ status: 'stopped', line: 2 });
+  expect(result.stopAccepted).toBe(true);
+  expect(result.cancelled).toMatchObject({ status: 'cancelled' });
+  expect(result.ordinaryValue).toBe('7');
+  expect(result.replacementEntry).toMatchObject({ status: 'stopped' });
+  expect(result.replacementFinished).toMatchObject({ status: 'finished', value: '42' });
+  expect(result.active).toBe(false);
+  expect(result.afterStop).toMatchObject({ value: null, error: null });
+});
+
 test('a detached foreign timer does not delay promise-root deadlock settlement', async ({ page }) => {
   await page.goto('/');
 

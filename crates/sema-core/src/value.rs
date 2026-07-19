@@ -360,17 +360,16 @@ impl NativeFn {
     }
 
     #[doc(hidden)]
-    /// Invokes the runtime ABI, using `eval_context` only for the legacy
-    /// callback fallback when no runtime-aware callback exists.
+    /// Invokes the runtime ABI. A legacy callback fallback observes the same
+    /// evaluator context carried by the runtime invocation.
     pub fn invoke_runtime(
         &self,
-        eval_context: &EvalContext,
         runtime_context: &mut NativeCallContext<'_>,
         args: &[Value],
     ) -> NativeResult {
         match &self.runtime_func {
             Some(f) => f(runtime_context, args),
-            None => (self.func)(eval_context, args).map(NativeOutcome::Return),
+            None => (self.func)(runtime_context.eval_context, args).map(NativeOutcome::Return),
         }
     }
 

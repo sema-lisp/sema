@@ -1239,8 +1239,10 @@ mod checkout_trace_tests {
 
     #[test]
     fn final_cont_does_not_swallow_runtime_transition_failure() {
+        let eval_context = sema_core::EvalContext::new();
         let (mut task_context, cancellation) = context();
         let mut context = NativeCallContext {
+            eval_context: &eval_context,
             task_context: &mut task_context,
             cancellation,
         };
@@ -1294,8 +1296,10 @@ mod checkout_trace_tests {
             lifecycle: Rc::clone(&lifecycle),
             terminal_on_success: false,
         };
+        let eval_context = sema_core::EvalContext::new();
         let (mut task_context, cancellation) = context();
         let mut native_context = NativeCallContext {
+            eval_context: &eval_context,
             task_context: &mut task_context,
             cancellation,
         };
@@ -1335,8 +1339,10 @@ mod checkout_trace_tests {
             lifecycle: Rc::clone(&lifecycle),
             terminal_on_success: false,
         };
+        let eval_context = sema_core::EvalContext::new();
         let (mut task_context, cancellation) = context();
         let mut native_context = NativeCallContext {
+            eval_context: &eval_context,
             task_context: &mut task_context,
             cancellation,
         };

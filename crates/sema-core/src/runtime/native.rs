@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::cycle::GcEdge;
-use crate::{SemaError, Value};
+use crate::{EvalContext, SemaError, Value};
 
 use super::{
     CancelReason, ChannelId, PreparedExternalOperation, PromiseId, ResourceGateId, TaskContext,
@@ -33,6 +33,7 @@ impl CancellationView {
 }
 
 pub struct NativeCallContext<'a> {
+    pub eval_context: &'a EvalContext,
     pub task_context: &'a mut TaskContext,
     pub cancellation: CancellationView,
 }
@@ -677,8 +678,10 @@ mod tests {
             "dispatch callable + arg + retained multimethod + retained arg + outer continuation"
         );
 
+        let eval_context = EvalContext::new();
         let mut task_context = TaskContext::default();
         let mut context = NativeCallContext {
+            eval_context: &eval_context,
             task_context: &mut task_context,
             cancellation: CancellationView::default(),
         };
@@ -716,8 +719,10 @@ mod tests {
             .continuation
         }
 
+        let eval_context = EvalContext::new();
         let mut task_context = TaskContext::default();
         let mut context = NativeCallContext {
+            eval_context: &eval_context,
             task_context: &mut task_context,
             cancellation: CancellationView::default(),
         };
@@ -795,8 +800,10 @@ mod tests {
     #[test]
     fn continuation_is_consumed_for_each_resume_input() {
         let seen = Rc::new(RefCell::new(Vec::new()));
+        let eval_context = EvalContext::new();
         let mut task_context = TaskContext::default();
         let mut context = NativeCallContext {
+            eval_context: &eval_context,
             task_context: &mut task_context,
             cancellation: CancellationView::default(),
         };
@@ -816,18 +823,42 @@ mod tests {
     }
 
     #[test]
+    fn legacy_runtime_fallback_uses_embedded_eval_context() {
+        let embedded = EvalContext::new();
+        let observed = Rc::new(Cell::new(std::ptr::null::<EvalContext>()));
+        let observed_by_native = Rc::clone(&observed);
+        let native = NativeFn::with_ctx("context-identity", move |context, _| {
+            observed_by_native.set(context);
+            Ok(Value::NIL)
+        });
+        let mut task_context = TaskContext::default();
+        let mut runtime_context = NativeCallContext {
+            eval_context: &embedded,
+            task_context: &mut task_context,
+            cancellation: CancellationView::default(),
+        };
+
+        assert!(matches!(
+            native.invoke_runtime(&mut runtime_context, &[]),
+            Ok(NativeOutcome::Return(value)) if value.is_nil()
+        ));
+        assert_eq!(observed.get(), &embedded as *const EvalContext);
+    }
+
+    #[test]
     fn native_fn_dual_abi_preserves_legacy_and_runtime_paths() {
         let eval = EvalContext::new();
         let seen_eval = Rc::new(Cell::new(std::ptr::null::<EvalContext>()));
         let mut task_context = TaskContext::default();
         let mut runtime = NativeCallContext {
+            eval_context: &eval,
             task_context: &mut task_context,
             cancellation: CancellationView::default(),
         };
         let legacy = NativeFn::simple("legacy", |_| Ok(Value::int(7)));
         assert_eq!((legacy.func)(&eval, &[]).unwrap(), Value::int(7));
         assert!(
-            matches!(legacy.invoke_runtime(&eval, &mut runtime, &[]), Ok(NativeOutcome::Return(v)) if v == Value::int(7))
+            matches!(legacy.invoke_runtime(&mut runtime, &[]), Ok(NativeOutcome::Return(v)) if v == Value::int(7))
         );
         let seen_eval_from_callback = Rc::clone(&seen_eval);
         let with_ctx = NativeFn::with_ctx("with-ctx", move |ctx, _| {
@@ -835,7 +866,7 @@ mod tests {
             Ok(Value::int(6))
         });
         assert!(
-            matches!(with_ctx.invoke_runtime(&eval, &mut runtime, &[]), Ok(NativeOutcome::Return(v)) if v == Value::int(6))
+            matches!(with_ctx.invoke_runtime(&mut runtime, &[]), Ok(NativeOutcome::Return(v)) if v == Value::int(6))
         );
         assert_eq!(seen_eval.get(), &eval as *const EvalContext);
         let payload: Rc<dyn std::any::Any> = Rc::new(Value::int(5));
@@ -844,13 +875,13 @@ mod tests {
         });
         assert!(Rc::ptr_eq(with_payload.payload.as_ref().unwrap(), &payload));
         assert!(
-            matches!(with_payload.invoke_runtime(&eval, &mut runtime, &[]), Ok(NativeOutcome::Return(v)) if v == Value::int(5))
+            matches!(with_payload.invoke_runtime(&mut runtime, &[]), Ok(NativeOutcome::Return(v)) if v == Value::int(5))
         );
 
         let result =
             NativeFn::simple_result("runtime", |_| Ok(NativeOutcome::Return(Value::int(8))));
         assert!(
-            matches!(result.invoke_runtime(&eval, &mut runtime, &[]), Ok(NativeOutcome::Return(v)) if v == Value::int(8))
+            matches!(result.invoke_runtime(&mut runtime, &[]), Ok(NativeOutcome::Return(v)) if v == Value::int(8))
         );
         assert!((result.func)(&eval, &[])
             .unwrap_err()
@@ -863,7 +894,7 @@ mod tests {
             Ok(NativeOutcome::Return(args[0].clone()))
         });
         assert!(
-            matches!(contextual.invoke_runtime(&eval, &mut runtime, &[Value::int(9)]), Ok(NativeOutcome::Return(v)) if v == Value::int(9))
+            matches!(contextual.invoke_runtime(&mut runtime, &[Value::int(9)]), Ok(NativeOutcome::Return(v)) if v == Value::int(9))
         );
         assert!((contextual.func)(&eval, &[])
             .unwrap_err()
@@ -902,11 +933,12 @@ mod tests {
         let eval = EvalContext::new();
         let mut task_context = TaskContext::default();
         let mut runtime = NativeCallContext {
+            eval_context: &eval,
             task_context: &mut task_context,
             cancellation: CancellationView::default(),
         };
         assert!(matches!(
-            native.invoke_runtime(&eval, &mut runtime, &[Value::int(11)]),
+            native.invoke_runtime(&mut runtime, &[Value::int(11)]),
             Ok(NativeOutcome::Return(value)) if value == Value::int(10)
         ));
         assert_eq!(*payload.value.borrow(), Value::int(11));

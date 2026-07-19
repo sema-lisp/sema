@@ -4300,6 +4300,147 @@ impl Trace for CountingDecoder {
     }
 }
 
+struct ContextIdentityDecoder(Rc<RefCell<Vec<(&'static str, usize)>>>);
+
+impl Trace for ContextIdentityDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CompletionDecoder for ContextIdentityDecoder {
+    fn decode(
+        self: Box<Self>,
+        context: &mut NativeCallContext<'_>,
+        _result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> Result<Value, SemaError> {
+        self.0.borrow_mut().push((
+            "decode",
+            context.eval_context as *const sema_core::EvalContext as usize,
+        ));
+        Ok(Value::NIL)
+    }
+}
+
+struct ContextIdentityContinuation {
+    stage: &'static str,
+    seen: Rc<RefCell<Vec<(&'static str, usize)>>>,
+}
+
+impl Trace for ContextIdentityContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for ContextIdentityContinuation {
+    fn resume(
+        self: Box<Self>,
+        context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        assert!(matches!(input, ResumeInput::Returned(_)));
+        self.seen.borrow_mut().push((
+            self.stage,
+            context.eval_context as *const sema_core::EvalContext as usize,
+        ));
+        Ok(NativeOutcome::Return(Value::NIL))
+    }
+}
+
+fn context_identity_suspend(seen: Rc<RefCell<Vec<(&'static str, usize)>>>) -> NativeSuspend {
+    NativeSuspend {
+        wait: WaitKind::External(Box::new(PreparedExternalOperation::quarantined_blocking(
+            CompletionKind::try_from_raw(91).unwrap(),
+            Box::new(ContextIdentityDecoder(Rc::clone(&seen))),
+            sema_core::runtime::QuarantineBound::hard_deadline(Duration::from_secs(1)).unwrap(),
+            || Ok(Box::new(())),
+        ))),
+        continuation: Box::new(ContextIdentityContinuation {
+            stage: "external-resume",
+            seen,
+        }),
+    }
+}
+
+#[test]
+fn runtime_native_external_decoder_and_continuations_keep_owning_eval_context() {
+    let context_a = Rc::new(sema_core::EvalContext::new());
+    let context_b = Rc::new(sema_core::EvalContext::new());
+    let expected_a = Rc::as_ptr(&context_a) as usize;
+    let expected_b = Rc::as_ptr(&context_b) as usize;
+    let runtime_a = Runtime::new(
+        Rc::clone(&context_a),
+        Rc::new(FakeClock::new()),
+        Arc::new(FakeExecutor {
+            mode: FakeSubmit::Inline,
+            failure: None,
+        }),
+    )
+    .expect("runtime A");
+    let runtime_b = Runtime::new(
+        Rc::clone(&context_b),
+        Rc::new(FakeClock::new()),
+        Arc::new(FakeExecutor {
+            mode: FakeSubmit::Inline,
+            failure: None,
+        }),
+    )
+    .expect("runtime B");
+
+    let submit = |runtime: &Runtime| {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let native_seen = Rc::clone(&seen);
+        let suspend_seen = Rc::clone(&seen);
+        let native = Value::native_fn(sema_core::NativeFn::with_context_result(
+            "context-identity",
+            move |context, _| {
+                native_seen.borrow_mut().push((
+                    "native",
+                    context.eval_context as *const sema_core::EvalContext as usize,
+                ));
+                Ok(NativeOutcome::Suspend(context_identity_suspend(Rc::clone(
+                    &suspend_seen,
+                ))))
+            },
+        ));
+        let handle = runtime
+            .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Call(
+                NativeCall {
+                    callable: native,
+                    args: Vec::new(),
+                    continuation: Box::new(ContextIdentityContinuation {
+                        stage: "outer-resume",
+                        seen: Rc::clone(&seen),
+                    }),
+                },
+            ))))
+            .expect("root admitted");
+        (handle, seen)
+    };
+    let (handle_a, seen_a) = submit(&runtime_a);
+    let (handle_b, seen_b) = submit(&runtime_b);
+
+    while matches!(handle_a.poll_result(), RootPoll::Pending)
+        || matches!(handle_b.poll_result(), RootPoll::Pending)
+    {
+        runtime_b.drive(&drive_budget(1)).expect("runtime B drives");
+        runtime_a.drive(&drive_budget(1)).expect("runtime A drives");
+    }
+
+    for (seen, expected) in [(&seen_a, expected_a), (&seen_b, expected_b)] {
+        assert_eq!(
+            &*seen.borrow(),
+            &[
+                ("native", expected),
+                ("decode", expected),
+                ("external-resume", expected),
+                ("outer-resume", expected),
+            ]
+        );
+    }
+}
+
 struct DecodeFailureDecoder(Arc<Mutex<Vec<&'static str>>>);
 impl Trace for DecodeFailureDecoder {
     fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
@@ -5266,6 +5407,7 @@ fn async_run_barrier_releases_over_resource_slot_cycle() {
 
 #[test]
 fn wait_inline_completion_observes_registered_state_then_consumes_owners_once() {
+    let eval_context = sema_core::EvalContext::new();
     let events = Arc::new(Mutex::new(Vec::new()));
     let executor = Arc::new(FakeExecutor {
         mode: FakeSubmit::Inline,
@@ -5294,10 +5436,10 @@ fn wait_inline_completion_observes_registered_state_then_consumes_owners_once() 
         task.wait_key().unwrap_or_else(|| pending.wait_key())
     );
     assert_eq!(task.state_name(), StateName::Ready);
-    let pending = pending.invoke_decoder();
+    let pending = pending.invoke_decoder(&eval_context);
     assert_eq!(&*events.lock().unwrap(), &["decode"]);
     assert!(matches!(
-        pending.invoke_continuation(),
+        pending.invoke_continuation(&eval_context),
         Ok(NativeOutcome::Return(_))
     ));
     assert_eq!(&*events.lock().unwrap(), &["decode", "returned"]);
@@ -5307,6 +5449,7 @@ fn wait_inline_completion_observes_registered_state_then_consumes_owners_once() 
 
 #[test]
 fn wait_submit_rejection_traverses_decoder_then_continuation() {
+    let eval_context = sema_core::EvalContext::new();
     let events = Arc::new(Mutex::new(Vec::new()));
     let executor = Arc::new(FakeExecutor {
         mode: FakeSubmit::Reject,
@@ -5326,10 +5469,10 @@ fn wait_submit_rejection_traverses_decoder_then_continuation() {
     };
     assert_eq!(task.state_name(), StateName::Running);
     assert_eq!(runtime.cleanup_len(), 0);
-    let pending = pending.invoke_decoder();
+    let pending = pending.invoke_decoder(&eval_context);
     assert_eq!(&*events.lock().unwrap(), &["decode"]);
     assert!(matches!(
-        pending.invoke_continuation(),
+        pending.invoke_continuation(&eval_context),
         Ok(NativeOutcome::Return(_))
     ));
     assert_eq!(&*events.lock().unwrap(), &["decode", "failed"]);
@@ -5338,6 +5481,7 @@ fn wait_submit_rejection_traverses_decoder_then_continuation() {
 
 #[test]
 fn wait_submit_rejection_cancels_interruptible_resource_before_resume() {
+    let eval_context = sema_core::EvalContext::new();
     for (result, expected_cleanup) in [
         (CancelResult::Reaped, 0),
         (CancelResult::PendingReap, 1),
@@ -5372,7 +5516,10 @@ fn wait_submit_rejection_cancels_interruptible_resource_before_resume() {
 
         assert_eq!(&*calls.lock().unwrap(), &["cancel"]);
         assert_eq!(runtime.cleanup_len(), expected_cleanup);
-        pending.invoke_decoder().invoke_continuation().unwrap();
+        pending
+            .invoke_decoder(&eval_context)
+            .invoke_continuation(&eval_context)
+            .unwrap();
     }
 }
 
@@ -5495,6 +5642,7 @@ fn wait_completion_for_wrong_task_preserves_active_wait() {
 
 #[test]
 fn wait_trace_reports_exact_owned_edges_and_fails_on_borrowed_context() {
+    let eval_context = sema_core::EvalContext::new();
     let executor = Arc::new(FakeExecutor {
         mode: FakeSubmit::Inline,
         failure: None,
@@ -5520,7 +5668,7 @@ fn wait_trace_reports_exact_owned_edges_and_fails_on_borrowed_context() {
     edges = 0;
     assert!(pending.trace(&mut |_| edges += 1));
     assert_eq!(edges, 3);
-    let pending = pending.invoke_decoder();
+    let pending = pending.invoke_decoder(&eval_context);
     edges = 0;
     assert!(pending.trace(&mut |_| edges += 1));
     assert_eq!(edges, 3);
@@ -5582,6 +5730,7 @@ fn wait_constructor_preserves_executor_attach_error() {
 
 #[test]
 fn wait_cancel_uses_first_task_reason_and_only_quarantine_completion_reaps_cleanup() {
+    let eval_context = sema_core::EvalContext::new();
     let executor = Arc::new(FakeExecutor {
         mode: FakeSubmit::Inline,
         failure: None,
@@ -5606,7 +5755,7 @@ fn wait_cancel_uses_first_task_reason_and_only_quarantine_completion_reaps_clean
         .unwrap();
     assert_eq!(quarantine_task.state_name(), StateName::Ready);
     assert!(matches!(
-        pending.invoke_continuation(),
+        pending.invoke_continuation(&eval_context),
         Ok(NativeOutcome::Return(_))
     ));
     assert_eq!(

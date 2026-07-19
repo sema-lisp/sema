@@ -2901,8 +2901,10 @@ mod tests {
     ) -> NativeOutcome {
         use sema_core::runtime::{CancellationView, NativeCallContext, ResumeInput, TaskContext};
 
+        let eval_context = sema_core::EvalContext::new();
         let mut task_context = TaskContext::empty();
         let mut native_context = NativeCallContext {
+            eval_context: &eval_context,
             task_context: &mut task_context,
             cancellation: CancellationView::default(),
         };
@@ -3101,8 +3103,10 @@ mod tests {
             in_rx: std::rc::Rc::new(std::cell::RefCell::new(Some(incoming_rx))),
             incoming_generation,
         };
+        let eval_context = sema_core::EvalContext::new();
         let mut task_context = TaskContext::empty();
         let mut native_context = NativeCallContext {
+            eval_context: &eval_context,
             task_context: &mut task_context,
             cancellation: CancellationView::default(),
         };

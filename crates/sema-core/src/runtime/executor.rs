@@ -1175,8 +1175,10 @@ mod tests {
     fn decoder_consumes_typed_result_on_runtime_thread() {
         let count = Rc::new(Cell::new(0));
         let decoder: Box<dyn CompletionDecoder> = Box::new(LocalDecoder(Rc::clone(&count)));
+        let eval_context = crate::EvalContext::new();
         let mut task_context = TaskContext::empty();
         let mut context = NativeCallContext {
+            eval_context: &eval_context,
             task_context: &mut task_context,
             cancellation: CancellationView::default(),
         };
@@ -1752,8 +1754,10 @@ mod tests {
         let (_sender, runtime, _submission, _) =
             registration(prepared, kind(1), CompletionDelivery::Delivered);
         let (decoder, _, _) = runtime.into_parts();
+        let eval_context = crate::EvalContext::new();
         let mut task = TaskContext::empty();
         let mut context = NativeCallContext {
+            eval_context: &eval_context,
             task_context: &mut task,
             cancellation: CancellationView::default(),
         };

@@ -2699,8 +2699,10 @@ mod tests {
 
     #[test]
     fn mcp_final_cont_does_not_swallow_runtime_transition_failure() {
+        let eval_context = sema_core::EvalContext::new();
         let mut task_context = sema_core::runtime::TaskContext::default();
         let mut context = NativeCallContext {
+            eval_context: &eval_context,
             task_context: &mut task_context,
             cancellation: sema_core::runtime::CancellationView::default(),
         };
@@ -2726,8 +2728,10 @@ mod tests {
             finish: tools_finish(),
             lifecycle: Rc::clone(&lifecycle),
         };
+        let eval_context = sema_core::EvalContext::new();
         let mut task_context = sema_core::runtime::TaskContext::default();
         let mut context = NativeCallContext {
+            eval_context: &eval_context,
             task_context: &mut task_context,
             cancellation: sema_core::runtime::CancellationView::default(),
         };
@@ -2762,8 +2766,10 @@ mod tests {
             entry
         }
 
+        let eval_context = sema_core::EvalContext::new();
         let mut task_context = sema_core::runtime::TaskContext::default();
         let mut context = NativeCallContext {
+            eval_context: &eval_context,
             task_context: &mut task_context,
             cancellation: sema_core::runtime::CancellationView::default(),
         };

@@ -1879,12 +1879,13 @@ impl VM {
                 let _installed = ctx.scope_task_context(handle.clone());
                 let mut task_context = handle.borrow_mut();
                 let mut native_ctx = NativeCallContext {
+                    eval_context: ctx,
                     task_context: &mut task_context,
                     cancellation: self.quantum_cancellation.clone(),
                 };
                 let outcome = {
                     let _vm_guard = CurrentVmGuard::enter(self);
-                    func.invoke_runtime(ctx, &mut native_ctx, call_args)
+                    func.invoke_runtime(&mut native_ctx, call_args)
                 }?;
                 drop(task_context);
                 drop(_installed);

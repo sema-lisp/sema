@@ -991,8 +991,10 @@ mod tests {
         assert!(continuation.trace(&mut |_| edges += 1));
         assert_eq!(edges, 1);
 
+        let eval_context = sema_core::EvalContext::new();
         let mut task_context = TaskContext::empty();
         let mut native_context = NativeCallContext {
+            eval_context: &eval_context,
             task_context: &mut task_context,
             cancellation: CancellationView::default(),
         };
@@ -1093,8 +1095,10 @@ mod tests {
             evt_generation,
             deadline: None,
         };
+        let eval_context = sema_core::EvalContext::new();
         let mut task_context = TaskContext::empty();
         let mut native_context = NativeCallContext {
+            eval_context: &eval_context,
             task_context: &mut task_context,
             cancellation: CancellationView::default(),
         };

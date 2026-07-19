@@ -186,10 +186,11 @@ impl PendingResume {
         self.key
     }
 
-    pub fn invoke_decoder(mut self) -> Self {
+    pub fn invoke_decoder(mut self, eval_context: &sema_core::EvalContext) -> Self {
         if let Some(decoder) = self.decoder.take() {
             let mut task_context = self.context.borrow_mut();
             let mut context = NativeCallContext {
+                eval_context,
                 task_context: &mut task_context,
                 cancellation: self.cancellation.clone(),
             };
@@ -204,9 +205,10 @@ impl PendingResume {
         self
     }
 
-    pub fn invoke_continuation(self) -> NativeResult {
+    pub fn invoke_continuation(self, eval_context: &sema_core::EvalContext) -> NativeResult {
         let mut task_context = self.context.borrow_mut();
         let mut context = NativeCallContext {
+            eval_context,
             task_context: &mut task_context,
             cancellation: self.cancellation,
         };

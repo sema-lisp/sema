@@ -1900,7 +1900,10 @@ impl Runtime {
                 self.apply_action(action)?;
                 return Ok(true);
             }
-            PendingStage::Decode(pending) => PendingStage::Continue(pending.invoke_decoder()),
+            PendingStage::Decode(pending) => {
+                let eval_context = Rc::clone(&self.state.borrow()._context);
+                PendingStage::Continue(pending.invoke_decoder(&eval_context))
+            }
             PendingStage::Continue(pending) => {
                 let task = pending.task_id();
                 let (owner, cancellation) = {
@@ -1931,7 +1934,8 @@ impl Runtime {
                     )?;
                     return Ok(true);
                 }
-                PendingStage::Apply(task, owner, pending.invoke_continuation())
+                let eval_context = Rc::clone(&self.state.borrow()._context);
+                PendingStage::Apply(task, owner, pending.invoke_continuation(&eval_context))
             }
             PendingStage::Invoke(task, owner, call) => {
                 self.invoke_callable(task, owner, call)?;
@@ -3099,8 +3103,10 @@ impl Runtime {
             Some(cancel) => ResumeInput::Cancelled(cancel.reason),
             None => response.map_or_else(ResumeInput::Failed, ResumeInput::Runtime),
         };
+        let eval_context = Rc::clone(&self.state.borrow()._context);
         let mut task_context = task.context.borrow_mut();
         let mut native_context = NativeCallContext {
+            eval_context: &eval_context,
             task_context: &mut task_context,
             cancellation: CancellationView::new(cancel.is_some(), cancel.map(|c| c.reason)),
         };
@@ -3547,6 +3553,7 @@ impl Runtime {
                 let _installed = eval_context.scope_task_context(context.clone());
                 let mut task_context = context.borrow_mut();
                 let mut native_context = NativeCallContext {
+                    eval_context: &eval_context,
                     task_context: &mut task_context,
                     cancellation: CancellationView::new(
                         cancellation.is_some(),
@@ -3564,8 +3571,7 @@ impl Runtime {
                         message: error.to_string(),
                     }
                 })?;
-                let native_result =
-                    native.invoke_runtime(&eval_context, &mut native_context, &call.args);
+                let native_result = native.invoke_runtime(&mut native_context, &call.args);
                 (ContinuationFrame::native(call.continuation), native_result)
             } else if let Some(keyword) = call.callable.as_keyword_spur() {
                 let result = if call.args.len() != 1 {
@@ -3787,6 +3793,7 @@ impl Runtime {
             if let Some(cancel) = task.record.cancellation() {
                 let mut task_context = task.context.borrow_mut();
                 let mut native_context = NativeCallContext {
+                    eval_context: &eval_context,
                     task_context: &mut task_context,
                     cancellation: CancellationView::new(true, Some(cancel.reason)),
                 };
@@ -3803,6 +3810,7 @@ impl Runtime {
             let Some(next_globals) = next_closure.globals.clone() else {
                 let mut task_context = task.context.borrow_mut();
                 let mut native_context = NativeCallContext {
+                    eval_context: &eval_context,
                     task_context: &mut task_context,
                     cancellation: CancellationView::default(),
                 };
@@ -3841,6 +3849,7 @@ impl Runtime {
             if let Err(error) = vm.setup_for_call(next_closure, &current_call.args) {
                 let mut task_context = task.context.borrow_mut();
                 let mut native_context = NativeCallContext {
+                    eval_context: &eval_context,
                     task_context: &mut task_context,
                     cancellation: CancellationView::default(),
                 };
@@ -3864,6 +3873,7 @@ impl Runtime {
                 Ok(VmExecResult::Finished(value)) => {
                     let mut task_context = task.context.borrow_mut();
                     let mut native_context = NativeCallContext {
+                        eval_context: &eval_context,
                         task_context: &mut task_context,
                         cancellation: CancellationView::default(),
                     };
@@ -3881,6 +3891,7 @@ impl Runtime {
                 Err(error) => {
                     let mut task_context = task.context.borrow_mut();
                     let mut native_context = NativeCallContext {
+                        eval_context: &eval_context,
                         task_context: &mut task_context,
                         cancellation: CancellationView::default(),
                     };
@@ -4004,17 +4015,22 @@ impl Runtime {
         frame: ContinuationFrame,
         input: ResumeInput,
     ) -> Result<NativeResult, RuntimeFault> {
-        let (context, cancellation) = {
+        let (eval_context, context, cancellation) = {
             let state = self.state.borrow();
             let Some(task) = state.tasks.get(&task_id) else {
                 return Err(RuntimeFault::Invariant {
                     message: "continuation task disappeared".into(),
                 });
             };
-            (task.context.clone(), task.record.cancellation())
+            (
+                Rc::clone(&state._context),
+                task.context.clone(),
+                task.record.cancellation(),
+            )
         };
         let mut task_context = context.borrow_mut();
         let mut native_context = NativeCallContext {
+            eval_context: &eval_context,
             task_context: &mut task_context,
             cancellation: CancellationView::new(
                 cancellation.is_some(),

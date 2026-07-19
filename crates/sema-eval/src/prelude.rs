@@ -943,6 +943,25 @@ pub const PRELUDE: &str = r#"
     ((null? (cddr __args)) (__llm-chat-blocking (car __args) (cadr __args)))
     (else (apply __llm-chat-blocking __args))))
 
+;; llm/pmap: map the prompt builder sequentially, then submit the complete prompt
+;; list through llm/batch. Both calls use their structural runtime ABI, so a
+;; suspending mapper parks the active task and cancellation stops before the
+;; batch is dispatched. Outside the runtime their legacy value ABIs preserve the
+;; synchronous behavior. llm/batch owns prompt stringification and option/request
+;; shaping, keeping those semantics shared instead of duplicated here.
+(define (llm/pmap . __pmap-args)
+  (cond
+    ((= (length __pmap-args) 2)
+     (llm/batch
+       (map (car __pmap-args)
+            (__llm-pmap-validate-items (cadr __pmap-args)))))
+    ((= (length __pmap-args) 3)
+     (llm/batch
+       (map (car __pmap-args)
+            (__llm-pmap-validate-items (cadr __pmap-args)))
+       (caddr __pmap-args)))
+    (else (apply __llm-pmap-arity-error __pmap-args))))
+
 ;; ── Non-blocking streaming (llm/stream + agent :on-text rounds, ADR #68) ──────
 ;; Same pivotal constraint as the agent loop: a native cannot retain a Rust loop
 ;; across suspension, so the per-delta loop lives in bytecode. The wire side

@@ -3496,79 +3496,25 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         agent_stream_apply(agent_token, stream_token_arg(&args[1])?)
     });
 
-    // (llm/pmap fn collection {:max-tokens N ...})
-    // Maps fn over collection to produce prompts, then sends all prompts in parallel via batch_complete
-    register_fn_ctx(env, "llm/pmap", |ctx, args| {
-        if args.len() < 2 || args.len() > 3 {
-            return Err(SemaError::arity("llm/pmap", "2-3", args.len()));
+    // The public `llm/pmap` is a prelude function composed from structural
+    // `map` and `llm/batch`. Keeping its arity error in Rust preserves the
+    // native's exact public diagnostic without retaining a blocking callback
+    // twin that could be called directly from an active runtime task.
+    register_fn(env, "__llm-pmap-arity-error", |args| {
+        Err(SemaError::arity("llm/pmap", "2-3", args.len()))
+    });
+    register_fn(env, "__llm-pmap-validate-items", |args| {
+        if args.len() != 1 {
+            return Err(SemaError::arity(
+                "__llm-pmap-validate-items",
+                "1",
+                args.len(),
+            ));
         }
-        let func = &args[0];
-        let items = args[1]
+        args[0]
             .as_seq()
-            .map(|l| l.to_vec())
-            .ok_or_else(|| SemaError::type_error("list or vector", args[1].type_name()))?;
-
-        let mut model = String::new();
-        let mut max_tokens = None;
-        let mut temperature = None;
-        let mut system = None;
-
-        if let Some(opts_val) = args.get(2) {
-            if let Some(opts) = opts_val.as_map_rc() {
-                model = get_opt_string(&opts, "model").unwrap_or_default();
-                max_tokens = get_opt_u32(&opts, "max-tokens");
-                temperature = get_opt_f64(&opts, "temperature");
-                system = get_opt_string(&opts, "system");
-            }
-        }
-
-        // Step 1: Map fn over items to produce prompt strings (sequentially, since Rc)
-        let mut prompts = Vec::with_capacity(items.len());
-        for item in &items {
-            #[allow(clippy::cloned_ref_to_slice_refs)] // clone needed: &Value -> [Value]
-            let result = sema_core::call_callback(ctx, func, &[item.clone()])?;
-            let prompt_str = result
-                .as_str()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| result.to_string());
-            prompts.push(prompt_str);
-        }
-
-        // Step 2: Build ChatRequests
-        let requests: Vec<ChatRequest> = prompts
-            .into_iter()
-            .map(|prompt_text| {
-                let messages = vec![ChatMessage::new("user", prompt_text)];
-                let mut req = ChatRequest::new(model.clone(), messages);
-                req.max_tokens = max_tokens.or(Some(4096));
-                req.temperature = temperature;
-                req.system = system.clone();
-                req
-            })
-            .collect();
-
-        // Step 3: batch_complete (runs concurrently at provider level)
-        let responses = with_provider(|p| {
-            let reqs: Vec<ChatRequest> = requests
-                .into_iter()
-                .map(|mut r| {
-                    if r.model.is_empty() {
-                        r.model = p.default_model().to_string();
-                    }
-                    r
-                })
-                .collect();
-            Ok(p.batch_complete(reqs))
-        })?;
-
-        // Step 4: Collect results
-        let mut results = Vec::with_capacity(responses.len());
-        for resp_result in responses {
-            let resp = resp_result.map_err(|e| SemaError::Llm(e.to_string()))?;
-            track_usage(&resp.usage)?;
-            results.push(Value::string(&resp.content));
-        }
-        Ok(Value::list(results))
+            .ok_or_else(|| SemaError::type_error("list or vector", args[0].type_name()))?;
+        Ok(args[0].clone())
     });
 
     // (llm/batch ["prompt1" "prompt2" "prompt3"] {:max-tokens 100})

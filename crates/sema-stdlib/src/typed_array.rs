@@ -1,6 +1,9 @@
 use sema_core::{check_arity, SemaError, Value};
 
-use crate::list::{collect_f64_array_call, collect_i64_array_call, register_hof, CollectMode};
+use crate::list::{
+    collect_f64_array_call, collect_i64_array_call, fold_f64_array_call, fold_i64_array_call,
+    register_hof, CollectMode,
+};
 use crate::register_fn;
 
 /// Validate a user-supplied array length: a non-negative integer within a sane
@@ -293,32 +296,64 @@ pub fn register(env: &sema_core::Env) {
     );
 
     // (f64-array/fold f init arr) — fold over array
-    register_fn(env, "f64-array/fold", |args| {
-        check_arity!(args, "f64-array/fold", 3);
-        let f = &args[0];
-        let mut acc = args[1].clone();
-        let arr = args[2]
-            .as_f64_array()
-            .ok_or_else(|| SemaError::type_error("f64-array", args[2].type_name()))?;
-        for &v in arr.iter() {
-            acc = crate::list::call_function(f, &[acc, Value::float(v)])?;
-        }
-        Ok(acc)
-    });
+    register_hof(
+        env,
+        "f64-array/fold",
+        |args| {
+            check_arity!(args, "f64-array/fold", 3);
+            let f = &args[0];
+            let mut acc = args[1].clone();
+            let arr = args[2]
+                .as_f64_array()
+                .ok_or_else(|| SemaError::type_error("f64-array", args[2].type_name()))?;
+            for &v in arr.iter() {
+                acc = crate::list::call_function(f, &[acc, Value::float(v)])?;
+            }
+            Ok(acc)
+        },
+        |args| {
+            check_arity!(args, "f64-array/fold", 3);
+            args[2]
+                .as_f64_array()
+                .ok_or_else(|| SemaError::type_error("f64-array", args[2].type_name()))?;
+            Ok(fold_f64_array_call(
+                &args[0],
+                args[1].clone(),
+                args[2].clone(),
+                "f64-array/fold",
+            ))
+        },
+    );
 
     // (i64-array/fold f init arr) — fold over array
-    register_fn(env, "i64-array/fold", |args| {
-        check_arity!(args, "i64-array/fold", 3);
-        let f = &args[0];
-        let mut acc = args[1].clone();
-        let arr = args[2]
-            .as_i64_array()
-            .ok_or_else(|| SemaError::type_error("i64-array", args[2].type_name()))?;
-        for &v in arr.iter() {
-            acc = crate::list::call_function(f, &[acc, Value::int(v)])?;
-        }
-        Ok(acc)
-    });
+    register_hof(
+        env,
+        "i64-array/fold",
+        |args| {
+            check_arity!(args, "i64-array/fold", 3);
+            let f = &args[0];
+            let mut acc = args[1].clone();
+            let arr = args[2]
+                .as_i64_array()
+                .ok_or_else(|| SemaError::type_error("i64-array", args[2].type_name()))?;
+            for &v in arr.iter() {
+                acc = crate::list::call_function(f, &[acc, Value::int(v)])?;
+            }
+            Ok(acc)
+        },
+        |args| {
+            check_arity!(args, "i64-array/fold", 3);
+            args[2]
+                .as_i64_array()
+                .ok_or_else(|| SemaError::type_error("i64-array", args[2].type_name()))?;
+            Ok(fold_i64_array_call(
+                &args[0],
+                args[1].clone(),
+                args[2].clone(),
+                "i64-array/fold",
+            ))
+        },
+    );
 
     // (f64-array/from-list lst) — convert list of numbers to f64 array
     register_fn(env, "f64-array/from-list", |args| {

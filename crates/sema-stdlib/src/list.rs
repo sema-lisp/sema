@@ -395,21 +395,189 @@ fn predicate_call(
     }))
 }
 
-/// Cooperative continuation for `foldl`/`reduce` (Task 04). Threads the
-/// accumulator through a fresh runtime Call per element so an async op inside the
-/// combiner parks/resumes. The accumulator is cloned across the callback boundary
-/// (the legacy path keeps its owned-handoff in-place fast path).
+enum FoldSequenceItems {
+    Retained {
+        source: Value,
+        start: usize,
+        end: usize,
+    },
+    Snapshot {
+        items: Vec<Value>,
+        start: usize,
+        end: usize,
+    },
+}
+
+impl FoldSequenceItems {
+    fn from_value(source: &Value, hof: &'static str) -> Result<Self, SemaError> {
+        match get_sequence(source, hof)? {
+            Cow::Borrowed(items) => Ok(Self::Retained {
+                source: source.clone(),
+                start: 0,
+                end: items.len(),
+            }),
+            Cow::Owned(items) => {
+                let end = items.len();
+                Ok(Self::Snapshot {
+                    items,
+                    start: 0,
+                    end,
+                })
+            }
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<Value> {
+        match self {
+            Self::Retained {
+                source, start, end, ..
+            } if *start < *end => {
+                let item = source
+                    .as_list()
+                    .or_else(|| source.as_vector())
+                    .and_then(|items| items.get(*start))
+                    .cloned();
+                *start += usize::from(item.is_some());
+                item
+            }
+            Self::Snapshot {
+                items, start, end, ..
+            } if *start < *end => {
+                let item = std::mem::replace(&mut items[*start], Value::nil());
+                *start += 1;
+                Some(item)
+            }
+            Self::Retained { .. } | Self::Snapshot { .. } => None,
+        }
+    }
+
+    fn pop_back(&mut self) -> Option<Value> {
+        match self {
+            Self::Retained {
+                source, start, end, ..
+            } if *start < *end => {
+                *end -= 1;
+                source
+                    .as_list()
+                    .or_else(|| source.as_vector())
+                    .and_then(|items| items.get(*end))
+                    .cloned()
+            }
+            Self::Snapshot {
+                items, start, end, ..
+            } if *start < *end => {
+                *end -= 1;
+                Some(std::mem::replace(&mut items[*end], Value::nil()))
+            }
+            Self::Retained { .. } | Self::Snapshot { .. } => None,
+        }
+    }
+
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) {
+        match self {
+            Self::Retained { source, .. } => sink(GcEdge::Value(source)),
+            Self::Snapshot {
+                items, start, end, ..
+            } => {
+                for item in &items[*start..*end] {
+                    sink(GcEdge::Value(item));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FoldDirection {
+    Forward,
+    Reverse,
+}
+
+enum FoldItems {
+    Sequence {
+        items: FoldSequenceItems,
+        direction: FoldDirection,
+    },
+    F64Array {
+        source: Value,
+        next: usize,
+    },
+    I64Array {
+        source: Value,
+        next: usize,
+    },
+}
+
+impl FoldItems {
+    fn pop_front(&mut self) -> Option<Value> {
+        match self {
+            Self::Sequence {
+                items,
+                direction: FoldDirection::Forward,
+            } => items.pop_front(),
+            Self::Sequence {
+                items,
+                direction: FoldDirection::Reverse,
+            } => items.pop_back(),
+            Self::F64Array { source, next } => {
+                let item = source
+                    .as_f64_array()
+                    .and_then(|items| items.get(*next))
+                    .copied()
+                    .map(Value::float);
+                *next += usize::from(item.is_some());
+                item
+            }
+            Self::I64Array { source, next } => {
+                let item = source
+                    .as_i64_array()
+                    .and_then(|items| items.get(*next))
+                    .copied()
+                    .map(Value::int);
+                *next += usize::from(item.is_some());
+                item
+            }
+        }
+    }
+
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) {
+        match self {
+            Self::Sequence { items, .. } => items.trace(sink),
+            Self::F64Array { source, .. } | Self::I64Array { source, .. } => {
+                sink(GcEdge::Value(source));
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FoldOrder {
+    AccumulatorThenItem,
+    ItemThenAccumulator,
+}
+
+impl FoldOrder {
+    fn args(self, accumulator: Value, item: Value) -> Vec<Value> {
+        match self {
+            Self::AccumulatorThenItem => vec![accumulator, item],
+            Self::ItemThenAccumulator => vec![item, accumulator],
+        }
+    }
+}
+
+/// Cooperative fold state. Each combiner result becomes the accumulator
+/// argument of the next structural runtime call.
 struct FoldContinuation {
+    hof: &'static str,
     combiner: Value,
-    remaining: VecDeque<Value>,
+    remaining: FoldItems,
+    order: FoldOrder,
 }
 
 impl Trace for FoldContinuation {
     fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
         sink(GcEdge::Value(&self.combiner));
-        for item in &self.remaining {
-            sink(GcEdge::Value(item));
-        }
+        self.remaining.trace(sink);
         true
     }
 }
@@ -421,11 +589,11 @@ impl NativeContinuation for FoldContinuation {
         input: ResumeInput,
     ) -> NativeResult {
         // The returned value is the new accumulator.
-        let acc = resume_value(input, "fold")?;
+        let acc = resume_value(input, self.hof)?;
         match self.remaining.pop_front() {
             Some(next) => Ok(NativeOutcome::Call(NativeCall {
                 callable: self.combiner.clone(),
-                args: vec![acc, next],
+                args: self.order.args(acc, next),
                 continuation: self,
             })),
             None => Ok(NativeOutcome::Return(acc)),
@@ -433,22 +601,92 @@ impl NativeContinuation for FoldContinuation {
     }
 }
 
-/// Initial cooperative `NativeOutcome::Call` for a left fold `(combiner acc
-/// item)` starting from `init`. Empty `items` has no combiner call, so it
-/// returns `init` directly.
-fn fold_call(combiner: &Value, init: Value, items: &[Value]) -> NativeOutcome {
-    let Some((first, rest)) = items.split_first() else {
+fn start_fold(
+    combiner: &Value,
+    init: Value,
+    mut remaining: FoldItems,
+    order: FoldOrder,
+    hof: &'static str,
+) -> NativeOutcome {
+    let Some(first) = remaining.pop_front() else {
         return NativeOutcome::Return(init);
     };
     let continuation = Box::new(FoldContinuation {
+        hof,
         combiner: combiner.clone(),
-        remaining: rest.iter().cloned().collect(),
+        remaining,
+        order,
     });
     NativeOutcome::Call(NativeCall {
         callable: combiner.clone(),
-        args: vec![init, first.clone()],
+        args: order.args(init, first),
         continuation,
     })
+}
+
+fn fold_sequence_call(
+    combiner: &Value,
+    init: Value,
+    source: &Value,
+    direction: FoldDirection,
+    order: FoldOrder,
+    hof: &'static str,
+) -> NativeResult {
+    let items = FoldSequenceItems::from_value(source, hof)?;
+    Ok(start_fold(
+        combiner,
+        init,
+        FoldItems::Sequence { items, direction },
+        order,
+        hof,
+    ))
+}
+
+fn reduce_call(combiner: &Value, source: &Value) -> NativeResult {
+    let mut items = FoldSequenceItems::from_value(source, "reduce")?;
+    let init = items
+        .pop_front()
+        .ok_or_else(|| SemaError::eval("reduce: empty list"))?;
+    Ok(start_fold(
+        combiner,
+        init,
+        FoldItems::Sequence {
+            items,
+            direction: FoldDirection::Forward,
+        },
+        FoldOrder::AccumulatorThenItem,
+        "reduce",
+    ))
+}
+
+pub(crate) fn fold_f64_array_call(
+    combiner: &Value,
+    init: Value,
+    source: Value,
+    hof: &'static str,
+) -> NativeOutcome {
+    start_fold(
+        combiner,
+        init,
+        FoldItems::F64Array { source, next: 0 },
+        FoldOrder::AccumulatorThenItem,
+        hof,
+    )
+}
+
+pub(crate) fn fold_i64_array_call(
+    combiner: &Value,
+    init: Value,
+    source: Value,
+    hof: &'static str,
+) -> NativeOutcome {
+    start_fold(
+        combiner,
+        init,
+        FoldItems::I64Array { source, next: 0 },
+        FoldOrder::AccumulatorThenItem,
+        hof,
+    )
 }
 
 /// Cooperative continuation for `for-each` (Task 04). Runs the callback for each
@@ -1356,8 +1594,14 @@ pub fn register(env: &sema_core::Env) {
         },
         |args| {
             check_arity!(args, "foldl", 3);
-            let items = get_sequence(&args[2], "foldl")?;
-            Ok(fold_call(&args[0], args[1].clone(), &items))
+            fold_sequence_call(
+                &args[0],
+                args[1].clone(),
+                &args[2],
+                FoldDirection::Forward,
+                FoldOrder::AccumulatorThenItem,
+                "foldl",
+            )
         },
     );
 
@@ -1644,11 +1888,7 @@ pub fn register(env: &sema_core::Env) {
         },
         |args| {
             check_arity!(args, "reduce", 2);
-            let items = get_sequence(&args[1], "reduce")?;
-            if items.is_empty() {
-                return Err(SemaError::eval("reduce: empty list"));
-            }
-            Ok(fold_call(&args[0], items[0].clone(), &items[1..]))
+            reduce_call(&args[0], &args[1])
         },
     );
 
@@ -1686,15 +1926,30 @@ pub fn register(env: &sema_core::Env) {
         },
     );
 
-    register_fn(env, "foldr", |args| {
-        check_arity!(args, "foldr", 3);
-        let items = get_sequence(&args[2], "foldr")?;
-        let mut acc = args[1].clone();
-        for item in items.iter().rev() {
-            acc = call_function(&args[0], &[item.clone(), acc])?;
-        }
-        Ok(acc)
-    });
+    register_hof(
+        env,
+        "foldr",
+        |args| {
+            check_arity!(args, "foldr", 3);
+            let items = get_sequence(&args[2], "foldr")?;
+            let mut acc = args[1].clone();
+            for item in items.iter().rev() {
+                acc = call_function(&args[0], &[item.clone(), acc])?;
+            }
+            Ok(acc)
+        },
+        |args| {
+            check_arity!(args, "foldr", 3);
+            fold_sequence_call(
+                &args[0],
+                args[1].clone(),
+                &args[2],
+                FoldDirection::Reverse,
+                FoldOrder::ItemThenAccumulator,
+                "foldr",
+            )
+        },
+    );
 
     register_fn(env, "sort", |args| {
         check_arity!(args, "sort", 1..=2);
@@ -2918,6 +3173,50 @@ mod continuation_trace_tests {
         };
         // Predicate + current + one compact source handle + retained sole match.
         assert_eq!(edge_count(&sole), 4);
+    }
+
+    #[test]
+    fn fold_continuation_traces_pending_inputs() {
+        let values = FoldContinuation {
+            hof: "foldr",
+            combiner: Value::string("combiner"),
+            remaining: FoldItems::Sequence {
+                items: FoldSequenceItems::Retained {
+                    source: Value::list(vec![Value::int(1), Value::int(2)]),
+                    start: 0,
+                    end: 2,
+                },
+                direction: FoldDirection::Reverse,
+            },
+            order: FoldOrder::ItemThenAccumulator,
+        };
+        assert_eq!(edge_count(&values), 2);
+
+        let snapshot = FoldContinuation {
+            hof: "foldl",
+            combiner: Value::string("combiner"),
+            remaining: FoldItems::Sequence {
+                items: FoldSequenceItems::Snapshot {
+                    items: vec![Value::int(1), Value::int(2)],
+                    start: 0,
+                    end: 2,
+                },
+                direction: FoldDirection::Forward,
+            },
+            order: FoldOrder::AccumulatorThenItem,
+        };
+        assert_eq!(edge_count(&snapshot), 3);
+
+        let typed = FoldContinuation {
+            hof: "i64-array/fold",
+            combiner: Value::string("combiner"),
+            remaining: FoldItems::I64Array {
+                source: Value::i64_array(vec![1, 2]),
+                next: 1,
+            },
+            order: FoldOrder::AccumulatorThenItem,
+        };
+        assert_eq!(edge_count(&typed), 2);
     }
 
     #[test]

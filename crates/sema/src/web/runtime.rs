@@ -154,6 +154,16 @@ fn validate_staged_assets(dir: &Path, assets: &[RuntimeAsset]) -> std::io::Resul
     Ok(())
 }
 
+fn cache_path_error(action: &str, path: &Path, error: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        error.kind(),
+        format!(
+            "cannot {action} web runtime cache path {}: {error}",
+            path.display()
+        ),
+    )
+}
+
 fn prepare_cache_root(cache_root: &Path) -> std::io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
@@ -162,9 +172,12 @@ fn prepare_cache_root(cache_root: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
-    builder.create(cache_root)?;
+    builder
+        .create(cache_root)
+        .map_err(|error| cache_path_error("create", cache_root, error))?;
 
-    let metadata = fs::symlink_metadata(cache_root)?;
+    let metadata = fs::symlink_metadata(cache_root)
+        .map_err(|error| cache_path_error("inspect", cache_root, error))?;
     if !metadata.file_type().is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -179,10 +192,23 @@ fn prepare_cache_root(cache_root: &Path) -> std::io::Result<()> {
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        if metadata.mode() & 0o077 != 0 {
-            fs::set_permissions(cache_root, fs::Permissions::from_mode(0o700))?;
+        fs::set_permissions(cache_root, fs::Permissions::from_mode(0o700))
+            .map_err(|error| cache_path_error("secure", cache_root, error))?;
+        let mode = fs::symlink_metadata(cache_root)
+            .map_err(|error| cache_path_error("verify", cache_root, error))?
+            .mode()
+            & 0o777;
+        if mode != 0o700 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "web runtime cache root {} has mode {mode:o}, expected 700",
+                    cache_root.display()
+                ),
+            ));
         }
     }
+    fs::read_dir(cache_root).map_err(|error| cache_path_error("search", cache_root, error))?;
     Ok(())
 }
 
@@ -254,11 +280,8 @@ fn extract_assets(
                 continue;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => {
-                repair = repair.checked_add(1).ok_or_else(|| {
-                    std::io::Error::other("web runtime cache repair sequence exhausted")
-                })?;
-                continue;
+            Err(error) => {
+                return Err(cache_path_error("inspect candidate", &generation, error));
             }
         }
 
@@ -278,16 +301,19 @@ fn extract_assets(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return Err(rename_error);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    return Err(cache_path_error("inspect candidate", &generation, error));
+                }
             },
         }
     }
 }
 
-/// Extract the embedded runtime to an immutable, content-addressed temp dir and
-/// return its path, so the dev server can serve it as static files. A complete
-/// generation is published with one directory rename; repeat launches validate
-/// and reuse the existing generation without rewriting the ~4.5 MB wasm file.
+/// Extract the embedded runtime to an immutable, content-addressed per-user
+/// cache directory and return its path, so the dev server can serve it as
+/// static files. A complete generation is published with one directory rename;
+/// repeat launches validate and reuse the existing generation without rewriting
+/// the ~4.5 MB wasm file.
 pub fn extract() -> std::io::Result<std::path::PathBuf> {
     let cache_root = ProjectDirs::from("com", "sema-lang", "sema")
         .ok_or_else(|| {
@@ -308,7 +334,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
 
-    use super::{asset_set_digest, extract_assets, RuntimeAsset, WebRuntime};
+    use super::{asset_set_digest, extract_assets, prepare_cache_root, RuntimeAsset, WebRuntime};
 
     static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -553,6 +579,35 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert!(std::fs::read_dir(real_root).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_executable_cache_root_is_repaired_before_namespace_scan() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        for initial_mode in [0o000, 0o600] {
+            let cache = TestDir::new();
+            std::fs::set_permissions(cache.path(), std::fs::Permissions::from_mode(initial_mode))
+                .unwrap();
+
+            let prepared = prepare_cache_root(cache.path());
+            let actual_mode = std::fs::symlink_metadata(cache.path()).unwrap().mode() & 0o777;
+            if actual_mode != 0o700 {
+                std::fs::set_permissions(cache.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+
+            prepared.expect("repair an owner-controlled non-executable cache root");
+            assert_eq!(actual_mode, 0o700);
+            let published =
+                extract_assets(cache.path(), "9.9.9", &[asset("sema_wasm.js", b"expected")])
+                    .expect("cache namespace scan must complete after repairing its mode");
+            assert_eq!(
+                std::fs::read(published.join("sema_wasm.js")).unwrap(),
+                b"expected"
+            );
+        }
     }
 
     #[test]

@@ -66,15 +66,13 @@ impl ServeProcess {
         }
     }
 
-    fn spawn(handler: &str) -> Self {
+    fn spawn_with_on_listen(handler: &str, on_listen: &str) -> Self {
         let program = format!(
             r#"(http/serve
                   {handler}
                   {{:host "127.0.0.1"
                     :port 0
-                    :on-listen (fn (info)
-                      (println (string-append "{BOUND_SIGNAL}"
-                                              (number->string (:port info)))))}})"#
+                    :on-listen {on_listen}}})"#
         );
         let mut process = Self::spawn_raw(&program, Arc::new(AtomicBool::new(false)));
         let port = process
@@ -84,6 +82,15 @@ impl ServeProcess {
             .expect("BOUND signal contains a u16 port");
         process.port = Some(port);
         process
+    }
+
+    fn spawn(handler: &str) -> Self {
+        let on_listen = format!(
+            r#"(fn (info)
+                  (println (string-append "{BOUND_SIGNAL}"
+                                          (number->string (:port info)))))"#
+        );
+        Self::spawn_with_on_listen(handler, &on_listen)
     }
 
     fn id(&self) -> u32 {
@@ -334,6 +341,23 @@ fn handler_parking_on_async_returns_response() {
     let body = http_get_body(server.port(), "/", Duration::from_secs(3));
     server.terminate();
     assert_eq!(body.as_deref(), Ok("awaited"));
+}
+
+#[test]
+fn on_listen_callback_runs_through_the_cooperative_runtime() {
+    let on_listen = format!(
+        r#"(fn (info)
+              (async/await (async/spawn (fn () "ready")))
+              (println (string-append "{BOUND_SIGNAL}"
+                                      (number->string (:port info)))))"#
+    );
+    let mut server =
+        ServeProcess::spawn_with_on_listen(r#"(fn (_req) (http/text "ok"))"#, &on_listen);
+
+    let body = http_get_body(server.port(), "/", Duration::from_secs(3));
+    server.terminate();
+
+    assert_eq!(body.as_deref(), Ok("ok"));
 }
 
 #[test]

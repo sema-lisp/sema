@@ -51,6 +51,134 @@ fn value_to_json_lossy_string(val: &Value) -> Result<String, String> {
     serde_json::to_string(&value_to_json_lossy(val)).map_err(|e| e.to_string())
 }
 
+struct ToolRouteHandlerPayload {
+    handler: std::cell::RefCell<Value>,
+}
+
+fn tool_route_payload_tracer(
+    payload: &std::rc::Rc<dyn std::any::Any>,
+    sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>),
+) -> bool {
+    sink(sema_core::cycle::GcEdge::Opaque {
+        ptr: sema_core::NodePtr::of_rc(payload),
+        strong_count: std::rc::Rc::strong_count(payload),
+        trace: trace_tool_route_payload,
+        sever: sever_tool_route_payload,
+    });
+    true
+}
+
+fn trace_tool_route_payload(
+    ptr: sema_core::NodePtr,
+    sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>),
+) -> bool {
+    // SAFETY: `tool_route_payload_tracer` supplied the data pointer of a live
+    // `Rc<ToolRouteHandlerPayload>`, retained for the complete collector pass.
+    let payload = unsafe { &*(ptr.raw() as *const ToolRouteHandlerPayload) };
+    let Ok(handler) = payload.handler.try_borrow() else {
+        return false;
+    };
+    sink(sema_core::cycle::GcEdge::Value(&handler));
+    true
+}
+
+fn sever_tool_route_payload(ptr: sema_core::NodePtr) -> Option<Value> {
+    // SAFETY: see `trace_tool_route_payload`; severing runs while the same
+    // payload allocation remains retained by the collector.
+    let payload = unsafe { &*(ptr.raw() as *const ToolRouteHandlerPayload) };
+    payload
+        .handler
+        .try_borrow_mut()
+        .ok()
+        .map(|mut handler| std::mem::replace(&mut *handler, Value::nil()))
+}
+
+fn tool_route_arguments(req_args: &[Value]) -> Result<Vec<Value>, SemaError> {
+    check_arity!(req_args, "tool-route-handler", 1);
+    let json_body = req_args[0]
+        .as_map_rc()
+        .and_then(|request| request.get(&Value::keyword("json")).cloned())
+        .unwrap_or_else(Value::nil);
+    Ok(vec![if json_body.is_nil() {
+        Value::map(BTreeMap::new())
+    } else {
+        json_body
+    }])
+}
+
+fn tool_route_response(result: &Value) -> Value {
+    let body = value_to_json_lossy_string(result).unwrap_or_else(|_| format!("{result}"));
+    let mut headers = BTreeMap::new();
+    headers.insert(
+        Value::string("content-type"),
+        Value::string("application/json"),
+    );
+    let mut response = BTreeMap::new();
+    response.insert(Value::keyword("status"), Value::int(200));
+    response.insert(Value::keyword("headers"), Value::map(headers));
+    response.insert(Value::keyword("body"), Value::string(&body));
+    Value::map(response)
+}
+
+fn tool_route_handler(payload: &ToolRouteHandlerPayload) -> Result<Value, SemaError> {
+    payload
+        .handler
+        .try_borrow()
+        .map(|handler| handler.clone())
+        .map_err(|_| SemaError::eval("tool route handler payload is already borrowed"))
+}
+
+fn tool_route_legacy(
+    payload: &ToolRouteHandlerPayload,
+    context: &sema_core::EvalContext,
+    req_args: &[Value],
+) -> Result<Value, SemaError> {
+    let handler = tool_route_handler(payload)?;
+    let result = sema_core::call_callback(context, &handler, &tool_route_arguments(req_args)?)?;
+    Ok(tool_route_response(&result))
+}
+
+fn tool_route_runtime(
+    payload: &ToolRouteHandlerPayload,
+    _context: &mut sema_core::runtime::NativeCallContext<'_>,
+    req_args: &[Value],
+) -> sema_core::runtime::NativeResult {
+    Ok(NativeOutcome::Call(sema_core::runtime::NativeCall {
+        callable: tool_route_handler(payload)?,
+        args: tool_route_arguments(req_args)?,
+        continuation: Box::new(ToolRouteContinuation),
+    }))
+}
+
+struct ToolRouteContinuation;
+
+impl sema_core::runtime::Trace for ToolRouteContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for ToolRouteContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+
+        match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(tool_route_response(&value))),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "tool route handler was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "tool route handler received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
 // --- Raw types for cross-thread communication (Value is !Send due to Rc) ---
 
 /// Raw HTTP request data that is Send-safe for crossing thread boundaries.
@@ -213,6 +341,11 @@ fn json_response(status: i64, val: &Value) -> Result<Value, SemaError> {
 }
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
+    sema_core::register_payload_tracer(
+        std::any::TypeId::of::<ToolRouteHandlerPayload>(),
+        tool_route_payload_tracer,
+    );
+
     register_fn(env, "http/ok", |args| {
         check_arity!(args, "http/ok", 1);
         json_response(200, &args[0])
@@ -444,52 +577,25 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             let param_schema = tool.parameters.clone();
             let tool_name = tool.name.clone();
 
-            // Build a native fn that extracts params from JSON body and calls the tool handler
-            let route_handler = Value::native_fn(sema_core::NativeFn::with_ctx(
+            let route_payload = std::rc::Rc::new(ToolRouteHandlerPayload {
+                handler: std::cell::RefCell::new(handler),
+            });
+            let route_handler = Value::native_fn(sema_core::NativeFn::with_payload_ctx_runtime(
                 format!("tools->routes/{}", tool_name),
-                move |ctx, req_args| {
-                    check_arity!(req_args, "tool-route-handler", 1);
-                    let req = &req_args[0];
-                    // Extract JSON body or use empty map
-                    let json_body = req
-                        .as_map_rc()
-                        .and_then(|m| m.get(&Value::keyword("json")).cloned())
-                        .unwrap_or_else(Value::nil);
-
-                    // Call the tool handler with the params
-                    let tool_args = if json_body.is_nil() {
-                        vec![Value::map(BTreeMap::new())]
-                    } else {
-                        vec![json_body]
-                    };
-                    let result = sema_core::call_callback(ctx, &handler, &tool_args)?;
-
-                    // Wrap result in http/ok-style response
-                    let body = value_to_json_lossy_string(&result)
-                        .unwrap_or_else(|_| format!("{}", result));
-                    let mut headers = BTreeMap::new();
-                    headers.insert(
-                        Value::string("content-type"),
-                        Value::string("application/json"),
-                    );
-                    let mut resp = BTreeMap::new();
-                    resp.insert(Value::keyword("status"), Value::int(200));
-                    resp.insert(Value::keyword("headers"), Value::map(headers));
-                    resp.insert(Value::keyword("body"), Value::string(&body));
-                    Ok(Value::map(resp))
-                },
+                route_payload,
+                tool_route_legacy,
+                tool_route_runtime,
             ));
 
             // Also create a schema endpoint
             let schema_path = format!("/tools/{}/schema", tool_name);
-            let schema_clone = param_schema.clone();
+            let schema_json =
+                value_to_json_lossy_string(&param_schema).unwrap_or_else(|_| "{}".to_string());
             let tool_name_clone = tool_name.clone();
             let tool_desc = tool.description.clone();
             let schema_handler = Value::native_fn(sema_core::NativeFn::simple(
                 format!("tools->routes/{}/schema", tool_name_clone),
                 move |_args| {
-                    let schema_json = value_to_json_lossy_string(&schema_clone)
-                        .unwrap_or_else(|_| "{}".to_string());
                     let mut body_map = BTreeMap::new();
                     body_map.insert(Value::string("name"), Value::string(&tool_name_clone));
                     body_map.insert(Value::string("description"), Value::string(&tool_desc));
@@ -792,10 +898,12 @@ fn register_router(env: &sema_core::Env) {
 /// suspend can flow out); the synchronous value ABI passes `false` and
 /// canonicalizes inline, so it never returns a suspension the value ABI cannot
 /// carry.
+type RouterInvoke<'a> = &'a dyn Fn(&Value, Value) -> Result<Value, SemaError>;
+
 fn dispatch_body(
     routes: &[(String, String, Value)],
     args: &[Value],
-    invoke: &dyn Fn(&Value, Value) -> Result<Value, SemaError>,
+    invoke: Option<RouterInvoke<'_>>,
     can_suspend: bool,
 ) -> sema_core::runtime::NativeResult {
     check_arity!(args, "http/router/dispatch", 1);
@@ -949,7 +1057,16 @@ fn dispatch_body(
                 return Ok(NativeOutcome::Return(Value::map(ws_map)));
             }
 
-            // Call handler
+            if can_suspend {
+                return Ok(NativeOutcome::Call(sema_core::runtime::NativeCall {
+                    callable: handler.clone(),
+                    args: vec![new_req_val],
+                    continuation: Box::new(RouteHandlerContinuation),
+                }));
+            }
+            let invoke = invoke.ok_or_else(|| {
+                SemaError::eval("http/router/dispatch: missing host callback invoker")
+            })?;
             return invoke(handler, new_req_val).map(NativeOutcome::Return);
         }
     }
@@ -967,34 +1084,57 @@ fn dispatch_body(
     Ok(NativeOutcome::Return(Value::map(result)))
 }
 
+struct RouteHandlerContinuation;
+
+impl sema_core::runtime::Trace for RouteHandlerContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for RouteHandlerContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+
+        match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "http/router handler was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "http/router handler received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
 /// Build the `http/router/dispatch` closure for a fully-resolved route table
 /// (every `:static` directory already canonicalized). Dual-ABI: the runtime
 /// callback lets a `:static` file's `canonicalize()` suspend structurally on an
-/// External wait; the synchronous value callback canonicalizes inline. Both
-/// invoke a matched non-static handler through `call_callback` — the value ABI
-/// with its passed `EvalContext`, the runtime ABI with the installed stdlib
-/// context.
+/// External wait; the synchronous value callback canonicalizes inline. A matched
+/// runtime handler is returned as a structural `NativeOutcome::Call`; the host
+/// value ABI uses its explicit `EvalContext` callback.
 fn build_router_dispatch_fn(routes: std::rc::Rc<Vec<(String, String, Value)>>) -> Value {
-    use sema_core::{call_callback, with_stdlib_ctx, EvalContext, NativeFn};
+    use sema_core::{call_callback, EvalContext, NativeFn};
 
     let routes_value = std::rc::Rc::clone(&routes);
     Value::native_fn(NativeFn::with_ctx_runtime(
         "http/router/dispatch",
         move |ctx: &EvalContext, args: &[Value]| {
             let invoke = |handler: &Value, req: Value| call_callback(ctx, handler, &[req]);
-            match dispatch_body(&routes, args, &invoke, false)? {
+            match dispatch_body(&routes, args, Some(&invoke), false)? {
                 NativeOutcome::Return(value) => Ok(value),
                 _ => Err(SemaError::eval(
                     "http/router/dispatch: native suspended outside the cooperative runtime",
                 )),
             }
         },
-        move |_ctx, args| {
-            let invoke = |handler: &Value, req: Value| {
-                with_stdlib_ctx(|c| call_callback(c, handler, &[req]))
-            };
-            dispatch_body(&routes_value, args, &invoke, true)
-        },
+        move |_ctx, args| dispatch_body(&routes_value, args, None, true),
     ))
 }
 
@@ -2020,11 +2160,8 @@ struct ServeSetup {
     factory: Value,
     receivers: ServeReceivers,
     host: ServerHostGuard,
+    on_listen: Option<(Value, Value)>,
 }
-
-/// Calls a Sema function value with args, used only for `http_serve_setup`'s
-/// `:on-listen` invocation — see its doc comment for the sync/runtime split.
-type ServeInvoke<'a> = &'a dyn Fn(&Value, &[Value]) -> Result<Value, SemaError>;
 
 /// Parse options, bind + spawn the axum server, and wait for it to come up.
 ///
@@ -2035,13 +2172,10 @@ type ServeInvoke<'a> = &'a dyn Fn(&Value, &[Value]) -> Result<Value, SemaError>;
 /// persistent — see that doc comment for the leak a cached version of this
 /// had), and `args[2]` is the optional options map.
 ///
-/// `invoke` calls a Sema function value with args — used only for the
-/// `:on-listen` callback. The sync caller passes its own `EvalContext`
-/// directly; the runtime caller (no `EvalContext` of its own — the runtime
-/// ABI only threads `NativeCallContext`) routes through the shared
-/// `STDLIB_CTX` via `with_stdlib_ctx`, the same seam `http/router/dispatch`'s
-/// runtime path uses for its handler calls.
-fn http_serve_setup(args: &[Value], invoke: ServeInvoke<'_>) -> Result<ServeSetup, SemaError> {
+/// The returned setup retains an optional `:on-listen` callback and its info
+/// argument. The value ABI invokes it directly; the runtime ABI yields a
+/// structural `NativeOutcome::Call` before entering the accept loop.
+fn http_serve_setup(args: &[Value]) -> Result<ServeSetup, SemaError> {
     // `http/serve`'s sync dispatch path below runs its own blocking accept
     // loop on THIS thread (`rx.blocking_recv()`) for the life of the server —
     // by design at top level, where it's the only thing this thread will ever
@@ -2188,7 +2322,7 @@ fn http_serve_setup(args: &[Value], invoke: ServeInvoke<'_>) -> Result<ServeSetu
     // Hand the caller the address actually bound (host/port may differ from the
     // request when :port-fallback picked the next free port) so it can print a
     // URL or open a browser.
-    if let Some(cb) = &on_listen {
+    let on_listen = on_listen.map(|callback| {
         let mut info = BTreeMap::new();
         info.insert(Value::keyword("host"), Value::string(&host));
         info.insert(Value::keyword("port"), Value::int(actual_port as i64));
@@ -2196,10 +2330,8 @@ fn http_serve_setup(args: &[Value], invoke: ServeInvoke<'_>) -> Result<ServeSetu
             Value::keyword("url"),
             Value::string(&format!("http://{host}:{actual_port}")),
         );
-        if let Err(e) = invoke(cb, &[Value::map(info)]) {
-            eprintln!("http/serve on-listen handler error: {e}");
-        }
-    }
+        (callback, Value::map(info))
+    });
 
     Ok(ServeSetup {
         handler,
@@ -2209,6 +2341,7 @@ fn http_serve_setup(args: &[Value], invoke: ServeInvoke<'_>) -> Result<ServeSetu
             lifecycle: lifecycle_rx,
         },
         host: host_guard,
+        on_listen,
     })
 }
 
@@ -2227,8 +2360,14 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
         factory: _,
         receivers,
         host,
-    } = http_serve_setup(args, &|f, a| call_callback(ctx, f, a))?;
+        on_listen,
+    } = http_serve_setup(args)?;
     let _host = host;
+    if let Some((callback, info)) = on_listen {
+        if let Err(error) = call_callback(ctx, &callback, &[info]) {
+            eprintln!("http/serve on-listen handler error: {error}");
+        }
+    }
     let ServeReceivers {
         requests: mut rx,
         lifecycle: lifecycle_rx,
@@ -2735,15 +2874,14 @@ impl sema_core::runtime::NativeContinuation for AfterDispatchContinuation {
 /// `async/spawn` uses), so a slow/parked handler does not stall its
 /// siblings. This is what `http/serve` runs in the shipped product
 /// (every eval entry point drives the unified runtime).
-fn http_serve_runtime_impl(args: &[Value]) -> sema_core::runtime::NativeResult {
+fn start_runtime_serve(setup: ServeSetup) -> sema_core::runtime::NativeResult {
     let ServeSetup {
         handler,
         factory,
         receivers,
         host,
-    } = http_serve_setup(args, &|f, a| {
-        sema_core::with_stdlib_ctx(|c| sema_core::call_callback(c, f, a))
-    })?;
+        on_listen: _,
+    } = setup;
     let state = std::rc::Rc::new(ServeLoopState {
         receivers: std::cell::RefCell::new(Some(receivers)),
         event: std::cell::RefCell::new(None),
@@ -2751,6 +2889,54 @@ fn http_serve_runtime_impl(args: &[Value]) -> sema_core::runtime::NativeResult {
         _host: host,
     });
     next_accept_wait(handler, factory, state)
+}
+
+struct OnListenContinuation {
+    setup: ServeSetup,
+}
+
+impl sema_core::runtime::Trace for OnListenContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        sink(sema_core::cycle::GcEdge::Value(&self.setup.handler));
+        sink(sema_core::cycle::GcEdge::Value(&self.setup.factory));
+        true
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for OnListenContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+
+        match input {
+            ResumeInput::Returned(_) => start_runtime_serve(self.setup),
+            ResumeInput::Failed(error) => {
+                eprintln!("http/serve on-listen handler error: {error}");
+                start_runtime_serve(self.setup)
+            }
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "http/serve on-listen handler was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "http/serve on-listen handler received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+fn http_serve_runtime_impl(args: &[Value]) -> sema_core::runtime::NativeResult {
+    let mut setup = http_serve_setup(args)?;
+    let Some((callback, info)) = setup.on_listen.take() else {
+        return start_runtime_serve(setup);
+    };
+    Ok(NativeOutcome::Call(sema_core::runtime::NativeCall {
+        callable: callback,
+        args: vec![info],
+        continuation: Box::new(OnListenContinuation { setup }),
+    }))
 }
 
 #[cfg(test)]
@@ -2764,6 +2950,21 @@ mod tests {
             owners: std::cell::RefCell::new(HashMap::new()),
             _host: ServerHostGuard { abort: None },
         })
+    }
+
+    fn empty_serve_setup(handler: Value, factory: Value) -> ServeSetup {
+        let (_request_tx, requests) = tokio::sync::mpsc::channel(1);
+        let (_lifecycle_tx, lifecycle) = tokio::sync::mpsc::unbounded_channel();
+        ServeSetup {
+            handler,
+            factory,
+            receivers: ServeReceivers {
+                requests,
+                lifecycle,
+            },
+            host: ServerHostGuard { abort: None },
+            on_listen: None,
+        }
     }
 
     #[test]
@@ -2943,6 +3144,57 @@ mod tests {
             edges, 2,
             "RouterDecoder must trace exactly one edge per route handler"
         );
+    }
+
+    #[test]
+    fn route_handler_continuation_traces_no_edges() {
+        use sema_core::runtime::Trace;
+        let mut edges = 0;
+        assert!(RouteHandlerContinuation.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 0);
+    }
+
+    #[test]
+    fn tool_route_continuation_traces_no_edges() {
+        use sema_core::runtime::Trace;
+        let mut edges = 0;
+        assert!(ToolRouteContinuation.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 0);
+    }
+
+    #[test]
+    fn tool_route_payload_traces_and_severs_its_handler() {
+        let payload = std::rc::Rc::new(ToolRouteHandlerPayload {
+            handler: std::cell::RefCell::new(Value::string("handler")),
+        });
+        let ptr = sema_core::NodePtr::of_rc(&payload);
+        let mut edges = 0;
+        assert!(trace_tool_route_payload(ptr, &mut |edge| {
+            if matches!(edge, sema_core::cycle::GcEdge::Value(_)) {
+                edges += 1;
+            }
+        }));
+        assert_eq!(edges, 1);
+        assert_eq!(
+            sever_tool_route_payload(ptr),
+            Some(Value::string("handler"))
+        );
+        assert!(payload.handler.borrow().is_nil());
+    }
+
+    #[test]
+    fn on_listen_continuation_traces_exactly_handler_and_factory() {
+        use sema_core::runtime::Trace;
+        let continuation = OnListenContinuation {
+            setup: empty_serve_setup(Value::string("handler"), Value::string("factory")),
+        };
+        let mut edges = 0;
+        assert!(continuation.trace(&mut |edge| {
+            if matches!(edge, sema_core::cycle::GcEdge::Value(_)) {
+                edges += 1;
+            }
+        }));
+        assert_eq!(edges, 2);
     }
 
     // SRV-1 / invariant I2 (CORE-2 GC): `AcceptLoopContinuation` holds the

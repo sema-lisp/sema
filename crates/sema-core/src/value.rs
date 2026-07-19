@@ -320,6 +320,44 @@ impl NativeFn {
         }
     }
 
+    /// Constructs a dual-ABI native with typed, collector-traceable state.
+    ///
+    /// The payload type must have a tracer registered with
+    /// [`crate::register_payload_tracer`] when it can reach a [`Value`] or
+    /// [`crate::Env`]. The payload field owns the sole strong callback-state
+    /// edge; both callbacks capture only a `Weak<T>` and their function
+    /// pointers, then temporarily upgrade the weak handle for each invocation.
+    pub fn with_payload_ctx_runtime<T: Any + 'static>(
+        name: impl Into<String>,
+        payload: Rc<T>,
+        func: fn(&T, &EvalContext, &[Value]) -> Result<Value, SemaError>,
+        runtime: for<'a> fn(&T, &mut NativeCallContext<'a>, &[Value]) -> NativeResult,
+    ) -> Self {
+        let legacy_payload = Rc::downgrade(&payload);
+        let runtime_payload = Rc::downgrade(&payload);
+        let payload: Rc<dyn Any> = payload;
+        Self {
+            name: name.into(),
+            func: Box::new(move |context, args| {
+                let payload = legacy_payload.upgrade().ok_or_else(|| {
+                    SemaError::eval("internal error: native payload is unavailable")
+                })?;
+                func(&payload, context, args)
+            }),
+            payload: Some(payload),
+            param_names: None,
+            is_closure: false,
+            runtime_func: Some(Box::new(move |context, args| {
+                let payload = runtime_payload.upgrade().ok_or_else(|| {
+                    SemaError::eval("internal error: runtime native payload is unavailable")
+                })?;
+                runtime(&payload, context, args)
+            })),
+            runtime_only: false,
+            escaping_args: &[],
+        }
+    }
+
     /// Constructs a native carrying both the synchronous value ABI and the
     /// runtime ABI. The runtime callback runs with an installed
     /// [`TaskContext`](crate::runtime::TaskContext); `func` handles callers that

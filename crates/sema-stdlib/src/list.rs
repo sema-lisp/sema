@@ -98,9 +98,8 @@ fn map_call(callback: &Value, items: &[Value]) -> NativeOutcome {
     })
 }
 
-/// Multi-list `map`: iterate the lists in lockstep (shortest wins), calling the
-/// callback synchronously on each column. There is no cooperative continuation
-/// for the multi-list shape, so a yielding callback here can't suspend.
+/// Synchronous value-ABI implementation for multi-list `map`: iterate the lists
+/// in lockstep (shortest wins), calling the callback on each column.
 fn map_multi(args: &[Value]) -> Result<Value, SemaError> {
     let lists: Vec<Cow<[Value]>> = args[1..]
         .iter()
@@ -372,58 +371,369 @@ fn sort_by_call(key_fn: &Value, items: &[Value]) -> NativeOutcome {
     })
 }
 
-/// Cooperative multi-list `map`: iterate N lists in lockstep (shortest wins),
-/// driving the callback on each zipped column as a fresh runtime `Call` so an
-/// async op inside it parks/resumes — the multi-arg counterpart to
-/// `MapContinuation`. The columns are snapshotted up front (so a callback that
-/// mutates an input array can't perturb iteration), and results preserve input
-/// order, matching the legacy synchronous `map_multi`.
-struct MapMultiContinuation {
-    callback: Value,
-    remaining: VecDeque<Vec<Value>>,
-    results: Vec<Value>,
+#[derive(Clone, Copy)]
+pub(crate) enum CollectMode {
+    Values,
+    FlattenedValues,
+    String,
+    F64Array,
+    I64Array,
 }
 
-impl Trace for MapMultiContinuation {
-    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
-        sink(GcEdge::Value(&self.callback));
-        for column in &self.remaining {
-            for item in column {
-                sink(GcEdge::Value(item));
+enum CollectResults {
+    Values(Vec<Value>),
+    FlattenedValues(Vec<Value>),
+    String(String),
+    F64Array(Vec<f64>),
+    I64Array(Vec<i64>),
+}
+
+impl CollectResults {
+    fn new(mode: CollectMode, capacity: usize) -> Self {
+        match mode {
+            CollectMode::Values => Self::Values(Vec::with_capacity(capacity)),
+            CollectMode::FlattenedValues => Self::FlattenedValues(Vec::with_capacity(capacity)),
+            CollectMode::String => Self::String(String::with_capacity(capacity)),
+            CollectMode::F64Array => Self::F64Array(Vec::with_capacity(capacity)),
+            CollectMode::I64Array => Self::I64Array(Vec::with_capacity(capacity)),
+        }
+    }
+
+    fn push(&mut self, value: Value) -> Result<(), SemaError> {
+        match self {
+            Self::Values(results) => results.push(value),
+            Self::FlattenedValues(results) => {
+                if let Some(list) = value.as_list() {
+                    results.extend(list.iter().cloned());
+                } else if let Some(vector) = value.as_vector() {
+                    results.extend(vector.iter().cloned());
+                } else {
+                    results.push(value);
+                }
+            }
+            Self::String(result) => {
+                if let Some(character) = value.as_char() {
+                    result.push(character);
+                } else if let Some(string) = value.as_str() {
+                    result.push_str(string);
+                } else {
+                    return Err(SemaError::type_error("char or string", value.type_name()));
+                }
+            }
+            Self::F64Array(results) => {
+                let number = value
+                    .as_float()
+                    .or_else(|| value.as_int().map(|integer| integer as f64))
+                    .ok_or_else(|| {
+                        SemaError::type_error(
+                            "number (f64-array/map callback must return number)",
+                            value.type_name(),
+                        )
+                    })?;
+                results.push(number);
+            }
+            Self::I64Array(results) => {
+                let integer = value.as_int().ok_or_else(|| {
+                    SemaError::type_error(
+                        "integer (i64-array/map callback must return integer)",
+                        value.type_name(),
+                    )
+                })?;
+                results.push(integer);
             }
         }
-        for result in &self.results {
-            sink(GcEdge::Value(result));
+        Ok(())
+    }
+
+    fn finish(self) -> Value {
+        match self {
+            Self::Values(results) | Self::FlattenedValues(results) => Value::list(results),
+            Self::String(result) => Value::string_owned(result),
+            Self::F64Array(results) => Value::f64_array(results),
+            Self::I64Array(results) => Value::i64_array(results),
         }
+    }
+
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) {
+        match self {
+            Self::Values(results) | Self::FlattenedValues(results) => {
+                for result in results {
+                    sink(GcEdge::Value(result));
+                }
+            }
+            Self::String(_) | Self::F64Array(_) | Self::I64Array(_) => {}
+        }
+    }
+}
+
+/// Cooperative ordered callback collector. Its compact source state constructs
+/// one argument vector at a time; the output mode validates and accumulates the
+/// result before the next structural runtime call is issued.
+struct CollectContinuation {
+    hof: &'static str,
+    callback: Value,
+    remaining: CollectCalls,
+    results: CollectResults,
+}
+
+enum CollectCalls {
+    Unary(VecDeque<Value>),
+    Indexed { items: Vec<Value>, next: usize },
+    Range { next: usize, end: usize },
+    String { source: Value, byte_index: usize },
+    F64Array { source: Value, next: usize },
+    I64Array { source: Value, next: usize },
+    Variadic(VecDeque<Vec<Value>>),
+}
+
+impl CollectCalls {
+    fn output_capacity_hint(&self) -> usize {
+        match self {
+            Self::Unary(calls) => calls.len(),
+            Self::Indexed { items, next } => items.len().saturating_sub(*next),
+            Self::Range { next, end } => end.saturating_sub(*next),
+            Self::String { source, byte_index } => source
+                .as_str()
+                .expect("string collector retains a string")
+                .len()
+                .saturating_sub(*byte_index),
+            Self::F64Array { source, next } => source
+                .as_f64_array()
+                .expect("f64 collector retains an f64-array")
+                .len()
+                .saturating_sub(*next),
+            Self::I64Array { source, next } => source
+                .as_i64_array()
+                .expect("i64 collector retains an i64-array")
+                .len()
+                .saturating_sub(*next),
+            Self::Variadic(calls) => calls.len(),
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<Vec<Value>> {
+        match self {
+            Self::Unary(calls) => calls.pop_front().map(|value| vec![value]),
+            Self::Indexed { items, next } => {
+                let item = items.get(*next)?.clone();
+                let index = *next;
+                *next += 1;
+                Some(vec![Value::int(index as i64), item])
+            }
+            Self::Range { next, end } => {
+                if *next == *end {
+                    return None;
+                }
+                let index = *next;
+                *next += 1;
+                Some(vec![Value::int(index as i64)])
+            }
+            Self::String { source, byte_index } => {
+                let string = source.as_str().expect("string collector retains a string");
+                let character = string.get(*byte_index..)?.chars().next()?;
+                *byte_index += character.len_utf8();
+                Some(vec![Value::char(character)])
+            }
+            Self::F64Array { source, next } => {
+                let array = source
+                    .as_f64_array()
+                    .expect("f64 collector retains an f64-array");
+                let number = *array.get(*next)?;
+                *next += 1;
+                Some(vec![Value::float(number)])
+            }
+            Self::I64Array { source, next } => {
+                let array = source
+                    .as_i64_array()
+                    .expect("i64 collector retains an i64-array");
+                let integer = *array.get(*next)?;
+                *next += 1;
+                Some(vec![Value::int(integer)])
+            }
+            Self::Variadic(calls) => calls.pop_front(),
+        }
+    }
+
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) {
+        match self {
+            Self::Unary(calls) => {
+                for value in calls {
+                    sink(GcEdge::Value(value));
+                }
+            }
+            Self::Indexed { items, .. } => {
+                for item in items {
+                    sink(GcEdge::Value(item));
+                }
+            }
+            Self::Range { .. } => {}
+            Self::String { source, .. }
+            | Self::F64Array { source, .. }
+            | Self::I64Array { source, .. } => sink(GcEdge::Value(source)),
+            Self::Variadic(calls) => {
+                for args in calls {
+                    for argument in args {
+                        sink(GcEdge::Value(argument));
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Trace for CollectContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.callback));
+        self.remaining.trace(sink);
+        self.results.trace(sink);
         true
     }
 }
 
-impl NativeContinuation for MapMultiContinuation {
+impl NativeContinuation for CollectContinuation {
     fn resume(
         mut self: Box<Self>,
         _context: &mut NativeCallContext<'_>,
         input: ResumeInput,
     ) -> NativeResult {
-        let value = resume_value(input, "map")?;
-        self.results.push(value);
+        let value = resume_value(input, self.hof)?;
+        self.results.push(value)?;
         match self.remaining.pop_front() {
             Some(next) => Ok(NativeOutcome::Call(NativeCall {
                 callable: self.callback.clone(),
                 args: next,
                 continuation: self,
             })),
-            None => Ok(NativeOutcome::Return(Value::list(std::mem::take(
-                &mut self.results,
-            )))),
+            None => {
+                let CollectContinuation { results, .. } = *self;
+                Ok(NativeOutcome::Return(results.finish()))
+            }
         }
     }
 }
 
+fn start_collect(
+    callback: &Value,
+    mut calls: CollectCalls,
+    mode: CollectMode,
+    hof: &'static str,
+) -> NativeOutcome {
+    let capacity = calls.output_capacity_hint();
+    let Some(first) = calls.pop_front() else {
+        return NativeOutcome::Return(CollectResults::new(mode, 0).finish());
+    };
+    NativeOutcome::Call(NativeCall {
+        callable: callback.clone(),
+        args: first,
+        continuation: Box::new(CollectContinuation {
+            hof,
+            callback: callback.clone(),
+            remaining: calls,
+            results: CollectResults::new(mode, capacity),
+        }),
+    })
+}
+
+fn collect_call(
+    callback: &Value,
+    calls: impl IntoIterator<Item = Vec<Value>>,
+    mode: CollectMode,
+    hof: &'static str,
+) -> NativeOutcome {
+    start_collect(
+        callback,
+        CollectCalls::Variadic(calls.into_iter().collect()),
+        mode,
+        hof,
+    )
+}
+
+pub(crate) fn collect_unary_call(
+    callback: &Value,
+    calls: impl IntoIterator<Item = Value>,
+    mode: CollectMode,
+    hof: &'static str,
+) -> NativeOutcome {
+    start_collect(
+        callback,
+        CollectCalls::Unary(calls.into_iter().collect()),
+        mode,
+        hof,
+    )
+}
+
+fn collect_indexed_call(
+    callback: &Value,
+    items: Vec<Value>,
+    mode: CollectMode,
+    hof: &'static str,
+) -> NativeOutcome {
+    start_collect(
+        callback,
+        CollectCalls::Indexed { items, next: 0 },
+        mode,
+        hof,
+    )
+}
+
+fn collect_range_call(
+    callback: &Value,
+    end: usize,
+    mode: CollectMode,
+    hof: &'static str,
+) -> NativeOutcome {
+    start_collect(callback, CollectCalls::Range { next: 0, end }, mode, hof)
+}
+
+pub(crate) fn collect_string_call(
+    callback: &Value,
+    source: Value,
+    mode: CollectMode,
+    hof: &'static str,
+) -> NativeOutcome {
+    start_collect(
+        callback,
+        CollectCalls::String {
+            source,
+            byte_index: 0,
+        },
+        mode,
+        hof,
+    )
+}
+
+pub(crate) fn collect_f64_array_call(
+    callback: &Value,
+    source: Value,
+    mode: CollectMode,
+    hof: &'static str,
+) -> NativeOutcome {
+    start_collect(
+        callback,
+        CollectCalls::F64Array { source, next: 0 },
+        mode,
+        hof,
+    )
+}
+
+pub(crate) fn collect_i64_array_call(
+    callback: &Value,
+    source: Value,
+    mode: CollectMode,
+    hof: &'static str,
+) -> NativeOutcome {
+    start_collect(
+        callback,
+        CollectCalls::I64Array { source, next: 0 },
+        mode,
+        hof,
+    )
+}
+
 /// Initial cooperative `NativeOutcome::Call` for a multi-list `map`. Zips the
 /// argument lists into per-column arg tuples (shortest list truncates), then
-/// drives the first column's callback with `MapMultiContinuation` handling the
-/// rest. Empty (any list empty) returns the empty list directly.
+/// drives the columns through the shared collector. Empty (any list empty)
+/// returns the empty list directly.
 fn map_multi_call(args: &[Value]) -> NativeResult {
     let lists: Vec<Cow<[Value]>> = args[1..]
         .iter()
@@ -434,19 +744,7 @@ fn map_multi_call(args: &[Value]) -> NativeResult {
     for i in 0..min_len {
         columns.push_back(lists.iter().map(|l| l[i].clone()).collect());
     }
-    let Some(first) = columns.pop_front() else {
-        return Ok(NativeOutcome::Return(Value::list(Vec::new())));
-    };
-    let continuation = Box::new(MapMultiContinuation {
-        callback: args[0].clone(),
-        remaining: columns,
-        results: Vec::with_capacity(min_len),
-    });
-    Ok(NativeOutcome::Call(NativeCall {
-        callable: args[0].clone(),
-        args: first,
-        continuation,
-    }))
+    Ok(collect_call(&args[0], columns, CollectMode::Values, "map"))
 }
 
 /// Cooperative identity continuation: forwards the callback's result straight
@@ -589,7 +887,7 @@ fn repeat_impl(args: &[Value]) -> Result<Value, SemaError> {
 /// (an async op inside it parks/resumes). Everywhere else (a bare top-level eval
 /// or nested/sync re-entry) the VM runs `legacy`, the synchronous per-element
 /// path.
-fn register_hof(
+pub(crate) fn register_hof(
     env: &sema_core::Env,
     name: &'static str,
     legacy: impl Fn(&[Value]) -> Result<Value, SemaError> + 'static,
@@ -762,18 +1060,32 @@ pub fn register(env: &sema_core::Env) {
         },
     );
 
-    register_fn(env, "map-indexed", |args| {
-        check_arity!(args, "map-indexed", 2);
-        let items = get_sequence(&args[1], "map-indexed")?;
-        let mut result = Vec::with_capacity(items.len());
-        for (i, item) in items.iter().enumerate() {
-            result.push(call_function(
+    register_hof(
+        env,
+        "map-indexed",
+        |args| {
+            check_arity!(args, "map-indexed", 2);
+            let items = get_sequence(&args[1], "map-indexed")?;
+            let mut result = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                result.push(call_function(
+                    &args[0],
+                    &[Value::int(i as i64), item.clone()],
+                )?);
+            }
+            Ok(Value::list(result))
+        },
+        |args| {
+            check_arity!(args, "map-indexed", 2);
+            let items = get_sequence(&args[1], "map-indexed")?;
+            Ok(collect_indexed_call(
                 &args[0],
-                &[Value::int(i as i64), item.clone()],
-            )?);
-        }
-        Ok(Value::list(result))
-    });
+                items.to_vec(),
+                CollectMode::Values,
+                "map-indexed",
+            ))
+        },
+    );
 
     register_fn(env, "enumerate", |args| {
         check_arity!(args, "enumerate", 1);
@@ -1444,22 +1756,36 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::list(result))
     });
 
-    register_fn(env, "flat-map", |args| {
-        check_arity!(args, "flat-map", 2);
-        let items = get_sequence(&args[1], "flat-map")?;
-        let mut result = Vec::new();
-        for item in items.iter() {
-            let mapped = call_function(&args[0], &[item.clone()])?;
-            if let Some(l) = mapped.as_list() {
-                result.extend(l.iter().cloned());
-            } else if let Some(v) = mapped.as_vector() {
-                result.extend(v.iter().cloned());
-            } else {
-                result.push(mapped);
+    register_hof(
+        env,
+        "flat-map",
+        |args| {
+            check_arity!(args, "flat-map", 2);
+            let items = get_sequence(&args[1], "flat-map")?;
+            let mut result = Vec::new();
+            for item in items.iter() {
+                let mapped = call_function(&args[0], &[item.clone()])?;
+                if let Some(l) = mapped.as_list() {
+                    result.extend(l.iter().cloned());
+                } else if let Some(v) = mapped.as_vector() {
+                    result.extend(v.iter().cloned());
+                } else {
+                    result.push(mapped);
+                }
             }
-        }
-        Ok(Value::list(result))
-    });
+            Ok(Value::list(result))
+        },
+        |args| {
+            check_arity!(args, "flat-map", 2);
+            let items = get_sequence(&args[1], "flat-map")?;
+            Ok(collect_unary_call(
+                &args[0],
+                items.iter().cloned(),
+                CollectMode::FlattenedValues,
+                "flat-map",
+            ))
+        },
+    );
 
     register_fn(env, "list/shuffle", |args| {
         check_arity!(args, "list/shuffle", 1);
@@ -1788,15 +2114,29 @@ pub fn register(env: &sema_core::Env) {
     });
 
     // list/times — generate list by calling fn N times
-    register_fn(env, "list/times", |args| {
-        check_arity!(args, "list/times", 2);
-        let n = args[0].as_index("list/times")?;
-        let mut result = Vec::with_capacity(n);
-        for i in 0..n {
-            result.push(call_function(&args[1], &[Value::int(i as i64)])?);
-        }
-        Ok(Value::list(result))
-    });
+    register_hof(
+        env,
+        "list/times",
+        |args| {
+            check_arity!(args, "list/times", 2);
+            let n = args[0].as_index("list/times")?;
+            let mut result = Vec::with_capacity(n);
+            for i in 0..n {
+                result.push(call_function(&args[1], &[Value::int(i as i64)])?);
+            }
+            Ok(Value::list(result))
+        },
+        |args| {
+            check_arity!(args, "list/times", 2);
+            let n = args[0].as_index("list/times")?;
+            Ok(collect_range_call(
+                &args[1],
+                n,
+                CollectMode::Values,
+                "list/times",
+            ))
+        },
+    );
 
     // list/duplicates — find duplicate values
     register_fn(env, "list/duplicates", |args| {
@@ -2158,22 +2498,55 @@ mod continuation_trace_tests {
         count
     }
 
-    /// The cooperative callback continuations added for multi-list `map`,
-    /// `apply`, and `call-with-values` carry `Value` state across the callback
-    /// boundary, so their GC trace must emit exactly one edge per retained
-    /// `Value` — otherwise a live value could be collected mid-suspension.
+    /// Cooperative callback continuations carry `Value` state across callback
+    /// boundaries, so their GC trace must emit exactly one edge per retained
+    /// value.
     #[test]
-    fn map_multi_continuation_emits_one_edge_per_value() {
-        let cont = MapMultiContinuation {
+    fn collect_continuation_emits_one_edge_per_value() {
+        let cont = CollectContinuation {
+            hof: "map",
             callback: Value::string("f"),
-            remaining: VecDeque::from(vec![
+            remaining: CollectCalls::Variadic(VecDeque::from(vec![
                 vec![Value::int(1), Value::int(2)],
                 vec![Value::int(3), Value::int(4)],
-            ]),
-            results: vec![Value::int(5)],
+            ])),
+            results: CollectResults::Values(vec![Value::int(5)]),
         };
         // callback (1) + 4 remaining column items + 1 result = 6.
         assert_eq!(edge_count(&cont), 6);
+    }
+
+    #[test]
+    fn compact_collect_sources_trace_only_their_retained_values() {
+        let indexed = CollectContinuation {
+            hof: "map-indexed",
+            callback: Value::string("f"),
+            remaining: CollectCalls::Indexed {
+                items: vec![Value::int(1), Value::int(2)],
+                next: 0,
+            },
+            results: CollectResults::Values(Vec::new()),
+        };
+        assert_eq!(edge_count(&indexed), 3);
+
+        let string = CollectContinuation {
+            hof: "string/map",
+            callback: Value::string("f"),
+            remaining: CollectCalls::String {
+                source: Value::string("abc"),
+                byte_index: 0,
+            },
+            results: CollectResults::String(String::new()),
+        };
+        assert_eq!(edge_count(&string), 2);
+
+        let range = CollectContinuation {
+            hof: "list/times",
+            callback: Value::string("f"),
+            remaining: CollectCalls::Range { next: 0, end: 3 },
+            results: CollectResults::Values(Vec::new()),
+        };
+        assert_eq!(edge_count(&range), 1);
     }
 
     #[test]

@@ -8,6 +8,7 @@ use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::list::{collect_string_call, register_hof, CollectMode};
 use crate::register_fn;
 
 /// Terminal display width of `s`: ANSI escapes count as 0, wide chars as 2,
@@ -945,24 +946,40 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::string_owned(s))
     });
 
-    register_fn(env, "string/map", |args| {
-        check_arity!(args, "string/map", 2);
-        let s = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        let mut result = String::with_capacity(s.len());
-        for ch in s.chars() {
-            let mapped = crate::list::call_function(&args[0], &[Value::char(ch)])?;
-            if let Some(c) = mapped.as_char() {
-                result.push(c);
-            } else if let Some(s) = mapped.as_str() {
-                result.push_str(s);
-            } else {
-                return Err(SemaError::type_error("char or string", mapped.type_name()));
+    register_hof(
+        env,
+        "string/map",
+        |args| {
+            check_arity!(args, "string/map", 2);
+            let s = args[1]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+            let mut result = String::with_capacity(s.len());
+            for ch in s.chars() {
+                let mapped = crate::list::call_function(&args[0], &[Value::char(ch)])?;
+                if let Some(c) = mapped.as_char() {
+                    result.push(c);
+                } else if let Some(s) = mapped.as_str() {
+                    result.push_str(s);
+                } else {
+                    return Err(SemaError::type_error("char or string", mapped.type_name()));
+                }
             }
-        }
-        Ok(Value::string_owned(result))
-    });
+            Ok(Value::string_owned(result))
+        },
+        |args| {
+            check_arity!(args, "string/map", 2);
+            args[1]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+            Ok(collect_string_call(
+                &args[0],
+                args[1].clone(),
+                CollectMode::String,
+                "string/map",
+            ))
+        },
+    );
 
     register_fn(env, "string/byte-length", |args| {
         check_arity!(args, "string/byte-length", 1);

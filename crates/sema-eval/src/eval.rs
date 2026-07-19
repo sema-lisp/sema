@@ -3085,6 +3085,255 @@ mod runtime_eval_tests {
     }
 
     #[test]
+    fn runtime_context_with_suspends_and_child_inherits_only_inside_scope() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                r#"(begin
+                     (context/set :scoped :outer)
+                     (list
+                       (context/with {:scoped :inner}
+                         (fn ()
+                           (async/sleep 2)
+                           (let ((child (async (context/get :scoped))))
+                             (list (await child) (context/get :scoped)))))
+                       (context/get :scoped)
+                       (await (async (context/get :scoped)))))"#,
+            )
+            .expect("context/with cooperates across suspension and child spawn");
+        let expected = interp
+            .eval_str("'((:inner :inner) :outer :outer)")
+            .expect("evaluate scoped-context oracle");
+        assert_eq!(result, expected);
+        assert_eq!(
+            interp.ctx.context_get(&Value::keyword("scoped")),
+            Some(Value::keyword("outer"))
+        );
+    }
+
+    #[test]
+    fn runtime_context_with_does_not_leak_into_preexisting_sibling() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                r#"(let ((go (channel/new 1))
+                          (ready (channel/new 1)))
+                     (context/set :scoped :outer)
+                     (let ((sibling
+                             (async
+                               (channel/send ready :ready)
+                               (channel/recv go)
+                               (context/get :scoped))))
+                       (channel/recv ready)
+                       (list
+                         (context/with {:scoped :inner}
+                           (fn ()
+                             (channel/send go :go)
+                             (async/sleep 2)
+                             (list (context/get :scoped) (await sibling))))
+                         (context/get :scoped))))"#,
+            )
+            .expect("preexisting sibling remains outside context/with scope");
+        let expected = interp
+            .eval_str("'((:inner :outer) :outer)")
+            .expect("evaluate sibling-isolation oracle");
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn runtime_context_with_preserves_captured_cell_mutation_across_suspend() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                r#"(let ((captured 0))
+                     (context/with {:scoped :inner}
+                       (fn ()
+                         (async/sleep 2)
+                         (set! captured 41)
+                         :done))
+                     (+ captured 1))"#,
+            )
+            .expect("context/with closes the thunk's captured cells before parking");
+        assert_eq!(result, Value::int(42));
+    }
+
+    #[test]
+    fn runtime_context_with_accepts_scope_already_removed_by_context_clear() {
+        let interp = Interpreter::new();
+        interp
+            .ctx
+            .context_set(Value::keyword("outer"), Value::keyword("present"));
+
+        let result = interp
+            .eval_str_via_runtime(
+                r#"(context/with {:scoped :inner}
+                     (fn () (async/sleep 2) (context/clear) 42))"#,
+            )
+            .expect("context/clear makes context/with teardown idempotent");
+
+        assert_eq!(result, Value::int(42));
+        assert!(interp.ctx.context_all().is_empty());
+    }
+
+    #[test]
+    fn runtime_context_with_failure_removes_only_its_owned_frame() {
+        let interp = Interpreter::new();
+        interp
+            .ctx
+            .context_set(Value::keyword("scoped"), Value::keyword("outer"));
+
+        let error = interp
+            .eval_str_via_runtime(
+                r#"(context/with {:scoped :inner :inner-only :value}
+                     (fn () (async/sleep 2) (error "expected failure")))"#,
+            )
+            .expect_err("context/with body fails");
+
+        assert!(error.to_string().contains("expected failure"));
+        assert_eq!(
+            interp.ctx.context_get(&Value::keyword("scoped")),
+            Some(Value::keyword("outer"))
+        );
+        assert_eq!(interp.ctx.context_get(&Value::keyword("inner-only")), None);
+    }
+
+    #[test]
+    fn runtime_context_with_cancellation_does_not_publish_scoped_bindings() {
+        let interp = Interpreter::new();
+        interp
+            .ctx
+            .context_set(Value::keyword("scoped"), Value::keyword("outer"));
+        let root = interp
+            .submit_str(
+                r#"(context/with {:scoped :inner :inner-only :value}
+                     (fn () (channel/recv (channel/new 1))))"#,
+                RootOptions::default(),
+            )
+            .expect("submit cancellable context/with root");
+
+        interp
+            .drive_roots(&[root.id()])
+            .expect("drive context/with body to channel wait");
+        assert!(matches!(root.poll_result(), RootPoll::Pending));
+        assert!(root.cancel(CancelReason::Explicit));
+        let settlement = drive_selected_until_ready(&interp, &root);
+        assert!(matches!(
+            settlement.outcome,
+            TaskOutcome::Cancelled(CancelReason::Explicit)
+        ));
+        assert_eq!(
+            interp.ctx.context_get(&Value::keyword("scoped")),
+            Some(Value::keyword("outer"))
+        );
+        assert_eq!(interp.ctx.context_get(&Value::keyword("inner-only")), None);
+    }
+
+    #[test]
+    fn simultaneous_interpreters_isolate_colliding_context_with_scope_ids() {
+        let interp_a = Interpreter::new();
+        let interp_b = Interpreter::new();
+        interp_a
+            .eval_str_via_runtime(
+                "(context/set :scoped :outer-a) (define context-gate (channel/new 1))",
+            )
+            .expect("prepare interpreter A");
+        interp_b
+            .eval_str_via_runtime(
+                "(context/set :scoped :outer-b) (define context-gate (channel/new 1))",
+            )
+            .expect("prepare interpreter B");
+        let root_a = interp_a
+            .submit_str(
+                "(context/with {:scoped :inner-a} (fn () (channel/recv context-gate) (context/get :scoped)))",
+                RootOptions::default(),
+            )
+            .expect("submit interpreter A scope");
+        let root_b = interp_b
+            .submit_str(
+                "(context/with {:scoped :inner-b} (fn () (channel/recv context-gate) (context/get :scoped)))",
+                RootOptions::default(),
+            )
+            .expect("submit interpreter B scope");
+
+        interp_a
+            .drive_roots(&[root_a.id()])
+            .expect("park interpreter A scope");
+        interp_b
+            .drive_roots(&[root_b.id()])
+            .expect("park interpreter B scope");
+        assert!(matches!(root_a.poll_result(), RootPoll::Pending));
+        assert!(matches!(root_b.poll_result(), RootPoll::Pending));
+
+        assert!(root_a.cancel(CancelReason::Explicit));
+        let cancelled = drive_selected_until_ready(&interp_a, &root_a);
+        assert!(matches!(
+            cancelled.outcome,
+            TaskOutcome::Cancelled(CancelReason::Explicit)
+        ));
+        assert!(matches!(root_b.poll_result(), RootPoll::Pending));
+        interp_b
+            .eval_str_via_runtime("(channel/send context-gate :go)")
+            .expect("release interpreter B scope");
+        let settled_b = drive_selected_until_ready(&interp_b, &root_b);
+        assert!(matches!(
+            settled_b.outcome,
+            TaskOutcome::Returned(ref value) if *value == Value::keyword("inner-b")
+        ));
+        assert_eq!(
+            interp_a.ctx.context_get(&Value::keyword("scoped")),
+            Some(Value::keyword("outer-a"))
+        );
+        assert_eq!(
+            interp_b.ctx.context_get(&Value::keyword("scoped")),
+            Some(Value::keyword("outer-b"))
+        );
+    }
+
+    #[test]
+    fn runtime_root_publishes_sets_into_preexisting_ambient_frames() {
+        let interp = Interpreter::new();
+        interp.ctx.context_push_frame_with(BTreeMap::from([(
+            Value::keyword("user"),
+            Value::keyword("ambient-user"),
+        )]));
+        interp.ctx.hidden_push_frame();
+        interp
+            .ctx
+            .hidden_set(Value::keyword("hidden"), Value::keyword("ambient-hidden"));
+
+        interp
+            .eval_str_via_runtime(
+                "(context/set :user :root-user) (context/set-hidden :hidden :root-hidden)",
+            )
+            .expect("root settles into ambient frames");
+
+        assert_eq!(
+            interp.ctx.context_get(&Value::keyword("user")),
+            Some(Value::keyword("root-user"))
+        );
+        assert_eq!(
+            interp.ctx.hidden_get(&Value::keyword("hidden")),
+            Some(Value::keyword("root-hidden"))
+        );
+    }
+
+    #[test]
+    fn runtime_root_publishes_remove_from_preexisting_ambient_frame() {
+        let interp = Interpreter::new();
+        interp.ctx.context_push_frame_with(BTreeMap::from([(
+            Value::keyword("removed"),
+            Value::keyword("ambient"),
+        )]));
+
+        let result = interp
+            .eval_str_via_runtime("(context/remove :removed)")
+            .expect("root removes ambient binding");
+
+        assert_eq!(result, Value::keyword("ambient"));
+        assert_eq!(interp.ctx.context_get(&Value::keyword("removed")), None);
+    }
+
+    #[test]
     fn runtime_cancelled_root_publishes_only_at_settlement() {
         let interp = Interpreter::new();
         let user = Value::keyword("cancelled-user");

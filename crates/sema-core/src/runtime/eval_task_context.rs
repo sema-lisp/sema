@@ -401,7 +401,10 @@ impl DynamicTaskState {
 
     pub fn user_set(&self, key: Value, value: Value) {
         let mut inner = self.inner.borrow_mut();
-        let publishes = inner.user_frames.len() == 1;
+        let publishes = inner
+            .user_frames
+            .last()
+            .is_some_and(|frame| frame.id.is_none());
         if let Some(frame) = inner.user_frames.last_mut() {
             frame.value.insert(key.clone(), value.clone());
         }
@@ -414,8 +417,8 @@ impl DynamicTaskState {
         let mut inner = self.inner.borrow_mut();
         let publishes = inner
             .user_frames
-            .first()
-            .is_some_and(|frame| frame.value.contains_key(key));
+            .iter()
+            .any(|frame| frame.id.is_none() && frame.value.contains_key(key));
         let mut removed = None;
         for frame in inner.user_frames.iter_mut().rev() {
             if let Some(value) = frame.value.remove(key) {
@@ -471,7 +474,10 @@ impl DynamicTaskState {
 
     pub fn hidden_set(&self, key: Value, value: Value) {
         let mut inner = self.inner.borrow_mut();
-        let publishes = inner.hidden_frames.len() == 1;
+        let publishes = inner
+            .hidden_frames
+            .last()
+            .is_some_and(|frame| frame.id.is_none());
         if let Some(frame) = inner.hidden_frames.last_mut() {
             frame.value.insert(key.clone(), value.clone());
         }
@@ -1194,6 +1200,53 @@ mod tests {
                 (shadowed, Value::int(3)),
                 (inner_only, Value::int(4)),
             ])
+        );
+    }
+
+    #[test]
+    fn inherited_top_frames_record_user_and_hidden_sets_for_publication() {
+        let user_key = Value::keyword("user");
+        let hidden_key = Value::keyword("hidden");
+        let state = DynamicTaskState::root(
+            vec![
+                BTreeMap::from([(user_key.clone(), Value::int(1))]),
+                BTreeMap::new(),
+            ],
+            vec![
+                BTreeMap::from([(hidden_key.clone(), Value::int(2))]),
+                BTreeMap::new(),
+            ],
+            BTreeMap::new(),
+        );
+
+        state.user_set(user_key.clone(), Value::int(10));
+        state.hidden_set(hidden_key.clone(), Value::int(20));
+
+        assert_eq!(
+            state.drain_mutations(),
+            Some(vec![
+                DynamicMutation::UserSet(user_key, Value::int(10)),
+                DynamicMutation::HiddenSet(hidden_key, Value::int(20)),
+            ])
+        );
+    }
+
+    #[test]
+    fn removing_a_key_from_any_inherited_frame_records_publication() {
+        let key = Value::keyword("removed");
+        let state = DynamicTaskState::root(
+            vec![
+                BTreeMap::new(),
+                BTreeMap::from([(key.clone(), Value::int(1))]),
+            ],
+            vec![BTreeMap::new()],
+            BTreeMap::new(),
+        );
+
+        assert_eq!(state.user_remove(&key), Some(Value::int(1)));
+        assert_eq!(
+            state.drain_mutations(),
+            Some(vec![DynamicMutation::UserRemove(key)])
         );
     }
 

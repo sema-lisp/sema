@@ -945,6 +945,7 @@ impl Runtime {
             cancellation_parent: CancellationParent::Root(root),
             lifetime_owner: LifetimeOwner::Root(root),
         };
+        let context = state.snapshot_dynamic_root_context();
         state.roots.insert(root, RootRecord::new(root, task));
         state.tasks.insert(
             task,
@@ -955,7 +956,7 @@ impl Runtime {
                 suspended_owner: None,
                 vm_call: None,
                 vm_owner: None,
-                context: TaskContextHandle::default(),
+                context,
                 vm_resume: None,
                 scopes: TaskScopes::default(),
             },

@@ -3487,7 +3487,7 @@ impl Trace for ChannelDeferContinuation {
 impl NativeContinuation for ChannelDeferContinuation {
     fn resume(
         self: Box<Self>,
-        _context: &mut NativeCallContext<'_>,
+        context: &mut NativeCallContext<'_>,
         input: ResumeInput,
     ) -> NativeResult {
         assert!(
@@ -3499,6 +3499,15 @@ impl NativeContinuation for ChannelDeferContinuation {
             ),
             "channel handoff must resume the continuation with a Sent runtime response"
         );
+        let key = Value::keyword("inline-channel-context-seam");
+        assert_eq!(
+            context.eval_context.context_get(&key),
+            Some(Value::keyword("native")),
+            "inline channel continuation observes the installed task state"
+        );
+        context
+            .eval_context
+            .context_set(key, Value::keyword("continuation"));
         self.0.lock().unwrap().push("channel-composed");
         // Compose into a further suspend instead of returning/erroring — this
         // is exactly what makes `resume_this_inline`'s match fall into the
@@ -3513,7 +3522,11 @@ fn channel_defer_native(
     channel: sema_core::runtime::ChannelId,
     events: Arc<Mutex<Vec<&'static str>>>,
 ) -> sema_core::NativeFn {
-    sema_core::NativeFn::with_context_result("chan-send-defer", move |_context, _args| {
+    sema_core::NativeFn::with_context_result("chan-send-defer", move |context, _args| {
+        context.eval_context.context_set(
+            Value::keyword("inline-channel-context-seam"),
+            Value::keyword("native"),
+        );
         Ok(NativeOutcome::Suspend(NativeSuspend {
             wait: WaitKind::Channel(sema_core::runtime::ChannelWait::Send {
                 channel,
@@ -4758,6 +4771,15 @@ impl CompletionDecoder for ContextIdentityDecoder {
         context: &mut NativeCallContext<'_>,
         _result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
     ) -> Result<Value, SemaError> {
+        let key = Value::keyword("runtime-context-seam");
+        assert_eq!(
+            context.eval_context.context_get(&key),
+            Some(Value::keyword("native")),
+            "external decoder observes the task state while NativeCallContext owns its mutable loan"
+        );
+        context
+            .eval_context
+            .context_set(key, Value::keyword("decoder"));
         self.0.borrow_mut().push((
             "decode",
             context.eval_context as *const sema_core::EvalContext as usize,
@@ -4784,6 +4806,18 @@ impl NativeContinuation for ContextIdentityContinuation {
         input: ResumeInput,
     ) -> NativeResult {
         assert!(matches!(input, ResumeInput::Returned(_)));
+        let key = Value::keyword("runtime-context-seam");
+        let (expected, next) = match self.stage {
+            "external-resume" => ("decoder", "external-continuation"),
+            "outer-resume" => ("external-continuation", "outer-continuation"),
+            stage => panic!("unexpected context-identity continuation stage: {stage}"),
+        };
+        assert_eq!(
+            context.eval_context.context_get(&key),
+            Some(Value::keyword(expected)),
+            "continuation observes the task state while NativeCallContext owns its mutable loan"
+        );
+        context.eval_context.context_set(key, Value::keyword(next));
         self.seen.borrow_mut().push((
             self.stage,
             context.eval_context as *const sema_core::EvalContext as usize,
@@ -4839,6 +4873,11 @@ fn runtime_native_external_decoder_and_continuations_keep_owning_eval_context() 
         let native = Value::native_fn(sema_core::NativeFn::with_context_result(
             "context-identity",
             move |context, _| {
+                let key = Value::keyword("runtime-context-seam");
+                assert_eq!(context.eval_context.context_get(&key), None);
+                context
+                    .eval_context
+                    .context_set(key, Value::keyword("native"));
                 native_seen.borrow_mut().push((
                     "native",
                     context.eval_context as *const sema_core::EvalContext as usize,
@@ -4881,6 +4920,13 @@ fn runtime_native_external_decoder_and_continuations_keep_owning_eval_context() 
                 ("external-resume", expected),
                 ("outer-resume", expected),
             ]
+        );
+    }
+    for context in [&context_a, &context_b] {
+        assert_eq!(
+            context.context_get(&Value::keyword("runtime-context-seam")),
+            Some(Value::keyword("outer-continuation")),
+            "the root publishes the state touched by every external seam"
         );
     }
 }

@@ -1,9 +1,9 @@
 import { createServer } from 'node:http';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, realpath, stat } from 'node:fs/promises';
 import { dirname, extname, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const root = await realpath(resolve(dirname(fileURLToPath(import.meta.url)), '..'));
 const port = Number(process.argv[2] ?? 8787);
 
 if (!Number.isInteger(port) || port < 1 || port > 65535) {
@@ -29,7 +29,9 @@ async function resolveFile(pathname) {
   if (candidate !== root && !candidate.startsWith(`${root}${sep}`)) return null;
 
   const metadata = await stat(candidate);
-  return metadata.isDirectory() ? resolve(candidate, 'index.html') : candidate;
+  const file = metadata.isDirectory() ? resolve(candidate, 'index.html') : candidate;
+  const canonical = await realpath(file);
+  return canonical === root || canonical.startsWith(`${root}${sep}`) ? canonical : null;
 }
 
 const server = createServer(async (request, response) => {
@@ -54,8 +56,8 @@ const server = createServer(async (request, response) => {
   }
 });
 
-server.listen(port, () => {
-  console.log(`Playground server listening on http://localhost:${port}`);
+server.listen(port, '127.0.0.1', () => {
+  console.log(`Playground server listening on http://127.0.0.1:${port}`);
 });
 
 for (const signal of ['SIGINT', 'SIGTERM']) {

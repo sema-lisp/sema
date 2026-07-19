@@ -1,4 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use sema_core::runtime::NativeOutcome;
 use sema_core::{check_arity, value_to_json_lossy, SemaError, Value};
@@ -105,9 +107,88 @@ enum WsMsg {
 /// A server request sent from the axum handler thread to the main evaluator thread.
 enum ServerRequest {
     Http {
+        lifecycle: Arc<ServeRequestLifecycle>,
         raw: RawRequest,
         respond: tokio::sync::oneshot::Sender<ServerResponse>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ServeRequestId(u64);
+
+static NEXT_SERVE_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_serve_request_id() -> ServeRequestId {
+    ServeRequestId(NEXT_SERVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+struct ServeRequestLifecycle {
+    id: ServeRequestId,
+    lifecycle_tx: tokio::sync::mpsc::UnboundedSender<Arc<Self>>,
+    disconnected: AtomicBool,
+    finished: AtomicBool,
+}
+
+impl ServeRequestLifecycle {
+    fn new(
+        id: ServeRequestId,
+        lifecycle_tx: tokio::sync::mpsc::UnboundedSender<Arc<Self>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            lifecycle_tx,
+            disconnected: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+        })
+    }
+
+    fn mark_disconnected(self: &Arc<Self>) {
+        if !self.disconnected.swap(true, Ordering::AcqRel) {
+            let _ = self.lifecycle_tx.send(Arc::clone(self));
+        }
+    }
+
+    fn mark_finished(self: &Arc<Self>) {
+        if !self.finished.swap(true, Ordering::AcqRel) {
+            let _ = self.lifecycle_tx.send(Arc::clone(self));
+        }
+    }
+
+    fn is_disconnected(&self) -> bool {
+        self.disconnected.load(Ordering::Acquire)
+    }
+
+    fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+}
+
+struct RequestFutureLease(Option<Arc<ServeRequestLifecycle>>);
+
+impl RequestFutureLease {
+    fn new(lifecycle: Arc<ServeRequestLifecycle>) -> Self {
+        Self(Some(lifecycle))
+    }
+
+    fn disarm(&mut self) {
+        self.0.take();
+    }
+}
+
+impl Drop for RequestFutureLease {
+    fn drop(&mut self) {
+        if let Some(lifecycle) = self.0.take() {
+            lifecycle.mark_disconnected();
+        }
+    }
+}
+
+struct HandlerFinishedLease(Arc<ServeRequestLifecycle>);
+
+impl Drop for HandlerFinishedLease {
+    fn drop(&mut self) {
+        self.0.mark_finished();
+    }
 }
 
 /// Build a JSON response map: {:status N :headers {"content-type" "application/json"} :body json-string}
@@ -921,13 +1002,14 @@ fn build_router_dispatch_fn(routes: std::rc::Rc<Vec<(String, String, Value)>>) -
 /// Convert an HTTP method string (e.g. "GET") to a lowercase keyword Value (e.g. :get).
 /// Validate a user-supplied port number. A bare `as u16` silently wrapped
 /// out-of-range values (70000 -> 4464, -1 -> 65535), binding the wrong port
-/// while logging the original. Reject anything outside 1..=65535.
+/// while logging the original. Port 0 deliberately asks the OS for an
+/// ephemeral listener; reject anything outside 0..=65535.
 fn parse_port(p: i64) -> Result<u16, SemaError> {
-    if (1..=65535).contains(&p) {
+    if (0..=65535).contains(&p) {
         Ok(p as u16)
     } else {
         Err(SemaError::eval(format!(
-            "http/serve: port must be in 1..=65535, got {p}"
+            "http/serve: port must be in 0..=65535, got {p}"
         )))
     }
 }
@@ -1058,6 +1140,7 @@ async fn handle_axum_request(
     ws_upgrade: Option<axum::extract::ws::WebSocketUpgrade>,
     req: axum::extract::Request,
     tx: tokio::sync::mpsc::Sender<ServerRequest>,
+    lifecycle_tx: tokio::sync::mpsc::UnboundedSender<Arc<ServeRequestLifecycle>>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
 
@@ -1108,10 +1191,12 @@ async fn handle_axum_request(
 
     // Create oneshot channel for the response
     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+    let lifecycle = ServeRequestLifecycle::new(next_serve_request_id(), lifecycle_tx);
 
     // Send request to main thread
     if tx
         .send(ServerRequest::Http {
+            lifecycle: Arc::clone(&lifecycle),
             raw,
             respond: resp_tx,
         })
@@ -1125,8 +1210,18 @@ async fn handle_axum_request(
         });
     }
 
+    // The route future owns the runtime handler until a response shape is
+    // transferred. If Hyper cancels this future because its connection task is
+    // dropped, the lease publishes a per-request disconnect for the VM accept
+    // loop to cancel. Reading an HTTP/1 request followed by an orderly FIN does
+    // not necessarily cancel Hyper's in-flight service future; this lease pins
+    // the precise future-drop ownership boundary.
+    let mut request_lease = RequestFutureLease::new(lifecycle);
+
     // Wait for response from main thread
-    match resp_rx.await {
+    let response = resp_rx.await;
+    request_lease.disarm();
+    match response {
         Ok(ServerResponse::Raw(raw_resp)) => raw_response_to_axum(&raw_resp),
         Ok(ServerResponse::Sse(rx)) => {
             use axum::response::sse::{Event, Sse};
@@ -1821,7 +1916,30 @@ fn register_serve(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     }
 }
 
-/// `http/serve`'s handler/dispatch-factory + bound request channel, once
+struct ServerHostGuard {
+    abort: Option<sema_core::AbortHook>,
+}
+
+impl ServerHostGuard {
+    fn new(abort: sema_core::AbortHook) -> Self {
+        Self { abort: Some(abort) }
+    }
+}
+
+impl Drop for ServerHostGuard {
+    fn drop(&mut self) {
+        if let Some(abort) = self.abort.take() {
+            abort();
+        }
+    }
+}
+
+struct ServeReceivers {
+    requests: tokio::sync::mpsc::Receiver<ServerRequest>,
+    lifecycle: tokio::sync::mpsc::UnboundedReceiver<Arc<ServeRequestLifecycle>>,
+}
+
+/// `http/serve`'s handler/dispatch-factory + bound request channels, once
 /// bind+listen succeeds. Shared between the sync (serial `blocking_recv`) and
 /// runtime (concurrent accept-loop) dispatch paths — everything up to "the
 /// server is listening and the caller has been notified" is identical
@@ -1833,7 +1951,8 @@ struct ServeSetup {
     /// dispatches inline exactly as before); threaded through only so
     /// `__http-serve-run`'s arg parsing is shared between both paths.
     factory: Value,
-    rx: tokio::sync::mpsc::Receiver<ServerRequest>,
+    receivers: ServeReceivers,
+    host: ServerHostGuard,
 }
 
 /// Calls a Sema function value with args, used only for `http_serve_setup`'s
@@ -1909,8 +2028,12 @@ fn http_serve_setup(args: &[Value], invoke: ServeInvoke<'_>) -> Result<ServeSetu
         }
     }
 
-    // Create the mpsc channel for server requests (tokio async channel)
-    let (tx, rx) = tokio::sync::mpsc::channel::<ServerRequest>(256);
+    // Request admission remains bounded. Lifecycle notifications are
+    // unbounded because they originate in Drop and must never await or be lost
+    // merely because the request queue is full.
+    let (tx, request_rx) = tokio::sync::mpsc::channel::<ServerRequest>(256);
+    let (lifecycle_tx, lifecycle_rx) =
+        tokio::sync::mpsc::unbounded_channel::<Arc<ServeRequestLifecycle>>();
 
     // Create a std sync channel for the ready signal, carrying the port the
     // server actually bound to (may differ from `port` when fallback kicks in).
@@ -1920,16 +2043,17 @@ fn http_serve_setup(args: &[Value], invoke: ServeInvoke<'_>) -> Result<ServeSetu
     let bind_port = port;
 
     // Spawn the bind+serve future (Send + 'static) onto the process-wide I/O
-    // pool. The server runs for the process lifetime (the VM thread below sits
-    // in the handler loop until every request sender is gone), so the returned
-    // AbortHook is deliberately unused — dropping it does not abort.
-    let _abort = sema_io::io_spawn(async move {
+    // pool. Its abort hook is retained by the server root and invoked when the
+    // root's final continuation state drops.
+    let abort = sema_io::io_spawn(async move {
         let tx = tx;
+        let lifecycle_tx = lifecycle_tx;
 
         // Build the axum router with a fallback handler that catches all requests.
         // We manually extract WebSocketUpgrade from request parts when needed.
         let app = axum::Router::new().fallback(move |req: axum::extract::Request| {
             let tx = tx.clone();
+            let lifecycle_tx = lifecycle_tx.clone();
             async move {
                 // Try to extract WebSocketUpgrade from request parts
                 use axum::extract::FromRequestParts;
@@ -1939,7 +2063,7 @@ fn http_serve_setup(args: &[Value], invoke: ServeInvoke<'_>) -> Result<ServeSetu
                         .await
                         .ok();
                 let req = axum::extract::Request::from_parts(parts, body);
-                handle_axum_request(ws_upgrade, req, tx).await
+                handle_axum_request(ws_upgrade, req, tx, lifecycle_tx).await
             }
         });
 
@@ -1959,13 +2083,17 @@ fn http_serve_setup(args: &[Value], invoke: ServeInvoke<'_>) -> Result<ServeSetu
                 .await
                 .map(|listener| (listener, bind_port))
         };
-        let (listener, actual_port) = match bind_result {
+        let (listener, fallback_port) = match bind_result {
             Ok(pair) => pair,
             Err(e) => {
                 let _ = ready_tx.send(Err(format!("bind {bind_host}:{bind_port}: {e}")));
                 return;
             }
         };
+        let actual_port = listener
+            .local_addr()
+            .map(|address| address.port())
+            .unwrap_or(fallback_port);
 
         // Signal success with the port actually bound
         let _ = ready_tx.send(Ok(actual_port));
@@ -1973,6 +2101,7 @@ fn http_serve_setup(args: &[Value], invoke: ServeInvoke<'_>) -> Result<ServeSetu
         // Run the server
         let _ = axum::serve(listener, app).await;
     });
+    let host_guard = ServerHostGuard::new(abort);
 
     // Wait for the ready signal (carrying the actual bound port) from the thread
     let actual_port = match ready_rx.recv() {
@@ -2008,7 +2137,11 @@ fn http_serve_setup(args: &[Value], invoke: ServeInvoke<'_>) -> Result<ServeSetu
     Ok(ServeSetup {
         handler,
         factory,
-        rx,
+        receivers: ServeReceivers {
+            requests: request_rx,
+            lifecycle: lifecycle_rx,
+        },
+        host: host_guard,
     })
 }
 
@@ -2025,8 +2158,18 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
     let ServeSetup {
         handler,
         factory: _,
-        mut rx,
+        receivers,
+        host,
     } = http_serve_setup(args, &|f, a| call_callback(ctx, f, a))?;
+    let _host = host;
+    let ServeReceivers {
+        requests: mut rx,
+        lifecycle: lifecycle_rx,
+    } = receivers;
+    // The legacy path cannot issue a runtime CancelPromise. Drop its lifecycle
+    // receiver so disconnect notifications fail immediately instead of
+    // accumulating behind this serial loop.
+    drop(lifecycle_rx);
 
     // Main evaluator loop: read requests from channel, call handler, send response.
     //
@@ -2043,7 +2186,11 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
     // production actually runs, and fixes exactly this for plain HTTP.
     while let Some(req) = rx.blocking_recv() {
         match req {
-            ServerRequest::Http { raw, respond } => {
+            ServerRequest::Http {
+                lifecycle: _,
+                raw,
+                respond,
+            } => {
                 let request_val = raw_request_to_value(&raw);
                 match call_callback(ctx, &handler, &[request_val]) {
                     Ok(response_val) => {
@@ -2087,13 +2234,25 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
 /// share a bucket.
 const SERVE_ACCEPT_COMPLETION_KIND: u64 = 0x7376_6163;
 
-type ServeRequestReceiver = tokio::sync::mpsc::Receiver<ServerRequest>;
-/// Ping-pongs the tokio receiver across accept-loop iterations: each External
-/// wait's job MOVES it into the future (so `rx.recv().await` runs off the VM
-/// thread), and its decoder hands it back on the VM thread before the next
-/// wait is built. A plain `Rc<RefCell<..>>`, not a `Value` — the runtime's GC
-/// only traces `Value`/`Env` edges, and this holds neither.
-type ServeRequestReceiverCell = std::rc::Rc<std::cell::RefCell<Option<ServeRequestReceiver>>>;
+enum ServeEvent {
+    Request(ServerRequest),
+    Lifecycle(Arc<ServeRequestLifecycle>),
+    Closed,
+}
+
+enum RequestOwner {
+    AwaitingPromise { disconnected: bool },
+    Running(sema_core::runtime::PromiseId),
+}
+
+struct ServeLoopState {
+    receivers: std::cell::RefCell<Option<ServeReceivers>>,
+    event: std::cell::RefCell<Option<ServeEvent>>,
+    owners: std::cell::RefCell<HashMap<ServeRequestId, RequestOwner>>,
+    _host: ServerHostGuard,
+}
+
+type ServeLoopStateRef = std::rc::Rc<ServeLoopState>;
 
 /// Build the per-request `responder` native: consumes the handler's return
 /// value exactly once and routes it to the connection's `respond` channel —
@@ -2124,14 +2283,23 @@ type ServeRequestReceiverCell = std::rc::Rc<std::cell::RefCell<Option<ServeReque
 /// suspension, so both branches build it identically. The legacy branch
 /// (reachable only outside a runtime quantum — dead in the shipped product)
 /// keeps calling the WS handler synchronously via `handle_ws_response`.
-fn make_responder_native(respond: tokio::sync::oneshot::Sender<ServerResponse>) -> Value {
+fn make_responder_native(
+    respond: tokio::sync::oneshot::Sender<ServerResponse>,
+    lifecycle: Arc<ServeRequestLifecycle>,
+) -> Value {
     use sema_core::runtime::NativeResult;
     use sema_core::NativeFn;
     let respond = std::rc::Rc::new(std::cell::RefCell::new(Some(respond)));
     let respond_runtime = respond.clone();
+    // Both ABI closures live inside one NativeFn allocation. Holding one Rc in
+    // each makes HandlerFinishedLease drop only when that final logical native
+    // owner is reclaimed; cloning the responder Value does not clone the lease.
+    let finished = std::rc::Rc::new(HandlerFinishedLease(lifecycle));
+    let finished_runtime = finished.clone();
     Value::native_fn(NativeFn::with_ctx_runtime(
         "http/serve/responder",
         move |ctx: &sema_core::EvalContext, args: &[Value]| {
+            let _finished = &finished;
             check_arity!(args, "http/serve/responder", 1);
             let response_val = &args[0];
             let respond = respond.borrow_mut().take().ok_or_else(|| {
@@ -2150,6 +2318,7 @@ fn make_responder_native(respond: tokio::sync::oneshot::Sender<ServerResponse>) 
             Ok(Value::nil())
         },
         move |_ctx, args| -> NativeResult {
+            let _finished = &finished_runtime;
             check_arity!(args, "http/serve/responder", 1);
             let response_val = args[0].clone();
             let respond = respond_runtime.borrow_mut().take().ok_or_else(|| {
@@ -2173,30 +2342,29 @@ fn make_responder_native(respond: tokio::sync::oneshot::Sender<ServerResponse>) 
     ))
 }
 
-/// Build the next accept-loop External wait: take `rx` out of `rx_cell`, park
-/// on `rx.recv()` off the VM thread, and decode the result back into either
-/// `nil` (channel closed — every sender dropped, server shutting down) or a
-/// 2-vector `[request-map responder-native]` for [`AcceptLoopContinuation`] to
-/// dispatch. This is the re-arming shape the SRV-1 liveness spike
+/// Build the next accept-loop External wait: move both receivers out of the
+/// loop state, select between admitted requests and lifecycle notifications
+/// off the VM thread, then restore them before [`AcceptLoopContinuation`]
+/// dispatches the event. This is the re-arming shape the SRV-1 liveness spike
 /// (`crates/sema-vm/src/runtime/tests.rs`, `srv1_spike_*`) proves deadlock-free:
 /// a task parked here alone still drives the runtime to `Idle`, never a false
 /// `Quiescent`/deadlock, and re-arming across many iterations leaks nothing.
 fn next_accept_wait(
     handler: Value,
     factory: Value,
-    rx_cell: ServeRequestReceiverCell,
+    state: ServeLoopStateRef,
 ) -> sema_core::runtime::NativeResult {
     use sema_core::runtime::CompletionKind;
 
-    let rx = rx_cell.borrow_mut().take().ok_or_else(|| {
-        SemaError::eval("http/serve: internal: accept-loop receiver missing (already parked?)")
+    let receivers = state.receivers.borrow_mut().take().ok_or_else(|| {
+        SemaError::eval("http/serve: internal: accept-loop receivers missing (already parked?)")
     })?;
-    let decode_cell = rx_cell.clone();
+    let decode_state = state.clone();
     let continuation: Box<dyn sema_core::runtime::NativeContinuation> =
         Box::new(AcceptLoopContinuation {
             handler: handler.clone(),
             factory: factory.clone(),
-            rx_cell,
+            state,
         });
     let kind = CompletionKind::try_from_raw(SERVE_ACCEPT_COMPLETION_KIND)
         .expect("http/serve accept completion kind is nonzero");
@@ -2204,32 +2372,40 @@ fn next_accept_wait(
         "http/serve",
         kind,
         "http/serve/accept",
-        move |(rx, item): (ServeRequestReceiver, Option<ServerRequest>)| -> Result<Value, SemaError> {
-            *decode_cell.borrow_mut() = Some(rx);
-            match item {
-                None => Ok(Value::nil()),
-                Some(ServerRequest::Http { raw, respond }) => {
-                    let request_val = raw_request_to_value(&raw);
-                    let responder_val = make_responder_native(respond);
-                    Ok(Value::vector(vec![request_val, responder_val]))
-                }
-            }
+        move |(receivers, event): (ServeReceivers, ServeEvent)| -> Result<Value, SemaError> {
+            *decode_state.receivers.borrow_mut() = Some(receivers);
+            *decode_state.event.borrow_mut() = Some(event);
+            Ok(Value::nil())
         },
         continuation,
         move || {
-            let mut rx = rx;
+            let ServeReceivers {
+                mut requests,
+                mut lifecycle,
+            } = receivers;
             async move {
-                let item = rx.recv().await;
-                Ok::<_, String>((rx, item))
+                let event = tokio::select! {
+                    request = requests.recv() => request.map_or(ServeEvent::Closed, ServeEvent::Request),
+                    notification = lifecycle.recv() => {
+                        notification.map_or(ServeEvent::Closed, ServeEvent::Lifecycle)
+                    }
+                };
+                Ok::<_, String>((
+                    ServeReceivers {
+                        requests,
+                        lifecycle,
+                    },
+                    event,
+                ))
             }
         },
     )
 }
 
-/// Resumes the accept-loop's External wait: decodes either `nil` (shutdown, end
-/// the loop) or `[request responder]`, then mints AND spawns the per-connection
-/// handler task in one `Call` to the per-connection dispatch factory (`args[1]`,
-/// minted fresh per call by the `http/serve` wrapper in prelude.rs).
+/// Resumes the accept-loop's External wait. A request mints and spawns its
+/// handler task through the per-connection dispatch factory; a lifecycle wake
+/// either records an early disconnect, cancels the matching promise, or removes
+/// a finished owner.
 /// Traces `handler`/`factory`: both are live `Value`s held across the External
 /// park, exactly like `RouterDecoder`'s route handlers.
 ///
@@ -2252,7 +2428,7 @@ fn next_accept_wait(
 struct AcceptLoopContinuation {
     handler: Value,
     factory: Value,
-    rx_cell: ServeRequestReceiverCell,
+    state: ServeLoopStateRef,
 }
 
 impl sema_core::runtime::Trace for AcceptLoopContinuation {
@@ -2271,35 +2447,48 @@ impl sema_core::runtime::NativeContinuation for AcceptLoopContinuation {
     ) -> sema_core::runtime::NativeResult {
         use sema_core::runtime::{NativeCall, NativeOutcome, ResumeInput};
         match input {
-            ResumeInput::Returned(value) => {
-                if value.is_nil() {
-                    // The request channel closed — every sender dropped, so the
-                    // axum server task is gone too. End the accept loop cleanly;
-                    // `http/serve`'s call resolves to nil, matching the legacy
-                    // serial loop's `while let Some(req) = rx.blocking_recv()`
-                    // falling out of its loop.
-                    return Ok(NativeOutcome::Return(Value::nil()));
+            ResumeInput::Returned(_) => {
+                let event = self.state.event.borrow_mut().take().ok_or_else(|| {
+                    SemaError::eval("http/serve: internal: accept-loop event missing after wake")
+                })?;
+                match event {
+                    ServeEvent::Closed => Ok(NativeOutcome::Return(Value::nil())),
+                    ServeEvent::Request(ServerRequest::Http {
+                        lifecycle,
+                        raw,
+                        respond,
+                    }) => {
+                        let disconnected = lifecycle.is_disconnected();
+                        self.state
+                            .owners
+                            .borrow_mut()
+                            .entry(lifecycle.id)
+                            .and_modify(|owner| {
+                                if let RequestOwner::AwaitingPromise {
+                                    disconnected: pending,
+                                } = owner
+                                {
+                                    *pending |= disconnected;
+                                }
+                            })
+                            .or_insert(RequestOwner::AwaitingPromise { disconnected });
+                        let request_val = raw_request_to_value(&raw);
+                        let responder_val = make_responder_native(respond, Arc::clone(&lifecycle));
+                        Ok(NativeOutcome::Call(NativeCall {
+                            callable: self.factory.clone(),
+                            args: vec![self.handler.clone(), request_val, responder_val],
+                            continuation: Box::new(AfterDispatchContinuation {
+                                handler: self.handler,
+                                factory: self.factory,
+                                state: self.state,
+                                request_id: lifecycle.id,
+                            }),
+                        }))
+                    }
+                    ServeEvent::Lifecycle(lifecycle) => {
+                        handle_lifecycle_event(self.handler, self.factory, self.state, lifecycle)
+                    }
                 }
-                let pair = value
-                    .as_vector_rc()
-                    .filter(|v| v.len() == 2)
-                    .ok_or_else(|| {
-                        SemaError::eval(
-                            "http/serve: internal: malformed accept-loop payload (expected a \
-                         2-vector [request responder])",
-                        )
-                    })?;
-                let request_val = pair[0].clone();
-                let responder_val = pair[1].clone();
-                Ok(NativeOutcome::Call(NativeCall {
-                    callable: self.factory.clone(),
-                    args: vec![self.handler.clone(), request_val, responder_val],
-                    continuation: Box::new(AfterDispatchContinuation {
-                        handler: self.handler,
-                        factory: self.factory,
-                        rx_cell: self.rx_cell,
-                    }),
-                }))
             }
             ResumeInput::Failed(error) => Err(error),
             ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
@@ -2312,18 +2501,110 @@ impl sema_core::runtime::NativeContinuation for AcceptLoopContinuation {
     }
 }
 
+fn handle_lifecycle_event(
+    handler: Value,
+    factory: Value,
+    state: ServeLoopStateRef,
+    lifecycle: Arc<ServeRequestLifecycle>,
+) -> sema_core::runtime::NativeResult {
+    let promise = apply_lifecycle_event(&mut state.owners.borrow_mut(), &lifecycle);
+    match promise {
+        Some(promise) => cancel_request_and_rearm(handler, factory, state, promise),
+        None => next_accept_wait(handler, factory, state),
+    }
+}
+
+fn apply_lifecycle_event(
+    owners: &mut HashMap<ServeRequestId, RequestOwner>,
+    lifecycle: &ServeRequestLifecycle,
+) -> Option<sema_core::runtime::PromiseId> {
+    if lifecycle.is_finished() {
+        owners.remove(&lifecycle.id);
+        return None;
+    }
+    if !lifecycle.is_disconnected() {
+        return None;
+    }
+
+    match owners.remove(&lifecycle.id) {
+        Some(RequestOwner::Running(promise)) => Some(promise),
+        Some(RequestOwner::AwaitingPromise { .. }) | None => {
+            owners.insert(
+                lifecycle.id,
+                RequestOwner::AwaitingPromise { disconnected: true },
+            );
+            None
+        }
+    }
+}
+
+fn cancel_request_and_rearm(
+    handler: Value,
+    factory: Value,
+    state: ServeLoopStateRef,
+    promise: sema_core::runtime::PromiseId,
+) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::{NativeOutcome, RuntimeRequest};
+
+    Ok(NativeOutcome::Runtime(RuntimeRequest::CancelPromise {
+        promise,
+        continuation: Box::new(CancelRequestContinuation {
+            handler,
+            factory,
+            state,
+        }),
+    }))
+}
+
+struct CancelRequestContinuation {
+    handler: Value,
+    factory: Value,
+    state: ServeLoopStateRef,
+}
+
+impl sema_core::runtime::Trace for CancelRequestContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        sink(sema_core::cycle::GcEdge::Value(&self.handler));
+        sink(sema_core::cycle::GcEdge::Value(&self.factory));
+        true
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for CancelRequestContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{ResumeInput, RuntimeResponse};
+
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Cancelled(_)) | ResumeInput::Failed(_) => {
+                next_accept_wait(self.handler, self.factory, self.state)
+            }
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "http/serve: accept loop was cancelled while cancelling a request ({reason:?})"
+            ))),
+            _ => Err(SemaError::eval(
+                "http/serve: request cancellation returned an unexpected runtime response",
+            )),
+        }
+    }
+}
+
 /// Resumes once the dispatch factory returns — the per-connection
-/// handler task is already minted AND spawned (detached — fire-and-forget,
-/// its promise discarded here; the connection's response reaches the client
-/// through `responder`, not through this promise): re-arms the next accept
-/// wait, closing the loop. The re-arm itself is what the SRV-1 spike's
+/// handler task is already minted AND spawned. Its promise is retained in the
+/// request-owner table so a future-drop notification can cancel exactly that
+/// handler; the response still reaches the client through `responder`. The
+/// re-arm itself is what the SRV-1 spike's
 /// `srv1_spike_rearm_indefinite` proves terminates cleanly and leaks nothing
 /// across many iterations. Traces `handler`/`factory` for the same reason as
 /// [`AcceptLoopContinuation`] (still held across this stage's `Call`).
 struct AfterDispatchContinuation {
     handler: Value,
     factory: Value,
-    rx_cell: ServeRequestReceiverCell,
+    state: ServeLoopStateRef,
+    request_id: ServeRequestId,
 }
 
 impl sema_core::runtime::Trace for AfterDispatchContinuation {
@@ -2342,11 +2623,36 @@ impl sema_core::runtime::NativeContinuation for AfterDispatchContinuation {
     ) -> sema_core::runtime::NativeResult {
         use sema_core::runtime::ResumeInput;
         match input {
-            // The dispatch factory's return value is the spawned
-            // task's promise (from `async/spawn` inside the factory) — not
-            // needed here; deliberately discarded (detached/fire-and-forget).
-            ResumeInput::Returned(_promise) => {
-                next_accept_wait(self.handler, self.factory, self.rx_cell)
+            ResumeInput::Returned(promise) => {
+                let promise = match promise.view() {
+                    sema_core::ValueView::AsyncPromise(promise) => promise.id,
+                    _ => {
+                        return Err(SemaError::eval(
+                            "http/serve: dispatch-task factory did not return an async promise",
+                        ));
+                    }
+                };
+                let disconnected = {
+                    let mut owners = self.state.owners.borrow_mut();
+                    match owners.remove(&self.request_id) {
+                        Some(RequestOwner::AwaitingPromise { disconnected }) => {
+                            if !disconnected {
+                                owners.insert(self.request_id, RequestOwner::Running(promise));
+                            }
+                            disconnected
+                        }
+                        Some(RequestOwner::Running(_)) | None => {
+                            return Err(SemaError::eval(
+                                "http/serve: request owner missing while dispatching handler",
+                            ));
+                        }
+                    }
+                };
+                if disconnected {
+                    cancel_request_and_rearm(self.handler, self.factory, self.state, promise)
+                } else {
+                    next_accept_wait(self.handler, self.factory, self.state)
+                }
             }
             ResumeInput::Failed(error) => Err(error),
             ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
@@ -2371,17 +2677,118 @@ fn http_serve_runtime_impl(args: &[Value]) -> sema_core::runtime::NativeResult {
     let ServeSetup {
         handler,
         factory,
-        rx,
+        receivers,
+        host,
     } = http_serve_setup(args, &|f, a| {
         sema_core::with_stdlib_ctx(|c| sema_core::call_callback(c, f, a))
     })?;
-    let rx_cell: ServeRequestReceiverCell = std::rc::Rc::new(std::cell::RefCell::new(Some(rx)));
-    next_accept_wait(handler, factory, rx_cell)
+    let state = std::rc::Rc::new(ServeLoopState {
+        receivers: std::cell::RefCell::new(Some(receivers)),
+        event: std::cell::RefCell::new(None),
+        owners: std::cell::RefCell::new(HashMap::new()),
+        _host: host,
+    });
+    next_accept_wait(handler, factory, state)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_serve_loop_state() -> ServeLoopStateRef {
+        std::rc::Rc::new(ServeLoopState {
+            receivers: std::cell::RefCell::new(None),
+            event: std::cell::RefCell::new(None),
+            owners: std::cell::RefCell::new(HashMap::new()),
+            _host: ServerHostGuard { abort: None },
+        })
+    }
+
+    #[test]
+    fn server_host_guard_aborts_only_after_final_owner_drops() {
+        let aborts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let aborts_from_hook = Arc::clone(&aborts);
+        let guard = std::rc::Rc::new(ServerHostGuard::new(Box::new(move || {
+            aborts_from_hook.fetch_add(1, Ordering::SeqCst);
+        })));
+        let second_owner = std::rc::Rc::clone(&guard);
+
+        drop(guard);
+        assert_eq!(aborts.load(Ordering::SeqCst), 0);
+        drop(second_owner);
+        assert_eq!(aborts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn handler_finished_lease_signals_only_after_final_logical_owner_drops() {
+        let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let lifecycle = ServeRequestLifecycle::new(ServeRequestId(7), lifecycle_tx);
+        let lease = std::rc::Rc::new(HandlerFinishedLease(Arc::clone(&lifecycle)));
+        let second_owner = std::rc::Rc::clone(&lease);
+
+        drop(lease);
+        assert!(matches!(
+            lifecycle_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        drop(second_owner);
+        let notification = lifecycle_rx
+            .try_recv()
+            .expect("final lease owner publishes handler completion");
+        assert_eq!(notification.id, lifecycle.id);
+        assert!(notification.is_finished());
+    }
+
+    #[test]
+    fn lifecycle_finished_and_disconnected_reordering_leaves_no_owner() {
+        let (lifecycle_tx, _lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let finished_first = ServeRequestLifecycle::new(ServeRequestId(8), lifecycle_tx.clone());
+        let mut owners = HashMap::from([(
+            finished_first.id,
+            RequestOwner::AwaitingPromise {
+                disconnected: false,
+            },
+        )]);
+        finished_first.mark_finished();
+        finished_first.mark_disconnected();
+        assert!(apply_lifecycle_event(&mut owners, &finished_first).is_none());
+        assert!(!owners.contains_key(&finished_first.id));
+
+        let disconnected_first = ServeRequestLifecycle::new(ServeRequestId(9), lifecycle_tx);
+        disconnected_first.mark_disconnected();
+        assert!(apply_lifecycle_event(&mut owners, &disconnected_first).is_none());
+        assert!(matches!(
+            owners.get(&disconnected_first.id),
+            Some(RequestOwner::AwaitingPromise { disconnected: true })
+        ));
+        disconnected_first.mark_finished();
+        assert!(apply_lifecycle_event(&mut owners, &disconnected_first).is_none());
+        assert!(!owners.contains_key(&disconnected_first.id));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_axum_request_future_publishes_disconnect() {
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+        let (lifecycle_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let request = axum::extract::Request::builder()
+            .uri("/drop")
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let task = tokio::spawn(handle_axum_request(None, request, request_tx, lifecycle_tx));
+        let request = request_rx.recv().await.expect("route enqueues request");
+        let ServerRequest::Http { lifecycle, .. } = request;
+
+        task.abort();
+        let _ = task.await;
+        let notification =
+            tokio::time::timeout(std::time::Duration::from_secs(1), lifecycle_rx.recv())
+                .await
+                .expect("request future drop publishes without timing out")
+                .expect("lifecycle channel remains open");
+        assert_eq!(notification.id, lifecycle.id);
+        assert!(notification.is_disconnected());
+        assert!(!notification.is_finished());
+    }
 
     // `RouterDecoder` holds the route table's handler `Value`s across the
     // External park while a `:static` directory batch canonicalizes off-thread.
@@ -2424,7 +2831,7 @@ mod tests {
         let cont = AcceptLoopContinuation {
             handler: handler.clone(),
             factory: factory.clone(),
-            rx_cell: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            state: empty_serve_loop_state(),
         };
         let mut edges = 0usize;
         cont.trace(&mut |edge| {
@@ -2448,7 +2855,8 @@ mod tests {
         let cont = AfterDispatchContinuation {
             handler: handler.clone(),
             factory: factory.clone(),
-            rx_cell: std::rc::Rc::new(std::cell::RefCell::new(None)),
+            state: empty_serve_loop_state(),
+            request_id: ServeRequestId(1),
         };
         let mut edges = 0usize;
         cont.trace(&mut |edge| {
@@ -2778,7 +3186,11 @@ mod tests {
         // `p as u16` silently wrapped: 70000 -> 4464, -1 -> 65535. Must error now.
         assert!(parse_port(70000).is_err());
         assert!(parse_port(-1).is_err());
-        assert!(parse_port(0).is_err());
+        assert_eq!(
+            parse_port(0).unwrap(),
+            0,
+            "port 0 requests an OS-assigned ephemeral listener"
+        );
         assert_eq!(parse_port(3000).unwrap(), 3000);
         assert_eq!(parse_port(65535).unwrap(), 65535);
     }

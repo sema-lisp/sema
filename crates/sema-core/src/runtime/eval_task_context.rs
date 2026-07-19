@@ -112,6 +112,10 @@ impl DynamicStackIdentities {
         true
     }
 
+    pub(crate) fn remove(&mut self, key: &Value) {
+        self.entries.remove(key);
+    }
+
     fn entries_for(&self, key: &Value, len: usize) -> Vec<DynamicStackEntryId> {
         let identities = self.entries.get(key).map(Vec::as_slice).unwrap_or(&[]);
         assert_eq!(

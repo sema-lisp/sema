@@ -678,6 +678,7 @@ impl EvalContext {
         }
         if stack.is_empty() {
             stacks.remove(key);
+            identities.remove(key);
         }
         val
     }
@@ -808,6 +809,25 @@ mod tests {
         assert!(context.publish_dynamic_task_state(&stale));
 
         assert_eq!(context.context_stack_get(&key), vec![value]);
+    }
+
+    #[test]
+    fn popping_a_direct_empty_stack_keeps_publication_sidecar_aligned() {
+        let context = EvalContext::new();
+        let key = Value::keyword("empty-stack");
+        context
+            .context_stacks
+            .borrow_mut()
+            .insert(key.clone(), Vec::new());
+        let root = context.snapshot_dynamic_task_state();
+        root.user_set(Value::keyword("published"), Value::int(1));
+
+        assert_eq!(context.context_stack_pop(&key), None);
+        assert!(context.publish_dynamic_task_state(&root));
+        assert_eq!(
+            context.context_get(&Value::keyword("published")),
+            Some(Value::int(1))
+        );
     }
 
     #[test]

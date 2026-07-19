@@ -157,12 +157,16 @@ pub fn clear_blocking_sleep_callback() {
     BLOCKING_SLEEP_CALLBACK.with(|cb| cb.set(None));
 }
 
-/// Block for `ms` milliseconds of real wall-clock time as part of advancing the
-/// runtime's virtual clock. If a host installed a callback (see
-/// [`set_blocking_sleep_callback`]) it is used. Otherwise the default is: sleep
-/// the OS thread on native, and no-op in wasm (the main thread must not block —
-/// the caller still advances virtual time afterward, preserving sleep ordering).
+/// Block a host or plain-worker thread for `ms` milliseconds of real wall-clock
+/// time. This adapter rejects an active runtime quantum: runtime code must park
+/// on a structural timer wait instead of blocking the interpreter thread. If a
+/// host installed a callback (see [`set_blocking_sleep_callback`]) it is used.
+/// Otherwise the default is: sleep the OS thread on native, and no-op in wasm.
 pub fn blocking_sleep_ms(ms: u64) {
+    assert!(
+        !in_runtime_quantum(),
+        "blocking_sleep_ms is a host-only adapter; runtime code must use a Timer wait"
+    );
     if let Some(f) = BLOCKING_SLEEP_CALLBACK.with(|cb| cb.get()) {
         f(ms);
         return;
@@ -510,6 +514,25 @@ pub fn check_interrupt() -> bool {
 mod tests {
     use super::*;
     use crate::runtime::{RuntimeId, RuntimeTaskId, TaskId};
+    use crate::EvalContext;
+
+    #[test]
+    fn blocking_sleep_rejects_an_active_runtime_quantum() {
+        let ctx = EvalContext::new();
+        let _quantum = ctx.enter_runtime_quantum().expect("enter runtime quantum");
+
+        let rejected = std::panic::catch_unwind(|| blocking_sleep_ms(0));
+
+        assert!(
+            rejected.is_err(),
+            "blocking_sleep_ms must be a host-only adapter"
+        );
+    }
+
+    #[test]
+    fn blocking_sleep_remains_available_to_a_plain_host_thread() {
+        blocking_sleep_ms(0);
+    }
 
     #[test]
     fn current_task_id_restores_displaced_runtime_scoped_identity() {

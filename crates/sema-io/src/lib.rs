@@ -189,8 +189,9 @@ where
 
 /// Drive `fut` to completion ON THE CALLING THREAD using THE pool's reactor,
 /// returning its output. `fut` may be non-`Send` and non-`'static`. Legal from
-/// plain OS threads and `io_spawn_blocking` closures; PANICS from async worker
-/// threads — see the threading contract in the module docs.
+/// plain OS threads and `io_spawn_blocking` closures; rejects an active Sema
+/// runtime quantum and panics from async worker threads — see the threading
+/// contract in the module docs.
 pub fn io_block_on<F: Future>(fut: F) -> F::Output {
     install();
     BLOCK_ON_OPS.fetch_add(1, Ordering::SeqCst);

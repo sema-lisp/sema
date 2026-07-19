@@ -136,13 +136,18 @@ pub fn io_spawn_blocking(work: Box<dyn FnOnce() + Send>) {
     require_backend().spawn_blocking(work);
 }
 
-/// Raw seam entry: drive `fut` to completion on the CALLING thread using the
-/// backend's reactor, returning its output. Generic sugar over
+/// Raw host/plain-worker seam: drive `fut` to completion on the CALLING thread
+/// using the backend's reactor, returning its output. Rejects an active runtime
+/// quantum, where callers must suspend on an External wait. Generic sugar over
 /// [`IoBackend::block_on_boxed`]: the output travels through a stack slot, so
 /// `fut` may be non-`Send` and non-`'static` (provider `&self` borrows,
 /// streaming callbacks over Sema values). Consumer crates use
 /// `sema_io::io_block_on`. NATIVE-ONLY semantics — see the trait method.
 pub fn io_block_on<F: Future>(fut: F) -> F::Output {
+    assert!(
+        !crate::in_runtime_quantum(),
+        "io_block_on is a host-only adapter; runtime code must use an External wait"
+    );
     let backend = require_backend();
     let mut slot = None;
     backend.block_on_boxed(Box::pin(async {

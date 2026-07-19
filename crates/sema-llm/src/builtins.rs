@@ -1324,6 +1324,16 @@ struct LispProvider {
     default_model: String,
 }
 
+fn lisp_provider_complete_callback(name: &str) -> Result<Value, LlmError> {
+    LISP_PROVIDERS.with(|providers| {
+        providers
+            .borrow()
+            .get(name)
+            .map(|callbacks| callbacks.complete_fn.clone())
+            .ok_or_else(|| LlmError::Config(format!("lisp provider '{name}' callbacks not found")))
+    })
+}
+
 impl LlmProvider for LispProvider {
     fn name(&self) -> &str {
         &self.name
@@ -1340,31 +1350,23 @@ impl LlmProvider for LispProvider {
     }
 
     fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
-        let name = self.name.clone();
-        LISP_PROVIDERS.with(|providers| {
-            let providers = providers.borrow();
-            let callbacks = providers.get(&name).ok_or_else(|| {
-                LlmError::Config(format!("lisp provider '{}' callbacks not found", name))
-            })?;
-            let complete_fn = callbacks.complete_fn.clone();
+        let complete_fn = lisp_provider_complete_callback(&self.name)?;
+        let request_map = chat_request_to_value(&request);
 
-            let request_map = chat_request_to_value(&request);
+        // The LlmProvider trait gives us no caller ctx, so invoke the user's
+        // `:complete` function on the shared stdlib context, which carries the
+        // registered evaluator callback (same path stdlib HOFs use).
+        let result = sema_core::with_stdlib_ctx(|ctx| {
+            sema_core::call_callback(ctx, &complete_fn, &[request_map])
+        });
 
-            // The LlmProvider trait gives us no caller ctx, so invoke the user's
-            // `:complete` function on the shared stdlib context, which carries the
-            // registered evaluator callback (same path stdlib HOFs use).
-            let result = sema_core::with_stdlib_ctx(|ctx| {
-                sema_core::call_callback(ctx, &complete_fn, &[request_map])
-            });
-
-            match result {
-                Ok(response_val) => parse_lisp_provider_response(&response_val, &request.model),
-                Err(e) => Err(LlmError::Api {
-                    status: 0,
-                    message: e.to_string(),
-                }),
-            }
-        })
+        match result {
+            Ok(response_val) => parse_lisp_provider_response(&response_val, &request.model),
+            Err(e) => Err(LlmError::Api {
+                status: 0,
+                message: e.to_string(),
+            }),
+        }
     }
 }
 
@@ -2400,10 +2402,10 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.reasoning_effort = reasoning_effort;
         request.timeout_ms = opt_timeout_ms(args.get(1));
 
-        // Native provider work in any runtime quantum, including root-main,
-        // suspends on an External wait. A leading Sema-defined fallback stays on
-        // the VM until the native tail is reached. The completion decoder accounts
-        // usage and shapes the value after the offload lands.
+        // In any runtime quantum, including root-main, the completion driver calls
+        // Sema-defined providers structurally on the VM and suspends each native
+        // provider attempt on an External wait. Finalization accounts usage and
+        // shapes the value after either kind of provider succeeds.
         #[cfg(not(target_arch = "wasm32"))]
         {
             dispatch_complete_offload(
@@ -6903,19 +6905,18 @@ impl sema_core::runtime::Trace for CompleteFinalize {
     }
 }
 
-/// On-VM-thread preparation result for a completion offload. `Inline` is a cache
+/// On-VM-thread preparation result for a runtime completion. `Inline` is a cache
 /// hit or cassette replay that made no provider call; the caller accounts zero
-/// usage and finalizes without suspending. `Offload` means the wire stage must run.
+/// usage and finalizes without suspending. `Offload` carries the provider plan.
 #[cfg(not(target_arch = "wasm32"))]
 enum CompletePrep {
     Inline(ChatResponse),
     Offload(Box<CompleteOffloadPlan>),
 }
 
-/// Everything the offloaded completion wire stage + its VM-thread finalize need,
-/// resolved on the VM thread before the offload so the pool worker touches no
-/// thread-locals. `request` is the wire request (moved into the future);
-/// `request_for_messages` is a clone kept for the span's I/O attributes.
+/// Everything the provider-at-a-time runtime driver and its VM-thread finalizer
+/// need. The chain is resolved on the VM thread so native workers touch no
+/// thread-locals; `request_for_messages` is retained for the span's I/O attributes.
 #[cfg(not(target_arch = "wasm32"))]
 struct CompleteOffloadPlan {
     chain: Vec<ResolvedProvider>,
@@ -6930,10 +6931,10 @@ struct CompleteOffloadPlan {
     request_for_messages: ChatRequest,
 }
 
-/// The on-VM-thread prep stage of an offloaded completion: open the conversation
+/// The on-VM-thread prep stage of a runtime completion: open the conversation
 /// scope, start the DETACHED `chat` span, consult the response cache and cassette
 /// (either can short-circuit to `Inline`), then resolve the fallback chain +
-/// rate-limit/retry parameters into `Arc` clones the pool worker can own. All
+/// rate-limit/retry parameters into `Arc` clones each native attempt can own. All
 /// runtime completion paths use this stage to keep cache, cassette, and retry
 /// behavior aligned.
 #[cfg(not(target_arch = "wasm32"))]
@@ -7067,14 +7068,13 @@ fn complete_offload_prep(request: ChatRequest) -> Result<CompletePrep, SemaError
 
     // ── Resolve the fallback chain (or default provider) into Arc clones ──
     // Done on the VM thread so the offloaded worker touches no thread-locals.
-    // Reserve this call's rate-limit slot HERE, synchronously, before the
-    // offload starts (see `reserve_rate_limit_wait_ms`); the wait itself (if
-    // any) is spent inside the offloaded future, never on the VM thread.
+    // Reserve this call's rate-limit slot HERE, synchronously. Runtime calls
+    // spend the wait as a structural timer before the provider driver starts;
+    // host calls use the synchronous path's existing pacing behavior.
     let rate_limit_wait_ms = reserve_rate_limit_wait_ms();
     let max_retries = NETWORK_MAX_RETRIES.with(|c| c.get());
-    // Capture the retry-backoff base on the VM thread so the offloaded wire
-    // stage honors it (pool workers have their own RETRY_BASE_MS TLS copies) —
-    // see `retry_backoff_ms`. Threaded through `run_fallback_retry_async`.
+    // Capture the retry-backoff base on the VM thread so each native provider
+    // attempt honors it (pool workers have their own RETRY_BASE_MS TLS copies).
     let retry_base_ms = RETRY_BASE_MS.with(|c| c.get());
     let chain: Vec<ResolvedProvider> = PROVIDER_REGISTRY.with(|reg| {
         let reg = reg.borrow();
@@ -7226,8 +7226,8 @@ fn in_runtime_offload_task() -> bool {
 /// simple completion entry point (`llm/complete`, `llm/send`, `llm/chat` no-tools,
 /// `llm/compare`) uses so runtime and synchronous paths stay aligned:
 ///
-/// * any unified-runtime quantum → [`do_complete_runtime_suspend`]; native work
-///   parks on External, while a leading Sema-defined provider stays on the VM;
+/// * any unified-runtime quantum → [`do_complete_runtime_suspend`]; Sema callbacks
+///   run as structural calls and native attempts park on External;
 /// * a host call → the synchronous provider call.
 ///
 /// `finalize` shapes the return value from the `ChatResponse` and runs on the VM
@@ -7247,13 +7247,11 @@ fn dispatch_complete_offload(
 }
 
 /// Cooperative provider-complete round under the unified runtime. It uses the
-/// shared on-VM-thread preparation and finalization stages, then suspends the
-/// active runtime task on an External wait. The wire stage runs off
-/// the VM thread on the executor's IO pool so sibling tasks (other agents) overlap,
-/// and an `async/cancel` runs the wait's abort (dropping the in-flight request). On
-/// a cache hit / cassette replay it finalizes inline (no suspend). Returns the
-/// `NativeOutcome` directly on the runtime native ABI (`__agent-step` drives it
-/// through its runtime callback).
+/// shared on-VM-thread preparation and finalization stages, then drives providers
+/// in fallback order. Sema callbacks are structural VM calls; each native attempt
+/// runs on the executor's IO pool behind a cancellable External wait. A cache hit
+/// or cassette replay finalizes inline. Returns the `NativeOutcome` directly on the
+/// runtime native ABI (`__agent-step` drives it through its runtime callback).
 #[cfg(not(target_arch = "wasm32"))]
 fn do_complete_runtime_suspend(
     request: ChatRequest,
@@ -7271,347 +7269,331 @@ fn do_complete_runtime_suspend(
     dispatch_complete_runtime_plan(plan, finalize)
 }
 
-/// Drive the VM-only prefix of a fallback chain before handing its native tail
-/// to the external-wait executor. A Sema-defined provider cannot leave the VM
-/// thread; a native provider cannot run on it. Supporting a native provider
-/// before a later Sema-defined provider requires the cooperative callback
-/// continuation that owns the provider-at-a-time loop, so that ordering is
-/// rejected before dispatch instead of falling back to a blocking native call.
+/// Drive a runtime completion one provider at a time. Sema-defined providers run
+/// as structural VM calls, while native providers suspend on one external attempt
+/// (including that provider's retry loop). Owning the whole chain in one
+/// continuation preserves arbitrary fallback order without blocking a quantum.
 #[cfg(not(target_arch = "wasm32"))]
 fn dispatch_complete_runtime_plan(
-    mut plan: CompleteOffloadPlan,
+    plan: CompleteOffloadPlan,
     finalize: CompleteFinalize,
 ) -> sema_core::runtime::NativeResult {
-    use sema_core::runtime::{NativeOutcome, NativeSuspend, WaitKind};
-
-    let vm_prefix_len = plan
-        .chain
-        .iter()
-        .take_while(|entry| entry.provider.runs_on_vm_thread())
-        .count();
-    if vm_prefix_len > 0 && plan.rate_limit_wait_ms > 0 {
-        let delay = std::time::Duration::from_millis(plan.rate_limit_wait_ms);
-        plan.rate_limit_wait_ms = 0;
-        return Ok(NativeOutcome::Suspend(NativeSuspend {
-            wait: WaitKind::Timer(delay),
-            continuation: Box::new(CompletePacingContinuation {
-                plan: Some(Box::new(plan)),
-                finalize: Some(finalize),
-            }),
-        }));
-    }
-    let vm_prefix: Vec<_> = plan.chain.drain(..vm_prefix_len).collect();
-    let mut last_error = None;
-
-    for entry in vm_prefix {
-        let mut request = plan.request.clone();
-        if let Some(model) = &entry.model {
-            request.model = model.clone();
-        } else if request.model.is_empty() {
-            request.model = entry.provider.default_model().to_string();
-        }
-        match complete_with_retry_collecting(
-            &*entry.provider,
-            &request,
-            plan.max_retries,
-            plan.retry_base_ms,
-        ) {
-            Ok((resp, retry_events)) => {
-                let outcome = CompleteOutcome {
-                    resp,
-                    serving_provider: entry.name,
-                    serving_model: request.model,
-                    retry_events,
-                };
-                let value = finalize_complete_success(
-                    outcome,
-                    plan.span,
-                    plan.cache_key,
-                    plan.cassette_record_key,
-                    plan.cassette_scope,
-                    current_usage_accum(),
-                    active_budget(),
-                    &plan.request_for_messages,
-                    finalize,
-                )?;
-                return Ok(NativeOutcome::Return(value));
-            }
-            Err(error) => {
-                eprintln!("Provider '{}' failed: {error}, trying next...", entry.name);
-                last_error = Some(error);
-            }
-        }
-    }
-
-    if plan.chain.is_empty() {
-        let error = last_error
-            .unwrap_or_else(|| crate::types::LlmError::Config("all providers failed".to_string()));
-        plan.span
-            .record_error(llm_error_kind(&error), &error.to_string());
-        return Err(SemaError::Llm(error.to_string()));
-    }
-
-    if plan
-        .chain
-        .iter()
-        .any(|entry| entry.provider.runs_on_vm_thread())
-    {
-        let message = "a runtime fallback chain cannot place a Sema-defined provider after a \
-                       native provider until provider callbacks use the cooperative call driver; \
-                       place Sema-defined providers first in the fallback chain";
-        plan.span.record_error("config", message);
-        return Err(SemaError::Llm(message.to_string()));
-    }
-
-    suspend_complete_offload_plan(plan, finalize)
+    Box::new(RuntimeCompleteDriver {
+        plan,
+        finalize,
+        next_provider: 0,
+        last_error: None,
+        phase: RuntimeCompletePhase::Ready,
+        usage_accum_slot: current_usage_accum(),
+        budget_slot: active_budget(),
+    })
+    .advance()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-struct CompletePacingContinuation {
-    plan: Option<Box<CompleteOffloadPlan>>,
-    finalize: Option<CompleteFinalize>,
+type CompleteAttemptSlot = Rc<RefCell<Option<Result<CompleteOutcome, crate::types::LlmError>>>>;
+
+#[cfg(not(target_arch = "wasm32"))]
+enum RuntimeCompletePhase {
+    Ready,
+    Pacing,
+    Sema {
+        provider: String,
+        model: String,
+    },
+    Native {
+        provider: String,
+        slot: CompleteAttemptSlot,
+    },
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl sema_core::runtime::Trace for CompletePacingContinuation {
+struct RuntimeCompleteDriver {
+    plan: CompleteOffloadPlan,
+    finalize: CompleteFinalize,
+    next_provider: usize,
+    last_error: Option<crate::types::LlmError>,
+    phase: RuntimeCompletePhase,
+    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
+    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for RuntimeCompleteDriver {
     fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
-        // CompleteOffloadPlan retains only host/provider data. Values captured by
-        // the result shaper are owned and traced by CompleteFinalize.
-        self.finalize
-            .as_ref()
-            .is_none_or(|finalize| sema_core::runtime::Trace::trace(finalize, sink))
+        sema_core::runtime::Trace::trace(&self.finalize, sink)
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl sema_core::runtime::NativeContinuation for CompletePacingContinuation {
-    fn resume(
+impl RuntimeCompleteDriver {
+    fn advance(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome, NativeSuspend, WaitKind};
+
+        if self.plan.rate_limit_wait_ms > 0 {
+            let delay = std::time::Duration::from_millis(self.plan.rate_limit_wait_ms);
+            self.plan.rate_limit_wait_ms = 0;
+            self.phase = RuntimeCompletePhase::Pacing;
+            return Ok(NativeOutcome::Suspend(NativeSuspend {
+                wait: WaitKind::Timer(delay),
+                continuation: self,
+            }));
+        }
+
+        loop {
+            let Some(entry) = self.plan.chain.get(self.next_provider) else {
+                let error = self.last_error.take().unwrap_or_else(|| {
+                    crate::types::LlmError::Config("all providers failed".to_string())
+                });
+                self.plan
+                    .span
+                    .record_error(llm_error_kind(&error), &error.to_string());
+                return Err(SemaError::Llm(error.to_string()));
+            };
+            self.next_provider += 1;
+
+            let provider = entry.provider.clone();
+            let provider_name = entry.name.clone();
+            let mut request = self.plan.request.clone();
+            if let Some(model) = &entry.model {
+                request.model = model.clone();
+            } else if request.model.is_empty() {
+                request.model = provider.default_model().to_string();
+            }
+
+            if provider.runs_on_vm_thread() {
+                let callback = match lisp_provider_complete_callback(&provider_name) {
+                    Ok(callback) => callback,
+                    Err(error) => {
+                        eprintln!(
+                            "Provider '{}' failed: {error}, trying next...",
+                            provider_name
+                        );
+                        self.last_error = Some(error);
+                        continue;
+                    }
+                };
+                let model = request.model.clone();
+                self.phase = RuntimeCompletePhase::Sema {
+                    provider: provider_name,
+                    model,
+                };
+                return Ok(NativeOutcome::Call(NativeCall {
+                    callable: callback,
+                    args: vec![chat_request_to_value(&request)],
+                    continuation: self,
+                }));
+            }
+
+            return self.suspend_native_attempt(provider, provider_name, request);
+        }
+    }
+
+    fn suspend_native_attempt(
         mut self: Box<Self>,
+        provider: std::sync::Arc<dyn LlmProvider>,
+        provider_name: String,
+        request: ChatRequest,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{
+            CompletionKind, InterruptibleResource, NativeOutcome, NativeSuspend,
+            PreparedExternalOperation, SendPayload, WaitKind,
+        };
+
+        let max_retries = self.plan.max_retries;
+        let retry_base_ms = self.plan.retry_base_ms;
+        let serving_model = request.model.clone();
+        let slot = Rc::new(RefCell::new(None));
+        let decoder = Box::new(CompleteAttemptDecoder {
+            slot: Rc::clone(&slot),
+        });
+        self.phase = RuntimeCompletePhase::Native {
+            provider: provider_name.clone(),
+            slot,
+        };
+
+        let kind = CompletionKind::try_from_raw(AGENT_COMPLETE_COMPLETION_KIND)
+            .expect("agent completion kind is nonzero");
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let resource = InterruptibleResource::new(
+            "agent/complete",
+            Box::new(LlmSelectCancelHook {
+                signal: Some(cancel_tx),
+            }),
+        );
+        let prepared = PreparedExternalOperation::interruptible_async(
+            kind,
+            decoder,
+            resource,
+            move || async move {
+                let work = async move {
+                    let _inflight = InflightGuard::new();
+                    complete_with_retry_collecting_async(
+                        &provider,
+                        &request,
+                        max_retries,
+                        retry_base_ms,
+                    )
+                    .await
+                    .map(|(resp, retry_events)| CompleteOutcome {
+                        resp,
+                        serving_provider: provider_name,
+                        serving_model,
+                        retry_events,
+                    })
+                };
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel_rx => {
+                        Err(crate::types::LlmError::Config("cancelled".to_string()))
+                    }
+                    result = work => result,
+                };
+                Ok(Box::new(result) as SendPayload)
+            },
+        );
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::External(Box::new(prepared)),
+            continuation: self,
+        }))
+    }
+
+    fn provider_failed(
+        mut self: Box<Self>,
+        provider: String,
+        error: crate::types::LlmError,
+    ) -> sema_core::runtime::NativeResult {
+        eprintln!("Provider '{provider}' failed: {error}, trying next...");
+        self.last_error = Some(error);
+        self.phase = RuntimeCompletePhase::Ready;
+        self.advance()
+    }
+
+    fn finish(self: Box<Self>, outcome: CompleteOutcome) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::NativeOutcome;
+
+        let Self {
+            plan,
+            finalize,
+            usage_accum_slot,
+            budget_slot,
+            ..
+        } = *self;
+        let value = finalize_complete_success(
+            outcome,
+            plan.span,
+            plan.cache_key,
+            plan.cassette_record_key,
+            plan.cassette_scope,
+            usage_accum_slot,
+            budget_slot,
+            &plan.request_for_messages,
+            finalize,
+        )?;
+        Ok(NativeOutcome::Return(value))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::NativeContinuation for RuntimeCompleteDriver {
+    fn resume(
+        self: Box<Self>,
         _context: &mut sema_core::runtime::NativeCallContext<'_>,
         input: sema_core::runtime::ResumeInput,
     ) -> sema_core::runtime::NativeResult {
         use sema_core::runtime::ResumeInput;
-        match input {
-            ResumeInput::Returned(_) => dispatch_complete_runtime_plan(
-                *self.plan.take().expect("pacing plan is consumed once"),
-                self.finalize
+
+        match (&self.phase, input) {
+            (RuntimeCompletePhase::Pacing, ResumeInput::Returned(_)) => {
+                let mut this = self;
+                this.phase = RuntimeCompletePhase::Ready;
+                this.advance()
+            }
+            (RuntimeCompletePhase::Sema { provider, model }, ResumeInput::Returned(value)) => {
+                let provider = provider.clone();
+                let model = model.clone();
+                match parse_lisp_provider_response(&value, &model) {
+                    Ok(resp) => self.finish(CompleteOutcome {
+                        resp,
+                        serving_provider: provider,
+                        serving_model: model,
+                        retry_events: Vec::new(),
+                    }),
+                    Err(error) => self.provider_failed(provider, error),
+                }
+            }
+            (RuntimeCompletePhase::Sema { provider, .. }, ResumeInput::Failed(error)) => {
+                let provider = provider.clone();
+                self.provider_failed(
+                    provider,
+                    crate::types::LlmError::Api {
+                        status: 0,
+                        message: error.to_string(),
+                    },
+                )
+            }
+            (RuntimeCompletePhase::Native { provider, slot }, ResumeInput::Returned(_)) => {
+                let provider = provider.clone();
+                let result = slot
+                    .borrow_mut()
                     .take()
-                    .expect("pacing finalizer is consumed once"),
-            ),
-            ResumeInput::Failed(error) => Err(error),
-            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
-                "LLM rate-limit pacing was cancelled ({reason:?})"
+                    .ok_or_else(|| SemaError::eval("agent completion result was not delivered"))?;
+                match result {
+                    Ok(outcome) => self.finish(outcome),
+                    Err(error) => self.provider_failed(provider, error),
+                }
+            }
+            (_, ResumeInput::Failed(error)) => {
+                self.plan.span.record_error("io", &error.to_string());
+                Err(error)
+            }
+            (_, ResumeInput::Cancelled(reason)) => Err(SemaError::eval(format!(
+                "agent completion was cancelled ({reason:?})"
             ))),
-            ResumeInput::Runtime(_) => Err(SemaError::eval(
-                "LLM rate-limit pacing received an unexpected runtime response",
+            (_, ResumeInput::Runtime(_)) => Err(SemaError::eval(
+                "agent completion driver received an unexpected runtime response",
+            )),
+            (RuntimeCompletePhase::Ready, ResumeInput::Returned(_)) => Err(SemaError::eval(
+                "agent completion driver resumed without an active attempt",
             )),
         }
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn suspend_complete_offload_plan(
-    plan: CompleteOffloadPlan,
-    finalize: CompleteFinalize,
-) -> sema_core::runtime::NativeResult {
-    use sema_core::runtime::{
-        CompletionKind, InterruptibleResource, NativeOutcome, NativeSuspend,
-        PreparedExternalOperation, SendPayload, WaitKind,
-    };
-
-    let CompleteOffloadPlan {
-        chain,
-        request,
-        max_retries,
-        retry_base_ms,
-        rate_limit_wait_ms,
-        span,
-        cache_key,
-        cassette_record_key,
-        cassette_scope,
-        request_for_messages,
-    } = plan;
-
-    // Capture the leaf usage-accumulator + budget frames on the VM thread; the
-    // decoder (which runs off the task's install boundary) reinstalls them.
-    let decoder = Box::new(AgentCompleteDecoder {
-        span: Some(span),
-        cache_key,
-        cassette_record_key,
-        cassette_scope,
-        usage_accum_slot: current_usage_accum(),
-        budget_slot: active_budget(),
-        request_for_messages,
-        finalize: Some(finalize),
-    });
-    let kind = CompletionKind::try_from_raw(AGENT_COMPLETE_COMPLETION_KIND)
-        .expect("agent completion kind is nonzero");
-    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
-    let resource = InterruptibleResource::new(
-        "agent/complete",
-        Box::new(LlmSelectCancelHook {
-            signal: Some(cancel_tx),
-        }),
-    );
-    let prepared = PreparedExternalOperation::interruptible_async(
-        kind,
-        decoder,
-        resource,
-        move || async move {
-            // Gauge simultaneity the same way the async path does; dropped with the
-            // future so an abort can't strand it.
-            let work = async move {
-                let _inflight = InflightGuard::new();
-                if rate_limit_wait_ms > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(rate_limit_wait_ms)).await;
-                }
-                run_fallback_retry_async(chain, request, max_retries, retry_base_ms).await
-            };
-            // A mid-flight `async/cancel`/`async/timeout` fires the hook's one-shot
-            // signal; the `biased` select drops the in-flight request future
-            // (connection torn down), robust even when the executor's async tier
-            // drives the job with a thread-parking `block_on` (no task abort).
-            let r = tokio::select! {
-                biased;
-                _ = cancel_rx => Err(crate::types::LlmError::Config("cancelled".to_string())),
-                r = work => r,
-            };
-            Ok(Box::new(r) as SendPayload)
-        },
-    );
-    let suspend = NativeSuspend {
-        wait: WaitKind::External(Box::new(prepared)),
-        continuation: Box::new(AgentCompleteContinuation),
-    };
-    Ok(NativeOutcome::Suspend(suspend))
-}
-
-/// Decodes an offloaded agent/chat completion on the VM thread once its wire future
-/// lands: unwraps the provider result and runs the SHARED `finalize_complete_success`
-/// (span/cache/cassette/usage/budget), or records the provider error on the span and
-/// surfaces it. Feeds the produced value/error to [`AgentCompleteContinuation`].
-#[cfg(not(target_arch = "wasm32"))]
-struct AgentCompleteDecoder {
-    span: Option<sema_otel::LlmSpan>,
-    cache_key: Option<String>,
-    cassette_record_key: Option<String>,
-    cassette_scope: Option<CassetteScope>,
-    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
-    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
-    request_for_messages: ChatRequest,
-    finalize: Option<CompleteFinalize>,
+struct CompleteAttemptDecoder {
+    slot: CompleteAttemptSlot,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl sema_core::runtime::Trace for AgentCompleteDecoder {
-    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
-        self.finalize
-            .as_ref()
-            .is_none_or(|finalize| sema_core::runtime::Trace::trace(finalize, sink))
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl sema_core::runtime::CompletionDecoder for AgentCompleteDecoder {
-    fn decode(
-        self: Box<Self>,
-        _context: &mut sema_core::runtime::NativeCallContext<'_>,
-        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
-    ) -> sema_core::runtime::DecodedCompletion {
-        let AgentCompleteDecoder {
-            span,
-            cache_key,
-            cassette_record_key,
-            cassette_scope,
-            usage_accum_slot,
-            budget_slot,
-            request_for_messages,
-            finalize,
-        } = *self;
-        let payload = match result {
-            Ok(payload) => payload,
-            Err(failure) => {
-                if let Some(span) = span {
-                    span.record_error("io", failure.message());
-                }
-                return Err(SemaError::eval(format!(
-                    "agent completion: {}",
-                    failure.message()
-                )));
-            }
-        };
-        let wire = match sema_core::runtime::downcast_send_payload::<
-            Result<CompleteOutcome, crate::types::LlmError>,
-        >(payload, "agent-complete")
-        {
-            Ok(wire) => wire,
-            Err(failure) => {
-                if let Some(span) = span {
-                    span.record_error("io", failure.message());
-                }
-                return Err(SemaError::eval(format!(
-                    "agent completion: {}",
-                    failure.message()
-                )));
-            }
-        };
-        match wire {
-            Err(e) => {
-                if let Some(span) = span {
-                    span.record_error(llm_error_kind(&e), &e.to_string());
-                }
-                Err(SemaError::Llm(e.to_string()))
-            }
-            Ok(outcome) => {
-                let span = span.expect("offload span present on success");
-                let finalize = finalize.expect("finalize used once");
-                finalize_complete_success(
-                    outcome,
-                    span,
-                    cache_key,
-                    cassette_record_key,
-                    cassette_scope,
-                    usage_accum_slot,
-                    budget_slot,
-                    &request_for_messages,
-                    finalize,
-                )
-            }
-        }
-    }
-}
-
-/// Resumes the parked `__agent-step` frame once its completion offload decodes: the
-/// decoder already produced the loop-state map / error, so this forwards it (or
-/// raises a cancellation at the call site, catchable by the driver's try/catch).
-#[cfg(not(target_arch = "wasm32"))]
-struct AgentCompleteContinuation;
-
-#[cfg(not(target_arch = "wasm32"))]
-impl sema_core::runtime::Trace for AgentCompleteContinuation {
+impl sema_core::runtime::Trace for CompleteAttemptDecoder {
     fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
         true
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl sema_core::runtime::NativeContinuation for AgentCompleteContinuation {
-    fn resume(
+impl sema_core::runtime::CompletionDecoder for CompleteAttemptDecoder {
+    fn decode(
         self: Box<Self>,
         _context: &mut sema_core::runtime::NativeCallContext<'_>,
-        input: sema_core::runtime::ResumeInput,
-    ) -> sema_core::runtime::NativeResult {
-        use sema_core::runtime::{NativeOutcome, ResumeInput};
-        match input {
-            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
-            ResumeInput::Failed(error) => Err(error),
-            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
-                "agent completion was cancelled ({reason:?})"
-            ))),
-            ResumeInput::Runtime(_) => Err(SemaError::eval(
-                "agent completion continuation received an unexpected runtime response",
-            )),
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        let payload = result.map_err(|failure| {
+            SemaError::eval(format!("agent completion: {}", failure.message()))
+        })?;
+        let result = sema_core::runtime::downcast_send_payload::<
+            Result<CompleteOutcome, crate::types::LlmError>,
+        >(payload, "agent-complete")
+        .map_err(|failure| SemaError::eval(format!("agent completion: {}", failure.message())))?;
+        let mut slot = self.slot.borrow_mut();
+        if slot.is_some() {
+            return Err(SemaError::eval(
+                "agent completion result was delivered more than once",
+            ));
         }
+        *slot = Some(result);
+        Ok(Value::nil())
     }
 }
 
@@ -8539,50 +8521,6 @@ async fn complete_with_retry_collecting_async(
             },
         }
     }
-}
-
-/// The offloaded wire unit for a runtime completion: walk the resolved fallback
-/// chain (via [`complete_with_retry_collecting_async`], preserving
-/// DROP_TEMPERATURE self-heal + network retry), failing over on error. Does NO
-/// thread-local access — no cassette, cache, spans, `track_usage`, or
-/// `set_serving_provider` (those all stay in the VM-thread finalizer).
-/// Runs inside an `io_spawn`ed pool future, so the external wait's abort hook
-/// cancels it mid-flight.
-#[cfg(not(target_arch = "wasm32"))]
-async fn run_fallback_retry_async(
-    chain: Vec<ResolvedProvider>,
-    request: ChatRequest,
-    max_retries: u32,
-    base_ms: u64,
-) -> Result<CompleteOutcome, crate::types::LlmError> {
-    let mut last_error = None;
-    for entry in &chain {
-        let mut req = request.clone();
-        // Per-provider override wins; else fill the provider default when unpinned
-        // (mirrors `do_complete_with_provider` / `do_complete_uncached`).
-        if let Some(model) = &entry.model {
-            req.model = model.clone();
-        } else if req.model.is_empty() {
-            req.model = entry.provider.default_model().to_string();
-        }
-        match complete_with_retry_collecting_async(&entry.provider, &req, max_retries, base_ms)
-            .await
-        {
-            Ok((resp, retry_events)) => {
-                return Ok(CompleteOutcome {
-                    resp,
-                    serving_provider: entry.name.clone(),
-                    serving_model: req.model,
-                    retry_events,
-                });
-            }
-            Err(e) => {
-                eprintln!("Provider '{}' failed: {e}, trying next...", entry.name);
-                last_error = Some(e);
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| crate::types::LlmError::Config("all providers failed".into())))
 }
 
 fn do_complete_with_provider(
@@ -11691,6 +11629,91 @@ mod tests {
         });
 
         assert!(saw_retained, "the retained Value must be visible to CORE-2");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn runtime_complete_driver_traces_its_finalizer_values() {
+        let retained = make_lambda(&["value"]);
+        let driver = RuntimeCompleteDriver {
+            plan: CompleteOffloadPlan {
+                chain: Vec::new(),
+                request: ChatRequest::new(String::new(), Vec::new()),
+                max_retries: 0,
+                retry_base_ms: 0,
+                rate_limit_wait_ms: 0,
+                span: sema_otel::llm_span_detached("chat"),
+                cache_key: None,
+                cassette_record_key: None,
+                cassette_scope: None,
+                request_for_messages: ChatRequest::new(String::new(), Vec::new()),
+            },
+            finalize: CompleteFinalize::with_values(
+                |_response| Ok(Value::nil()),
+                vec![retained.clone()],
+            ),
+            next_provider: 0,
+            last_error: None,
+            phase: RuntimeCompletePhase::Ready,
+            usage_accum_slot: None,
+            budget_slot: None,
+        };
+        let mut saw_retained = false;
+
+        sema_core::runtime::Trace::trace(&driver, &mut |edge| {
+            if let sema_core::cycle::GcEdge::Value(value) = edge {
+                saw_retained |= value == &retained;
+            }
+        });
+
+        assert!(
+            saw_retained,
+            "the runtime driver must retain the finalizer's CORE-2 edge"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn complete_attempt_decoder_delivers_one_owned_result() {
+        use sema_core::runtime::{
+            CancellationView, CompletionDecoder, NativeCallContext, SendPayload, TaskContext,
+        };
+
+        let slot = Rc::new(RefCell::new(None));
+        let decoder = Box::new(CompleteAttemptDecoder {
+            slot: Rc::clone(&slot),
+        });
+        let outcome = CompleteOutcome {
+            resp: ChatResponse {
+                content: "done".to_string(),
+                role: "assistant".to_string(),
+                model: "fake-model".to_string(),
+                tool_calls: Vec::new(),
+                usage: Usage::default(),
+                stop_reason: Some("end_turn".to_string()),
+            },
+            serving_provider: "fake".to_string(),
+            serving_model: "fake-model".to_string(),
+            retry_events: Vec::new(),
+        };
+        let eval_context = EvalContext::new();
+        let mut task_context = TaskContext::empty();
+        let mut call_context = NativeCallContext {
+            eval_context: &eval_context,
+            task_context: &mut task_context,
+            cancellation: CancellationView::default(),
+        };
+
+        let decoded = CompletionDecoder::decode(
+            decoder,
+            &mut call_context,
+            Ok(Box::new(Ok::<CompleteOutcome, LlmError>(outcome)) as SendPayload),
+        )
+        .expect("matching completion payload decodes");
+
+        assert_eq!(decoded, Value::nil());
+        assert!(matches!(slot.borrow_mut().take(), Some(Ok(_))));
+        assert!(slot.borrow_mut().take().is_none(), "slot is consumed once");
     }
 
     // -- json_args_to_sema tests --

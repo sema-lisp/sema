@@ -262,17 +262,17 @@ fn root_batch_parks_while_a_sibling_runs() {
 
 #[test]
 #[serial]
-fn native_before_sema_fallback_is_rejected_before_native_dispatch() {
+fn native_before_sema_fallback_reaches_the_sema_provider() {
     let fake = FakeProvider::builder("fake")
         .model("fake-chat")
-        .reply("must-not-dispatch")
+        .error(LlmError::Config("fall through".to_string()))
         .build();
     let recorder = fake.recorder();
     let interp = Interpreter::new();
     reset_runtime_state();
     register_test_provider(Box::new(fake));
 
-    let error = interp
+    let value = interp
         .eval_str_compiled(
             r#"
             (llm/define-provider :sema-provider
@@ -282,19 +282,77 @@ fn native_before_sema_fallback_is_rejected_before_native_dispatch() {
               (fn () (llm/complete "root")))
             "#,
         )
-        .expect_err("native-before-Sema fallback must be rejected before dispatch");
+        .expect("native-before-Sema fallback reaches its second provider");
 
-    assert!(
-        error
-            .to_string()
-            .contains("place Sema-defined providers first"),
-        "error must provide an immediately usable remedy: {error}"
-    );
-    assert_eq!(
-        recorder.call_count(),
-        0,
-        "unsupported fallback ordering must not call the leading native provider"
-    );
+    assert_eq!(value.as_str(), Some("sema"));
+    assert_eq!(recorder.call_count(), 1);
+}
+
+#[test]
+#[serial]
+fn sema_provider_callback_parks_while_a_sibling_runs() {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (llm/define-provider :sema-provider
+              {:complete (fn (_request) (sleep 100) "provider")
+               :default-model "sema-model"})
+            (let ((out (channel/new 2)))
+              (async/spawn (fn () (sleep 10) (channel/send out "sibling")))
+              (channel/send out (llm/complete "root"))
+              (list (channel/recv out) (channel/recv out)))
+            "#,
+        )
+        .expect("Sema-defined provider callback and sibling settle");
+
+    assert_eq!(strings(&value), ["sibling", "provider"]);
+}
+
+#[test]
+#[serial]
+fn sema_provider_callback_can_spawn_and_await_runtime_work() {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (llm/define-provider :sema-provider
+              {:complete (fn (_request)
+                           (define pending
+                             (async/spawn (fn () (sleep 10) "nested")))
+                           (string-append "provider-" (async/await pending)))
+               :default-model "sema-model"})
+            (llm/complete "root")
+            "#,
+        )
+        .expect("Sema-defined provider callback can use runtime primitives");
+
+    assert_eq!(value.as_str(), Some("provider-nested"));
+}
+
+#[test]
+#[serial]
+fn sema_provider_callback_observes_the_callers_dynamic_context() {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (llm/define-provider :sema-provider
+              {:complete (fn (_request) (context/get :request-id))
+               :default-model "sema-model"})
+            (context/with {:request-id "req-42"}
+              (fn () (llm/complete "root")))
+            "#,
+        )
+        .expect("Sema-defined provider inherits its caller context");
+
+    assert_eq!(value.as_str(), Some("req-42"));
 }
 
 #[test]
@@ -357,6 +415,49 @@ fn cancelling_sema_provider_pacing_does_not_invoke_the_provider() {
     let items = value.as_list().expect("cancel result and call count");
     assert_eq!(items[0], sema_core::Value::keyword("cancelled"));
     assert_eq!(items[1].as_int(), Some(1));
+}
+
+#[test]
+#[serial]
+fn cancelling_a_sema_provider_callback_does_not_fall_back_or_charge_usage() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .reply("must-not-dispatch")
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let started = Instant::now();
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (llm/define-provider :sema-provider
+              {:complete (fn (_request) (sleep 1000) "late")
+               :default-model "sema-model"})
+            (llm/with-fallback [:sema-provider :fake]
+              (fn ()
+                (define pending (async/spawn (fn () (llm/complete "cancelled"))))
+                (async/spawn (fn () (sleep 20) (async/cancel pending)))
+                (list (try (async/await pending) (catch error :cancelled))
+                      (:total-tokens (llm/session-usage)))))
+            "#,
+        )
+        .expect("Sema-defined provider callback is cancellable");
+
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "cancellation must not wait out the provider callback's sleep"
+    );
+    let items = value.as_list().expect("cancel result and usage");
+    assert_eq!(items[0], sema_core::Value::keyword("cancelled"));
+    assert_eq!(items[1].as_int(), Some(0));
+    assert_eq!(
+        recorder.call_count(),
+        0,
+        "cancellation must not advance into the fallback provider"
+    );
 }
 
 #[test]

@@ -37,10 +37,11 @@
 //!
 //! **Cancellation semantics.** If a task is cancelled (`async/cancel`,
 //! `async/timeout` expiry) while it holds a connection's checkout, the slot is
-//! tombstoned by the External wait's cancellation hook: the in-flight worker's
-//! eventual completion is discarded by the runtime, and the
-//! connection itself — the `McpClient`, hence any child process/socket — drops
-//! on the worker thread. Any *later* use of that handle fails fast with a
+//! tombstoned by the External wait's cancellation hook. That hook also fires a
+//! pre-armed one-shot; the worker's biased select drops the transport future,
+//! and the connection itself — the `McpClient`, hence any child process/socket
+//! — drops on the worker thread. Any late completion is discarded by the
+//! runtime. A *later* use of that handle fails fast with a
 //! `SemaError` naming the reason and a reconnect hint; a task that was merely
 //! *queued* (never actually held the checkout) when cancelled leaves the slot
 //! untouched (a no-op abort) so the connection remains usable by others.
@@ -846,20 +847,40 @@ enum ConnectPayloadResult {
     },
     NeedsAuth(String),
     Failed(ConnectErrorPayload),
+    Cancelled,
 }
 
 struct McpConnectPayload(ConnectPayloadResult);
 
-struct McpNoopCancelHook;
+type McpCancelSignal = tokio::sync::oneshot::Sender<()>;
+type McpCancelWaiter = tokio::sync::oneshot::Receiver<()>;
 
-impl Trace for McpNoopCancelHook {
+fn mcp_cancel_channel() -> (McpCancelSignal, McpCancelWaiter) {
+    tokio::sync::oneshot::channel()
+}
+
+fn fire_cancel_signal(signal: &mut Option<McpCancelSignal>) {
+    if let Some(signal) = signal.take() {
+        // A send error means the worker completed and dropped its receiver
+        // first. Otherwise the biased select is now armed to drop its transport
+        // future before the hook reports the resource reaped.
+        let _ = signal.send(());
+    }
+}
+
+struct McpConnectCancelHook {
+    signal: Option<McpCancelSignal>,
+}
+
+impl Trace for McpConnectCancelHook {
     fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
         true
     }
 }
 
-impl CancelHook for McpNoopCancelHook {
+impl CancelHook for McpConnectCancelHook {
     fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        fire_cancel_signal(&mut self.signal);
         Ok(CancelDisposition::Reaped)
     }
 
@@ -933,6 +954,7 @@ impl CompletionDecoder for McpConnectDecoder {
                 ConnectOutcome::NeedsAuth(url),
             )),
             ConnectPayloadResult::Failed(error) => Err(error.into_sema()),
+            ConnectPayloadResult::Cancelled => Err(SemaError::eval("mcp/connect was cancelled")),
         }
     }
 }
@@ -945,23 +967,37 @@ fn connect_runtime_outcome(
     let kind = CompletionKind::try_from_raw(MCP_CONNECT_COMPLETION_KIND)
         .expect("mcp/connect completion kind is nonzero");
     let decoder = Box::new(McpConnectDecoder { opts: opts.clone() });
-    let resource = InterruptibleResource::new("mcp/connect", Box::new(McpNoopCancelHook));
+    let (cancel_tx, cancel_rx) = mcp_cancel_channel();
+    let resource = InterruptibleResource::new(
+        "mcp/connect",
+        Box::new(McpConnectCancelHook {
+            signal: Some(cancel_tx),
+        }),
+    );
     let prepared =
         PreparedExternalOperation::interruptible_blocking(kind, decoder, resource, move || {
-            let result = match sema_io::io_block_on(connect_dispatch_async(
-                config_json,
-                opts,
-                OpenerSource::Resolved(browser_allowed),
-            )) {
-                Ok((client, identity)) => ConnectPayloadResult::Connected {
-                    client: Box::new(client),
-                    identity,
-                },
-                Err(ConnectOutcome::NeedsAuth(url)) => ConnectPayloadResult::NeedsAuth(url),
-                Err(ConnectOutcome::Sema(error)) => {
-                    ConnectPayloadResult::Failed(ConnectErrorPayload::from_sema(error))
+            let result = sema_io::io_block_on(async move {
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx => ConnectPayloadResult::Cancelled,
+                    outcome = connect_dispatch_async(
+                        config_json,
+                        opts,
+                        OpenerSource::Resolved(browser_allowed),
+                    ) => match outcome {
+                        Ok((client, identity)) => ConnectPayloadResult::Connected {
+                            client: Box::new(client),
+                            identity,
+                        },
+                        Err(ConnectOutcome::NeedsAuth(url)) => {
+                            ConnectPayloadResult::NeedsAuth(url)
+                        }
+                        Err(ConnectOutcome::Sema(error)) => ConnectPayloadResult::Failed(
+                            ConnectErrorPayload::from_sema(error),
+                        ),
+                    },
                 }
-            };
+            });
             Ok(Box::new(McpConnectPayload(result)) as SendPayload)
         });
     Ok(NativeOutcome::Suspend(NativeSuspend {
@@ -1292,9 +1328,8 @@ fn call_tool(
 //
 // Calls to DIFFERENT connections overlap on separate workers (each has its own
 // gate); calls to the SAME connection serialize through its one gate. A
-// mid-flight cancel tombstones the slot (the connection is stuck in the blocking
-// worker, best-effort) and still releases the gate so a queued sibling wakes and
-// fails fast on the tombstone.
+// mid-flight cancel fires the worker's one-shot, tombstones the slot, and still
+// releases the gate so a queued sibling wakes and fails fast on the tombstone.
 
 /// Completion tag for the runtime `mcp/call` external op. A tag only needs to be
 /// consistent between issue and prepared op; collisions with other external ops
@@ -1316,15 +1351,15 @@ struct McpCallPayload {
     result: Result<serde_json::Value, String>,
 }
 
-/// Tombstones a connection whose in-flight `mcp/call` is cancelled mid-flight:
-/// the blocking job keeps running on its worker and its eventual result is
-/// discarded (a late completion), so the `McpConnection` it owns drops
-/// off-thread and the slot must never return to `Available`. The wait runtime
-/// invokes `cancel`/`reap` on the VM thread, so holding an `Rc<ConnEntry>` is
-/// sound; a checked-out slot owns no connection, so `trace` is trivially
-/// complete.
+/// Tears down and tombstones an in-flight `mcp/call`. The one-shot makes the
+/// worker's biased select drop the transport future; the late completion is
+/// discarded, so the `McpConnection` it owns drops off-thread and the slot must
+/// never return to `Available`. The wait runtime invokes `cancel`/`reap` on the
+/// VM thread, so holding an `Rc<ConnEntry>` is sound; a checked-out slot owns no
+/// connection, so `trace` is trivially complete.
 struct McpCallCancelHook {
     entry: Rc<ConnEntry>,
+    signal: Option<McpCancelSignal>,
 }
 
 impl Trace for McpCallCancelHook {
@@ -1335,6 +1370,7 @@ impl Trace for McpCallCancelHook {
 
 impl CancelHook for McpCallCancelHook {
     fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        fire_cancel_signal(&mut self.signal);
         tombstone_slot(&self.entry, "cancelled mid-call");
         Ok(CancelDisposition::Reaped)
     }
@@ -1453,17 +1489,30 @@ impl McpGatedAction for McpCallAction {
             cassette_key,
             materialize,
         });
-        let resource =
-            InterruptibleResource::new("mcp/call", Box::new(McpCallCancelHook { entry }));
+        let (cancel_tx, cancel_rx) = mcp_cancel_channel();
+        let resource = InterruptibleResource::new(
+            "mcp/call",
+            Box::new(McpCallCancelHook {
+                entry,
+                signal: Some(cancel_tx),
+            }),
+        );
         PreparedExternalOperation::interruptible_blocking(kind, decoder, resource, move || {
             let mut conn = conn;
-            let result = sema_io::io_block_on(call_tool_async(
+            let call = call_tool_async(
                 &mut conn,
                 &tool_name,
                 arguments_json,
                 interactive_auth,
                 OpenerSource::Resolved(browser_allowed),
-            ));
+            );
+            let result = sema_io::io_block_on(async move {
+                tokio::select! {
+                    biased;
+                    _ = cancel_rx => Err("cancelled".to_string()),
+                    result = call => result,
+                }
+            });
             Ok(Box::new(McpCallPayload { conn, result }) as SendPayload)
         })
     }
@@ -1736,6 +1785,7 @@ impl McpConnectionFinish {
 struct McpConnectionCancelHook {
     entry: Rc<ConnEntry>,
     label: &'static str,
+    signal: Option<McpCancelSignal>,
 }
 
 impl Trace for McpConnectionCancelHook {
@@ -1746,6 +1796,7 @@ impl Trace for McpConnectionCancelHook {
 
 impl CancelHook for McpConnectionCancelHook {
     fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        fire_cancel_signal(&mut self.signal);
         tombstone_slot(&self.entry, format!("cancelled during {}", self.label));
         Ok(CancelDisposition::Reaped)
     }
@@ -1846,17 +1897,38 @@ impl McpGatedAction for McpConnectionAction {
             entry: entry.clone(),
             finish,
         });
-        let resource =
-            InterruptibleResource::new(label, Box::new(McpConnectionCancelHook { entry, label }));
+        let (cancel_tx, cancel_rx) = mcp_cancel_channel();
+        let resource = InterruptibleResource::new(
+            label,
+            Box::new(McpConnectionCancelHook {
+                entry,
+                label,
+                signal: Some(cancel_tx),
+            }),
+        );
         PreparedExternalOperation::interruptible_blocking(kind, decoder, resource, move || {
             let mut conn = conn;
             let result = match operation {
-                McpConnectionOperation::ListTools => McpConnectionOperationResult::Tools(
-                    sema_io::io_block_on(list_tools_async(&mut conn)),
-                ),
-                McpConnectionOperation::Close => McpConnectionOperationResult::Close(
-                    sema_io::io_block_on(close_async(&mut conn)),
-                ),
+                McpConnectionOperation::ListTools => {
+                    let list = list_tools_async(&mut conn);
+                    McpConnectionOperationResult::Tools(sema_io::io_block_on(async move {
+                        tokio::select! {
+                            biased;
+                            _ = cancel_rx => Err("cancelled".to_string()),
+                            result = list => result,
+                        }
+                    }))
+                }
+                McpConnectionOperation::Close => {
+                    let close = close_async(&mut conn);
+                    McpConnectionOperationResult::Close(sema_io::io_block_on(async move {
+                        tokio::select! {
+                            biased;
+                            _ = cancel_rx => Err("cancelled".to_string()),
+                            result = close => result,
+                        }
+                    }))
+                }
             };
             Ok(Box::new(McpConnectionOperationPayload { conn, result }) as SendPayload)
         })

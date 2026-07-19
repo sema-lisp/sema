@@ -9,6 +9,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  playground-runtime:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/playground-runtime.yml
+
   test:
     runs-on: ubuntu-latest
     steps:

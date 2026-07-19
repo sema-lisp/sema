@@ -1339,17 +1339,21 @@ Benchmark binary-identity rule: rebuild and verify the baseline worktree binary
 (`git log` + mtime) before measuring — a stale bisect-era binary contaminated
 one investigation.
 
-## PG-E2E-1 — playground debugger e2e subset long-red (pre-existing, not CI-gated)
+## PG-E2E-1 — two playground debugger defects remain
 
-**Recorded 2026-07-17 (P6-3 step-2 verification).** ~20 playground Playwright
-specs (breakpoint snapping ×4, continue-past-breakpoint, infinite-loop step
-limit, the async-debugger suite, one HTTP-debug exchange, the `?no-worker`
-instant-virtual-clock sleep) fail identically at the migration-close commit
-`e72f8109` and at current HEAD — verified by running the suite at both refs.
-They predate the recent slices; `jake test.playground-e2e` is not in any CI
-workflow, so the red set went unnoticed. The Rust-level wasm debug tests
-(`wasm_async_debug_test.rs`) are green — the gap is in the playground JS debug
-harness/UX layer, not the runtime protocol. Needs its own diagnosis pass;
-candidates: harness drift vs the P3-B2 cooperative-debug rewiring, and the
-absent virtual clock for `?no-worker` sleep. Consider adding the playground
-e2e (or a stable subset) to CI once green.
+**Recorded 2026-07-17; narrowed 2026-07-19.** The broad debugger red set was
+mostly test-harness drift. `@sema-lang/ui` exposes current and breakpoint state
+as the `cur` and `bp` classes on `[part~="gutter-line"]`; the shared helpers
+incorrectly queried nonexistent `current` and `breakpoint` part tokens. After
+aligning the helpers with the installed UI contract, 31 of the 33 focused
+debugger tests pass. Two independent defects remain:
+
+- The exchange-rates HTTP test reaches Ready and then clicks a hidden Stop
+  button; its external response path and control flow need a dedicated repair.
+- The infinite-loop debugger test receives `unsupported runtime VM stop:
+  Yielded` instead of the expected step-limit termination.
+
+The release gates now build the final playground WASM and run the stable
+runtime subset: `unified-runtime.spec.ts` and `debug-http-replay.spec.ts` (12
+tests). The two remaining debugger defects are excluded from that focused gate
+until repaired; the full playground suite remains the local acceptance suite.

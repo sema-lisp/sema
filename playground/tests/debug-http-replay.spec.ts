@@ -1,5 +1,5 @@
 import { test, expect, Page } from '@playwright/test';
-import { toggleBreakpoint } from './gutter';
+import { getCurrentDebugLine, toggleBreakpoint } from './gutter';
 
 // Regression test for the debug HTTP replay-restart loop: `debugStart`
 // unconditionally cleared the HTTP replay cache (`clear_http_cache()`) even
@@ -60,15 +60,7 @@ test('debug session with an HTTP call replays from cache instead of looping', as
   await page.getByTestId('debug-btn').click();
   await waitForPaused(page);
 
-  // NOTE: `getCurrentDebugLine`/`getBreakpointLines` (tests/gutter.ts) query
-  // `[part~="current"]`/`[part~="breakpoint"]`, but the vendored
-  // @sema-lang/ui editor marks the current/breakpoint line with CSS classes
-  // ("cur"/"bp"), not extra `part` tokens — those helpers are stale against
-  // the current component (pre-existing PG-E2E-1 harness drift, unrelated to
-  // this fix). The status bar text is the reliable source of the paused
-  // line, so assert on that instead.
-  const status = await page.getByTestId('status').textContent();
-  expect(status).toBe('Paused at line 12');
+  expect(await getCurrentDebugLine(page)).toBe(12);
 
   expect(requestCount).toBe(1);
 

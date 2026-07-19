@@ -3636,24 +3636,13 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             })
             .collect();
 
-        // ── Runtime path: offload the whole batch (native targets only) ──────
+        // ── Runtime path ────────────────────────────────────────────────────
         //
-        // `batch_complete`'s provider impls (anthropic/openai/gemini/ollama) drive
-        // their own concurrency internally via `sema_io::io_block_on(join_all(..))`
-        // — legal from a `spawn_blocking` closure, illegal from an async worker (see
-        // the sema-io threading contract) — so the WHOLE call is offloaded to the
-        // blocking tier as ONE unit rather than re-driven as a `spawn`ed future; the
-        // provider's own internal join_all runs unchanged inside it, occupying one
-        // admission-control permit for its entire duration (by design, same as a
-        // long retry backoff — see the sema-io module docs).
+        // Sema-defined providers run one structural callback per request, in order.
+        // Native providers retain their own `batch_complete` concurrency and run the
+        // whole batch as one admission-controlled blocking-tier unit.
         #[cfg(not(target_arch = "wasm32"))]
-        if in_runtime_offload_context()
-            && PROVIDER_REGISTRY.with(|reg| {
-                reg.borrow()
-                    .default_provider()
-                    .is_none_or(|provider| !provider.runs_on_vm_thread())
-            })
-        {
+        if in_runtime_offload_context() {
             let provider = PROVIDER_REGISTRY.with(|reg| reg.borrow().default_provider());
             let Some(provider) = provider else {
                 return Err(SemaError::Llm(
@@ -3662,6 +3651,21 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                         .to_string(),
                 ));
             };
+
+            if provider.runs_on_vm_thread() {
+                return Box::new(SemaBatchDriver {
+                    provider: provider.name().to_string(),
+                    default_model: provider.default_model().to_string(),
+                    requests,
+                    next_request: 0,
+                    active_model: None,
+                    responses: Vec::new(),
+                    usage_accum_slot: current_usage_accum(),
+                    budget_slot: active_budget(),
+                })
+                .advance();
+            }
+
             let reqs: Vec<ChatRequest> = requests
                 .iter()
                 .cloned()
@@ -7881,6 +7885,132 @@ impl sema_core::runtime::CompletionDecoder for RerankDecoder {
 #[cfg(not(target_arch = "wasm32"))]
 const BATCH_COMPLETION_KIND: u64 = 0x6261_7463; // "batc"
 
+/// Cooperative sequencer for a Sema-defined provider's default `batch_complete`
+/// behavior. Every request callback runs in input order, including callbacks after
+/// an earlier failure; only after the sequence settles are results folded in order.
+#[cfg(not(target_arch = "wasm32"))]
+struct SemaBatchDriver {
+    provider: String,
+    default_model: String,
+    requests: Vec<ChatRequest>,
+    next_request: usize,
+    active_model: Option<String>,
+    responses: Vec<Result<ChatResponse, LlmError>>,
+    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
+    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for SemaBatchDriver {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SemaBatchDriver {
+    fn advance(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome};
+
+        while let Some(request) = self.requests.get(self.next_request) {
+            let mut request = request.clone();
+            self.next_request += 1;
+            if request.model.is_empty() {
+                request.model = self.default_model.clone();
+            }
+            let callback = match lisp_provider_complete_callback(&self.provider) {
+                Ok(callback) => callback,
+                Err(error) => {
+                    self.responses.push(Err(error));
+                    continue;
+                }
+            };
+            self.active_model = Some(request.model.clone());
+            return Ok(NativeOutcome::Call(NativeCall {
+                callable: callback,
+                args: vec![chat_request_to_value(&request)],
+                continuation: self,
+            }));
+        }
+
+        let Self {
+            responses,
+            usage_accum_slot,
+            budget_slot,
+            ..
+        } = *self;
+        finalize_batch_responses(responses, usage_accum_slot, budget_slot)
+            .map(NativeOutcome::Return)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::NativeContinuation for SemaBatchDriver {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+
+        match input {
+            ResumeInput::Returned(value) => {
+                let model = self
+                    .active_model
+                    .take()
+                    .expect("Sema batch callback has an active model");
+                self.responses
+                    .push(parse_lisp_provider_response(&value, &model));
+                self.advance()
+            }
+            ResumeInput::Failed(error) => {
+                self.active_model.take();
+                self.responses.push(Err(LlmError::Api {
+                    status: 0,
+                    message: error.to_string(),
+                }));
+                self.advance()
+            }
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "llm/batch callback was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "llm/batch callback received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn finalize_batch_responses(
+    responses: Vec<Result<ChatResponse, LlmError>>,
+    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
+    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
+) -> Result<Value, SemaError> {
+    let mut results = Vec::with_capacity(responses.len());
+    for resp_result in responses {
+        let resp = resp_result.map_err(|error| SemaError::Llm(error.to_string()))?;
+        // Priced with an empty provider, matching the sync path (which never
+        // stamps a serving provider for `llm/batch`).
+        if let Some(slot) = &usage_accum_slot {
+            let cost = pricing::calculate_cost_for("", &resp.usage);
+            accumulate_into(slot, &resp.usage, cost);
+        }
+        let prev_budget = ACTIVE_BUDGET
+            .with(|active| std::mem::replace(&mut *active.borrow_mut(), budget_slot.clone()));
+        let track_result = USAGE_ACCUM_SUPPRESS.with(|suppress| {
+            suppress.set(true);
+            let result = track_usage(&resp.usage);
+            suppress.set(false);
+            result
+        });
+        ACTIVE_BUDGET.with(|active| *active.borrow_mut() = prev_budget);
+        track_result?;
+        results.push(Value::string(&resp.content));
+    }
+    Ok(Value::list(results))
+}
+
 /// Decoder for an offloaded `llm/batch`: folds each response into the
 /// dispatch-time leaf/budget frames and shapes the result list on the VM thread.
 /// Holds no live `Value`.
@@ -7915,28 +8045,7 @@ impl sema_core::runtime::CompletionDecoder for BatchDecoder {
             Ok(responses) => responses,
             Err(failure) => return Err(SemaError::eval(format!("batch: {}", failure.message()))),
         };
-        let mut results = Vec::with_capacity(responses.len());
-        for resp_result in responses {
-            let resp = resp_result.map_err(|e| SemaError::Llm(e.to_string()))?;
-            // Priced with an empty provider, matching the sync path (which never
-            // stamps a serving provider for `llm/batch`).
-            if let Some(slot) = &self.usage_accum_slot {
-                let cost = pricing::calculate_cost_for("", &resp.usage);
-                accumulate_into(slot, &resp.usage, cost);
-            }
-            let prev_budget = ACTIVE_BUDGET
-                .with(|b| std::mem::replace(&mut *b.borrow_mut(), self.budget_slot.clone()));
-            let track_result = USAGE_ACCUM_SUPPRESS.with(|s| {
-                s.set(true);
-                let r = track_usage(&resp.usage);
-                s.set(false);
-                r
-            });
-            ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
-            track_result?;
-            results.push(Value::string(&resp.content));
-        }
-        Ok(Value::list(results))
+        finalize_batch_responses(responses, self.usage_accum_slot, self.budget_slot)
     }
 }
 

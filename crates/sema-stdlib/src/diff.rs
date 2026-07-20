@@ -1,20 +1,21 @@
 //! Unified-diff generation and patch application builtins.
 //!
-//! `diff/*` functions are read-only (pure string transforms) and registered with
-//! plain `register_fn`. `patch/apply-file` touches the filesystem and is gated
-//! behind `Caps::FS_WRITE`.
+//! `diff/unified`, `diff/stat`, `diff/hunks`, `diff/parse`, and `diff/apply` are
+//! read-only in-memory transforms registered with plain `register_fn`; they are
+//! not external jobs. `patch/apply-file` is the separate filesystem surface,
+//! gated behind `Caps::FS_WRITE`.
 //!
 //! The unified-diff text produced by `diff/unified` (via the `similar` crate) is
 //! the canonical interchange format: `diff/stat`, `diff/hunks`, `diff/parse`, and
 //! `diff/apply` all consume that same textual shape, so a round-trip
 //! (`diff/unified` then `diff/apply`) reconstructs `new` from `old`.
 //!
-//! `patch/apply-file`'s real work (read + apply + write) lives in
-//! `patch_apply_file_work`, called directly at top level or — inside
-//! `async/spawn` (`in_async_context()`) — offloaded through `fs_offload`
-//! (`io.rs`) so applying a patch to a large file doesn't block the VM thread
-//! (and every sibling task). See `archive.rs`'s module doc for the full
-//! offload rationale.
+//! `patch/apply-file`'s real work lives in `patch_apply_file_work`. A direct
+//! native call outside the scheduler runs it synchronously; a runtime quantum
+//! offloads it through `quarantined_compute` (`io.rs`). The runtime path captures patch-byte,
+//! target-byte, output-byte, and hunk-count caps before dispatch, then rechecks
+//! the target and output on the worker. Cancellation discards the eventual
+//! result; it does not interrupt an already-running worker.
 
 use std::collections::BTreeMap;
 
@@ -24,6 +25,121 @@ use similar::TextDiff;
 use crate::register_fn;
 #[cfg(not(target_arch = "wasm32"))]
 use {crate::register_runtime_fn_gated, sema_core::runtime::NativeOutcome, sema_core::Caps};
+
+#[cfg(not(target_arch = "wasm32"))]
+const PATCH_INPUT_BYTE_CAP: u64 = 64 * 1024 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const PATCH_TARGET_BYTE_CAP: u64 = 256 * 1024 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const PATCH_OUTPUT_BYTE_CAP: u64 = 256 * 1024 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const PATCH_HUNK_CAP: usize = 100_000;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug)]
+struct PatchBounds {
+    patch_bytes: u64,
+    target_bytes: u64,
+    output_bytes: u64,
+    hunks: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const PATCH_RUNTIME_BOUNDS: PatchBounds = PatchBounds {
+    patch_bytes: PATCH_INPUT_BYTE_CAP,
+    target_bytes: PATCH_TARGET_BYTE_CAP,
+    output_bytes: PATCH_OUTPUT_BYTE_CAP,
+    hunks: PATCH_HUNK_CAP,
+};
+
+#[cfg(not(target_arch = "wasm32"))]
+fn check_patch_limit(dimension: &str, actual: u64, limit: u64) -> Result<(), SemaError> {
+    if actual > limit {
+        return Err(SemaError::eval(format!(
+            "patch/apply-file: {dimension} {actual} exceeds the quarantined limit {limit}"
+        ))
+        .with_hint("reduce or split the target and patch"));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn patch_hunk_count(patch: &str) -> usize {
+    patch.lines().filter(|line| line.starts_with("@@")).count()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn patch_added_bytes(patch: &str) -> Result<u64, SemaError> {
+    patch
+        .lines()
+        // Counting file headers too is conservative. Excluding every `+++`
+        // line would undercount a real added line whose content starts `++`.
+        .filter(|line| line.starts_with('+'))
+        .try_fold(0u64, |total, line| {
+            total
+                .checked_add(line.len() as u64)
+                .and_then(|total| total.checked_add(1))
+                .ok_or_else(|| SemaError::eval("patch/apply-file: output byte count overflowed"))
+        })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn check_patch_output_bound(
+    target_bytes: u64,
+    patch: &str,
+    bounds: PatchBounds,
+) -> Result<(), SemaError> {
+    let output_upper_bound = target_bytes
+        .checked_add(patch_added_bytes(patch)?)
+        .ok_or_else(|| SemaError::eval("patch/apply-file: output byte count overflowed"))?;
+    check_patch_limit("output bytes", output_upper_bound, bounds.output_bytes)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct PatchRuntimeInput {
+    file: std::fs::File,
+    bounds: PatchBounds,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn prepare_patch_runtime_input(
+    path: &str,
+    patch: &str,
+    bounds: PatchBounds,
+) -> Result<PatchRuntimeInput, SemaError> {
+    check_patch_limit("patch bytes", patch.len() as u64, bounds.patch_bytes)?;
+    check_patch_limit("hunks", patch_hunk_count(patch) as u64, bounds.hunks as u64)?;
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+    if !metadata.is_file() {
+        return Err(SemaError::eval(format!(
+            "patch/apply-file: target must be a regular file: {path}"
+        )));
+    }
+    check_patch_limit("target bytes", metadata.len(), bounds.target_bytes)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+    let opened = file
+        .metadata()
+        .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+    if !opened.is_file() {
+        return Err(SemaError::eval(format!(
+            "patch/apply-file: target must be a regular file: {path}"
+        )));
+    }
+    check_patch_limit("target bytes", opened.len(), bounds.target_bytes)?;
+    check_patch_output_bound(opened.len(), patch, bounds)?;
+    Ok(PatchRuntimeInput { file, bounds })
+}
 
 /// A single parsed hunk header `@@ -old_start,old_count +new_start,new_count @@`
 /// together with the body lines that follow it.
@@ -479,28 +595,62 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .to_string();
 
         if sema_core::in_runtime_quantum() {
+            let bounds = PATCH_RUNTIME_BOUNDS;
+            let input = prepare_patch_runtime_input(&path, &patch, bounds)?;
             return crate::io::quarantined_compute("patch/apply-file", Value::int, move || {
-                patch_apply_file_work(&path, &patch).map_err(|e| e.to_string())
+                patch_apply_file_work(&path, &patch, Some(input)).map_err(|e| e.to_string())
             });
         }
         Ok(NativeOutcome::Return(Value::int(patch_apply_file_work(
-            &path, &patch,
+            &path, &patch, None,
         )?)))
     });
 }
 
 /// `patch/apply-file`'s actual work: read `path`, apply `patch`'s hunks, write
-/// the patched content back, returning the hunk count. Shared verbatim by the
-/// sync and offloaded-async paths (see `archive.rs`'s module doc for the
-/// offload rationale — `SemaError` never crosses the thread boundary, only
-/// its `.to_string()` rendering does).
+/// the patched content back, returning the hunk count. Runtime callers provide
+/// the bounds captured before dispatch; `SemaError` never crosses the thread
+/// boundary, only its `.to_string()` rendering does.
 #[cfg(not(target_arch = "wasm32"))]
-fn patch_apply_file_work(path: &str, patch: &str) -> Result<i64, SemaError> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+fn patch_apply_file_work(
+    path: &str,
+    patch: &str,
+    input: Option<PatchRuntimeInput>,
+) -> Result<i64, SemaError> {
+    let (content, runtime_file) = if let Some(input) = input {
+        use std::io::Read as _;
+
+        let PatchRuntimeInput { file, bounds } = input;
+        let mut content = String::new();
+        (&file)
+            .take(bounds.target_bytes.saturating_add(1))
+            .read_to_string(&mut content)
+            .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+        check_patch_limit("target bytes", content.len() as u64, bounds.target_bytes)?;
+        check_patch_output_bound(content.len() as u64, patch, bounds)?;
+        (content, Some((file, bounds)))
+    } else {
+        (
+            std::fs::read_to_string(path)
+                .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?,
+            None,
+        )
+    };
     let hunks = parse_hunks(patch);
     let count = hunks.len() as i64;
     let patched = apply_hunks(&content, &hunks)?;
+    if let Some((mut file, bounds)) = runtime_file {
+        use std::io::{Seek as _, Write as _};
+
+        check_patch_limit("output bytes", patched.len() as u64, bounds.output_bytes)?;
+        file.set_len(0)
+            .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+        file.seek(std::io::SeekFrom::Start(0))
+            .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+        file.write_all(patched.as_bytes())
+            .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+        return Ok(count);
+    }
     std::fs::write(path, patched)
         .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
     Ok(count)
@@ -510,6 +660,78 @@ fn patch_apply_file_work(path: &str, patch: &str) -> Result<i64, SemaError> {
 mod tests {
     use super::*;
     use sema_core::{Env, Sandbox};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn patch_quarantine_limit_accepts_boundary_and_rejects_one_over() {
+        assert!(check_patch_limit("patch bytes", 8, 8).is_ok());
+        let error = check_patch_limit("patch bytes", 9, 8)
+            .expect_err("one byte over the captured limit must fail");
+        assert!(error.to_string().contains("9"));
+        assert!(error.to_string().contains("8"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn patch_runtime_input_rejects_non_regular_files() {
+        let path = std::env::temp_dir().join(format!("sema-patch-special-{}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("create special-input directory");
+        let error = prepare_patch_runtime_input(
+            path.to_str().expect("utf-8 temp path"),
+            "@@ -1 +1 @@\n-old\n+new\n",
+            PATCH_RUNTIME_BOUNDS,
+        )
+        .expect_err("directory must not enter the worker queue");
+        let _ = std::fs::remove_dir(&path);
+        assert!(error.to_string().contains("regular file"));
+    }
+
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    #[test]
+    fn patch_runtime_input_rejects_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let path = std::env::temp_dir().join(format!("sema-patch-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        let error = prepare_patch_runtime_input(
+            path.to_str().expect("utf-8 temp path"),
+            "@@ -1 +1 @@\n-old\n+new\n",
+            PATCH_RUNTIME_BOUNDS,
+        )
+        .expect_err("FIFO must not enter the worker queue");
+        let _ = std::fs::remove_file(&path);
+        assert!(error.to_string().contains("regular file"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn patch_worker_rechecks_output_bound_after_open() {
+        let path = std::env::temp_dir().join(format!(
+            "sema-patch-grow-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"").expect("create target");
+        let patch = "@@ -1 +1 @@\n-old\n+new\n";
+        let bounds = PatchBounds {
+            patch_bytes: 64,
+            target_bytes: 8,
+            output_bytes: 8,
+            hunks: 1,
+        };
+        let input =
+            prepare_patch_runtime_input(path.to_str().expect("utf-8 temp path"), patch, bounds)
+                .expect("empty target passes preflight");
+        std::fs::write(&path, b"12345678").expect("grow target after descriptor capture");
+
+        let error =
+            patch_apply_file_work(path.to_str().expect("utf-8 temp path"), patch, Some(input))
+                .expect_err("grown target plus additions must fail before patch construction");
+        let _ = std::fs::remove_file(&path);
+        assert!(error.to_string().contains("output bytes"), "{error}");
+    }
 
     fn make_env() -> Env {
         let env = Env::new();

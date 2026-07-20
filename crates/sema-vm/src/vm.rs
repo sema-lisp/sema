@@ -1,8 +1,10 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::rc::{Rc, Weak};
 
 use smallvec::SmallVec;
+use web_time::Instant;
 
 use sema_core::runtime::{
     multimethod_call, CancellationView, NativeCallContext, NativeContinuation, NativeOutcome,
@@ -12,15 +14,16 @@ use sema_core::{
     bits_to_spur,
     error::{suggest_similar, veteran_hint, CallFrame as CoreCallFrame, StackTrace},
     number::SemaNumber,
-    resolve as resolve_spur, Env, EvalContext, GcEdge, NativeFn, NodePtr, SemaError, Spur, Value,
-    ValueViewRef, NAN_INT_SMALL_PATTERN, NAN_PAYLOAD_BITS, NAN_PAYLOAD_MASK, NAN_TAG_MASK,
-    TAG_NATIVE_FN,
+    resolve as resolve_spur, Env, EnvBindings, EvalContext, GcEdge, NativeFn, NodePtr,
+    OpaqueTraceFn, SemaError, Spur, Value, ValueViewRef, NAN_INT_SMALL_PATTERN, NAN_PAYLOAD_BITS,
+    NAN_PAYLOAD_MASK, NAN_TAG_MASK, TAG_NATIVE_FN,
 };
 
 use crate::chunk::Function;
 use crate::debug::VmPendingOutcome;
 use crate::opcodes::op;
 use crate::opcodes::Op;
+use crate::restricted::{run_program_restricted, RestrictedRunPolicy};
 
 /// Result of dispatching a native through the runtime ABI at a VM call site.
 enum NativeDispatchResult {
@@ -49,6 +52,9 @@ impl VmNativeSignal {
 }
 
 const DEBUG_VALUE_REF_BASE: u64 = crate::debug::DEBUG_VALUE_REF_BASE;
+const DEBUG_EVALUATION_INSTRUCTION_LIMIT: usize = 100_000;
+const DEBUG_EVALUATION_TRANSITION_LIMIT: usize = 10_000;
+const DEBUG_EVALUATION_SNAPSHOT_NODE_LIMIT: usize = 100_000;
 
 /// Outcome of [`VM::handle_debug_stop`]: whether the caller should resume
 /// execution (step mode already set per the resume command) or terminate the
@@ -974,6 +980,611 @@ struct EscapingValueWalker<'a> {
     owner_vm: Option<&'a VM>,
 }
 
+/// Original paused-frame upvalue states retained while a debugger scratch VM
+/// runs. Rejected expressions restore these cells before the owner resumes;
+/// successful expressions keep their writes and synchronize tracked locals.
+struct DebugUpvalueRollback {
+    seen: HashSet<*const UpvalueCell>,
+    entries: Vec<(Rc<UpvalueCell>, DebugUpvalueRollbackState)>,
+}
+
+enum DebugUpvalueRollbackState {
+    Closed(Value),
+    Tracked {
+        frame_base: usize,
+        slot: usize,
+        value: Value,
+    },
+}
+
+impl DebugUpvalueRollback {
+    fn new() -> Self {
+        Self {
+            seen: HashSet::new(),
+            entries: Vec::new(),
+        }
+    }
+
+    fn capture_owner_frames(
+        &mut self,
+        owner_vm: &VM,
+        budget: &mut DebugTraversalBudget,
+    ) -> Result<(), SemaError> {
+        for frame in &owner_vm.frames {
+            if let Some(open_upvalues) = &frame.open_upvalues {
+                for cell in open_upvalues.iter().flatten() {
+                    if self.capture_cell(cell) {
+                        budget.reserve_node()?;
+                    }
+                }
+            }
+            for cell in &frame.closure.upvalues {
+                if self.capture_cell(cell) {
+                    budget.reserve_node()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_cell(&mut self, cell: &Rc<UpvalueCell>) -> bool {
+        let state = cell.state.borrow();
+        if matches!(&*state, UpvalueState::Open { .. }) || !self.seen.insert(Rc::as_ptr(cell)) {
+            return false;
+        }
+        let original = match &*state {
+            UpvalueState::Open { .. } => unreachable!("open cells are not rollback-owned"),
+            UpvalueState::Closed(value) => DebugUpvalueRollbackState::Closed(value.clone()),
+            UpvalueState::Tracked {
+                frame_base,
+                slot,
+                value,
+            } => DebugUpvalueRollbackState::Tracked {
+                frame_base: *frame_base,
+                slot: *slot,
+                value: value.clone(),
+            },
+        };
+        drop(state);
+        self.entries.push((Rc::clone(cell), original));
+        true
+    }
+
+    fn restore(self) {
+        for (cell, original) in self.entries {
+            *cell.state.borrow_mut() = match original {
+                DebugUpvalueRollbackState::Closed(value) => UpvalueState::Closed(value),
+                DebugUpvalueRollbackState::Tracked {
+                    frame_base,
+                    slot,
+                    value,
+                } => UpvalueState::Tracked {
+                    frame_base,
+                    slot,
+                    value,
+                },
+            };
+        }
+    }
+}
+
+struct DebugTraversalBudget {
+    nodes_remaining: usize,
+    ordinary_edges_remaining: usize,
+    cancellation: CancellationView,
+    deadline: Option<Instant>,
+}
+
+impl DebugTraversalBudget {
+    fn new(cancellation: CancellationView, deadline: Option<Instant>) -> Self {
+        Self {
+            nodes_remaining: DEBUG_EVALUATION_SNAPSHOT_NODE_LIMIT,
+            ordinary_edges_remaining: DEBUG_EVALUATION_SNAPSHOT_NODE_LIMIT,
+            cancellation,
+            deadline,
+        }
+    }
+
+    fn reserve_node(&mut self) -> Result<(), SemaError> {
+        self.check_boundary()?;
+        if self.nodes_remaining == 0 {
+            return Err(SemaError::eval(
+                "debug evaluation exceeded snapshot node limit",
+            ));
+        }
+        self.nodes_remaining -= 1;
+        Ok(())
+    }
+
+    fn reserve_ordinary_edges(&mut self, count: usize) -> Result<(), SemaError> {
+        self.check_boundary()?;
+        if count > self.ordinary_edges_remaining {
+            return Err(SemaError::eval(
+                "debug evaluation exceeded snapshot node limit",
+            ));
+        }
+        self.ordinary_edges_remaining -= count;
+        Ok(())
+    }
+
+    fn check_boundary(&self) -> Result<(), SemaError> {
+        if self.cancellation.is_requested() {
+            return Err(SemaError::eval("debug evaluation was cancelled"));
+        }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(SemaError::eval("debug evaluation exceeded deadline"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DebugGraphMode {
+    CaptureRollback,
+    SnapshotOwner,
+}
+
+enum DebugGraphWork {
+    Value(Value),
+    Closure(Rc<Closure>),
+    Env(Rc<Env>),
+    EnvBindings(Rc<EnvBindings>),
+    Function(Rc<Function>),
+    FunctionTable(Rc<Vec<Rc<Function>>>),
+    Opaque {
+        ptr: NodePtr,
+        trace: OpaqueTraceFn,
+        keepalive: Value,
+    },
+}
+
+enum DebugVariableTarget {
+    Local {
+        frame_id: usize,
+        slot: usize,
+        stack_index: usize,
+    },
+    Upvalue {
+        frame_id: usize,
+        cell: Rc<UpvalueCell>,
+    },
+}
+
+impl DebugVariableTarget {
+    fn frame_id(&self) -> usize {
+        match self {
+            Self::Local { frame_id, .. } | Self::Upvalue { frame_id, .. } => *frame_id,
+        }
+    }
+}
+
+/// Iterative traversal of values reachable by debugger evaluation. Scheduled
+/// graph state and ordinary container/environment fanout are bounded; opaque
+/// payload and runtime-interior tracers are boundary-checked edge by edge, but
+/// their callback API cannot abort enumeration partway through one tracer.
+/// Rollback capture is rooted only in stopped-frame bindings; owner snapshotting
+/// separately follows globals and closure homes so foreign execution is safe
+/// without making unrelated global state transactional.
+struct DebugValueGraphWalker<'owner, 'state> {
+    owner_vm: &'owner VM,
+    mode: DebugGraphMode,
+    rollback: Option<&'state mut DebugUpvalueRollback>,
+    budget: &'state mut DebugTraversalBudget,
+    work: Vec<DebugGraphWork>,
+    visited_values: HashSet<NodePtr>,
+    visited_closures: HashSet<*const Closure>,
+    visited_envs: HashSet<NodePtr>,
+    visited_opaque: HashSet<NodePtr>,
+    visited_functions: HashSet<*const Function>,
+    visited_function_tables: HashSet<*const Vec<Rc<Function>>>,
+}
+
+impl<'owner, 'state> DebugValueGraphWalker<'owner, 'state> {
+    fn capture_stopped_bindings(
+        owner_vm: &'owner VM,
+        env: &Env,
+        rollback: &'state mut DebugUpvalueRollback,
+        budget: &'state mut DebugTraversalBudget,
+    ) -> Result<(), SemaError> {
+        let mut walker = Self::new(
+            owner_vm,
+            DebugGraphMode::CaptureRollback,
+            Some(rollback),
+            budget,
+        );
+        let bindings = env
+            .bindings
+            .try_borrow()
+            .map_err(|_| SemaError::eval("debug evaluation could not inspect a borrowed value"))?;
+        walker.budget.reserve_ordinary_edges(bindings.len())?;
+        for value in bindings.values() {
+            walker.schedule_value(value.clone())?;
+        }
+        drop(bindings);
+        walker.run()
+    }
+
+    fn snapshot_reachable(
+        owner_vm: &'owner VM,
+        env: Rc<Env>,
+        budget: &'state mut DebugTraversalBudget,
+    ) -> Result<(), SemaError> {
+        let mut walker = Self::new(owner_vm, DebugGraphMode::SnapshotOwner, None, budget);
+        walker.schedule_env(env)?;
+        walker.run()
+    }
+
+    fn new(
+        owner_vm: &'owner VM,
+        mode: DebugGraphMode,
+        rollback: Option<&'state mut DebugUpvalueRollback>,
+        budget: &'state mut DebugTraversalBudget,
+    ) -> Self {
+        Self {
+            owner_vm,
+            mode,
+            rollback,
+            budget,
+            work: Vec::new(),
+            visited_values: HashSet::new(),
+            visited_closures: HashSet::new(),
+            visited_envs: HashSet::new(),
+            visited_opaque: HashSet::new(),
+            visited_functions: HashSet::new(),
+            visited_function_tables: HashSet::new(),
+        }
+    }
+
+    fn run(&mut self) -> Result<(), SemaError> {
+        while let Some(work) = self.work.pop() {
+            match work {
+                DebugGraphWork::Value(value) => self.visit_value(value)?,
+                DebugGraphWork::Closure(closure) => self.visit_closure(closure)?,
+                DebugGraphWork::Env(env) => self.visit_env(env)?,
+                DebugGraphWork::EnvBindings(bindings) => self.visit_env_bindings(bindings)?,
+                DebugGraphWork::Function(function) => self.visit_function(function)?,
+                DebugGraphWork::FunctionTable(functions) => self.visit_function_table(functions)?,
+                DebugGraphWork::Opaque {
+                    ptr,
+                    trace,
+                    keepalive,
+                } => self.visit_opaque(ptr, trace, keepalive)?,
+            }
+        }
+        self.budget.check_boundary()
+    }
+
+    fn schedule_value(&mut self, value: Value) -> Result<(), SemaError> {
+        if NodePtr::of_value(&value).is_some_and(|node| !self.visited_values.insert(node)) {
+            return Ok(());
+        }
+        self.budget.reserve_node()?;
+        self.work.push(DebugGraphWork::Value(value));
+        Ok(())
+    }
+
+    fn schedule_closure(&mut self, closure: Rc<Closure>) -> Result<(), SemaError> {
+        if !self
+            .visited_closures
+            .insert(std::ptr::from_ref(closure.as_ref()))
+        {
+            return Ok(());
+        }
+        self.budget.reserve_node()?;
+        self.work.push(DebugGraphWork::Closure(closure));
+        Ok(())
+    }
+
+    fn schedule_env(&mut self, env: Rc<Env>) -> Result<(), SemaError> {
+        if !self
+            .visited_envs
+            .insert(NodePtr::of_env_bindings(env.as_ref()))
+        {
+            return Ok(());
+        }
+        self.budget.reserve_node()?;
+        self.work.push(DebugGraphWork::Env(env));
+        Ok(())
+    }
+
+    fn schedule_env_bindings(&mut self, bindings: Rc<EnvBindings>) -> Result<(), SemaError> {
+        let node = NodePtr::of_rc(&bindings);
+        if !self.visited_envs.insert(node) {
+            return Ok(());
+        }
+        self.budget.reserve_node()?;
+        self.work.push(DebugGraphWork::EnvBindings(bindings));
+        Ok(())
+    }
+
+    fn schedule_opaque(
+        &mut self,
+        ptr: NodePtr,
+        trace: OpaqueTraceFn,
+        keepalive: Value,
+    ) -> Result<(), SemaError> {
+        if !self.visited_opaque.insert(ptr) {
+            return Ok(());
+        }
+        self.budget.reserve_node()?;
+        self.work.push(DebugGraphWork::Opaque {
+            ptr,
+            trace,
+            keepalive,
+        });
+        Ok(())
+    }
+
+    fn schedule_function(&mut self, function: Rc<Function>) -> Result<(), SemaError> {
+        if !self
+            .visited_functions
+            .insert(std::ptr::from_ref(function.as_ref()))
+        {
+            return Ok(());
+        }
+        self.budget.reserve_node()?;
+        self.work.push(DebugGraphWork::Function(function));
+        Ok(())
+    }
+
+    fn schedule_function_table(
+        &mut self,
+        functions: Rc<Vec<Rc<Function>>>,
+    ) -> Result<(), SemaError> {
+        if !self.visited_function_tables.insert(Rc::as_ptr(&functions)) {
+            return Ok(());
+        }
+        self.budget.reserve_node()?;
+        self.work.push(DebugGraphWork::FunctionTable(functions));
+        Ok(())
+    }
+
+    fn visit_value(&mut self, value: Value) -> Result<(), SemaError> {
+        if let Some((closure, functions, _native_fns)) = extract_vm_closure(&value) {
+            self.schedule_closure(closure)?;
+            self.schedule_function_table(functions)?;
+        }
+
+        let ordinary_edge_count = Self::ordinary_value_edge_count(&value)?;
+        if let Some(count) = ordinary_edge_count {
+            self.budget.reserve_ordinary_edges(count)?;
+        }
+        let keepalive = value.clone();
+        let mut schedule_error = None;
+        let complete = sema_core::trace_value(&value, &mut |edge| {
+            if schedule_error.is_none() {
+                if ordinary_edge_count.is_none() {
+                    schedule_error = self.budget.reserve_ordinary_edges(1).err();
+                }
+                if schedule_error.is_none() {
+                    schedule_error = self.schedule_gc_edge(edge, &keepalive).err();
+                }
+            }
+        });
+        if !complete {
+            return Err(SemaError::eval(
+                "debug evaluation could not inspect a borrowed value",
+            ));
+        }
+        match schedule_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn ordinary_value_edge_count(value: &Value) -> Result<Option<usize>, SemaError> {
+        let borrowed_error =
+            || SemaError::eval("debug evaluation could not inspect a borrowed value");
+        let count = match value.view_ref() {
+            ValueViewRef::List(items) | ValueViewRef::Vector(items) => Some(items.len()),
+            ValueViewRef::Map(map) => Some(map.len().saturating_mul(2)),
+            ValueViewRef::HashMap(map) => Some(map.len().saturating_mul(2)),
+            ValueViewRef::Record(record) => Some(record.fields.len()),
+            ValueViewRef::ToolDef(_) => Some(2),
+            ValueViewRef::Agent(agent) => Some(agent.tools.len()),
+            ValueViewRef::Thunk(thunk) => {
+                let forced = thunk.forced.try_borrow().map_err(|_| borrowed_error())?;
+                Some(1 + usize::from(forced.is_some()))
+            }
+            ValueViewRef::MutableArray(array) => {
+                let items = array.items.try_borrow().map_err(|_| borrowed_error())?;
+                Some(items.len())
+            }
+            ValueViewRef::MutableCell(cell) => {
+                cell.value.try_borrow().map_err(|_| borrowed_error())?;
+                Some(1)
+            }
+            ValueViewRef::MultiMethod(multimethod) => {
+                let methods = multimethod
+                    .methods
+                    .try_borrow()
+                    .map_err(|_| borrowed_error())?;
+                let default = multimethod
+                    .default
+                    .try_borrow()
+                    .map_err(|_| borrowed_error())?;
+                Some(
+                    1usize
+                        .saturating_add(methods.len().saturating_mul(2))
+                        .saturating_add(usize::from(default.is_some())),
+                )
+            }
+            ValueViewRef::Macro(expander) => Some(
+                expander.body.len().saturating_add(
+                    expander
+                        .syntax_rules
+                        .as_ref()
+                        .map_or(0, |rules| rules.rules.len().saturating_mul(2)),
+                ),
+            ),
+            ValueViewRef::Lambda(lambda) => Some(
+                lambda
+                    .body
+                    .len()
+                    .saturating_add(1)
+                    .saturating_add(usize::from(lambda.env.parent.is_some())),
+            ),
+            ValueViewRef::AsyncPromise(_)
+            | ValueViewRef::Channel(_)
+            | ValueViewRef::NativeFn(_) => None,
+            _ => Some(0),
+        };
+        Ok(count)
+    }
+
+    fn schedule_gc_edge(&mut self, edge: GcEdge<'_>, keepalive: &Value) -> Result<(), SemaError> {
+        match edge {
+            GcEdge::Value(value) => self.schedule_value(value.clone()),
+            GcEdge::Env(env) if self.mode == DebugGraphMode::SnapshotOwner => {
+                self.schedule_env(Rc::clone(env))
+            }
+            GcEdge::EnvBindings(bindings) if self.mode == DebugGraphMode::SnapshotOwner => {
+                self.schedule_env_bindings(Rc::clone(bindings))
+            }
+            GcEdge::Env(_) | GcEdge::EnvBindings(_) => Ok(()),
+            GcEdge::Opaque { ptr, trace, .. } => {
+                self.schedule_opaque(ptr, trace, keepalive.clone())
+            }
+        }
+    }
+
+    fn visit_closure(&mut self, closure: Rc<Closure>) -> Result<(), SemaError> {
+        self.schedule_function(Rc::clone(&closure.func))?;
+        if let Some(functions) = &closure.functions {
+            self.schedule_function_table(Rc::clone(functions))?;
+        }
+        for cell in &closure.upvalues {
+            let state = cell.state.borrow();
+            let next = match &*state {
+                UpvalueState::Open { frame_base, slot } => {
+                    let open = (*frame_base, *slot);
+                    drop(state);
+                    let Some(value) = self.owner_open_value(cell, open.0, open.1) else {
+                        continue;
+                    };
+                    if self.mode == DebugGraphMode::SnapshotOwner {
+                        *cell.state.borrow_mut() = UpvalueState::Tracked {
+                            frame_base: open.0,
+                            slot: open.1,
+                            value: value.clone(),
+                        };
+                    }
+                    value
+                }
+                UpvalueState::Closed(value) | UpvalueState::Tracked { value, .. } => {
+                    let value = value.clone();
+                    drop(state);
+                    if let Some(rollback) = self.rollback.as_deref_mut() {
+                        rollback.capture_cell(cell);
+                    }
+                    value
+                }
+            };
+            self.schedule_value(next)?;
+        }
+        if self.mode == DebugGraphMode::SnapshotOwner {
+            if let Some(globals) = &closure.globals {
+                self.schedule_env(Rc::clone(globals))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_env(&mut self, env: Rc<Env>) -> Result<(), SemaError> {
+        debug_assert_eq!(self.mode, DebugGraphMode::SnapshotOwner);
+        let bindings = env
+            .bindings
+            .try_borrow()
+            .map_err(|_| SemaError::eval("debug evaluation could not inspect a borrowed value"))?;
+        self.budget.reserve_ordinary_edges(bindings.len())?;
+        for value in bindings.values() {
+            self.schedule_value(value.clone())?;
+        }
+        drop(bindings);
+        if let Some(parent) = &env.parent {
+            self.schedule_env(Rc::clone(parent))?;
+        }
+        Ok(())
+    }
+
+    fn visit_env_bindings(&mut self, bindings: Rc<EnvBindings>) -> Result<(), SemaError> {
+        let bindings = bindings
+            .try_borrow()
+            .map_err(|_| SemaError::eval("debug evaluation could not inspect a borrowed value"))?;
+        self.budget.reserve_ordinary_edges(bindings.len())?;
+        for value in bindings.values() {
+            self.schedule_value(value.clone())?;
+        }
+        Ok(())
+    }
+
+    fn visit_function(&mut self, function: Rc<Function>) -> Result<(), SemaError> {
+        self.budget
+            .reserve_ordinary_edges(function.chunk.consts.len())?;
+        for value in &function.chunk.consts {
+            self.schedule_value(value.clone())?;
+        }
+        Ok(())
+    }
+
+    fn visit_function_table(&mut self, functions: Rc<Vec<Rc<Function>>>) -> Result<(), SemaError> {
+        self.budget.reserve_ordinary_edges(functions.len())?;
+        for function in functions.iter() {
+            self.schedule_function(Rc::clone(function))?;
+        }
+        Ok(())
+    }
+
+    fn visit_opaque(
+        &mut self,
+        ptr: NodePtr,
+        trace: OpaqueTraceFn,
+        keepalive: Value,
+    ) -> Result<(), SemaError> {
+        let mut trace_error = None;
+        let complete = trace(ptr, &mut |edge| {
+            if trace_error.is_none() {
+                trace_error = self.budget.reserve_ordinary_edges(1).err();
+                if trace_error.is_none() {
+                    trace_error = self.schedule_gc_edge(edge, &keepalive).err();
+                }
+            }
+        });
+        if !complete {
+            return Err(SemaError::eval(
+                "debug evaluation could not inspect a borrowed value",
+            ));
+        }
+        match trace_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn owner_open_value(
+        &self,
+        cell: &Rc<UpvalueCell>,
+        frame_base: usize,
+        slot: usize,
+    ) -> Option<Value> {
+        let owns_cell = self.owner_vm.frames.iter().any(|frame| {
+            frame.base == frame_base
+                && frame
+                    .open_upvalues
+                    .as_ref()
+                    .and_then(|open| open.get(slot))
+                    .and_then(Option::as_ref)
+                    .is_some_and(|candidate| Rc::ptr_eq(candidate, cell))
+        });
+        owns_cell
+            .then(|| self.owner_vm.stack.get(frame_base + slot).cloned())
+            .flatten()
+    }
+}
+
 impl<'a> EscapingValueWalker<'a> {
     fn new(owner_vm: Option<&'a VM>) -> Self {
         Self {
@@ -1547,22 +2158,13 @@ impl VM {
                     value_expression,
                     reply,
                 }) => {
-                    let result = match crate::debug::decode_scope_ref(variables_reference) {
-                        Some(crate::debug::ScopeKind::Locals(frame_id))
-                        | Some(crate::debug::ScopeKind::Upvalues(frame_id)) => {
-                            sema_reader::read(&value_expression)
-                                .map_err(|e| e.to_string())
-                                .and_then(|expr| {
-                                    self.debug_evaluate(frame_id, &expr, ctx, debug)
-                                        .map_err(|e| e.to_string())
-                                })
-                                .and_then(|value| {
-                                    self.debug_set_variable(variables_reference, &name, value)
-                                        .map_err(|e| e.to_string())
-                                })
-                        }
-                        None => Err("setVariable: invalid variablesReference".to_string()),
-                    };
+                    let result = self.debug_set_variable_expression(
+                        variables_reference,
+                        &name,
+                        &value_expression,
+                        ctx,
+                        debug,
+                    );
                     let _ = reply.send(result);
                 }
                 Ok(crate::debug::DebugCommand::Disconnect) => {
@@ -4843,7 +5445,7 @@ impl VM {
     /// bad condition surfaces to the user rather than silently swallowing the
     /// breakpoint.
     fn debug_condition_allows_stop(
-        &self,
+        &mut self,
         file: Option<&std::path::PathBuf>,
         line: u32,
         debug: &crate::debug::DebugState,
@@ -4870,26 +5472,67 @@ impl VM {
     }
 
     pub fn debug_evaluate(
-        &self,
+        &mut self,
         frame_id: usize,
         expr: &Value,
         ctx: &EvalContext,
         _debug: &crate::debug::DebugState,
     ) -> Result<Value, SemaError> {
         let env = self.debug_env_for_frame(frame_id)?;
-        match sema_core::eval_callback(ctx, expr, &env) {
-            Ok(value) => Ok(value),
-            Err(_) if ctx.eval_fn.get().is_none() => {
-                let prog = compile_program(std::slice::from_ref(expr), None)?;
-                let mut vm = VM::new(
-                    env,
-                    prog.functions,
-                    &prog.native_table,
-                    prog.main_cache_slots,
-                )?;
-                vm.execute(prog.closure, ctx)
+        let cancellation = self.quantum_cancellation.clone();
+        let deadline = ctx.eval_deadline.get();
+        let task_context = ctx.task_context().unwrap_or_default();
+        let mut traversal_budget = DebugTraversalBudget::new(cancellation.clone(), deadline);
+        let mut rollback = DebugUpvalueRollback::new();
+        DebugValueGraphWalker::capture_stopped_bindings(
+            self,
+            &env,
+            &mut rollback,
+            &mut traversal_budget,
+        )?;
+        DebugValueGraphWalker::snapshot_reachable(self, Rc::clone(&env), &mut traversal_budget)?;
+        rollback.capture_owner_frames(self, &mut traversal_budget)?;
+        traversal_budget.check_boundary()?;
+        let native_context = NativeCallContext {
+            eval_context: ctx,
+            task_context: task_context.clone(),
+            call_env: Some(Rc::clone(&env)),
+            cancellation: cancellation.clone(),
+        };
+        let result = (|| {
+            let expanded = sema_core::try_macro_expand_callback(&native_context, expr, &env)
+                .transpose()?
+                .unwrap_or_else(|| expr.clone());
+            if expanded.is_nil() {
+                return Ok(Value::nil());
             }
-            Err(err) => Err(err),
+            let program = compile_program(std::slice::from_ref(&expanded), None)?;
+            run_program_restricted(
+                ctx,
+                task_context,
+                program,
+                env,
+                RestrictedRunPolicy {
+                    operation: "debug evaluation",
+                    suspension_error: "debug evaluation cannot suspend",
+                    instruction_limit: NonZeroUsize::new(DEBUG_EVALUATION_INSTRUCTION_LIMIT)
+                        .expect("debug evaluation instruction limit is nonzero"),
+                    transition_limit: NonZeroUsize::new(DEBUG_EVALUATION_TRANSITION_LIMIT)
+                        .expect("debug evaluation transition limit is nonzero"),
+                    deadline,
+                    cancellation,
+                },
+            )
+        })();
+        match result {
+            Ok(value) => {
+                self.sync_tracked_upvalues_to_stack();
+                Ok(value)
+            }
+            Err(error) => {
+                rollback.restore();
+                Err(error)
+            }
         }
     }
 
@@ -4899,17 +5542,150 @@ impl VM {
         name: &str,
         value: Value,
     ) -> Result<crate::debug::DapVariable, SemaError> {
+        let target = self.resolve_debug_variable_target(variables_reference, name)?;
+        self.write_debug_variable_target(target, name, value)
+    }
+
+    fn debug_set_variable_expression(
+        &mut self,
+        variables_reference: u64,
+        name: &str,
+        value_expression: &str,
+        ctx: &EvalContext,
+        debug: &crate::debug::DebugState,
+    ) -> Result<crate::debug::DapVariable, String> {
+        let target = self
+            .resolve_debug_variable_target(variables_reference, name)
+            .map_err(|error| error.to_string())?;
+        let expression = sema_reader::read(value_expression).map_err(|error| error.to_string())?;
+        let value = self
+            .debug_evaluate(target.frame_id(), &expression, ctx, debug)
+            .map_err(|error| error.to_string())?;
+        self.write_debug_variable_target(target, name, value)
+            .map_err(|error| error.to_string())
+    }
+
+    fn resolve_debug_variable_target(
+        &self,
+        variables_reference: u64,
+        name: &str,
+    ) -> Result<DebugVariableTarget, SemaError> {
         match crate::debug::decode_scope_ref(variables_reference) {
             Some(crate::debug::ScopeKind::Locals(frame_id)) => {
-                self.debug_set_local(frame_id, name, value)
+                let Some(slot) = self.in_scope_local_slot(frame_id, name) else {
+                    return Err(SemaError::eval(format!(
+                        "setVariable: local '{name}' not found"
+                    )));
+                };
+                let frame = self.frames.get(frame_id).ok_or_else(|| {
+                    SemaError::eval(format!("setVariable: invalid frame id {frame_id}"))
+                })?;
+                let stack_index = frame.base + usize::from(slot);
+                if self.stack.get(stack_index).is_none() {
+                    return Err(SemaError::eval(format!(
+                        "setVariable: local '{name}' is out of range"
+                    )));
+                }
+                Ok(DebugVariableTarget::Local {
+                    frame_id,
+                    slot: usize::from(slot),
+                    stack_index,
+                })
             }
             Some(crate::debug::ScopeKind::Upvalues(frame_id)) => {
-                self.debug_set_upvalue(frame_id, name, value)
+                let frame = self.frames.get(frame_id).ok_or_else(|| {
+                    SemaError::eval(format!("setVariable: invalid frame id {frame_id}"))
+                })?;
+                let index = if let Some(index) = name
+                    .strip_prefix("upvalue_")
+                    .and_then(|suffix| suffix.parse::<usize>().ok())
+                {
+                    index
+                } else if let Some(index) = frame
+                    .closure
+                    .func
+                    .upvalue_names
+                    .iter()
+                    .position(|spur| sema_core::resolve(*spur) == name)
+                {
+                    index
+                } else {
+                    return Err(SemaError::eval(format!(
+                        "setVariable: upvalue '{name}' not found"
+                    )));
+                };
+                let Some(cell) = frame.closure.upvalues.get(index).cloned() else {
+                    return Err(SemaError::eval(format!(
+                        "setVariable: upvalue '{name}' not found"
+                    )));
+                };
+                if let UpvalueState::Open { frame_base, slot } = &*cell.state.borrow() {
+                    if self.stack.get(*frame_base + *slot).is_none() {
+                        return Err(SemaError::eval(format!(
+                            "setVariable: upvalue '{name}' is out of range"
+                        )));
+                    }
+                }
+                Ok(DebugVariableTarget::Upvalue { frame_id, cell })
             }
             None => Err(SemaError::eval(
                 "setVariable: invalid variablesReference".to_string(),
             )),
         }
+    }
+
+    fn write_debug_variable_target(
+        &mut self,
+        target: DebugVariableTarget,
+        name: &str,
+        value: Value,
+    ) -> Result<crate::debug::DapVariable, SemaError> {
+        match target {
+            DebugVariableTarget::Local {
+                frame_id,
+                slot,
+                stack_index,
+            } => {
+                let Some(slot_value) = self.stack.get_mut(stack_index) else {
+                    return Err(SemaError::eval(format!(
+                        "setVariable: local '{name}' is out of range"
+                    )));
+                };
+                *slot_value = value.clone();
+                self.propagate_local_store_to_tracked(frame_id, slot, &value);
+            }
+            DebugVariableTarget::Upvalue { cell, .. } => {
+                let wrote_tracked = {
+                    let mut state = cell.state.borrow_mut();
+                    match &mut *state {
+                        UpvalueState::Closed(slot_value) => {
+                            *slot_value = value.clone();
+                            false
+                        }
+                        UpvalueState::Tracked {
+                            value: tracked_value,
+                            ..
+                        } => {
+                            *tracked_value = value.clone();
+                            true
+                        }
+                        UpvalueState::Open { frame_base, slot } => {
+                            let Some(slot_value) = self.stack.get_mut(*frame_base + *slot) else {
+                                return Err(SemaError::eval(format!(
+                                    "setVariable: upvalue '{name}' is out of range"
+                                )));
+                            };
+                            *slot_value = value.clone();
+                            false
+                        }
+                    }
+                };
+                if wrote_tracked {
+                    self.sync_tracked_upvalues_to_stack();
+                }
+            }
+        }
+        Ok(self.debug_value_to_variable(name, value))
     }
 
     fn span_at_pc(&self, frame: &CallFrame) -> (u64, u64) {
@@ -4969,20 +5745,6 @@ impl VM {
         }
     }
 
-    fn debug_set_local(
-        &mut self,
-        frame_id: usize,
-        name: &str,
-        value: Value,
-    ) -> Result<crate::debug::DapVariable, SemaError> {
-        let Some(slot) = self.in_scope_local_slot(frame_id, name) else {
-            return Err(SemaError::eval(format!(
-                "setVariable: local '{name}' not found"
-            )));
-        };
-        self.debug_set_local_slot(frame_id, slot, name, value)
-    }
-
     /// Write `value` to a specific local `slot` of the frame, resolving the
     /// stack index from the frame base. The caller has already mapped the name
     /// to the pc-active slot (so shadowed locals write the binding actually in
@@ -5006,6 +5768,7 @@ impl VM {
             )));
         };
         *slot_value = value.clone();
+        self.propagate_local_store_to_tracked(frame_id, slot as usize, &value);
         Ok(self.debug_value_to_variable(name, value))
     }
 
@@ -5043,17 +5806,19 @@ impl VM {
             )));
         };
 
-        {
+        let wrote_tracked = {
             let mut state = upvalue.state.borrow_mut();
             match &mut *state {
                 UpvalueState::Closed(slot_value) => {
                     *slot_value = value.clone();
+                    false
                 }
                 UpvalueState::Tracked {
                     value: tracked_value,
                     ..
                 } => {
                     *tracked_value = value.clone();
+                    true
                 }
                 UpvalueState::Open { frame_base, slot } => {
                     let Some(slot_value) = self.stack.get_mut(*frame_base + *slot) else {
@@ -5062,8 +5827,12 @@ impl VM {
                         )));
                     };
                     *slot_value = value.clone();
+                    false
                 }
             }
+        };
+        if wrote_tracked {
+            self.sync_tracked_upvalues_to_stack();
         }
 
         Ok(self.debug_value_to_variable(name, value))
@@ -5833,7 +6602,168 @@ pub fn program_as_callable(prog: CompiledProgram, home: Rc<Env>) -> Result<Value
 mod tests {
     use super::*;
     use crate::chunk::{Chunk, Function};
-    use sema_core::{intern, NativeFn};
+    use sema_core::runtime::{
+        NativeCall, NativeSuspend, TaskContextHandle, TaskLocalValue, WaitKind,
+    };
+    use sema_core::{intern, MultiMethod, NativeFn};
+    use std::any::Any;
+    use std::time::Duration;
+
+    struct DebugIdentityContinuation;
+
+    impl Trace for DebugIdentityContinuation {
+        fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+            true
+        }
+    }
+
+    impl NativeContinuation for DebugIdentityContinuation {
+        fn resume(
+            self: Box<Self>,
+            _context: &mut NativeCallContext<'_>,
+            input: ResumeInput,
+        ) -> NativeResult {
+            match input {
+                ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+                ResumeInput::Failed(error) => Err(error),
+                ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                    "debug identity continuation was cancelled ({reason:?})"
+                ))),
+                ResumeInput::Runtime(_) => Err(SemaError::eval(
+                    "debug identity continuation received an unexpected runtime response",
+                )),
+            }
+        }
+    }
+
+    struct DebugHandlerPayload {
+        handler: RefCell<Value>,
+    }
+
+    fn debug_handler_payload_tracer(
+        payload: &Rc<dyn Any>,
+        sink: &mut dyn FnMut(GcEdge<'_>),
+    ) -> bool {
+        sink(GcEdge::Opaque {
+            ptr: NodePtr::of_rc(payload),
+            strong_count: Rc::strong_count(payload),
+            trace: trace_debug_handler_payload,
+            sever: sever_debug_handler_payload,
+        });
+        true
+    }
+
+    fn trace_debug_handler_payload(ptr: NodePtr, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        // SAFETY: the NativeFn Value retained by the debugger work item owns
+        // this payload allocation for the complete opaque traversal.
+        let payload = unsafe { &*(ptr.raw() as *const DebugHandlerPayload) };
+        let Ok(handler) = payload.handler.try_borrow() else {
+            return false;
+        };
+        sink(GcEdge::Value(&handler));
+        true
+    }
+
+    fn sever_debug_handler_payload(ptr: NodePtr) -> Option<Value> {
+        // SAFETY: see `trace_debug_handler_payload`; this hook is present only
+        // to satisfy the collector edge contract and is not called by the
+        // debugger walker.
+        let payload = unsafe { &*(ptr.raw() as *const DebugHandlerPayload) };
+        payload
+            .handler
+            .try_borrow_mut()
+            .ok()
+            .map(|mut handler| std::mem::replace(&mut *handler, Value::nil()))
+    }
+
+    fn invoke_debug_handler(
+        payload: &DebugHandlerPayload,
+        _context: &mut NativeCallContext<'_>,
+        args: &[Value],
+    ) -> NativeResult {
+        Ok(NativeOutcome::Call(NativeCall {
+            callable: payload.handler.borrow().clone(),
+            args: args.to_vec(),
+            continuation: Box::new(DebugIdentityContinuation),
+        }))
+    }
+
+    fn debug_handler_value(handler: Value) -> Value {
+        sema_core::register_payload_tracer(
+            std::any::TypeId::of::<DebugHandlerPayload>(),
+            debug_handler_payload_tracer,
+        );
+        Value::native_fn(NativeFn::with_payload_result(
+            "debug-handler",
+            Rc::new(DebugHandlerPayload {
+                handler: RefCell::new(handler),
+            }),
+            invoke_debug_handler,
+        ))
+    }
+
+    fn debug_macro_probe(
+        _context: &NativeCallContext<'_>,
+        expression: &Value,
+        env: &Env,
+    ) -> Result<Value, SemaError> {
+        let Some(items) = expression.as_list() else {
+            return Ok(expression.clone());
+        };
+        let Some(head) = items.first().and_then(Value::as_symbol_spur) else {
+            return Ok(expression.clone());
+        };
+        match sema_core::resolve(head).as_str() {
+            "debug-expand-value" => Ok(Value::int(42)),
+            "debug-expand-fail" => {
+                mutate_debug_macro_owner_cell(env)?;
+                Err(SemaError::eval("debug macro expansion failed"))
+            }
+            "debug-expand-compile-fail" => {
+                mutate_debug_macro_owner_cell(env)?;
+                sema_reader::read("(if)")
+            }
+            _ => Ok(expression.clone()),
+        }
+    }
+
+    fn mutate_debug_macro_owner_cell(env: &Env) -> Result<(), SemaError> {
+        let mutator = env
+            .get(intern("mutate-captured"))
+            .ok_or_else(|| SemaError::eval("debug macro mutator is missing"))?;
+        let (closure, _, _) = extract_vm_closure(&mutator)
+            .ok_or_else(|| SemaError::eval("debug macro mutator is not a VM closure"))?;
+        let cell = closure
+            .upvalues
+            .first()
+            .ok_or_else(|| SemaError::eval("debug macro mutator has no upvalue"))?;
+        let mut state = cell.state.borrow_mut();
+        let UpvalueState::Tracked { value, .. } = &mut *state else {
+            return Err(SemaError::eval(
+                "debug macro expansion ran before paused-owner snapshot",
+            ));
+        };
+        *value = Value::int(99);
+        Ok(())
+    }
+
+    struct DebugContextMarker(i64);
+
+    impl Trace for DebugContextMarker {
+        fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+            true
+        }
+    }
+
+    impl TaskLocalValue for DebugContextMarker {
+        fn inherit(&self) -> Rc<dyn TaskLocalValue> {
+            Rc::new(Self(self.0))
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
 
     #[test]
     fn native_table_is_traced_as_one_shared_opaque_node() {
@@ -6127,6 +7057,80 @@ mod tests {
             functions: Some(owner.functions.clone()),
         });
         (owner, closure, cell)
+    }
+
+    fn paused_debug_owner_with_open_mutator(value: Value) -> (VM, Rc<UpvalueCell>) {
+        let globals = make_test_env();
+        let ctx = EvalContext::new();
+        let template = eval_str(
+            "(let ((captured 0))\
+               (lambda (value) (set! captured value) captured))",
+            &globals,
+            &ctx,
+        )
+        .expect("mutator template evaluates");
+        let (template_closure, functions, native_fns) =
+            extract_vm_closure(&template).expect("mutator template is a VM closure");
+        assert_eq!(template_closure.upvalues.len(), 1);
+
+        let forms = sema_reader::read_many("nil").expect("owner source parses");
+        let program = compile_program(&forms, None).expect("owner source compiles");
+        let mut owner_func = (*program.closure.func).clone();
+        owner_func.chunk.n_locals = 1;
+        owner_func.local_names = vec![(0, intern("captured"))];
+        let owner_closure = Rc::new(Closure {
+            func: Rc::new(owner_func),
+            upvalues: Vec::new(),
+            globals: None,
+            functions: None,
+        });
+        let mut owner = VM::new(
+            Rc::clone(&globals),
+            program.functions,
+            &program.native_table,
+            program.main_cache_slots,
+        )
+        .expect("owner VM constructs");
+        owner.seed_main_frame(owner_closure);
+        owner.stack[0] = value;
+        let cell = Rc::new(UpvalueCell::new_open(0, 0));
+        owner.frames[0].open_upvalues = Some(vec![Some(Rc::clone(&cell))]);
+
+        let closure = Rc::new(Closure {
+            func: Rc::clone(&template_closure.func),
+            upvalues: vec![Rc::clone(&cell)],
+            globals: Some(Rc::clone(&globals)),
+            functions: Some(Rc::clone(&functions)),
+        });
+        let payload = Rc::new(VmClosurePayload {
+            closure,
+            functions,
+            native_fns,
+        });
+        let mut native = NativeFn::with_payload(
+            "mutate-captured",
+            payload as Rc<dyn std::any::Any>,
+            |_, _| Ok(Value::nil()),
+        );
+        native.is_closure = true;
+        globals.set(intern("mutate-captured"), Value::native_fn(native));
+
+        (owner, cell)
+    }
+
+    fn paused_debug_owner_with_closed_upvalue_mutator(value: Value) -> (VM, Rc<UpvalueCell>) {
+        let (mut owner, cell) = paused_debug_owner_with_open_mutator(value.clone());
+        *cell.state.borrow_mut() = UpvalueState::Closed(value);
+        let mut owner_func = (*owner.frames[0].closure.func).clone();
+        owner_func.upvalue_names = vec![intern("captured-upvalue")];
+        owner.frames[0].closure = Rc::new(Closure {
+            func: Rc::new(owner_func),
+            upvalues: vec![Rc::clone(&cell)],
+            globals: None,
+            functions: None,
+        });
+        owner.frames[0].open_upvalues = None;
+        (owner, cell)
     }
 
     fn vm_closure_value(owner: &VM, closure: Rc<Closure>) -> Value {
@@ -6930,6 +7934,834 @@ mod tests {
             DebugEvent::Stopped { .. } => {} // expected
             other => panic!("expected Stopped event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn debug_evaluate_compiles_directly_without_the_eval_callback() {
+        let globals = make_test_env();
+        let forms = sema_reader::read_many("nil").expect("fixture source parses");
+        let program = compile_program(&forms, None).expect("fixture source compiles");
+        let mut vm = VM::new(
+            globals,
+            program.functions,
+            &program.native_table,
+            program.main_cache_slots,
+        )
+        .expect("fixture VM constructs");
+        vm.seed_main_frame(program.closure);
+        let ctx = EvalContext::new();
+        sema_core::set_eval_callback(&ctx, |_, _, _| {
+            Err(SemaError::eval("debug evaluation called the eval callback"))
+        });
+        let expr = sema_reader::read("(+ 1 2)").expect("debug expression parses");
+
+        let value = vm
+            .debug_evaluate(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect("debug evaluation must compile directly");
+
+        assert_eq!(value, Value::int(3));
+    }
+
+    #[test]
+    fn debug_evaluate_uses_the_registered_macro_expander_without_eval_callback() {
+        let globals = make_test_env();
+        let forms = sema_reader::read_many("nil").expect("fixture source parses");
+        let program = compile_program(&forms, None).expect("fixture source compiles");
+        let mut vm = VM::new(
+            globals,
+            program.functions,
+            &program.native_table,
+            program.main_cache_slots,
+        )
+        .expect("fixture VM constructs");
+        vm.seed_main_frame(program.closure);
+        let ctx = EvalContext::new();
+        sema_core::set_eval_callback(&ctx, |_, _, _| {
+            Err(SemaError::eval("debug evaluation called the eval callback"))
+        });
+        sema_core::set_macro_expand_callback(&ctx, debug_macro_probe);
+        let expr = sema_reader::read("(debug-expand-value)").expect("debug expression parses");
+
+        let value = vm
+            .debug_evaluate(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect("debug evaluation uses the dedicated macro expander");
+
+        assert_eq!(value, Value::int(42));
+    }
+
+    #[test]
+    fn failed_debug_macro_expansion_rolls_back_paused_owner_writes() {
+        let (mut vm, cell) = paused_debug_owner_with_open_mutator(Value::int(7));
+        let ctx = EvalContext::new();
+        sema_core::set_macro_expand_callback(&ctx, debug_macro_probe);
+        let expr = sema_reader::read("(debug-expand-fail)").expect("debug expression parses");
+
+        let error = vm
+            .debug_evaluate(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect_err("macro expansion failure must reject the debugger expression");
+
+        assert!(matches!(
+            error.inner(),
+            SemaError::Eval(message) if message == "debug macro expansion failed"
+        ));
+        assert_eq!(vm.stack[0], Value::int(7));
+        assert!(matches!(
+            &*cell.state.borrow(),
+            UpvalueState::Tracked { value, .. } if value == &Value::int(7)
+        ));
+    }
+
+    #[test]
+    fn failed_debug_compile_after_macro_expansion_rolls_back_paused_owner_writes() {
+        let (mut vm, cell) = paused_debug_owner_with_open_mutator(Value::int(7));
+        let ctx = EvalContext::new();
+        sema_core::set_macro_expand_callback(&ctx, debug_macro_probe);
+        let expr =
+            sema_reader::read("(debug-expand-compile-fail)").expect("debug expression parses");
+
+        vm.debug_evaluate(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect_err("compile failure must reject the expanded debugger expression");
+
+        assert_eq!(vm.stack[0], Value::int(7));
+        assert!(matches!(
+            &*cell.state.borrow(),
+            UpvalueState::Tracked { value, .. } if value == &Value::int(7)
+        ));
+    }
+
+    #[test]
+    fn debug_evaluate_reads_locals_globals_and_upvalues() {
+        let globals = make_test_env();
+        globals.set(intern("global-value"), Value::int(4));
+        let forms = sema_reader::read_many("nil").expect("fixture source parses");
+        let program = compile_program(&forms, None).expect("fixture source compiles");
+        let mut owner_func = (*program.closure.func).clone();
+        owner_func.chunk.n_locals = 1;
+        owner_func.local_names = vec![(0, intern("local-value"))];
+        owner_func.upvalue_names = vec![intern("captured-value")];
+        let owner_closure = Rc::new(Closure {
+            func: Rc::new(owner_func),
+            upvalues: vec![Rc::new(UpvalueCell::new_closed(Value::int(5)))],
+            globals: None,
+            functions: None,
+        });
+        let mut vm = VM::new(
+            globals,
+            program.functions,
+            &program.native_table,
+            program.main_cache_slots,
+        )
+        .expect("fixture VM constructs");
+        vm.seed_main_frame(owner_closure);
+        vm.stack[0] = Value::int(3);
+        let ctx = EvalContext::new();
+        let expr = sema_reader::read("(list local-value global-value captured-value)")
+            .expect("debug expression parses");
+
+        let value = vm
+            .debug_evaluate(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect("debug bindings evaluate");
+
+        assert_eq!(
+            value,
+            Value::list(vec![Value::int(3), Value::int(4), Value::int(5)])
+        );
+    }
+
+    #[test]
+    fn debug_evaluate_drives_helper_hof_and_multimethod_calls() {
+        let globals = make_test_env();
+        globals.set(
+            intern("debug-apply-one"),
+            Value::native_fn(
+                NativeFn::simple_result("debug-apply-one", |args| {
+                    Ok(NativeOutcome::Call(NativeCall {
+                        callable: args[0].clone(),
+                        args: vec![args[1].clone()],
+                        continuation: Box::new(DebugIdentityContinuation),
+                    }))
+                })
+                .with_escaping_args(&[0]),
+            ),
+        );
+        let dispatch = Value::native_fn(NativeFn::simple_result("debug-dispatch", |_| {
+            Ok(NativeOutcome::Return(Value::keyword("selected")))
+        }));
+        let selected = Value::native_fn(NativeFn::simple_result("debug-selected", |args| {
+            Ok(NativeOutcome::Return(args[0].clone()))
+        }));
+        let mut methods = BTreeMap::new();
+        methods.insert(Value::keyword("selected"), selected);
+        globals.set(
+            intern("debug-mm"),
+            Value::multimethod(MultiMethod {
+                name: intern("debug-mm"),
+                dispatch_fn: dispatch,
+                methods: RefCell::new(methods),
+                default: RefCell::new(None),
+            }),
+        );
+        let forms = sema_reader::read_many("nil").expect("fixture source parses");
+        let program = compile_program(&forms, None).expect("fixture source compiles");
+        let mut vm = VM::new(
+            globals,
+            program.functions,
+            &program.native_table,
+            program.main_cache_slots,
+        )
+        .expect("fixture VM constructs");
+        vm.seed_main_frame(program.closure);
+        let ctx = EvalContext::new();
+        let expr = sema_reader::read(
+            "(let ((helper (lambda (value) (+ value 1))))\
+               (list (debug-apply-one helper 41) (debug-mm 43)))",
+        )
+        .expect("debug expression parses");
+
+        let value = vm
+            .debug_evaluate(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect("debug helper, HOF, and multimethod calls complete inline");
+
+        assert_eq!(value, Value::list(vec![Value::int(42), Value::int(43)]));
+    }
+
+    #[test]
+    fn debug_evaluate_installs_the_exact_task_context() {
+        let globals = make_test_env();
+        globals.set(
+            intern("debug-context-marker"),
+            Value::native_fn(NativeFn::with_context_result(
+                "debug-context-marker",
+                |context, _| {
+                    let marker = context
+                        .task_context
+                        .borrow()
+                        .get::<DebugContextMarker>()
+                        .map(|marker| marker.0)
+                        .ok_or_else(|| SemaError::eval("debug task context marker is missing"))?;
+                    Ok(NativeOutcome::Return(Value::int(marker)))
+                },
+            )),
+        );
+        let forms = sema_reader::read_many("nil").expect("fixture source parses");
+        let program = compile_program(&forms, None).expect("fixture source compiles");
+        let mut vm = VM::new(
+            globals,
+            program.functions,
+            &program.native_table,
+            program.main_cache_slots,
+        )
+        .expect("fixture VM constructs");
+        vm.seed_main_frame(program.closure);
+        let task_context = TaskContextHandle::default();
+        task_context
+            .borrow_mut()
+            .insert(Rc::new(DebugContextMarker(77)));
+        let ctx = EvalContext::new();
+        ctx.install_task_context(task_context);
+        let expr = sema_reader::read("(debug-context-marker)").expect("debug expression parses");
+
+        let value = vm
+            .debug_evaluate(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect("debug evaluation sees the active task context");
+
+        assert_eq!(value, Value::int(77));
+    }
+
+    #[test]
+    fn debug_evaluate_enforces_budget_and_current_cancellation() {
+        let globals = make_test_env();
+        let forms = sema_reader::read_many("nil").expect("fixture source parses");
+        let program = compile_program(&forms, None).expect("fixture source compiles");
+        let mut vm = VM::new(
+            globals,
+            program.functions,
+            &program.native_table,
+            program.main_cache_slots,
+        )
+        .expect("fixture VM constructs");
+        vm.seed_main_frame(program.closure);
+        let ctx = EvalContext::new();
+        let infinite = sema_reader::read("(let loop () (loop))").expect("debug expression parses");
+
+        let budget_error = vm
+            .debug_evaluate(
+                0,
+                &infinite,
+                &ctx,
+                &crate::debug::DebugState::new_headless(),
+            )
+            .expect_err("infinite debug evaluation must hit its budget");
+        assert!(matches!(
+            budget_error.inner(),
+            SemaError::Eval(message) if message == "debug evaluation exceeded instruction limit"
+        ));
+
+        vm.quantum_cancellation = CancellationView::new(true, None);
+        let literal = sema_reader::read("42").expect("debug expression parses");
+        let cancellation_error = vm
+            .debug_evaluate(0, &literal, &ctx, &crate::debug::DebugState::new_headless())
+            .expect_err("debug evaluation must observe current cancellation");
+        assert!(matches!(
+            cancellation_error.inner(),
+            SemaError::Eval(message) if message == "debug evaluation was cancelled"
+        ));
+    }
+
+    #[test]
+    fn conditional_debug_evaluation_is_boolean_and_fails_open_on_errors() {
+        let globals = make_test_env();
+        globals.set(
+            intern("debug-suspend"),
+            Value::native_fn(NativeFn::simple_with_runtime(
+                "debug-suspend",
+                |_| Ok(Value::nil()),
+                |_, _| {
+                    Ok(NativeOutcome::Suspend(NativeSuspend {
+                        wait: WaitKind::Timer(Duration::from_secs(1)),
+                        continuation: Box::new(DebugIdentityContinuation),
+                    }))
+                },
+            )),
+        );
+        let forms = sema_reader::read_many("nil").expect("fixture source parses");
+        let program = compile_program(&forms, None).expect("fixture source compiles");
+        let mut vm = VM::new(
+            globals,
+            program.functions,
+            &program.native_table,
+            program.main_cache_slots,
+        )
+        .expect("fixture VM constructs");
+        vm.seed_main_frame(program.closure);
+        let ctx = EvalContext::new();
+        let file = std::path::PathBuf::from("debug-condition-test.sema");
+        let mut allows_stop = |condition: &str| {
+            let mut debug = crate::debug::DebugState::new_headless();
+            debug.set_breakpoints_with_conditions(
+                &file,
+                &[crate::debug::SourceBreakpoint {
+                    line: 1,
+                    condition: Some(condition.to_string()),
+                }],
+            );
+            vm.debug_condition_allows_stop(Some(&file), 1, &debug, &ctx)
+        };
+
+        assert!(allows_stop("#t"));
+        assert!(!allows_stop("#f"));
+        assert!(allows_stop("("), "parse errors must fail open");
+        assert!(allows_stop("missing-name"), "eval errors must fail open");
+        assert!(
+            allows_stop("(let loop () (loop))"),
+            "budget errors must fail open"
+        );
+        assert!(
+            allows_stop("(debug-suspend)"),
+            "suspension errors must fail open"
+        );
+    }
+
+    #[test]
+    fn debug_evaluate_snapshots_global_closures_against_the_paused_owner() {
+        let (mut vm, cell) = paused_debug_owner_with_open_mutator(Value::int(7));
+        let ctx = EvalContext::new();
+        let expr = sema_reader::read("(mutate-captured 99)").expect("debug expression parses");
+
+        let value = vm
+            .debug_evaluate(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect("debug evaluation runs a closure reached through globals");
+
+        assert_eq!(value, Value::int(99));
+        assert_eq!(vm.stack[0], Value::int(99));
+        assert!(matches!(
+            &*cell.state.borrow(),
+            UpvalueState::Tracked { value, .. } if value == &Value::int(99)
+        ));
+    }
+
+    #[test]
+    fn debug_evaluate_snapshots_closures_reached_through_a_closure_home_env() {
+        let (mut vm, cell) = paused_debug_owner_with_open_mutator(Value::int(7));
+        let inner = vm
+            .globals
+            .take(intern("mutate-captured"))
+            .expect("inner mutator is installed");
+        let module_env = Rc::new(Env::with_parent(Rc::clone(&vm.globals)));
+        module_env.set(intern("mutate-captured"), inner);
+        let ctx = EvalContext::new();
+        let outer = eval_str(
+            "(lambda (value) (mutate-captured value))",
+            &module_env,
+            &ctx,
+        )
+        .expect("outer module closure evaluates");
+        vm.globals.set(intern("transitive-mutate"), outer);
+        let expr = sema_reader::read("(transitive-mutate 99)").expect("debug expression parses");
+
+        let value = vm
+            .debug_evaluate(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect("debug evaluation follows a closure home environment");
+
+        assert_eq!(value, Value::int(99));
+        assert_eq!(vm.stack[0], Value::int(99));
+        assert!(matches!(
+            &*cell.state.borrow(),
+            UpvalueState::Tracked { value, .. } if value == &Value::int(99)
+        ));
+    }
+
+    #[test]
+    fn debug_evaluate_snapshots_closures_reached_through_function_constants() {
+        let (mut vm, cell) = paused_debug_owner_with_open_mutator(Value::int(7));
+        let mutator = vm
+            .globals
+            .take(intern("mutate-captured"))
+            .expect("mutator fixture is installed");
+        let ctx = EvalContext::new();
+        let holder_template = eval_str(
+            "(lambda () (lambda () \"debug-constant-sentinel\"))",
+            &vm.globals,
+            &ctx,
+        )
+        .expect("constant holder template evaluates");
+        let (template_closure, functions, native_fns) =
+            extract_vm_closure(&holder_template).expect("holder template is a VM closure");
+        let sentinel = Value::string("debug-constant-sentinel");
+        let mut rewritten_functions: Vec<Rc<Function>> = functions.iter().cloned().collect();
+        let mut replaced = false;
+        for function in &mut rewritten_functions {
+            let Some(const_index) = function
+                .chunk
+                .consts
+                .iter()
+                .position(|value| value == &sentinel)
+            else {
+                continue;
+            };
+            let mut rewritten = (**function).clone();
+            rewritten.chunk.consts[const_index] = mutator.clone();
+            *function = Rc::new(rewritten);
+            replaced = true;
+        }
+        assert!(
+            replaced,
+            "the nested function contains the sentinel constant"
+        );
+        let functions = Rc::new(rewritten_functions);
+        let holder_closure = Rc::new(Closure {
+            func: Rc::clone(&template_closure.func),
+            upvalues: template_closure.upvalues.clone(),
+            globals: template_closure.globals.clone(),
+            functions: Some(Rc::clone(&functions)),
+        });
+        let payload = Rc::new(VmClosurePayload {
+            closure: holder_closure,
+            functions,
+            native_fns,
+        });
+        let mut holder =
+            NativeFn::with_payload("constant-holder", payload as Rc<dyn Any>, |_, _| {
+                Ok(Value::nil())
+            });
+        holder.is_closure = true;
+        vm.globals
+            .set(intern("constant-holder"), Value::native_fn(holder));
+        let expr = sema_reader::read("(((constant-holder)) 99)").expect("debug expression parses");
+
+        let value = vm
+            .debug_evaluate(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect("debug evaluation follows constants in the holder's function table");
+
+        assert_eq!(value, Value::int(99));
+        assert_eq!(vm.stack[0], Value::int(99));
+        assert!(matches!(
+            &*cell.state.borrow(),
+            UpvalueState::Tracked { value, .. } if value == &Value::int(99)
+        ));
+    }
+
+    #[test]
+    fn debug_evaluate_snapshots_an_open_owner_through_an_opaque_payload() {
+        let (mut vm, cell) = paused_debug_owner_with_open_mutator(Value::int(7));
+        let mutator = vm
+            .globals
+            .take(intern("mutate-captured"))
+            .expect("mutator fixture is installed");
+        vm.stack[0] = debug_handler_value(mutator);
+        let mut owner_func = (*vm.frames[0].closure.func).clone();
+        owner_func.local_names = vec![(0, intern("route"))];
+        vm.frames[0].closure = Rc::new(Closure {
+            func: Rc::new(owner_func),
+            upvalues: Vec::new(),
+            globals: None,
+            functions: None,
+        });
+        let ctx = EvalContext::new();
+        let expr = sema_reader::read("(route 99)").expect("debug expression parses");
+
+        let value = vm
+            .debug_evaluate(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect("debug evaluation follows the handler retained by an opaque payload");
+
+        assert_eq!(value, Value::int(99));
+        assert_eq!(vm.stack[0], Value::int(99));
+        assert!(matches!(
+            &*cell.state.borrow(),
+            UpvalueState::Tracked { value, .. } if value == &Value::int(99)
+        ));
+    }
+
+    #[test]
+    fn failed_debug_evaluate_rolls_back_a_closed_cell_through_an_opaque_payload() {
+        let (mut vm, cell) = paused_debug_owner_with_open_mutator(Value::int(7));
+        let mutator = vm
+            .globals
+            .take(intern("mutate-captured"))
+            .expect("mutator fixture is installed");
+        *cell.state.borrow_mut() = UpvalueState::Closed(Value::int(7));
+        vm.frames[0].open_upvalues = None;
+        vm.stack[0] = debug_handler_value(mutator);
+        let mut owner_func = (*vm.frames[0].closure.func).clone();
+        owner_func.local_names = vec![(0, intern("route"))];
+        vm.frames[0].closure = Rc::new(Closure {
+            func: Rc::new(owner_func),
+            upvalues: Vec::new(),
+            globals: None,
+            functions: None,
+        });
+        vm.globals.set(
+            intern("debug-suspend"),
+            Value::native_fn(NativeFn::simple_with_runtime(
+                "debug-suspend",
+                |_| Ok(Value::nil()),
+                |_, _| {
+                    Ok(NativeOutcome::Suspend(NativeSuspend {
+                        wait: WaitKind::Timer(Duration::from_secs(1)),
+                        continuation: Box::new(DebugIdentityContinuation),
+                    }))
+                },
+            )),
+        );
+        let ctx = EvalContext::new();
+        let expr = sema_reader::read("(begin (route 99) (debug-suspend))")
+            .expect("debug expression parses");
+
+        let error = vm
+            .debug_evaluate(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect_err("a debugger expression must reject suspension");
+
+        assert!(matches!(
+            error.inner(),
+            SemaError::Eval(message) if message == "debug evaluation cannot suspend"
+        ));
+        assert!(matches!(
+            &*cell.state.borrow(),
+            UpvalueState::Closed(value) if value == &Value::int(7)
+        ));
+    }
+
+    #[test]
+    fn failed_debug_set_rolls_back_reachable_tracked_upvalue_writes() {
+        let (mut vm, cell) = paused_debug_owner_with_open_mutator(Value::int(7));
+        vm.globals.set(
+            intern("debug-suspend"),
+            Value::native_fn(NativeFn::simple_with_runtime(
+                "debug-suspend",
+                |_| Ok(Value::nil()),
+                |_, _| {
+                    Ok(NativeOutcome::Suspend(NativeSuspend {
+                        wait: WaitKind::Timer(Duration::from_secs(1)),
+                        continuation: Box::new(DebugIdentityContinuation),
+                    }))
+                },
+            )),
+        );
+        let ctx = EvalContext::new();
+        let expr =
+            sema_reader::read("(set! captured (begin (mutate-captured 99) (debug-suspend)))")
+                .expect("debug expression parses");
+
+        let error = vm
+            .debug_evaluate_mut(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect_err("a debugger expression must reject suspension");
+
+        assert!(matches!(
+            error.inner(),
+            SemaError::Eval(message) if message == "debug evaluation cannot suspend"
+        ));
+        assert_eq!(vm.stack[0], Value::int(7));
+        assert!(matches!(
+            &*cell.state.borrow(),
+            UpvalueState::Tracked { value, .. } if value == &Value::int(7)
+        ));
+    }
+
+    #[test]
+    fn failed_debug_set_restores_a_closed_upvalue_target_mutated_by_a_helper() {
+        let (mut vm, cell) = paused_debug_owner_with_closed_upvalue_mutator(Value::int(7));
+        vm.globals.set(
+            intern("debug-suspend"),
+            Value::native_fn(NativeFn::simple_with_runtime(
+                "debug-suspend",
+                |_| Ok(Value::nil()),
+                |_, _| {
+                    Ok(NativeOutcome::Suspend(NativeSuspend {
+                        wait: WaitKind::Timer(Duration::from_secs(1)),
+                        continuation: Box::new(DebugIdentityContinuation),
+                    }))
+                },
+            )),
+        );
+        let ctx = EvalContext::new();
+        let expr = sema_reader::read(
+            "(set! captured-upvalue (begin (mutate-captured 99) (debug-suspend)))",
+        )
+        .expect("debug expression parses");
+
+        let error = vm
+            .debug_evaluate_mut(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect_err("a debugger expression must reject suspension");
+
+        assert!(matches!(
+            error.inner(),
+            SemaError::Eval(message) if message == "debug evaluation cannot suspend"
+        ));
+        assert!(matches!(
+            &*cell.state.borrow(),
+            UpvalueState::Closed(value) if value == &Value::int(7)
+        ));
+    }
+
+    #[test]
+    fn successful_debug_set_updates_a_tracked_local_cell() {
+        let (mut vm, cell) = paused_debug_owner_with_open_mutator(Value::int(7));
+        let ctx = EvalContext::new();
+        let expr = sema_reader::read("(set! captured 42)").expect("debug expression parses");
+
+        let value = vm
+            .debug_evaluate_mut(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect("debug assignment succeeds");
+
+        assert_eq!(value, Value::int(42));
+        assert_eq!(vm.stack[0], Value::int(42));
+        assert!(matches!(
+            &*cell.state.borrow(),
+            UpvalueState::Tracked { value, .. } if value == &Value::int(42)
+        ));
+    }
+
+    #[test]
+    fn debug_set_tracked_upvalue_synchronizes_its_live_defining_frame() {
+        let (mut vm, child_closure, cell) = open_upvalue_fixture(Value::int(7));
+        *cell.state.borrow_mut() = UpvalueState::Tracked {
+            frame_base: 0,
+            slot: 0,
+            value: Value::int(7),
+        };
+        let mut parent_func = (*vm.frames[0].closure.func).clone();
+        parent_func.chunk.n_locals = 1;
+        parent_func.local_names = vec![(0, intern("captured"))];
+        vm.frames[0].closure = Rc::new(Closure {
+            func: Rc::new(parent_func),
+            upvalues: Vec::new(),
+            globals: None,
+            functions: None,
+        });
+        let mut child_func = (*child_closure.func).clone();
+        child_func.upvalue_names = vec![intern("captured")];
+        vm.frames.push(CallFrame {
+            closure: Rc::new(Closure {
+                func: Rc::new(child_func),
+                upvalues: vec![Rc::clone(&cell)],
+                globals: child_closure.globals.clone(),
+                functions: child_closure.functions.clone(),
+            }),
+            pc: 0,
+            base: 1,
+            open_upvalues: None,
+            cache_base: 0,
+        });
+        vm.stack.push(Value::nil());
+
+        vm.debug_set_variable(
+            crate::debug::scope_upvalues_ref(1),
+            "captured",
+            Value::int(42),
+        )
+        .expect("tracked child upvalue is writable");
+
+        assert!(matches!(
+            &*cell.state.borrow(),
+            UpvalueState::Tracked { value, .. } if value == &Value::int(42)
+        ));
+        assert_eq!(
+            vm.stack[0],
+            Value::int(42),
+            "the defining frame's next LOAD_LOCAL must observe the write"
+        );
+    }
+
+    #[test]
+    fn debug_set_variable_rejects_a_missing_target_before_evaluating_its_rhs() {
+        let (mut vm, cell) = paused_debug_owner_with_closed_upvalue_mutator(Value::int(7));
+        let ctx = EvalContext::new();
+
+        let error = vm
+            .debug_set_variable_expression(
+                crate::debug::scope_locals_ref(0),
+                "missing",
+                "(mutate-captured 99)",
+                &ctx,
+                &crate::debug::DebugState::new_headless(),
+            )
+            .expect_err("a missing setVariable target must be rejected");
+
+        assert_eq!(error, "Eval error: setVariable: local 'missing' not found");
+        assert!(matches!(
+            &*cell.state.borrow(),
+            UpvalueState::Closed(value) if value == &Value::int(7)
+        ));
+    }
+
+    #[test]
+    fn failed_debug_set_restores_closed_cells_nested_in_stopped_local_values() {
+        let (mut vm, cell) = paused_debug_owner_with_open_mutator(Value::int(7));
+        *cell.state.borrow_mut() = UpvalueState::Closed(Value::int(7));
+        vm.frames[0].open_upvalues = None;
+        vm.stack[0] = vm
+            .globals
+            .get(intern("mutate-captured"))
+            .expect("nested closure fixture is installed");
+        let ctx = EvalContext::new();
+        let global_mutator = eval_str(
+            "(let ((global-counter 0))\
+               (lambda (value) (set! global-counter value) global-counter))",
+            &vm.globals,
+            &ctx,
+        )
+        .expect("independent global mutator evaluates");
+        let (global_closure, _, _) =
+            extract_vm_closure(&global_mutator).expect("global mutator is a VM closure");
+        let global_cell = Rc::clone(&global_closure.upvalues[0]);
+        vm.globals.set(intern("mutate-global"), global_mutator);
+        vm.globals.set(
+            intern("debug-suspend"),
+            Value::native_fn(NativeFn::simple_with_runtime(
+                "debug-suspend",
+                |_| Ok(Value::nil()),
+                |_, _| {
+                    Ok(NativeOutcome::Suspend(NativeSuspend {
+                        wait: WaitKind::Timer(Duration::from_secs(1)),
+                        continuation: Box::new(DebugIdentityContinuation),
+                    }))
+                },
+            )),
+        );
+        let expr = sema_reader::read(
+            "(set! captured\
+               (begin (mutate-captured 99) (mutate-global 88) (debug-suspend)))",
+        )
+        .expect("debug expression parses");
+
+        let error = vm
+            .debug_evaluate_mut(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect_err("a debugger expression must reject suspension");
+
+        assert!(matches!(
+            error.inner(),
+            SemaError::Eval(message) if message == "debug evaluation cannot suspend"
+        ));
+        assert!(vm.stack[0].as_native_fn_ref().is_some());
+        assert!(matches!(
+            &*cell.state.borrow(),
+            UpvalueState::Closed(value) if value == &Value::int(7)
+        ));
+        assert!(matches!(
+            &*global_cell.state.borrow(),
+            UpvalueState::Closed(value) if value == &Value::int(88)
+        ));
+    }
+
+    #[test]
+    fn debug_evaluate_rejects_a_stopped_value_graph_over_the_snapshot_limit() {
+        let globals = make_test_env();
+        let forms = sema_reader::read_many("nil").expect("fixture source parses");
+        let program = compile_program(&forms, None).expect("fixture source compiles");
+        let mut owner_func = (*program.closure.func).clone();
+        owner_func.chunk.n_locals = 1;
+        owner_func.local_names = vec![(0, intern("wide-value"))];
+        let owner_closure = Rc::new(Closure {
+            func: Rc::new(owner_func),
+            upvalues: Vec::new(),
+            globals: None,
+            functions: None,
+        });
+        let mut vm = VM::new(
+            globals,
+            program.functions,
+            &program.native_table,
+            program.main_cache_slots,
+        )
+        .expect("fixture VM constructs");
+        vm.seed_main_frame(owner_closure);
+        vm.stack[0] = Value::list(vec![Value::nil(); DEBUG_EVALUATION_SNAPSHOT_NODE_LIMIT + 1]);
+        let ctx = EvalContext::new();
+        let expr = sema_reader::read("42").expect("debug expression parses");
+
+        let error = vm
+            .debug_evaluate(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect_err("wide stopped values must hit the snapshot limit");
+
+        assert!(matches!(
+            error.inner(),
+            SemaError::Eval(message)
+                if message == "debug evaluation exceeded snapshot node limit"
+        ));
+    }
+
+    #[test]
+    fn debug_evaluate_walks_deep_acyclic_stopped_values_iteratively() {
+        const DEPTH: usize = 20_000;
+
+        let globals = make_test_env();
+        let forms = sema_reader::read_many("nil").expect("fixture source parses");
+        let program = compile_program(&forms, None).expect("fixture source compiles");
+        let mut owner_func = (*program.closure.func).clone();
+        owner_func.chunk.n_locals = 1;
+        owner_func.local_names = vec![(0, intern("deep-value"))];
+        let owner_closure = Rc::new(Closure {
+            func: Rc::new(owner_func),
+            upvalues: Vec::new(),
+            globals: None,
+            functions: None,
+        });
+        let mut vm = VM::new(
+            globals,
+            program.functions,
+            &program.native_table,
+            program.main_cache_slots,
+        )
+        .expect("fixture VM constructs");
+        vm.seed_main_frame(owner_closure);
+        let mut value = Value::nil();
+        let mut drop_pins = Vec::with_capacity(DEPTH);
+        for _ in 0..DEPTH {
+            value = Value::list(vec![value]);
+            drop_pins.push(value.clone());
+        }
+        vm.stack[0] = value;
+        let ctx = EvalContext::new();
+        let expr = sema_reader::read("42").expect("debug expression parses");
+
+        let result = vm
+            .debug_evaluate(0, &expr, &ctx, &crate::debug::DebugState::new_headless())
+            .expect("deep acyclic debugger values stay within the node limit");
+
+        assert_eq!(result, Value::int(42));
+        // Keep every chain link alive independently so test teardown does not
+        // recursively drop a deliberately pathological value graph.
+        std::mem::forget(drop_pins);
     }
 
     #[test]

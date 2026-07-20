@@ -6,8 +6,8 @@ use std::rc::{Rc, Weak};
 use std::time::Instant;
 
 use crate::runtime::{
-    apply_dynamic_mutations, DynamicStackIdentities, DynamicTaskState, ModuleTaskState, ScopeId,
-    TaskContextHandle,
+    apply_dynamic_mutations, DynamicStackIdentities, DynamicTaskState, ModuleTaskState,
+    NativeCallContext, ScopeId, TaskContextHandle,
 };
 use crate::{CallFrame, Env, Sandbox, SemaError, Span, SpanMap, StackTrace, Value};
 
@@ -15,6 +15,12 @@ const MAX_SPAN_TABLE_ENTRIES: usize = 200_000;
 
 /// Function-pointer type for the full evaluator callback: (ctx, expr, env) -> Result<Value, SemaError>
 pub type EvalCallbackFn = fn(&EvalContext, &Value, &Env) -> Result<Value, SemaError>;
+
+/// Function-pointer type for macro expansion with an explicit runtime-native
+/// context. The expansion implementation may run bounded restricted evaluators,
+/// but it must not drive the scheduler or retain any borrowed input.
+pub type MacroExpandCallbackFn =
+    for<'a> fn(&NativeCallContext<'a>, &Value, &Env) -> Result<Value, SemaError>;
 
 /// Function-pointer type for calling a function value with evaluated arguments: (ctx, func, args) -> Result<Value, SemaError>
 pub type CallCallbackFn = fn(&EvalContext, &Value, &[Value]) -> Result<Value, SemaError>;
@@ -120,6 +126,7 @@ pub struct EvalContext {
     /// teardown even when an embedder retains the global environment.
     signal_teardown_hooks: RefCell<Vec<SignalTeardownHook>>,
     pub eval_fn: Cell<Option<EvalCallbackFn>>,
+    macro_expand_fn: Cell<Option<MacroExpandCallbackFn>>,
     pub call_fn: Cell<Option<CallCallbackFn>>,
     pub call_owned_fn: Cell<Option<CallOwnedCallbackFn>>,
     pub interactive: Cell<bool>,
@@ -244,6 +251,7 @@ impl EvalContext {
             signal_callbacks: RefCell::default(),
             signal_teardown_hooks: RefCell::default(),
             eval_fn: Cell::new(None),
+            macro_expand_fn: Cell::new(None),
             call_fn: Cell::new(None),
             call_owned_fn: Cell::new(None),
             interactive: Cell::new(false),
@@ -274,6 +282,7 @@ impl EvalContext {
             signal_callbacks: RefCell::default(),
             signal_teardown_hooks: RefCell::default(),
             eval_fn: Cell::new(None),
+            macro_expand_fn: Cell::new(None),
             call_fn: Cell::new(None),
             call_owned_fn: Cell::new(None),
             interactive: Cell::new(false),
@@ -1291,6 +1300,83 @@ mod tests {
         }
     }
 
+    fn macro_expand_probe(
+        context: &crate::runtime::NativeCallContext<'_>,
+        expr: &Value,
+        env: &Env,
+    ) -> Result<Value, SemaError> {
+        let env_marker = env
+            .get(crate::intern("macro-expand-env"))
+            .expect("expansion env marker");
+        let call_env_marker = context
+            .call_env
+            .as_ref()
+            .and_then(|call_env| call_env.get(crate::intern("macro-expand-call-env")))
+            .expect("call env marker");
+        let task_marker = context
+            .task_context
+            .get_rc::<TestTaskLocal>()
+            .expect("task context marker");
+        let eval_marker = context
+            .eval_context
+            .context_get(&Value::keyword("macro-expand-context"))
+            .expect("eval context marker");
+        Ok(Value::list(vec![
+            expr.clone(),
+            env_marker,
+            call_env_marker,
+            Value::int(i64::from(task_marker.0)),
+            eval_marker,
+            Value::bool(context.cancellation.is_requested()),
+        ]))
+    }
+
+    #[test]
+    fn macro_expand_callback_is_optional_per_context_and_receives_exact_inputs() {
+        let eval_context = EvalContext::new();
+        eval_context.context_set(Value::keyword("macro-expand-context"), Value::int(44));
+        let env = Env::new();
+        env.set(crate::intern("macro-expand-env"), Value::int(11));
+        let call_env = Rc::new(Env::new());
+        call_env.set(crate::intern("macro-expand-call-env"), Value::int(22));
+        let task_context = TaskContextHandle::default();
+        task_context.borrow_mut().insert(Rc::new(TestTaskLocal(33)));
+        let native_context = crate::runtime::NativeCallContext {
+            eval_context: &eval_context,
+            task_context,
+            call_env: Some(call_env),
+            cancellation: crate::runtime::CancellationView::new(true, None),
+        };
+        let expr = Value::int(55);
+
+        assert!(try_macro_expand_callback(&native_context, &expr, &env).is_none());
+
+        set_macro_expand_callback(&eval_context, macro_expand_probe);
+        let expanded = try_macro_expand_callback(&native_context, &expr, &env)
+            .expect("callback registered")
+            .expect("callback succeeds");
+        assert_eq!(
+            expanded,
+            Value::list(vec![
+                Value::int(55),
+                Value::int(11),
+                Value::int(22),
+                Value::int(33),
+                Value::int(44),
+                Value::bool(true),
+            ])
+        );
+
+        let other_context = EvalContext::new();
+        let other_native_context = crate::runtime::NativeCallContext {
+            eval_context: &other_context,
+            task_context: TaskContextHandle::default(),
+            call_env: None,
+            cancellation: crate::runtime::CancellationView::default(),
+        };
+        assert!(try_macro_expand_callback(&other_native_context, &expr, &env).is_none());
+    }
+
     // --- File path tracking ---
 
     #[test]
@@ -1471,6 +1557,32 @@ where
 pub fn set_eval_callback(ctx: &EvalContext, f: EvalCallbackFn) {
     ctx.eval_fn.set(Some(f));
     STDLIB_CTX.with(|stdlib| stdlib.eval_fn.set(Some(f)));
+}
+
+/// Register this evaluator context's runtime-aware macro expander.
+///
+/// Unlike the legacy evaluator and call callbacks, this is deliberately not
+/// copied into `STDLIB_CTX`: every invocation must carry an explicit task,
+/// cancellation snapshot, and call environment in [`NativeCallContext`].
+pub fn set_macro_expand_callback(ctx: &EvalContext, f: MacroExpandCallbackFn) {
+    ctx.macro_expand_fn.set(Some(f));
+}
+
+/// Invoke the macro expander registered on the exact evaluator context.
+///
+/// `None` means no expansion provider is installed. Low-level VM embedders use
+/// that to retain their direct-compilation fallback without acquiring ambient
+/// evaluator state.
+pub fn try_macro_expand_callback(
+    context: &NativeCallContext<'_>,
+    expr: &Value,
+    env: &Env,
+) -> Option<Result<Value, SemaError>> {
+    context
+        .eval_context
+        .macro_expand_fn
+        .get()
+        .map(|expand| expand(context, expr, env))
 }
 
 /// Register the call-value callback. Called by `sema-eval` during interpreter init.

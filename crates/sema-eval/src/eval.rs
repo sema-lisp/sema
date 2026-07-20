@@ -1184,11 +1184,19 @@ pub fn expand_for_vm_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResul
 }
 
 fn expand_for_vm_in_runtime(
-    context: &mut sema_core::runtime::NativeCallContext<'_>,
+    context: &sema_core::runtime::NativeCallContext<'_>,
     env: &Env,
     expr: &Value,
 ) -> EvalResult {
     expand_for_vm_in_with(&MacroExpander::runtime(context), env, expr)
+}
+
+fn expand_for_vm_runtime_callback(
+    context: &sema_core::runtime::NativeCallContext<'_>,
+    expr: &Value,
+    env: &Env,
+) -> EvalResult {
+    expand_for_vm_in_runtime(context, env, expr)
 }
 
 fn expand_for_vm_in_with(expander: &MacroExpander<'_>, env: &Env, expr: &Value) -> EvalResult {
@@ -3451,7 +3459,9 @@ fn force_legacy(
 /// pins the entire environment past Interpreter teardown. Runtime delegates
 /// receive the exact evaluator context and call environment through their
 /// invocation context rather than capturing either owner.
-pub fn register_vm_delegates(env: &Rc<Env>, _ctx: &Rc<EvalContext>) {
+pub fn register_vm_delegates(env: &Rc<Env>, ctx: &Rc<EvalContext>) {
+    sema_core::set_macro_expand_callback(ctx, expand_for_vm_runtime_callback);
+
     // __vm-eval: macro-expand, compile, and run the expression on the bytecode
     // VM (rooted at the global env so top-level `define`s persist). The runtime
     // `(eval ...)` meta path is thus VM-native.
@@ -4888,6 +4898,40 @@ mod runtime_eval_tests {
     }
 
     #[test]
+    fn vm_delegates_register_runtime_macro_expansion_for_the_explicit_environment() {
+        let delegate_env = Rc::new(Env::new());
+        let expansion_env = Rc::new(Env::new());
+        let eval_context = Rc::new(EvalContext::new());
+        register_vm_delegates(&delegate_env, &eval_context);
+
+        let definition = sema_reader::read_many("(defmacro callback-transformer () '42)")
+            .expect("parse macro definition")
+            .remove(0);
+        register_defmacro(
+            definition.as_list().expect("defmacro form is a list"),
+            &expansion_env,
+        )
+        .expect("register macro only in the explicit expansion environment");
+        let expression = sema_reader::read_many("(callback-transformer)")
+            .expect("parse macro invocation")
+            .remove(0);
+        let native_context = NativeCallContext {
+            eval_context: &eval_context,
+            task_context: TaskContextHandle::default(),
+            call_env: Some(Rc::clone(&delegate_env)),
+            cancellation: CancellationView::default(),
+        };
+
+        let expanded =
+            sema_core::try_macro_expand_callback(&native_context, &expression, &expansion_env)
+                .expect("register_vm_delegates installs the callback")
+                .expect("runtime macro expansion succeeds");
+
+        assert_eq!(expanded, Value::int(42));
+        assert!(delegate_env.get_str("callback-transformer").is_none());
+    }
+
+    #[test]
     fn cancelled_runtime_macro_expansion_stops_before_transformer_execution() {
         let interp = Interpreter::new();
         interp
@@ -4896,14 +4940,15 @@ mod runtime_eval_tests {
         let expression = sema_reader::read_many("(cancelled-transformer)")
             .expect("parse macro invocation")
             .remove(0);
-        let mut context = NativeCallContext {
+        let context = NativeCallContext {
             eval_context: &interp.ctx,
             task_context: TaskContextHandle::default(),
             call_env: Some(Rc::clone(&interp.global_env)),
             cancellation: CancellationView::new(true, Some(CancelReason::Explicit)),
         };
 
-        let error = expand_for_vm_in_runtime(&mut context, &interp.global_env, &expression)
+        let error = sema_core::try_macro_expand_callback(&context, &expression, &interp.global_env)
+            .expect("interpreter registers the runtime macro callback")
             .expect_err("cancelled expansion must not run its transformer");
 
         assert!(

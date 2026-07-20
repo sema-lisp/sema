@@ -38,8 +38,8 @@ pub use async_signal::{
 };
 pub use context::{
     call_callback, call_callback_owned, eval_callback, set_call_callback, set_call_owned_callback,
-    set_eval_callback, with_stdlib_ctx, CallCallbackFn, CallOwnedCallbackFn, EvalCallbackFn,
-    EvalContext,
+    set_eval_callback, set_macro_expand_callback, try_macro_expand_callback, with_stdlib_ctx,
+    CallCallbackFn, CallOwnedCallbackFn, EvalCallbackFn, EvalContext, MacroExpandCallbackFn,
 };
 pub use cycle::{
     collect as gc_collect, env_chain_pins as gc_env_chain_pins, last_stats as gc_last_stats,

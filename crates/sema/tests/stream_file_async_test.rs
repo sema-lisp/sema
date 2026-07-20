@@ -714,6 +714,777 @@ fn assert_open_stdin_operations_are_cancellable(program: &str, expected_cancella
     );
 }
 
+fn assert_open_stdin_builtin_is_cancellable(call: &str) {
+    assert_open_stdin_builtin_with_prefix_is_cancellable(call, b"");
+}
+
+fn assert_open_stdin_builtin_with_prefix_is_cancellable(call: &str, prefix: &[u8]) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let program = format!(
+        r#"
+        (let ((pending (async/spawn (fn () {call}))))
+          (async/spawn (fn ()
+            (async/sleep 20)
+            (async/cancel pending)
+            (println "sibling-cancelled")
+            (io/flush)))
+          (try (await pending) (catch error (:type error))))
+        "#
+    );
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["--no-llm", "-e", &program])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sema with an open stdin pipe");
+
+    // Keep the writer open and empty until the child has settled. Closing it
+    // before observing the marker would let a blocking implementation escape
+    // through EOF and would destroy the test's regression teeth.
+    let mut open_stdin = child.stdin.take().expect("piped stdin");
+    open_stdin
+        .write_all(prefix)
+        .expect("write incomplete stdin prefix");
+    open_stdin.flush().expect("flush incomplete stdin prefix");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (send_marker, receive_marker) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        let mut marker = String::new();
+        let result = stdout.read_line(&mut marker).map(|_| (marker, stdout));
+        let _ = send_marker.send(result);
+    });
+
+    let (marker, mut stdout) = match receive_marker.recv_timeout(Duration::from_secs(10)) {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => {
+            let _ = child.kill();
+            drop(open_stdin);
+            panic!("read sibling cancellation marker for {call}: {error}");
+        }
+        Err(error) => {
+            let _ = child.kill();
+            drop(open_stdin);
+            let mut stderr = String::new();
+            child
+                .stderr
+                .take()
+                .expect("piped stderr")
+                .read_to_string(&mut stderr)
+                .expect("read child stderr");
+            panic!(
+                "{call} pinned the runtime while stdin remained open; marker={error}; stderr={stderr}"
+            );
+        }
+    };
+    assert_eq!(
+        marker, "sibling-cancelled\n",
+        "unexpected marker for {call}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll sema child") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            drop(open_stdin);
+            panic!("cancelled {call} did not let the process settle");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(open_stdin);
+
+    let mut remaining_stdout = String::new();
+    stdout
+        .read_to_string(&mut remaining_stdout)
+        .expect("read remaining child stdout");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut stderr)
+        .expect("read child stderr");
+    assert!(
+        status.success(),
+        "cancelled {call} child failed: stdout={remaining_stdout} stderr={stderr}"
+    );
+    assert!(
+        remaining_stdout.contains(":cancelled"),
+        "{call} completed instead of settling through cancellation: {remaining_stdout}"
+    );
+}
+
+#[test]
+fn read_line_on_open_stdin_yields_to_cancellation_sibling() {
+    assert_open_stdin_builtin_is_cancellable("(read-line)");
+}
+
+#[test]
+fn read_stdin_on_open_stdin_yields_to_cancellation_sibling() {
+    assert_open_stdin_builtin_is_cancellable("(read-stdin)");
+}
+
+#[test]
+fn stdin_text_builtins_preserve_results_in_runtime_tasks() {
+    assert_eq!(
+        eval_with_stdin(
+            r#"(await (async/spawn (fn () (list (read-line) (read-stdin)))))"#,
+            b"first\nremaining",
+        ),
+        r#"("first" "remaining")"#
+    );
+}
+
+#[test]
+fn stdin_line_readers_preserve_existing_bare_carriage_return_semantics() {
+    assert_eq!(
+        eval_with_stdin("(string-length (read-line))", b"x\r"),
+        "2",
+        "read-line only strips a carriage return when it precedes a newline"
+    );
+    assert_eq!(
+        eval_with_stdin("(string-length (stream/read-line *stdin*))", b"x\r"),
+        "1",
+        "stream/read-line keeps its existing bare-carriage-return normalization"
+    );
+}
+
+#[test]
+fn stdin_line_readers_enforce_the_runtime_line_cap() {
+    const LINE_CAP: usize = 256 * 1024;
+    for call in ["(read-line)", "(stream/read-line *stdin*)"] {
+        let at_cap = format!(r#"(await (async/spawn (fn () (string-length {call}))))"#);
+        let one_over = format!(
+            r#"(try
+                  (await (async/spawn (fn () (string-length {call}))))
+                  (catch error (:type error)))"#
+        );
+        for (ending, terminator) in [
+            ("EOF", &b""[..]),
+            ("LF", &b"\n"[..]),
+            ("CRLF", &b"\r\n"[..]),
+        ] {
+            let mut exact = vec![b'x'; LINE_CAP];
+            exact.extend_from_slice(terminator);
+            assert_eq!(
+                eval_with_stdin(&at_cap, &exact),
+                LINE_CAP.to_string(),
+                "{call} must accept exactly the cap before {ending}"
+            );
+
+            let mut over = vec![b'x'; LINE_CAP + 1];
+            over.extend_from_slice(terminator);
+            assert_eq!(
+                eval_with_stdin(&one_over, &over),
+                ":eval",
+                "{call} must reject one content byte above the cap before {ending}"
+            );
+        }
+
+        let (bare_exact_content, bare_exact_result) = if call == "(read-line)" {
+            (LINE_CAP - 1, LINE_CAP)
+        } else {
+            (LINE_CAP, LINE_CAP)
+        };
+        let mut bare_exact = vec![b'x'; bare_exact_content];
+        bare_exact.push(b'\r');
+        assert_eq!(
+            eval_with_stdin(&at_cap, &bare_exact),
+            bare_exact_result.to_string(),
+            "{call} must preserve its bare-CR ABI at the cap"
+        );
+
+        let mut bare_over = vec![b'x'; bare_exact_content + 1];
+        bare_over.push(b'\r');
+        assert_eq!(
+            eval_with_stdin(&one_over, &bare_over),
+            ":eval",
+            "{call} must reject a bare-CR line whose normalized content is over the cap"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn read_key_on_open_stdin_yields_to_cancellation_sibling() {
+    assert_open_stdin_builtin_is_cancellable("(io/read-key)");
+}
+
+#[cfg(unix)]
+#[test]
+fn read_key_decodes_complete_input_in_runtime_task() {
+    assert_eq!(
+        eval_with_stdin(
+            r#"(let ((key (await (async/spawn (fn () (io/read-key))))))
+                  (list (:kind key) (:char key)))"#,
+            b"x",
+        ),
+        r#"(:char "x")"#
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn read_key_with_incomplete_escape_sequence_remains_cancellable() {
+    assert_open_stdin_builtin_with_prefix_is_cancellable("(io/read-key)", b"\x1b[");
+}
+
+#[cfg(unix)]
+#[test]
+fn key_read_after_cancelled_text_read_consumes_the_preserved_owner_byte() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let program = r#"
+        (let ((pending (async/spawn (fn () (read-line)))))
+          (async/sleep 20)
+          (async/cancel pending)
+          (try (await pending) (catch error nil))
+          (println "text-cancelled")
+          (io/flush)
+          (let ((key (io/read-key)))
+            (list (:kind key) (:char key))))
+    "#;
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["--no-llm", "-e", program])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sema with piped stdin");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let (send_marker, receive_marker) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut stdout = BufReader::new(stdout);
+        let mut marker = String::new();
+        let result = stdout.read_line(&mut marker).map(|_| (marker, stdout));
+        let _ = send_marker.send(result);
+    });
+
+    let (marker, mut stdout) = receive_marker
+        .recv_timeout(Duration::from_secs(10))
+        .expect("cancelled text reader must let its sibling progress")
+        .expect("read text cancellation marker");
+    assert_eq!(marker, "text-cancelled\n");
+
+    stdin.write_all(b"x").expect("write post-cancel key byte");
+    stdin.flush().expect("flush post-cancel key byte");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll cross-family child") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            drop(stdin);
+            panic!("key reader did not consume the cancelled text reader's preserved byte");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(stdin);
+    let mut remaining_stdout = String::new();
+    stdout
+        .read_to_string(&mut remaining_stdout)
+        .expect("read cross-family stdout");
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut stderr)
+        .expect("read cross-family stderr");
+    assert!(status.success(), "cross-family child failed: {stderr}");
+    assert_eq!(remaining_stdout.trim(), r#"(:char "x")"#);
+}
+
+#[test]
+fn cancelled_stdin_operations_requeue_already_accumulated_prefixes() {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let run_case = |label: &str, program: &str, expected: &str| {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+            .args(["--no-llm", "-e", program])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn accumulated-prefix child");
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        stdin
+            .write_all(b"abc")
+            .expect("write prefix before cancellation");
+        stdin.flush().expect("flush prefix before cancellation");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll accumulated-prefix child") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                drop(stdin);
+                panic!("{label} discarded its accumulated prefix on cancellation");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        drop(stdin);
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .expect("piped stdout")
+            .read_to_string(&mut stdout)
+            .expect("read accumulated-prefix stdout");
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("piped stderr")
+            .read_to_string(&mut stderr)
+            .expect("read accumulated-prefix stderr");
+        assert!(status.success(), "{label} child failed: {stderr}");
+        assert_eq!(stdout.trim(), expected, "unexpected result for {label}");
+    };
+
+    for call in [
+        "(read-line)",
+        "(read-stdin)",
+        "(stream/read-all *stdin* 64)",
+    ] {
+        let program = format!(
+            r#"
+            (let ((pending (async/spawn (fn () {call}))))
+              (async/sleep 100)
+              (async/cancel pending)
+              (try (await pending) (catch error nil))
+              (utf8->string (stream/read *stdin* 3)))
+            "#
+        );
+        run_case(call, &program, r#""abc""#);
+    }
+
+    run_case(
+        "(stream/copy *stdin* destination 64)",
+        r#"
+        (let ((destination (stream/byte-buffer)))
+          (let ((pending (async/spawn
+                           (fn () (stream/copy *stdin* destination 64)))))
+            (async/sleep 100)
+            (async/cancel pending)
+            (try (await pending) (catch error nil))
+            (list (bytes/length (stream/to-bytes destination))
+                  (utf8->string (stream/read *stdin* 3)))))
+        "#,
+        r#"(0 "abc")"#,
+    );
+}
+
+#[cfg(unix)]
+fn assert_partial_terminal_query_reply_is_cancellable(call: &str, query: &[u8]) {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let program = format!(
+        r#"
+        (let ((_raw-token (io/tty-raw!))
+              (pending (async/spawn (fn () {call}))))
+          (async/spawn (fn ()
+            (async/sleep 20)
+            (async/cancel pending)))
+          (try
+            (await pending)
+            (catch error
+              (begin
+                (println "query-cancelled")
+                (io/flush)
+                (:type error)))))
+        "#
+    );
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open terminal-query pty");
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_sema"));
+    command.args(["--no-llm", "-e", &program]);
+    command.env("TERM", "xterm-256color");
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .expect("spawn terminal-query child");
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().expect("clone pty reader");
+    let mut writer = pair.master.take_writer().expect("take pty writer");
+    let (send_chunk, receive_chunk) = mpsc::channel();
+    let reader_thread = std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) if send_chunk.send(chunk[..read].to_vec()).is_err() => break,
+                Ok(_) => {}
+            }
+        }
+    });
+
+    let mut output = Vec::new();
+    let query_deadline = Instant::now() + Duration::from_secs(10);
+    while !output.windows(query.len()).any(|bytes| bytes == query) {
+        let remaining = query_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let _ = child.kill();
+            drop(writer);
+            let _ = reader_thread.join();
+            panic!(
+                "{call} did not emit its terminal query: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        output.extend(
+            receive_chunk
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| panic!("read {call} query: {error}")),
+        );
+    }
+
+    // A direct blocking CSI parser waits forever for the final byte after this
+    // prefix and pins the VM. The structural probe retains it in the shared
+    // stdin owner and cancellation can still settle the task.
+    writer
+        .write_all(b"\x1b[")
+        .expect("write incomplete terminal reply");
+    writer.flush().expect("flush incomplete terminal reply");
+
+    let marker = b"query-cancelled";
+    let marker_deadline = Instant::now() + Duration::from_secs(10);
+    while !output.windows(marker.len()).any(|bytes| bytes == marker) {
+        let remaining = marker_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let _ = child.kill();
+            drop(writer);
+            let _ = reader_thread.join();
+            panic!(
+                "{call} pinned the runtime on an incomplete reply: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        output.extend(
+            receive_chunk
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| panic!("read {call} cancellation marker: {error}")),
+        );
+    }
+
+    let _ = child.kill();
+    drop(writer);
+    let _ = reader_thread.join();
+}
+
+#[cfg(unix)]
+#[test]
+fn kitty_support_query_with_partial_reply_remains_cancellable() {
+    assert_partial_terminal_query_reply_is_cancellable(
+        "(term/supports-kitty-keys?)",
+        b"\x1b[?u\x1b[c",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_position_query_with_partial_reply_remains_cancellable() {
+    assert_partial_terminal_query_reply_is_cancellable("(term/cursor-position)", b"\x1b[6n");
+}
+
+#[cfg(unix)]
+#[test]
+fn terminal_query_requeues_unrelated_events_before_its_partial_suffix() {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    let program = r#"
+        (let ((_raw-token (io/tty-raw!)))
+          (term/supports-kitty-keys?)
+          (println "query-events-preserved")
+          (io/flush)
+          (let ((character (io/read-key))
+                (focus (io/read-key))
+                (mouse (io/read-key))
+                (key (io/read-key)))
+            (list (:kind character) (:char character)
+                  (:kind focus) (:focused focus)
+                  (:kind mouse) (:kind key) (:name key))))
+    "#;
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open terminal event preservation pty");
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_sema"));
+    command.args(["--no-llm", "-e", program]);
+    command.env("TERM", "xterm-256color");
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .expect("spawn terminal event preservation child");
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().expect("clone pty reader");
+    let mut writer = pair.master.take_writer().expect("take pty writer");
+    let (send_chunk, receive_chunk) = mpsc::channel();
+    let reader_thread = std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) if send_chunk.send(chunk[..read].to_vec()).is_err() => break,
+                Ok(_) => {}
+            }
+        }
+    });
+
+    let mut output = Vec::new();
+    let query = b"\x1b[?u\x1b[c";
+    let query_deadline = Instant::now() + Duration::from_secs(10);
+    while !output.windows(query.len()).any(|bytes| bytes == query) {
+        let remaining = query_deadline.saturating_duration_since(Instant::now());
+        output.extend(
+            receive_chunk
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| panic!("read terminal query: {error}")),
+        );
+    }
+
+    // Three complete unrelated events followed by an incomplete CSI. The
+    // query must retain all four byte ranges without interpreting them as its
+    // own reply.
+    writer
+        .write_all(b"x\x1b[I\x1b[<0;1;1M\x1b[")
+        .expect("write unrelated terminal events");
+    writer.flush().expect("flush unrelated terminal events");
+
+    let marker = b"query-events-preserved";
+    let marker_deadline = Instant::now() + Duration::from_secs(10);
+    while !output.windows(marker.len()).any(|bytes| bytes == marker) {
+        let remaining = marker_deadline.saturating_duration_since(Instant::now());
+        output.extend(
+            receive_chunk
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| panic!("read query cancellation marker: {error}")),
+        );
+    }
+    writer
+        .write_all(b"A")
+        .expect("complete preserved up-arrow suffix");
+    writer.flush().expect("flush preserved up-arrow completion");
+
+    let expected = br#"(:char "x" :focus #t :mouse :key :up)"#;
+    let result_deadline = Instant::now() + Duration::from_secs(10);
+    while !output
+        .windows(expected.len())
+        .any(|bytes| bytes == expected)
+    {
+        let remaining = result_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let _ = child.kill();
+            drop(writer);
+            let _ = reader_thread.join();
+            panic!(
+                "terminal query lost or reordered unrelated input: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        output.extend(
+            receive_chunk
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "read preserved terminal events: {error}; output={}",
+                        String::from_utf8_lossy(&output)
+                    )
+                }),
+        );
+    }
+
+    let _ = child.kill();
+    drop(writer);
+    let _ = reader_thread.join();
+}
+
+#[cfg(unix)]
+fn pty_wait_for_after(
+    output: &mut Vec<u8>,
+    receive_chunk: &std::sync::mpsc::Receiver<Vec<u8>>,
+    writer: &mut dyn std::io::Write,
+    answered_dsr: &mut usize,
+    needle: &[u8],
+    start: usize,
+    context: &str,
+) {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let dsr_count = output
+            .windows(b"\x1b[6n".len())
+            .filter(|bytes| *bytes == b"\x1b[6n")
+            .count();
+        while *answered_dsr < dsr_count {
+            writer
+                .write_all(b"\x1b[1;1R")
+                .expect("answer REPL cursor-position query");
+            writer.flush().expect("flush REPL cursor-position reply");
+            *answered_dsr += 1;
+        }
+        if output[start.min(output.len())..]
+            .windows(needle.len())
+            .any(|bytes| bytes == needle)
+        {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "timed out waiting for {context}: {}",
+                String::from_utf8_lossy(output)
+            );
+        }
+        output.extend(
+            receive_chunk
+                .recv_timeout(remaining)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "read {context}: {error}; output={}",
+                        String::from_utf8_lossy(output)
+                    )
+                }),
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_eval_stdin_read_does_not_steal_the_next_repl_line() {
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+
+    let pty = native_pty_system();
+    let pair = pty
+        .openpty(PtySize {
+            rows: 24,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open REPL handoff pty");
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_sema"));
+    command.arg("--no-llm");
+    command.env("TERM", "xterm-256color");
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .expect("spawn REPL handoff child");
+    drop(pair.slave);
+    let mut reader = pair.master.try_clone_reader().expect("clone REPL reader");
+    let mut writer = pair.master.take_writer().expect("take REPL writer");
+    let (send_chunk, receive_chunk) = mpsc::channel();
+    let reader_thread = std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) if send_chunk.send(chunk[..read].to_vec()).is_err() => break,
+                Ok(_) => {}
+            }
+        }
+    });
+
+    let mut output = Vec::new();
+    let mut answered_dsr = 0;
+    pty_wait_for_after(
+        &mut output,
+        &receive_chunk,
+        &mut writer,
+        &mut answered_dsr,
+        b"> ",
+        0,
+        "initial REPL prompt",
+    );
+    let cancel_expression = r#"(let ((pending (async/spawn (fn () (read-line))))) (async/sleep 50) (async/cancel pending) (try (await pending) (catch error nil)) (println (string-append "HANDOFF_" "READY")) (io/flush))"#;
+    writer
+        .write_all(cancel_expression.as_bytes())
+        .and_then(|_| writer.write_all(b"\n"))
+        .and_then(|_| writer.flush())
+        .expect("submit cancelling stdin expression");
+    let marker_start = output.len();
+    pty_wait_for_after(
+        &mut output,
+        &receive_chunk,
+        &mut writer,
+        &mut answered_dsr,
+        b"HANDOFF_READY",
+        marker_start,
+        "cancelled-eval marker",
+    );
+    let next_prompt_start = output.len();
+    pty_wait_for_after(
+        &mut output,
+        &receive_chunk,
+        &mut writer,
+        &mut answered_dsr,
+        b"> ",
+        next_prompt_start,
+        "post-cancellation REPL prompt",
+    );
+
+    // Send only after eval has settled and Reedline owns stdin again. A stale
+    // owner-thread read steals this whole line and the REPL never prints 42.
+    let result_start = output.len();
+    writer
+        .write_all(b"(+ 20 22)\n")
+        .and_then(|_| writer.flush())
+        .expect("submit post-cancellation REPL expression");
+    pty_wait_for_after(
+        &mut output,
+        &receive_chunk,
+        &mut writer,
+        &mut answered_dsr,
+        b"42",
+        result_start,
+        "post-cancellation REPL result",
+    );
+
+    let _ = writer.write_all(b",quit\n");
+    let _ = writer.flush();
+    let _ = child.kill();
+    drop(writer);
+    let _ = reader_thread.join();
+}
+
 #[test]
 fn cancelled_open_stdin_aggregations_exit_without_pinned_workers_or_gates() {
     let destination = TempFile::new("stdin-copy-cancel");

@@ -63,11 +63,9 @@ pub fn run(interpreter: Interpreter, quiet: bool, sandbox_mode: Option<&str>) {
 
     // Reedline puts the terminal in raw mode and queries the cursor; it
     // can't run against piped stdin (CI, test harnesses, `printf ... | sema`).
-    // Fall back to a plain BufRead loop in that case.
+    // Fall back to the coordinated headless loop in that case.
     if !std::io::stdin().is_terminal() {
-        let stdin = std::io::stdin();
-        let reader = stdin.lock();
-        match headless::run(reader, &interpreter, &env, &prelude_keys) {
+        match headless::run_stdin(&interpreter, &env, &prelude_keys) {
             Ok(()) => {
                 println!("Goodbye!");
             }

@@ -15395,6 +15395,45 @@ fn test_u4_repl_eof_unterminated() {
 }
 
 #[test]
+fn test_headless_repl_runtime_stdin_does_not_lose_prefetched_input() {
+    let output = run_repl_with_input("(read-line)\nhello\n");
+    assert!(
+        output.status.success(),
+        "sema exited non-zero: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "\"hello\"\nGoodbye!\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
+fn test_headless_repl_preserves_multiline_forms() {
+    let output = run_repl_with_input("(let ((x 20)\n      (y 22))\n  (+ x y))\n");
+    assert!(
+        output.status.success(),
+        "sema exited non-zero: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\nGoodbye!\n");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
+fn test_headless_repl_preserves_multiple_source_lines() {
+    let output = run_repl_with_input("(+ 1 2)\n(+ 20 22)\n");
+    assert!(
+        output.status.success(),
+        "sema exited non-zero: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "3\n42\nGoodbye!\n");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
 fn test_u5_repl_define_feedback() {
     // Top-level `(define x 1)` evaluates to nil; the REPL should still print
     // `; defined x` so the user knows something happened.

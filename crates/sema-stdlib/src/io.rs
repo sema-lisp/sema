@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::io::BufRead;
+#[cfg(target_arch = "wasm32")]
 use std::io::Read as _;
 use std::io::Write as _;
 
@@ -12,6 +13,61 @@ thread_local! {
     static STDIN_EOF: Cell<bool> = const { Cell::new(false) };
 }
 
+pub(crate) fn mark_stdin_eof() {
+    STDIN_EOF.with(|flag| flag.set(true));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_line_value(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "read-line", 0);
+    match crate::stream::stdin_text_line_value("read-line")? {
+        Some(line) => Ok(Value::string_owned(line)),
+        None => {
+            mark_stdin_eof();
+            Ok(Value::nil())
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_line_value(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "read-line", 0);
+    let mut input = String::new();
+    let read = std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|error| SemaError::Io(format!("read-line: {error}")))?;
+    if read == 0 {
+        mark_stdin_eof();
+        return Ok(Value::nil());
+    }
+    if input.ends_with('\n') {
+        input.pop();
+        if input.ends_with('\r') {
+            input.pop();
+        }
+    }
+    Ok(Value::string_owned(input))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_stdin_value(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "read-stdin", 0);
+    let input = crate::stream::stdin_text_value("read-stdin")?;
+    mark_stdin_eof();
+    Ok(Value::string_owned(input))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_stdin_value(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "read-stdin", 0);
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|error| SemaError::Io(format!("read-stdin: {error}")))?;
+    mark_stdin_eof();
+    Ok(Value::string_owned(input))
+}
+
 // TTY restore-token store (unix only)
 #[cfg(unix)]
 thread_local! {
@@ -22,54 +78,6 @@ thread_local! {
     // report only when one is pending; otherwise it's modified-F3 keyboard input
     // (`CSI 1;<mod>R`), which is byte-identical to a CPR reply.
     static EXPECT_CPR: Cell<u32> = const { Cell::new(0) };
-}
-
-// Returns true if stdin has data ready to read within `timeout_ms` milliseconds (0 = non-blocking).
-#[cfg(unix)]
-fn unix_stdin_ready(timeout_ms: u64) -> bool {
-    unsafe {
-        let mut readfds: libc::fd_set = std::mem::zeroed();
-        libc::FD_ZERO(&mut readfds);
-        libc::FD_SET(libc::STDIN_FILENO, &mut readfds);
-        let mut tv = libc::timeval {
-            tv_sec: (timeout_ms / 1000) as libc::time_t,
-            tv_usec: ((timeout_ms % 1000) * 1000) as libc::suseconds_t,
-        };
-        libc::select(
-            libc::STDIN_FILENO + 1,
-            &mut readfds,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut tv,
-        ) > 0
-    }
-}
-
-/// Read exactly one byte from stdin (raw-mode key input). Returns None on EOF.
-///
-/// Reads straight from the raw fd, NOT `std::io::stdin()` (an 8 KB `BufReader`).
-/// Buffering there pulls a whole escape-sequence burst (e.g. `ESC [ C` for an
-/// arrow key) into userspace on the first byte, leaving `select()` /
-/// `unix_stdin_ready` — which inspect the kernel fd — blind to the continuation
-/// bytes. The decoder would then emit a lone ESC and let `[C` leak through as
-/// literal characters. An unbuffered read keeps the two in sync. Retry on EINTR
-/// (a SIGWINCH etc. can interrupt a blocking read).
-#[cfg(unix)]
-fn read_one_byte() -> std::io::Result<Option<u8>> {
-    let mut buf = [0u8; 1];
-    loop {
-        let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, 1) };
-        if n == 1 {
-            return Ok(Some(buf[0]));
-        } else if n == 0 {
-            return Ok(None);
-        }
-        let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        return Err(e);
-    }
 }
 
 /// Build a Sema list of active modifier keywords from a modifier bitmask
@@ -446,36 +454,42 @@ mod terminal_response_tests {
         assert_eq!(kw(&focus_event(true), "focused"), Some(Value::bool(true)));
         assert_eq!(kw(&focus_event(false), "focused"), Some(Value::bool(false)));
     }
-}
 
-/// Read the continuation bytes of a UTF-8 character whose lead byte is `lead`,
-/// returning the decoded string ("?" on invalid UTF-8). A single-byte ASCII
-/// lead returns that char unchanged, so this also covers Alt+ASCII.
-#[cfg(unix)]
-fn read_utf8_char(lead: u8) -> Result<String, SemaError> {
-    let extra = if lead & 0xe0 == 0xc0 {
-        1usize
-    } else if lead & 0xf0 == 0xe0 {
-        2
-    } else if lead & 0xf8 == 0xf0 {
-        3
-    } else {
-        0
-    };
-    let mut bytes = vec![lead];
-    for _ in 0..extra {
-        // Wait up to 20ms for continuation bytes (handles slow pipes / heavy load).
-        if !unix_stdin_ready(20) {
-            break;
-        }
-        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-            None => break,
-            Some(ch) => bytes.push(ch),
-        }
+    #[test]
+    fn runtime_key_decoder_preserves_character_csi_and_paste_shapes() {
+        let character = decode_runtime_key("ø".as_bytes());
+        assert!(is_kw(&character, "kind", "char"));
+        assert_eq!(kw(&character, "char"), Some(Value::string("ø")));
+
+        let right = decode_runtime_key(b"\x1b[1;5C");
+        assert!(is_kw(&right, "kind", "key"));
+        assert!(is_kw(&right, "name", "right"));
+        assert_eq!(mods_of(&right), vec!["ctrl"]);
+
+        let paste = decode_runtime_key(b"\x1b[200~hello\x1b[201~");
+        assert!(is_kw(&paste, "kind", "paste"));
+        assert_eq!(kw(&paste, "text"), Some(Value::string("hello")));
     }
-    Ok(std::str::from_utf8(&bytes)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|_| "?".to_string()))
+
+    #[test]
+    fn runtime_key_framing_waits_for_complete_escape_sequences() {
+        assert!(!runtime_key_complete(b"\x1b[", None));
+        assert!(!runtime_key_complete(b"\x1b[1;5", None));
+        assert!(runtime_key_complete(b"\x1b[1;5C", None));
+        assert!(!runtime_key_complete(b"\x1b[200~hello", None));
+        assert!(runtime_key_complete(b"\x1b[200~hello\x1b[201~", None));
+    }
+
+    #[test]
+    fn kitty_query_timeout_preserves_boolean_contract() {
+        let outcome =
+            terminal_query_runtime_with_timeout(TerminalQueryKind::KittySupport, Duration::ZERO)
+                .expect("kitty query timeout returns its fallback");
+        let NativeOutcome::Return(value) = outcome else {
+            panic!("zero-timeout kitty query must return immediately");
+        };
+        assert_eq!(value, Value::bool(false));
+    }
 }
 
 /// `{:kind :focus :focused <bool>}` — a terminal focus in/out report (enabled
@@ -604,33 +618,6 @@ fn decode_modify_other_keys(csi: &[u8]) -> Value {
     Value::map(m)
 }
 
-/// Collect a bracketed-paste payload: the literal bytes after `ESC[200~` up to
-/// the `ESC[201~` terminator, as `{:kind :paste :text …}`. Pasted content
-/// bypasses key dispatch entirely, so control bytes in a paste can't be
-/// misread as live keystrokes.
-#[cfg(unix)]
-fn read_bracketed_paste() -> Result<Value, SemaError> {
-    const TERMINATOR: &[u8] = b"\x1b[201~";
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
-        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-            None => break,
-            Some(ch) => {
-                buf.push(ch);
-                if buf.ends_with(TERMINATOR) {
-                    buf.truncate(buf.len() - TERMINATOR.len());
-                    break;
-                }
-            }
-        }
-    }
-    let text = String::from_utf8_lossy(&buf).to_string();
-    let mut m = std::collections::BTreeMap::new();
-    m.insert(Value::keyword("kind"), Value::keyword("paste"));
-    m.insert(Value::keyword("text"), Value::string(&text));
-    Ok(Value::map(m))
-}
-
 /// True when stdin is a real terminal (probes are meaningless otherwise).
 #[cfg(unix)]
 fn stdin_is_tty() -> bool {
@@ -647,43 +634,6 @@ fn write_stdout(seq: &str) -> Result<(), SemaError> {
         .map_err(|e| SemaError::Io(format!("term: {e}")))
 }
 
-/// Scan stdin for the next complete CSI sequence (`ESC [ … final`), returning
-/// its body (params + final byte) — or None on a `budget_ms` idle timeout.
-/// Non-CSI bytes are skipped; used only by the capability probes below.
-#[cfg(unix)]
-fn read_one_csi(budget_ms: u64) -> Result<Option<Vec<u8>>, SemaError> {
-    loop {
-        if !unix_stdin_ready(budget_ms) {
-            return Ok(None);
-        }
-        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-            None => return Ok(None),
-            Some(0x1b) => {}
-            Some(_) => continue,
-        }
-        if !unix_stdin_ready(50) {
-            return Ok(None);
-        }
-        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-            Some(b'[') => {}
-            _ => continue,
-        }
-        let mut csi: Vec<u8> = Vec::new();
-        loop {
-            match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-                None => return Ok(None),
-                Some(ch) => {
-                    csi.push(ch);
-                    if (0x40..=0x7e).contains(&ch) {
-                        break;
-                    }
-                }
-            }
-        }
-        return Ok(Some(csi));
-    }
-}
-
 /// Detect kitty-keyboard support: send the flags query `CSI ?u` followed by a
 /// Primary Device Attributes barrier `CSI c` (the method the kitty spec
 /// recommends). A supporting terminal answers the flags query (`ESC[?…u`) before
@@ -697,16 +647,9 @@ fn probe_kitty_support() -> Result<bool, SemaError> {
         return Ok(false);
     }
     write_stdout("\x1b[?u\x1b[c")?;
-    while let Some(csi) = read_one_csi(200)? {
-        let last = *csi.last().unwrap_or(&0);
-        if last == b'u' && csi.first() == Some(&b'?') {
-            return Ok(true);
-        }
-        if last == b'c' {
-            return Ok(false); // DA barrier reached with no kitty reply
-        }
-    }
-    Ok(false)
+    let value =
+        run_terminal_query_value(TerminalQueryKind::KittySupport, Duration::from_millis(200))?;
+    Ok(value.as_bool().unwrap_or(false))
 }
 
 /// Round-trip the cursor position: send DSR (`CSI 6n`) and return `{:row :col}`
@@ -717,129 +660,101 @@ fn query_cursor_position() -> Result<Value, SemaError> {
         return Ok(Value::nil());
     }
     write_stdout("\x1b[6n")?;
-    while let Some(csi) = read_one_csi(200)? {
-        if *csi.last().unwrap_or(&0) == b'R' {
-            let p = csi_params(&csi[..csi.len().saturating_sub(1)]);
-            let mut m = std::collections::BTreeMap::new();
-            m.insert(
-                Value::keyword("row"),
-                Value::int(p.first().copied().unwrap_or(0) as i64),
-            );
-            m.insert(
-                Value::keyword("col"),
-                Value::int(p.get(1).copied().unwrap_or(0) as i64),
-            );
-            return Ok(Value::map(m));
-        }
-    }
-    Ok(Value::nil())
+    run_terminal_query_value(
+        TerminalQueryKind::CursorPosition,
+        Duration::from_millis(200),
+    )
 }
 
-// Parse a key event from stdin (assuming raw mode).
-// Returns Ok(None) on EOF, Ok(Some(value)) on success.
 #[cfg(unix)]
-fn parse_key_input() -> Result<Option<Value>, SemaError> {
-    let b = match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-        None => return Ok(None),
-        Some(b) => b,
-    };
+fn key_character(kind: &str, character: String) -> Value {
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(Value::keyword("kind"), Value::keyword(kind));
+    map.insert(Value::keyword("char"), Value::string_owned(character));
+    Value::map(map)
+}
 
-    // ESC or escape sequence
-    if b == 0x1b {
-        if !unix_stdin_ready(50) {
-            // Plain ESC key
-            let mut m = std::collections::BTreeMap::new();
-            m.insert(Value::keyword("kind"), Value::keyword("key"));
-            m.insert(Value::keyword("name"), Value::keyword("esc"));
-            return Ok(Some(Value::map(m)));
-        }
-        let b2 = match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-            None => {
-                let mut m = std::collections::BTreeMap::new();
-                m.insert(Value::keyword("kind"), Value::keyword("key"));
-                m.insert(Value::keyword("name"), Value::keyword("esc"));
-                return Ok(Some(Value::map(m)));
-            }
-            Some(b) => b,
+#[cfg(unix)]
+fn named_key(name: &str) -> Value {
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(Value::keyword("kind"), Value::keyword("key"));
+    map.insert(Value::keyword("name"), Value::keyword(name));
+    Value::map(map)
+}
+
+/// Decode one complete key event collected by the runtime's nonblocking poll.
+/// An incomplete terminal sequence remains buffered between VM quanta instead
+/// of blocking the VM thread for its next byte.
+#[cfg(unix)]
+fn decode_runtime_key(bytes: &[u8]) -> Value {
+    let first = bytes.first().copied().unwrap_or_default();
+    if first == 0x1b {
+        let Some(second) = bytes.get(1).copied() else {
+            return named_key("esc");
         };
-
-        if b2 == b'[' {
-            // CSI sequence: read until final byte (0x40–0x7e)
-            let mut csi: Vec<u8> = Vec::new();
-            loop {
-                match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-                    None => break,
-                    Some(ch) => {
-                        csi.push(ch);
-                        if (0x40..=0x7e).contains(&ch) {
-                            break;
-                        }
-                    }
-                }
+        if second == b'[' {
+            let csi = &bytes[2..];
+            let last = csi.last().copied().unwrap_or_default();
+            let first = csi.first().copied().unwrap_or_default();
+            if csi.starts_with(b"200~") {
+                const PREFIX_LEN: usize = 4;
+                const TERMINATOR: &[u8] = b"\x1b[201~";
+                let payload_end = csi.len().saturating_sub(TERMINATOR.len());
+                let payload = &csi[PREFIX_LEN.min(payload_end)..payload_end];
+                let mut map = std::collections::BTreeMap::new();
+                map.insert(Value::keyword("kind"), Value::keyword("paste"));
+                map.insert(
+                    Value::keyword("text"),
+                    Value::string_owned(String::from_utf8_lossy(payload).into_owned()),
+                );
+                return Value::map(map);
             }
-            let last = *csi.last().unwrap_or(&0);
-            let first = *csi.first().unwrap_or(&0);
-            // Dispatch by shape (each form is unambiguous by its marker/final byte):
-            //   ESC[<b;x;y M|m  → SGR mouse            ESC[…u        → kitty key
-            //   ESC[?…u         → kitty flags reply    ESC[200~      → bracketed paste
-            //   ESC[I | ESC[O   → focus in/out         ESC[?…c/>…c   → device attrs
-            //   ESC[r;cR        → cursor-position rpt   ESC[27;m;c~   → modifyOtherKeys
-            //   else            → legacy keys + xterm modifier forms + function keys
             if first == b'<' {
-                return Ok(Some(decode_sgr_mouse(&csi, last)));
+                return decode_sgr_mouse(csi, last);
             }
             if last == b'u' {
-                if first == b'?' {
-                    return Ok(Some(decode_kitty_flags(&csi)));
-                }
-                return Ok(Some(decode_kitty(&csi)));
+                return if first == b'?' {
+                    decode_kitty_flags(csi)
+                } else {
+                    decode_kitty(csi)
+                };
             }
-            if csi.as_slice() == b"200~" {
-                return read_bracketed_paste().map(Some);
+            if csi == b"I" {
+                return focus_event(true);
             }
-            if csi.as_slice() == b"I" {
-                return Ok(Some(focus_event(true)));
-            }
-            if csi.as_slice() == b"O" {
-                return Ok(Some(focus_event(false)));
+            if csi == b"O" {
+                return focus_event(false);
             }
             if last == b'c' && (first == b'?' || first == b'>') {
-                return Ok(Some(decode_device_attributes(&csi, first)));
+                return decode_device_attributes(csi, first);
             }
-            // A `CSI…R` is a cursor-position report only when we solicited one;
-            // otherwise it's modified-F3 (`CSI 1;<mod>R`) → fall through to keys.
             if last == b'R'
-                && EXPECT_CPR.with(|c| {
-                    let n = c.get();
-                    if n > 0 {
-                        c.set(n - 1);
-                        true
-                    } else {
+                && EXPECT_CPR.with(|counter| {
+                    let pending = counter.get();
+                    if pending == 0 {
                         false
+                    } else {
+                        counter.set(pending - 1);
+                        true
                     }
                 })
             {
-                return Ok(Some(decode_cpr(&csi)));
+                return decode_cpr(csi);
             }
             if last == b'~' && csi.starts_with(b"27;") {
-                return Ok(Some(decode_modify_other_keys(&csi)));
+                return decode_modify_other_keys(csi);
             }
-            let (name, mbits) = parse_legacy_csi(&csi);
-            let mut m = std::collections::BTreeMap::new();
-            m.insert(Value::keyword("kind"), Value::keyword("key"));
-            m.insert(Value::keyword("name"), Value::keyword(name));
-            if let Some(mods) = mods_list(mbits) {
-                m.insert(Value::keyword("mods"), mods);
+            let (name, modifier_bits) = parse_legacy_csi(csi);
+            let mut map = std::collections::BTreeMap::new();
+            map.insert(Value::keyword("kind"), Value::keyword("key"));
+            map.insert(Value::keyword("name"), Value::keyword(name));
+            if let Some(modifiers) = mods_list(modifier_bits) {
+                map.insert(Value::keyword("mods"), modifiers);
             }
-            return Ok(Some(Value::map(m)));
+            return Value::map(map);
         }
-
-        // ESC O sequences (SS3, e.g. function keys on some terminals)
-        if b2 == b'O' {
-            let b3 = read_one_byte()
-                .map_err(|e| SemaError::Io(format!("io/read-key: {e}")))?
-                .unwrap_or(0);
-            let name = match b3 {
+        if second == b'O' {
+            let name = match bytes.get(2).copied().unwrap_or_default() {
                 b'A' => "up",
                 b'B' => "down",
                 b'C' => "right",
@@ -852,79 +767,23 @@ fn parse_key_input() -> Result<Option<Value>, SemaError> {
                 b'S' => "f4",
                 _ => "unknown",
             };
-            let mut m = std::collections::BTreeMap::new();
-            m.insert(Value::keyword("kind"), Value::keyword("key"));
-            m.insert(Value::keyword("name"), Value::keyword(name));
-            return Ok(Some(Value::map(m)));
+            return named_key(name);
         }
-
-        // Alt + char (ESC followed by a character; may be multi-byte UTF-8).
-        let alt_str = read_utf8_char(b2)?;
-        let mut m = std::collections::BTreeMap::new();
-        m.insert(Value::keyword("kind"), Value::keyword("alt"));
-        m.insert(Value::keyword("char"), Value::string(&alt_str));
-        return Ok(Some(Value::map(m)));
+        let character = std::str::from_utf8(&bytes[1..]).unwrap_or("?").to_string();
+        return key_character("alt", character);
     }
 
-    // DEL / Backspace (0x7f)
-    if b == 0x7f {
-        let mut m = std::collections::BTreeMap::new();
-        m.insert(Value::keyword("kind"), Value::keyword("key"));
-        m.insert(Value::keyword("name"), Value::keyword("backspace"));
-        return Ok(Some(Value::map(m)));
+    match first {
+        0x7f | 0x08 => named_key("backspace"),
+        0x09 => named_key("tab"),
+        0x0a | 0x0d => named_key("enter"),
+        byte if byte < 0x20 => key_character("ctrl", char::from(byte + 0x60).to_string()),
+        byte if byte < 0x80 => key_character("char", char::from(byte).to_string()),
+        _ => key_character(
+            "char",
+            std::str::from_utf8(bytes).unwrap_or("?").to_string(),
+        ),
     }
-
-    // Control characters (0x00–0x1f, excluding ESC already handled)
-    if b < 0x20 {
-        match b {
-            0x08 => {
-                // Ctrl-H = backspace
-                let mut m = std::collections::BTreeMap::new();
-                m.insert(Value::keyword("kind"), Value::keyword("key"));
-                m.insert(Value::keyword("name"), Value::keyword("backspace"));
-                return Ok(Some(Value::map(m)));
-            }
-            0x09 => {
-                let mut m = std::collections::BTreeMap::new();
-                m.insert(Value::keyword("kind"), Value::keyword("key"));
-                m.insert(Value::keyword("name"), Value::keyword("tab"));
-                return Ok(Some(Value::map(m)));
-            }
-            0x0a | 0x0d => {
-                let mut m = std::collections::BTreeMap::new();
-                m.insert(Value::keyword("kind"), Value::keyword("key"));
-                m.insert(Value::keyword("name"), Value::keyword("enter"));
-                return Ok(Some(Value::map(m)));
-            }
-            _ => {
-                // 0x01–0x1a → Ctrl-A through Ctrl-Z; map to letter
-                let ctrl_char = char::from(b.wrapping_add(0x60));
-                let mut m = std::collections::BTreeMap::new();
-                m.insert(Value::keyword("kind"), Value::keyword("ctrl"));
-                m.insert(
-                    Value::keyword("char"),
-                    Value::string(&ctrl_char.to_string()),
-                );
-                return Ok(Some(Value::map(m)));
-            }
-        }
-    }
-
-    // Regular ASCII (0x20–0x7e)
-    if b < 0x80 {
-        let ch = char::from(b);
-        let mut m = std::collections::BTreeMap::new();
-        m.insert(Value::keyword("kind"), Value::keyword("char"));
-        m.insert(Value::keyword("char"), Value::string(&ch.to_string()));
-        return Ok(Some(Value::map(m)));
-    }
-
-    // Multi-byte UTF-8 character (b >= 0x80)
-    let ch_str = read_utf8_char(b)?;
-    let mut m = std::collections::BTreeMap::new();
-    m.insert(Value::keyword("kind"), Value::keyword("char"));
-    m.insert(Value::keyword("char"), Value::string(&ch_str));
-    Ok(Some(Value::map(m)))
 }
 
 // Shared path-component implementations. Each is registered under both a canonical
@@ -1779,13 +1638,9 @@ fn file_line_runtime(args: &[Value], kind: FileLineKind) -> NativeResult {
 /// is ready (or on non-unix platforms, where raw key input isn't wired).
 #[cfg(unix)]
 pub(crate) fn poll_key_event(ms: u64) -> Option<Value> {
-    if !unix_stdin_ready(ms) {
-        return None;
-    }
-    match parse_key_input() {
-        Ok(Some(v)) => Some(v),
-        _ => None,
-    }
+    read_key_from_owner(Some(Duration::from_millis(ms)))
+        .ok()
+        .filter(|value| !value.is_nil())
 }
 
 #[cfg(not(unix))]
@@ -1833,7 +1688,12 @@ pub(crate) fn await_runtime_until(
     started: std::time::Instant,
     timeout_ms: u64,
 ) -> NativeResult {
-    runtime_poll_step(probe, started, timeout_ms)
+    runtime_poll_step(probe, Some((started, Duration::from_millis(timeout_ms))))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn await_runtime_indefinitely(probe: Box<dyn RuntimePoll>) -> NativeResult {
+    runtime_poll_step(probe, None)
 }
 
 /// One scan of the cooperative poll: check the probe on the VM thread; resolve if
@@ -1842,8 +1702,7 @@ pub(crate) fn await_runtime_until(
 #[cfg(not(target_arch = "wasm32"))]
 fn runtime_poll_step(
     mut probe: Box<dyn RuntimePoll>,
-    started: std::time::Instant,
-    timeout_ms: u64,
+    deadline: Option<(std::time::Instant, Duration)>,
 ) -> NativeResult {
     let requested_delay = match probe.poll() {
         RuntimePollResult::Ready(value) => return Ok(NativeOutcome::Return(value)),
@@ -1851,20 +1710,23 @@ fn runtime_poll_step(
         RuntimePollResult::PendingAfter(delay) => delay,
     };
 
-    let timeout = Duration::from_millis(timeout_ms);
-    let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
-        return Ok(NativeOutcome::Return(Value::nil()));
+    let delay = if let Some((started, timeout)) = deadline {
+        let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+            return Ok(NativeOutcome::Return(Value::nil()));
+        };
+        if remaining.is_zero() {
+            return Ok(NativeOutcome::Return(Value::nil()));
+        }
+        requested_delay.min(remaining)
+    } else {
+        requested_delay
     };
-    if remaining.is_zero() {
-        return Ok(NativeOutcome::Return(Value::nil()));
-    }
 
     Ok(NativeOutcome::Suspend(NativeSuspend {
-        wait: WaitKind::Timer(requested_delay.min(remaining)),
+        wait: WaitKind::Timer(delay),
         continuation: Box::new(RuntimePollContinuation {
             probe: Some(probe),
-            started,
-            timeout_ms,
+            deadline,
         }),
     }))
 }
@@ -1875,8 +1737,7 @@ fn runtime_poll_step(
 #[cfg(not(target_arch = "wasm32"))]
 struct RuntimePollContinuation {
     probe: Option<Box<dyn RuntimePoll>>,
-    started: std::time::Instant,
-    timeout_ms: u64,
+    deadline: Option<(std::time::Instant, Duration)>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1899,7 +1760,7 @@ impl NativeContinuation for RuntimePollContinuation {
         match input {
             ResumeInput::Returned(_) => {
                 let probe = self.probe.take().expect("runtime poll probe resumed once");
-                runtime_poll_step(probe, self.started, self.timeout_ms)
+                runtime_poll_step(probe, self.deadline)
             }
             ResumeInput::Failed(error) => Err(error),
             ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
@@ -1914,59 +1775,389 @@ impl NativeContinuation for RuntimePollContinuation {
 
 /// The VM-thread readiness probe for `io/read-key-timeout`: a keypress is ready
 /// once a byte is available on stdin; EOF resolves to nil. Holds no `Value`.
-#[cfg(not(target_arch = "wasm32"))]
-struct KeyProbe;
+#[cfg(unix)]
+struct KeyProbe {
+    lease: crate::stream::StdinInputLease,
+    bytes: Vec<u8>,
+    completed_bytes: Vec<u8>,
+    escape_started: Option<std::time::Instant>,
+    terminal: bool,
+}
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(unix)]
+impl KeyProbe {
+    fn new() -> Self {
+        Self {
+            lease: crate::stream::acquire_stdin_input(),
+            bytes: Vec::new(),
+            completed_bytes: Vec::new(),
+            escape_started: None,
+            terminal: false,
+        }
+    }
+
+    fn take_completed_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.completed_bytes)
+    }
+
+    fn next_event(&mut self) {
+        debug_assert!(self.bytes.is_empty());
+        debug_assert!(self.completed_bytes.is_empty());
+        self.escape_started = None;
+        self.terminal = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for KeyProbe {
+    fn drop(&mut self) {
+        if !self.terminal {
+            self.lease.return_bytes(&self.bytes);
+        }
+    }
+}
+
+#[cfg(unix)]
+const RUNTIME_KEY_BYTE_CAP: usize = 8 * 1024 * 1024;
+
+#[cfg(unix)]
+fn utf8_event_width(lead: u8) -> usize {
+    if lead & 0xe0 == 0xc0 {
+        2
+    } else if lead & 0xf0 == 0xe0 {
+        3
+    } else if lead & 0xf8 == 0xf0 {
+        4
+    } else {
+        1
+    }
+}
+
+#[cfg(unix)]
+fn runtime_key_complete(bytes: &[u8], escape_started: Option<std::time::Instant>) -> bool {
+    let Some(first) = bytes.first().copied() else {
+        return false;
+    };
+    if first != 0x1b {
+        return bytes.len() >= utf8_event_width(first);
+    }
+    let Some(second) = bytes.get(1).copied() else {
+        return escape_started
+            .is_some_and(|started| started.elapsed() >= Duration::from_millis(50));
+    };
+    if second == b'[' {
+        let csi = &bytes[2..];
+        if csi.starts_with(b"200~") {
+            return csi.ends_with(b"\x1b[201~");
+        }
+        return csi.iter().any(|byte| (0x40..=0x7e).contains(byte));
+    }
+    if second == b'O' {
+        return bytes.len() >= 3;
+    }
+    bytes.len() > utf8_event_width(second)
+}
+
+#[cfg(unix)]
+fn runtime_key_poll_delay(bytes: &[u8], escape_started: Option<std::time::Instant>) -> Duration {
+    if bytes == [0x1b] {
+        let elapsed = escape_started.map_or(Duration::ZERO, |started| started.elapsed());
+        return Duration::from_millis(50).saturating_sub(elapsed);
+    }
+    Duration::from_millis(5)
+}
+
+#[cfg(unix)]
+fn poll_runtime_key(probe: &mut KeyProbe) -> RuntimePollResult {
+    loop {
+        if runtime_key_complete(&probe.bytes, probe.escape_started) {
+            probe.terminal = true;
+            probe.completed_bytes = std::mem::take(&mut probe.bytes);
+            return RuntimePollResult::Ready(decode_runtime_key(&probe.completed_bytes));
+        }
+        match probe.lease.poll(1, None, "io/read-key") {
+            Ok(crate::stream::StdinInputPoll::Data(bytes)) => {
+                let byte = bytes[0];
+                if probe.bytes.is_empty() && byte == 0x1b {
+                    probe.escape_started = Some(std::time::Instant::now());
+                }
+                probe.bytes.push(byte);
+                if probe.bytes.len() > RUNTIME_KEY_BYTE_CAP {
+                    probe.terminal = true;
+                    return RuntimePollResult::Failed(format!(
+                        "io/read-key: input exceeds the {RUNTIME_KEY_BYTE_CAP}-byte event cap"
+                    ));
+                }
+            }
+            Ok(crate::stream::StdinInputPoll::Eof) if probe.bytes.is_empty() => {
+                probe.terminal = true;
+                mark_stdin_eof();
+                return RuntimePollResult::Ready(Value::nil());
+            }
+            Ok(crate::stream::StdinInputPoll::Eof) => {
+                probe.terminal = true;
+                mark_stdin_eof();
+                probe.completed_bytes = std::mem::take(&mut probe.bytes);
+                return RuntimePollResult::Ready(decode_runtime_key(&probe.completed_bytes));
+            }
+            Ok(crate::stream::StdinInputPoll::Pending) => {
+                return RuntimePollResult::PendingAfter(runtime_key_poll_delay(
+                    &probe.bytes,
+                    probe.escape_started,
+                ));
+            }
+            Err(error) => {
+                probe.terminal = true;
+                return RuntimePollResult::Failed(error.to_string());
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 impl Trace for KeyProbe {
     fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
         true
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(unix)]
 impl RuntimePoll for KeyProbe {
     fn poll(&mut self) -> RuntimePollResult {
-        if !unix_stdin_ready(0) {
-            return RuntimePollResult::PendingAfter(Duration::from_millis(5));
-        }
-        match parse_key_input() {
-            Ok(Some(value)) => RuntimePollResult::Ready(value),
-            Ok(None) => {
-                STDIN_EOF.with(|f| f.set(true));
-                RuntimePollResult::Ready(Value::nil())
-            }
-            Err(error) => RuntimePollResult::Failed(error.to_string()),
+        poll_runtime_key(self)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum TerminalQueryKind {
+    KittySupport,
+    CursorPosition,
+}
+
+#[cfg(unix)]
+impl TerminalQueryKind {
+    fn fallback(self) -> Value {
+        match self {
+            Self::KittySupport => Value::bool(false),
+            Self::CursorPosition => Value::nil(),
         }
     }
 }
 
-/// Synchronous value-ABI body for `io/read-key-timeout` using blocking
-/// `select(2)`. The cooperative path lives in the runtime ABI
+#[cfg(unix)]
+struct TerminalQueryProbe {
+    key: KeyProbe,
+    deferred_bytes: Vec<u8>,
+    kind: TerminalQueryKind,
+    cpr_armed: bool,
+    deadline: std::time::Instant,
+}
+
+#[cfg(unix)]
+impl TerminalQueryProbe {
+    fn new(kind: TerminalQueryKind, timeout: Duration) -> Self {
+        let cpr_armed = matches!(kind, TerminalQueryKind::CursorPosition);
+        if cpr_armed {
+            EXPECT_CPR.with(|counter| counter.set(counter.get().saturating_add(1)));
+        }
+        Self {
+            key: KeyProbe::new(),
+            deferred_bytes: Vec::new(),
+            kind,
+            cpr_armed,
+            deadline: std::time::Instant::now() + timeout,
+        }
+    }
+
+    fn is_kind(value: &Value, kind: &str) -> bool {
+        value
+            .as_map_ref()
+            .and_then(|map| map.get(&Value::keyword("kind")).cloned())
+            == Some(Value::keyword(kind))
+    }
+
+    fn defer_completed_event(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        if bytes.len() > RUNTIME_KEY_BYTE_CAP.saturating_sub(self.deferred_bytes.len()) {
+            // `prepend` places each call before the previous one. Return the
+            // newest event first, then the earlier deferred bytes, so the next
+            // stdin consumer observes their original order.
+            self.key.lease.return_bytes(&bytes);
+            self.key.lease.return_bytes(&self.deferred_bytes);
+            self.deferred_bytes.clear();
+            self.key.terminal = true;
+            return Err(format!(
+                "terminal query: unrelated input exceeds the {RUNTIME_KEY_BYTE_CAP}-byte preservation cap"
+            ));
+        }
+        self.deferred_bytes.extend(bytes);
+        self.key.next_event();
+        Ok(())
+    }
+
+    fn requeue_preserved_input(&mut self) {
+        let partial = std::mem::take(&mut self.key.bytes);
+        self.key.terminal = true;
+        // Return the partial suffix first because each prepend call inserts at
+        // the front. Deferred complete events must be observed before it.
+        self.key.lease.return_bytes(&partial);
+        self.key.lease.return_bytes(&self.deferred_bytes);
+        self.deferred_bytes.clear();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalQueryProbe {
+    fn drop(&mut self) {
+        self.requeue_preserved_input();
+        if self.cpr_armed {
+            EXPECT_CPR.with(|counter| counter.set(counter.get().saturating_sub(1)));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Trace for TerminalQueryProbe {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        self.key.trace(sink)
+    }
+}
+
+#[cfg(unix)]
+impl RuntimePoll for TerminalQueryProbe {
+    fn poll(&mut self) -> RuntimePollResult {
+        loop {
+            let Some(remaining) = self
+                .deadline
+                .checked_duration_since(std::time::Instant::now())
+            else {
+                return RuntimePollResult::Ready(self.kind.fallback());
+            };
+            if remaining.is_zero() {
+                return RuntimePollResult::Ready(self.kind.fallback());
+            }
+            match self.key.poll() {
+                RuntimePollResult::Ready(value) if value.is_nil() => {
+                    return RuntimePollResult::Ready(self.kind.fallback());
+                }
+                RuntimePollResult::Ready(value) => {
+                    let bytes = self.key.take_completed_bytes();
+                    match self.kind {
+                        TerminalQueryKind::KittySupport if Self::is_kind(&value, "kitty-flags") => {
+                            return RuntimePollResult::Ready(Value::bool(true));
+                        }
+                        TerminalQueryKind::KittySupport
+                            if Self::is_kind(&value, "device-attributes") =>
+                        {
+                            return RuntimePollResult::Ready(Value::bool(false));
+                        }
+                        TerminalQueryKind::CursorPosition if Self::is_kind(&value, "cpr") => {
+                            self.cpr_armed = false;
+                            return RuntimePollResult::Ready(value);
+                        }
+                        _ => {
+                            if let Err(message) = self.defer_completed_event(bytes) {
+                                return RuntimePollResult::Failed(message);
+                            }
+                        }
+                    }
+                }
+                RuntimePollResult::Failed(message) => {
+                    return RuntimePollResult::Failed(message);
+                }
+                RuntimePollResult::PendingAfter(delay) => {
+                    return RuntimePollResult::PendingAfter(delay.min(remaining));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_terminal_query_value(
+    kind: TerminalQueryKind,
+    timeout: Duration,
+) -> Result<Value, SemaError> {
+    let mut probe = TerminalQueryProbe::new(kind, timeout);
+    loop {
+        match probe.poll() {
+            RuntimePollResult::Ready(value) => return Ok(value),
+            RuntimePollResult::Failed(message) => return Err(SemaError::eval(message)),
+            RuntimePollResult::PendingAfter(delay) => std::thread::sleep(delay),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn terminal_query_runtime(kind: TerminalQueryKind) -> NativeResult {
+    terminal_query_runtime_with_timeout(kind, Duration::from_millis(200))
+}
+
+#[cfg(unix)]
+fn terminal_query_runtime_with_timeout(kind: TerminalQueryKind, timeout: Duration) -> NativeResult {
+    await_runtime_indefinitely(Box::new(TerminalQueryProbe::new(kind, timeout)))
+}
+
+/// Synchronous value-ABI body for `io/read-key-timeout` using the shared stdin
+/// owner. The cooperative path lives in the runtime ABI
 /// ([`register_read_key_timeout`]).
+#[cfg(unix)]
 fn read_key_timeout_value(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "io/read-key-timeout", 1);
     let ms = args[0]
         .as_int()
         .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))? as u64;
 
-    #[cfg(not(target_arch = "wasm32"))]
-    if !unix_stdin_ready(ms) {
-        return Ok(Value::nil());
-    }
-    match parse_key_input()? {
-        None => {
-            STDIN_EOF.with(|f| f.set(true));
-            Ok(Value::nil())
+    read_key_from_owner(Some(Duration::from_millis(ms)))
+}
+
+#[cfg(unix)]
+fn read_key_from_owner(timeout: Option<Duration>) -> Result<Value, SemaError> {
+    let started = std::time::Instant::now();
+    let mut probe = KeyProbe::new();
+    loop {
+        match poll_runtime_key(&mut probe) {
+            RuntimePollResult::Ready(value) => return Ok(value),
+            RuntimePollResult::Failed(message) => return Err(SemaError::eval(message)),
+            RuntimePollResult::PendingAfter(delay) => {
+                let sleep = if let Some(timeout) = timeout {
+                    let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                        return Ok(Value::nil());
+                    };
+                    if remaining.is_zero() {
+                        return Ok(Value::nil());
+                    }
+                    delay.min(remaining)
+                } else {
+                    delay
+                };
+                std::thread::sleep(sleep);
+            }
         }
-        Some(v) => Ok(v),
     }
+}
+
+#[cfg(unix)]
+fn read_key_value(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "io/read-key", 0);
+    read_key_from_owner(None)
+}
+
+#[cfg(unix)]
+fn register_read_key(env: &sema_core::Env) {
+    crate::register_runtime_fn(env, "io/read-key", |args| {
+        if sema_core::in_runtime_quantum() {
+            check_arity!(args, "io/read-key", 0);
+            return await_runtime_indefinitely(Box::new(KeyProbe::new()));
+        }
+        read_key_value(args).map(NativeOutcome::Return)
+    });
 }
 
 /// Register `io/read-key-timeout` dual-ABI: the value body is synchronous; the
 /// runtime body uses structural timer wakes so a "key OR agent progress" loop
 /// overlaps sibling tasks.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(unix)]
 fn register_read_key_timeout(env: &sema_core::Env) {
     env.set(
         sema_core::intern("io/read-key-timeout"),
@@ -1981,17 +2172,12 @@ fn register_read_key_timeout(env: &sema_core::Env) {
                         .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?
                         as u64;
                     let started = std::time::Instant::now();
-                    return await_runtime_until(Box::new(KeyProbe), started, ms);
+                    return await_runtime_until(Box::new(KeyProbe::new()), started, ms);
                 }
                 read_key_timeout_value(args).map(NativeOutcome::Return)
             },
         )),
     );
-}
-
-#[cfg(target_arch = "wasm32")]
-fn register_read_key_timeout(env: &sema_core::Env) {
-    register_fn(env, "io/read-key-timeout", read_key_timeout_value);
 }
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
@@ -2195,25 +2381,13 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         },
     );
 
-    register_fn(env, "read-line", |args| {
-        check_arity!(args, "read-line", 0);
-        let mut input = String::new();
-        let n = std::io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| SemaError::Io(format!("read-line: {e}")))?;
-        if n == 0 {
-            // EOF: stdin was closed (piped input exhausted or Ctrl-D in raw mode)
-            STDIN_EOF.with(|f| f.set(true));
-            return Ok(Value::nil());
+    crate::register_runtime_fn(env, "read-line", |args| {
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_runtime_quantum() {
+            check_arity!(args, "read-line", 0);
+            return crate::stream::stdin_text_line("read-line");
         }
-        // Remove trailing newline
-        if input.ends_with('\n') {
-            input.pop();
-            if input.ends_with('\r') {
-                input.pop();
-            }
-        }
-        Ok(Value::string_owned(input))
+        read_line_value(args).map(NativeOutcome::Return)
     });
 
     register_fn(env, "read", |args| {
@@ -2841,14 +3015,13 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         Ok(Value::nil())
     });
 
-    register_fn(env, "read-stdin", |args| {
-        check_arity!(args, "read-stdin", 0);
-        let mut buf = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buf)
-            .map_err(|e| SemaError::Io(format!("read-stdin: {e}")))?;
-        STDIN_EOF.with(|f| f.set(true));
-        Ok(Value::string_owned(buf))
+    crate::register_runtime_fn(env, "read-stdin", |args| {
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_runtime_quantum() {
+            check_arity!(args, "read-stdin", 0);
+            return crate::stream::stdin_text("read-stdin");
+        }
+        read_stdin_value(args).map(NativeOutcome::Return)
     });
 
     // io/flush — flush stdout
@@ -2929,25 +3102,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         //   {:kind :ctrl   :char "c"}         Ctrl-C (ctrl + letter)
         //   {:kind :key    :name :enter}      named key (:enter :backspace :tab :esc :up …)
         //   {:kind :alt    :char "x"}         Alt + character
-        register_fn(env, "io/read-key", |args| {
-            check_arity!(args, "io/read-key", 0);
-
-            // In an async task, the raw `libc::read(STDIN)` below blocks the
-            // single cooperative VM thread with no timeout — worse than
-            // `io/read-key-timeout`, which at least bounds the stall. Reuse the
-            // same cooperative park (`await_io_until` + `unix_stdin_ready(0)`
-            // polling), just with an effectively unbounded timeout so it waits
-            // for a key exactly like the sync path, without blocking siblings.
-            // The sync path below is byte-identical to before.
-
-            match parse_key_input()? {
-                None => {
-                    STDIN_EOF.with(|f| f.set(true));
-                    Ok(Value::nil())
-                }
-                Some(v) => Ok(v),
-            }
-        });
+        register_read_key(env);
 
         // io/read-key-timeout — like io/read-key but returns nil if no key arrives within
         // `timeout-ms` milliseconds.
@@ -2955,14 +3110,30 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
         // Capability probes (raw mode required; they round-trip a query + reply).
         // term/supports-kitty-keys? → bool via `CSI ?u` + DSR barrier.
-        register_fn(env, "term/supports-kitty-keys?", |args| {
+        crate::register_runtime_fn(env, "term/supports-kitty-keys?", |args| {
             check_arity!(args, "term/supports-kitty-keys?", 0);
-            Ok(Value::bool(probe_kitty_support()?))
+            if sema_core::in_runtime_quantum() {
+                if !stdin_is_tty() {
+                    return Ok(NativeOutcome::Return(Value::bool(false)));
+                }
+                write_stdout("\x1b[?u\x1b[c")?;
+                return terminal_query_runtime(TerminalQueryKind::KittySupport);
+            }
+            probe_kitty_support()
+                .map(Value::bool)
+                .map(NativeOutcome::Return)
         });
         // term/cursor-position → {:row :col} (or nil) via a DSR round-trip.
-        register_fn(env, "term/cursor-position", |args| {
+        crate::register_runtime_fn(env, "term/cursor-position", |args| {
             check_arity!(args, "term/cursor-position", 0);
-            query_cursor_position()
+            if sema_core::in_runtime_quantum() {
+                if !stdin_is_tty() {
+                    return Ok(NativeOutcome::Return(Value::nil()));
+                }
+                write_stdout("\x1b[6n")?;
+                return terminal_query_runtime(TerminalQueryKind::CursorPosition);
+            }
+            query_cursor_position().map(NativeOutcome::Return)
         });
         // term/query-cursor-position → write DSR and arm the CPR flag, so the
         // reply (arriving later via io/read-key) is decoded as :cpr rather than

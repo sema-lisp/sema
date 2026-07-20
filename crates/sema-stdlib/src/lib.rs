@@ -62,6 +62,17 @@ mod server;
 #[cfg(not(target_arch = "wasm32"))]
 mod sqlite;
 mod stream;
+
+/// Read one source line through the process-wide stdin coordinator.
+///
+/// This is an internal integration seam for the native headless REPL. Keeping
+/// source acquisition behind the same owner as runtime stdin operations lets a
+/// form such as `(read-line)` consume the bytes immediately following it.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub fn read_coordinated_stdin_source_line() -> Result<Option<String>, sema_core::SemaError> {
+    stream::stdin_source_line_value("headless REPL")
+}
 mod string;
 #[cfg(not(target_arch = "wasm32"))]
 mod system;

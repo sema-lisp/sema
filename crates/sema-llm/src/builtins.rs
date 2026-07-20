@@ -313,6 +313,13 @@ struct LlmDynScope {
     stream_budget_pregate: bool,
     call_tags: Vec<String>,
     call_meta: Vec<(String, String)>,
+    last_usage: Option<Usage>,
+    fallback_chain: Option<Vec<FallbackEntry>>,
+    rate_limit_rps: Option<f64>,
+    /// Siblings spawned inside one rate-limit scope reserve against one cursor.
+    rate_limit_last: Option<Rc<Cell<u64>>>,
+    retry_base_ms: u64,
+    network_max_retries: u32,
     /// The active budget frame, shared by `Rc` so concurrent siblings charge one aggregate.
     budget: Option<Rc<RefCell<BudgetFrame>>>,
     /// The cassette selected by this scope. Spawned siblings share one tape so
@@ -328,6 +335,12 @@ impl Default for LlmDynScope {
             stream_budget_pregate: false,
             call_tags: Vec::new(),
             call_meta: Vec::new(),
+            last_usage: None,
+            fallback_chain: None,
+            rate_limit_rps: None,
+            rate_limit_last: None,
+            retry_base_ms: 500,
+            network_max_retries: 3,
             budget: None,
             cassette: None,
         }
@@ -342,6 +355,12 @@ fn read_llm_scope() -> LlmDynScope {
         stream_budget_pregate: STREAM_BUDGET_PREGATE.with(|c| c.get()),
         call_tags: CALL_TAGS.with(|t| t.borrow().clone()),
         call_meta: CALL_META.with(|m| m.borrow().clone()),
+        last_usage: LAST_USAGE.with(|u| u.borrow().clone()),
+        fallback_chain: FALLBACK_CHAIN.with(|c| c.borrow().clone()),
+        rate_limit_rps: RATE_LIMIT_RPS.with(|r| r.get()),
+        rate_limit_last: RATE_LIMIT_LAST.with(|last| last.borrow().clone()),
+        retry_base_ms: RETRY_BASE_MS.with(|base| base.get()),
+        network_max_retries: NETWORK_MAX_RETRIES.with(|retries| retries.get()),
         budget: ACTIVE_BUDGET.with(|b| b.borrow().clone()),
         cassette: CASSETTE.with(|c| c.borrow().clone()),
     }
@@ -355,6 +374,12 @@ fn write_llm_scope(s: LlmDynScope) -> LlmDynScope {
     STREAM_BUDGET_PREGATE.with(|c| c.set(s.stream_budget_pregate));
     CALL_TAGS.with(|t| *t.borrow_mut() = s.call_tags);
     CALL_META.with(|m| *m.borrow_mut() = s.call_meta);
+    LAST_USAGE.with(|u| *u.borrow_mut() = s.last_usage);
+    FALLBACK_CHAIN.with(|c| *c.borrow_mut() = s.fallback_chain);
+    RATE_LIMIT_RPS.with(|r| r.set(s.rate_limit_rps));
+    RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = s.rate_limit_last);
+    RETRY_BASE_MS.with(|base| base.set(s.retry_base_ms));
+    NETWORK_MAX_RETRIES.with(|retries| retries.set(s.network_max_retries));
     ACTIVE_BUDGET.with(|b| *b.borrow_mut() = s.budget);
     CASSETTE.with(|c| *c.borrow_mut() = s.cassette);
     prev
@@ -362,7 +387,11 @@ fn write_llm_scope(s: LlmDynScope) -> LlmDynScope {
 
 /// Capture (clone) the LLM dynamic scope to seed onto a freshly-spawned task.
 fn capture_llm_scope() -> Box<dyn std::any::Any> {
-    Box::new(read_llm_scope())
+    let mut scope = read_llm_scope();
+    // `last-usage` describes the most recent request made by this task. A new
+    // task inherits dynamic configuration, but starts without request history.
+    scope.last_usage = None;
+    Box::new(scope)
 }
 
 /// Take the LLM dynamic scope out of the thread-locals, leaving defaults.
@@ -397,6 +426,11 @@ fn llm_scope_ambient_is_empty() -> bool {
         && !ACTIVE_BUDGET.with(|b| b.borrow().is_some())
         && CALL_TAGS.with(|t| t.borrow().is_empty())
         && CALL_META.with(|m| m.borrow().is_empty())
+        && LAST_USAGE.with(|u| u.borrow().is_none())
+        && FALLBACK_CHAIN.with(|c| c.borrow().is_none())
+        && RATE_LIMIT_RPS.with(|r| r.get().is_none())
+        && RETRY_BASE_MS.with(|base| base.get() == 500)
+        && NETWORK_MAX_RETRIES.with(|retries| retries.get() == 3)
         && CASSETTE.with(|c| c.borrow().is_none())
 }
 
@@ -412,6 +446,11 @@ fn llm_dyn_scope_is_default(s: &LlmDynScope) -> bool {
         && s.cassette.is_none()
         && s.call_tags.is_empty()
         && s.call_meta.is_empty()
+        && s.last_usage.is_none()
+        && s.fallback_chain.is_none()
+        && s.rate_limit_rps.is_none()
+        && s.retry_base_ms == 500
+        && s.network_max_retries == 3
 }
 
 /// Register the per-task LLM dynamic-scope callbacks with sema-core. Called once at startup.
@@ -468,12 +507,27 @@ thread_local! {
     static VECTOR_STORES: RefCell<std::collections::HashMap<String, VectorStore>> =
         RefCell::new(std::collections::HashMap::new());
     static RATE_LIMIT_RPS: Cell<Option<f64>> = const { Cell::new(None) };
-    static RATE_LIMIT_LAST: Cell<u64> = const { Cell::new(0) };
+    static RATE_LIMIT_LAST: RefCell<Option<Rc<Cell<u64>>>> = const { RefCell::new(None) };
     // Name of the provider that served the most recent `do_complete` response, so cost
     // tracking can price the model as served by that provider (resellers/gateways can list
     // the same model id at a different rate). Set at the dispatch choke points, consumed +
     // cleared by `track_usage`. `None` → canonical first-party price.
     static LAST_SERVING_PROVIDER: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+fn rate_limit_last_value() -> u64 {
+    RATE_LIMIT_LAST.with(|last| last.borrow().as_ref().map_or(0, |slot| slot.get()))
+}
+
+fn set_rate_limit_last_value(value: u64) {
+    RATE_LIMIT_LAST.with(|last| {
+        let mut last = last.borrow_mut();
+        if let Some(slot) = last.as_ref() {
+            slot.set(value);
+        } else {
+            *last = Some(Rc::new(Cell::new(value)));
+        }
+    });
 }
 
 fn current_cassette_scope() -> Option<CassetteScope> {
@@ -607,7 +661,7 @@ pub fn reset_runtime_state() {
     FALLBACK_CHAIN.with(|c| *c.borrow_mut() = None);
     VECTOR_STORES.with(|s| s.borrow_mut().clear());
     RATE_LIMIT_RPS.with(|r| r.set(None));
-    RATE_LIMIT_LAST.with(|r| r.set(0));
+    RATE_LIMIT_LAST.with(|r| *r.borrow_mut() = None);
     install_cassette_scope(None);
     LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = None);
     RETRY_BASE_MS.with(|c| c.set(500));
@@ -1739,7 +1793,10 @@ fn parse_lisp_provider_response(val: &Value, model: &str) -> Result<ChatResponse
             role: "assistant".to_string(),
             model: model.to_string(),
             tool_calls: vec![],
-            usage: Usage::default(),
+            usage: Usage {
+                model: model.to_string(),
+                ..Usage::default()
+            },
             stop_reason: Some("end_turn".to_string()),
         }),
         ValueView::Map(map) => {
@@ -6265,11 +6322,14 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             return Err(SemaError::type_error("function", body_fn.type_name()));
         }
         let prev = RATE_LIMIT_RPS.with(|r| r.get());
+        let prev_last = RATE_LIMIT_LAST.with(|last| last.borrow().clone());
         RATE_LIMIT_RPS.with(|r| r.set(Some(rps)));
+        RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = Some(Rc::new(Cell::new(0))));
         Ok((
             body_fn.clone(),
             Box::new(move || {
                 RATE_LIMIT_RPS.with(|r| r.set(prev));
+                RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = prev_last);
             }),
         ))
     });
@@ -9404,7 +9464,7 @@ fn enforce_rate_limit() {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let last = RATE_LIMIT_LAST.with(|l| l.get());
+        let last = rate_limit_last_value();
         // saturating_sub: a backward wall-clock adjustment makes `now < last`,
         // which would panic (debug) or wrap to a huge value (release) on plain
         // subtraction. Treat that as "no wait needed". This sleep runs on the
@@ -9419,7 +9479,7 @@ fn enforce_rate_limit() {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        RATE_LIMIT_LAST.with(|l| l.set(actual_now));
+        set_rate_limit_last_value(actual_now);
     }
 }
 
@@ -9453,7 +9513,7 @@ fn reserve_rate_limit_wait_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let last = RATE_LIMIT_LAST.with(|l| l.get());
+    let last = rate_limit_last_value();
     // A `last` slot more than this far ahead of `now` cannot be a legitimate
     // reservation queue — the wall clock jumped backward since it was
     // stamped. Discard it, exactly like `enforce_rate_limit`'s
@@ -9481,7 +9541,7 @@ fn reserve_rate_limit_wait_ms() -> u64 {
     } else {
         now.max(last.saturating_add(min_interval_ms))
     };
-    RATE_LIMIT_LAST.with(|l| l.set(slot));
+    set_rate_limit_last_value(slot);
     slot.saturating_sub(now)
 }
 
@@ -12586,6 +12646,91 @@ mod tests {
     }
 
     #[test]
+    fn llm_dynamic_scope_capture_copies_configuration_but_not_last_usage() {
+        let fallback = vec![FallbackEntry {
+            provider: "scoped-provider".to_string(),
+            model: Some("scoped-model".to_string()),
+        }];
+        let last_usage = usage(17, 9);
+        FALLBACK_CHAIN.with(|chain| *chain.borrow_mut() = Some(fallback));
+        RATE_LIMIT_RPS.with(|rate| rate.set(Some(7.0)));
+        set_rate_limit_last_value(41);
+        RETRY_BASE_MS.with(|base| base.set(23));
+        NETWORK_MAX_RETRIES.with(|retries| retries.set(5));
+        LAST_USAGE.with(|usage| *usage.borrow_mut() = Some(last_usage.clone()));
+        let captured = capture_llm_scope();
+
+        FALLBACK_CHAIN.with(|chain| *chain.borrow_mut() = None);
+        RATE_LIMIT_RPS.with(|rate| rate.set(None));
+        RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = None);
+        RETRY_BASE_MS.with(|base| base.set(500));
+        NETWORK_MAX_RETRIES.with(|retries| retries.set(3));
+        LAST_USAGE.with(|usage| *usage.borrow_mut() = None);
+
+        let displaced = install_llm_scope(captured);
+        assert_eq!(
+            FALLBACK_CHAIN.with(|chain| chain.borrow().as_ref().unwrap()[0].provider.clone()),
+            "scoped-provider"
+        );
+        assert_eq!(RATE_LIMIT_RPS.with(Cell::get), Some(7.0));
+        assert_eq!(rate_limit_last_value(), 41);
+        assert_eq!(RETRY_BASE_MS.with(Cell::get), 23);
+        assert_eq!(NETWORK_MAX_RETRIES.with(Cell::get), 5);
+        assert!(LAST_USAGE.with(|usage| usage.borrow().is_none()));
+
+        let _ = install_llm_scope(displaced);
+    }
+
+    #[test]
+    fn llm_dynamic_scope_take_install_preserves_own_last_usage() {
+        let last_usage = usage(17, 9);
+        LAST_USAGE.with(|usage| *usage.borrow_mut() = Some(last_usage.clone()));
+
+        let taken = take_llm_scope();
+        assert!(LAST_USAGE.with(|usage| usage.borrow().is_none()));
+
+        let displaced = install_llm_scope(taken);
+        LAST_USAGE.with(|usage| {
+            let usage = usage.borrow();
+            let restored = usage.as_ref().expect("task usage restored");
+            assert_eq!(restored.prompt_tokens, last_usage.prompt_tokens);
+            assert_eq!(restored.completion_tokens, last_usage.completion_tokens);
+            assert_eq!(restored.model, last_usage.model);
+        });
+
+        let _ = install_llm_scope(displaced);
+    }
+
+    #[test]
+    fn captured_rate_limit_siblings_share_one_reservation_cursor() {
+        RATE_LIMIT_RPS.with(|rate| rate.set(Some(10.0)));
+        set_rate_limit_last_value(0);
+        let first_child = capture_llm_scope();
+        let second_child = capture_llm_scope();
+        let parent = take_llm_scope();
+        RATE_LIMIT_RPS.with(|rate| rate.set(None));
+        RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = None);
+
+        let displaced = install_llm_scope(first_child);
+        assert_eq!(reserve_rate_limit_wait_ms(), 0);
+        let _first_child = take_llm_scope();
+        let _ = install_llm_scope(displaced);
+
+        let displaced = install_llm_scope(second_child);
+        let second_wait = reserve_rate_limit_wait_ms();
+        assert!(
+            (90..=110).contains(&second_wait),
+            "sibling must reserve after the first shared slot, got {second_wait}ms"
+        );
+        let _second_child = take_llm_scope();
+        let _ = install_llm_scope(displaced);
+
+        let _ = install_llm_scope(parent);
+        RATE_LIMIT_RPS.with(|rate| rate.set(None));
+        RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = None);
+    }
+
+    #[test]
     fn enforce_rate_limit_survives_backward_clock() {
         // A last-request timestamp in the future (wall clock jumped backward)
         // must not panic on the `now - last` subtraction (debug overflow check)
@@ -12595,7 +12740,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        RATE_LIMIT_LAST.with(|l| l.set(now + 1_000_000));
+        set_rate_limit_last_value(now + 1_000_000);
         let start = std::time::Instant::now();
         enforce_rate_limit();
         assert!(
@@ -12603,13 +12748,13 @@ mod tests {
             "backward clock should not cause a long sleep"
         );
         RATE_LIMIT_RPS.with(|r| r.set(None));
-        RATE_LIMIT_LAST.with(|l| l.set(0));
+        RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = None);
     }
 
     #[test]
     fn reserve_rate_limit_wait_ms_stays_zero_with_no_gate() {
         RATE_LIMIT_RPS.with(|r| r.set(None));
-        RATE_LIMIT_LAST.with(|l| l.set(0));
+        RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = None);
         assert_eq!(reserve_rate_limit_wait_ms(), 0);
     }
 
@@ -12621,7 +12766,7 @@ mod tests {
         // proving concurrent async dispatches get staggered instead of all
         // computing the same wait against a stale `RATE_LIMIT_LAST`.
         RATE_LIMIT_RPS.with(|r| r.set(Some(10.0)));
-        RATE_LIMIT_LAST.with(|l| l.set(0));
+        set_rate_limit_last_value(0);
         let first = reserve_rate_limit_wait_ms();
         let second = reserve_rate_limit_wait_ms();
         let third = reserve_rate_limit_wait_ms();
@@ -12635,7 +12780,7 @@ mod tests {
             "third reservation should land ~200ms out, got {third}"
         );
         RATE_LIMIT_RPS.with(|r| r.set(None));
-        RATE_LIMIT_LAST.with(|l| l.set(0));
+        RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = None);
     }
 
     #[test]
@@ -12648,14 +12793,14 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        RATE_LIMIT_LAST.with(|l| l.set(now + 1_000_000));
+        set_rate_limit_last_value(now + 1_000_000);
         let wait = reserve_rate_limit_wait_ms();
         assert!(
             wait < 1_000,
             "backward clock should not produce a huge reserved wait, got {wait}ms"
         );
         RATE_LIMIT_RPS.with(|r| r.set(None));
-        RATE_LIMIT_LAST.with(|l| l.set(0));
+        RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = None);
     }
 
     #[test]

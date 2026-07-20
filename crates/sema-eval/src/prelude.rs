@@ -289,8 +289,8 @@ pub const PRELUDE: &str = r#"
 ;; The meta map's `:budget` submap caps spend: `:tokens` (deterministic) and/or `:usd`
 ;; (best-effort, pricing-table dependent). Exceeding a cap latches the run and refuses
 ;; to launch further `step` leaves; the run ends {:status :failed :reason "budget
-;; exceeded"}. Under a concurrent fan-out the cap still trips, but per-step token
-;; accounting is best-effort (the LAST_USAGE thread-local is not swapped per task).
+;; exceeded"}. Concurrent fan-out shares the aggregate budget while each task keeps
+;; its own last-usage snapshot and leaf accumulator.
 ;; The cap is PER-INVOCATION: a `--resume` run starts spend at 0 (memoized leaves
 ;; replay for free and don't recharge), so it does not carry the prior run's spend.
 ;; expands to a (workflow/run name doc meta thunk) call. `name` is a bare symbol that
@@ -387,9 +387,8 @@ pub const PRELUDE: &str = r#"
 ;; structurally) or a map with a `:type` field. A bare-keyword field map is
 ;; presence-only (re-ask can't tighten it), so that case surfaces the raw text instead
 ;; of wasting a call.
-;; Per-step budget for a multi-round tool loop is best-effort (the Budget event
-;; reflects the final round's usage; LAST_USAGE is a single slot — same caveat as
-;; fan-out accounting).
+;; Per-step budget accounting sums every model round in the leaf accumulator; the
+;; task-private last-usage snapshot still reports only the most recent completion.
 (defmacro step (prompt . rest)
   (let ((opts-form (if (null? rest) {} (car rest))))
     `(let ((st-opts0# ,opts-form)

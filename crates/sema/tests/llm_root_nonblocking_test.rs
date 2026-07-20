@@ -108,6 +108,84 @@ fn root_rate_limit_pacing_parks_while_a_sibling_runs() {
 
 #[test]
 #[serial]
+fn concurrent_tasks_keep_fallback_and_last_usage_scopes_isolated() {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (llm/define-provider :provider-a
+              {:complete (fn (_request) "reply-a")
+               :default-model "model-a"})
+            (llm/define-provider :provider-b
+              {:complete (fn (_request) "reply-b")
+               :default-model "model-b"})
+            (let ((out (channel/new 2)))
+              (async/spawn
+                (fn ()
+                  (llm/with-fallback [:provider-a]
+                    (fn ()
+                      (sleep 10)
+                      (define reply (llm/complete "task-a"))
+                      (sleep 30)
+                      (channel/send out
+                        (list "task-a" reply (:model (llm/last-usage))))))))
+              (async/spawn
+                (fn ()
+                  (llm/with-fallback [:provider-b]
+                    (fn ()
+                      (sleep 20)
+                      (define reply (llm/complete "task-b"))
+                      (channel/send out
+                        (list "task-b" reply (:model (llm/last-usage))))))))
+              (list (channel/recv out) (channel/recv out)))
+            "#,
+        )
+        .expect("concurrent dynamic scopes settle");
+
+    let rows = value.as_list().expect("two task rows");
+    let row = |label: &str| {
+        rows.iter()
+            .find_map(|value| {
+                let values = value.as_list()?;
+                (values.first()?.as_str() == Some(label)).then_some(values)
+            })
+            .unwrap_or_else(|| panic!("missing result for {label}"))
+    };
+    let task_a = row("task-a");
+    let task_b = row("task-b");
+    assert_eq!(task_a[1].as_str(), Some("reply-a"));
+    assert_eq!(task_a[2].as_str(), Some("model-a"));
+    assert_eq!(task_b[1].as_str(), Some("reply-b"));
+    assert_eq!(task_b[2].as_str(), Some("model-b"));
+}
+
+#[test]
+#[serial]
+fn spawned_task_starts_without_its_parents_last_usage() {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (llm/define-provider :provider-a
+              {:complete (fn (_request) "parent-reply")
+               :default-model "parent-model"})
+            (llm/with-fallback [:provider-a]
+              (fn ()
+                (llm/complete "parent-call")
+                (await (async/spawn (fn () (llm/last-usage))))))
+            "#,
+        )
+        .expect("child reads its task-private last-usage slot");
+
+    assert!(value.is_nil(), "child inherited parent usage: {value}");
+}
+
+#[test]
+#[serial]
 fn root_chat_keeps_a_sema_defined_provider_on_the_vm_thread() {
     let interp = Interpreter::new();
     reset_runtime_state();

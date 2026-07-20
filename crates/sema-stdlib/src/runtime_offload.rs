@@ -440,6 +440,45 @@ where
     suspend_with_resource(op, kind, resource, cancel_rx, Box::new(decode), make_future)
 }
 
+/// Build an interruptible blocking External wait whose job future owns its
+/// cancellation receiver and does not get dropped at the cancellation edge.
+///
+/// This is for resources whose cancellation contract includes asynchronous
+/// cleanup that must finish on the I/O runtime, such as killing a subprocess,
+/// draining its pipes, and awaiting its exit. The supplied [`CancelHook`] must
+/// wake that future and return `PendingReap` until its own shared completion
+/// proof says cleanup finished. Generic socket/request work should keep using
+/// [`suspend_external_interruptible_try`], whose drop-on-cancel behavior is the
+/// appropriate, smaller contract.
+pub(crate) fn suspend_external_interruptible_owned_try<T, F, Fut, D>(
+    op: &'static str,
+    kind: CompletionKind,
+    resource: InterruptibleResource,
+    decode: D,
+    make_future: F,
+) -> NativeResult
+where
+    T: Send + 'static,
+    D: FnOnce(T) -> Result<Value, SemaError> + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+{
+    let decoder = Box::new(IoDecoder {
+        op,
+        decode: Box::new(decode),
+    });
+    let continuation = Box::new(IoOffloadContinuation { op });
+    let prepared =
+        PreparedExternalOperation::interruptible_blocking(kind, decoder, resource, move || {
+            let out = sema_io::io_block_on(make_future());
+            Ok(Box::new(out) as SendPayload)
+        });
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation,
+    }))
+}
+
 /// Build a checkout `abort` hook that SIGKILLs the process **group** led by
 /// `pid` (Unix). The subprocess modules (`proc`, `pty`, `serial` where a child
 /// is spawned) put their child in its own group (`process_group(0)` → pgid ==

@@ -16,14 +16,26 @@
 //! `recent_files_value`, …) shared by synchronous and runtime paths.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult};
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{
+    CancelDisposition, CancelHook, CancelHookError, CompletionKind, InterruptibleResource,
+    NativeOutcome, NativeResult, Trace,
+};
 use sema_core::{check_arity, in_runtime_quantum, Caps, SemaError, Value};
 
 /// Completion tag for an offloaded `git` subprocess. Consistent between the
 /// issued identity and the prepared op (not a uniqueness key), so one shared
 /// value for every `git/*` op is correct.
 const GIT_COMPLETION_KIND: u64 = 0x6769_7400; // "git\0"
+
+/// Cancellation grace for process-group members to close inherited pipes.
+/// A group kill normally closes them immediately; 100 ms absorbs scheduler and
+/// pipe-delivery latency while keeping runtime shutdown cleanup bounded when a
+/// foreign descendant escaped the group but retained an output descriptor.
+const GIT_CANCEL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Run `git` with `args`, returning raw (untrimmed) stdout on a zero exit. On a
 /// non-zero exit, surface git's stderr. If the `git` binary can't be launched at
@@ -154,33 +166,273 @@ struct RawGitOutput {
     stderr: Vec<u8>,
 }
 
+/// Shared proof that the Git child was waited and both pipe-drain tasks were
+/// joined. Cancellation cleanup stays registered until this flips to true.
+#[derive(Clone, Default)]
+struct GitCompletionGuard(Arc<AtomicBool>);
+
+impl GitCompletionGuard {
+    fn mark_reaped(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    fn disposition(&self) -> CancelDisposition {
+        if self.0.load(Ordering::Acquire) {
+            CancelDisposition::Reaped
+        } else {
+            CancelDisposition::PendingReap
+        }
+    }
+}
+
+/// Proves the queued-before-start case. If the executor discards the job
+/// closure before invoking it, no process or pipe can exist and dropping this
+/// guard publishes `Reaped`. Once started, only [`git_run_future`] may publish
+/// that proof after its wait and pipe joins finish.
+struct GitDispatchGuard {
+    completion: Option<GitCompletionGuard>,
+}
+
+impl GitDispatchGuard {
+    fn new(completion: GitCompletionGuard) -> Self {
+        Self {
+            completion: Some(completion),
+        }
+    }
+
+    fn start(mut self) -> GitCompletionGuard {
+        self.completion
+            .take()
+            .expect("dispatch completion is transferred exactly once")
+    }
+}
+
+impl Drop for GitDispatchGuard {
+    fn drop(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            completion.mark_reaped();
+        }
+    }
+}
+
+/// Cancel one runtime Git invocation by waking the owned worker. The worker
+/// keeps the child unreaped while pipe drains are live, so it can signal the
+/// original process group without retaining a reusable raw pid in this hook.
+struct GitCancelHook {
+    signal: Option<crate::runtime_offload::CancelSignal>,
+    completion: GitCompletionGuard,
+}
+
+impl GitCancelHook {
+    fn new(signal: crate::runtime_offload::CancelSignal, completion: GitCompletionGuard) -> Self {
+        Self {
+            signal: Some(signal),
+            completion,
+        }
+    }
+}
+
+impl Trace for GitCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CancelHook for GitCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        if let Some(signal) = self.signal.take() {
+            let _ = signal.send(());
+        }
+        Ok(self.completion.disposition())
+    }
+
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(self.completion.disposition())
+    }
+}
+
+#[cfg(unix)]
+fn kill_git_process_group(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    // SAFETY: runtime Git children call `process_group(0)`, so a negative pid
+    // targets only the process group owned by this invocation.
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+    }
+}
+
+fn terminate_git_child(child: &mut tokio::process::Child, pid: u32) {
+    #[cfg(unix)]
+    kill_git_process_group(pid);
+    // This is the non-Unix cancellation mechanism and a direct-child fallback
+    // if a Unix group signal races process-group setup or exit.
+    let _ = child.start_kill();
+}
+
+async fn drain_git_pipe<R>(mut pipe: R) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
 /// The `Send` future that runs one `git` invocation off the VM thread on the
-/// executor's blocking worker (via `io_block_on` inside `runtime_offload`). The
-/// direct child is `kill_on_drop`, so a cancel that drops this future kills it —
-/// best-effort, matching every other non-shell offload's cancellation policy.
-async fn git_run_future(full_args: Vec<String>) -> Result<RawGitOutput, String> {
+/// executor's blocking worker (via `io_block_on` inside `runtime_offload`).
+/// Stdout and stderr are drained concurrently with the child wait, preventing a
+/// full pipe from deadlocking the process. Cancellation kills the process group
+/// on Unix (the direct child elsewhere), then still joins both drains and awaits
+/// the child before publishing the completion proof. `kill_on_drop` remains a
+/// fallback for executor panic/drop paths.
+async fn git_run_future(
+    full_args: Vec<String>,
+    mut cancel: crate::runtime_offload::CancelWaiter,
+    completion: GitCompletionGuard,
+) -> Result<RawGitOutput, String> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.args(&full_args)
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("git: failed to run `git` (is it installed and on PATH?): {e}"))?;
+
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            completion.mark_reaped();
+            return Err(format!(
+                "git: failed to run `git` (is it installed and on PATH?): {error}"
+            ));
+        }
+    };
+    let pid = child.id().unwrap_or(0);
+
+    let (stdout, stderr) = match (child.stdout.take(), child.stderr.take()) {
+        (Some(stdout), Some(stderr)) => (stdout, stderr),
+        _ => {
+            terminate_git_child(&mut child, pid);
+            let wait = child.wait().await;
+            if wait.is_ok() {
+                completion.mark_reaped();
+            }
+            return Err("git: subprocess pipes were not captured".to_string());
+        }
+    };
+    let stdout_drain = tokio::spawn(drain_git_pipe(stdout));
+    let stderr_drain = tokio::spawn(drain_git_pipe(stderr));
+    let stdout_abort = stdout_drain.abort_handle();
+    let stderr_abort = stderr_drain.abort_handle();
+
+    let mut cancelled = false;
+    let mut cancel_resolved = false;
+    let drains = async { tokio::join!(stdout_drain, stderr_drain) };
+    tokio::pin!(drains);
+    let (stdout, stderr) = tokio::select! {
+        result = &mut drains => result,
+        signal = &mut cancel => {
+            cancel_resolved = true;
+            if signal.is_ok() {
+                cancelled = true;
+                terminate_git_child(&mut child, pid);
+                match tokio::time::timeout(GIT_CANCEL_DRAIN_GRACE, &mut drains).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        stdout_abort.abort();
+                        stderr_abort.abort();
+                        drains.await
+                    }
+                }
+            } else {
+                drains.await
+            }
+        }
+    };
+    // The child remains unreaped until both pipes close. While an inherited-pipe
+    // descendant is alive, the pid therefore still names the original group and
+    // cannot be reused by an unrelated process group.
+    let status = if cancel_resolved {
+        child.wait().await
+    } else {
+        tokio::select! {
+            result = child.wait() => result,
+            signal = &mut cancel => {
+                if signal.is_ok() {
+                    cancelled = true;
+                    terminate_git_child(&mut child, pid);
+                }
+                child.wait().await
+            }
+        }
+    };
+    let status = match status {
+        Ok(status) => Ok(status),
+        Err(first_error) => child.wait().await.map_err(|second_error| {
+            std::io::Error::new(
+                second_error.kind(),
+                format!("initial wait failed: {first_error}; reap retry failed: {second_error}"),
+            )
+        }),
+    };
+
+    // These three awaits are the resource proof: the direct child is reaped and
+    // neither pipe-drain task remains live. On cancellation, an escaped process
+    // can force the bounded path to abort the drains, but both JoinHandles are
+    // still awaited before this proof is published.
+    if status.is_ok() {
+        completion.mark_reaped();
+    }
+
+    let status = status.map_err(|error| format!("git: failed while waiting for `git`: {error}"))?;
+    let stdout = stdout
+        .map_err(|error| format!("git: stdout drain task failed: {error}"))?
+        .map_err(|error| format!("git: failed to read stdout: {error}"))?;
+    let stderr = stderr
+        .map_err(|error| format!("git: stderr drain task failed: {error}"))?
+        .map_err(|error| format!("git: failed to read stderr: {error}"))?;
+    if cancelled {
+        return Err("git was cancelled".to_string());
+    }
     Ok(RawGitOutput {
-        status_code: output.status.code(),
-        stdout: output.stdout,
-        stderr: output.stderr,
+        status_code: status.code(),
+        stdout,
+        stderr,
     })
+}
+
+fn git_external_runtime(
+    full_args: Vec<String>,
+    decode: impl FnOnce(RawGitOutput) -> Result<Value, SemaError> + 'static,
+) -> NativeResult {
+    let kind =
+        CompletionKind::try_from_raw(GIT_COMPLETION_KIND).expect("git completion kind is nonzero");
+    let (cancel_tx, cancel_rx) = crate::runtime_offload::cancel_channel();
+    let completion = GitCompletionGuard::default();
+    let dispatch = GitDispatchGuard::new(completion.clone());
+    let resource =
+        InterruptibleResource::new("git", Box::new(GitCancelHook::new(cancel_tx, completion)));
+    crate::runtime_offload::suspend_external_interruptible_owned_try(
+        "git",
+        kind,
+        resource,
+        decode,
+        move || git_run_future(full_args, cancel_rx, dispatch.start()),
+    )
 }
 
 /// Unified-runtime counterpart to running `git` off the VM thread: SUSPEND on an
 /// interruptible External wait whose job runs `git` off the VM thread and, on a
 /// zero exit, resumes with `decode(stdout)`; a non-zero exit / spawn failure
 /// raises the SAME error text `git()` renders (so runtime and sync can't drift).
-/// Cancellation drops the child (`kill_on_drop`). Cancellation class:
-/// interruptible, best-effort kill (single direct child, no process group).
+/// Cancellation kills the owned process group on Unix (the direct child on
+/// other platforms), drains both pipes, and reaps the child before the runtime
+/// cleanup registry releases the resource.
 fn git_stdout_runtime(
     args: Vec<String>,
     decode: impl FnOnce(String) -> Value + 'static,
@@ -188,12 +440,8 @@ fn git_stdout_runtime(
     let args_joined = args.join(" ");
     let mut full_args = vec!["-c".to_string(), "core.quotepath=false".to_string()];
     full_args.extend(args);
-    let kind =
-        CompletionKind::try_from_raw(GIT_COMPLETION_KIND).expect("git completion kind is nonzero");
-    crate::runtime_offload::external_io_interruptible_try(
-        "git",
-        kind,
-        "git",
+    git_external_runtime(
+        full_args,
         move |raw: RawGitOutput| -> Result<Value, SemaError> {
             if raw.status_code == Some(0) {
                 Ok(decode(String::from_utf8_lossy(&raw.stdout).to_string()))
@@ -202,7 +450,6 @@ fn git_stdout_runtime(
                 Err(SemaError::eval(format!("git {args_joined}: {stderr}")))
             }
         },
-        move || git_run_future(full_args),
     )
 }
 
@@ -213,12 +460,8 @@ fn git_stdout_runtime(
 fn git_ignore_matches_runtime(path: String) -> NativeResult {
     let path_for_msg = path.clone();
     let full_args = vec!["check-ignore".to_string(), "-q".to_string(), path];
-    let kind =
-        CompletionKind::try_from_raw(GIT_COMPLETION_KIND).expect("git completion kind is nonzero");
-    crate::runtime_offload::external_io_interruptible_try(
-        "git",
-        kind,
-        "git",
+    git_external_runtime(
+        full_args,
         move |raw: RawGitOutput| -> Result<Value, SemaError> {
             match raw.status_code {
                 Some(0) => Ok(Value::bool(true)),
@@ -234,7 +477,6 @@ fn git_ignore_matches_runtime(path: String) -> NativeResult {
                 }
             }
         },
-        move || git_run_future(full_args),
     )
 }
 
@@ -440,6 +682,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sema_core::runtime::{CancelDisposition, CancelHook};
 
     /// True when a `git` binary is available; tests early-return otherwise so a
     /// machine without git doesn't hard-fail the suite.
@@ -533,5 +776,56 @@ mod tests {
         let tracked = call(&env, "git/ignore-matches?", &[Value::string(&cargo)])
             .expect("git/ignore-matches? Cargo.toml");
         assert_eq!(tracked, Value::bool(false), "{cargo} should not be ignored");
+    }
+
+    #[test]
+    fn cancel_hook_stays_pending_until_process_and_pipes_are_reaped() {
+        let completion = GitCompletionGuard::default();
+        let (cancel_tx, mut cancel_rx) = crate::runtime_offload::cancel_channel();
+        let mut hook = GitCancelHook::new(cancel_tx, completion.clone());
+
+        assert_eq!(hook.cancel().unwrap(), CancelDisposition::PendingReap);
+        assert_eq!(cancel_rx.try_recv(), Ok(()), "cancel signal must fire");
+        assert_eq!(hook.reap().unwrap(), CancelDisposition::PendingReap);
+
+        completion.mark_reaped();
+        assert_eq!(hook.reap().unwrap(), CancelDisposition::Reaped);
+    }
+
+    #[test]
+    fn cancel_hook_reports_reaped_when_worker_already_finished() {
+        let completion = GitCompletionGuard::default();
+        completion.mark_reaped();
+        let (cancel_tx, mut cancel_rx) = crate::runtime_offload::cancel_channel();
+        let mut hook = GitCancelHook::new(cancel_tx, completion);
+
+        assert_eq!(hook.cancel().unwrap(), CancelDisposition::Reaped);
+        assert_eq!(cancel_rx.try_recv(), Ok(()), "cancel signal is one-shot");
+        assert_eq!(hook.reap().unwrap(), CancelDisposition::Reaped);
+    }
+
+    #[test]
+    fn dropping_unstarted_dispatch_proves_no_process_exists() {
+        let completion = GitCompletionGuard::default();
+        let dispatch = GitDispatchGuard::new(completion.clone());
+
+        drop(dispatch);
+
+        assert_eq!(completion.disposition(), CancelDisposition::Reaped);
+    }
+
+    #[test]
+    fn starting_dispatch_requires_explicit_reap_proof() {
+        let completion = GitCompletionGuard::default();
+        let dispatch = GitDispatchGuard::new(completion.clone());
+
+        let worker_completion = dispatch.start();
+        drop(worker_completion);
+
+        assert_eq!(
+            completion.disposition(),
+            CancelDisposition::PendingReap,
+            "a started worker cannot be declared reaped merely because its guard dropped"
+        );
     }
 }

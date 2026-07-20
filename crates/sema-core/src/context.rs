@@ -31,7 +31,7 @@ pub type CallCallbackFn = fn(&EvalContext, &Value, &[Value]) -> Result<Value, Se
 /// values out of it (leaving nil behind). See [`call_callback_owned`].
 pub type CallOwnedCallbackFn = fn(&EvalContext, &Value, &mut [Value]) -> Result<Value, SemaError>;
 
-type SignalTeardownHook = Box<dyn Fn()>;
+type InterpreterTeardownHook = Box<dyn Fn()>;
 
 pub type ContextStackMap = BTreeMap<Value, Vec<Value>>;
 
@@ -123,9 +123,9 @@ pub struct EvalContext {
     /// This store is intentionally separate from task-local dynamic context:
     /// any root may dispatch a subscription installed by another root.
     signal_callbacks: RefCell<[Vec<Value>; 3]>,
-    /// Weak, non-Value hooks that release process signal leases at interpreter
+    /// Weak, non-Value hooks that release host resources at interpreter
     /// teardown even when an embedder retains the global environment.
-    signal_teardown_hooks: RefCell<Vec<SignalTeardownHook>>,
+    interpreter_teardown_hooks: RefCell<Vec<InterpreterTeardownHook>>,
     pub eval_fn: Cell<Option<EvalCallbackFn>>,
     macro_expand_fn: Cell<Option<MacroExpandCallbackFn>>,
     pub call_fn: Cell<Option<CallCallbackFn>>,
@@ -250,7 +250,7 @@ impl EvalContext {
             hidden_context: RefCell::new(vec![BTreeMap::new()]),
             context_stacks: ContextStacks::default(),
             signal_callbacks: RefCell::default(),
-            signal_teardown_hooks: RefCell::default(),
+            interpreter_teardown_hooks: RefCell::default(),
             eval_fn: Cell::new(None),
             macro_expand_fn: Cell::new(None),
             call_fn: Cell::new(None),
@@ -281,7 +281,7 @@ impl EvalContext {
             hidden_context: RefCell::new(vec![BTreeMap::new()]),
             context_stacks: ContextStacks::default(),
             signal_callbacks: RefCell::default(),
-            signal_teardown_hooks: RefCell::default(),
+            interpreter_teardown_hooks: RefCell::default(),
             eval_fn: Cell::new(None),
             macro_expand_fn: Cell::new(None),
             call_fn: Cell::new(None),
@@ -389,13 +389,15 @@ impl EvalContext {
     }
 
     #[doc(hidden)]
-    pub fn register_signal_teardown_hook(&self, hook: impl Fn() + 'static) {
-        self.signal_teardown_hooks.borrow_mut().push(Box::new(hook));
+    pub fn register_interpreter_teardown_hook(&self, hook: impl Fn() + 'static) {
+        self.interpreter_teardown_hooks
+            .borrow_mut()
+            .push(Box::new(hook));
     }
 
     #[doc(hidden)]
-    pub fn try_run_signal_teardown_hooks(&self) -> bool {
-        let hooks = match self.signal_teardown_hooks.try_borrow_mut() {
+    pub fn try_run_interpreter_teardown_hooks(&self) -> bool {
+        let hooks = match self.interpreter_teardown_hooks.try_borrow_mut() {
             Ok(mut hooks) => std::mem::take(&mut *hooks),
             Err(_) => return false,
         };
@@ -403,6 +405,18 @@ impl EvalContext {
             hook();
         }
         true
+    }
+
+    /// Compatibility name for hosts built against the signal-specific hook API.
+    #[doc(hidden)]
+    pub fn register_signal_teardown_hook(&self, hook: impl Fn() + 'static) {
+        self.register_interpreter_teardown_hook(hook);
+    }
+
+    /// Compatibility name for hosts built against the signal-specific hook API.
+    #[doc(hidden)]
+    pub fn try_run_signal_teardown_hooks(&self) -> bool {
+        self.try_run_interpreter_teardown_hooks()
     }
 
     #[doc(hidden)]

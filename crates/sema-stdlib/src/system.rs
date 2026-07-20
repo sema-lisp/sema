@@ -363,7 +363,7 @@ impl SignalRegistry {
         }
         if !self.teardown_hook_registered.replace(true) {
             let registry = Rc::downgrade(self);
-            ctx.register_signal_teardown_hook(move || {
+            ctx.register_interpreter_teardown_hook(move || {
                 if let Some(registry) = registry.upgrade() {
                     registry.release_installed_handlers();
                 }

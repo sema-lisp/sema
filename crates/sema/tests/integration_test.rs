@@ -11811,6 +11811,154 @@ fn test_allowed_paths_none_allows_everything() {
     );
 }
 
+#[test]
+fn fs_watch_interpreters_isolate_handles() {
+    let dir = std::env::temp_dir().join(format!("sema-fs-watch-isolation-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.to_string_lossy().replace('\\', "/");
+
+    let interp_a = Interpreter::new();
+    let interp_b = Interpreter::new();
+    let handle = interp_a
+        .eval_str(&format!(r#"(fs/watch "{path}")"#))
+        .unwrap();
+    assert_eq!(handle, Value::int(1));
+
+    let err = interp_b
+        .eval_str("(fs/watch-events 1)")
+        .expect_err("another interpreter must not see the watcher handle");
+    assert!(
+        err.to_string().contains("no such watcher 1"),
+        "unexpected isolation error: {err}"
+    );
+    assert_eq!(interp_b.eval_str("(fs/unwatch 1)").unwrap(), Value::nil());
+
+    assert!(interp_a.eval_str("(fs/watch-events 1)").is_ok());
+    assert_eq!(interp_a.eval_str("(fs/unwatch 1)").unwrap(), Value::nil());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn fs_watch_respects_allowed_paths() {
+    let root = std::env::temp_dir().join(format!("sema-fs-watch-sandbox-{}", std::process::id()));
+    let allowed = root.join("allowed");
+    let denied = root.join("denied");
+    std::fs::create_dir_all(&allowed).unwrap();
+    std::fs::create_dir_all(&denied).unwrap();
+
+    let sandbox = sema_core::Sandbox::allow_all().with_allowed_paths(vec![allowed]);
+    let interp = Interpreter::new_with_sandbox(&sandbox);
+    let denied = denied.to_string_lossy().replace('\\', "/");
+    let err = interp
+        .eval_str(&format!(r#"(fs/watch "{denied}")"#))
+        .expect_err("watching outside the sandbox must be denied");
+    assert_path_denied(&err);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fs_watch_teardown_clears_handles_with_retained_environment() {
+    let dir = std::env::temp_dir().join(format!("sema-fs-watch-teardown-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.to_string_lossy().replace('\\', "/");
+
+    let interp = Interpreter::new();
+    let handle = interp.eval_str(&format!(r#"(fs/watch "{path}")"#)).unwrap();
+    assert_eq!(handle, Value::int(1));
+    let retained_env = interp.global_env.clone();
+    drop(interp);
+
+    let watch_events = retained_env
+        .get(sema_core::intern("fs/watch-events"))
+        .expect("retained fs/watch-events native");
+    let native = watch_events
+        .as_native_fn_ref()
+        .expect("fs/watch-events is native");
+    let fresh_ctx = sema_core::EvalContext::new();
+    let err = (native.func)(&fresh_ctx, &[handle])
+        .expect_err("interpreter teardown must clear retained watcher handles");
+    assert!(
+        err.to_string().contains("no such watcher 1"),
+        "unexpected teardown error: {err}"
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn fs_watch_explicit_shutdown_clears_handles_with_retained_environment() {
+    let dir = std::env::temp_dir().join(format!("sema-fs-watch-shutdown-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.to_string_lossy().replace('\\', "/");
+
+    let interp = Interpreter::new();
+    let handle = interp.eval_str(&format!(r#"(fs/watch "{path}")"#)).unwrap();
+    assert_eq!(handle, Value::int(1));
+    let retained_env = interp.global_env.clone();
+    interp
+        .shutdown(sema_vm::runtime::ShutdownOptions {
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+            drive_budget: sema_vm::runtime::DriveBudget::host_default(),
+        })
+        .expect("explicit interpreter shutdown succeeds");
+
+    let watch_events = retained_env
+        .get(sema_core::intern("fs/watch-events"))
+        .expect("retained fs/watch-events native");
+    let native = watch_events
+        .as_native_fn_ref()
+        .expect("fs/watch-events is native");
+    let fresh_ctx = sema_core::EvalContext::new();
+    let err = (native.func)(&fresh_ctx, &[handle])
+        .expect_err("explicit shutdown must clear retained watcher handles");
+    assert!(
+        err.to_string().contains("no such watcher 1"),
+        "unexpected explicit-shutdown error: {err}"
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn fs_watch_delivers_real_events_and_unwatch_removes_handle() {
+    let dir = std::env::temp_dir().join(format!("sema-fs-watch-events-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.to_string_lossy().replace('\\', "/");
+    let changed_file = dir.join("changed.txt");
+    let interp = Interpreter::new();
+
+    assert_eq!(
+        interp.eval_str(&format!(r#"(fs/watch "{path}")"#)).unwrap(),
+        Value::int(1)
+    );
+
+    let mut delivered = false;
+    for revision in 0..400 {
+        std::fs::write(&changed_file, revision.to_string()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let events = interp.eval_str("(fs/watch-events 1)").unwrap();
+        if events.as_list().is_some_and(|events| !events.is_empty()) {
+            delivered = true;
+            break;
+        }
+    }
+    assert!(
+        delivered,
+        "real filesystem changes must reach fs/watch-events"
+    );
+
+    assert_eq!(interp.eval_str("(fs/unwatch 1)").unwrap(), Value::nil());
+    let err = interp
+        .eval_str("(fs/watch-events 1)")
+        .expect_err("unwatch removes the public handle");
+    assert!(
+        err.to_string().contains("no such watcher 1"),
+        "unexpected unwatch error: {err}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 // ── f-string tests ──
 
 #[test]

@@ -237,6 +237,50 @@ fn test_mcp_connect_denied_without_process_capability() {
     );
 }
 
+fn invalid_command_error(interp: &Interpreter, via_runtime: bool) -> sema::SemaError {
+    let source = r#"(mcp/connect {:command "sema-mcp-sandbox-isolation-no-such-command"})"#;
+    if via_runtime {
+        interp.eval_str_via_runtime(source)
+    } else {
+        interp.eval_str(source)
+    }
+    .expect_err("the deliberately missing command must fail")
+}
+
+#[test]
+fn mcp_sandbox_authority_is_isolated_between_interpreters() {
+    fn assert_authority(interpreter: &Interpreter, via_runtime: bool, should_be_denied: bool) {
+        let error = invalid_command_error(interpreter, via_runtime);
+        let denied = error.to_string().contains("Permission denied");
+        assert_eq!(
+            denied, should_be_denied,
+            "each call must use its owning interpreter's sandbox: {error}"
+        );
+    }
+
+    let unrestricted_before_restricted = InterpreterBuilder::new()
+        .with_sandbox(Sandbox::allow_all())
+        .build();
+    let restricted_after_unrestricted = InterpreterBuilder::new()
+        .with_sandbox(Sandbox::deny(Caps::PROCESS))
+        .build();
+    assert_authority(&unrestricted_before_restricted, false, false);
+    assert_authority(&restricted_after_unrestricted, true, true);
+    assert_authority(&unrestricted_before_restricted, true, false);
+    assert_authority(&restricted_after_unrestricted, false, true);
+
+    let restricted_before_unrestricted = InterpreterBuilder::new()
+        .with_sandbox(Sandbox::deny(Caps::PROCESS))
+        .build();
+    let unrestricted_after_restricted = InterpreterBuilder::new()
+        .with_sandbox(Sandbox::allow_all())
+        .build();
+    assert_authority(&restricted_before_unrestricted, false, true);
+    assert_authority(&unrestricted_after_restricted, true, false);
+    assert_authority(&restricted_before_unrestricted, true, true);
+    assert_authority(&unrestricted_after_restricted, false, false);
+}
+
 #[test]
 fn mcp_builtins_validate_arguments() {
     let interp = Interpreter::new();

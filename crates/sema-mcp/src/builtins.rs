@@ -74,10 +74,17 @@ thread_local! {
     // Keep MCP connections in a thread-local map so each Sema evaluator can own its own
     // client state without introducing cross-thread sharing.
     static CONNECTIONS: RefCell<HashMap<String, Rc<ConnEntry>>> = RefCell::new(HashMap::new());
-    // The evaluator's sandbox, captured at registration, so the OAuth browser
-    // launch (connect-time or mid-session re-auth) can be denied when `PROCESS`
-    // is — opening the system browser spawns a process.
-    static SANDBOX: RefCell<Sandbox> = RefCell::new(Sandbox::allow_all());
+    // Host-only compatibility authority for Rust entry points without an
+    // evaluator context (`connect_from_config`, workflow OAuth helpers). Sema
+    // natives capture their registering evaluator's sandbox directly.
+    static HOST_SANDBOX: RefCell<Sandbox> = RefCell::new(Sandbox::allow_all());
+}
+
+fn sandbox_allows_browser(sandbox: &Sandbox) -> bool {
+    sandbox.is_unrestricted()
+        || sandbox
+            .check(Caps::PROCESS, "mcp/connect (open browser)")
+            .is_ok()
 }
 
 /// A browser opener that refuses to launch (spawn) a browser when the sandbox
@@ -87,56 +94,28 @@ thread_local! {
 /// opener so a run-start browser login is gated identically to `mcp/connect`'s
 /// own interactive path — never a separate, laxer gate.
 ///
-/// SYNC-PATH USE ONLY: this reads the `SANDBOX` thread-local at INVOCATION
-/// time (not construction time). The async-offload path must never use this —
-/// see [`resolved_browser_opener`] and [`OpenerSource`].
+/// Sync host-adapter use only: authority is resolved from `HOST_SANDBOX` when
+/// the opener is constructed, before `LoopbackDriver` moves it to its opener
+/// thread. Evaluator-owned paths use [`BrowserAuthority`] directly.
 pub fn gated_browser_opener() -> crate::oauth::loopback::BrowserOpener {
-    Box::new(|url: &str| {
-        if let Some(err) = SANDBOX.with(|s| {
-            let sb = s.borrow();
-            if sb.is_unrestricted() {
-                None
-            } else {
-                sb.check(Caps::PROCESS, "mcp/connect (open browser)").err()
-            }
-        }) {
-            return Err(err.to_string());
-        }
-        crate::oauth::loopback::open_browser(url)
-    })
+    resolved_browser_opener(browser_open_allowed())
 }
 
 /// Whether the sandbox captured by the most recent [`register_mcp_builtins`]
 /// call on this thread currently permits opening a browser (`Caps::PROCESS`).
-/// Consult this BEFORE attempting an interactive login, not just
-/// [`gated_browser_opener`]'s internal check: `LoopbackDriver::drive` runs the
-/// opener on a spawned thread and discards its `Err` (`let _ = opener(&url)`),
-/// so a denied opener alone would silently sit waiting for a redirect that can
-/// never arrive, until the full login timeout elapses. Checking here lets a
-/// denied sandbox degrade immediately to the headless `NeedsAuth` path.
+/// Consult this before attempting an interactive login so a denied host can
+/// degrade immediately to the headless `NeedsAuth` path without binding a
+/// loopback listener.
 ///
-/// Also the seam the async-offload path uses to resolve the browser-open
-/// decision on the VM thread BEFORE offloading (see [`OpenerSource`]).
+/// This is a host-compatibility seam for workflow code without an evaluator
+/// context. Sema natives resolve the same check from their captured sandbox.
 pub fn browser_open_allowed() -> bool {
-    SANDBOX.with(|s| {
-        let sb = s.borrow();
-        sb.is_unrestricted()
-            || sb
-                .check(Caps::PROCESS, "mcp/connect (open browser)")
-                .is_ok()
-    })
+    HOST_SANDBOX.with(|sandbox| sandbox_allows_browser(&sandbox.borrow()))
 }
 
-/// A browser opener for the OFFLOADED reauth/connect path: the sandbox
-/// decision is resolved ONCE, on the VM thread (via [`browser_open_allowed`])
-/// BEFORE any thread hop, and baked into the returned closure as a plain
-/// `bool`. It must NEVER read the `SANDBOX` thread-local itself — the
-/// offloaded reauth code (and, one layer further in, `LoopbackDriver::drive`'s
-/// own spawned thread) runs on background threads where that thread-local is
-/// unpopulated (defaults to unrestricted), which would silently defeat the
-/// gate. Mirrors the `TestOpenerFn` pattern in
-/// `crates/sema/src/workflow_view/connect.rs`, which resolves its opener
-/// choice on the calling thread for the identical reason.
+/// A browser opener carrying an already-resolved decision as a plain `bool`.
+/// It never reads `HOST_SANDBOX`; background threads have independent TLS and
+/// must not select authority themselves.
 fn resolved_browser_opener(allowed: bool) -> crate::oauth::loopback::BrowserOpener {
     Box::new(move |url: &str| {
         if !allowed {
@@ -150,22 +129,39 @@ fn resolved_browser_opener(allowed: bool) -> crate::oauth::loopback::BrowserOpen
     })
 }
 
-/// Where an OAuth login/reauth attempt's browser-open decision comes from.
-/// `Live` (sync path, unchanged): read live off `SANDBOX` at the moment a
-/// browser is actually needed — today's behavior. `Resolved` (async-offload
-/// path): the decision was already made on the VM thread; the offloaded code
-/// must never touch `SANDBOX` itself.
+/// An evaluator or host adapter's browser-open authority, resolved before any
+/// worker or browser-opener thread hop.
 #[derive(Clone, Copy)]
-enum OpenerSource {
-    Live,
-    Resolved(bool),
+enum BrowserAuthority {
+    Allowed,
+    Denied,
 }
 
-impl OpenerSource {
-    fn opener(self) -> crate::oauth::loopback::BrowserOpener {
+impl BrowserAuthority {
+    fn from_allowed(allowed: bool) -> Self {
+        if allowed {
+            Self::Allowed
+        } else {
+            Self::Denied
+        }
+    }
+
+    fn from_sandbox(sandbox: &Sandbox) -> Self {
+        Self::from_allowed(sandbox_allows_browser(sandbox))
+    }
+
+    fn redirect_driver(
+        self,
+        timeout: Duration,
+    ) -> Result<Box<dyn crate::oauth::loopback::RedirectDriver>, String> {
         match self {
-            OpenerSource::Live => gated_browser_opener(),
-            OpenerSource::Resolved(allowed) => resolved_browser_opener(allowed),
+            Self::Allowed => Ok(Box::new(
+                crate::oauth::loopback::LoopbackDriver::with_opener(
+                    timeout,
+                    resolved_browser_opener(true),
+                )?,
+            )),
+            Self::Denied => Ok(Box::new(SandboxDeniedDriver)),
         }
     }
 }
@@ -486,7 +482,7 @@ async fn connect_stdio_async(
 async fn connect_http_async(
     config_json: &serde_json::Value,
     opts: &ConnectOpts,
-    opener_source: OpenerSource,
+    browser_authority: BrowserAuthority,
 ) -> Result<(McpClient, String), ConnectOutcome> {
     let url = config_json
         .get("url")
@@ -536,7 +532,7 @@ async fn connect_http_async(
                 url,
                 &challenge,
                 preconfigured_client_id.as_deref(),
-                opener_source,
+                browser_authority,
             )
             .await
             .map_err(ConnectOutcome::Sema)?;
@@ -587,24 +583,23 @@ async fn connect_legacy_async(
 }
 
 /// Run (or reuse) the OAuth login for a remote server that answered `401`, and
-/// return an access token. Uses the default credential store (keychain or file)
-/// and a real loopback + system-browser flow.
+/// return an access token. Uses the default credential store (keychain or file).
+/// Cached and refresh tokens stay silent; a fresh consent uses either a real
+/// loopback browser driver or the immediate sandbox-denial driver.
 async fn obtain_access_token_async(
     url: &str,
     challenge_header: &str,
     preconfigured_client_id: Option<&str>,
-    opener_source: OpenerSource,
+    browser_authority: BrowserAuthority,
 ) -> Result<String, SemaError> {
-    use crate::oauth::{discovery, login, loopback, store};
+    use crate::oauth::{discovery, login, store};
 
     let challenge = discovery::parse_www_authenticate(challenge_header);
     let http = reqwest::Client::new();
     let credential_store = store::default_store();
-    let driver = loopback::LoopbackDriver::with_opener(
-        std::time::Duration::from_secs(300),
-        opener_source.opener(),
-    )
-    .map_err(|e| SemaError::eval(format!("mcp/connect: {e}")))?;
+    let driver = browser_authority
+        .redirect_driver(std::time::Duration::from_secs(300))
+        .map_err(|e| SemaError::eval(format!("mcp/connect: {e}")))?;
 
     let config = login::LoginConfig {
         mcp_url: url,
@@ -613,7 +608,7 @@ async fn obtain_access_token_async(
         preconfigured_client_id,
     };
 
-    login::ensure_access_token(&http, credential_store.as_ref(), &config, &driver)
+    login::ensure_access_token(&http, credential_store.as_ref(), &config, driver.as_ref())
         .await
         .map_err(|e| {
             SemaError::eval(format!("mcp/connect: OAuth login failed: {e}")).with_hint(
@@ -629,10 +624,10 @@ async fn obtain_access_token_async(
 async fn connect_dispatch_async(
     config_json: serde_json::Value,
     opts: ConnectOpts,
-    opener_source: OpenerSource,
+    browser_authority: BrowserAuthority,
 ) -> Result<(McpClient, String), ConnectOutcome> {
     if config_json.get("url").and_then(|v| v.as_str()).is_some() {
-        connect_http_async(&config_json, &opts, opener_source).await
+        connect_http_async(&config_json, &opts, browser_authority).await
     } else {
         connect_stdio_async(&config_json)
             .await
@@ -722,21 +717,21 @@ enum ConnectOutcome {
     Sema(SemaError),
 }
 
-/// Gate on the sandbox captured by the most recent [`register_mcp_builtins`]
-/// call on this thread (unrestricted if that was never called), dispatch on
-/// transport, and connect. SYNC PATH ONLY (drives [`connect_dispatch_async`]
-/// via the blocking [`block_on`]) — shared by `mcp/connect`'s synchronous
-/// branch and [`connect_from_config`] so the two can never drift.
+/// Gate on an explicit sandbox, dispatch on transport, and connect. Sync path
+/// only (drives [`connect_dispatch_async`] via the blocking [`block_on`]) —
+/// shared by `mcp/connect` and [`connect_from_config`] so transport behavior
+/// stays identical while their authority sources remain distinct.
 fn connect_with_opts(
+    sandbox: &Sandbox,
     config_json: &serde_json::Value,
     opts: &ConnectOpts,
+    browser_authority: BrowserAuthority,
 ) -> Result<Value, ConnectOutcome> {
-    let sandbox = SANDBOX.with(|s| s.borrow().clone());
-    gate(&sandbox, connect_capability(config_json)).map_err(ConnectOutcome::Sema)?;
+    gate(sandbox, connect_capability(config_json)).map_err(ConnectOutcome::Sema)?;
     let (client, identity) = block_on(connect_dispatch_async(
         config_json.clone(),
         opts.clone(),
-        OpenerSource::Live,
+        browser_authority,
     ))?;
     Ok(register_connection(client, identity, opts))
 }
@@ -760,9 +755,17 @@ fn connect_with_opts(
 /// this runs before any concurrent fan-out starts, never inside
 /// `async/spawn`) — see `docs/plans/2026-06-24-workflow-mcp-auth.md` §3.
 pub fn connect_from_config(config: &Value, opts: ConnectOpts) -> Result<Value, ConnectFailure> {
+    let sandbox = HOST_SANDBOX.with(|sandbox| sandbox.borrow().clone());
     let outcome = value_to_config_json(config)
         .map_err(ConnectOutcome::Sema)
-        .and_then(|config_json| connect_with_opts(&config_json, &opts));
+        .and_then(|config_json| {
+            connect_with_opts(
+                &sandbox,
+                &config_json,
+                &opts,
+                BrowserAuthority::from_sandbox(&sandbox),
+            )
+        });
     outcome.map_err(connect_outcome_to_failure)
 }
 
@@ -986,7 +989,7 @@ fn connect_runtime_outcome(
                     outcome = connect_dispatch_async(
                         config_json,
                         opts,
-                        OpenerSource::Resolved(browser_allowed),
+                        BrowserAuthority::from_allowed(browser_allowed),
                     ) => match outcome {
                         Ok((client, identity)) => ConnectPayloadResult::Connected {
                             client: Box::new(client),
@@ -1011,20 +1014,24 @@ fn connect_runtime_outcome(
     }))
 }
 
-fn connect_builtin(args: &[Value]) -> NativeResult {
+fn connect_builtin(sandbox: &Sandbox, args: &[Value]) -> NativeResult {
     let config_json = config_to_json(args)?;
     let opts = ConnectOpts {
         interactive_auth: true,
         allowed_tools: None,
     };
     if in_runtime_quantum() {
-        let sandbox = SANDBOX.with(|sandbox| sandbox.borrow().clone());
-        gate(&sandbox, connect_capability(&config_json))?;
-        return connect_runtime_outcome(config_json, opts, browser_open_allowed());
+        gate(sandbox, connect_capability(&config_json))?;
+        return connect_runtime_outcome(config_json, opts, sandbox_allows_browser(sandbox));
     }
-    connect_with_opts(&config_json, &opts)
-        .map(NativeOutcome::Return)
-        .map_err(connect_outcome_to_sema_error)
+    connect_with_opts(
+        sandbox,
+        &config_json,
+        &opts,
+        BrowserAuthority::from_sandbox(sandbox),
+    )
+    .map(NativeOutcome::Return)
+    .map_err(connect_outcome_to_sema_error)
 }
 
 fn require_handle<'a>(args: &'a [Value], fn_name: &str) -> Result<&'a str, SemaError> {
@@ -1114,27 +1121,61 @@ fn replay_miss_error() -> SemaError {
         )
 }
 
-/// A [`RedirectDriver`](crate::oauth::loopback::RedirectDriver) for
-/// non-interactive connections (`ConnectOpts::interactive_auth: false`).
-/// `reauth_on_challenge`'s refresh-token path never calls `drive()` — a valid
-/// stored refresh token self-heals a `401` without any redirect — but its full
-/// login fallback (no/expired refresh token, or a `403 insufficient_scope`
-/// step-up, which always needs fresh consent) does call it. Failing `drive()`
-/// cleanly here, with no changes to `oauth/login.rs`, is what keeps a
-/// non-interactive connection from ever popping a browser for the rest of its
-/// lifetime.
-struct NoInteractiveDriver;
+/// Redirect driver used when the owning evaluator denies browser processes.
+/// Authentication may still reuse a cached token or refresh silently; a full
+/// login fails in `preflight()` before discovery or client registration.
+struct SandboxDeniedDriver;
 
-impl crate::oauth::loopback::RedirectDriver for NoInteractiveDriver {
+impl SandboxDeniedDriver {
+    fn error() -> String {
+        SemaError::PermissionDenied {
+            function: "mcp/connect (open browser)".to_string(),
+            capability: Caps::PROCESS.name().to_string(),
+        }
+        .to_string()
+    }
+}
+
+impl crate::oauth::loopback::RedirectDriver for SandboxDeniedDriver {
+    fn preflight(&self) -> Result<(), String> {
+        Err(Self::error())
+    }
+
     fn redirect_uri(&self) -> String {
-        // `login()` reads this to build the authorize URL / register a DCR
-        // client BEFORE calling `drive()`, which always errors below — so this
-        // is never actually dialed, but must be a well-formed loopback URI.
         "http://127.0.0.1:1/callback".to_string()
     }
 
     fn drive(&self, _authorize_url: &str, _expected_state: &str) -> Result<String, String> {
-        Err("interactive authentication is disabled for this connection".to_string())
+        Err(Self::error())
+    }
+}
+
+/// A [`RedirectDriver`](crate::oauth::loopback::RedirectDriver) for
+/// non-interactive connections (`ConnectOpts::interactive_auth: false`).
+/// `reauth_on_challenge`'s refresh-token path never enters full login — a valid
+/// stored refresh token self-heals a `401` without any redirect — but its full
+/// login fallback (no/expired refresh token, or a `403 insufficient_scope`
+/// step-up, which always needs fresh consent) runs `preflight()`. Failing there
+/// is what keeps a
+/// non-interactive connection from ever popping a browser for the rest of its
+/// lifetime.
+struct NoInteractiveDriver;
+
+const NO_INTERACTIVE_AUTH: &str = "interactive authentication is disabled for this connection";
+
+impl crate::oauth::loopback::RedirectDriver for NoInteractiveDriver {
+    fn preflight(&self) -> Result<(), String> {
+        Err(NO_INTERACTIVE_AUTH.to_string())
+    }
+
+    fn redirect_uri(&self) -> String {
+        // A well-formed fallback keeps the driver valid if a caller bypasses
+        // `preflight()`; the non-interactive path never dials this URI.
+        "http://127.0.0.1:1/callback".to_string()
+    }
+
+    fn drive(&self, _authorize_url: &str, _expected_state: &str) -> Result<String, String> {
+        Err(NO_INTERACTIVE_AUTH.to_string())
     }
 }
 
@@ -1142,24 +1183,22 @@ impl crate::oauth::loopback::RedirectDriver for NoInteractiveDriver {
 /// `403 insufficient_scope`) and return a fresh access token to retry with.
 /// `interactive_auth` selects the redirect driver: the real loopback+browser
 /// flow, or [`NoInteractiveDriver`] so a login fallback fails cleanly instead
-/// of popping a browser mid-run. `opener_source` resolves the browser opener
-/// (see [`OpenerSource`]) — never touches `SANDBOX` when offloaded. No
-/// thread-local access otherwise: legal under either driver.
+/// of popping a browser mid-run. `browser_authority` is resolved before any
+/// thread hop (see [`BrowserAuthority`]) and never touches `HOST_SANDBOX` when
+/// offloaded. There is no other thread-local access under either driver.
 async fn reauthorize_async(
     url: &str,
     status: Option<u16>,
     challenge: Option<&str>,
     interactive_auth: bool,
-    opener_source: OpenerSource,
+    browser_authority: BrowserAuthority,
 ) -> Result<Option<String>, String> {
     let http = reqwest::Client::new();
     let store = crate::oauth::store::default_store();
     let result = if interactive_auth {
-        let driver = crate::oauth::loopback::LoopbackDriver::with_opener(
-            Duration::from_secs(300),
-            opener_source.opener(),
-        )
-        .map_err(|e| format!("mcp/call: {e}"))?;
+        let driver = browser_authority
+            .redirect_driver(Duration::from_secs(300))
+            .map_err(|e| format!("mcp/call: {e}"))?;
         crate::oauth::login::reauth_on_challenge(
             &http,
             store.as_ref(),
@@ -1167,7 +1206,7 @@ async fn reauthorize_async(
             status,
             challenge,
             None,
-            &driver,
+            driver.as_ref(),
         )
         .await
     } else {
@@ -1186,7 +1225,7 @@ async fn reauthorize_async(
 }
 
 /// Async core of one `tools/call`, including the mid-session reauth-on-401/403
-/// retry. No thread-local access: `interactive_auth`/`opener_source` are
+/// retry. No thread-local access: `interactive_auth`/`browser_authority` are
 /// resolved by the caller (see the module doc on browser-opener hoisting).
 /// Returns the RAW (unprefixed) error string on failure — every branch below
 /// mirrors the pre-offload implementation's `"mcp/call: {err}"` prefix, added
@@ -1197,7 +1236,7 @@ async fn call_tool_async(
     tool_name: &str,
     arguments_json: serde_json::Value,
     interactive_auth: bool,
-    opener_source: OpenerSource,
+    browser_authority: BrowserAuthority,
 ) -> Result<serde_json::Value, String> {
     let err = match conn
         .client
@@ -1224,7 +1263,7 @@ async fn call_tool_async(
         status,
         challenge.as_deref(),
         interactive_auth,
-        opener_source,
+        browser_authority,
     )
     .await
     {
@@ -1266,6 +1305,7 @@ async fn close_async(conn: &mut McpConnection) -> Result<(), String> {
 /// decide — a replay hit returns synchronously (no offload spawned), a
 /// record-miss in replay mode errors synchronously.
 fn call_tool(
+    sandbox: &Sandbox,
     handle: &str,
     tool_name: &str,
     arguments_json: serde_json::Value,
@@ -1293,7 +1333,7 @@ fn call_tool(
     // on the VM thread.
     if in_runtime_quantum() {
         let interactive_auth = entry.meta.interactive_auth;
-        let browser_allowed = browser_open_allowed();
+        let browser_allowed = sandbox_allows_browser(sandbox);
         return mcp_call_runtime_outcome(
             entry,
             cassette_recorder,
@@ -1311,7 +1351,7 @@ fn call_tool(
         tool_name,
         arguments_json,
         entry.meta.interactive_auth,
-        OpenerSource::Live,
+        BrowserAuthority::from_sandbox(sandbox),
     ));
     checkin(&entry, conn);
     let raw = result.map_err(|e| SemaError::eval(format!("mcp/call: {e}")))?;
@@ -1592,7 +1632,7 @@ impl McpGatedAction for McpCallAction {
                 &tool_name,
                 arguments_json,
                 interactive_auth,
-                OpenerSource::Resolved(browser_allowed),
+                BrowserAuthority::from_allowed(browser_allowed),
             );
             let result = sema_io::io_block_on(async move {
                 tokio::select! {
@@ -1937,8 +1977,8 @@ struct McpConnectionDecoder {
 
 impl Trace for McpConnectionDecoder {
     fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
-        // `entry` never owns a Value, and ToolsMaterialize captures only plain
-        // strings (the connection handle for tools->sema).
+        // `entry` never owns a Value, and ToolsMaterialize captures only host
+        // authority plus plain strings (the connection handle for tools->sema).
         true
     }
 }
@@ -2198,6 +2238,7 @@ fn tool_defs_to_value(
     tools: Vec<Tool>,
     allowed_tools: &Option<Vec<String>>,
     connection_handle: &str,
+    sandbox: &Sandbox,
 ) -> Value {
     let mut items = Vec::new();
     for tool in tools {
@@ -2210,6 +2251,7 @@ fn tool_defs_to_value(
         let tool_name = tool.name.clone();
         let connection_handle = connection_handle.to_string();
         let handler_name = format!("mcp/{tool_name}");
+        let sandbox = sandbox.clone();
         let handler = Value::native_fn(dual_native(handler_name, move |args| {
             // The agent loop passes arguments positionally in `ordered` order
             // (see `json_args_to_sema`); rebuild the named arguments object,
@@ -2223,6 +2265,7 @@ fn tool_defs_to_value(
             }
             let tool_name_for_err = tool_name.clone();
             call_tool(
+                &sandbox,
                 &connection_handle,
                 &tool_name,
                 serde_json::Value::Object(arguments),
@@ -2486,8 +2529,10 @@ fn close_connection(args: &[Value]) -> NativeResult {
 }
 
 pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
-    // Capture the sandbox so the OAuth browser launch can honor the PROCESS cap.
-    SANDBOX.with(|s| *s.borrow_mut() = sandbox.clone());
+    // Host helpers without an evaluator context retain their established
+    // latest-registration behavior. Every Sema-callable authority check below
+    // captures `sandbox` in its own native instead of consulting this slot.
+    HOST_SANDBOX.with(|slot| *slot.borrow_mut() = sandbox.clone());
 
     // `mcp/connect` picks its transport from the config map at runtime, so the
     // capability it needs is not fixed: a `:url` server is network I/O
@@ -2495,9 +2540,12 @@ pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
     // dispatch live in the shared connect helpers used by
     // `connect_from_config`; this just supplies the interactive, unrestricted
     // options `mcp/connect` has always used.
+    let connect_sandbox = sandbox.clone();
     env.set_str(
         "mcp/connect",
-        Value::native_fn(dual_native("mcp/connect".to_string(), connect_builtin)),
+        Value::native_fn(dual_native("mcp/connect".to_string(), move |args| {
+            connect_builtin(&connect_sandbox, args)
+        })),
     );
 
     env.set_str(
@@ -2511,21 +2559,24 @@ pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
         })),
     );
 
+    let tools_sandbox = sandbox.clone();
     env.set_str(
         "mcp/tools->sema",
-        Value::native_fn(dual_native("mcp/tools->sema".to_string(), |args| {
+        Value::native_fn(dual_native("mcp/tools->sema".to_string(), move |args| {
             check_arity!(args, "mcp/tools->sema", 1);
             let handle = require_handle(args, "mcp/tools->sema")?;
             let connection_handle = handle.to_string();
+            let sandbox = tools_sandbox.clone();
             fetch_tools(handle, "mcp/tools->sema", move |tools, meta| {
-                tool_defs_to_value(tools, &meta.allowed_tools, &connection_handle)
+                tool_defs_to_value(tools, &meta.allowed_tools, &connection_handle, &sandbox)
             })
         })),
     );
 
+    let call_sandbox = sandbox.clone();
     env.set_str(
         "mcp/call",
-        Value::native_fn(dual_native("mcp/call".to_string(), |args| {
+        Value::native_fn(dual_native("mcp/call".to_string(), move |args| {
             check_arity!(args, "mcp/call", 3);
             let handle = require_handle(args, "mcp/call")?;
             let tool_name = args[1].as_str().ok_or_else(|| {
@@ -2533,7 +2584,7 @@ pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
                     .with_hint("mcp/call expects the tool name as a string")
             })?;
             let arguments_json = sema_core::value_to_json_lossy(&args[2]);
-            call_tool(handle, tool_name, arguments_json, |raw| {
+            call_tool(&call_sandbox, handle, tool_name, arguments_json, |raw| {
                 Ok(result_to_value(&raw))
             })
         })),
@@ -2576,8 +2627,7 @@ mod tests {
     #[test]
     fn no_interactive_driver_never_dials_and_fails_cleanly() {
         let driver = NoInteractiveDriver;
-        // Well-formed enough for `login()` to build an authorize URL / DCR
-        // request with it, even though it is never actually dialed.
+        // The defense-only fallback remains a well-formed loopback URI.
         assert!(driver.redirect_uri().starts_with("http://127.0.0.1"));
         let err = driver
             .drive("https://example.com/authorize", "some-state")
@@ -2586,6 +2636,55 @@ mod tests {
             err,
             "interactive authentication is disabled for this connection"
         );
+    }
+
+    #[test]
+    fn denied_redirect_preflight_runs_before_oauth_discovery() {
+        let config = crate::oauth::login::LoginConfig {
+            mcp_url: "http://127.0.0.1:1/mcp",
+            resource_metadata_url: None,
+            requested_scope: None,
+            preconfigured_client_id: None,
+        };
+        let error = sema_io::io_block_on(crate::oauth::login::login(
+            &reqwest::Client::new(),
+            &config,
+            None,
+            &SandboxDeniedDriver,
+        ))
+        .expect_err("sandbox denial must reject before network discovery");
+
+        assert!(error.contains("Permission denied"), "{error}");
+        assert!(error.contains("process"), "{error}");
+    }
+
+    #[test]
+    fn denied_browser_authority_fails_without_loopback_timeout() {
+        let driver = BrowserAuthority::from_sandbox(&Sandbox::deny(Caps::PROCESS))
+            .redirect_driver(Duration::from_secs(300))
+            .expect("denied authority uses a non-binding redirect driver");
+        let started = std::time::Instant::now();
+        let error = driver
+            .drive("https://example.com/authorize", "state")
+            .expect_err("denied browser authority must refuse interactive consent");
+
+        assert!(error.contains("Permission denied"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "denied authority waited for a loopback timeout: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn gated_host_opener_captures_authority_at_construction() {
+        HOST_SANDBOX.with(|slot| *slot.borrow_mut() = Sandbox::deny(Caps::PROCESS));
+        let opener = gated_browser_opener();
+        HOST_SANDBOX.with(|slot| *slot.borrow_mut() = Sandbox::allow_all());
+
+        let error = opener("https://example.com/authorize")
+            .expect_err("later host registration must not widen a constructed opener");
+        assert!(error.contains("Permission denied"), "{error}");
     }
 
     #[test]

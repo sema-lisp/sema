@@ -1,9 +1,11 @@
+use std::cell::Cell;
+use std::fmt;
 use std::num::NonZeroUsize;
 use std::rc::Rc;
 
 use sema_core::runtime::{
     multimethod_call, CancellationView, NativeCall, NativeCallContext, NativeContinuation,
-    NativeOutcome, NativeResult, ResumeInput, TaskContextHandle,
+    NativeOutcome, NativeResult, ResumeInput, RuntimeRequest, TaskContextHandle,
 };
 use sema_core::{Env, EvalContext, SemaError, Value};
 use web_time::Instant;
@@ -23,6 +25,69 @@ pub struct RestrictedRunPolicy {
     pub cancellation: CancellationView,
 }
 
+const RESTRICTED_INSTRUCTION_QUANTUM: usize = 4_096;
+
+/// Cloneable instruction and transition counters shared by restricted runs.
+#[derive(Clone)]
+pub struct RestrictedRunBudget(Rc<RestrictedRunBudgetState>);
+
+struct RestrictedRunBudgetState {
+    instructions_remaining: Cell<usize>,
+    transitions_remaining: Cell<usize>,
+}
+
+impl RestrictedRunBudget {
+    pub fn new(instruction_limit: NonZeroUsize, transition_limit: NonZeroUsize) -> Self {
+        Self(Rc::new(RestrictedRunBudgetState {
+            instructions_remaining: Cell::new(instruction_limit.get()),
+            transitions_remaining: Cell::new(transition_limit.get()),
+        }))
+    }
+
+    fn reserve_instruction_quantum(&self) -> usize {
+        let remaining = self.0.instructions_remaining.get();
+        let reserved = remaining.min(RESTRICTED_INSTRUCTION_QUANTUM);
+        self.0
+            .instructions_remaining
+            .set(remaining.saturating_sub(reserved));
+        reserved
+    }
+
+    fn refund_instructions(&self, instructions: usize) {
+        self.0.instructions_remaining.set(
+            self.0
+                .instructions_remaining
+                .get()
+                .saturating_add(instructions),
+        );
+    }
+
+    fn has_instructions(&self) -> bool {
+        self.0.instructions_remaining.get() > 0
+    }
+
+    fn consume_transition(&self) -> bool {
+        let remaining = self.0.transitions_remaining.get();
+        if remaining == 0 {
+            return false;
+        }
+        self.0.transitions_remaining.set(remaining - 1);
+        true
+    }
+}
+
+impl fmt::Debug for RestrictedRunBudget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RestrictedRunBudget")
+            .field(
+                "instructions_remaining",
+                &self.0.instructions_remaining.get(),
+            )
+            .field("transitions_remaining", &self.0.transitions_remaining.get())
+            .finish()
+    }
+}
+
 /// Evaluate a compiled program without driving the runtime scheduler.
 ///
 /// Runtime-ABI calls and continuations are driven inline. Any wait or runtime
@@ -35,21 +100,33 @@ pub fn run_program_restricted(
     globals: Rc<Env>,
     policy: RestrictedRunPolicy,
 ) -> Result<Value, SemaError> {
+    let budget = RestrictedRunBudget::new(policy.instruction_limit, policy.transition_limit);
+    run_program_restricted_with_budget(ctx, task_context, program, globals, policy, budget)
+}
+
+/// Evaluate a compiled program against counters shared with related restricted runs.
+pub fn run_program_restricted_with_budget(
+    ctx: &EvalContext,
+    task_context: TaskContextHandle,
+    program: CompiledProgram,
+    globals: Rc<Env>,
+    policy: RestrictedRunPolicy,
+    budget: RestrictedRunBudget,
+) -> Result<Value, SemaError> {
     let _task_context = ctx.scope_task_context(task_context.clone());
     let _quantum = if ctx.runtime_quantum_active() {
         None
     } else {
         Some(ctx.enter_runtime_quantum()?)
     };
-    RestrictedVmDriver::new(ctx, task_context, policy).run(program, globals)
+    RestrictedVmDriver::new(ctx, task_context, policy, budget).run(program, globals)
 }
 
 struct RestrictedVmDriver<'a> {
     ctx: &'a EvalContext,
     task_context: TaskContextHandle,
     policy: RestrictedRunPolicy,
-    instructions_remaining: usize,
-    transitions_remaining: usize,
+    budget: RestrictedRunBudget,
 }
 
 enum RestrictedWork {
@@ -125,19 +202,17 @@ impl<'a> RestrictedVmDriver<'a> {
         ctx: &'a EvalContext,
         task_context: TaskContextHandle,
         policy: RestrictedRunPolicy,
+        budget: RestrictedRunBudget,
     ) -> Self {
-        let instructions_remaining = policy.instruction_limit.get();
-        let transitions_remaining = policy.transition_limit.get();
         Self {
             ctx,
             task_context,
             policy,
-            instructions_remaining,
-            transitions_remaining,
+            budget,
         }
     }
 
-    fn run(mut self, program: CompiledProgram, globals: Rc<Env>) -> Result<Value, SemaError> {
+    fn run(self, program: CompiledProgram, globals: Rc<Env>) -> Result<Value, SemaError> {
         let mut vm = VM::new(
             globals,
             program.functions,
@@ -153,18 +228,22 @@ impl<'a> RestrictedVmDriver<'a> {
         loop {
             work = match work {
                 RestrictedWork::RunVm { mut vm, owner } => {
-                    self.check_boundary()?;
-                    if self.instructions_remaining == 0 {
-                        return Err(self.instruction_limit_error());
+                    if let Err(error) = self.check_boundary() {
+                        return self.fail_with_cleanup(owner, None, error);
+                    }
+                    let reserved_instructions = self.budget.reserve_instruction_quantum();
+                    if reserved_instructions == 0 {
+                        return self.fail_with_cleanup(owner, None, self.instruction_limit_error());
                     }
                     let quantum = vm.run_quantum(
                         self.ctx,
-                        self.instructions_remaining,
+                        reserved_instructions,
                         self.policy.cancellation.clone(),
                     );
-                    self.instructions_remaining = self
-                        .instructions_remaining
-                        .saturating_sub(quantum.instructions);
+                    debug_assert!(quantum.instructions <= reserved_instructions);
+                    self.budget.refund_instructions(
+                        reserved_instructions.saturating_sub(quantum.instructions),
+                    );
                     match quantum.outcome {
                         Ok(VmExecResult::Finished(value)) => RestrictedWork::Settle {
                             owner,
@@ -183,18 +262,33 @@ impl<'a> RestrictedVmDriver<'a> {
                             }
                         }
                         Ok(VmExecResult::QuantumExpired { .. }) => {
-                            return Err(self.instruction_limit_error())
+                            if self.budget.has_instructions() {
+                                RestrictedWork::RunVm { vm, owner }
+                            } else {
+                                return self.fail_with_cleanup(
+                                    owner,
+                                    None,
+                                    self.instruction_limit_error(),
+                                );
+                            }
                         }
                         Ok(VmExecResult::Stopped(_) | VmExecResult::Yielded) => {
-                            return Err(SemaError::eval(format!(
-                                "{} stopped unexpectedly",
-                                self.policy.operation
-                            )))
+                            return self.fail_with_cleanup(
+                                owner,
+                                None,
+                                SemaError::eval(format!(
+                                    "{} stopped unexpectedly",
+                                    self.policy.operation
+                                )),
+                            )
                         }
                     }
                 }
                 RestrictedWork::Apply { owner, result } => {
-                    self.check_boundary()?;
+                    if let Err(error) = self.check_boundary() {
+                        let outcome = result.ok();
+                        return self.fail_with_cleanup(owner, outcome, error);
+                    }
                     match result {
                         Ok(NativeOutcome::Return(value)) => RestrictedWork::Settle {
                             owner,
@@ -205,23 +299,39 @@ impl<'a> RestrictedVmDriver<'a> {
                             result: Err(error),
                         },
                         Ok(NativeOutcome::Call(call)) => {
-                            self.consume_transition()?;
+                            if let Err(error) = self.consume_transition() {
+                                return self.fail_with_cleanup(
+                                    owner,
+                                    Some(NativeOutcome::Call(call)),
+                                    error,
+                                );
+                            }
                             self.invoke_call(owner, call)
                         }
-                        Ok(NativeOutcome::Suspend(_) | NativeOutcome::Runtime(_)) => {
+                        Ok(outcome @ (NativeOutcome::Suspend(_) | NativeOutcome::Runtime(_))) => {
+                            let error = SemaError::eval(self.policy.suspension_error);
+                            self.cleanup_current_outcome(&owner, outcome, &error);
                             RestrictedWork::Settle {
                                 owner,
-                                result: Err(SemaError::eval(self.policy.suspension_error)),
+                                result: Err(error),
                             }
                         }
                     }
                 }
                 RestrictedWork::Settle { mut owner, result } => {
-                    self.check_boundary()?;
+                    if let Err(error) = self.check_boundary() {
+                        return self.fail_with_cleanup(owner, None, error);
+                    }
                     match owner.pop() {
                         None => return result,
                         Some(RestrictedFrame::Continuation(continuation)) => {
-                            self.consume_transition()?;
+                            if let Err(error) = self.consume_transition() {
+                                return self.fail_with_continuation_cleanup(
+                                    owner,
+                                    continuation,
+                                    error,
+                                );
+                            }
                             let mut native_context = NativeCallContext {
                                 eval_context: self.ctx,
                                 task_context: self.task_context.clone(),
@@ -355,14 +465,13 @@ impl<'a> RestrictedVmDriver<'a> {
         Ok(())
     }
 
-    fn consume_transition(&mut self) -> Result<(), SemaError> {
-        if self.transitions_remaining == 0 {
+    fn consume_transition(&self) -> Result<(), SemaError> {
+        if !self.budget.consume_transition() {
             return Err(SemaError::eval(format!(
                 "{} exceeded transition limit",
                 self.policy.operation
             )));
         }
-        self.transitions_remaining -= 1;
         Ok(())
     }
 
@@ -371,6 +480,81 @@ impl<'a> RestrictedVmDriver<'a> {
             "{} exceeded instruction limit",
             self.policy.operation
         ))
+    }
+
+    fn fail_with_cleanup(
+        &self,
+        mut owner: RestrictedOwner,
+        current: Option<NativeOutcome>,
+        original: SemaError,
+    ) -> Result<Value, SemaError> {
+        if let Some(outcome) = current {
+            self.cleanup_current_outcome(&owner, outcome, &original);
+        }
+        while let Some(frame) = owner.pop() {
+            if let RestrictedFrame::Continuation(continuation) = frame {
+                self.resume_cleanup_continuation(continuation, owner.call_env(), &original);
+            }
+        }
+        Err(original)
+    }
+
+    fn fail_with_continuation_cleanup(
+        &self,
+        owner: RestrictedOwner,
+        continuation: Box<dyn NativeContinuation>,
+        original: SemaError,
+    ) -> Result<Value, SemaError> {
+        self.resume_cleanup_continuation(continuation, owner.call_env(), &original);
+        self.fail_with_cleanup(owner, None, original)
+    }
+
+    fn cleanup_current_outcome(
+        &self,
+        owner: &RestrictedOwner,
+        outcome: NativeOutcome,
+        original: &SemaError,
+    ) {
+        if let Some(continuation) = cleanup_continuation(outcome) {
+            self.resume_cleanup_continuation(continuation, owner.call_env(), original);
+        }
+    }
+
+    fn resume_cleanup_continuation(
+        &self,
+        continuation: Box<dyn NativeContinuation>,
+        call_env: Option<Rc<Env>>,
+        original: &SemaError,
+    ) {
+        let mut native_context = NativeCallContext {
+            eval_context: self.ctx,
+            task_context: self.task_context.clone(),
+            call_env,
+            cancellation: self.policy.cancellation.clone(),
+        };
+        let _cleanup_result =
+            continuation.resume(&mut native_context, ResumeInput::Failed(original.clone()));
+    }
+}
+
+fn cleanup_continuation(outcome: NativeOutcome) -> Option<Box<dyn NativeContinuation>> {
+    match outcome {
+        NativeOutcome::Return(_) => None,
+        NativeOutcome::Call(call) => Some(call.continuation),
+        NativeOutcome::Suspend(suspend) => Some(suspend.continuation),
+        NativeOutcome::Runtime(request) => Some(match request {
+            RuntimeRequest::Spawn { continuation, .. }
+            | RuntimeRequest::CancelPromise { continuation, .. }
+            | RuntimeRequest::CreateChannel { continuation, .. }
+            | RuntimeRequest::ChannelOp { continuation, .. }
+            | RuntimeRequest::CreateSettledPromise { continuation, .. }
+            | RuntimeRequest::InspectPromise { continuation, .. }
+            | RuntimeRequest::PromiseSetWait { continuation, .. }
+            | RuntimeRequest::CreateResourceGate { continuation }
+            | RuntimeRequest::ReleaseResourceGate { continuation, .. }
+            | RuntimeRequest::CloseResourceGate { continuation, .. }
+            | RuntimeRequest::OriginBarrier { continuation } => continuation,
+        }),
     }
 }
 
@@ -395,7 +579,10 @@ mod tests {
     use sema_core::{Env, EvalContext, MultiMethod, NativeFn, SemaError, Value};
     use web_time::Instant;
 
-    use super::{run_program_restricted, RestrictedRunPolicy};
+    use super::{
+        run_program_restricted, run_program_restricted_with_budget, RestrictedRunBudget,
+        RestrictedRunPolicy,
+    };
     use crate::compile_program;
 
     fn policy() -> RestrictedRunPolicy {
@@ -427,6 +614,41 @@ mod tests {
 
         assert_eq!(value, Value::int(42));
         assert!(!ctx.runtime_quantum_active());
+    }
+
+    #[test]
+    fn cloned_restricted_budget_is_shared_across_separate_runs() {
+        let budget = RestrictedRunBudget::new(
+            NonZeroUsize::new(3).unwrap(),
+            NonZeroUsize::new(10).unwrap(),
+        );
+        let compile = || {
+            let forms = sema_reader::read_many("42").expect("source parses");
+            compile_program(&forms, None).expect("source compiles")
+        };
+
+        let first = run_program_restricted_with_budget(
+            &EvalContext::new(),
+            TaskContextHandle::default(),
+            compile(),
+            Rc::new(Env::new()),
+            policy(),
+            budget.clone(),
+        )
+        .expect("first program fits the shared budget");
+        assert_eq!(first, Value::int(42));
+
+        let error = run_program_restricted_with_budget(
+            &EvalContext::new(),
+            TaskContextHandle::default(),
+            compile(),
+            Rc::new(Env::new()),
+            policy(),
+            budget,
+        )
+        .expect_err("second program must observe the first program's instruction spend");
+
+        assert_eval_message(&error, "test evaluation exceeded instruction limit");
     }
 
     #[test]
@@ -498,6 +720,38 @@ mod tests {
                 ResumeInput::Failed(error) => Err(error),
                 _ => Err(SemaError::eval("restricted callback resumed unexpectedly")),
             }
+        }
+    }
+
+    struct RejectionCleanupProbe(Arc<AtomicUsize>);
+
+    impl Trace for RejectionCleanupProbe {
+        fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+            true
+        }
+    }
+
+    impl NativeContinuation for RejectionCleanupProbe {
+        fn resume(
+            self: Box<Self>,
+            context: &mut NativeCallContext<'_>,
+            input: ResumeInput,
+        ) -> NativeResult {
+            let ResumeInput::Failed(error) = input else {
+                panic!("rejected outcome must resume its continuation with failure")
+            };
+            assert_eval_message(&error, "test evaluation cannot suspend");
+            self.0.fetch_add(1, Ordering::SeqCst);
+            let callable = context
+                .call_env
+                .as_ref()
+                .and_then(|env| env.get_str("cleanup-must-not-run"))
+                .ok_or_else(|| SemaError::eval("cleanup probe callable missing"))?;
+            Ok(NativeOutcome::Call(NativeCall {
+                callable,
+                args: Vec::new(),
+                continuation: Box::new(ReturnValue),
+            }))
         }
     }
 
@@ -686,6 +940,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn restricted_driver_cleans_rejected_outcomes_without_driving_cleanup_results() {
+        let resumes = Arc::new(AtomicUsize::new(0));
+        let forbidden_runs = Arc::new(AtomicUsize::new(0));
+
+        for runtime_request in [false, true] {
+            let globals = Rc::new(Env::new());
+            let native_forbidden_runs = Arc::clone(&forbidden_runs);
+            globals.set_str(
+                "cleanup-must-not-run",
+                Value::native_fn(NativeFn::simple_result("cleanup-must-not-run", move |_| {
+                    native_forbidden_runs.fetch_add(1, Ordering::SeqCst);
+                    Ok(NativeOutcome::Return(Value::nil()))
+                })),
+            );
+            let native_resumes = Arc::clone(&resumes);
+            globals.set_str(
+                "reject-outcome",
+                Value::native_fn(NativeFn::simple_result("reject-outcome", move |_| {
+                    let continuation = Box::new(RejectionCleanupProbe(Arc::clone(&native_resumes)));
+                    if runtime_request {
+                        Ok(NativeOutcome::Runtime(RuntimeRequest::CreateChannel {
+                            capacity: 1,
+                            continuation,
+                        }))
+                    } else {
+                        Ok(NativeOutcome::Suspend(NativeSuspend {
+                            wait: WaitKind::Timer(Duration::from_secs(1)),
+                            continuation,
+                        }))
+                    }
+                })),
+            );
+            let forms = sema_reader::read_many("(reject-outcome)").expect("source parses");
+            let program = compile_program(&forms, None).expect("source compiles");
+
+            let error = run_program_restricted(
+                &EvalContext::new(),
+                TaskContextHandle::default(),
+                program,
+                globals,
+                policy(),
+            )
+            .expect_err("restricted operation must reject the outcome");
+
+            assert_eval_message(&error, "test evaluation cannot suspend");
+        }
+
+        assert_eq!(resumes.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            forbidden_runs.load(Ordering::SeqCst),
+            0,
+            "cleanup-produced structural calls must be dropped, not driven"
+        );
+    }
+
     struct RejectOnlyDecoder;
 
     impl Trace for RejectOnlyDecoder {
@@ -760,6 +1070,68 @@ mod tests {
         assert_eval_message(&error, "test evaluation exceeded instruction limit");
     }
 
+    struct FatalCleanupContinuation(Arc<AtomicUsize>);
+
+    impl Trace for FatalCleanupContinuation {
+        fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+            true
+        }
+    }
+
+    impl NativeContinuation for FatalCleanupContinuation {
+        fn resume(
+            self: Box<Self>,
+            _context: &mut NativeCallContext<'_>,
+            input: ResumeInput,
+        ) -> NativeResult {
+            let ResumeInput::Failed(error) = input else {
+                panic!("fatal cleanup must resume with failure")
+            };
+            assert_eval_message(&error, "test evaluation exceeded instruction limit");
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(error)
+        }
+    }
+
+    #[test]
+    fn restricted_driver_resumes_pending_continuations_on_instruction_cap() {
+        let resumes = Arc::new(AtomicUsize::new(0));
+        let native_resumes = Arc::clone(&resumes);
+        let globals = Rc::new(Env::new());
+        globals.set_str(
+            "enter-loop",
+            Value::native_fn(
+                NativeFn::simple_result("enter-loop", move |args| {
+                    Ok(NativeOutcome::Call(NativeCall {
+                        callable: args[0].clone(),
+                        args: Vec::new(),
+                        continuation: Box::new(FatalCleanupContinuation(Arc::clone(
+                            &native_resumes,
+                        ))),
+                    }))
+                })
+                .with_escaping_args(&[0]),
+            ),
+        );
+        let forms = sema_reader::read_many("(enter-loop (lambda () (let loop () (loop))))")
+            .expect("source parses");
+        let program = compile_program(&forms, None).expect("source compiles");
+        let mut limited = policy();
+        limited.instruction_limit = NonZeroUsize::new(64).unwrap();
+
+        let error = run_program_restricted(
+            &EvalContext::new(),
+            TaskContextHandle::default(),
+            program,
+            globals,
+            limited,
+        )
+        .expect_err("nested VM must hit the instruction cap");
+
+        assert_eval_message(&error, "test evaluation exceeded instruction limit");
+        assert_eq!(resumes.load(Ordering::SeqCst), 1);
+    }
+
     struct DropProbe(Arc<AtomicUsize>);
 
     impl Drop for DropProbe {
@@ -795,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn restricted_driver_counts_continuation_resumes_and_drops_frames_at_the_cap() {
+    fn restricted_driver_cleans_current_call_continuation_at_the_transition_cap() {
         let drops = Arc::new(AtomicUsize::new(0));
         let resumes = Arc::new(AtomicUsize::new(0));
         let globals = Rc::new(Env::new());
@@ -841,7 +1213,7 @@ mod tests {
         .expect_err("continuation resume must consume the second transition");
 
         assert_eval_message(&error, "test evaluation exceeded transition limit");
-        assert_eq!(resumes.load(Ordering::SeqCst), 0);
+        assert_eq!(resumes.load(Ordering::SeqCst), 1);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert!(!ctx.runtime_quantum_active());
         assert!(ctx.task_context().is_none());

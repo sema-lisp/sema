@@ -31,7 +31,10 @@ pub use lower::{is_special_form, lower};
 pub use opcodes::Op;
 pub use optimize::optimize as optimize_expr;
 pub use resolve::resolve_with_locals;
-pub use restricted::{run_program_restricted, RestrictedRunPolicy};
+pub use restricted::{
+    run_program_restricted, run_program_restricted_with_budget, RestrictedRunBudget,
+    RestrictedRunPolicy,
+};
 pub use serialize::{deserialize_from_bytes, is_bytecode_file, serialize_to_bytes};
 pub use vm::{
     call_closure_owned, compile_program, compile_program_with_spans,

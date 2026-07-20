@@ -1,5 +1,7 @@
+use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::rc::{Rc, Weak};
 
 use sema_core::{
@@ -906,6 +908,160 @@ impl<'a> Shadow<'a> {
     }
 }
 
+const MACRO_TRANSFORMER_INSTRUCTION_LIMIT: usize = 1_000_000;
+const MACRO_TRANSFORMER_TRANSITION_LIMIT: usize = 100_000;
+const MACRO_EXPANSION_DEPTH_LIMIT: usize = 16;
+
+struct MacroExpansionState {
+    budget: sema_vm::RestrictedRunBudget,
+    active_depth: Rc<std::cell::Cell<usize>>,
+}
+
+impl MacroExpansionState {
+    fn new() -> Self {
+        Self {
+            budget: sema_vm::RestrictedRunBudget::new(
+                NonZeroUsize::new(MACRO_TRANSFORMER_INSTRUCTION_LIMIT)
+                    .expect("macro transformer instruction limit is nonzero"),
+                NonZeroUsize::new(MACRO_TRANSFORMER_TRANSITION_LIMIT)
+                    .expect("macro transformer transition limit is nonzero"),
+            ),
+            active_depth: Rc::new(std::cell::Cell::new(0)),
+        }
+    }
+
+    fn enter_expansion(&self) -> Result<MacroExpansionDepthGuard, SemaError> {
+        let depth = self.active_depth.get();
+        if depth >= MACRO_EXPANSION_DEPTH_LIMIT {
+            return Err(SemaError::eval("macro expansion exceeded depth limit"));
+        }
+        self.active_depth.set(depth + 1);
+        Ok(MacroExpansionDepthGuard {
+            active_depth: Rc::clone(&self.active_depth),
+        })
+    }
+}
+
+struct MacroExpansionDepthGuard {
+    active_depth: Rc<std::cell::Cell<usize>>,
+}
+
+impl Drop for MacroExpansionDepthGuard {
+    fn drop(&mut self) {
+        let depth = self.active_depth.get();
+        debug_assert!(depth > 0);
+        self.active_depth.set(depth.saturating_sub(1));
+    }
+}
+
+impl sema_core::runtime::Trace for MacroExpansionState {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl sema_core::runtime::TaskLocalValue for MacroExpansionState {
+    fn inherit(&self) -> Rc<dyn sema_core::runtime::TaskLocalValue> {
+        Rc::new(Self {
+            budget: self.budget.clone(),
+            active_depth: Rc::clone(&self.active_depth),
+        })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+struct MacroExpansionInstallGuard {
+    task_context: sema_core::runtime::TaskContextHandle,
+    state: Rc<MacroExpansionState>,
+}
+
+impl Drop for MacroExpansionInstallGuard {
+    fn drop(&mut self) {
+        let current = self.task_context.get_rc::<MacroExpansionState>();
+        if current
+            .as_ref()
+            .is_some_and(|current| Rc::ptr_eq(current, &self.state))
+        {
+            let _removed = self
+                .task_context
+                .borrow_mut()
+                .remove::<MacroExpansionState>();
+        }
+    }
+}
+
+struct RuntimeMacroExpansion {
+    task_context: sema_core::runtime::TaskContextHandle,
+    cancellation: sema_core::runtime::CancellationView,
+    deadline: Option<web_time::Instant>,
+    state: Rc<MacroExpansionState>,
+    _installation: Option<MacroExpansionInstallGuard>,
+}
+
+struct MacroExpander<'a> {
+    eval_context: &'a EvalContext,
+    runtime: Option<RuntimeMacroExpansion>,
+}
+
+impl<'a> MacroExpander<'a> {
+    fn host(eval_context: &'a EvalContext) -> Self {
+        Self {
+            eval_context,
+            runtime: None,
+        }
+    }
+
+    fn runtime(context: &'a sema_core::runtime::NativeCallContext<'_>) -> Self {
+        let task_context = context.task_context.clone();
+        let (state, installation) = match task_context.get_rc::<MacroExpansionState>() {
+            Some(state) => (state, None),
+            None => {
+                let state = Rc::new(MacroExpansionState::new());
+                let replaced = task_context.borrow_mut().insert(Rc::clone(&state));
+                debug_assert!(replaced.is_none());
+                let installation = MacroExpansionInstallGuard {
+                    task_context: task_context.clone(),
+                    state: Rc::clone(&state),
+                };
+                (state, Some(installation))
+            }
+        };
+        Self {
+            eval_context: context.eval_context,
+            runtime: Some(RuntimeMacroExpansion {
+                task_context,
+                cancellation: context.cancellation.clone(),
+                deadline: context.eval_context.eval_deadline.get(),
+                state,
+                _installation: installation,
+            }),
+        }
+    }
+
+    fn enter_macro_expansion(&self) -> Result<Option<MacroExpansionDepthGuard>, SemaError> {
+        self.runtime.as_ref().map_or(Ok(None), |runtime| {
+            runtime.state.enter_expansion().map(Some)
+        })
+    }
+
+    fn apply_procedural_macro(
+        &self,
+        mac: &sema_core::Macro,
+        args: &[Value],
+        caller_env: &Env,
+    ) -> Result<Value, SemaError> {
+        match &self.runtime {
+            Some(runtime) => {
+                apply_macro_vm_restricted(self.eval_context, runtime, mac, args, caller_env)
+            }
+            None => apply_macro_vm(self.eval_context, mac, args, caller_env),
+        }
+    }
+}
+
 /// Collect every symbol in a binding pattern (a param list, a let binding
 /// name, a match/destructure pattern). Deliberately conservative: any symbol
 /// anywhere in the pattern counts as bound. Over-collecting only suppresses
@@ -983,7 +1139,7 @@ fn collect_defined_names(expr: &Value, out: &mut HashSet<Spur>) {
 /// Expand the forms of a body sequence: names defined anywhere in the body
 /// shadow macros throughout it (letrec* semantics, matching the resolver).
 fn expand_body(
-    ctx: &EvalContext,
+    expander: &MacroExpander<'_>,
     env: &Env,
     body: &[Value],
     shadow: &Shadow,
@@ -994,7 +1150,7 @@ fn expand_body(
     }
     let inner = shadow.child(defined);
     body.iter()
-        .map(|form| expand_macros_in(ctx, env, form, &inner))
+        .map(|form| expand_macros_in(expander, env, form, &inner))
         .collect()
 }
 
@@ -1024,13 +1180,25 @@ fn rebuilt_list(original: &Value, items: &[Value], expanded: Vec<Value>) -> Valu
 /// program use [`expand_for_vm_batch`], which lets a top-level
 /// `(define step ...)` shadow the macro in sibling forms too.
 pub fn expand_for_vm_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResult {
+    expand_for_vm_in_with(&MacroExpander::host(ctx), env, expr)
+}
+
+fn expand_for_vm_in_runtime(
+    context: &mut sema_core::runtime::NativeCallContext<'_>,
+    env: &Env,
+    expr: &Value,
+) -> EvalResult {
+    expand_for_vm_in_with(&MacroExpander::runtime(context), env, expr)
+}
+
+fn expand_for_vm_in_with(expander: &MacroExpander<'_>, env: &Env, expr: &Value) -> EvalResult {
     let mut defined = HashSet::new();
     collect_defined_names(expr, &mut defined);
     let shadow = Shadow {
         names: defined,
         parent: None,
     };
-    expand_top_form(ctx, env, expr, &shadow)
+    expand_top_form(expander, env, expr, &shadow)
 }
 
 /// Expand a whole multi-form program: names defined by ANY top-level form
@@ -1050,13 +1218,19 @@ pub fn expand_for_vm_batch(
         names: defined,
         parent: None,
     };
+    let expander = MacroExpander::host(ctx);
     exprs
         .iter()
-        .map(|expr| expand_top_form(ctx, env, expr, &shadow))
+        .map(|expr| expand_top_form(&expander, env, expr, &shadow))
         .collect()
 }
 
-fn expand_top_form(ctx: &EvalContext, env: &Env, expr: &Value, shadow: &Shadow) -> EvalResult {
+fn expand_top_form(
+    expander: &MacroExpander<'_>,
+    env: &Env,
+    expr: &Value,
+    shadow: &Shadow,
+) -> EvalResult {
     if let Some(items) = expr.as_list() {
         if let Some(s) = items.first().and_then(|v| v.as_symbol_spur()) {
             let name = resolve(s);
@@ -1076,7 +1250,7 @@ fn expand_top_form(ctx: &EvalContext, env: &Env, expr: &Value, shadow: &Shadow) 
                 let mut new_items = vec![Value::symbol_from_spur(s)];
                 let mut changed = false;
                 for item in &items[1..] {
-                    let expanded = expand_top_form(ctx, env, item, shadow)?;
+                    let expanded = expand_top_form(expander, env, item, shadow)?;
                     if expanded.raw_bits() != item.raw_bits() {
                         changed = true;
                     }
@@ -1089,7 +1263,7 @@ fn expand_top_form(ctx: &EvalContext, env: &Env, expr: &Value, shadow: &Shadow) 
             }
         }
     }
-    expand_macros_in(ctx, env, expr, shadow)
+    expand_macros_in(expander, env, expr, shadow)
 }
 
 /// Recursively expand macro calls, resolving macros via `env` (walking the
@@ -1098,7 +1272,12 @@ fn expand_top_form(ctx: &EvalContext, env: &Env, expr: &Value, shadow: &Shadow) 
 /// binding shadows is treated as an ordinary call. Preserves Rc pointer
 /// identity when no expansion occurs so span lookups (keyed by Rc pointer)
 /// remain valid.
-fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value, shadow: &Shadow) -> EvalResult {
+fn expand_macros_in(
+    expander: &MacroExpander<'_>,
+    env: &Env,
+    expr: &Value,
+    shadow: &Shadow,
+) -> EvalResult {
     if let Some(items) = expr.as_list() {
         if !items.is_empty() {
             if let Some(s) = items.first().and_then(|v| v.as_symbol_spur()) {
@@ -1109,19 +1288,23 @@ fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value, shadow: &Shadow)
                 // Binding forms expand structurally so their bound names
                 // shadow macros in exactly the scopes the resolver gives them.
                 match name.as_str() {
-                    "define" => return expand_define_form(ctx, env, expr, items, shadow),
-                    "fn" | "lambda" => return expand_lambda_form(ctx, env, expr, items, shadow),
-                    "let" | "let*" | "letrec" | "let-values" | "let*-values" => {
-                        return expand_let_form(ctx, env, expr, items, shadow, &name)
+                    "define" => return expand_define_form(expander, env, expr, items, shadow),
+                    "fn" | "lambda" => {
+                        return expand_lambda_form(expander, env, expr, items, shadow)
                     }
-                    "do" => return expand_do_form(ctx, env, expr, items, shadow),
-                    "try" => return expand_try_form(ctx, env, expr, items, shadow),
-                    "match" | "match*" => return expand_match_form(ctx, env, expr, items, shadow),
+                    "let" | "let*" | "letrec" | "let-values" | "let*-values" => {
+                        return expand_let_form(expander, env, expr, items, shadow, &name)
+                    }
+                    "do" => return expand_do_form(expander, env, expr, items, shadow),
+                    "try" => return expand_try_form(expander, env, expr, items, shadow),
+                    "match" | "match*" => {
+                        return expand_match_form(expander, env, expr, items, shadow)
+                    }
                     "define-values" => {
                         // Formals are a binding position; only the value expands.
                         let mut expanded: Vec<Value> = items[..items.len().min(2)].to_vec();
                         for item in items.iter().skip(2) {
-                            expanded.push(expand_macros_in(ctx, env, item, shadow)?);
+                            expanded.push(expand_macros_in(expander, env, item, shadow)?);
                         }
                         return Ok(rebuilt_list(expr, items, expanded));
                     }
@@ -1130,21 +1313,23 @@ fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value, shadow: &Shadow)
                 if !shadow.contains(s) {
                     if let Some(mac_val) = env.get(s) {
                         if let Some(mac) = mac_val.as_macro_rc() {
+                            let _depth = expander.enter_macro_expansion()?;
                             if mac.syntax_rules.is_some() {
                                 // R7RS syntax-rules: pattern-match + template expand.
                                 let expanded = crate::syntax_rules::expand(&mac, &items[1..], env)?;
-                                return expand_macros_in(ctx, env, &expanded, shadow);
+                                return expand_macros_in(expander, env, &expanded, shadow);
                             }
                             // VM-native expansion: apply the transformer on the VM.
-                            let expanded = apply_macro_vm(ctx, &mac, &items[1..], env)?;
-                            return expand_macros_in(ctx, env, &expanded, shadow);
+                            let expanded =
+                                expander.apply_procedural_macro(&mac, &items[1..], env)?;
+                            return expand_macros_in(expander, env, &expanded, shadow);
                         }
                     }
                 }
             }
             let expanded: Vec<Value> = items
                 .iter()
-                .map(|v| expand_macros_in(ctx, env, v, shadow))
+                .map(|v| expand_macros_in(expander, env, v, shadow))
                 .collect::<Result<_, _>>()?;
             return Ok(rebuilt_list(expr, items, expanded));
         }
@@ -1154,7 +1339,7 @@ fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value, shadow: &Shadow)
         ValueView::Vector(items) => {
             let expanded: Vec<Value> = items
                 .iter()
-                .map(|v| expand_macros_in(ctx, env, v, shadow))
+                .map(|v| expand_macros_in(expander, env, v, shadow))
                 .collect::<Result<_, _>>()?;
             let changed = expanded
                 .iter()
@@ -1170,8 +1355,8 @@ fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value, shadow: &Shadow)
             let mut changed = false;
             let mut expanded = BTreeMap::new();
             for (key, value) in map.iter() {
-                let expanded_key = expand_macros_in(ctx, env, key, shadow)?;
-                let expanded_value = expand_macros_in(ctx, env, value, shadow)?;
+                let expanded_key = expand_macros_in(expander, env, key, shadow)?;
+                let expanded_value = expand_macros_in(expander, env, value, shadow)?;
                 changed |= expanded_key.raw_bits() != key.raw_bits()
                     || expanded_value.raw_bits() != value.raw_bits();
                 expanded.insert(expanded_key, expanded_value);
@@ -1190,7 +1375,7 @@ fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value, shadow: &Shadow)
 /// binding position (never expanded); the defined name and any params shadow
 /// macros in the value/body.
 fn expand_define_form(
-    ctx: &EvalContext,
+    expander: &MacroExpander<'_>,
     env: &Env,
     expr: &Value,
     items: &[Value],
@@ -1203,13 +1388,13 @@ fn expand_define_form(
     collect_pattern_symbols(target, &mut bound);
     let inner = shadow.child(bound);
     let mut expanded: Vec<Value> = items[..2.min(items.len())].to_vec();
-    expanded.extend(expand_body(ctx, env, &items[2..], &inner)?);
+    expanded.extend(expand_body(expander, env, &items[2..], &inner)?);
     Ok(rebuilt_list(expr, items, expanded))
 }
 
 /// `(fn params body...)`: params are a binding position and shadow the body.
 fn expand_lambda_form(
-    ctx: &EvalContext,
+    expander: &MacroExpander<'_>,
     env: &Env,
     expr: &Value,
     items: &[Value],
@@ -1222,7 +1407,7 @@ fn expand_lambda_form(
     collect_pattern_symbols(params, &mut bound);
     let inner = shadow.child(bound);
     let mut expanded: Vec<Value> = items[..2.min(items.len())].to_vec();
-    expanded.extend(expand_body(ctx, env, &items[2..], &inner)?);
+    expanded.extend(expand_body(expander, env, &items[2..], &inner)?);
     Ok(rebuilt_list(expr, items, expanded))
 }
 
@@ -1230,7 +1415,7 @@ fn expand_lambda_form(
 /// `let`/`let-values` inits see the outer scope, the starred forms see the
 /// bindings accumulated so far, `letrec` inits see everything.
 fn expand_let_form(
-    ctx: &EvalContext,
+    expander: &MacroExpander<'_>,
     env: &Env,
     expr: &Value,
     items: &[Value],
@@ -1251,7 +1436,7 @@ fn expand_let_form(
         // Malformed; let the lowering report it. Expand generically.
         let expanded: Vec<Value> = items
             .iter()
-            .map(|v| expand_macros_in(ctx, env, v, shadow))
+            .map(|v| expand_macros_in(expander, env, v, shadow))
             .collect::<Result<_, _>>()?;
         return Ok(rebuilt_list(expr, items, expanded));
     };
@@ -1282,7 +1467,7 @@ fn expand_let_form(
                 // The binding pattern itself never expands.
                 new_pair.push(part.clone());
             } else {
-                new_pair.push(expand_macros_in(ctx, env, part, &init_scope)?);
+                new_pair.push(expand_macros_in(expander, env, part, &init_scope)?);
             }
         }
         if sequential || form == "letrec" {
@@ -1307,7 +1492,7 @@ fn expand_let_form(
     let mut expanded: Vec<Value> = items[..bindings_idx].to_vec();
     expanded.push(Value::list(new_pairs));
     expanded.extend(expand_body(
-        ctx,
+        expander,
         env,
         &items[bindings_idx + 1..],
         &body_scope,
@@ -1318,7 +1503,7 @@ fn expand_let_form(
 /// Scheme `do`: `(do ((var init step)...) (test result...) body...)` — vars
 /// bind in steps, the test/result, and the body; inits see the outer scope.
 fn expand_do_form(
-    ctx: &EvalContext,
+    expander: &MacroExpander<'_>,
     env: &Env,
     expr: &Value,
     items: &[Value],
@@ -1327,7 +1512,7 @@ fn expand_do_form(
     let Some(specs) = items.get(1).and_then(|v| v.as_list().map(|l| l.to_vec())) else {
         let expanded: Vec<Value> = items
             .iter()
-            .map(|v| expand_macros_in(ctx, env, v, shadow))
+            .map(|v| expand_macros_in(expander, env, v, shadow))
             .collect::<Result<_, _>>()?;
         return Ok(rebuilt_list(expr, items, expanded));
     };
@@ -1348,22 +1533,22 @@ fn expand_do_form(
         for (i, part) in spec_items.iter().enumerate() {
             match i {
                 0 => new_spec.push(part.clone()),
-                1 => new_spec.push(expand_macros_in(ctx, env, part, shadow)?),
-                _ => new_spec.push(expand_macros_in(ctx, env, part, &inner)?),
+                1 => new_spec.push(expand_macros_in(expander, env, part, shadow)?),
+                _ => new_spec.push(expand_macros_in(expander, env, part, &inner)?),
             }
         }
         new_specs.push(rebuilt_list(spec, spec_items, new_spec));
     }
     let mut expanded: Vec<Value> = vec![items[0].clone(), Value::list(new_specs)];
     for item in items.iter().skip(2) {
-        expanded.push(expand_macros_in(ctx, env, item, &inner)?);
+        expanded.push(expand_macros_in(expander, env, item, &inner)?);
     }
     Ok(rebuilt_list(expr, items, expanded))
 }
 
 /// `try`: catch clauses bind their error variable over the handler body.
 fn expand_try_form(
-    ctx: &EvalContext,
+    expander: &MacroExpander<'_>,
     env: &Env,
     expr: &Value,
     items: &[Value],
@@ -1384,11 +1569,11 @@ fn expand_try_form(
             let inner = shadow.child(bound);
             let mut new_clause: Vec<Value> = clause[..2.min(clause.len())].to_vec();
             for part in clause.iter().skip(2) {
-                new_clause.push(expand_macros_in(ctx, env, part, &inner)?);
+                new_clause.push(expand_macros_in(expander, env, part, &inner)?);
             }
             expanded.push(rebuilt_list(item, clause, new_clause));
         } else {
-            expanded.push(expand_macros_in(ctx, env, item, shadow)?);
+            expanded.push(expand_macros_in(expander, env, item, shadow)?);
         }
     }
     Ok(rebuilt_list(expr, items, expanded))
@@ -1397,7 +1582,7 @@ fn expand_try_form(
 /// `match`/`match*`: each clause's pattern is a binding position (never
 /// expanded) whose symbols shadow the clause's guard and body.
 fn expand_match_form(
-    ctx: &EvalContext,
+    expander: &MacroExpander<'_>,
     env: &Env,
     expr: &Value,
     items: &[Value],
@@ -1405,7 +1590,7 @@ fn expand_match_form(
 ) -> EvalResult {
     let mut expanded: Vec<Value> = vec![items[0].clone()];
     if let Some(scrutinee) = items.get(1) {
-        expanded.push(expand_macros_in(ctx, env, scrutinee, shadow)?);
+        expanded.push(expand_macros_in(expander, env, scrutinee, shadow)?);
     }
     for clause in items.iter().skip(2) {
         let parts: Option<Vec<Value>> = if let Some(l) = clause.as_list() {
@@ -1416,7 +1601,7 @@ fn expand_match_form(
             None
         };
         let Some(parts) = parts else {
-            expanded.push(expand_macros_in(ctx, env, clause, shadow)?);
+            expanded.push(expand_macros_in(expander, env, clause, shadow)?);
             continue;
         };
         if parts.is_empty() {
@@ -1428,7 +1613,7 @@ fn expand_match_form(
         let inner = shadow.child(bound);
         let mut new_parts = vec![parts[0].clone()];
         for part in parts.iter().skip(1) {
-            new_parts.push(expand_macros_in(ctx, env, part, &inner)?);
+            new_parts.push(expand_macros_in(expander, env, part, &inner)?);
         }
         let changed = new_parts
             .iter()
@@ -1659,6 +1844,30 @@ pub fn apply_macro_vm(
     args: &[Value],
     caller_env: &Env,
 ) -> Result<Value, SemaError> {
+    let env = bind_macro_arguments(mac, args, caller_env)?;
+
+    // Compile and run each body form on the VM, fresh per call site (no cache)
+    // to keep auto-gensym hygienic. The body is the *transformer* code; it is
+    // NOT macro-pre-expanded here — quasiquote templates inside it (which may
+    // legitimately mention the macro's own name, as the recursive threading
+    // macros do) must be compiled as data, not re-expanded. Any macro call the
+    // transformer *produces* is re-expanded by the caller (`expand_macros_in`
+    // recurses on the returned form). `compile_program` lowers quasiquote /
+    // unquote / unquote-splicing directly.
+    let mut result = Value::nil();
+    for expr in &mac.body {
+        let prog = sema_vm::compile_program(std::slice::from_ref(expr), None)?;
+        let mut vm = sema_vm::VM::new(env.clone(), prog.functions, &[], prog.main_cache_slots)?;
+        result = vm.execute(prog.closure, ctx)?;
+    }
+    Ok(result)
+}
+
+fn bind_macro_arguments(
+    mac: &sema_core::Macro,
+    args: &[Value],
+    caller_env: &Env,
+) -> Result<Rc<Env>, SemaError> {
     let env = Rc::new(Env::with_parent(Rc::new(caller_env.clone())));
 
     // Bind parameters to unevaluated forms.
@@ -1687,21 +1896,37 @@ pub fn apply_macro_vm(
         }
     }
 
-    // Compile and run each body form on the VM, fresh per call site (no cache)
-    // to keep auto-gensym hygienic. The body is the *transformer* code; it is
-    // NOT macro-pre-expanded here — quasiquote templates inside it (which may
-    // legitimately mention the macro's own name, as the recursive threading
-    // macros do) must be compiled as data, not re-expanded. Any macro call the
-    // transformer *produces* is re-expanded by the caller (`expand_macros_in`
-    // recurses on the returned form). `compile_program` lowers quasiquote /
-    // unquote / unquote-splicing directly.
-    let mut result = Value::nil();
-    for expr in &mac.body {
-        let prog = sema_vm::compile_program(std::slice::from_ref(expr), None)?;
-        let mut vm = sema_vm::VM::new(env.clone(), prog.functions, &[], prog.main_cache_slots)?;
-        result = vm.execute(prog.closure, ctx)?;
-    }
-    Ok(result)
+    Ok(env)
+}
+
+fn apply_macro_vm_restricted(
+    ctx: &EvalContext,
+    runtime: &RuntimeMacroExpansion,
+    mac: &sema_core::Macro,
+    args: &[Value],
+    caller_env: &Env,
+) -> Result<Value, SemaError> {
+    let env = bind_macro_arguments(mac, args, caller_env)?;
+    // One program gives the whole transformer invocation one shared budget,
+    // including every body form and structural callback transition.
+    let program = sema_vm::compile_program(&mac.body, None)?;
+    sema_vm::run_program_restricted_with_budget(
+        ctx,
+        runtime.task_context.clone(),
+        program,
+        env,
+        sema_vm::RestrictedRunPolicy {
+            operation: "macro transformer",
+            suspension_error: "macro transformer cannot suspend during expansion",
+            instruction_limit: NonZeroUsize::new(MACRO_TRANSFORMER_INSTRUCTION_LIMIT)
+                .expect("macro transformer instruction limit is nonzero"),
+            transition_limit: NonZeroUsize::new(MACRO_TRANSFORMER_TRANSITION_LIMIT)
+                .expect("macro transformer transition limit is nonzero"),
+            deadline: runtime.deadline,
+            cancellation: runtime.cancellation.clone(),
+        },
+        runtime.state.budget.clone(),
+    )
 }
 
 /// Register a `defmacro` form's macro in `env` — a
@@ -2409,11 +2634,10 @@ impl RuntimeSourceModule {
 
         while let Some(expression) = self.expressions.get(self.next) {
             self.next += 1;
-            let expanded =
-                match expand_for_vm_in(context.eval_context, &self.run.globals, expression) {
-                    Ok(expanded) => expanded,
-                    Err(error) => return self.run.fail(error),
-                };
+            let expanded = match expand_for_vm_in_runtime(context, &self.run.globals, expression) {
+                Ok(expanded) => expanded,
+                Err(error) => return self.run.fail(error),
+            };
             if expanded.is_nil() {
                 continue;
             }
@@ -3160,7 +3384,7 @@ fn start_forced_body(
             return Ok(Some(thunk.body.clone()));
         }
         let force_env = upgrade_delegate_env(&force_env)?;
-        let expanded = expand_for_vm_in(context.eval_context, &force_env, &thunk.body)?;
+        let expanded = expand_for_vm_in_runtime(context, &force_env, &thunk.body)?;
         if expanded.is_nil() {
             let value = Value::nil();
             *thunk.forced.borrow_mut() = Some(value);
@@ -3232,21 +3456,10 @@ pub fn register_vm_delegates(env: &Rc<Env>, _ctx: &Rc<EvalContext>) {
     // VM (rooted at the global env so top-level `define`s persist). The runtime
     // `(eval ...)` meta path is thus VM-native.
     //
-    // Dual ABI (Step G): the legacy value ABI (`func`, below) is UNCHANGED —
-    // a bare top-level `eval` or one reached from a nested synchronous
-    // re-entry keeps running the eval'd form on a fresh, throwaway
-    // `VM::execute`, exactly as before. The runtime ABI (`runtime`) only
-    // takes over when `__vm-eval` is dispatched inside a live runtime
-    // quantum (`dispatch_native`'s `runtime_quantum_active()` gate): macro
-    // expansion and compilation stay synchronous (they need `EvalContext`,
-    // which the runtime ABI is never handed — `NativeFn::invoke_runtime`
-    // only forwards it to the legacy fallback), but EXECUTION of the
-    // compiled program is handed to the runtime as an ordinary
-    // `NativeOutcome::Call` callee (`sema_vm::program_as_callable`), exactly
-    // like a HOF's callback (`MapContinuation` et al. in
-    // `sema-stdlib::list`). This lets the runtime host a suspension
-    // (`async/await`, `channel/*`, …) inside the eval'd form instead of the
-    // fresh VM hitting a dead end with no scheduler attached.
+    // The host ABI keeps one-shot fresh-VM compatibility. The runtime ABI
+    // expands procedural transformers with the task's exact context under the
+    // bounded restricted driver, then hands execution of the expanded program
+    // to the scheduler as an ordinary structural call.
     let eval_env = Rc::downgrade(env);
     let eval_env_runtime = Rc::downgrade(env);
     env.set(
@@ -3273,7 +3486,7 @@ pub fn register_vm_delegates(env: &Rc<Env>, _ctx: &Rc<EvalContext>) {
                     return Err(SemaError::arity("eval", "1", args.len()));
                 }
                 let eval_env = runtime_delegate_target(native_ctx, &eval_env_runtime)?;
-                let expanded = expand_for_vm_in(native_ctx.eval_context, &eval_env, &args[0])?;
+                let expanded = expand_for_vm_in_runtime(native_ctx, &eval_env, &args[0])?;
                 if expanded.is_nil() {
                     return Ok(sema_core::runtime::NativeOutcome::Return(Value::nil()));
                 }
@@ -3502,34 +3715,72 @@ pub fn register_vm_delegates(env: &Rc<Env>, _ctx: &Rc<EvalContext>) {
         ),
     );
 
-    // __vm-macroexpand: expand a macro form
+    // __vm-macroexpand: expand one macro form. Runtime transformer execution
+    // is scheduler-free and bounded; the host ABI retains synchronous
+    // compatibility.
     let me_env = Rc::downgrade(env);
+    let me_env_runtime = Rc::downgrade(env);
     env.set(
         intern("__vm-macroexpand"),
-        Value::native_fn(NativeFn::with_ctx("__vm-macroexpand", move |ctx, args| {
-            if args.len() != 1 {
-                return Err(SemaError::arity("macroexpand", "1", args.len()));
-            }
-            if let Some(items) = args[0].as_list() {
-                if !items.is_empty() {
-                    if let Some(spur) = items[0].as_symbol_spur() {
-                        // Upgrade lazily: the non-macro passthrough below never
-                        // touches the env.
-                        let me_env = upgrade_delegate_env(&me_env)?;
-                        if let Some(mac_val) = me_env.get(spur) {
-                            if let Some(mac) = mac_val.as_macro_rc() {
-                                if mac.syntax_rules.is_some() {
-                                    return crate::syntax_rules::expand(&mac, &items[1..], &me_env);
+        Value::native_fn(NativeFn::with_ctx_runtime(
+            "__vm-macroexpand",
+            move |ctx, args| {
+                if args.len() != 1 {
+                    return Err(SemaError::arity("macroexpand", "1", args.len()));
+                }
+                if let Some(items) = args[0].as_list() {
+                    if !items.is_empty() {
+                        if let Some(spur) = items[0].as_symbol_spur() {
+                            // Upgrade lazily: the non-macro passthrough below never
+                            // touches the env.
+                            let me_env = upgrade_delegate_env(&me_env)?;
+                            if let Some(mac_val) = me_env.get(spur) {
+                                if let Some(mac) = mac_val.as_macro_rc() {
+                                    if mac.syntax_rules.is_some() {
+                                        return crate::syntax_rules::expand(
+                                            &mac,
+                                            &items[1..],
+                                            &me_env,
+                                        );
+                                    }
+                                    return apply_macro_vm(ctx, &mac, &items[1..], &me_env);
                                 }
-                                // VM-native: expand the transformer on the VM.
-                                return apply_macro_vm(ctx, &mac, &items[1..], &me_env);
                             }
                         }
                     }
                 }
-            }
-            Ok(args[0].clone())
-        })),
+                Ok(args[0].clone())
+            },
+            move |context, args| {
+                if args.len() != 1 {
+                    return Err(SemaError::arity("macroexpand", "1", args.len()));
+                }
+                if let Some(items) = args[0].as_list() {
+                    if !items.is_empty() {
+                        if let Some(spur) = items[0].as_symbol_spur() {
+                            let me_env = runtime_delegate_target(context, &me_env_runtime)?;
+                            if let Some(mac_val) = me_env.get(spur) {
+                                if let Some(mac) = mac_val.as_macro_rc() {
+                                    let expander = MacroExpander::runtime(context);
+                                    let _depth = expander.enter_macro_expansion()?;
+                                    let expanded = if mac.syntax_rules.is_some() {
+                                        crate::syntax_rules::expand(&mac, &items[1..], &me_env)?
+                                    } else {
+                                        expander.apply_procedural_macro(
+                                            &mac,
+                                            &items[1..],
+                                            &me_env,
+                                        )?
+                                    };
+                                    return Ok(sema_core::runtime::NativeOutcome::Return(expanded));
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(sema_core::runtime::NativeOutcome::Return(args[0].clone()))
+            },
+        )),
     );
 
     // __vm-prompt: build Prompt directly from pre-evaluated entries
@@ -3869,9 +4120,16 @@ fn gc_collect_with_pins(pins: Vec<sema_core::NodePtr>) -> Value {
 mod runtime_eval_tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use sema_core::cycle::GcEdge;
     use sema_core::runtime::{
-        CancelReason, CancellationView, NativeCallContext, NativeOutcome, TaskContextHandle,
-        TaskOutcome, TaskSettlement,
+        CancelReason, CancellationView, CompletionDecoder, CompletionKind, ExternalFailure,
+        NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, NativeSuspend,
+        PreparedExternalOperation, QuarantineBound, ResumeInput, SendPayload, TaskContextHandle,
+        TaskOutcome, TaskSettlement, Trace, WaitKind,
     };
     use sema_vm::runtime::{RootHandle, RootOptions, RootPoll};
 
@@ -3946,6 +4204,90 @@ mod runtime_eval_tests {
         delegate
             .invoke_runtime(&mut context, args)
             .unwrap_or_else(|error| panic!("runtime delegate {name} failed: {error}"))
+    }
+
+    struct RejectedMacroExternalDecoder;
+
+    impl Trace for RejectedMacroExternalDecoder {
+        fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+            true
+        }
+    }
+
+    impl CompletionDecoder for RejectedMacroExternalDecoder {
+        fn decode(
+            self: Box<Self>,
+            _context: &mut NativeCallContext<'_>,
+            _result: Result<SendPayload, ExternalFailure>,
+        ) -> Result<Value, SemaError> {
+            panic!("rejected macro external operation must never be decoded")
+        }
+    }
+
+    struct RejectedMacroExternalContinuation;
+
+    impl Trace for RejectedMacroExternalContinuation {
+        fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+            true
+        }
+    }
+
+    impl NativeContinuation for RejectedMacroExternalContinuation {
+        fn resume(
+            self: Box<Self>,
+            _context: &mut NativeCallContext<'_>,
+            input: ResumeInput,
+        ) -> NativeResult {
+            let ResumeInput::Failed(error) = input else {
+                panic!("rejected macro external operation must resume with failure")
+            };
+            assert!(matches!(
+                error.inner(),
+                SemaError::Eval(message)
+                    if message == "macro transformer cannot suspend during expansion"
+            ));
+            Err(error)
+        }
+    }
+
+    struct TransitionBurnContinuation {
+        callable: Value,
+        remaining: usize,
+    }
+
+    impl Trace for TransitionBurnContinuation {
+        fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+            sink(GcEdge::Value(&self.callable));
+            true
+        }
+    }
+
+    impl NativeContinuation for TransitionBurnContinuation {
+        fn resume(
+            self: Box<Self>,
+            _context: &mut NativeCallContext<'_>,
+            input: ResumeInput,
+        ) -> NativeResult {
+            match input {
+                ResumeInput::Returned(_) if self.remaining == 0 => {
+                    Ok(NativeOutcome::Return(Value::nil()))
+                }
+                ResumeInput::Returned(_) => {
+                    Ok(NativeOutcome::Call(sema_core::runtime::NativeCall {
+                        callable: self.callable.clone(),
+                        args: Vec::new(),
+                        continuation: Box::new(Self {
+                            callable: self.callable,
+                            remaining: self.remaining - 1,
+                        }),
+                    }))
+                }
+                ResumeInput::Failed(error) => Err(error),
+                _ => Err(SemaError::eval(
+                    "transition burn continuation resumed unexpectedly",
+                )),
+            }
+        }
     }
 
     #[test]
@@ -4131,6 +4473,462 @@ mod runtime_eval_tests {
         let (exprs, _spans) = sema_reader::read_many_with_spans("(+ 1 2)").expect("parse");
         let result = interp.eval_via_runtime(&exprs[0]).expect("eval");
         assert_eq!(result, Value::int(3));
+    }
+
+    #[test]
+    fn runtime_eval_rejects_a_suspending_procedural_macro() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str("(defmacro sleeping-transformer () (async/sleep 1) '42)")
+            .expect("register procedural macro");
+
+        let error = interp
+            .eval_str_via_runtime("(eval '(sleeping-transformer))")
+            .expect_err("runtime macro expansion must not drive a suspension");
+
+        assert!(
+            error
+                .to_string()
+                .contains("macro transformer cannot suspend during expansion"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn runtime_loaded_source_defines_and_uses_a_procedural_macro_in_order() {
+        let interp = Interpreter::new();
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from("runtime-macro-load.sema"),
+            b"(defmacro loaded-plus-one (x) (list '+ x 1))\
+              (define loaded-macro-result (loaded-plus-one 41))\
+              loaded-macro-result"
+                .to_vec(),
+        );
+
+        let result = interp
+            .eval_str_via_runtime(r#"(load "runtime-macro-load.sema")"#)
+            .expect("runtime source load expands its later forms");
+
+        assert_eq!(result, Value::int(42));
+        assert_eq!(
+            interp
+                .eval_str_via_runtime("loaded-macro-result")
+                .expect("loaded definition persists"),
+            Value::int(42)
+        );
+    }
+
+    #[test]
+    fn runtime_loaded_source_rejects_a_suspending_transformer_before_publishing_result() {
+        let interp = Interpreter::new();
+        interp.ctx.set_embedded_file(
+            std::path::PathBuf::from("runtime-suspending-macro-load.sema"),
+            b"(defmacro loaded-sleeper () (async/sleep 1) '42)\
+              (define rejected-loaded-result (loaded-sleeper))"
+                .to_vec(),
+        );
+
+        let error = interp
+            .eval_str_via_runtime(r#"(load "runtime-suspending-macro-load.sema")"#)
+            .expect_err("loaded transformer suspension must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("macro transformer cannot suspend during expansion"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            interp
+                .global_env
+                .get(intern("rejected-loaded-result"))
+                .is_none(),
+            "the form whose transformer was rejected must not publish a definition"
+        );
+    }
+
+    #[test]
+    fn runtime_macro_transformer_drives_helpers_hofs_multimethods_and_nested_output() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str(
+                "(define (macro-helper xs) (car (map (fn (x) x) xs)))\
+                 (defmulti macro-emit (fn (key) key))\
+                 (defmethod macro-emit :answer (fn (_) (list '+ 40 2)))\
+                 (defmacro inner-runtime-macro ()\
+                   (macro-helper (list (macro-emit :answer))))\
+                 (defmacro outer-runtime-macro () '(inner-runtime-macro))",
+            )
+            .expect("register transformer helpers and macros");
+
+        let result = interp
+            .eval_str_via_runtime("(eval '(outer-runtime-macro))")
+            .expect("restricted transformer drives structural calls");
+
+        assert_eq!(result, Value::int(42));
+    }
+
+    #[test]
+    fn runtime_macro_transformer_receives_the_exact_task_context() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str(
+                "(defmacro task-context-transformer ()\
+                   (list 'quote (context/get :macro-marker)))",
+            )
+            .expect("register context-reading transformer");
+
+        let result = interp
+            .eval_str_via_runtime(
+                "(context/with {:macro-marker :exact-task}\
+                   (fn () (eval '(task-context-transformer))))",
+            )
+            .expect("runtime transformer reads its task-local context");
+
+        assert_eq!(result, Value::keyword("exact-task"));
+    }
+
+    #[test]
+    fn runtime_force_uses_restricted_expansion_for_a_late_macro() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str_via_runtime("(define late-macro-promise (__vm-delay '(late-force-macro)))")
+            .expect("create delayed form before its macro exists");
+        interp
+            .eval_str("(defmacro late-force-macro () (async/sleep 1) '42)")
+            .expect("register late macro");
+
+        let error = interp
+            .eval_str_via_runtime("(force late-macro-promise)")
+            .expect_err("force-time transformer must not suspend");
+
+        assert!(
+            error
+                .to_string()
+                .contains("macro transformer cannot suspend during expansion"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn runtime_macroexpand_rejects_a_suspending_transformer() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str("(defmacro macroexpand-sleeper () (async/sleep 1) '42)")
+            .expect("register procedural macro");
+
+        let error = interp
+            .eval_str_via_runtime("(macroexpand '(macroexpand-sleeper))")
+            .expect_err("runtime macroexpand must use restricted execution");
+
+        assert!(
+            error
+                .to_string()
+                .contains("macro transformer cannot suspend during expansion"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn runtime_macro_transformer_rejects_channel_and_spawn_requests() {
+        for (definition, invocation) in [
+            (
+                "(defmacro channel-transformer () (channel/new 1))",
+                "(eval '(channel-transformer))",
+            ),
+            (
+                "(defmacro spawn-transformer () (async/spawn (fn () 42)))",
+                "(eval '(spawn-transformer))",
+            ),
+        ] {
+            let interp = Interpreter::new();
+            interp
+                .eval_str(definition)
+                .expect("register suspending transformer");
+
+            let error = interp
+                .eval_str_via_runtime(invocation)
+                .expect_err("runtime request must be rejected during expansion");
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("macro transformer cannot suspend during expansion"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_macro_transformer_rejects_external_wait_before_job_admission() {
+        let interp = Interpreter::new();
+        let job_runs = Arc::new(AtomicUsize::new(0));
+        let native_job_runs = Arc::clone(&job_runs);
+        interp.global_env.set_str(
+            "macro-external",
+            Value::native_fn(NativeFn::simple_result("macro-external", move |_| {
+                let job_runs = Arc::clone(&native_job_runs);
+                Ok(NativeOutcome::Suspend(NativeSuspend {
+                    wait: WaitKind::External(Box::new(
+                        PreparedExternalOperation::quarantined_blocking(
+                            CompletionKind::try_from_raw(101)
+                                .expect("macro external completion kind is nonzero"),
+                            Box::new(RejectedMacroExternalDecoder),
+                            QuarantineBound::hard_deadline(Duration::from_secs(1))
+                                .expect("macro external quarantine bound is positive"),
+                            move || {
+                                job_runs.fetch_add(1, Ordering::SeqCst);
+                                Ok(Box::new(()))
+                            },
+                        ),
+                    )),
+                    continuation: Box::new(RejectedMacroExternalContinuation),
+                }))
+            })),
+        );
+        interp
+            .eval_str("(defmacro external-transformer () (macro-external))")
+            .expect("register external transformer");
+
+        let error = interp
+            .eval_str_via_runtime("(eval '(external-transformer))")
+            .expect_err("external transformer wait must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("macro transformer cannot suspend during expansion"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            job_runs.load(Ordering::SeqCst),
+            0,
+            "rejected transformer external job must never be admitted"
+        );
+    }
+
+    #[test]
+    fn infinite_runtime_macro_transformer_hits_the_instruction_cap() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str("(defmacro infinite-transformer () (let loop () (loop)))")
+            .expect("register infinite transformer");
+
+        let error = interp
+            .eval_str_via_runtime("(eval '(infinite-transformer))")
+            .expect_err("infinite transformer must be bounded");
+
+        assert!(
+            error
+                .to_string()
+                .contains("macro transformer exceeded instruction limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn nested_runtime_macro_transformers_share_one_transition_budget() {
+        let interp = Interpreter::new();
+        interp.global_env.set_str(
+            "macro-transition-step",
+            Value::native_fn(NativeFn::simple_result("macro-transition-step", |_| {
+                Ok(NativeOutcome::Return(Value::nil()))
+            })),
+        );
+        interp.global_env.set_str(
+            "macro-transition-burn",
+            Value::native_fn(NativeFn::with_context_result(
+                "macro-transition-burn",
+                |context, args| {
+                    let count = args
+                        .first()
+                        .and_then(Value::as_int)
+                        .ok_or_else(|| SemaError::type_error("integer", "other"))?
+                        as usize;
+                    if count == 0 {
+                        return Ok(NativeOutcome::Return(Value::nil()));
+                    }
+                    let callable = context
+                        .call_env
+                        .as_ref()
+                        .and_then(|env| env.get_str("macro-transition-step"))
+                        .ok_or_else(|| SemaError::eval("macro transition step missing"))?;
+                    Ok(NativeOutcome::Call(sema_core::runtime::NativeCall {
+                        callable: callable.clone(),
+                        args: Vec::new(),
+                        continuation: Box::new(TransitionBurnContinuation {
+                            callable,
+                            remaining: count - 1,
+                        }),
+                    }))
+                },
+            )),
+        );
+        interp
+            .eval_str(
+                "(defmacro shared-budget-inner ()\
+                   (macro-transition-burn 30000)\
+                   '42)\
+                 (defmacro shared-budget-outer ()\
+                   (macro-transition-burn 30000)\
+                   (macroexpand '(shared-budget-inner)))",
+            )
+            .expect("register nested finite transformers");
+
+        let error = interp
+            .eval_str_via_runtime("(eval '(shared-budget-outer))")
+            .expect_err("nested transformers must share one transition budget");
+
+        assert!(
+            error
+                .to_string()
+                .contains("macro transformer exceeded transition limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn finite_generated_macro_chain_hits_the_runtime_expansion_depth_bound() {
+        let interp = Interpreter::new();
+        let mut definitions = String::new();
+        for index in 0..MACRO_EXPANSION_DEPTH_LIMIT {
+            definitions.push_str(&format!(
+                "(defmacro generated-step-{index} () '(generated-step-{})) ",
+                index + 1
+            ));
+        }
+        definitions.push_str(&format!(
+            "(defmacro generated-step-{} () '42)",
+            MACRO_EXPANSION_DEPTH_LIMIT
+        ));
+        interp
+            .eval_str(&definitions)
+            .expect("register finite generated macro chain");
+
+        let error = interp
+            .eval_str_via_runtime("(eval '(generated-step-0))")
+            .expect_err("runtime macro expansion must stop before deep Rust recursion");
+
+        assert!(
+            error
+                .to_string()
+                .contains("macro expansion exceeded depth limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn recursive_runtime_macroexpand_hits_the_shared_expansion_depth_bound() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str(
+                "(defmacro recursive-macroexpand ()\
+                   (macroexpand '(recursive-macroexpand)))",
+            )
+            .expect("register directly recursive macro transformer");
+
+        let error = interp
+            .eval_str_via_runtime("(macroexpand '(recursive-macroexpand))")
+            .expect_err("recursive runtime macroexpand must be bounded");
+
+        assert!(
+            error
+                .to_string()
+                .contains("macro expansion exceeded depth limit"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn independent_runtime_macro_siblings_do_not_consume_the_depth_bound() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str("(defmacro flat-runtime-macro () '42)")
+            .expect("register flat macro");
+        let siblings = (0..MACRO_EXPANSION_DEPTH_LIMIT * 2)
+            .map(|_| "(flat-runtime-macro)")
+            .collect::<Vec<_>>()
+            .join(" ");
+        let source = format!("(eval '(list {siblings}))");
+
+        let value = interp
+            .eval_str_via_runtime(&source)
+            .expect("independent siblings must release the active-depth guard");
+
+        assert_eq!(
+            value,
+            Value::list(vec![Value::int(42); MACRO_EXPANSION_DEPTH_LIMIT * 2])
+        );
+    }
+
+    #[test]
+    fn fatal_runtime_macro_budget_error_unwinds_dynamic_context_scope() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str(
+                "(defmacro scoped-infinite-transformer ()\
+                   (context/with {:restricted-leak :present}\
+                     (fn () (let loop () (loop)))))",
+            )
+            .expect("register scoped infinite transformer");
+
+        let leaked = interp
+            .eval_str_via_runtime(
+                "(try\
+                   (eval '(scoped-infinite-transformer))\
+                   (catch error (context/get :restricted-leak)))",
+            )
+            .expect("outer runtime catches the restricted expansion failure");
+
+        assert_eq!(
+            leaked,
+            Value::nil(),
+            "fatal restricted cleanup must remove context/with's owned frame"
+        );
+    }
+
+    #[test]
+    fn cancelled_runtime_macro_expansion_stops_before_transformer_execution() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str("(defmacro cancelled-transformer () '42)")
+            .expect("register procedural macro");
+        let expression = sema_reader::read_many("(cancelled-transformer)")
+            .expect("parse macro invocation")
+            .remove(0);
+        let mut context = NativeCallContext {
+            eval_context: &interp.ctx,
+            task_context: TaskContextHandle::default(),
+            call_env: Some(Rc::clone(&interp.global_env)),
+            cancellation: CancellationView::new(true, Some(CancelReason::Explicit)),
+        };
+
+        let error = expand_for_vm_in_runtime(&mut context, &interp.global_env, &expression)
+            .expect_err("cancelled expansion must not run its transformer");
+
+        assert!(
+            error
+                .to_string()
+                .contains("macro transformer was cancelled"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn host_procedural_macro_expansion_keeps_synchronous_compatibility() {
+        let interp = Interpreter::new();
+        interp
+            .eval_str("(define (host-macro-helper x) (+ x 1))")
+            .expect("register host transformer helper");
+        let result = interp
+            .eval_str(
+                "(defmacro host-compatible-macro (x)\
+                   (list 'quote (host-macro-helper x)))\
+                 (host-compatible-macro 41)",
+            )
+            .expect("host macro expansion stays on the synchronous path");
+
+        assert_eq!(result, Value::int(42));
     }
 
     // A legacy user closure (`double`, defined via `eval_str`) called from a

@@ -1,0 +1,2 @@
+# token-id<TAB>exact-repository-path<TAB>exact-count<TAB>reason
+CALL_CALLBACK	scripts/fixtures/unified-runtime-source-policy/negated-runtime-host-adapter.rs	1	negated runtime guard is a permitted host-only adapter

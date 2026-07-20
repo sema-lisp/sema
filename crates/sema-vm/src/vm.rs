@@ -437,6 +437,13 @@ fn legacy_vm_entry_during_quantum_error() -> SemaError {
     )
 }
 
+fn ensure_legacy_vm_entry_allowed(ctx: &EvalContext) -> Result<(), SemaError> {
+    if ctx.runtime_quantum_active() || sema_core::in_runtime_quantum() {
+        return Err(legacy_vm_entry_during_quantum_error());
+    }
+    Ok(())
+}
+
 /// Extracted VM closure: the closure itself and the function table from its compilation context.
 pub type VmClosureInfo = (Rc<Closure>, Rc<Vec<Rc<Function>>>, Rc<Vec<Rc<NativeFn>>>);
 
@@ -514,11 +521,6 @@ pub struct VM {
     native_fns: Rc<Vec<Rc<NativeFn>>>,
     debug_values: HashMap<u64, Value>,
     next_debug_value_ref: u64,
-    /// Frame-count floor at which the dispatch loop treats a RETURN as
-    /// "finished". Normally 0 (run until the call stack is empty). Raised
-    /// temporarily by `run_nested_closure` so a re-entrant in-VM HOF callback
-    /// returns to its native caller without unwinding the parent's frames.
-    frame_floor: usize,
     /// One-entry cache of the last home env this VM registered with the
     /// cycle collector (CORE-2): consecutive `make_closure`s share a home,
     /// so a pointer-equality hit skips the collector's seen-set probe. The
@@ -590,57 +592,6 @@ impl sema_core::runtime::Trace for VM {
     }
 }
 
-thread_local! {
-    /// Stack of pointers to VMs that are currently executing a native call on
-    /// this thread. When a stdlib higher-order function invokes a VM closure
-    /// via `call_callback`, the closure's fallback consults this stack so it can
-    /// run *inside* the live VM (keeping open upvalue cells connected to the
-    /// parent stack) instead of spawning a fresh VM that loses `set!` mutations.
-    ///
-    /// SAFETY: each pointer is valid for as long as the corresponding native
-    /// call is on the Rust call stack. A `CurrentVmGuard` pushes the pointer
-    /// immediately before a synchronous native call and pops it immediately
-    /// after, so the pointer is only observed while the owning VM is paused at
-    /// that exact call site and is not otherwise touched.
-    static CURRENT_VM: RefCell<Vec<*mut VM>> = const { RefCell::new(Vec::new()) };
-}
-
-/// RAII guard that registers a VM as the current re-entrant target for the
-/// duration of a native call, then unregisters it on drop.
-struct CurrentVmGuard;
-
-impl CurrentVmGuard {
-    fn enter(vm: &mut VM) -> Self {
-        let ptr = vm as *mut VM;
-        CURRENT_VM.with(|stack| stack.borrow_mut().push(ptr));
-        CurrentVmGuard
-    }
-}
-
-impl Drop for CurrentVmGuard {
-    fn drop(&mut self) {
-        CURRENT_VM.with(|stack| {
-            stack.borrow_mut().pop();
-        });
-    }
-}
-
-/// Identity of the root ancestor of an env chain: the root's `bindings`
-/// allocation. All envs of one interpreter — the global env, module envs, and
-/// closure homes — chain up to the same root *bindings*, so this is a stable
-/// "same interpreter universe" test that doesn't depend on which frame a VM
-/// happens to be paused in. The `Env` struct itself is not a usable identity:
-/// module envs parent to a fresh `Rc` *clone* of the root
-/// (`create_module_env`), and per-form module VMs wrap further clones — all of
-/// which share the root's `bindings` Rc.
-fn env_root(env: &Rc<Env>) -> *const () {
-    let mut cur = env;
-    while let Some(parent) = &cur.parent {
-        cur = parent;
-    }
-    Rc::as_ptr(&cur.bindings) as *const ()
-}
-
 /// Cooperative continuation for a runtime-quantum multimethod call
 /// (`call_value`/`call_value_with`'s `call_non_native`, Step G): the selected
 /// method is driven as one `NativeOutcome::Call`, and this continuation just
@@ -675,60 +626,6 @@ impl NativeContinuation for MultimethodCallContinuation {
     }
 }
 
-/// Try to run `closure` on the live VM currently executing a native call on
-/// this thread. Returns `Some(result)` if a compatible VM was found and the
-/// closure was dispatched in-VM; `None` if no compatible VM is registered (the
-/// caller should fall back to a fresh VM).
-///
-/// "Compatible" means the closure belongs to the same interpreter universe as
-/// the VM (their env chains share a root). Per-frame state is NOT compared:
-/// the run loop re-points `self.globals`/`self.functions` at every frame
-/// activation from the frame's own closure (M1 + M4), so a same-interpreter
-/// closure from any module runs correctly as a nested frame. Running nested is
-/// not just an optimization — it keeps the closure graph's still-open upvalue
-/// cells connected to the stack that owns them. A fresh-VM fallback only
-/// snapshots the *dispatched* closure's cells; a closure it reaches
-/// transitively (via captured data or module state) would dereference open
-/// cells against the wrong stack — out-of-bounds at best, a silent wrong-slot
-/// read/write at worst.
-fn try_run_on_current_vm(
-    closure: &Rc<Closure>,
-    globals: &Rc<Env>,
-    args: &[Value],
-    ctx: &EvalContext,
-) -> Option<Result<Value, SemaError>> {
-    try_run_on_current_vm_args(closure, globals, CallArgs::Borrowed(args), ctx)
-}
-
-fn try_run_on_current_vm_args(
-    closure: &Rc<Closure>,
-    globals: &Rc<Env>,
-    args: CallArgs,
-    ctx: &EvalContext,
-) -> Option<Result<Value, SemaError>> {
-    let closure_root = env_root(globals);
-    // Snapshot the innermost compatible VM pointer, then release the borrow
-    // before re-entering the VM (the nested run may itself register a new
-    // current VM).
-    let vm_ptr = CURRENT_VM.with(|stack| {
-        let stack = stack.borrow();
-        stack.iter().rev().copied().find(|&ptr| {
-            // SAFETY: see CURRENT_VM docs — the pointer is valid while the
-            // native call that registered it is on the Rust stack, which is
-            // strictly the case here (we are inside that native call).
-            let vm = unsafe { &*ptr };
-            env_root(&vm.globals) == closure_root
-        })
-    })?;
-    // SAFETY: the owning VM is paused at the native call site that registered
-    // this pointer and does not touch `self` until the call returns. Args live
-    // in a buffer owned by the native caller (borrowed or handed over for
-    // moving out — see `CallArgs`), so there is no outstanding borrow of the
-    // VM's stack. The reference does not escape this call.
-    let vm = unsafe { &mut *vm_ptr };
-    Some(vm.run_nested_closure_args(closure.clone(), args, ctx))
-}
-
 /// Args handoff mode when pushing a callee frame from a native boundary:
 /// `Borrowed` clones each value into its local slot (the caller keeps its
 /// buffer intact); `Owned` moves each value out, leaving nil behind (the
@@ -755,23 +652,21 @@ impl CallArgs<'_> {
 /// moves, this lets a fold accumulator reach the stdlib's `strong_count == 1`
 /// in-place fast paths (`assoc` & co.) instead of deep-cloning per step.
 ///
-/// Mirrors the borrowed fallback wrapper built in `make_closure`
-/// decision-for-decision (async inline task → current-VM nested run → foreign
-/// fresh VM). Returns `None` when `func` is not a VM closure; the caller then
-/// falls back to the borrowed protocol.
+/// Mirrors the host-only borrowed fallback wrapper built in `make_closure`.
+/// Returns `None` when `func` is not a VM closure; the caller then falls back
+/// to the borrowed protocol.
 pub fn call_closure_owned(
     func: &Value,
     ctx: &EvalContext,
     args: &mut [Value],
 ) -> Option<Result<Value, SemaError>> {
     let (closure, functions, native_fns) = extract_vm_closure(func)?;
+    if let Err(error) = ensure_legacy_vm_entry_allowed(ctx) {
+        return Some(Err(error));
+    }
     // The top-level main closure never travels as a callback value; if it
     // somehow does (globals is None), let the generic borrowed path handle it.
     let globals = closure.globals.as_ref()?.clone();
-    if let Some(result) = try_run_on_current_vm_args(&closure, &globals, CallArgs::Owned(args), ctx)
-    {
-        return Some(result);
-    }
     // No authoritative owner is available in this fallback. Traverse values
     // that were already detached by the explicit caller; an Open cell is
     // rejected when the foreign VM tries to dereference it.
@@ -780,32 +675,7 @@ pub fn call_closure_owned(
     if let Err(e) = vm.setup_for_call_args(closure, CallArgs::Owned(args)) {
         return Some(Err(e));
     }
-    // TEMPORARY BRIDGE: a legacy user closure re-entered via `call_callback`
-    // runs SYNCHRONOUSLY on this fresh foreign VM (no yield/await/spawn), so it
-    // never touches the runtime scheduler. Suspend the quantum flag so the
-    // `run` entry guard doesn't reject this synchronous nested run during an
-    // active runtime quantum. Deleted with the Task 04 `NativeOutcome::Call`
-    // migration of legacy callback re-entry (see `suspend_runtime_quantum`).
-    let _q = ctx.suspend_runtime_quantum();
     Some(vm.run(ctx))
-}
-
-/// The home globals env of the VM currently executing a native call on this
-/// thread (the innermost `CURRENT_VM`), if any. A native invoked from a running
-/// VM uses this to act on the *current* environment — e.g. a nested `import`/
-/// `load` copies bindings into the executing module's env rather than a fixed
-/// global env (M4 nested-module isolation).
-///
-/// SAFETY: the top `CURRENT_VM` pointer is valid while the native call that
-/// registered it is on the Rust stack, which is exactly the case when this is
-/// called from inside that native. The VM is paused at the call site.
-pub fn current_vm_globals() -> Option<Rc<Env>> {
-    CURRENT_VM.with(|stack| {
-        stack
-            .borrow()
-            .last()
-            .map(|&ptr| unsafe { &*ptr }.globals.clone())
-    })
 }
 
 thread_local! {
@@ -816,12 +686,12 @@ thread_local! {
     /// carry a borrowed `&mut DebugState`; it consults this thread-local instead so
     /// task steps run in debug mode and a mid-task breakpoint can stop/resume.
     ///
-    /// SAFETY mirrors `CURRENT_VM`: each pointer is valid for as long as the
-    /// `execute_debug` frame that pushed it is on the Rust call stack. While that
-    /// frame is blocked inside a native call that re-enters the scheduler, the
-    /// `&mut DebugState` it owns is DORMANT (not otherwise touched) — the scheduler
-    /// reborrows it through this raw pointer for the duration of one task step and
-    /// drops the borrow before returning, so no two live `&mut` ever alias.
+    /// SAFETY: each pointer is valid for as long as the `execute_debug` frame that
+    /// pushed it is on the Rust call stack. While that frame is blocked inside a
+    /// native call that re-enters the scheduler, the `&mut DebugState` it owns is
+    /// DORMANT (not otherwise touched) — the scheduler reborrows it through this
+    /// raw pointer for the duration of one task step and drops the borrow before
+    /// returning, so no two live `&mut` ever alias.
     static ACTIVE_DEBUG: RefCell<Vec<ActiveDebugTarget>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -1813,7 +1683,6 @@ impl VM {
             native_fns: Rc::new(native_fns),
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
-            frame_floor: 0,
             gc_adopted_home: std::cell::RefCell::new(Weak::new()),
             instruction_budget: None,
             instructions_executed: 0,
@@ -1876,7 +1745,6 @@ impl VM {
             native_fns,
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
-            frame_floor: 0,
             gc_adopted_home: std::cell::RefCell::new(Weak::new()),
             instruction_budget: None,
             instructions_executed: 0,
@@ -1908,7 +1776,6 @@ impl VM {
             native_fns: Rc::new(native_fns),
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
-            frame_floor: 0,
             gc_adopted_home: std::cell::RefCell::new(Weak::new()),
             instruction_budget: None,
             instructions_executed: 0,
@@ -1960,7 +1827,6 @@ impl VM {
         self.native_fns = native_fns;
         self.debug_values.clear();
         self.next_debug_value_ref = DEBUG_VALUE_REF_BASE;
-        self.frame_floor = 0;
         *self.gc_adopted_home.borrow_mut() = Weak::new();
         self.instruction_budget = None;
         self.instructions_executed = 0;
@@ -1970,6 +1836,7 @@ impl VM {
     }
 
     pub fn execute(&mut self, closure: Rc<Closure>, ctx: &EvalContext) -> Result<Value, SemaError> {
+        ensure_legacy_vm_entry_allowed(ctx)?;
         self.ensure_cache_space(&closure.func);
         let base = self.stack.len();
         // Reserve space for locals
@@ -1982,18 +1849,6 @@ impl VM {
             base,
             open_upvalues: None,
         });
-        // TEMPORARY BRIDGE: `execute` is the SYNCHRONOUS whole-program entry —
-        // it is used both at the top level (no active quantum) and, crucially,
-        // for nested module-body evaluation (`eval_module_body_vm` /
-        // `eval_value_vm` for `import` / `load` / eval-callback re-entry) fired
-        // from a native running *inside* a root VM that holds an active runtime
-        // quantum. That nested run is synchronous (module bodies do not
-        // yield/await/spawn to the scheduler), so suspend the quantum flag for
-        // the duration of `run` so the entry guard doesn't reject it. At the top
-        // level there is no active quantum and this is a no-op. Deleted with the
-        // Task 04 migration of legacy synchronous re-entry to
-        // `NativeOutcome::Call` (see `EvalContext::suspend_runtime_quantum`).
-        let _q = ctx.suspend_runtime_quantum();
         self.run(ctx)
     }
 
@@ -2003,6 +1858,7 @@ impl VM {
         ctx: &EvalContext,
         debug: &mut crate::debug::DebugState,
     ) -> Result<Value, SemaError> {
+        ensure_legacy_vm_entry_allowed(ctx)?;
         self.ensure_cache_space(&closure.func);
         let base = self.stack.len();
         let n_locals = closure.func.chunk.n_locals as usize;
@@ -2252,9 +2108,7 @@ impl VM {
     }
 
     fn run(&mut self, ctx: &EvalContext) -> Result<Value, SemaError> {
-        if ctx.runtime_quantum_active() {
-            return Err(legacy_vm_entry_during_quantum_error());
-        }
+        ensure_legacy_vm_entry_allowed(ctx)?;
         match self.run_inner::<false>(ctx, None)? {
             crate::debug::VmExecResult::Finished(v) => Ok(v),
             crate::debug::VmExecResult::Stopped(_) | crate::debug::VmExecResult::Yielded => {
@@ -2266,103 +2120,6 @@ impl VM {
             crate::debug::VmExecResult::Pending(_) => Err(SemaError::eval(
                 "async yield outside of scheduler context".to_string(),
             )),
-        }
-    }
-
-    /// Run `closure` with `args` as a nested frame on this *live* VM and return
-    /// its result, leaving the parent frames and stack intact.
-    ///
-    /// This is the in-VM routing path for stdlib higher-order callbacks (C1).
-    /// Because the closure executes on the same VM, its open upvalue cells stay
-    /// connected to the parent frame's live stack slots, so `set!` inside the
-    /// callback propagates back to the caller — fixing the divergence where the
-    /// fresh-VM fallback mutated a detached closed snapshot.
-    ///
-    /// The dispatch loop is bounded by `frame_floor`: it returns as soon as the
-    /// frame it pushed (and any frames pushed beneath it) have returned, without
-    /// unwinding the caller's frames.
-    fn run_nested_closure_args(
-        &mut self,
-        closure: Rc<Closure>,
-        args: CallArgs,
-        ctx: &EvalContext,
-    ) -> Result<Value, SemaError> {
-        // TEMPORARY BRIDGE: this in-VM nested run is the synchronous
-        // legacy-callback re-entry path — it is reached only from the
-        // NON-async wrapper branches (both `make_closure`'s native wrapper and
-        // `call_closure_owned` route the async case to
-        // `run_closure_as_inline_task` *before* trying the current VM). The
-        // callback runs synchronously to completion here (a structural suspend
-        // below is treated as an unrecoverable error), so it never touches the
-        // runtime scheduler. Suspend the quantum flag for the nested run so the
-        // re-entry guard doesn't reject legacy user closures called across
-        // context boundaries during an active runtime quantum. Deleted with the
-        // Task 04 `NativeOutcome::Call` migration of legacy callback re-entry
-        // (see `EvalContext::suspend_runtime_quantum`).
-        let _q = ctx.suspend_runtime_quantum();
-        // Floor = the parent's current frame depth. After setup_for_call pushes
-        // the callee frame, the loop must stop unwinding once it pops back to
-        // this depth (rather than emptying the whole call stack).
-        let floor = self.frames.len();
-        let stack_floor = self.stack.len();
-        // The nested run's frame activations re-point `self.globals` /
-        // `self.functions` (M1 + M4) and nothing re-activates the paused
-        // caller's frame until it resumes. Save/restore them so the VM's live
-        // state stays coherent with the paused frame while the nested call is
-        // in progress and after control returns to the caller.
-        let saved_globals = self.globals.clone();
-        let saved_functions = self.functions.clone();
-        self.setup_for_call_args(closure, args)?;
-        let saved_floor = self.frame_floor;
-        self.frame_floor = floor;
-        // The nested run is synchronous and outside the parent runtime quantum's
-        // scheduling. Save and clear the quantum budget/cancellation so the
-        // nested callback does not consume the parent's instruction budget or
-        // observe its cancellation snapshot. Without this, a long callback would
-        // return `QuantumExpired`, which this synchronous path treats as
-        // unreachable.
-        let saved_budget = self.instruction_budget.take();
-        let saved_instructions = self.instructions_executed;
-        let saved_cancellation = std::mem::take(&mut self.quantum_cancellation);
-        // Each native→VM re-entry nests a fresh dispatch loop on the *Rust*
-        // stack; grow it on demand so deep re-entrant recursion hits the VM's
-        // catchable frame guard instead of overflowing the OS stack (SIGABRT).
-        let result = sema_core::stack::maybe_grow(|| self.run_inner::<false>(ctx, None));
-        self.instruction_budget = saved_budget;
-        self.instructions_executed = saved_instructions;
-        self.quantum_cancellation = saved_cancellation;
-        self.frame_floor = saved_floor;
-        self.globals = saved_globals;
-        self.functions = saved_functions;
-        match result {
-            Ok(crate::debug::VmExecResult::Finished(v)) => Ok(v),
-            Ok(crate::debug::VmExecResult::Stopped(_))
-            | Ok(crate::debug::VmExecResult::Yielded) => {
-                unreachable!("Stopped/Yielded without debug state")
-            }
-            Ok(crate::debug::VmExecResult::QuantumExpired { .. }) => {
-                unreachable!("nested synchronous execution does not install a runtime quantum")
-            }
-            Ok(crate::debug::VmExecResult::Pending(_)) => {
-                // Re-entrant HOF callbacks are synchronous; a suspension here
-                // cannot be resumed. Roll back the partial nested frames/stack so
-                // the parent VM stays consistent, then surface the same error the
-                // fresh-VM fallback would have produced.
-                self.frames.truncate(floor);
-                self.stack.truncate(stack_floor);
-                Err(SemaError::eval(
-                    "async yield outside of scheduler context".to_string(),
-                ))
-            }
-            Err(e) => {
-                // The error propagated past every handler in the nested frames
-                // without being caught. run_inner leaves those frames in place
-                // on error, so unwind them back to the parent's depth before
-                // returning so the parent VM can handle/propagate cleanly.
-                self.frames.truncate(floor);
-                self.stack.truncate(stack_floor);
-                Err(e)
-            }
         }
     }
 
@@ -2465,11 +2222,10 @@ impl VM {
     /// individual task-local operations, so re-entrant setup can access the same
     /// context without an invocation-wide `RefMut`.
     ///
-    /// The runtime ABI is spoken ONLY at the top of a live runtime quantum
-    /// (`runtime_quantum_active`). A nested synchronous re-entry (a module body
-    /// run via `execute`, or a legacy callback) suspends that flag precisely so
-    /// its natives take the value ABI and cannot install a second task-owned
-    /// runtime wait while the enclosing call is unresolved.
+    /// The runtime ABI is spoken only during a live runtime quantum. All
+    /// synchronous fresh-VM and callback adapters reject while that quantum is
+    /// active, so an unresolved task-owned wait cannot be bypassed by value-ABI
+    /// re-entry.
     fn dispatch_native(
         &mut self,
         func: &Rc<NativeFn>,
@@ -2486,7 +2242,6 @@ impl VM {
                     cancellation: self.quantum_cancellation.clone(),
                 };
                 let outcome = {
-                    let _vm_guard = CurrentVmGuard::enter(self);
                     snapshot_native_escaping_args(self, func, call_args);
                     func.invoke_runtime(&mut native_ctx, call_args)
                 }?;
@@ -2499,7 +2254,6 @@ impl VM {
         }
         let result = {
             let _call_env = ctx.scope_legacy_call_env(&self.globals);
-            let _vm_guard = CurrentVmGuard::enter(self);
             snapshot_escaping_args_with_owner(self, call_args);
             (func.func)(ctx, call_args)
         };
@@ -3458,10 +3212,7 @@ impl VM {
                         }
                         let frame = self.frames.pop().unwrap();
                         self.stack.truncate(frame.base);
-                        if self.frames.len() == self.frame_floor {
-                            // Either the top-level program finished (floor == 0)
-                            // or a re-entrant nested closure returned to its
-                            // native caller (floor raised by run_nested_closure).
+                        if self.frames.is_empty() {
                             return Ok(crate::debug::VmExecResult::Finished(result));
                         }
                         self.stack.push(result);
@@ -3494,19 +3245,15 @@ impl VM {
                             )));
                         }
 
-                        // C1: keep open upvalues open across the call so a
-                        // re-entrant in-VM HOF callback (routed via
-                        // try_run_on_current_vm) can write `set!` back through
-                        // them. Explicit-owner handoffs snapshot closures before
-                        // they cross onto a fresh callback or async task VM.
+                        // Keep open upvalues open across the call. Explicit-owner
+                        // handoffs snapshot closures before they cross onto a
+                        // fresh callback or async task VM.
                         let native = self.native_fns[native_id].clone();
                         let args_start = self.stack.len() - argc;
                         // Move args into an owned buffer and drop them from the
                         // stack before the call so no borrow of self.stack is held
-                        // while the native may re-enter this VM (run_nested_closure
-                        // needs &mut self via the CURRENT_VM pointer). SmallVec
-                        // keeps argc <= 8 off the heap; drain moves without
-                        // refcount traffic.
+                        // while the native runs. SmallVec keeps argc <= 8 off the
+                        // heap; drain moves without refcount traffic.
                         let call_args: SmallVec<[Value; 8]> =
                             self.stack.drain(args_start..).collect();
                         match self.dispatch_native(&native, &call_args, ctx) {
@@ -3525,13 +3272,10 @@ impl VM {
                                 handle_err!(self, fi, pc, err, saved_pc, 'dispatch);
                             }
                         }
-                        // The native completed on this frame (a re-entrant
-                        // callback ran nested — run_nested_closure floors at
-                        // this frame and restores globals/functions), so stay
-                        // in the inner loop instead of re-entering 'dispatch.
-                        // The length check guards the invariant; DEBUG
-                        // re-enters so stepping/breakpoint semantics are
-                        // unchanged.
+                        // The native completed on this frame, so stay in the
+                        // inner loop instead of re-entering 'dispatch. The
+                        // length check guards frame topology; DEBUG re-enters
+                        // so stepping/breakpoint semantics are unchanged.
                         if DEBUG || self.frames.len() != fi + 1 {
                             continue 'dispatch;
                         }
@@ -3939,14 +3683,12 @@ impl VM {
                                             self.frames[fi].pc = pc; // PC already past CALL_GLOBAL
                                             return Ok(signal.into_exec_result());
                                         }
-                                        // The native completed on this frame (a
-                                        // re-entrant callback ran nested —
-                                        // run_nested_closure floors at this frame
-                                        // and restores globals/functions), so stay
-                                        // in the inner loop instead of re-entering
-                                        // 'dispatch. The length check guards the
-                                        // invariant; DEBUG re-enters so stepping
-                                        // and breakpoint semantics are unchanged.
+                                        // The native completed on this frame, so
+                                        // stay in the inner loop instead of
+                                        // re-entering 'dispatch. The length check
+                                        // guards frame topology; DEBUG re-enters
+                                        // so stepping and breakpoint semantics are
+                                        // unchanged.
                                         if DEBUG || self.frames.len() != fi + 1 {
                                             continue 'dispatch;
                                         }
@@ -4387,11 +4129,9 @@ impl VM {
                 }
                 return self.call_vm_closure(closure, argc);
             }
-            // C1: keep open upvalues open across the call so a re-entrant
-            // in-VM HOF callback can write back through them. Move args into an
-            // owned buffer (releasing the stack borrow) so the native may
-            // re-enter this VM via run_nested_closure. Closures crossing onto a
-            // foreign stack are snapshotted at the crossing point.
+            // Keep open upvalues live across the native call so structural
+            // in-VM HOF callbacks can write back through them. Move args into
+            // an owned buffer to release the stack borrow during dispatch.
             let func_rc = self.stack[func_idx].as_native_fn_rc().unwrap();
             let call_args: SmallVec<[Value; 8]> = self.stack.drain(func_idx + 1..).collect();
             self.stack.pop(); // pop the native fn value
@@ -4416,11 +4156,9 @@ impl VM {
             self.stack.push(result);
             Ok(())
         } else {
-            // C1: keep upvalues open across the callback. The callback may
-            // re-enter this VM (e.g. a multimethod whose handler is a VM
-            // closure). Move args into an owned buffer so no stack borrow is
-            // held during the (possibly re-entrant) call. Closures crossing
-            // onto a foreign stack are snapshotted at the crossing point.
+            // Keep upvalues open across structural multimethod dispatch. Move
+            // args into an owned buffer so no stack borrow is held while the
+            // selected handler is invoked.
             let func_val = self.stack[func_idx].clone();
             let call_args: SmallVec<[Value; 8]> = self.stack.drain(func_idx + 1..).collect();
             self.stack.pop(); // pop the callable value
@@ -4449,11 +4187,16 @@ impl VM {
             ));
             return Ok(());
         }
+        if ctx.runtime_quantum_active() {
+            return Err(SemaError::eval(format!(
+                "not callable: {} ({})",
+                func_val,
+                func_val.type_name()
+            ))
+            .with_hint("expected a function, lambda, or keyword"));
+        }
         snapshot_escaping_call_with_owner(self, &func_val, &call_args);
-        let result = {
-            let _vm_guard = CurrentVmGuard::enter(self);
-            sema_core::call_callback(ctx, &func_val, &call_args)
-        };
+        let result = sema_core::call_callback(ctx, &func_val, &call_args);
         self.sync_tracked_upvalues_to_stack();
         let result = result?;
         self.stack.push(result);
@@ -4500,10 +4243,8 @@ impl VM {
         ctx: &EvalContext,
     ) -> Result<(), SemaError> {
         if func_val.raw_tag() == Some(TAG_NATIVE_FN) {
-            // C1: keep upvalues open; move args off the stack so the native may
-            // re-enter this VM via run_nested_closure without an outstanding
-            // stack borrow. Closures crossing onto a foreign stack are
-            // snapshotted there.
+            // Keep upvalues open and move args off the stack so native dispatch
+            // holds no outstanding stack borrow.
             let func_rc = func_val.as_native_fn_rc().unwrap();
             let args_start = self.stack.len() - argc;
             let call_args: SmallVec<[Value; 8]> = self.stack.drain(args_start..).collect();
@@ -4545,10 +4286,8 @@ impl VM {
         argc: usize,
         ctx: &EvalContext,
     ) -> Result<(), SemaError> {
-        // C1: keep upvalues open; move args off the stack so the native may
-        // re-enter this VM via run_nested_closure without an outstanding
-        // stack borrow. Closures crossing onto a foreign stack are
-        // snapshotted at the crossing point.
+        // Keep upvalues open and move args off the stack so native dispatch
+        // holds no outstanding stack borrow.
         let args_start = self.stack.len() - argc;
         let call_args: SmallVec<[Value; 8]> = self.stack.drain(args_start..).collect();
         let dispatch = self.dispatch_native(func, &call_args, ctx)?;
@@ -4977,29 +4716,13 @@ impl VM {
             name,
             payload as Rc<dyn std::any::Any>,
             move |ctx, args| {
+                ensure_legacy_vm_entry_allowed(ctx)?;
                 let closure = &payload_for_box.closure;
                 let functions = &payload_for_box.functions;
                 let globals = closure
                     .globals
                     .as_ref()
                     .expect("MakeClosure closures always carry Some(home)");
-
-                // Inside an async task, route through the scheduler so any
-                // yield in the inner closure (channel/send, channel/recv,
-                // await, sleep) suspends cleanly. Otherwise the inner VM's
-                // structural suspend would surface as "async yield outside of
-                // scheduler context" and crash the calling HOF.
-
-                // C1: if this closure belongs to a VM currently running a native
-                // call on this thread (e.g. a stdlib HOF like map/filter/foldl
-                // invoked us), run it as a nested frame on that *live* VM. This
-                // keeps the closure's open upvalue cells connected to the
-                // parent's stack slots so `set!` mutations flow back to the
-                // caller. Falls back to a fresh VM only when no compatible VM is
-                // on the stack.
-                if let Some(result) = try_run_on_current_vm(closure, globals, args, ctx) {
-                    return result;
-                }
 
                 // The explicit caller snapshots reachable Open cells before
                 // this ownerless foreign-VM fallback is entered.
@@ -5010,16 +4733,6 @@ impl VM {
                     payload_for_box.native_fns.clone(),
                 );
                 vm.setup_for_call(closure.clone(), args)?;
-                // TEMPORARY BRIDGE: a legacy user closure re-entered via
-                // `call_callback` (e.g. a global `define`d fn called from
-                // another VM context) runs SYNCHRONOUSLY on this fresh foreign
-                // VM — this non-async wrapper arm never yields/awaits/spawns,
-                // so it never touches the runtime scheduler. Suspend the quantum
-                // flag so the `run` entry guard doesn't reject this synchronous
-                // nested run during an active runtime quantum. Deleted with the
-                // Task 04 `NativeOutcome::Call` migration of legacy callback
-                // re-entry (see `suspend_runtime_quantum`).
-                let _q = ctx.suspend_runtime_quantum();
                 vm.run(ctx)
             },
         );
@@ -5127,11 +4840,8 @@ impl VM {
         err = err.with_stack_trace(trace);
 
         let mut pc_for_lookup = failing_pc as u32;
-        // Walk frames from top looking for a handler. Stop at `frame_floor`:
-        // during a re-entrant nested run (run_nested_closure) the frames below
-        // the floor belong to the parent VM execution, which must handle or
-        // propagate the error itself once control returns to it.
-        while self.frames.len() > self.frame_floor {
+        // Walk frames from top looking for a handler.
+        while !self.frames.is_empty() {
             let frame = self.frames.last().unwrap();
             let chunk = &frame.closure.func.chunk;
 
@@ -6568,15 +6278,13 @@ pub fn program_as_callable(prog: CompiledProgram, home: Rc<Env>) -> Result<Value
         "<eval-program>",
         payload as Rc<dyn std::any::Any>,
         move |ctx, args| {
+            ensure_legacy_vm_entry_allowed(ctx)?;
             let closure = &payload_for_box.closure;
             let functions = &payload_for_box.functions;
             let globals = closure
                 .globals
                 .as_ref()
                 .expect("program_as_callable closures always carry Some(home)");
-            if let Some(result) = try_run_on_current_vm(closure, globals, args, ctx) {
-                return result;
-            }
             close_closure_upvalues_for_foreign_run(closure);
             let mut vm = VM::new_with_rc_functions(
                 globals.clone(),
@@ -6584,7 +6292,6 @@ pub fn program_as_callable(prog: CompiledProgram, home: Rc<Env>) -> Result<Value
                 payload_for_box.native_fns.clone(),
             );
             vm.setup_for_call(closure.clone(), args)?;
-            let _q = ctx.suspend_runtime_quantum();
             vm.run(ctx)
         },
     );
@@ -6607,6 +6314,7 @@ mod tests {
     };
     use sema_core::{intern, MultiMethod, NativeFn};
     use std::any::Any;
+    use std::cell::Cell;
     use std::time::Duration;
 
     struct DebugIdentityContinuation;
@@ -6821,14 +6529,8 @@ mod tests {
         assert_eq!(suspended.frame_count(), 1);
     }
 
-    // TEMPORARY BRIDGE: a legacy user closure re-entered via the `call_value`
-    // callback during a runtime quantum runs SYNCHRONOUSLY on a fresh foreign
-    // VM (it cannot yield/await/spawn), carried by `suspend_runtime_quantum`.
-    // Before the bridge this rejected with the re-entry guard; the guard still
-    // protects genuine (non-suspended) fresh-VM entry via `VM::run`. Deleted
-    // with the Task 04 `NativeOutcome::Call` migration of legacy callbacks.
     #[test]
-    fn closure_fallback_runs_synchronously_during_runtime_quantum() {
+    fn closure_fallback_rejects_during_runtime_quantum_before_running_bytecode() {
         let globals = make_test_env();
         let calls = Rc::new(std::cell::Cell::new(0));
         let calls_for_native = Rc::clone(&calls);
@@ -6844,41 +6546,52 @@ mod tests {
         let native = callback.as_native_fn_ref().expect("VM closure wrapper");
         let _quantum = ctx.enter_runtime_quantum().unwrap();
 
-        let result = (native.func)(&ctx, &[]).expect("bridged sync run");
+        let error = (native.func)(&ctx, &[])
+            .expect_err("legacy closure fallback must not re-enter during a runtime quantum");
 
         assert_eq!(
             calls.get(),
-            1,
-            "callback bytecode must execute via the bridge"
+            0,
+            "rejection must happen before callback bytecode executes"
         );
-        assert_eq!(result, Value::int(9));
+        assert!(error
+            .to_string()
+            .contains("legacy native callback cannot re-enter a VM"));
         assert!(
             ctx.runtime_quantum_active(),
-            "quantum flag restored after the bridged sync run"
+            "rejection must leave the active quantum installed"
         );
     }
 
     #[test]
-    fn ownerless_escape_snapshot_does_not_consult_the_ambient_vm() {
-        let (mut owner, closure, cell) = open_upvalue_fixture(Value::int(7));
-        let _ambient = CurrentVmGuard::enter(&mut owner);
+    fn owned_closure_fallback_rejects_before_moving_arguments() {
+        let globals = make_test_env();
+        let ctx = EvalContext::new();
+        let callback = eval_str("(lambda (value) value)", &globals, &ctx).unwrap();
+        let mut args = [Value::int(42)];
+        let _quantum = ctx.enter_runtime_quantum().unwrap();
 
-        close_closure_upvalues_for_foreign_run(&closure);
+        let error = call_closure_owned(&callback, &ctx, &mut args)
+            .expect("value is a VM closure")
+            .expect_err("owned legacy fallback must reject active runtime re-entry");
 
-        assert!(
-            matches!(&*cell.state.borrow(), UpvalueState::Open { .. }),
-            "an ownerless snapshot must not discover an owner through CURRENT_VM"
+        assert!(error
+            .to_string()
+            .contains("legacy native callback cannot re-enter a VM"));
+        assert_eq!(
+            args[0],
+            Value::int(42),
+            "rejected owned calls must leave the caller's buffer intact"
         );
     }
 
     #[test]
     fn explicit_escape_owner_does_not_snapshot_a_colliding_interpreter() {
         let (mut first_owner, first_closure, first_cell) = open_upvalue_fixture(Value::int(11));
-        let (mut second_owner, second_closure, second_cell) = open_upvalue_fixture(Value::int(22));
+        let (second_owner, second_closure, second_cell) = open_upvalue_fixture(Value::int(22));
         let first = vm_closure_value(&first_owner, first_closure);
         let second = vm_closure_value(&second_owner, second_closure);
         let graph = Value::list(vec![first, second]);
-        let _foreign_ambient = CurrentVmGuard::enter(&mut second_owner);
 
         snapshot_escaping_call_with_owner(&mut first_owner, &graph, &[]);
 
@@ -6888,7 +6601,7 @@ mod tests {
         ));
         assert!(
             matches!(&*second_cell.state.borrow(), UpvalueState::Open { .. }),
-            "an explicit owner must not inspect a colliding ambient interpreter"
+            "an explicit owner must not inspect a colliding interpreter"
         );
     }
 
@@ -6923,13 +6636,8 @@ mod tests {
         );
     }
 
-    /// A synchronous in-VM callback re-entry (e.g. `http/serve` invoking its
-    /// request handler) must not inherit the parent runtime quantum's
-    /// instruction budget. The nested closure runs to completion synchronously;
-    /// if it consumed the parent's budget it could return `QuantumExpired`,
-    /// which `run_nested_closure_args` treats as unreachable.
     #[test]
-    fn nested_closure_callback_ignores_parent_instruction_budget() {
+    fn nested_legacy_callback_rejects_during_runtime_quantum() {
         let globals = make_test_env();
         let ctx = EvalContext::new();
         globals.set(
@@ -6956,18 +6664,72 @@ mod tests {
         )
         .unwrap();
         vm.setup_for_call(program.closure, &[]).unwrap();
+        let _quantum = ctx.enter_runtime_quantum().unwrap();
 
-        // Budget is large enough for the parent to reach the native call, but
-        // far smaller than the 100-iteration nested callback would consume if
-        // it inherited the parent's instruction budget.
         let quantum = vm.run_quantum(&ctx, 100, CancellationView::default());
+        let error = quantum
+            .outcome
+            .expect_err("legacy callback must not start a nested VM dispatch loop");
+
+        assert!(error
+            .to_string()
+            .contains("legacy native callback cannot re-enter a VM"));
+    }
+
+    #[test]
+    fn runtime_invalid_call_reports_not_callable_without_callback_fallback() {
+        let globals = make_test_env();
+        let ctx = EvalContext::new();
+        let forms = sema_reader::read_many("(42)").unwrap();
+        let program = compile_program(&forms, None).unwrap();
+        let mut vm = VM::new(
+            globals,
+            program.functions,
+            &program.native_table,
+            program.main_cache_slots,
+        )
+        .unwrap();
+        vm.setup_for_call(program.closure, &[]).unwrap();
+        let _quantum = ctx.enter_runtime_quantum().unwrap();
+
+        let error = vm
+            .run_quantum(&ctx, 100, CancellationView::default())
+            .outcome
+            .expect_err("a raw value is not callable");
+
         assert!(
-            matches!(
-                quantum.outcome.unwrap(),
-                crate::debug::VmExecResult::Finished(_)
-            ),
-            "nested callback must complete without exhausting the parent quantum"
+            error.to_string().contains("not callable: 42 (int)"),
+            "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn legacy_vm_bridge_symbols_are_absent_from_sources() {
+        let source = [include_str!("vm.rs"), include_str!("lib.rs")].concat();
+        let source_without_line_comments = source
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let forbidden = [
+            ["CURRENT", "_VM"].concat(),
+            ["Current", "VmGuard"].concat(),
+            ["try_run_on", "_current_vm"].concat(),
+            ["run_nested", "_closure_args"].concat(),
+            ["current_vm", "_globals"].concat(),
+            ["suspend_runtime", "_quantum"].concat(),
+            ["Quantum", "SuspendGuard"].concat(),
+            ["snapshot_escaping", "_closure"].concat(),
+            ["snapshot_escaping", "_value"].concat(),
+            ["snapshot_native_escaping_args", "_for_current_vm"].concat(),
+        ];
+
+        for symbol in forbidden {
+            assert!(
+                !source_without_line_comments.contains(&symbol),
+                "legacy bridge symbol remains in production source: {symbol}"
+            );
+        }
     }
 
     /// Convenience: compile and run a string expression in the VM.
@@ -7937,7 +7699,58 @@ mod tests {
     }
 
     #[test]
-    fn debug_evaluate_compiles_directly_without_the_eval_callback() {
+    fn execute_debug_rejects_same_and_cross_context_runtime_quantums_before_execution() {
+        for cross_context in [false, true] {
+            let globals = Rc::new(Env::new());
+            let calls = Rc::new(Cell::new(0));
+            let calls_for_native = Rc::clone(&calls);
+            globals.set(
+                intern("debug-entry-probe"),
+                Value::native_fn(NativeFn::simple("debug-entry-probe", move |_| {
+                    calls_for_native.set(calls_for_native.get() + 1);
+                    Ok(Value::nil())
+                })),
+            );
+            let forms =
+                sema_reader::read_many("(debug-entry-probe)").expect("fixture source parses");
+            let program = compile_program(&forms, None).expect("fixture source compiles");
+            let mut vm = VM::new(
+                globals,
+                program.functions,
+                &program.native_table,
+                program.main_cache_slots,
+            )
+            .expect("fixture VM constructs");
+            let callback_context = EvalContext::new();
+            let runtime_context = cross_context
+                .then(EvalContext::new)
+                .unwrap_or_else(EvalContext::new);
+            let _quantum = if cross_context {
+                runtime_context
+                    .enter_runtime_quantum()
+                    .expect("enter cross-context runtime quantum")
+            } else {
+                callback_context
+                    .enter_runtime_quantum()
+                    .expect("enter same-context runtime quantum")
+            };
+            let mut debug_state = crate::debug::DebugState::new_headless();
+
+            let error = vm
+                .execute_debug(program.closure, &callback_context, &mut debug_state)
+                .expect_err("debug VM entry must be host-only");
+
+            assert!(error
+                .to_string()
+                .contains("legacy native callback cannot re-enter a VM"));
+            assert_eq!(calls.get(), 0, "debug bytecode must not execute");
+            assert!(vm.frames.is_empty(), "guard must run before frame mutation");
+            assert!(vm.stack.is_empty(), "guard must run before stack mutation");
+        }
+    }
+
+    #[test]
+    fn debug_evaluate_compiles_directly() {
         let globals = make_test_env();
         let forms = sema_reader::read_many("nil").expect("fixture source parses");
         let program = compile_program(&forms, None).expect("fixture source compiles");
@@ -7950,9 +7763,6 @@ mod tests {
         .expect("fixture VM constructs");
         vm.seed_main_frame(program.closure);
         let ctx = EvalContext::new();
-        sema_core::set_eval_callback(&ctx, |_, _, _| {
-            Err(SemaError::eval("debug evaluation called the eval callback"))
-        });
         let expr = sema_reader::read("(+ 1 2)").expect("debug expression parses");
 
         let value = vm
@@ -7963,7 +7773,7 @@ mod tests {
     }
 
     #[test]
-    fn debug_evaluate_uses_the_registered_macro_expander_without_eval_callback() {
+    fn debug_evaluate_uses_the_registered_macro_expander() {
         let globals = make_test_env();
         let forms = sema_reader::read_many("nil").expect("fixture source parses");
         let program = compile_program(&forms, None).expect("fixture source compiles");
@@ -7976,9 +7786,6 @@ mod tests {
         .expect("fixture VM constructs");
         vm.seed_main_frame(program.closure);
         let ctx = EvalContext::new();
-        sema_core::set_eval_callback(&ctx, |_, _, _| {
-            Err(SemaError::eval("debug evaluation called the eval callback"))
-        });
         sema_core::set_macro_expand_callback(&ctx, debug_macro_probe);
         let expr = sema_reader::read("(debug-expand-value)").expect("debug expression parses");
 

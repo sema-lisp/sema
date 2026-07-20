@@ -3,7 +3,7 @@
 //! calls) parks/wakes through ONE pool instead of growing its own runtime.
 //!
 //! Sixth instance of the house type-erased-registration idiom (precedents:
-//! `set_eval_callback`, the otel task callbacks, the usage-scope callbacks,
+//! the macro-expansion callback, the otel task callbacks, the usage-scope callbacks,
 //! `set_blocking_sleep_callback`, `set_interrupt_callback`). Two deliberate
 //! divergences from those: the slot is a process-global `OnceLock` rather than a
 //! thread-local (the backend is reachable from pool threads and plain OS threads

@@ -1,0 +1,33 @@
+# token-id<TAB>exact-repository-path<TAB>exact-count<TAB>reason
+EVAL_CALLBACK	crates/sema-core/src/context.rs	4	host-only evaluator callback definition plus same-context/cross-context rejection and host compatibility tests
+EVAL_CALLBACK_FN	crates/sema-core/src/context.rs	3	public host-compatibility callback type, context slot, and setter signature
+EVAL_CALLBACK_FN	crates/sema-core/src/lib.rs	1	public re-export retained for embedding API compatibility
+EVAL_FN	crates/sema-core/src/context.rs	6	host-only evaluator callback slot initialization, registration, and guarded invocation
+SET_EVAL_CALLBACK	crates/sema-core/src/context.rs	4	host-only evaluator setter definition plus compatibility and rejection tests
+SET_EVAL_CALLBACK	crates/sema-eval/src/eval.rs	2	interpreter construction installs the host evaluator callback on each context
+SET_EVAL_CALLBACK	crates/sema-wasm/src/lib.rs	1	WASM interpreter construction installs the guarded host evaluator callback
+SET_EVAL_CALLBACK	crates/sema/src/lib.rs	1	embedding builder construction installs the guarded host evaluator callback
+CALL_CALLBACK	crates/sema-core/src/context.rs	5	host-only callback API definition/fallback plus in-file rejection and compatibility tests
+CALL_CALLBACK	crates/sema-core/src/value.rs	1	host-only multimethod dispatch selector; runtime dispatch is structural
+CALL_CALLBACK	crates/sema-eval/src/eval.rs	1	host-only legacy force callback; runtime force uses its structural continuation
+CALL_CALLBACK	crates/sema-llm/src/builtins.rs	15	plain-value LLM compatibility and synchronous tool-loop paths; runtime variants use traced structural continuations
+CALL_CALLBACK	crates/sema-stdlib/src/context.rs	1	plain-value context/with adapter; runtime invocation uses ContextWithContinuation
+CALL_CALLBACK	crates/sema-stdlib/src/io.rs	1	host-only file/for-each-line adapter; runtime file-line callbacks are structural
+CALL_CALLBACK	crates/sema-stdlib/src/list.rs	2	host-only plain-value HOF dispatch; runtime HOFs use structural callback continuations
+CALL_CALLBACK	crates/sema-stdlib/src/server.rs	6	non-quantum HTTP/SSE/WebSocket compatibility handlers; runtime handlers dispatch structurally
+CALL_CALLBACK	crates/sema-vm/src/vm.rs	1	host-only non-native callable fallback after an explicit active-quantum rejection
+CALL_CALLBACK_OWNED	crates/sema-core/src/context.rs	3	host-only owned callback API definition plus in-file rejection and compatibility tests
+CALL_CALLBACK_OWNED	crates/sema-stdlib/src/io.rs	2	host-only owned file-fold accumulators; runtime file folds use structural owned handoff
+CALL_CALLBACK_OWNED	crates/sema-stdlib/src/list.rs	1	host-only owned HOF dispatch; runtime folds use structural owned handoff
+SET_CALL_CALLBACK	crates/sema-core/src/context.rs	4	callback setter definition plus in-file host-guard tests
+SET_CALL_CALLBACK	crates/sema-eval/src/eval.rs	2	interpreter construction installs host compatibility callbacks on each evaluator context
+SET_CALL_CALLBACK	crates/sema-wasm/src/lib.rs	1	WASM interpreter construction installs the host compatibility callback
+SET_CALL_CALLBACK	crates/sema/src/lib.rs	1	embedding builder construction installs the host compatibility callback
+SET_CALL_OWNED_CALLBACK	crates/sema-core/src/context.rs	3	owned-callback setter definition plus in-file host-guard tests
+SET_CALL_OWNED_CALLBACK	crates/sema-eval/src/eval.rs	2	interpreter construction installs owned host compatibility callbacks
+SET_CALL_OWNED_CALLBACK	crates/sema-wasm/src/lib.rs	1	WASM interpreter construction installs the owned host compatibility callback
+SET_CALL_OWNED_CALLBACK	crates/sema/src/lib.rs	1	embedding builder construction installs the owned host compatibility callback
+WITH_STDLIB_CTX	crates/sema-core/src/context.rs	2	host-only shared-context definition plus its active-runtime rejection test
+WITH_STDLIB_CTX	crates/sema-llm/src/builtins.rs	2	host-only Lisp-provider trait and synchronous extraction-validation adapters
+WITH_STDLIB_CTX	crates/sema-stdlib/src/io.rs	3	host-only file-line callback adapters guarded away from runtime paths
+WITH_STDLIB_CTX	crates/sema-stdlib/src/list.rs	3	host-only plain-value HOF adapters; runtime HOFs dispatch structurally

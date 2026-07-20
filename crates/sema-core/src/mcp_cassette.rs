@@ -3,7 +3,7 @@
 //! dependency edge between the two crates.
 //!
 //! `sema-llm` owns the tape and installs the hook at interpreter init (a function
-//! pointer into its task-scoped cassette selection, like `set_eval_callback`);
+//! pointer into its task-scoped cassette selection, like other callback seams);
 //! `sema-mcp` consults the hook around each real `tools/call`. When no cassette
 //! is selected the hook returns no decision and calls pass straight through.
 

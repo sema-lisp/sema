@@ -38,14 +38,10 @@ pub fn create_module_env(env: &Env) -> Env {
 fn collect_native_names(env: &Env) -> HashSet<Spur> {
     // A "known native" tells the compiler it may emit a direct native-call for
     // that global. Prelude functions are VM closures *wrapped* in a `NativeFn`
-    // (a `VmClosurePayload`), so `is_native_fn()` is true for them too — but they
-    // must be CALLED IN-VM (as a bytecode frame), not through the `NativeFn`
-    // wrapper: the wrapper's synchronous nested-run path suspends the runtime
-    // quantum and turns any `async/spawn`/`await`/channel yield inside the
-    // closure into "async yield outside of scheduler context". Exclude VM
-    // closures so a call to a prelude function (e.g. the owned-concurrency
-    // helpers `__spawn-thunks`/`__owned-all`) dispatches through the ordinary
-    // VM-closure path, keeping its yields on the scheduler.
+    // (`VmClosurePayload`), so `is_native_fn()` is true for them too. They must
+    // remain ordinary in-VM bytecode calls: the wrapper is a guarded host-only
+    // compatibility adapter and cannot synchronously re-enter during a runtime
+    // quantum.
     env.all_names()
         .into_iter()
         .filter(|&spur| {
@@ -220,7 +216,7 @@ impl Interpreter {
     fn new_parts() -> (Rc<Env>, Rc<EvalContext>) {
         let env = Env::new();
         let ctx = EvalContext::new();
-        // Register eval/call callbacks so stdlib can invoke the real evaluator
+        // Register host-compatibility callbacks for direct embedding calls.
         sema_core::set_eval_callback(&ctx, eval_value_vm);
         sema_core::set_call_callback(&ctx, call_value);
         sema_core::set_call_owned_callback(&ctx, call_value_owned);
@@ -4976,11 +4972,8 @@ mod runtime_eval_tests {
         assert_eq!(result, Value::int(42));
     }
 
-    // A legacy user closure (`double`, defined via `eval_str`) called from a
-    // runtime quantum re-enters through the `call_value` callback onto a fresh
-    // foreign VM. That synchronous nested run is carried by the TEMPORARY
-    // `suspend_runtime_quantum` bridge until the Task 04 `NativeOutcome::Call`
-    // migration makes legacy callback re-entry scheduler-native.
+    // A user closure defined through the host API remains visible when a later
+    // expression is submitted through the runtime against the same globals.
     #[test]
     fn eval_via_runtime_shares_interpreter_globals() {
         let interp = Interpreter::new();

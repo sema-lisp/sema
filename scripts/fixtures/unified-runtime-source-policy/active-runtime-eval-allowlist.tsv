@@ -1,0 +1,2 @@
+# token-id<TAB>exact-repository-path<TAB>exact-count<TAB>reason
+EVAL_CALLBACK	scripts/fixtures/unified-runtime-source-policy/active-runtime-eval-callback.rs	1	mutation fixture is allowlisted so the thread active-runtime rule supplies the failure tooth

@@ -318,7 +318,7 @@ pub enum GcEdge<'a> {
     },
 }
 
-/// Registered by sema-vm at startup (same pattern as `set_eval_callback`,
+/// Registered by sema-vm at startup (the standard function-pointer seam,
 /// keeping sema-core independent of sema-vm). Reports **all** heap edges
 /// owned by the whole `NativeFn` — its payload `Rc`s *including the payload
 /// allocation itself* (as an [`GcEdge::Opaque`], with the exact number of

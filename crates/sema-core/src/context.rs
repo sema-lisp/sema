@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
-use std::time::Instant;
+
+use web_time::Instant;
 
 use crate::runtime::{
     apply_dynamic_mutations, DynamicStackIdentities, DynamicTaskState, ModuleTaskState,
@@ -355,10 +356,9 @@ impl EvalContext {
                 "internal error: runtime VM quantum is already active",
             ));
         }
-        // Mirror the per-ctx flag into a thread-local so ctx-less yielding
-        // natives (e.g. `async/sleep`, registered via the value-only ABI) can
-        // detect that they run under the unified runtime and should surface a
-        // yield the runtime will turn into a native wait.
+        // Mirror the per-context flag into a thread-local so context-free
+        // host-adapter guards reject synchronous or blocking entry during any
+        // active runtime quantum, including one owned by a different context.
         let previous_thread_local = crate::in_runtime_quantum();
         crate::set_runtime_quantum(true);
         Ok(RuntimeQuantumGuard {
@@ -369,39 +369,6 @@ impl EvalContext {
 
     pub fn runtime_quantum_active(&self) -> bool {
         self.runtime_quantum_active.get()
-    }
-
-    /// TEMPORARY BRIDGE — suspend the "runtime quantum active" flag for the
-    /// lifetime of the returned guard, restoring the previous value on `Drop`.
-    ///
-    /// The unified cooperative runtime forbids entering a *fresh* VM while a
-    /// runtime quantum is active (that would re-enter the scheduler off-plan).
-    /// But legacy user closures that cross context boundaries are still
-    /// dispatched through `sema_core::call_callback`, which runs them on a fresh
-    /// foreign VM. Those foreign-run helpers are contractually
-    /// SYNCHRONOUS-ONLY (their callback must not yield/await/spawn), so the
-    /// nested VM never touches the runtime scheduler — it is safe to run it with
-    /// the quantum flag suspended.
-    ///
-    /// This is a one-way bridge that merely carries current language behavior.
-    /// It MUST be deleted together with the Task 04 `NativeOutcome::Call`
-    /// migration of legacy callback re-entry, which replaces fresh-VM re-entry
-    /// with a scheduler-native call and removes the need to suspend the flag.
-    pub fn suspend_runtime_quantum(&self) -> QuantumSuspendGuard<'_> {
-        // Suspend BOTH flags `enter_runtime_quantum` set: the per-ctx flag (read
-        // by the VM `run` entry guard) AND the thread-local mirror (read by
-        // ctx-less yielding natives via `in_runtime_quantum` — `async/sleep`,
-        // `mcp/call`, the channel ops). A synchronous nested re-entry must see a
-        // FULLY suspended quantum: if only the ctx flag were cleared, a yielding
-        // native running on the nested VM would still observe the thread-local as
-        // active, surface a runtime yield, and crash the synchronous run with
-        // "async yield outside of scheduler context".
-        QuantumSuspendGuard {
-            ctx: self,
-            previous_ctx: self.runtime_quantum_active.replace(false),
-            previous_thread_local: crate::in_runtime_quantum(),
-        }
-        .with_thread_local_suspended()
     }
 
     pub fn take_task_context(&self) -> Option<TaskContextHandle> {
@@ -923,29 +890,6 @@ impl Drop for RuntimeQuantumGuard<'_> {
     }
 }
 
-/// Guard returned by [`EvalContext::suspend_runtime_quantum`]. TEMPORARY bridge
-/// — restores the prior `runtime_quantum_active` value on `Drop`. Deleted with
-/// the Task 04 `NativeOutcome::Call` migration (see `suspend_runtime_quantum`).
-pub struct QuantumSuspendGuard<'a> {
-    ctx: &'a EvalContext,
-    previous_ctx: bool,
-    previous_thread_local: bool,
-}
-
-impl QuantumSuspendGuard<'_> {
-    fn with_thread_local_suspended(self) -> Self {
-        crate::set_runtime_quantum(false);
-        self
-    }
-}
-
-impl Drop for QuantumSuspendGuard<'_> {
-    fn drop(&mut self) {
-        self.ctx.runtime_quantum_active.set(self.previous_ctx);
-        crate::set_runtime_quantum(self.previous_thread_local);
-    }
-}
-
 impl Default for EvalContext {
     fn default() -> Self {
         Self::new()
@@ -955,6 +899,7 @@ impl Default for EvalContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::BTreeMap;
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::path::PathBuf;
@@ -1282,6 +1227,159 @@ mod tests {
         assert!(!crate::in_runtime_quantum());
     }
 
+    thread_local! {
+        static EVAL_CALLS: Cell<usize> = const { Cell::new(0) };
+        static BORROWED_CALLS: Cell<usize> = const { Cell::new(0) };
+        static OWNED_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn eval_probe(
+        _context: &EvalContext,
+        expression: &Value,
+        _environment: &Env,
+    ) -> Result<Value, SemaError> {
+        EVAL_CALLS.set(EVAL_CALLS.get() + 1);
+        Ok(expression.clone())
+    }
+
+    fn borrowed_call_probe(
+        _context: &EvalContext,
+        _function: &Value,
+        args: &[Value],
+    ) -> Result<Value, SemaError> {
+        BORROWED_CALLS.set(BORROWED_CALLS.get() + 1);
+        Ok(args.first().cloned().unwrap_or_else(Value::nil))
+    }
+
+    fn owned_call_probe(
+        _context: &EvalContext,
+        _function: &Value,
+        args: &mut [Value],
+    ) -> Result<Value, SemaError> {
+        OWNED_CALLS.set(OWNED_CALLS.get() + 1);
+        Ok(args
+            .first_mut()
+            .map_or_else(Value::nil, |value| std::mem::replace(value, Value::nil())))
+    }
+
+    #[test]
+    fn call_callbacks_remain_available_to_host_code() {
+        BORROWED_CALLS.set(0);
+        OWNED_CALLS.set(0);
+        let context = EvalContext::new();
+        set_call_callback(&context, borrowed_call_probe);
+        set_call_owned_callback(&context, owned_call_probe);
+        let function = Value::int(1);
+
+        assert_eq!(
+            call_callback(&context, &function, &[Value::int(21)]).expect("borrowed host call"),
+            Value::int(21)
+        );
+        let mut owned_args = [Value::int(22)];
+        assert_eq!(
+            call_callback_owned(&context, &function, &mut owned_args).expect("owned host call"),
+            Value::int(22)
+        );
+        assert_eq!(owned_args, [Value::nil()]);
+        assert_eq!(BORROWED_CALLS.get(), 1);
+        assert_eq!(OWNED_CALLS.get(), 1);
+    }
+
+    #[test]
+    fn eval_callback_remains_available_to_host_code() {
+        EVAL_CALLS.set(0);
+        let context = EvalContext::new();
+        let environment = Env::new();
+        set_eval_callback(&context, eval_probe);
+
+        assert_eq!(
+            eval_callback(&context, &Value::int(23), &environment).expect("host evaluation"),
+            Value::int(23)
+        );
+        assert_eq!(EVAL_CALLS.get(), 1);
+    }
+
+    #[test]
+    fn eval_callback_rejects_same_and_cross_context_runtime_quantums() {
+        EVAL_CALLS.set(0);
+        let runtime_context = EvalContext::new();
+        let callback_context = EvalContext::new();
+        let environment = Env::new();
+        set_eval_callback(&runtime_context, eval_probe);
+        set_eval_callback(&callback_context, eval_probe);
+
+        let quantum = runtime_context
+            .enter_runtime_quantum()
+            .expect("enter runtime quantum");
+        let same_context = eval_callback(&runtime_context, &Value::int(1), &environment)
+            .expect_err("same-context runtime evaluation must be rejected");
+        let cross_context = eval_callback(&callback_context, &Value::int(2), &environment)
+            .expect_err("cross-context runtime evaluation must be rejected");
+        drop(quantum);
+
+        assert!(same_context.to_string().contains("host-only"));
+        assert!(cross_context.to_string().contains("host-only"));
+        assert_eq!(EVAL_CALLS.get(), 0);
+    }
+
+    #[test]
+    fn call_callbacks_reject_an_active_runtime_quantum_before_invocation() {
+        BORROWED_CALLS.set(0);
+        OWNED_CALLS.set(0);
+        let context = EvalContext::new();
+        set_call_callback(&context, borrowed_call_probe);
+        set_call_owned_callback(&context, owned_call_probe);
+        let function = Value::int(1);
+        let mut owned_args = [Value::int(22)];
+        let _quantum = context
+            .enter_runtime_quantum()
+            .expect("enter runtime quantum");
+
+        let borrowed_error = call_callback(&context, &function, &[Value::int(21)])
+            .expect_err("borrowed callback must be host-only");
+        let owned_error = call_callback_owned(&context, &function, &mut owned_args)
+            .expect_err("owned callback must be host-only");
+
+        assert!(borrowed_error.to_string().contains("host-only"));
+        assert!(owned_error.to_string().contains("host-only"));
+        assert_eq!(owned_args, [Value::int(22)]);
+        assert_eq!(BORROWED_CALLS.get(), 0);
+        assert_eq!(OWNED_CALLS.get(), 0);
+    }
+
+    #[test]
+    fn call_callback_rejects_another_context_during_a_thread_runtime_quantum() {
+        BORROWED_CALLS.set(0);
+        let runtime_context = EvalContext::new();
+        let callback_context = EvalContext::new();
+        set_call_callback(&callback_context, borrowed_call_probe);
+        let _quantum = runtime_context
+            .enter_runtime_quantum()
+            .expect("enter runtime quantum");
+
+        let error = call_callback(&callback_context, &Value::int(1), &[])
+            .expect_err("thread-local runtime quantum must reject ambient callbacks");
+
+        assert!(error.to_string().contains("host-only"));
+        assert_eq!(BORROWED_CALLS.get(), 0);
+    }
+
+    #[test]
+    fn stdlib_context_rejects_an_active_runtime_quantum_before_invocation() {
+        let runtime_context = EvalContext::new();
+        let invoked = Cell::new(false);
+        let _quantum = runtime_context
+            .enter_runtime_quantum()
+            .expect("enter runtime quantum");
+
+        let rejected = catch_unwind(AssertUnwindSafe(|| {
+            with_stdlib_ctx(|_| invoked.set(true));
+        }));
+
+        assert!(rejected.is_err(), "stdlib context must be host-only");
+        assert!(!invoked.get(), "stdlib closure must not be invoked");
+    }
+
     struct TestTaskLocal(u32);
 
     impl crate::runtime::Trace for TestTaskLocal {
@@ -1543,17 +1641,23 @@ thread_local! {
 }
 
 /// Get a reference to the shared stdlib EvalContext.
-/// Use this for stdlib callback invocations instead of creating throwaway contexts.
+/// Use this for host-side stdlib callback invocations instead of creating
+/// throwaway contexts. Panics before invoking `f` during a runtime quantum.
 pub fn with_stdlib_ctx<F, R>(f: F) -> R
 where
     F: FnOnce(&EvalContext) -> R,
 {
-    STDLIB_CTX.with(f)
+    STDLIB_CTX.with(|context| {
+        assert!(
+            !context.runtime_quantum_active() && !crate::in_runtime_quantum(),
+            "with_stdlib_ctx is a host-only adapter; runtime code must carry its EvalContext explicitly"
+        );
+        f(context)
+    })
 }
 
-/// Register the full evaluator callback. Called by `sema-eval` during interpreter init.
-/// Stores into both `ctx` and the shared `STDLIB_CTX` so that stdlib simple-fn closures
-/// (which lack a ctx parameter) can still invoke the evaluator.
+/// Register the full evaluator callback for host compatibility.
+/// Stores it on both `ctx` and the shared host-only `STDLIB_CTX`.
 pub fn set_eval_callback(ctx: &EvalContext, f: EvalCallbackFn) {
     ctx.eval_fn.set(Some(f));
     STDLIB_CTX.with(|stdlib| stdlib.eval_fn.set(Some(f)));
@@ -1592,9 +1696,10 @@ pub fn set_call_callback(ctx: &EvalContext, f: CallCallbackFn) {
     STDLIB_CTX.with(|stdlib| stdlib.call_fn.set(Some(f)));
 }
 
-/// Evaluate an expression using the registered evaluator.
-/// Returns an error if no evaluator has been registered.
+/// Evaluate an expression using the registered host-compatibility evaluator.
+/// Runtime code must use the restricted structural evaluator instead.
 pub fn eval_callback(ctx: &EvalContext, expr: &Value, env: &Env) -> Result<Value, SemaError> {
+    reject_callback_during_runtime_quantum(ctx, "eval")?;
     let f = ctx.eval_fn.get().ok_or_else(|| {
         SemaError::eval("eval callback not registered — Interpreter::new() must be called first")
     })?;
@@ -1604,6 +1709,7 @@ pub fn eval_callback(ctx: &EvalContext, expr: &Value, env: &Env) -> Result<Value
 /// Call a function value with arguments using the registered callback.
 /// Returns an error if no callback has been registered.
 pub fn call_callback(ctx: &EvalContext, func: &Value, args: &[Value]) -> Result<Value, SemaError> {
+    reject_callback_during_runtime_quantum(ctx, "call")?;
     let f = ctx.call_fn.get().ok_or_else(|| {
         SemaError::eval("call callback not registered — Interpreter::new() must be called first")
     })?;
@@ -1629,8 +1735,21 @@ pub fn call_callback_owned(
     func: &Value,
     args: &mut [Value],
 ) -> Result<Value, SemaError> {
+    reject_callback_during_runtime_quantum(ctx, "call")?;
     if let Some(f) = ctx.call_owned_fn.get() {
         return f(ctx, func, args);
     }
     call_callback(ctx, func, args)
+}
+
+fn reject_callback_during_runtime_quantum(
+    ctx: &EvalContext,
+    adapter: &str,
+) -> Result<(), SemaError> {
+    if ctx.runtime_quantum_active() || crate::in_runtime_quantum() {
+        return Err(SemaError::eval(format!(
+            "internal error: {adapter} callback is a host-only adapter; runtime code must use structural evaluation"
+        )));
+    }
+    Ok(())
 }

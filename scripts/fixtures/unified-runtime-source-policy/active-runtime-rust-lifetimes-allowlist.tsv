@@ -1,0 +1,2 @@
+# token-id<TAB>exact-repository-path<TAB>exact-count<TAB>reason
+CALL_CALLBACK	scripts/fixtures/unified-runtime-source-policy/active-runtime-rust-lifetimes.rs	1	Rust lifetimes must remain visible while char literals are masked

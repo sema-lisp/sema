@@ -16,9 +16,20 @@ const HTTP_COMPLETION_KIND: u64 = 0x6874_7470; // "http"
 static HTTP_SHARED_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
 
 /// Get (initializing on first use) the process-wide shared client.
+///
+/// Built through [`sema_llm::http::proxy_env_client_builder`] so the first build
+/// in a process does not perform reqwest's slow synchronous system-proxy lookup
+/// on the VM thread (see that function's docs); env-var proxies are still
+/// honored. Falls back to the plain client only if the configured build fails.
 #[cfg(not(target_arch = "wasm32"))]
 fn http_shared_client() -> reqwest::Client {
-    HTTP_SHARED_CLIENT.get_or_init(reqwest::Client::new).clone()
+    HTTP_SHARED_CLIENT
+        .get_or_init(|| {
+            sema_llm::http::proxy_env_client_builder()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
 }
 
 /// A decoded response body: text by default, or raw bytes when the caller asks

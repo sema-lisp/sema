@@ -5,10 +5,56 @@ use crate::types::LlmError;
 /// Default HTTP request timeout for LLM providers (2 minutes).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// A `reqwest::ClientBuilder` that honors the standard proxy environment
+/// variables but does NOT run reqwest's automatic *system* proxy detection.
+///
+/// reqwest's default auto-detection reads the OS proxy configuration; on macOS
+/// (and Windows) that is a synchronous `SCDynamicStore`/registry lookup that
+/// blocks the calling thread for ~2 s the first time a client is built in a
+/// process. In the cooperative unified runtime that first `Client` build runs on
+/// the VM thread inside a drive quantum (e.g. the first `http/get` or the first
+/// `llm/*` call), so it stalls the whole scheduler — and everything parked on it,
+/// including a sibling task's `async/sleep`+`async/cancel` — for the duration.
+/// That is a "no blocking work on the VM thread inside a quantum" violation and
+/// it makes prompt cancellation impossible until the lookup finishes.
+///
+/// `.no_proxy()` disables that lookup; the portable `*_PROXY`/`NO_PROXY`
+/// environment proxies (what CI, containers, and most proxied users actually
+/// rely on) are re-added explicitly — reqwest reads those instantly on every
+/// platform. Specific `HTTPS_PROXY`/`HTTP_PROXY` are added before `ALL_PROXY` so
+/// they take precedence, matching reqwest's documented ordering.
+pub fn proxy_env_client_builder() -> reqwest::ClientBuilder {
+    let mut builder = reqwest::Client::builder().no_proxy();
+    let no_proxy = reqwest::NoProxy::from_env();
+    let pick = |names: &[&str]| -> Option<String> {
+        names
+            .iter()
+            .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+    };
+    // Order matters: reqwest uses the first proxy whose scheme matches the
+    // request, so the scheme-specific entries must precede the catch-all.
+    if let Some(url) = pick(&["HTTPS_PROXY", "https_proxy"]) {
+        if let Ok(proxy) = reqwest::Proxy::https(url.as_str()) {
+            builder = builder.proxy(proxy.no_proxy(no_proxy.clone()));
+        }
+    }
+    if let Some(url) = pick(&["HTTP_PROXY", "http_proxy"]) {
+        if let Ok(proxy) = reqwest::Proxy::http(url.as_str()) {
+            builder = builder.proxy(proxy.no_proxy(no_proxy.clone()));
+        }
+    }
+    if let Some(url) = pick(&["ALL_PROXY", "all_proxy"]) {
+        if let Ok(proxy) = reqwest::Proxy::all(url.as_str()) {
+            builder = builder.proxy(proxy.no_proxy(no_proxy.clone()));
+        }
+    }
+    builder
+}
+
 /// Create a new HTTP client with the given optional timeout.
 /// Falls back to [`DEFAULT_TIMEOUT`] if `None`.
 pub fn create_client(timeout: Option<Duration>) -> Result<reqwest::Client, LlmError> {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = proxy_env_client_builder();
     if let Some(t) = timeout.or(Some(DEFAULT_TIMEOUT)) {
         builder = builder.timeout(t);
     }

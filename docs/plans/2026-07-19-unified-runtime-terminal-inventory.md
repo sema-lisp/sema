@@ -1,6 +1,6 @@
 # Unified Runtime Terminal Inventory
 
-**Status:** In progress 2026-07-19
+**Status:** In progress; independently re-audited 2026-07-20
 
 ## Goal
 
@@ -10,7 +10,7 @@ checker green. A row reaches `MIGRATED`, `REMOVED`, or `SYNCHRONOUS-PROOF` only
 after its implementation, cancellation/ownership contract, regression, and
 source guard agree.
 
-The post-finish audit classified 109 of 132 rows as already terminal and found
+The initial post-finish audit classified 109 of 132 rows as terminal and found
 23 blockers:
 
 - `F08B F09A F09B F10 F14 F21A F29 F32 F35A F35B`
@@ -18,6 +18,17 @@ The post-finish audit classified 109 of 132 rows as already terminal and found
 - `C07C C07D C10`
 - `H10B H10C H13`
 - `V02 V05 V06 V09`
+
+Tasks 1–7 closed those originally listed mechanisms, including the restricted
+VM bridge deletion at `c0e9a2c9`. A fresh row-by-row audit then found that the
+original count had missed 26 nonterminal resource/context rows:
+
+- resource: `R02 R03 R05 R06 R08B R08C R09A R09B R10 R13 R14 R16A R16B R17A R19 R21`
+- context: `C04 C05 C06 C07A C07D C08 C09 C10 C12 C14`
+
+Do not bulk-stamp the ledger from the earlier 109/23 estimate. These rows need
+implementation or an explicit split before the inventory and source mapping are
+reconciled.
 
 ## Constraints
 
@@ -168,6 +179,34 @@ Then:
 5. run the full finish-remediation release gate and independent reviews.
 
 Rows closed: `V06` and the final evidence rows.
+
+## Task 8: Close missed resource bounds and cancellation gaps
+
+- Make stdin/terminal reads structural and cancellable in a runtime quantum.
+- Give archive, patch/file, PDF, KV persistence, SQLite result collection, and
+  sync-only provider quarantine paths finite pre-dispatch work/input/output
+  bounds. A cleanup expiry is not an operation deadline.
+- Add real abort/close wake paths for checked-out stream, KV, serial, and SQLite
+  operations, or narrow and split rows that remain best-effort quarantine.
+- Make watcher and spinner lifecycles interpreter/resource-owned with bounded
+  shutdown. Add git process-group cancellation evidence.
+- Bound or deliberately split synchronous secret, crypto, CSV, and markup CPU
+  work.
+
+Rows: `R02 R03 R05 R06 R08B R08C R09A R09B R10 R13 R14 R16A R16B R17A R19 R21`.
+
+## Task 9: Close missed context-isolation and active-I/O gaps
+
+- Make MCP sandbox authority evaluator-specific.
+- Split root-tagged output capture from arbitrary fallback host hooks and guard
+  the latter against runtime re-entry/blocking.
+- Move OTel file export and LLM cache/cassette disk I/O out of active quantums.
+- Capture fallback/rate/retry configuration and last-usage state in task scope.
+- Isolate concurrent workflow scope instead of leaving one ambient workflow
+  installed across suspension.
+- Re-audit registry shutdown only after the corresponding resource rows close.
+
+Rows: `C04 C05 C06 C07A C07D C08 C09 C10 C12 C14`.
 
 ## Final gate
 

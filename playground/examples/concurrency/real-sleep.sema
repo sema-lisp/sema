@@ -7,9 +7,9 @@
 ;; the sleeps really happen instead of completing instantly. Hit Stop to
 ;; cancel mid-nap.
 ;;
-;; (On native this is real time too. On the main thread — e.g. with ?no-worker
-;; — it falls back to an instant virtual clock — ordering is preserved,
-;; durations just don't really wait.)
+;; (On native this is real time too. With ?no-worker the Promise runtime keeps
+;; the real timing, but CPU-bound Sema work shares the browser UI thread and
+;; the running evaluation cannot be cancelled from the Run button.)
 
 (println "Taking 10 naps, each a random 1–3 seconds. Watch them land live...")
 (println "")

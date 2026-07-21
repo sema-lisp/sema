@@ -79,10 +79,14 @@ self.onmessage = async (e) => {
     }
   } catch (err) {
     const message = (err && err.message) ? err.message : String(err);
-    self.postMessage({
-      type: 'result',
-      id: msg && msg.id,
-      result: { value: null, output: [], error: message },
-    });
+    if (msg && msg.type === 'init') {
+      self.postMessage({ type: 'init_error', error: message });
+    } else {
+      self.postMessage({
+        type: 'result',
+        id: msg && msg.id,
+        result: { value: null, output: [], error: message },
+      });
+    }
   }
 };

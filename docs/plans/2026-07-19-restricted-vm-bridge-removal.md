@@ -1,6 +1,6 @@
 # Restricted VM Bridge Removal
 
-**Status:** Approved for implementation 2026-07-19
+**Status:** Complete 2026-07-20 (`c0e9a2c9`)
 
 ## Goal
 
@@ -137,3 +137,23 @@ scripts/check-unified-runtime-inventory.sh --check
 
 Finish with the repository-wide release gate from
 `2026-07-19-unified-runtime-terminal-inventory.md`.
+
+## Result
+
+Tasks 1–7 landed. Runtime-native calls carry explicit task context, call
+environment, and escape ownership. Procedural macros and debugger expressions
+use the bounded restricted driver. The ambient current-VM pointer stack,
+nested VM runner, runtime-quantum suspension guard, and ambient snapshot helpers
+are deleted.
+
+The public eval/call callbacks remain guarded host-compatibility adapters, as
+required by Task 7. Same-context and cross-context active runtime quantums are
+rejected before callback invocation or VM mutation. A comment-stripped source
+policy enforces exact path/count allowlists and rejects active-runtime callback
+branches, including multiline, nested, per-context, and compound-condition
+mutations.
+
+Verification at completion: 1,194 core/VM/evaluator tests, 177 async/DAP tests,
+344 stdlib/LLM/DAP tests, strict native Clippy, wasm32 `sema-wasm` check, and
+the source-policy fixture/production scans. Independent adversarial re-review
+reported no Critical or Important findings.

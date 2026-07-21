@@ -1,5 +1,4 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://sema-lang.com/sitemap.xml
 Agentmap: https://sema-lang.com/.well-known/ai-catalog.json

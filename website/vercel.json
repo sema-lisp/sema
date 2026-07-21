@@ -4,6 +4,15 @@
   "installCommand": "npm install",
   "framework": null,
   "cleanUrls": true,
+  "headers": [
+    {
+      "source": "/.well-known/ai-catalog.json",
+      "headers": [
+        { "key": "Access-Control-Allow-Origin", "value": "*" },
+        { "key": "Cache-Control", "value": "public, max-age=300, s-maxage=3600" }
+      ]
+    }
+  ],
   "redirects": [
     {
       "source": "/install.sh",

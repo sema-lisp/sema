@@ -2491,7 +2491,9 @@ impl Runtime {
         quantum: VmQuantumResult,
     ) -> TaskAction {
         match quantum.outcome {
-            Ok(VmExecResult::QuantumExpired { .. }) => {
+            // Both runtime-quantum and cooperative-debugger budget exhaustion
+            // preserve the VM and reschedule the task from the same frame.
+            Ok(VmExecResult::QuantumExpired { .. } | VmExecResult::Yielded) => {
                 task.vm_call = Some(vm);
                 TaskAction::Yield(root, task_id)
             }
@@ -2529,13 +2531,6 @@ impl Runtime {
                 task_id,
                 task.vm_owner.take().expect("VM call has a return owner"),
                 Err(error),
-            ),
-            Ok(other) => TaskAction::VmResult(
-                task_id,
-                task.vm_owner.take().expect("VM call has a return owner"),
-                Err(sema_core::SemaError::eval(format!(
-                    "unsupported runtime VM stop: {other:?}"
-                ))),
             ),
         }
     }

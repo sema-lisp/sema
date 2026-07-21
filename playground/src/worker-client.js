@@ -16,6 +16,39 @@ let nextId = 1;
 let currentEvalId = null; // the eval message id currently in flight, for cancel
 let outputHandler = null; // called with each streamed output line
 const pending = new Map();
+let readyResolve = null;
+let readyReject = null;
+let initTimer = null;
+
+const WORKER_INIT_TIMEOUT_MS = 10_000;
+
+function asError(value, fallback) {
+  if (value instanceof Error) return value;
+  if (typeof value === 'string' && value) return new Error(value);
+  return new Error(fallback);
+}
+
+function clearInitState() {
+  if (initTimer !== null) clearTimeout(initTimer);
+  initTimer = null;
+  readyResolve = null;
+  readyReject = null;
+}
+
+function failWorker(reason) {
+  const error = asError(reason, 'The Sema evaluation worker failed.');
+  const rejectReady = readyReject;
+  clearInitState();
+  rejectReady?.(error);
+
+  for (const request of pending.values()) request.reject(error);
+  pending.clear();
+  currentEvalId = null;
+
+  worker?.terminate();
+  worker = null;
+  ready = null;
+}
 
 /** Register a handler called with each live output line during a worker run. */
 export function setWorkerOutputHandler(fn) {
@@ -23,9 +56,9 @@ export function setWorkerOutputHandler(fn) {
 }
 
 /** True when the worker eval path should be used: the browser is cross-origin
- *  isolated (SharedArrayBuffer + Atomics available) and the user hasn't opted
- *  out with ?no-worker. Otherwise the playground runs on the main thread
- *  (instant virtual-clock sleeps), exactly as before. */
+ *  isolated (with SharedArrayBuffer available) and the user hasn't opted
+ *  out with ?no-worker. Otherwise the same Promise runtime runs on the main
+ *  thread with real timers and HTTP, but CPU-bound work shares the UI thread. */
 export function workerEvalEnabled() {
   return (
     typeof SharedArrayBuffer !== 'undefined' &&
@@ -43,18 +76,34 @@ export function initWorker() {
     if (m && m.type === 'output') {
       if (outputHandler) outputHandler(m.text);
     } else if (m && m.type === 'result') {
-      const resolve = pending.get(m.id);
-      if (resolve) {
+      const request = pending.get(m.id);
+      if (request) {
         pending.delete(m.id);
-        resolve({ result: m.result, vfs: m.vfs });
+        request.resolve({ result: m.result, vfs: m.vfs });
       }
+    } else if (m && m.type === 'init_error') {
+      failWorker(m.error || 'The Sema evaluation worker could not initialize.');
     }
   });
-  ready = new Promise((res) => {
-    const onReady = (e) => {
-      if (e.data && e.data.type === 'ready') {
-        worker.removeEventListener('message', onReady);
-        res();
+  worker.addEventListener('error', (event) => {
+    event.preventDefault();
+    failWorker(event.message || 'The Sema evaluation worker crashed.');
+  });
+  worker.addEventListener('messageerror', () => {
+    failWorker('The Sema evaluation worker sent an unreadable message.');
+  });
+  ready = new Promise((resolve, reject) => {
+    readyResolve = resolve;
+    readyReject = reject;
+    initTimer = setTimeout(() => {
+      failWorker(`The Sema evaluation worker did not initialize within ${WORKER_INIT_TIMEOUT_MS}ms.`);
+    }, WORKER_INIT_TIMEOUT_MS);
+    const onReady = (event) => {
+      if (event.data && event.data.type === 'ready') {
+        worker?.removeEventListener('message', onReady);
+        const resolveReady = readyResolve;
+        clearInitState();
+        resolveReady?.();
       }
     };
     worker.addEventListener('message', onReady);
@@ -75,12 +124,14 @@ export function cancelWorker() {
 /** Evaluate `code` on the worker, seeding it with `vfs` (a dumpVfs snapshot).
  *  Resolves to { result: {value,output,error}, vfs: snapshot-after-run }. */
 export async function evalViaWorker(code, vfs) {
+  if (!ready) throw new Error('The Sema evaluation worker is not initialized.');
   await ready;
+  if (!worker) throw new Error('The Sema evaluation worker is unavailable.');
   const id = nextId++;
   currentEvalId = id;
   try {
-    return await new Promise((resolve) => {
-      pending.set(id, resolve);
+    return await new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
       worker.postMessage({ type: 'eval', id, code, vfs });
     });
   } finally {

@@ -4,6 +4,7 @@ import { makeVfsHost, BACKENDS } from './vfs-backends.js';
 import { initSplitters } from './splitters.js';
 import { workerEvalEnabled, initWorker, evalViaWorker, cancelWorker, setWorkerOutputHandler } from './worker-client.js';
 import { toast } from './sema-ui.js';
+import { registerPlaygroundWebMcp } from './webmcp.js';
 
 let interp = null;
 // When true, eval runs on a Web Worker (real wall-clock async/sleep, responsive
@@ -19,6 +20,7 @@ let activeFilePath = null;
 let breakpoints = new Set();
 let currentDebugLine = null;
 let debugState = 'idle'; // 'idle' | 'running' | 'paused'
+let debugOutcome = null;
 
 const STORAGE_KEY = 'sema-playground';
 
@@ -29,6 +31,45 @@ function loadState() {
 function saveState(patch) {
   const state = { ...loadState(), ...patch };
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+}
+
+function toolFailure(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  throw error;
+}
+
+function requireToolReady() {
+  if (!interp) toolFailure('NOT_READY', 'The Sema playground is still initializing.');
+}
+
+function requireToolIdle() {
+  requireToolReady();
+  if (workerRunning) toolFailure('BUSY', 'A Sema evaluation is already running.');
+  if (debugState !== 'idle') toolFailure('BUSY', 'The Sema debugger is active.');
+}
+
+function pageText(content, input = {}) {
+  const offset = input.offset ?? 0;
+  const limit = input.limit ?? 1500;
+  if (!Number.isInteger(offset) || offset < 0) {
+    toolFailure('INVALID_INPUT', 'offset must be a non-negative integer.');
+  }
+  if (!Number.isInteger(limit) || limit < 1 || limit > 12_000) {
+    toolFailure('INVALID_INPUT', 'limit must be an integer from 1 through 12000.');
+  }
+
+  const start = Math.min(offset, content.length);
+  const end = Math.min(start + limit, content.length);
+  return {
+    ok: true,
+    content: content.slice(start, end),
+    offset: start,
+    limit,
+    total: content.length,
+    truncated: end < content.length,
+    next_offset: end < content.length ? end : null,
+  };
 }
 
 // ── Files panel collapse ──
@@ -54,7 +95,13 @@ if (savedFilesCollapsed) {
 
 // Flat lookup: example id -> { id, name, code }.
 const examplesById = new Map();
-for (const cat of examples) for (const f of cat.files) examplesById.set(f.id, f);
+const exampleRecords = [];
+for (const category of examples) {
+  for (const file of category.files) {
+    examplesById.set(file.id, file);
+    exampleRecords.push({ ...file, category: category.category });
+  }
+}
 
 // Resolve a `?example=` query-param value to an example. Accepts either the
 // full id (`getting-started/hello.sema`) or a bare filename (`hello.sema`),
@@ -72,10 +119,15 @@ function resolveExampleParam(raw) {
 }
 
 function loadExample(file) {
-  editorEl.value = file.code;
+  replaceEditorSource(file.code);
+  saveState({ lastExampleId: file.id, editorContent: file.code });
+}
+
+function replaceEditorSource(code) {
+  editorEl.value = code;
   editorEl.resetHistory();
   scheduleHighlight();
-  saveState({ lastExampleId: file.id, editorContent: file.code });
+  debounceSaveEditor();
 }
 
 // Examples sidebar — dogfoods <sema-tree>: categories are expandable items, files
@@ -274,6 +326,54 @@ function refreshVfsStats() {
   vfsStatsEl.textContent = s.files > 0 ? `${s.files} files · ${formatBytes(s.bytes)}` : '';
 }
 
+function normalizeVirtualPath(path, { allowRoot = false } = {}) {
+  if (typeof path !== 'string' || !path.startsWith('/') || path.includes('\\') || path.includes('\0')) {
+    toolFailure('INVALID_PATH', 'Virtual paths must be absolute and use forward slashes.');
+  }
+  if (path === '/') {
+    if (allowRoot) return path;
+    toolFailure('INVALID_PATH', 'A file path cannot be the virtual filesystem root.');
+  }
+  if (path.endsWith('/')) toolFailure('INVALID_PATH', 'Virtual paths cannot end with a slash.');
+
+  const segments = path.slice(1).split('/');
+  if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
+    toolFailure('INVALID_PATH', 'Virtual paths cannot contain empty, dot, or parent segments.');
+  }
+  return path;
+}
+
+async function writeVirtualFile(path, content, { flush = true, refresh = true } = {}) {
+  requireToolReady();
+  const normalized = normalizeVirtualPath(path);
+  if (typeof content !== 'string') toolFailure('INVALID_INPUT', 'content must be a string.');
+
+  const bytes = new TextEncoder().encode(content).byteLength;
+  if (bytes > 1024 * 1024) toolFailure('FILE_TOO_LARGE', 'File content exceeds the 1 MiB UTF-8 limit.');
+
+  const segments = normalized.slice(1).split('/');
+  let directory = '';
+  for (const segment of segments.slice(0, -1)) {
+    directory += `/${segment}`;
+    interp.mkdir(directory);
+  }
+  interp.writeFile(normalized, content);
+
+  if (flush && backendName !== 'memory' && vfsBackend) {
+    try {
+      await vfsBackend.flush(vfsHost);
+    } catch (error) {
+      toolFailure('PERSIST_ERROR', error?.message ?? String(error));
+    }
+  }
+
+  if (refresh) {
+    refreshFileTree();
+    refreshVfsStats();
+  }
+  return { path: normalized, bytes };
+}
+
 // ── Upload files into VFS ──
 
 const uploadInput = document.getElementById('vfs-upload');
@@ -335,7 +435,7 @@ async function uploadFiles(fileList) {
     try {
       const text = await file.text();
       const path = '/uploads/' + file.name;
-      interp.writeFile(path, text);
+      await writeVirtualFile(path, text, { flush: false, refresh: false });
       uploaded++;
     } catch (e) {
       toast.error(`Upload failed: ${e.message}`);
@@ -414,7 +514,8 @@ async function main() {
   interp = new SemaInterpreter();
   vfsHost = makeVfsHost(interp);
 
-  // Opt-in worker path: run eval off the main thread for real async/sleep.
+  // Default worker path: run eval off the main thread when the browser can
+  // isolate it; ?no-worker retains a main-thread fallback.
   if (workerEvalEnabled()) {
     try {
       await initWorker();
@@ -491,19 +592,32 @@ async function run() {
 
   const t0 = performance.now();
   let result;
-  if (workerActive) {
-    // The worker owns eval; keep the main-thread interp as a synchronous VFS
-    // mirror so the existing file-tree/preview/persistence code is unchanged.
-    // Seed the worker with the mirror, then reflect any file changes back.
-    const { result: r, vfs } = await evalViaWorker(code, interp.dumpVfs());
-    result = r;
-    interp.loadVfs(vfs);
-  } else {
-    result = await interp.evalVMAsync(code);
+  const usingWorker = workerActive;
+  try {
+    if (usingWorker) {
+      // The worker owns eval; keep the main-thread interp as a synchronous VFS
+      // mirror so the existing file-tree/preview/persistence code is unchanged.
+      // Seed the worker with the mirror, then reflect any file changes back.
+      const workerResult = await evalViaWorker(code, interp.dumpVfs());
+      result = workerResult.result;
+      if (workerResult.vfs !== undefined) interp.loadVfs(workerResult.vfs);
+    } else {
+      result = await interp.evalVMAsync(code);
+    }
+  } catch (error) {
+    result = {
+      value: null,
+      output: [],
+      error: error?.message ?? String(error),
+    };
+    if (usingWorker) {
+      workerActive = false;
+      console.warn('worker eval failed, using main thread for future runs:', error);
+    }
   }
   const elapsed = performance.now() - t0;
 
-  if (workerActive) {
+  if (usingWorker) {
     workerRunning = false;
     runBtn.textContent = 'Run';
     runBtn.setAttribute('shortcut', '⌘↵'); // restore the badge (rendered by sema-button)
@@ -515,12 +629,16 @@ async function run() {
       : 'status-text status-ready';
   } else {
     runBtn.disabled = false;
+    statusEl.textContent = result.error ? 'Error' : 'Ready';
+    statusEl.className = result.error
+      ? 'status-text status-error'
+      : 'status-text status-ready';
   }
 
   // On the worker path the output lines already streamed in live (and the pane
   // was cleared at run start), so we only append the value/error + timing here.
   // On the main-thread path output is batched, so clear and render it now.
-  if (!workerActive) {
+  if (!usingWorker) {
     outputEl.innerHTML = '';
     if (result.output && result.output.length > 0) {
       for (const line of result.output) {
@@ -570,6 +688,8 @@ async function run() {
     const content = interp.readFile(activeFilePath);
     fileViewerEl.textContent = content ?? '(empty file)';
   }
+
+  return { ...result, elapsed };
 }
 
 // Run button (acts as Stop while a worker eval is in flight)
@@ -578,10 +698,9 @@ document.getElementById('run-btn').addEventListener('click', () => {
   else run();
 });
 
-// Format button
-document.getElementById('fmt-btn').addEventListener('click', () => {
+function formatEditorSource() {
   const code = editorEl.value;
-  if (!code.trim()) return;
+  if (!code.trim()) toolFailure('INVALID_INPUT', 'The editor is empty.');
   const result = formatCode(code, 80, 2, false);
   if (result.error) {
     outputEl.innerHTML = '';
@@ -590,11 +709,19 @@ document.getElementById('fmt-btn').addEventListener('click', () => {
     div.setAttribute('data-testid', 'output-error');
     div.textContent = `Format error: ${result.error}`;
     outputEl.appendChild(div);
+    toolFailure('FORMAT_ERROR', result.error);
   } else if (result.formatted !== null) {
     editorEl.value = result.formatted;
     scheduleHighlight();
     debounceSaveEditor();
+    return result.formatted;
   }
+  toolFailure('FORMAT_ERROR', 'The formatter did not return source code.');
+}
+
+// Format button
+document.getElementById('fmt-btn').addEventListener('click', () => {
+  try { formatEditorSource(); } catch (_) { /* error is rendered above */ }
 });
 
 // Clear button
@@ -718,6 +845,7 @@ function setDebugState(state) {
       document.getElementById('status').className = 'status-text status-loading';
       break;
   }
+
 }
 
 function escapeHtml(s) {
@@ -725,6 +853,19 @@ function escapeHtml(s) {
 }
 
 let validBreakpointLines = null; // Set of lines that can have breakpoints
+
+function getDebugSnapshot() {
+  const paused = debugState === 'paused' && interp;
+  return {
+    ok: true,
+    state: debugState,
+    line: currentDebugLine,
+    breakpoints: [...breakpoints].sort((left, right) => left - right),
+    locals: paused ? (interp.debugGetLocalsPromise() ?? []) : [],
+    stack: paused ? (interp.debugGetStackTracePromise() ?? []) : [],
+    ...(debugOutcome ?? {}),
+  };
+}
 
 function handleDebugResult(result) {
   // Sync breakpoint positions if the response includes validation info
@@ -740,23 +881,27 @@ function handleDebugResult(result) {
     }
   }
 
-  if (result.output && result.output.length > 0) {
-    for (const line of result.output) {
+  const outputEvents = result.outputEvents ?? result.output?.map((text) => ({ stream: 'stdout', text })) ?? [];
+  for (const event of outputEvents) {
+    if (event.text !== undefined) {
       const div = document.createElement('div');
       div.className = 'output-line';
       div.setAttribute('data-testid', 'output-line');
-      div.textContent = line;
+      div.dataset.stream = event.stream ?? 'stdout';
+      div.textContent = event.text;
       outputEl.appendChild(div);
     }
   }
 
   if (result.status === 'stopped') {
+    debugOutcome = { status: 'paused' };
     currentDebugLine = result.line;
     updateGutter();
     setDebugState('paused');
     scrollToLine(result.line);
     updateVariablesPanel();
   } else if (result.status === 'finished') {
+    debugOutcome = { status: 'finished', value: result.value ?? null };
     if (result.value !== null && result.value !== undefined) {
       const div = document.createElement('div');
       div.className = 'output-value';
@@ -766,6 +911,7 @@ function handleDebugResult(result) {
     }
     setDebugState('idle');
   } else if (result.status === 'error') {
+    debugOutcome = { status: 'error', error: result.error };
     const div = document.createElement('div');
     div.className = 'output-error';
     div.setAttribute('data-testid', 'output-error');
@@ -773,11 +919,13 @@ function handleDebugResult(result) {
     outputEl.appendChild(div);
     setDebugState('idle');
   } else if (result.status === 'cancelled') {
+    debugOutcome = { status: 'stopped' };
     setDebugState('idle');
   }
 }
 
 function showDebugError(e) {
+  debugOutcome = { status: 'error', error: e.message || String(e) };
   const div = document.createElement('div');
   div.className = 'output-error';
   div.setAttribute('data-testid', 'output-error');
@@ -785,6 +933,73 @@ function showDebugError(e) {
   outputEl.appendChild(div);
   try { interp.debugStopPromise(); } catch (_) { /* ignore */ }
   setDebugState('idle');
+}
+
+function replaceBreakpoints(lines) {
+  requireToolReady();
+  if (!Array.isArray(lines) || lines.some((line) => !Number.isInteger(line) || line < 1)) {
+    toolFailure('INVALID_INPUT', 'lines must contain positive one-based integers.');
+  }
+  ensureValidLines();
+  breakpoints = new Set(lines.map((line) => snapToValidLine(line)));
+  updateGutter();
+  if (interp.debugIsActivePromise()) interp.debugSetBreakpointsPromise([...breakpoints]);
+  return [...breakpoints].sort((left, right) => left - right);
+}
+
+async function startDebugging() {
+  requireToolIdle();
+  const code = editorEl.value;
+  if (!code.trim()) toolFailure('INVALID_INPUT', 'The editor is empty.');
+
+  outputEl.innerHTML = '';
+  debugOutcome = null;
+  setDebugState('running');
+
+  try {
+    handleDebugResult(await interp.debugStartPromise(code, [...breakpoints]));
+  } catch (error) {
+    showDebugError(error);
+  }
+  return getDebugSnapshot();
+}
+
+async function continueDebugging() {
+  requireToolReady();
+  if (debugState !== 'paused') toolFailure('NOT_PAUSED', 'The Sema debugger is not paused.');
+  setDebugState('running');
+  try {
+    handleDebugResult(await interp.debugContinuePromise());
+  } catch (error) {
+    showDebugError(error);
+  }
+  return getDebugSnapshot();
+}
+
+async function stepDebugger(mode) {
+  requireToolReady();
+  if (debugState !== 'paused') toolFailure('NOT_PAUSED', 'The Sema debugger is not paused.');
+  const commands = {
+    into: () => interp.debugStepIntoPromise(),
+    over: () => interp.debugStepOverPromise(),
+    out: () => interp.debugStepOutPromise(),
+  };
+  setDebugState('running');
+  try {
+    handleDebugResult(await commands[mode]());
+  } catch (error) {
+    showDebugError(error);
+  }
+  return getDebugSnapshot();
+}
+
+function stopDebugging() {
+  requireToolReady();
+  if (debugState === 'idle') toolFailure('NOT_DEBUGGING', 'No Sema debugger session is active.');
+  interp.debugStopPromise();
+  debugOutcome = { status: 'stopped' };
+  setDebugState('idle');
+  return getDebugSnapshot();
 }
 
 function scrollToLine(line) {
@@ -822,50 +1037,29 @@ function updateVariablesPanel() {
 }
 
 // Debug button
-debugBtn.addEventListener('click', async () => {
-  if (!interp || debugState !== 'idle') return;
-  const code = editorEl.value;
-  if (!code.trim()) return;
-
-  outputEl.innerHTML = '';
-  setDebugState('running');
-  try {
-    const result = await interp.debugStartPromise(code, Array.from(breakpoints));
-    handleDebugResult(result);
-  } catch (e) {
-    showDebugError(e);
-  }
+debugBtn.addEventListener('click', () => {
+  startDebugging().catch(showDebugError);
 });
 
 // Debug control buttons
-document.getElementById('dbg-continue').addEventListener('click', async () => {
-  if (!interp || debugState !== 'paused') return;
-  setDebugState('running');
-  try { handleDebugResult(await interp.debugContinuePromise()); } catch (e) { showDebugError(e); }
+document.getElementById('dbg-continue').addEventListener('click', () => {
+  continueDebugging().catch(showDebugError);
 });
 
-document.getElementById('dbg-step-over').addEventListener('click', async () => {
-  if (!interp || debugState !== 'paused') return;
-  setDebugState('running');
-  try { handleDebugResult(await interp.debugStepOverPromise()); } catch (e) { showDebugError(e); }
+document.getElementById('dbg-step-over').addEventListener('click', () => {
+  stepDebugger('over').catch(showDebugError);
 });
 
-document.getElementById('dbg-step-into').addEventListener('click', async () => {
-  if (!interp || debugState !== 'paused') return;
-  setDebugState('running');
-  try { handleDebugResult(await interp.debugStepIntoPromise()); } catch (e) { showDebugError(e); }
+document.getElementById('dbg-step-into').addEventListener('click', () => {
+  stepDebugger('into').catch(showDebugError);
 });
 
-document.getElementById('dbg-step-out').addEventListener('click', async () => {
-  if (!interp || debugState !== 'paused') return;
-  setDebugState('running');
-  try { handleDebugResult(await interp.debugStepOutPromise()); } catch (e) { showDebugError(e); }
+document.getElementById('dbg-step-out').addEventListener('click', () => {
+  stepDebugger('out').catch(showDebugError);
 });
 
 document.getElementById('dbg-stop').addEventListener('click', () => {
-  if (!interp) return;
-  interp.debugStopPromise();
-  setDebugState('idle');
+  try { stopDebugging(); } catch (_) { /* controls are hidden while idle */ }
 });
 
 // ── Editor events ──
@@ -927,5 +1121,122 @@ editorEl.addEventListener('keydown', (e) => {
 
 // Highlight initial content
 scheduleHighlight();
+
+const webMcpActions = {
+  read_editor: (input) => pageText(editorEl.value, input),
+  write_editor: ({ code }) => {
+    requireToolIdle();
+    if (typeof code !== 'string') toolFailure('INVALID_INPUT', 'code must be a string.');
+    replaceEditorSource(code);
+    return { ok: true, length: code.length };
+  },
+  format_editor: () => {
+    requireToolIdle();
+    const formatted = formatEditorSource();
+    return { ok: true, formatted: true, length: formatted.length };
+  },
+  run_editor: async () => {
+    requireToolIdle();
+    if (!editorEl.value.trim()) toolFailure('INVALID_INPUT', 'The editor is empty.');
+    const result = await run();
+    if (result?.error) {
+      const code = result.error.toLowerCase().includes('cancelled') ? 'CANCELLED' : 'EVAL_ERROR';
+      toolFailure(code, result.error);
+    }
+    return {
+      ok: true,
+      status: 'finished',
+      value: result?.value ?? null,
+      elapsed_ms: result?.elapsed ?? null,
+    };
+  },
+  stop_run: () => {
+    requireToolReady();
+    if (!workerActive || !workerRunning) toolFailure('NOT_RUNNING', 'No cancellable evaluation is running.');
+    cancelWorker();
+    return { ok: true, status: 'stopping' };
+  },
+  read_output: (input) => {
+    const content = [...outputEl.children].map((element) => element.textContent ?? '').join('\n');
+    return pageText(content, input);
+  },
+  find_examples: ({ query = '', limit = 20 }) => {
+    if (typeof query !== 'string') toolFailure('INVALID_INPUT', 'query must be a string.');
+    if (!Number.isInteger(limit) || limit < 1 || limit > 20) {
+      toolFailure('INVALID_INPUT', 'limit must be an integer from 1 through 20.');
+    }
+    const needle = query.trim().toLowerCase();
+    const matches = exampleRecords.filter((example) => !needle ||
+      example.id.toLowerCase().includes(needle) ||
+      example.name.toLowerCase().includes(needle) ||
+      example.category.toLowerCase().includes(needle));
+    return {
+      ok: true,
+      examples: matches.slice(0, limit).map(({ id, name, category }) => ({ id, name, category })),
+      total: matches.length,
+      truncated: matches.length > limit,
+    };
+  },
+  load_example: ({ id }) => {
+    requireToolIdle();
+    if (typeof id !== 'string' || !id.trim()) toolFailure('INVALID_INPUT', 'id must be a non-empty string.');
+    const file = resolveExampleParam(id);
+    if (!file) toolFailure('NOT_FOUND', `Example not found: ${id}`);
+    loadExample(file);
+    const record = exampleRecords.find((example) => example.id === file.id);
+    return {
+      ok: true,
+      id: file.id,
+      name: file.name,
+      category: record?.category ?? null,
+      length: file.code.length,
+    };
+  },
+  list_files: ({ dir = '/' }) => {
+    requireToolReady();
+    const normalized = normalizeVirtualPath(dir, { allowRoot: true });
+    if (normalized !== '/' && !interp.isDirectory(normalized)) {
+      toolFailure('NOT_FOUND', `Virtual directory not found: ${normalized}`);
+    }
+    const entries = [...(interp.listFiles(normalized) ?? [])]
+      .map((name) => {
+        const path = normalized === '/' ? `/${name}` : `${normalized}/${name}`;
+        return { name, path, type: interp.isDirectory(path) ? 'directory' : 'file' };
+      })
+      .sort((left, right) => left.name.localeCompare(right.name));
+    return { ok: true, dir: normalized, entries };
+  },
+  read_file: ({ path, ...input }) => {
+    requireToolReady();
+    const normalized = normalizeVirtualPath(path);
+    if (!interp.fileExists(normalized) || interp.isDirectory(normalized)) {
+      toolFailure('NOT_FOUND', `Virtual file not found: ${normalized}`);
+    }
+    return { path: normalized, ...pageText(interp.readFile(normalized) ?? '', input) };
+  },
+  write_file: async ({ path, content }) => {
+    requireToolIdle();
+    const written = await writeVirtualFile(path, content);
+    return { ok: true, ...written };
+  },
+  set_breakpoints: ({ lines }) => ({ ok: true, breakpoints: replaceBreakpoints(lines) }),
+  start_debugging: () => startDebugging(),
+  continue_debugging: () => continueDebugging(),
+  step_debugger: ({ mode }) => {
+    if (!['into', 'over', 'out'].includes(mode)) {
+      toolFailure('INVALID_INPUT', 'mode must be into, over, or out.');
+    }
+    return stepDebugger(mode);
+  },
+  stop_debugging: () => stopDebugging(),
+  get_debug_state: () => {
+    requireToolReady();
+    return getDebugSnapshot();
+  },
+};
+
+registerPlaygroundWebMcp(webMcpActions).catch((error) => {
+  console.warn('WebMCP registration failed:', error);
+});
 
 main().then(() => { scheduleHighlight(); });

@@ -19,6 +19,7 @@ const contentTypes = new Map([
   ['.map', 'application/json; charset=utf-8'],
   ['.png', 'image/png'],
   ['.svg', 'image/svg+xml; charset=utf-8'],
+  ['.txt', 'text/plain; charset=utf-8'],
   ['.wasm', 'application/wasm'],
   ['.webmanifest', 'application/manifest+json'],
 ]);
@@ -48,6 +49,9 @@ const server = createServer(async (request, response) => {
       'cache-control': 'no-store',
       'content-length': body.byteLength,
       'content-type': contentTypes.get(extname(file)) ?? 'application/octet-stream',
+      'cross-origin-embedder-policy': 'require-corp',
+      'cross-origin-opener-policy': 'same-origin',
+      'origin-agent-cluster': '?1',
     });
     response.end(request.method === 'HEAD' ? undefined : body);
   } catch (error) {

@@ -22,7 +22,7 @@ test('debug exchange-rates via UI with HTTP fetch', async ({ page }) => {
   // Click Debug
   await page.getByTestId('debug-btn').click();
 
-  // Wait for paused — may take time for HTTP fetch + restart cycle
+  // Wait for the promise-driven debugger to resume the HTTP frame and pause.
   await page.waitForFunction(
     () => document.getElementById('status')?.textContent?.startsWith('Paused'),
     { timeout: 30000 }
@@ -54,12 +54,16 @@ test('debug exchange-rates via UI with HTTP fetch', async ({ page }) => {
   const finalStatus = await page.getByTestId('status').textContent();
   console.log('Final status:', finalStatus);
 
-  // Stop
-  await page.getByTestId('dbg-stop').click();
-  await page.waitForFunction(
-    () => document.getElementById('status')?.textContent === 'Ready',
-    { timeout: 5000 }
-  );
+  // Continuing may either reach the requested breakpoint or finish the
+  // program. Stop only while a session is still paused.
+  if (finalStatus !== 'Ready') {
+    await page.getByTestId('dbg-stop').click();
+    await page.waitForFunction(
+      () => document.getElementById('status')?.textContent === 'Ready',
+      { timeout: 5000 }
+    );
+  }
+  await expect(page.getByTestId('status')).toHaveText('Ready');
 
   console.log('\n=== Browser logs ===');
   for (const log of logs) console.log(log);

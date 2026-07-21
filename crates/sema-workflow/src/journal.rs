@@ -39,10 +39,12 @@ pub struct Journal {
 }
 
 impl Journal {
-    /// Create (or reuse) the run directory `<runs_root>/<run_id>/` and open its
-    /// `events.jsonl` for append. Errors propagate to the caller so the workflow
-    /// runtime can decide whether to abort (vs. the per-event writes below, which
-    /// are best-effort and swallow failures).
+    /// Create a FRESH run and open its `events.jsonl`. The journal file is claimed
+    /// ATOMICALLY with `create_new`, so a fresh run whose journal already exists fails
+    /// with [`io::ErrorKind::AlreadyExists`] rather than appending to (and corrupting)
+    /// another run's frozen event stream — the A2 run-identity guarantee. Errors propagate
+    /// so the workflow runtime can fail the run cleanly (vs. the per-event writes below,
+    /// which swallow failures).
     ///
     /// `runs_root` is normally [`crate::RUNS_ROOT`] (project-local `.sema/runs`),
     /// resolved cwd-relative — NOT `~/.sema`.
@@ -50,19 +52,27 @@ impl Journal {
         Self::open_named(runs_root, run_id, "events.jsonl")
     }
 
-    /// As [`Self::open`] but writes to a named events file under the run dir. Resume
-    /// writes a sibling `events.resume-<n>.jsonl` segment so each file keeps the frozen
-    /// invariants (first line is `run.started`, `seq` monotonic from 0) intact — the
-    /// reader merges segments. See [`next_resume_segment`].
+    /// As [`Self::open`] but writes to a named events file. A resume does NOT come through
+    /// here — it claims a sibling `events.resume-<n>.jsonl` segment via
+    /// [`next_resume_segment`] (each segment keeps the frozen invariants: first line
+    /// `run.started`, `seq` monotonic from 0; the reader merges segments).
+    ///
+    /// The run DIRECTORY may already exist without being a collision — a `:persist :run`
+    /// MCP credential store is seeded under it before the run opens (see
+    /// [`ensure_run_dir`]); the exclusive claim is the journal file's `create_new`, not
+    /// the directory, so two runs never share an event stream even if they share the dir.
     pub fn open_named(
         runs_root: impl AsRef<Path>,
         run_id: &str,
         filename: &str,
     ) -> io::Result<Self> {
         let dir = runs_root.as_ref().join(run_id);
-        fs::create_dir_all(&dir)?;
+        ensure_run_dir(&dir)?;
         let path = dir.join(filename);
-        let file = OpenOptions::new().append(true).create(true).open(&path)?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
         Ok(Self {
             dir,
             writer: BufWriter::new(file),
@@ -166,6 +176,25 @@ impl Journal {
     }
 }
 
+/// Ensure the run directory exists so the journal file can be created inside it. The dir
+/// may already exist WITHOUT being a run collision — a `:persist :run` MCP credential
+/// store is seeded under `<run_dir>/<run_id>/auth/` before the run opens its journal — so
+/// a pre-existing directory is adopted, not rejected. The exclusive per-run claim is the
+/// journal file's `create_new` (in [`Journal::open_named`] / [`next_resume_segment`]), not
+/// the directory. A recursive `create_dir_all` over the RUN dir is deliberately avoided:
+/// only the parent chain is created recursively (the A2 source guard forbids the run-dir
+/// reuse shape).
+fn ensure_run_dir(dir: &Path) -> io::Result<()> {
+    if let Some(parent) = dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match fs::create_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Load all memo sidecars for a prior run into `(content_key, json)` pairs. Returns an
 /// empty vec when there is no `memo/` dir (a fresh or never-memoized run). Best-effort:
 /// an unreadable/corrupt memo file is skipped (that leaf re-runs), never fatal.
@@ -192,16 +221,38 @@ pub fn load_memos(runs_root: impl AsRef<Path>, run_id: &str) -> Vec<(String, ser
     out
 }
 
-/// Pick the next free `events.resume-<n>.jsonl` segment filename under a run dir (1-based;
-/// the first resume of a run writes `events.resume-1.jsonl`). A free-filename probe so
-/// each resumed run gets its own clean segment (each keeps the frozen invariants).
-pub fn next_resume_segment(runs_root: impl AsRef<Path>, run_id: &str) -> String {
+/// Atomically claim the next free `events.resume-<n>.jsonl` segment under an EXISTING run
+/// dir and return an opened journal writing to it (1-based; the first resume claims
+/// `events.resume-1.jsonl`). The claim IS the open: `create_new` tests-and-takes the
+/// segment in one syscall, so two concurrent resumes of the same run can never grab the
+/// same file — there is no exists-probe TOCTOU window. The run dir must already exist (a
+/// resume of a nonexistent run is rejected upstream in `set_workflow_scope`); this never
+/// creates it.
+pub fn next_resume_segment(runs_root: impl AsRef<Path>, run_id: &str) -> io::Result<Journal> {
     let dir = runs_root.as_ref().join(run_id);
-    let mut n = 1;
-    while dir.join(format!("events.resume-{n}.jsonl")).exists() {
-        n += 1;
+    let mut n: u32 = 1;
+    loop {
+        let path = dir.join(format!("events.resume-{n}.jsonl"));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                return Ok(Journal {
+                    dir,
+                    writer: BufWriter::new(file),
+                });
+            }
+            // Segment already claimed (by us on a prior resume, or a racing resume) — try
+            // the next ordinal. The claim above is atomic, so the loser here simply moves on.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                n = n.checked_add(1).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "resume segment ordinal space exhausted",
+                    )
+                })?;
+            }
+            Err(e) => return Err(e),
+        }
     }
-    format!("events.resume-{n}.jsonl")
 }
 
 #[cfg(test)]
@@ -261,6 +312,87 @@ mod tests {
             .unwrap();
         assert!(j.dir().join("args.json").exists());
         assert!(j.dir().join("result.json").exists());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn open_fresh_fails_when_journal_already_exists() {
+        // A fresh run must never append to an existing journal: the second open of the
+        // same id fails with AlreadyExists (the create_new claim), leaving the first
+        // run's events.jsonl untouched.
+        let root = tmp_root();
+        let _first = Journal::open(&root, "wf_dupe").unwrap();
+        let err = match Journal::open(&root, "wf_dupe") {
+            Ok(_) => panic!("second fresh open must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn open_fresh_adopts_a_pre_existing_dir_without_a_journal() {
+        // The run dir may already hold non-journal artifacts (e.g. a `:persist :run` MCP
+        // credential store seeded before the run). With no events.jsonl present that is
+        // NOT a collision — the fresh run adopts the dir and claims its journal.
+        let root = tmp_root();
+        fs::create_dir_all(root.join("wf_seeded").join("auth")).unwrap();
+        let j = Journal::open(&root, "wf_seeded").expect("adopt a dir with no journal");
+        assert!(j.dir().join("events.jsonl").exists());
+        assert!(j.dir().join("auth").is_dir(), "seeded content is preserved");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn concurrent_resume_segment_claims_are_distinct() {
+        use std::sync::{Arc, Barrier};
+
+        // Two resumes of the SAME run racing on the segment claim must land on distinct
+        // files: `create_new` makes each claim atomic, so exactly one thread wins each
+        // ordinal — the pair ends up on events.resume-1 and events.resume-2, never both
+        // on the same segment (the exists-probe TOCTOU this replaces could double-claim).
+        let root = tmp_root();
+        let run = "wf_race";
+        fs::create_dir_all(root.join(run)).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let root = root.clone();
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut journal =
+                    next_resume_segment(&root, run).expect("segment claim succeeds");
+                // Write one event so each claimed segment is a real, distinct file.
+                journal.write(&WorkflowEvent::RunEnded {
+                    seq: 0,
+                    ts: "0".into(),
+                    status: "success".into(),
+                    reason: None,
+                    dur_ms: 0,
+                });
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut names: Vec<String> = fs::read_dir(root.join(run))
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with("events.resume-"))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "events.resume-1.jsonl".to_string(),
+                "events.resume-2.jsonl".to_string()
+            ],
+            "concurrent resumes must claim two distinct segments"
+        );
         fs::remove_dir_all(&root).ok();
     }
 }

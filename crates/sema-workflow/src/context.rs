@@ -24,7 +24,9 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
+use std::path::Path;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use sema_core::cycle::GcEdge;
@@ -756,17 +758,50 @@ pub fn set_workflow_scope(
     meta: &Value,
     task_context: Option<&TaskContextHandle>,
 ) -> io::Result<WorkflowGuard> {
-    let run_id = resolve_run_id();
     let runs_root = resolve_runs_root();
     let code_version = std::env::var(CODE_VERSION_ENV).unwrap_or_default();
-    // Resume mode: reuse the run dir, write a fresh sibling events.resume-<n>.jsonl
-    // segment (keeps the frozen first-line/seq invariants), and preload prior memos.
     let resuming = std::env::var(RESUME_ENV).map(|v| v == "1").unwrap_or(false);
-    let journal = if resuming {
-        let seg = crate::journal::next_resume_segment(&runs_root, &run_id);
-        Journal::open_named(&runs_root, &run_id, &seg)?
+
+    // An explicit run id (the `SEMA_WORKFLOW_RUN_ID` seam, or a future library caller) is
+    // validated HERE as exactly one safe path component before it is ever joined into a
+    // filesystem path — the library is the authoritative gate, not just the CLI.
+    let explicit_id = match std::env::var(RUN_ID_ENV) {
+        Ok(id) if !id.is_empty() => {
+            validate_explicit_run_id(&id)?;
+            Some(id)
+        }
+        _ => None,
+    };
+
+    // Resolve the run id AND open its journal together, because the two decisions are
+    // coupled: a fresh run creates its dir fresh (a pre-existing dir is an error, a
+    // generated-id collision retries with a new nonce), while a resume claims a new
+    // sibling `events.resume-<n>.jsonl` segment in the ALREADY-existing dir.
+    let (run_id, journal) = if resuming {
+        // Resume requires an existing, explicitly-named run — never a generated id.
+        let id = explicit_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow resume requires an explicit run id (set SEMA_WORKFLOW_RUN_ID)",
+            )
+        })?;
+        let events = Path::new(&runs_root).join(&id).join("events.jsonl");
+        if !events.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("cannot resume: no prior run journal at {}", events.display()),
+            ));
+        }
+        let journal = crate::journal::next_resume_segment(&runs_root, &id)?;
+        (id, journal)
+    } else if let Some(id) = explicit_id {
+        // Fresh run with an operator-chosen id: fail loudly if that dir already exists.
+        let journal = Journal::open(&runs_root, &id).map_err(|e| annotate_fresh_open(e, &id))?;
+        (id, journal)
     } else {
-        Journal::open(&runs_root, &run_id)?
+        // Fresh run with a generated id: retry past the (astronomically unlikely) dir
+        // collision with a new nonce each time.
+        open_fresh_generated(&runs_root)?
     };
     // metadata.json — self-describing run header. Best-effort; not part of the
     // byte-identical events.jsonl oracle.
@@ -847,21 +882,122 @@ const RESUME_ENV: &str = "SEMA_WORKFLOW_RESUME";
 /// Env seam: a stable hash of the workflow source, folded into every content-key.
 const CODE_VERSION_ENV: &str = "SEMA_WORKFLOW_CODE_VERSION";
 
-/// Resolve the run id for a new run: `SEMA_WORKFLOW_RUN_ID` if set, else a generated
-/// id of the form `wf_<unix_secs>_<pid>` — deterministic-enough to be unique per
-/// process without a random-number dependency, and overridable to a fixed value in
+/// Process-wide monotonic nonce folded into every generated run id, so two runs started
+/// in one process — even within the same nanosecond — never collide on a run directory.
+static RUN_ID_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Max attempts to place a generated run into a free directory. A generated id already
+/// folds in a process nonce, so a collision is astronomically unlikely; the bound only
+/// stops an infinite loop if the filesystem keeps returning `AlreadyExists` for some
+/// other reason.
+const MAX_FRESH_ATTEMPTS: u32 = 8;
+
+/// A freshly generated run id: `wf_<unix_secs>_<subsec_nanos>_<pid>_<nonce>`. No RNG
+/// dependency, yet unique per process: the nanosecond field separates rapid runs and the
+/// process nonce guarantees distinctness even at identical clock readings (two runs in
+/// the same second — or nanosecond — no longer share a directory).
+fn generate_run_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let nonce = RUN_ID_NONCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "wf_{}_{}_{}_{}",
+        now.as_secs(),
+        now.subsec_nanos(),
+        std::process::id(),
+        nonce
+    )
+}
+
+/// Validate an explicit run id (the `SEMA_WORKFLOW_RUN_ID` seam or a library caller) as
+/// exactly ONE safe path component: non-empty, no `/` or `\` separator, no `..` traversal,
+/// not a `.`-only component, and free of NUL / control characters — it joins straight into
+/// a filesystem path, so anything else is a traversal or a broken directory name. Returns
+/// `InvalidInput` on rejection.
+pub fn validate_explicit_run_id(id: &str) -> io::Result<()> {
+    let reject = |why: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("workflow run id {id:?} is not a safe directory name: {why}"),
+        )
+    };
+    if id.is_empty() {
+        return Err(reject("must not be empty"));
+    }
+    if id.contains('/') || id.contains('\\') {
+        return Err(reject("must not contain a path separator"));
+    }
+    if id.contains("..") {
+        return Err(reject("must not contain '..'"));
+    }
+    if id.bytes().all(|b| b == b'.') {
+        return Err(reject("must not be only '.' characters"));
+    }
+    if id.chars().any(|c| c == '\0' || c.is_control()) {
+        return Err(reject("must not contain NUL or control characters"));
+    }
+    Ok(())
+}
+
+/// Resolve the run id for a NEW run: the validated `SEMA_WORKFLOW_RUN_ID` seam if set and
+/// non-empty, else a freshly generated id (see [`generate_run_id`]). An invalid explicit
+/// id is an error rather than a silently sanitized path. Overridable to a fixed value in
 /// tests (the golden oracle sets `SEMA_WORKFLOW_RUN_ID=wf_test_0001`).
-pub fn resolve_run_id() -> String {
-    if let Ok(id) = std::env::var(RUN_ID_ENV) {
-        if !id.is_empty() {
-            return id;
+pub fn resolve_run_id() -> io::Result<String> {
+    match std::env::var(RUN_ID_ENV) {
+        Ok(id) if !id.is_empty() => {
+            validate_explicit_run_id(&id)?;
+            Ok(id)
+        }
+        _ => Ok(generate_run_id()),
+    }
+}
+
+/// Open a fresh run under a generated id, retrying with a new id (fresh nonce) on the
+/// unlikely directory collision. Returns the winning id alongside its opened journal.
+fn open_fresh_generated(runs_root: &str) -> io::Result<(String, Journal)> {
+    open_fresh_with(runs_root, generate_run_id)
+}
+
+/// The collision-retry core, with an injectable id source so the retry path is unit
+/// testable without racing the clock. Bounded by [`MAX_FRESH_ATTEMPTS`].
+fn open_fresh_with(
+    runs_root: &str,
+    mut next_id: impl FnMut() -> String,
+) -> io::Result<(String, Journal)> {
+    let mut last_err = None;
+    for _ in 0..MAX_FRESH_ATTEMPTS {
+        let id = next_id();
+        match Journal::open(runs_root, &id) {
+            Ok(journal) => return Ok((id, journal)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last_err = Some(e),
+            Err(e) => return Err(e),
         }
     }
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("wf_{secs}_{}", std::process::id())
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique workflow run directory",
+        )
+    }))
+}
+
+/// Turn the bare `AlreadyExists` from a fresh journal claim into an actionable message
+/// (keeping the error KIND so callers can still match on it), for an operator-chosen id
+/// whose journal already exists.
+fn annotate_fresh_open(err: io::Error, run_id: &str) -> io::Error {
+    if err.kind() == io::ErrorKind::AlreadyExists {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "a workflow run journal for {run_id:?} already exists; \
+                 choose a fresh run id or resume it with --resume"
+            ),
+        )
+    } else {
+        err
+    }
 }
 
 /// Format `SystemTime::now()` as an RFC3339 / ISO-8601 UTC string (`YYYY-MM-DDTHH:MM:SSZ`)
@@ -1193,6 +1329,73 @@ mod tests {
         // The parent's own teardown still works.
         assert!(state.remove(parent_token));
         assert!(state.current_ctx().is_none());
+    }
+
+    // ── run identity (A2) ────────────────────────────────────────────────
+
+    #[test]
+    fn generated_run_id_has_secs_nanos_pid_and_nonce() {
+        let a = generate_run_id();
+        let b = generate_run_id();
+        assert_ne!(a, b, "the process nonce makes back-to-back ids distinct");
+        for id in [&a, &b] {
+            assert!(id.starts_with("wf_"), "id keeps the wf_ prefix: {id}");
+            let parts: Vec<&str> = id.split('_').collect();
+            assert_eq!(parts.len(), 5, "wf_<secs>_<nanos>_<pid>_<nonce>: {id}");
+            for field in &parts[1..] {
+                assert!(
+                    !field.is_empty() && field.bytes().all(|c| c.is_ascii_digit()),
+                    "each generated id field is a non-empty number: {id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_explicit_run_id_accepts_safe_names_and_rejects_unsafe() {
+        for ok in ["wf_test_0001", "run-42", "abc.def", "a"] {
+            assert!(validate_explicit_run_id(ok).is_ok(), "should accept {ok:?}");
+        }
+        for bad in [
+            "",     // empty
+            "a/b",  // unix separator
+            "a\\b", // windows separator
+            "..",   // traversal
+            "a..b", // embedded traversal
+            ".",    // dot-only
+            "...",  // dots-only
+            "a\0b", // NUL
+            "a\nb", // control char
+        ] {
+            let err = validate_explicit_run_id(bad)
+                .expect_err(&format!("should reject {bad:?}"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn open_fresh_with_retries_past_a_colliding_id() {
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "sema-wf-fresh-retry-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root_str = root.to_string_lossy().to_string();
+        // The first two candidate ids already have a JOURNAL (events.jsonl); the opener
+        // must skip them (its create_new claim fails) and land on the first free id.
+        for taken in ["taken_1", "taken_2"] {
+            std::fs::create_dir_all(root.join(taken)).unwrap();
+            std::fs::write(root.join(taken).join("events.jsonl"), "{}\n").unwrap();
+        }
+        let mut candidates = ["taken_1", "taken_2", "free_3"].into_iter();
+        let (id, _journal) =
+            open_fresh_with(&root_str, || candidates.next().unwrap().to_string()).unwrap();
+        assert_eq!(id, "free_3", "opener retried past the colliding ids");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

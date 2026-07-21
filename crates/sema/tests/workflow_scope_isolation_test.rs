@@ -59,6 +59,30 @@ fn run_src(src: &str, run_id: &str) -> WfRun {
     WfRun { value, events }
 }
 
+/// As [`run_src`] but WITHOUT pinning an explicit `SEMA_WORKFLOW_RUN_ID`, so each
+/// `workflow/run` gets a distinct GENERATED id. Required for NESTED runs: under the A2
+/// run-identity guarantee two fresh runs can never share a directory, so a nested run
+/// coexists with its parent only when both ids are generated — the production shape (only
+/// `--resume` pins an explicit id). Events are not read back; the caller asserts on the
+/// returned value.
+fn run_src_generated(src: &str) -> Result<Value, String> {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("sema-wfiso-gen-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::env::set_var("SEMA_WORKFLOW_FIXED_TS", "0");
+    std::env::remove_var("SEMA_WORKFLOW_RUN_ID");
+    std::env::set_var("SEMA_WORKFLOW_RUN_DIR", &dir);
+
+    let interp = Interpreter::new();
+    let value = interp.eval_str_compiled(src).map_err(|e| e.to_string());
+
+    for v in ["SEMA_WORKFLOW_FIXED_TS", "SEMA_WORKFLOW_RUN_DIR"] {
+        std::env::remove_var(v);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    value
+}
+
 fn read_events(path: &std::path::Path) -> Vec<serde_json::Value> {
     std::fs::read_to_string(path)
         .unwrap_or_default()
@@ -244,8 +268,10 @@ fn spawned_child_inherits_workflow_and_step_attribution() {
 fn nested_runs_restore_exact_outer_scope_across_interleaved_teardown() {
     // A nested `workflow/run` installs and tears down its own scope; when it returns, the
     // OUTER run's scope is exactly restored, so the outer checkpoint reads back its own
-    // value (not the inner run's).
-    let out = run_src(
+    // value (not the inner run's). Uses GENERATED ids (no pinned RUN_ID) so the nested run
+    // gets its own directory — under A2 two fresh runs never share one, and a nested run's
+    // production form is a distinct generated id.
+    let value = run_src_generated(
         r#"
         (workflow/run "outer" "doc" {}
           (fn ()
@@ -257,9 +283,8 @@ fn nested_runs_restore_exact_outer_scope_across_interleaved_teardown() {
              :outer-readback (workflow/checkpoint :marker)
              :inner-status (:status inner)}))
         "#,
-        "wf_nested_iso",
-    );
-    let value = out.value.expect("program evaluated");
+    )
+    .expect("program evaluated");
     let rendered = sema_core::pretty_print(&value, 100);
     assert!(
         rendered.contains(":outer-readback :outer-value"),

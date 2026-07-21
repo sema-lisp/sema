@@ -108,6 +108,76 @@ pub fn run_workflow(src: &str, fake: FakeProvider, opts: RunOpts) -> RunOutput {
     }
 }
 
+/// Like [`run_once`] but WITHOUT pinning an explicit `SEMA_WORKFLOW_RUN_ID`, so every
+/// `workflow/run` (including one a `defworkflow`/`workflow/run-form` nests inside the
+/// outer run) gets its OWN generated id and directory. Under the A2 run-identity guarantee
+/// two fresh runs can never share a dir, so a nested/emitted run only coexists with its
+/// parent when ids are generated — the production shape (a plain `sema workflow run` never
+/// pins an id; only `--resume` does). Reads back the run whose `run.started` names
+/// `workflow_name` (there may be several run dirs — the outer and any nested runs).
+pub fn run_once_generated(src: &str, fake: FakeProvider, workflow_name: &str) -> RunOutput {
+    let _g: MutexGuard<()> = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut base = std::env::temp_dir();
+    base.push(format!(
+        "sema-wf-gen-{}-{workflow_name}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::env::set_var("SEMA_WORKFLOW_FIXED_TS", "0");
+    std::env::remove_var("SEMA_WORKFLOW_RUN_ID");
+    std::env::set_var("SEMA_WORKFLOW_RUN_DIR", &base);
+    std::env::set_var("SEMA_WORKFLOW_ARGS_JSON", "{}");
+    std::env::remove_var("SEMA_WORKFLOW_RESUME");
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    let recorder = fake.recorder();
+    register_test_provider(Box::new(fake));
+    let _ = interp.eval_str_compiled(src);
+
+    for v in [
+        "SEMA_WORKFLOW_FIXED_TS",
+        "SEMA_WORKFLOW_RUN_DIR",
+        "SEMA_WORKFLOW_ARGS_JSON",
+    ] {
+        std::env::remove_var(v);
+    }
+
+    // Find the generated run dir whose events.jsonl first line is the `run.started` for
+    // `workflow_name`; read its events + result.json.
+    let mut events = Vec::new();
+    let mut result = serde_json::Value::Null;
+    if let Ok(entries) = std::fs::read_dir(&base) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            let evs = std::fs::read_to_string(dir.join("events.jsonl")).unwrap_or_default();
+            let parsed: Vec<serde_json::Value> = evs
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str(l).expect("valid event json"))
+                .collect();
+            let is_target = parsed.first().is_some_and(|e| {
+                e["event"] == "run.started" && e["workflow"] == workflow_name
+            });
+            if is_target {
+                result = std::fs::read_to_string(dir.join("result.json"))
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                events = parsed;
+                break;
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
+    RunOutput {
+        events,
+        result,
+        recorder,
+    }
+}
+
 /// Convenience: run once into a fresh temp dir (created + cleaned up here).
 pub fn run_once(src: &str, fake: FakeProvider, run_id: &str) -> RunOutput {
     let mut dir = std::env::temp_dir();
@@ -115,6 +185,33 @@ pub fn run_once(src: &str, fake: FakeProvider, run_id: &str) -> RunOutput {
     let _ = std::fs::remove_dir_all(&dir);
     let out = run_workflow(src, fake, RunOpts::fresh(run_id, &dir));
     let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+/// Env vars every workflow test touches — cleared before/after a locked section so no run
+/// identity or seam leaks between tests sharing this process-global state.
+const WORKFLOW_ENV_VARS: [&str; 6] = [
+    "SEMA_WORKFLOW_FIXED_TS",
+    "SEMA_WORKFLOW_RUN_ID",
+    "SEMA_WORKFLOW_RUN_DIR",
+    "SEMA_WORKFLOW_CODE_VERSION",
+    "SEMA_WORKFLOW_ARGS_JSON",
+    "SEMA_WORKFLOW_RESUME",
+];
+
+/// Run `f` while holding the SAME process-wide lock `run_workflow` uses, with all
+/// `SEMA_WORKFLOW_*` vars cleared on entry and exit. For tests that drive run-identity /
+/// resume gating directly (not through a full `run_workflow`) while sharing the env with
+/// the harness so the two never interleave.
+pub fn with_workflow_env_lock<T>(f: impl FnOnce() -> T) -> T {
+    let _g: MutexGuard<()> = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    for v in WORKFLOW_ENV_VARS {
+        std::env::remove_var(v);
+    }
+    let out = f();
+    for v in WORKFLOW_ENV_VARS {
+        std::env::remove_var(v);
+    }
     out
 }
 

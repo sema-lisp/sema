@@ -3,6 +3,8 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 host_adapter_allowlist="$repo_root/scripts/unified-runtime-host-adapters.tsv"
+workflow_journal_allowlist="$repo_root/scripts/workflow-journal-fs-allowlist.tsv"
+workflow_journal_src="$repo_root/crates/sema-workflow/src/journal.rs"
 
 # ── Fixture pattern (used by --scan-path) ───────────────────────────────────
 # Broad "legacy async" markers used only to prove the scanner still detects a
@@ -329,6 +331,89 @@ check_restricted_paths() {
   rm -f "$hits_file"
 }
 
+# ── A2 workflow-journal filesystem policy ───────────────────────────────────
+# The per-run journal is claimed atomically (`create_new`), so a fresh run never appends
+# to another run's frozen event stream. This scan pins the SHAPE of the run-dir creation
+# in `journal.rs`: `create_dir_all` is allowed only for the parent chain and the memo
+# subdir (an exact count), and the exists-probe segment claim (`resume-…exists()`) that
+# A2 replaced is forbidden outright. Only the production module is scanned — the
+# `#[cfg(test)]` block is never shipped and legitimately calls `create_dir_all`.
+scan_workflow_journal_file() {
+  local file="$1" rel prod matched ln
+  rel=$(repo_relative_path "$file")
+  # Comment-strip, then keep only the production module (drop the `#[cfg(test)]` block and
+  # everything after it). On a fixture without that marker, the whole file is scanned.
+  prod=$(sed -E 's://.*$::' "$file" | sed -n '1,/#\[cfg(test)\]/p')
+  matched=$(printf '%s\n' "$prod" | rg -n --no-heading --color never '\bcreate_dir_all\b' || true)
+  while IFS=: read -r ln _; do
+    [[ -z "$ln" ]] && continue
+    printf 'WORKFLOW_CREATE_DIR_ALL\t%s:%s\n' "$rel" "$ln"
+  done <<< "$matched"
+  matched=$(printf '%s\n' "$prod" \
+    | rg -n --no-heading --color never 'resume-.*\.exists[[:space:]]*\(' || true)
+  while IFS=: read -r ln _; do
+    [[ -z "$ln" ]] && continue
+    printf 'WORKFLOW_SEGMENT_EXISTS_PROBE\t%s:%s\n' "$rel" "$ln"
+  done <<< "$matched"
+}
+
+check_workflow_journal_file() {
+  local file="$1" allowlist="$2"
+  if [[ ! -f "$file" ]]; then
+    echo "workflow journal source is missing: $file" >&2
+    return 2
+  fi
+  if [[ ! -f "$allowlist" ]]; then
+    echo "workflow-journal fs allowlist is missing: $allowlist" >&2
+    return 2
+  fi
+  local hits_file
+  hits_file=$(mktemp)
+  scan_workflow_journal_file "$file" >"$hits_file"
+  if ! awk -F '\t' '
+    BEGIN {
+      valid["WORKFLOW_CREATE_DIR_ALL"] = 1
+      valid["WORKFLOW_SEGMENT_EXISTS_PROBE"] = 1
+    }
+    FILENAME == ARGV[1] {
+      if ($0 ~ /^[[:space:]]*(#|$)/) next
+      if (NF < 2 || !($1 in valid) || $2 !~ /^[0-9]+$/) {
+        print "malformed workflow-journal allowlist row: " $0 > "/dev/stderr"
+        invalid = 1
+        next
+      }
+      expected[$1] = $2 + 0
+      next
+    }
+    { actual[$1]++; sample[$1] = $2 }
+    END {
+      for (t in actual) {
+        if (!(t in expected)) {
+          print "forbidden workflow-journal fs shape " t " at " sample[t] \
+            " (reintroduced run-dir reuse / exists-probe)" > "/dev/stderr"
+          invalid = 1
+        } else if (actual[t] != expected[t]) {
+          print "workflow-journal create_dir_all count changed for " t \
+            ": expected " expected[t] ", found " actual[t] > "/dev/stderr"
+          invalid = 1
+        }
+      }
+      for (t in expected) {
+        if (!(t in actual) && expected[t] != 0) {
+          print "workflow-journal allowlist entry is stale for " t \
+            ": expected " expected[t] ", found 0" > "/dev/stderr"
+          invalid = 1
+        }
+      }
+      exit invalid
+    }
+  ' "$allowlist" "$hits_file"; then
+    rm -f "$hits_file"
+    return 1
+  fi
+  rm -f "$hits_file"
+}
+
 check_source_policy_paths() {
   local allowlist="$1"
   shift
@@ -380,9 +465,20 @@ case "${1:-}" in
     fi
     check_source_policy_paths "$3" "$2"
     ;;
+  --check-workflow-journal)
+    if [[ $# -ne 3 ]]; then
+      echo "usage: $0 --check-workflow-journal FILE ALLOWLIST" >&2
+      exit 2
+    fi
+    check_workflow_journal_file "$2" "$3"
+    ;;
   ""|--check)
     if ! check_source_policy_paths "$host_adapter_allowlist" crates/*/src playground/src; then
       echo "unified-runtime source policy failed" >&2
+      exit 1
+    fi
+    if ! check_workflow_journal_file "$workflow_journal_src" "$workflow_journal_allowlist"; then
+      echo "workflow-journal filesystem policy failed" >&2
       exit 1
     fi
     bash "$repo_root/scripts/test-unified-runtime-source-policy.sh"

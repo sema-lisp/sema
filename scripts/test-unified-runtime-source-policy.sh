@@ -157,4 +157,45 @@ expect_success \
   "$fixtures/comments-only.rs" \
   "$fixtures/empty-allowlist.tsv"
 
+# ── A2 workflow-journal filesystem policy ───────────────────────────────────
+wf_journal_allowlist="$repo_root/scripts/workflow-journal-fs-allowlist.tsv"
+
+expect_journal_success() {
+  local fixture="$1" allowlist="$2" output
+  if ! output="$($scanner --check-workflow-journal "$fixture" "$allowlist" 2>&1)"; then
+    echo "workflow-journal fixture unexpectedly failed: $fixture" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+}
+
+expect_journal_failure() {
+  local fixture="$1" allowlist="$2"
+  shift 2
+  local output
+  if output="$($scanner --check-workflow-journal "$fixture" "$allowlist" 2>&1)"; then
+    echo "workflow-journal fixture unexpectedly passed: $fixture" >&2
+    exit 1
+  fi
+  for expected in "$@"; do
+    if [[ "$output" != *"$expected"* ]]; then
+      echo "workflow-journal fixture did not report '$expected': $fixture" >&2
+      echo "$output" >&2
+      exit 1
+    fi
+  done
+}
+
+# The sanctioned shape (create_new claim, parent+memo create_dir_all only) PASSES.
+expect_journal_success \
+  "$fixtures/workflow-journal-clean.rs" \
+  "$wf_journal_allowlist"
+
+# Reintroducing the exists-probe segment claim FAILS, even with the allowlisted
+# create_dir_all count intact.
+expect_journal_failure \
+  "$fixtures/workflow-journal-exists-probe.rs" \
+  "$wf_journal_allowlist" \
+  WORKFLOW_SEGMENT_EXISTS_PROBE
+
 echo "ok: unified-runtime source-policy fixtures"

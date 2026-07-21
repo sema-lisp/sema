@@ -1,0 +1,12 @@
+# Workflow journal filesystem policy (A2 — safe run identity).
+#
+# The per-run journal file is claimed ATOMICALLY (`create_new` on events.jsonl /
+# events.resume-<n>.jsonl), so two runs never share and corrupt one event stream.
+# `create_dir_all` is permitted ONLY for the parent chain and the memo subdir — NEVER
+# recursively over the run dir itself (the reuse shape this guard forbids). Segment claims
+# use `create_new`, never an exists-probe, so WORKFLOW_SEGMENT_EXISTS_PROBE has NO row
+# (any hit fails). The scan counts the production module only (the #[cfg(test)] block is
+# never shipped).
+#
+# Format: TOKEN<TAB>COUNT<TAB>reason
+WORKFLOW_CREATE_DIR_ALL	2	parent-chain + memo subdir only; the run dir is never create_dir_all'd (journal claim is create_new)

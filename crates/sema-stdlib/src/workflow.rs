@@ -23,7 +23,7 @@
 use sema_core::cycle::GcEdge;
 use sema_core::runtime::{
     NativeCall, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, ResumeInput,
-    Trace,
+    TaskContextHandle, Trace,
 };
 use sema_core::{SemaError, Value};
 use sema_workflow::context;
@@ -208,9 +208,11 @@ fn end_run_before_body(
     envelope
 }
 
-/// Post-thunk teardown for a `register_thunk_fn` native: given the teardown state and
-/// the thunk's result, journal/close and return the builtin's value.
-type FinishFn<T> = fn(T, Result<Value, SemaError>) -> Result<Value, SemaError>;
+/// Post-thunk teardown for a `register_thunk_fn` native: given the owning task context
+/// (so the live scope resolves off the task, not TLS), the teardown state, and the
+/// thunk's result, journal/close and return the builtin's value.
+type FinishFn<T> =
+    fn(Option<&TaskContextHandle>, T, Result<Value, SemaError>) -> Result<Value, SemaError>;
 /// Trace the `Value` edges a teardown state carries (a run's open MCP handles; none for
 /// a step).
 type TraceTeardownFn<T> = fn(&T, &mut dyn FnMut(GcEdge<'_>));
@@ -228,7 +230,7 @@ type TraceTeardownFn<T> = fn(&T, &mut dyn FnMut(GcEdge<'_>));
 fn register_thunk_fn<T: 'static>(
     env: &sema_core::Env,
     name: &'static str,
-    plan: impl Fn(&[Value]) -> Result<ThunkPlan<T>, SemaError> + 'static,
+    plan: impl Fn(Option<&TaskContextHandle>, &[Value]) -> Result<ThunkPlan<T>, SemaError> + 'static,
     finish: FinishFn<T>,
     trace_teardown: TraceTeardownFn<T>,
 ) {
@@ -239,25 +241,57 @@ fn register_thunk_fn<T: 'static>(
         sema_core::intern(name),
         Value::native_fn(sema_core::NativeFn::simple_with_runtime(
             name,
-            move |args| match for_legacy(args)? {
+            // Host arm (outside a runtime quantum): no task context — scope resolves off
+            // the `WORKFLOW` thread-local fallback.
+            move |args| match for_legacy(None, args)? {
                 ThunkPlan::Immediate(value) => Ok(value),
                 ThunkPlan::Run { thunk, teardown } => {
                     let result = crate::list::call_function(&thunk, &[]);
-                    finish(teardown, result)
+                    finish(None, teardown, result)
                 }
             },
-            move |_ctx, args| match for_runtime(args)? {
-                ThunkPlan::Immediate(value) => Ok(NativeOutcome::Return(value)),
-                ThunkPlan::Run { thunk, teardown } => Ok(NativeOutcome::Call(NativeCall {
-                    callable: thunk,
-                    args: Vec::new(),
-                    continuation: Box::new(ThunkContinuation {
-                        teardown: Some(teardown),
-                        finish,
-                        trace_teardown,
-                        name,
-                    }),
-                })),
+            // Runtime arm: install/read/remove the scope on the OWNING TASK's context, so
+            // a sibling task interleaved on the thread never resolves to this run.
+            move |ctx, args| {
+                let task_context = ctx.task_context.clone();
+                match for_runtime(Some(&task_context), args)? {
+                    ThunkPlan::Immediate(value) => Ok(NativeOutcome::Return(value)),
+                    ThunkPlan::Run { thunk, teardown } => Ok(NativeOutcome::Call(NativeCall {
+                        callable: thunk,
+                        args: Vec::new(),
+                        continuation: Box::new(ThunkContinuation {
+                            teardown: Some(teardown),
+                            finish,
+                            trace_teardown,
+                            name,
+                        }),
+                    })),
+                }
+            },
+        )),
+    );
+}
+
+/// Register a non-thunk workflow builtin (`workflow/phase`, `workflow/tool-call`,
+/// `workflow/mcp-handle`) as a DUAL-ABI native so its runtime arm reads the task-scoped
+/// workflow state instead of the `WORKFLOW` thread-local. The host arm passes `None`
+/// (host fallback); the runtime arm passes the owning task's context.
+fn register_scoped_fn(
+    env: &sema_core::Env,
+    name: &'static str,
+    body: impl Fn(Option<&TaskContextHandle>, &[Value]) -> Result<Value, SemaError> + 'static,
+) {
+    let body = Rc::new(body);
+    let for_legacy = body.clone();
+    let for_runtime = body;
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
+            name,
+            move |args| for_legacy(None, args),
+            move |ctx, args| {
+                let task_context = ctx.task_context.clone();
+                Ok(NativeOutcome::Return(for_runtime(Some(&task_context), args)?))
             },
         )),
     );
@@ -294,7 +328,7 @@ impl<T> Trace for ThunkContinuation<T> {
 impl<T: 'static> NativeContinuation for ThunkContinuation<T> {
     fn resume(
         mut self: Box<Self>,
-        _context: &mut NativeCallContext<'_>,
+        context: &mut NativeCallContext<'_>,
         input: ResumeInput,
     ) -> NativeResult {
         let result = match input {
@@ -313,7 +347,8 @@ impl<T: 'static> NativeContinuation for ThunkContinuation<T> {
             .teardown
             .take()
             .expect("thunk continuation resumed once");
-        (self.finish)(teardown, result).map(NativeOutcome::Return)
+        let task_context = context.task_context.clone();
+        (self.finish)(Some(&task_context), teardown, result).map(NativeOutcome::Return)
     }
 }
 
@@ -331,6 +366,7 @@ struct StepTeardown {
 /// live scope (still installed by the enclosing `workflow/run` guard) rather than
 /// capturing it. Shared by the legacy and cooperative paths.
 fn finish_step(
+    task_context: Option<&TaskContextHandle>,
     teardown: Option<StepTeardown>,
     result: Result<Value, SemaError>,
 ) -> Result<Value, SemaError> {
@@ -338,10 +374,10 @@ fn finish_step(
         // Transparent (outside a run): nothing to journal.
         return result;
     };
-    let Some(ctx) = context::current() else {
+    let Some(ctx) = context::current_for(task_context) else {
         return result;
     };
-    ctx.set_cur_agent(None);
+    context::set_cur_agent_for(task_context, None);
     let dur_ms = if ctx.deterministic() {
         0
     } else {
@@ -386,7 +422,10 @@ fn finish_step(
 
 /// Pre-thunk work for `workflow/step` — see the original inline documentation preserved
 /// in `finish_step` and the event emissions below.
-fn step_plan(args: &[Value]) -> Result<ThunkPlan<Option<StepTeardown>>, SemaError> {
+fn step_plan(
+    task_context: Option<&TaskContextHandle>,
+    args: &[Value],
+) -> Result<ThunkPlan<Option<StepTeardown>>, SemaError> {
     if args.len() != 2 {
         return Err(SemaError::arity("workflow/step", "2", args.len()));
     }
@@ -394,7 +433,7 @@ fn step_plan(args: &[Value]) -> Result<ThunkPlan<Option<StepTeardown>>, SemaErro
     // form), or a bare keyword/string label. Default role is "agent".
     let label = agent_role(&args[0]);
     let thunk = args[1].clone();
-    let Some(ctx) = context::current() else {
+    let Some(ctx) = context::current_for(task_context) else {
         // Outside a run: transparent — just call the thunk (still cooperatively, so an
         // async op inside it works), with no journaling teardown.
         return Ok(ThunkPlan::Run {
@@ -445,10 +484,10 @@ fn step_plan(args: &[Value]) -> Result<ThunkPlan<Option<StepTeardown>>, SemaErro
     // fan-out can't clobber the tally. The guard pops the frame when the teardown drops it.
     let usage_scope = sema_llm::builtins::open_usage_scope();
     // Mark this as the current agent so `workflow/tool-call` inside the thunk attributes
-    // to it; cleared in `finish_step`. `cur_agent` is a single shared slot — under a
-    // CONCURRENT `:tools` fan-out attribution is best-effort (same single-slot caveat as
-    // the per-agent budget).
-    ctx.set_cur_agent(Some(agent_id.clone()));
+    // to it; cleared in `finish_step`. `cur_agent` is TASK-PRIVATE, so two concurrent
+    // steps on sibling tasks keep distinct active agents (no cross-attribution); a child
+    // spawned inside the thunk inherits this attribution.
+    context::set_cur_agent_for(task_context, Some(agent_id.clone()));
     Ok(ThunkPlan::Run {
         thunk,
         teardown: Some(StepTeardown {
@@ -468,14 +507,17 @@ struct CheckpointTeardown {
     resume_key: String,
 }
 
-fn checkpoint_plan(args: &[Value]) -> Result<ThunkPlan<CheckpointTeardown>, SemaError> {
+fn checkpoint_plan(
+    task_context: Option<&TaskContextHandle>,
+    args: &[Value],
+) -> Result<ThunkPlan<CheckpointTeardown>, SemaError> {
     if args.is_empty() || args.len() > 2 {
         return Err(SemaError::arity("workflow/checkpoint", "1-2", args.len()));
     }
     let key = as_name(&args[0])
         .ok_or_else(|| SemaError::type_error("keyword or string", args[0].type_name()))?;
-    let ctx =
-        context::current().ok_or_else(|| SemaError::eval("checkpoint outside a workflow/run"))?;
+    let ctx = context::current_for(task_context)
+        .ok_or_else(|| SemaError::eval("checkpoint outside a workflow/run"))?;
 
     if args.len() == 1 {
         return Ok(ThunkPlan::Immediate(
@@ -500,11 +542,12 @@ fn checkpoint_plan(args: &[Value]) -> Result<ThunkPlan<CheckpointTeardown>, Sema
 }
 
 fn finish_checkpoint(
+    task_context: Option<&TaskContextHandle>,
     teardown: CheckpointTeardown,
     result: Result<Value, SemaError>,
 ) -> Result<Value, SemaError> {
     let value = result?;
-    let Some(ctx) = context::current() else {
+    let Some(ctx) = context::current_for(task_context) else {
         return Ok(value);
     };
     ctx.store_checkpoint(&teardown.key, value.clone());
@@ -522,24 +565,54 @@ fn finish_checkpoint(
     Ok(value)
 }
 
-/// Post-thunk teardown state for `workflow/run`. Holds the scope guard (dropped last,
-/// after `run.ended` + `result.json`) and any open MCP handles to close (the handles are
-/// `Value`s — traced).
+/// Post-thunk teardown state for `workflow/run`. Holds the scope guard (whose Drop
+/// removes the exact scope token, LAST — after `run.ended` + `result.json`) and, until
+/// closed exactly once, the resolver + open MCP handles (the handles are `Value`s —
+/// traced).
 struct RunTeardown {
+    // A pure RAII drop guard: never read by name (a type with a manual `Drop` cannot be
+    // destructured), it exists solely so its own `Drop` removes the exact scope token
+    // whenever the `RunTeardown` is dropped — on `finish_run`, or via the backstop.
+    #[allow(dead_code)]
     guard: context::WorkflowGuard,
-    mcp_resolver: Option<Rc<dyn WorkflowMcpResolver>>,
-    mcp_handles: Vec<Value>,
+    mcp: Option<McpClose>,
+}
+
+/// Resolver + open MCP handles to close exactly once — whether the run ends normally,
+/// errors, is cancelled, or its continuation is dropped without ever resuming.
+struct McpClose {
+    resolver: Rc<dyn WorkflowMcpResolver>,
+    handles: Vec<Value>,
+}
+
+impl RunTeardown {
+    /// Close the run's MCP handles exactly once (idempotent — the `Drop` backstop calls
+    /// this too). A run with no `:mcp` has nothing to close.
+    fn close_mcp(&mut self) {
+        if let Some(mcp) = self.mcp.take() {
+            mcp.resolver.close(&mcp.handles);
+        }
+    }
+}
+
+impl Drop for RunTeardown {
+    fn drop(&mut self) {
+        // Backstop: a continuation dropped WITHOUT resume (runtime teardown) still closes
+        // MCP exactly once; the `guard` field's own Drop then removes the exact scope
+        // token, so no run leaks its handles or its scope.
+        self.close_mcp();
+    }
 }
 
 /// Derive the run envelope from the body's result, journal `run.ended`, write
-/// `result.json`, close any MCP handles, then drop the scope guard. Shared by the legacy
-/// and cooperative paths; always returns an envelope (a body error becomes a failed one).
-fn finish_run(teardown: RunTeardown, result: Result<Value, SemaError>) -> Result<Value, SemaError> {
-    let RunTeardown {
-        guard,
-        mcp_resolver,
-        mcp_handles,
-    } = teardown;
+/// `result.json`, close any MCP handles, then remove the scope token. Shared by the
+/// legacy and cooperative paths; always returns an envelope (a body error becomes a
+/// failed one).
+fn finish_run(
+    task_context: Option<&TaskContextHandle>,
+    mut teardown: RunTeardown,
+    result: Result<Value, SemaError>,
+) -> Result<Value, SemaError> {
     let (mut status, mut envelope, mut reason) = match &result {
         Ok(v) => ("success", success_envelope(v.clone()), None),
         Err(e) => (
@@ -549,10 +622,8 @@ fn finish_run(teardown: RunTeardown, result: Result<Value, SemaError>) -> Result
         ),
     };
     // Close any resolved MCP handles exactly once, regardless of how the body exited.
-    if let Some(resolver) = mcp_resolver {
-        resolver.close(&mcp_handles);
-    }
-    if let Some(ctx) = context::current() {
+    teardown.close_mcp();
+    if let Some(ctx) = context::current_for(task_context) {
         // A tripped budget cap fails the run regardless of the body's own outcome.
         if ctx.over_budget() {
             status = "failed";
@@ -569,7 +640,9 @@ fn finish_run(teardown: RunTeardown, result: Result<Value, SemaError>) -> Result
         });
         ctx.write_result(&envelope);
     }
-    drop(guard);
+    // Dropping the teardown removes the exact scope token (its `guard`) and is a no-op
+    // second MCP close.
+    drop(teardown);
     Ok(envelope)
 }
 
@@ -577,7 +650,10 @@ fn finish_run(teardown: RunTeardown, result: Result<Value, SemaError>) -> Result
 /// any declared `:mcp` servers (a pre-body gate that can end the run before the body ever
 /// runs), and hand back the body thunk plus the teardown state. Mirrors the original
 /// inline builtin; the post-body work moved to `finish_run`.
-fn run_plan(args: &[Value]) -> Result<ThunkPlan<RunTeardown>, SemaError> {
+fn run_plan(
+    task_context: Option<&TaskContextHandle>,
+    args: &[Value],
+) -> Result<ThunkPlan<RunTeardown>, SemaError> {
     if args.len() != 4 {
         return Err(SemaError::arity("workflow/run", "4", args.len()));
     }
@@ -595,12 +671,12 @@ fn run_plan(args: &[Value]) -> Result<ThunkPlan<RunTeardown>, SemaError> {
     // the thread-local WorkflowCtx, and returns a panic-safe Drop guard that reaps the
     // previous scope. `set_workflow_scope` reads the SEMA_WORKFLOW_RUN_ID /
     // SEMA_WORKFLOW_FIXED_TS test seam internally.
-    let guard = context::set_workflow_scope(&name, &doc, &meta)
+    let guard = context::set_workflow_scope(&name, &doc, &meta, task_context)
         .map_err(|e| SemaError::eval(format!("workflow/run: {e}")))?;
 
     // run.started — emitted inside the live scope so seq starts at 0.
     {
-        let ctx = context::current()
+        let ctx = context::current_for(task_context)
             .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
         ctx.emit(WorkflowEvent::RunStarted {
             seq: ctx.next_seq(),
@@ -620,7 +696,7 @@ fn run_plan(args: &[Value]) -> Result<ThunkPlan<RunTeardown>, SemaError> {
     let decls = match workflow_mcp::declared_mcp(&meta) {
         Ok(d) => d,
         Err(e) => {
-            let ctx = context::current()
+            let ctx = context::current_for(task_context)
                 .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
             let envelope = failed_envelope(&e.to_string());
             return Ok(ThunkPlan::Immediate(end_run_before_body(
@@ -633,12 +709,12 @@ fn run_plan(args: &[Value]) -> Result<ThunkPlan<RunTeardown>, SemaError> {
         }
     };
 
-    // Handles resolved below (if any), closed exactly once after the body exits.
-    let mut mcp_resolver: Option<Rc<dyn WorkflowMcpResolver>> = None;
-    let mut mcp_handles: Vec<Value> = Vec::new();
+    // Resolver + handles resolved below (if any), closed exactly once after the body
+    // exits (or when a dropped continuation triggers the teardown backstop).
+    let mut mcp: Option<McpClose> = None;
 
     if !decls.is_empty() {
-        let ctx = context::current()
+        let ctx = context::current_for(task_context)
             .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
         ctx.set_mcp_declared(decls.iter().map(|d| d.alias.clone()).collect());
 
@@ -747,17 +823,15 @@ fn run_plan(args: &[Value]) -> Result<ThunkPlan<RunTeardown>, SemaError> {
         // Every declared server connected: publish handles for workflow/mcp-handle, and
         // remember (resolver, handles) so `finish_run` closes them EXACTLY once.
         ctx.set_mcp_handles(connected);
-        mcp_resolver = Some(resolver);
-        mcp_handles = connected_handles;
+        mcp = Some(McpClose {
+            resolver,
+            handles: connected_handles,
+        });
     }
 
     Ok(ThunkPlan::Run {
         thunk,
-        teardown: RunTeardown {
-            guard,
-            mcp_resolver,
-            mcp_handles,
-        },
+        teardown: RunTeardown { guard, mcp },
     })
 }
 
@@ -773,8 +847,10 @@ pub fn register(env: &sema_core::Env) {
         finish_run,
         |teardown: &RunTeardown, sink: &mut dyn FnMut(GcEdge<'_>)| {
             // The only GC-visible state a pending run holds is its open MCP handles.
-            for handle in &teardown.mcp_handles {
-                sink(GcEdge::Value(handle));
+            if let Some(mcp) = &teardown.mcp {
+                for handle in &mcp.handles {
+                    sink(GcEdge::Value(handle));
+                }
             }
         },
     );
@@ -783,7 +859,7 @@ pub fn register(env: &sema_core::Env) {
     // the previously-open phase (emitting its phase.ended) then opens `label`. The
     // checkpoints/agents that follow attribute to this phase until the next marker or
     // the run end (`workflow/run` closes the last open phase). Returns nil.
-    crate::register_fn(env, "workflow/phase", |args| {
+    register_scoped_fn(env, "workflow/phase", |task_context, args| {
         if args.len() != 1 {
             return Err(SemaError::arity("workflow/phase", "1", args.len()));
         }
@@ -791,7 +867,7 @@ pub fn register(env: &sema_core::Env) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
             .to_string();
-        let ctx = context::current()
+        let ctx = context::current_for(task_context)
             .ok_or_else(|| SemaError::eval("workflow/phase outside a workflow/run"))?;
 
         // Reaching a new marker means the prior phase completed successfully.
@@ -830,14 +906,14 @@ pub fn register(env: &sema_core::Env) {
     // agent (the dashboard renders these as tool twigs in the agent's drill-in).
     // No-op (returns nil) outside a workflow/step. `args` is an opaque/gated
     // descriptor; pass a string or omit for the "gated" sentinel.
-    crate::register_fn(env, "workflow/tool-call", |args| {
+    register_scoped_fn(env, "workflow/tool-call", |task_context, args| {
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("workflow/tool-call", "1-2", args.len()));
         }
         let tool_name = as_name(&args[0])
             .ok_or_else(|| SemaError::type_error("keyword or string", args[0].type_name()))?;
-        if let Some(ctx) = context::current() {
-            if let Some(agent_id) = ctx.cur_agent() {
+        if let Some(ctx) = context::current_for(task_context) {
+            if let Some(agent_id) = context::cur_agent_for(task_context) {
                 // The args descriptor is a string (the manual demo form) OR a structured
                 // value (the real on-tool-call callback passes the tool's arg map) —
                 // render the latter so args_json carries the real call args, not "gated".
@@ -882,7 +958,7 @@ pub fn register(env: &sema_core::Env) {
     // workflow/run only invokes after every declared server resolves to
     // Connected — so that call site is always safe. A direct/manual call
     // site (not the macro-generated one) is still handled defensively below.
-    crate::register_fn(env, "workflow/mcp-handle", |args| {
+    register_scoped_fn(env, "workflow/mcp-handle", |task_context, args| {
         if args.len() != 1 {
             return Err(SemaError::arity("workflow/mcp-handle", "1", args.len()));
         }
@@ -893,7 +969,7 @@ pub fn register(env: &sema_core::Env) {
                 SemaError::type_error("symbol or keyword", args[0].type_name())
                     .with_hint("e.g. (workflow/mcp-handle 'asana) or (workflow/mcp-handle :asana)")
             })?;
-        let ctx = context::current().ok_or_else(|| {
+        let ctx = context::current_for(task_context).ok_or_else(|| {
             SemaError::eval("workflow/mcp-handle outside a workflow/run")
                 .with_hint("call workflow/mcp-handle from inside a running workflow's body")
         })?;
@@ -984,7 +1060,7 @@ mod continuation_tests {
         // Stand-in teardown that carries two `Value` handles, traced like `RunTeardown`.
         let cont = ThunkContinuation::<Vec<Value>> {
             teardown: Some(vec![Value::int(1), Value::int(2)]),
-            finish: |_t, r| r,
+            finish: |_tc, _t, r| r,
             trace_teardown: |t: &Vec<Value>, sink: &mut dyn FnMut(GcEdge<'_>)| {
                 for v in t {
                     sink(GcEdge::Value(v));
@@ -999,7 +1075,7 @@ mod continuation_tests {
         // A step-shaped teardown (no `Value`) exposes zero edges.
         let empty = ThunkContinuation::<()> {
             teardown: Some(()),
-            finish: |_t, r| r,
+            finish: |_tc, _t, r| r,
             trace_teardown: |_t, _sink| {},
             name: "workflow/test",
         };

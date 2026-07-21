@@ -101,6 +101,15 @@ expect_failure \
   "active-runtime synchronous callback re-entry" \
   CALL_CALLBACK
 
+# A workflow-scope TLS read allowlisted by exact count must STILL fail when it sits
+# inside an active runtime branch: the runtime path must reach the live run through the
+# owning task context, never the `WORKFLOW` thread-local.
+expect_failure \
+  "$fixtures/active-runtime-workflow-tls.rs" \
+  "$fixtures/active-runtime-workflow-tls-allowlist.tsv" \
+  "active-runtime synchronous callback re-entry" \
+  WORKFLOW_TLS
+
 expect_failure \
   "$fixtures/active-runtime-compound-negation.rs" \
   "$fixtures/active-runtime-compound-negation-allowlist.tsv" \

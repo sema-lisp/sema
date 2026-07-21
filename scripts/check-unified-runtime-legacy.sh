@@ -58,6 +58,7 @@ restricted_tokens=(
   'WITH_STDLIB_CTX|\bwith_stdlib_ctx([[:space:]]*<|[[:space:]]*\()'
   'SET_CALL_OWNED_CALLBACK|\bset_call_owned_callback[[:space:]]*\('
   'SET_CALL_CALLBACK|\bset_call_callback[[:space:]]*\('
+  'WORKFLOW_TLS|\bWORKFLOW\.with\b'
 )
 
 # Exact-file allowlist (no globs). A purged identifier surviving here is a KNOWN,
@@ -239,6 +240,8 @@ scan_active_runtime_callbacks_paths() {
           if $body =~ /\bcall_callback\s*\(/;
         print "WITH_STDLIB_CTX\t$line:$condition\n"
           if $body =~ /\bwith_stdlib_ctx\s*(?:<|\()/;
+        print "WORKFLOW_TLS\t$line:$condition\n"
+          if $body =~ /\bWORKFLOW\.with\b/;
       }
     ' "$file" || true)
     while IFS=$'\t' read -r token line; do
@@ -270,6 +273,7 @@ check_restricted_paths() {
       valid["WITH_STDLIB_CTX"] = 1
       valid["SET_CALL_CALLBACK"] = 1
       valid["SET_CALL_OWNED_CALLBACK"] = 1
+      valid["WORKFLOW_TLS"] = 1
     }
     FILENAME == ARGV[1] {
       if ($0 ~ /^[[:space:]]*(#|$)/) next

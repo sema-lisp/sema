@@ -31,3 +31,4 @@ WITH_STDLIB_CTX	crates/sema-core/src/context.rs	2	host-only shared-context defin
 WITH_STDLIB_CTX	crates/sema-llm/src/builtins.rs	2	host-only Lisp-provider trait and synchronous extraction-validation adapters
 WITH_STDLIB_CTX	crates/sema-stdlib/src/io.rs	3	host-only file-line callback adapters guarded away from runtime paths
 WITH_STDLIB_CTX	crates/sema-stdlib/src/list.rs	3	host-only plain-value HOF adapters; runtime HOFs dispatch structurally
+WORKFLOW_TLS	crates/sema-workflow/src/context.rs	1	host-adapter-only fallback scope store read only when !in_runtime_quantum(); the runtime path lives on the owning task context

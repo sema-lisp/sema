@@ -1276,3 +1276,55 @@ fn self_tail_named_let_with_capture_still_collects_no_cycle() {
     );
     assert_eq!(v, Value::list(vec![Value::keyword("done"), Value::int(0)]));
 }
+
+// ── Workflow checkpoint state bag traced through the task-local scope ──
+
+#[test]
+fn workflow_checkpoint_self_cycle_survives_a_live_collection() {
+    // A self-cyclic mutable array is checkpointed and its binding discarded, so the ONLY
+    // strong reference is the run's state bag. A collection WHILE the run is live must not
+    // free it: the run's `WorkflowCtx` is a TRACED task-local scope (Invariant I2), so the
+    // collector reaches the array and reading `:cyc` back returns the intact structure.
+    // Without the trace the collector would sever the cycle as garbage and the read-back
+    // would corrupt.
+    let dir = temp_dir("wf-gc-cycle");
+    std::env::set_var("SEMA_WORKFLOW_FIXED_TS", "0");
+    std::env::set_var("SEMA_WORKFLOW_RUN_ID", "wf_gc_cycle");
+    std::env::set_var("SEMA_WORKFLOW_RUN_DIR", &dir);
+
+    let v = Interpreter::new().eval_str_compiled(
+        r#"
+        (workflow/run "gc-cycle" "doc" {}
+          (fn ()
+            (gc/collect)
+            ;; store a self-cycle reachable ONLY through the run state bag
+            (workflow/checkpoint :cyc
+              (fn ()
+                (let ((a (mutable-array/new)))
+                  (mutable-array/push! a a)
+                  (mutable-array/push! a 42)
+                  a)))
+            (gc/collect)
+            (let ((back (workflow/checkpoint :cyc)))
+              {:status :success
+               :len (mutable-array/length back)
+               :second (mutable-array/get back 1)})))
+        "#,
+    );
+
+    for k in [
+        "SEMA_WORKFLOW_FIXED_TS",
+        "SEMA_WORKFLOW_RUN_ID",
+        "SEMA_WORKFLOW_RUN_DIR",
+    ] {
+        std::env::remove_var(k);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let result = v.expect("workflow evaluated");
+    assert_eq!(
+        result,
+        eval_ok("{:status :success :len 2 :second 42}"),
+        "the live checkpoint cycle must survive a collection intact"
+    );
+}

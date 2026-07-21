@@ -1,22 +1,34 @@
 //! Run-scoped dynamic context for a workflow run.
 //!
-//! A workflow run installs a [`WorkflowCtx`] into a thread-local for the duration of
-//! the run via [`set_workflow_scope`]; every builtin (`workflow/phase`, `checkpoint`,
-//! …) reaches the live context through [`current`]. The scope is restored on drop via
-//! a panic-safe RAII guard (mirrors `sema_otel`'s `ConversationGuard`), so a nested
-//! run — or a panic unwinding through a phase thunk — cannot leave a stale context
-//! installed.
+//! A workflow run installs a [`WorkflowCtx`] as a scope on the OWNING TASK via
+//! [`set_workflow_scope`]; every builtin (`workflow/phase`, `checkpoint`, …) reaches the
+//! live context through [`current_for`], reading the task-local [`WorkflowTaskState`]
+//! extension. The scope is a token-keyed stack entry restored on drop via a panic-safe
+//! RAII guard (mirrors `DynamicTaskState`'s `ScopeId` removal), so a nested run — or a
+//! panic unwinding through a phase thunk — cannot leave a stale context installed, and a
+//! sibling task interleaved on the same thread never observes another task's run.
+//!
+//! `WorkflowCtx` holds live checkpoint/memo/MCP `Value`s, so the extension is TRACED
+//! (Invariant I2): the `TaskContextHandle` traces each extension, `WorkflowTaskState`
+//! traces its scope stack, and each `WorkflowCtx` traces its `Value`-bearing bags.
+//!
+//! The `WORKFLOW` thread-local survives ONLY as the HOST-ADAPTER fallback for callers
+//! outside a runtime quantum (a synchronous host `call_function`, the non-runtime
+//! restricted VM); it is read only when [`sema_core::in_runtime_quantum`] is false.
 //!
 //! The context owns the run's monotonic `seq` counter, the wall-clock seam (`ts` /
 //! `dur_ms`, both frozen under `SEMA_WORKFLOW_FIXED_TS` for byte-identical goldens),
 //! the append-only [`Journal`], and a Mastra-style checkpoint/state bag.
 
+use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{IdCounter, ScopeId, TaskContextHandle, TaskLocalValue, Trace};
 use sema_core::Value;
 
 use crate::event::WorkflowEvent;
@@ -37,9 +49,12 @@ const RUN_ID_ENV: &str = "SEMA_WORKFLOW_RUN_ID";
 const RUN_DIR_ENV: &str = "SEMA_WORKFLOW_RUN_DIR";
 
 thread_local! {
-    /// The live workflow context, if a run is in progress on this thread. `None`
-    /// outside any run; builtins error with a clear message in that case.
-    static WORKFLOW: RefCell<Option<Rc<WorkflowCtx>>> = const { RefCell::new(None) };
+    /// HOST-ADAPTER-ONLY fallback scope store for callers outside a runtime quantum.
+    /// A per-thread [`WorkflowTaskState`] (same shape as the task-local extension) that
+    /// only synchronous host paths install into / read from; the runtime path lives on
+    /// the owning task's [`TaskContextHandle`] instead. Read only when
+    /// `!sema_core::in_runtime_quantum()`.
+    static WORKFLOW: Rc<WorkflowTaskState> = Rc::new(WorkflowTaskState::default());
 }
 
 /// Run-scoped dynamic context. Cheap to clone-share via `Rc`; all interior state is
@@ -81,11 +96,10 @@ pub struct WorkflowCtx {
     /// phases need the label to emit the matching `phase.ended` when the next marker
     /// (or the run end) closes the phase.
     cur_phase_label: RefCell<Option<String>>,
-    /// Per-name agent invocation counter, for minting unique `agent_id`s.
+    /// Per-name agent invocation counter, for minting unique `agent_id`s. Run-shared
+    /// (via the `Rc<WorkflowCtx>`), so ids stay unique even across concurrent tasks; the
+    /// per-task ACTIVE-agent attribution slot moved to [`WorkflowTaskState::set_cur_agent`].
     agent_n: RefCell<BTreeMap<String, u64>>,
-    /// The `agent_id` of the agent currently executing (set by `workflow/agent`), so
-    /// `workflow/tool-call` can attribute a tool call to it. `None` outside an agent.
-    cur_agent_id: RefCell<Option<String>>,
     /// Resume state. `resuming` ⇒ this run was launched with `--resume`, so leaves whose
     /// content-key is in `resume_memos` short-circuit (return the recorded value, skip
     /// the model + events). `resume_memos` is loaded from the prior run's `memo/` dir at
@@ -167,7 +181,6 @@ impl WorkflowCtx {
             cur_phase_seq: Cell::new(None),
             cur_phase_label: RefCell::new(None),
             agent_n: RefCell::new(BTreeMap::new()),
-            cur_agent_id: RefCell::new(None),
             resuming: Cell::new(false),
             code_version: RefCell::new(String::new()),
             resume_memos: RefCell::new(HashMap::new()),
@@ -213,17 +226,6 @@ impl WorkflowCtx {
         let n = m.entry(name.to_string()).or_insert(0);
         *n += 1;
         format!("{name}_{n}")
-    }
-
-    /// Set (or clear) the agent currently executing, so `workflow/tool-call` can
-    /// attribute to it. Set on `workflow/agent` entry, cleared on exit.
-    pub fn set_cur_agent(&self, agent_id: Option<String>) {
-        *self.cur_agent_id.borrow_mut() = agent_id;
-    }
-
-    /// The `agent_id` of the executing agent, if inside one.
-    pub fn cur_agent(&self) -> Option<String> {
-        self.cur_agent_id.borrow().clone()
     }
 
     /// A stable short resume key for a checkpoint (`ck_<hex>` over key + digest).
@@ -464,26 +466,248 @@ impl WorkflowCtx {
     }
 }
 
-/// Panic-safe RAII guard that restores the PREVIOUS workflow context on drop. Copied
-/// from `sema_otel::ConversationGuard`'s shape: the restore happens in `Drop`, so an
-/// `Err` short-circuit OR a panic unwinding through the run body both reinstall the
-/// prior context (supporting nested runs and never leaking a stale `Rc`).
+impl Trace for WorkflowCtx {
+    /// Expose every live `Value` a run holds so the CORE-2 collector never frees a
+    /// checkpoint/memo/MCP handle it can still reach through the owning task (Invariant
+    /// I2). A conflicting borrow means the bag is mid-mutation; report incomplete
+    /// (`false`) so the collector retries rather than under-tracing.
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        let (Ok(state), Ok(memos), Ok(handles)) = (
+            self.state.try_borrow(),
+            self.resume_memos.try_borrow(),
+            self.mcp_handles.try_borrow(),
+        ) else {
+            return false;
+        };
+        for value in state.values() {
+            sink(GcEdge::Value(value));
+        }
+        for value in memos.values() {
+            sink(GcEdge::Value(value));
+        }
+        for value in handles.values() {
+            sink(GcEdge::Value(value));
+        }
+        true
+    }
+}
+
+/// One published workflow scope on a task's stack. A scope this task INSTALLED carries
+/// `Some(token)` and is removed by that exact token (mirrors `DynamicTaskState`'s
+/// `ScopeId` removal — out-of-LIFO teardown across interleaved tasks restores the exact
+/// outer scope). An INHERITED scope (a spawned child observing its spawner's run) carries
+/// `None`: the child sees the workflow for attribution but cannot tear down an ancestor's
+/// scope. The `Rc<WorkflowCtx>` is SCOPE-SHARED, so the child journals into the same run.
+struct WorkflowScope {
+    token: Option<ScopeId>,
+    ctx: Rc<WorkflowCtx>,
+}
+
+struct WorkflowTaskInner {
+    tokens: IdCounter<ScopeId>,
+    scopes: Vec<WorkflowScope>,
+    /// The `agent_id` of the step currently executing ON THIS TASK, so
+    /// `workflow/tool-call` attributes to it. TASK-PRIVATE: two concurrent steps on
+    /// sibling tasks keep distinct active agents (no cross-attribution).
+    cur_agent: Option<String>,
+}
+
+/// Task-local workflow scope: the run stack plus the per-task active-step attribution.
+/// Installed on the owning task's [`TaskContextHandle`] (traced), inherited clone-shared
+/// by spawned children.
+pub struct WorkflowTaskState {
+    inner: RefCell<WorkflowTaskInner>,
+}
+
+impl Default for WorkflowTaskState {
+    fn default() -> Self {
+        Self {
+            inner: RefCell::new(WorkflowTaskInner {
+                tokens: IdCounter::new(),
+                scopes: Vec::new(),
+                cur_agent: None,
+            }),
+        }
+    }
+}
+
+impl WorkflowTaskState {
+    /// Push `ctx` as the live scope, minting a fresh removal token for it.
+    fn install(&self, ctx: Rc<WorkflowCtx>) -> ScopeId {
+        let mut inner = self.inner.borrow_mut();
+        let token = inner
+            .tokens
+            .allocate()
+            .expect("workflow scope identity space exhausted");
+        inner.scopes.push(WorkflowScope {
+            token: Some(token),
+            ctx,
+        });
+        token
+    }
+
+    /// Remove the scope carrying exactly `token`. Returns `false` if it is already gone
+    /// (idempotent teardown).
+    fn remove(&self, token: ScopeId) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        match inner.scopes.iter().position(|s| s.token == Some(token)) {
+            Some(pos) => {
+                inner.scopes.remove(pos);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The innermost live run scope, if any.
+    fn current_ctx(&self) -> Option<Rc<WorkflowCtx>> {
+        self.inner
+            .borrow()
+            .scopes
+            .last()
+            .map(|s| Rc::clone(&s.ctx))
+    }
+
+    fn cur_agent(&self) -> Option<String> {
+        self.inner.borrow().cur_agent.clone()
+    }
+
+    fn set_cur_agent(&self, agent_id: Option<String>) {
+        self.inner.borrow_mut().cur_agent = agent_id;
+    }
+}
+
+impl Trace for WorkflowTaskState {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        let Ok(inner) = self.inner.try_borrow() else {
+            return false;
+        };
+        for scope in &inner.scopes {
+            if !scope.ctx.trace(sink) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl TaskLocalValue for WorkflowTaskState {
+    /// A spawned child clone-shares the run stack (each `Rc<WorkflowCtx>` is shared, so
+    /// the child journals into the SAME run) and copies the spawner's active-step
+    /// attribution, but inherited scopes reset to `token: None` (the child cannot tear
+    /// down an ancestor's scope) and it mints from a fresh counter.
+    fn inherit(&self) -> Rc<dyn TaskLocalValue> {
+        let inner = self.inner.borrow();
+        let scopes = inner
+            .scopes
+            .iter()
+            .map(|s| WorkflowScope {
+                token: None,
+                ctx: Rc::clone(&s.ctx),
+            })
+            .collect();
+        Rc::new(Self {
+            inner: RefCell::new(WorkflowTaskInner {
+                tokens: IdCounter::new(),
+                scopes,
+                cur_agent: inner.cur_agent.clone(),
+            }),
+        })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Panic-safe RAII guard for one installed workflow scope. Drop removes the EXACT token
+/// it minted from the task (or host) state — an `Err` short-circuit, a panic unwinding
+/// through the run body, OR a continuation dropped without resume all reinstate the
+/// outer scope and never leak. Holds a `Weak` so the guard never keeps the traced state
+/// alive on its own (Invariant I2): the `WorkflowCtx` `Value`s are reachable ONLY through
+/// the traced [`TaskContextHandle`] / host store, never through this guard.
 pub struct WorkflowGuard {
-    prev: Option<Rc<WorkflowCtx>>,
+    state: Weak<WorkflowTaskState>,
+    token: ScopeId,
 }
 
 impl Drop for WorkflowGuard {
     fn drop(&mut self) {
-        WORKFLOW.with(|c| *c.borrow_mut() = self.prev.take());
+        if let Some(state) = self.state.upgrade() {
+            state.remove(self.token);
+        }
     }
 }
 
-/// Low-level: install an already-built `ctx` as the live workflow context for the
-/// current thread, returning a guard whose drop restores whatever was installed
-/// before. Used by unit tests and by [`set_workflow_scope`].
-pub fn install_scope(ctx: Rc<WorkflowCtx>) -> WorkflowGuard {
-    let prev = WORKFLOW.with(|c| c.borrow_mut().replace(ctx));
-    WorkflowGuard { prev }
+/// The per-thread HOST-ADAPTER fallback scope state (used only outside a runtime quantum).
+fn host_state() -> Rc<WorkflowTaskState> {
+    WORKFLOW.with(Rc::clone)
+}
+
+/// Resolve the [`WorkflowTaskState`] a scope installs into: the runtime path's task
+/// context (get-or-create the extension) or the host fallback when there is no task
+/// context.
+fn resolve_state(task_context: Option<&TaskContextHandle>) -> Rc<WorkflowTaskState> {
+    if let Some(handle) = task_context {
+        if let Some(state) = handle.get_rc::<WorkflowTaskState>() {
+            return state;
+        }
+        let state = Rc::new(WorkflowTaskState::default());
+        handle.borrow_mut().insert(Rc::clone(&state));
+        return state;
+    }
+    host_state()
+}
+
+/// Low-level: install an already-built `ctx` as a scope on `task_context` (or the host
+/// fallback), returning a guard whose drop removes that exact scope. Used by unit tests
+/// and by [`set_workflow_scope`].
+pub fn install_scope(
+    task_context: Option<&TaskContextHandle>,
+    ctx: Rc<WorkflowCtx>,
+) -> WorkflowGuard {
+    let state = resolve_state(task_context);
+    let token = state.install(ctx);
+    WorkflowGuard {
+        state: Rc::downgrade(&state),
+        token,
+    }
+}
+
+/// The live workflow context for `task_context`, if a run is in progress on that task.
+/// Reads the task-local extension first; the `WORKFLOW` thread-local is consulted ONLY as
+/// the host-adapter fallback outside a runtime quantum.
+pub fn current_for(task_context: Option<&TaskContextHandle>) -> Option<Rc<WorkflowCtx>> {
+    if let Some(handle) = task_context {
+        if let Some(state) = handle.get_rc::<WorkflowTaskState>() {
+            if let Some(ctx) = state.current_ctx() {
+                return Some(ctx);
+            }
+        }
+    }
+    if !sema_core::in_runtime_quantum() {
+        return host_state().current_ctx();
+    }
+    None
+}
+
+/// The `agent_id` of the step currently executing on `task_context` (TASK-PRIVATE
+/// attribution), for `workflow/tool-call`.
+pub fn cur_agent_for(task_context: Option<&TaskContextHandle>) -> Option<String> {
+    if let Some(handle) = task_context {
+        if let Some(state) = handle.get_rc::<WorkflowTaskState>() {
+            return state.cur_agent();
+        }
+    }
+    if !sema_core::in_runtime_quantum() {
+        return host_state().cur_agent();
+    }
+    None
+}
+
+/// Set (or clear) the step currently executing on `task_context`.
+pub fn set_cur_agent_for(task_context: Option<&TaskContextHandle>, agent_id: Option<String>) {
+    resolve_state(task_context).set_cur_agent(agent_id);
 }
 
 /// Redact secret-bearing values out of the workflow meta map's lossy-JSON form
@@ -526,7 +750,12 @@ fn redact_meta_secrets(mut meta_json: serde_json::Value) -> serde_json::Value {
 /// `meta` is the workflow's metadata map (`{:phases … :budget … :args …}`); it is
 /// recorded into `metadata.json`, and `:budget` is parsed into the run's spend caps.
 /// `:permissions` is enforced by the CLI before the interpreter is built.
-pub fn set_workflow_scope(name: &str, doc: &str, meta: &Value) -> io::Result<WorkflowGuard> {
+pub fn set_workflow_scope(
+    name: &str,
+    doc: &str,
+    meta: &Value,
+    task_context: Option<&TaskContextHandle>,
+) -> io::Result<WorkflowGuard> {
     let run_id = resolve_run_id();
     let runs_root = resolve_runs_root();
     let code_version = std::env::var(CODE_VERSION_ENV).unwrap_or_default();
@@ -561,7 +790,7 @@ pub fn set_workflow_scope(name: &str, doc: &str, meta: &Value) -> io::Result<Wor
             .collect();
         ctx.enter_resume(memos);
     }
-    Ok(install_scope(ctx))
+    Ok(install_scope(task_context, ctx))
 }
 
 /// Extract the `:budget` submap from a workflow `meta` map, flattening its keyword
@@ -586,11 +815,6 @@ pub fn parse_budget(meta: &Value) -> BTreeMap<String, Value> {
 /// `--run-dir`) if present, else the project-local [`RUNS_ROOT`].
 pub fn resolve_runs_root() -> String {
     std::env::var(RUN_DIR_ENV).unwrap_or_else(|_| RUNS_ROOT.to_string())
-}
-
-/// The live workflow context, if a run is in progress on this thread.
-pub fn current() -> Option<Rc<WorkflowCtx>> {
-    WORKFLOW.with(|c| c.borrow().clone())
 }
 
 /// Length-prefixed md5 over a field list → short hex. Length-prefixing each field
@@ -870,29 +1094,105 @@ mod tests {
     }
 
     #[test]
-    fn scope_restores_previous_on_drop() {
-        assert!(current().is_none());
+    fn workflow_ctx_traces_state_memo_and_mcp_values() {
+        // Invariant I2: every live `Value` a run holds must be reachable to the
+        // collector — one edge per state-bag / memo / MCP-handle value.
+        let ctx = WorkflowCtx::new("t".into(), Journal::null(), BTreeMap::new());
+        ctx.store_checkpoint("k", Value::int(1));
+        let mut memos = HashMap::new();
+        memos.insert("ck".to_string(), Value::int(2));
+        ctx.enter_resume(memos);
+        let mut handles = BTreeMap::new();
+        handles.insert("asana".to_string(), Value::string("handle"));
+        ctx.set_mcp_handles(handles);
+
+        let mut edges = 0;
+        assert!(ctx.trace(&mut |edge| {
+            assert!(matches!(edge, GcEdge::Value(_)));
+            edges += 1;
+        }));
+        assert_eq!(edges, 3, "state bag + resume memo + MCP handle each trace once");
+    }
+
+    #[test]
+    fn host_scope_restores_previous_on_drop() {
+        // The host fallback (no task context) behaves like a scope stack: a nested run
+        // reveals the outer scope again once its guard drops.
+        assert!(current_for(None).is_none());
         let outer = WorkflowCtx::new("outer".into(), Journal::null(), BTreeMap::new());
-        let g_outer = install_scope(outer.clone());
+        let g_outer = install_scope(None, outer);
         assert_eq!(
-            current().map(|c| c.run_id.clone()).as_deref(),
+            current_for(None).map(|c| c.run_id.clone()).as_deref(),
             Some("outer")
         );
         {
             let inner = WorkflowCtx::new("inner".into(), Journal::null(), BTreeMap::new());
-            let _g_inner = install_scope(inner);
+            let _g_inner = install_scope(None, inner);
             assert_eq!(
-                current().map(|c| c.run_id.clone()).as_deref(),
+                current_for(None).map(|c| c.run_id.clone()).as_deref(),
                 Some("inner")
             );
         }
         // inner guard dropped → outer reinstated
         assert_eq!(
-            current().map(|c| c.run_id.clone()).as_deref(),
+            current_for(None).map(|c| c.run_id.clone()).as_deref(),
             Some("outer")
         );
         drop(g_outer);
-        assert!(current().is_none());
+        assert!(current_for(None).is_none());
+    }
+
+    #[test]
+    fn task_state_removes_the_exact_token_out_of_lifo() {
+        // Two scopes installed, torn down OLDEST-first (out of LIFO order): exact-token
+        // removal restores the surviving inner scope, not whatever happens to be on top.
+        let state = WorkflowTaskState::default();
+        let outer = WorkflowCtx::new("outer".into(), Journal::null(), BTreeMap::new());
+        let inner = WorkflowCtx::new("inner".into(), Journal::null(), BTreeMap::new());
+        let outer_token = state.install(outer);
+        let inner_token = state.install(inner);
+        assert_eq!(state.current_ctx().map(|c| c.run_id.clone()).as_deref(), Some("inner"));
+
+        assert!(state.remove(outer_token));
+        assert!(!state.remove(outer_token), "removing the same token twice is idempotent");
+        assert_eq!(
+            state.current_ctx().map(|c| c.run_id.clone()).as_deref(),
+            Some("inner"),
+            "removing the outer token leaves the inner scope live and on top"
+        );
+        assert!(state.remove(inner_token));
+        assert!(state.current_ctx().is_none());
+    }
+
+    #[test]
+    fn child_inherits_run_and_agent_but_not_removal_authority() {
+        // A spawned child clone-shares the run scope + copies the active agent, but its
+        // inherited scope is not removable by the child (token stripped to None).
+        let state = Rc::new(WorkflowTaskState::default());
+        let run = WorkflowCtx::new("shared-run".into(), Journal::null(), BTreeMap::new());
+        let parent_token = state.install(run);
+        state.set_cur_agent(Some("scout_1".to_string()));
+
+        let child = state.inherit();
+        let child = child
+            .as_any()
+            .downcast_ref::<WorkflowTaskState>()
+            .expect("inherited workflow state");
+        assert_eq!(
+            child.current_ctx().map(|c| c.run_id.clone()).as_deref(),
+            Some("shared-run"),
+            "child observes the spawner's active run"
+        );
+        assert_eq!(child.cur_agent().as_deref(), Some("scout_1"));
+        // The child cannot tear down the parent's scope with the parent's token.
+        assert!(!child.remove(parent_token));
+        assert_eq!(
+            child.current_ctx().map(|c| c.run_id.clone()).as_deref(),
+            Some("shared-run")
+        );
+        // The parent's own teardown still works.
+        assert!(state.remove(parent_token));
+        assert!(state.current_ctx().is_none());
     }
 
     #[test]

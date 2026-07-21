@@ -15,7 +15,10 @@ pub mod context;
 pub mod event;
 mod journal;
 
-pub use context::{current, resolve_run_id, set_workflow_scope, WorkflowCtx, WorkflowGuard};
+pub use context::{
+    current_for, cur_agent_for, resolve_run_id, set_cur_agent_for, set_workflow_scope, WorkflowCtx,
+    WorkflowGuard, WorkflowTaskState,
+};
 pub use event::WorkflowEvent;
 pub use journal::Journal;
 

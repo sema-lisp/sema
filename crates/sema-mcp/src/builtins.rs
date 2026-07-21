@@ -769,6 +769,67 @@ pub fn connect_from_config(config: &Value, opts: ConnectOpts) -> Result<Value, C
     outcome.map_err(connect_outcome_to_failure)
 }
 
+/// A successfully-connected client produced off the VM thread by
+/// [`connect_send`] and registered on the VM thread by [`register_connected`].
+/// `McpClient` is `Send` (the compile-time gate `_assert_mcp_connection_is_send`
+/// pins that), so this travels back from a blocking worker as a `SendPayload`
+/// without any `Value`/`Rc` crossing the thread boundary — the opaque handle
+/// `Value` is minted only in `register_connected`, on the VM thread.
+pub struct ConnectedClient {
+    client: McpClient,
+    identity: String,
+}
+
+/// Connect to an MCP server from a config value on the CURRENT thread — a plain
+/// executor worker where `io_block_on` is legal — WITHOUT touching the
+/// `CONNECTIONS` thread-local. Returns the live `Send` client for the caller to
+/// register on the VM thread via [`register_connected`]. Browser authority is
+/// supplied as a pre-resolved `bool` (captured from the VM-thread sandbox);
+/// this function never reads `HOST_SANDBOX`, so the caller MUST apply the
+/// capability gate on the VM thread before offloading (see
+/// [`host_capability_allowed`]). This is the workflow resolver's
+/// off-runtime-quantum connect path; the synchronous [`connect_from_config`]
+/// stays the host/CLI entry point.
+pub async fn connect_send(
+    config: &Value,
+    opts: &ConnectOpts,
+    browser_allowed: bool,
+) -> Result<ConnectedClient, ConnectFailure> {
+    let config_json =
+        value_to_config_json(config).map_err(|error| connect_outcome_to_failure(ConnectOutcome::Sema(error)))?;
+    match connect_dispatch_async(
+        config_json,
+        opts.clone(),
+        BrowserAuthority::from_allowed(browser_allowed),
+    )
+    .await
+    {
+        Ok((client, identity)) => Ok(ConnectedClient { client, identity }),
+        Err(outcome) => Err(connect_outcome_to_failure(outcome)),
+    }
+}
+
+/// Register a client connected off the VM thread (via [`connect_send`]) under a
+/// fresh opaque handle in the thread-local `CONNECTIONS` table, on the CURRENT
+/// (VM) thread. Returns the same opaque handle-string `Value` `mcp/connect`
+/// yields, usable with `mcp/call`/`mcp/close`/… on this thread.
+pub fn register_connected(connected: ConnectedClient, opts: &ConnectOpts) -> Value {
+    register_connection(connected.client, connected.identity, opts)
+}
+
+/// Whether the thread-local host sandbox currently permits `cap`. The workflow
+/// resolver captures `Caps::NETWORK`/`Caps::PROCESS` with this on the VM thread
+/// BEFORE it offloads connects to a worker (whose `HOST_SANDBOX` is a separate,
+/// default-unrestricted thread-local) — so the connect capability gate
+/// (`Caps::NETWORK` for `:url`, `Caps::PROCESS` for `:command`) is enforced with
+/// the caller's real authority rather than the worker's.
+pub fn host_capability_allowed(cap: Caps) -> bool {
+    HOST_SANDBOX.with(|sandbox| {
+        let sandbox = sandbox.borrow();
+        sandbox.is_unrestricted() || sandbox.check(cap, "mcp/connect").is_ok()
+    })
+}
+
 /// Collapse a [`ConnectOutcome`] into the public [`ConnectFailure`]. Any hint
 /// the original `SemaError` carried is appended to the message — `Display`
 /// alone would drop it (hints are a separate structured field), and
@@ -2489,9 +2550,38 @@ pub fn close_handle(handle: &Value) {
         clear_entry_gate(&entry, gate.id());
     }
     remove_connection_entry(handle_str, &entry);
-    if let Some(mut conn) = conn {
+    if let Some(conn) = conn {
+        close_conn_best_effort(conn);
+    }
+}
+
+/// Best-effort transport close of an owned, already-deregistered connection.
+/// Inside a runtime quantum (workflow teardown closes `:mcp` handles from
+/// `finish_run`, which runs during a native callback), the synchronous
+/// `io_block_on` would hit its active-quantum guard AND block the cooperative
+/// scheduler — so fire-and-forget the async close on a background blocking worker
+/// (`McpConnection` is `Send`; the connection is already unreachable, so nothing
+/// waits on it). On a host/plain thread, close synchronously as before.
+fn close_conn_best_effort(conn: McpConnection) {
+    if in_runtime_quantum() {
+        spawn_background_close(conn);
+    } else {
+        let mut conn = conn;
         let _ = block_on(close_async(&mut conn));
     }
+}
+
+/// Fire-and-forget the async transport close on a background blocking worker,
+/// where `io_block_on` is legal (no active runtime quantum on that thread). Kept
+/// out of `close_conn_best_effort`'s `in_runtime_quantum()` branch on purpose:
+/// the `io_block_on` lives on the worker, not the VM thread, so it must not sit
+/// textually inside an active-runtime branch (the source-policy guard rejects
+/// that shape).
+fn spawn_background_close(conn: McpConnection) {
+    sema_io::io_spawn_blocking(move || {
+        let mut conn = conn;
+        let _ = sema_io::io_block_on(close_async(&mut conn));
+    });
 }
 
 fn close_connection(args: &[Value]) -> NativeResult {

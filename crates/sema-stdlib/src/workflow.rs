@@ -22,8 +22,8 @@
 
 use sema_core::cycle::GcEdge;
 use sema_core::runtime::{
-    NativeCall, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, ResumeInput,
-    TaskContextHandle, Trace,
+    NativeCall, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, NativeSuspend,
+    ResumeInput, TaskContextHandle, Trace, WaitKind,
 };
 use sema_core::{SemaError, Value};
 use sema_workflow::context;
@@ -249,6 +249,11 @@ fn register_thunk_fn<T: 'static>(
                     let result = crate::list::call_function(&thunk, &[]);
                     finish(None, teardown, result)
                 }
+                // The host arm resolves `:mcp` synchronously (its `io_block_on` is legal
+                // off the quantum), so it never asks for a suspend and cannot drive one.
+                ThunkPlan::Suspend(_) => Err(SemaError::eval(format!(
+                    "{name}: cannot offload MCP resolution outside the runtime"
+                ))),
             },
             // Runtime arm: install/read/remove the scope on the OWNING TASK's context, so
             // a sibling task interleaved on the thread never resolves to this run.
@@ -266,6 +271,7 @@ fn register_thunk_fn<T: 'static>(
                             name,
                         }),
                     })),
+                    ThunkPlan::Suspend(suspend) => Ok(NativeOutcome::Suspend(suspend)),
                 }
             },
         )),
@@ -298,11 +304,15 @@ fn register_scoped_fn(
 }
 
 /// A workflow builtin's pre-thunk decision: either an immediate value (nothing to run —
-/// a resume replay, a budget-tripped skip, or a pre-body `:mcp` gate exit) or a thunk to
-/// run with the `teardown` state its `finish` needs afterward.
+/// a resume replay, a budget-tripped skip, or a pre-body `:mcp` gate exit), a thunk to
+/// run with the `teardown` state its `finish` needs afterward, or — only under a runtime
+/// quantum, only `workflow/run` — a structural suspend that offloads the blocking `:mcp`
+/// resolve off the VM thread and resumes in a continuation. The host arm never produces
+/// `Suspend` (it resolves synchronously), so it rejects one it can't drive.
 enum ThunkPlan<T> {
     Immediate(Value),
     Run { thunk: Value, teardown: T },
+    Suspend(NativeSuspend),
 }
 
 /// Cooperative teardown for a `register_thunk_fn` native: the runtime drives the thunk
@@ -709,130 +719,281 @@ fn run_plan(
         }
     };
 
-    // Resolver + handles resolved below (if any), closed exactly once after the body
-    // exits (or when a dropped continuation triggers the teardown backstop).
-    let mut mcp: Option<McpClose> = None;
-
-    if !decls.is_empty() {
-        let ctx = context::current_for(task_context)
-            .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
-        ctx.set_mcp_declared(decls.iter().map(|d| d.alias.clone()).collect());
-
-        let Some(resolver) = workflow_mcp::workflow_mcp_resolver() else {
-            let envelope = failed_envelope(
-                "workflow declares :mcp servers but this build has no MCP resolver \
-                 registered",
-            );
-            return Ok(ThunkPlan::Immediate(end_run_before_body(
-                &ctx,
-                guard,
-                "failed",
-                "mcp resolution failed".to_string(),
-                envelope,
-            )));
-        };
-
-        let resolutions = resolver.resolve(&decls, &name, &ctx.run_id());
-
-        let mut connected: BTreeMap<String, Value> = BTreeMap::new();
-        let mut connected_handles: Vec<Value> = Vec::new();
-        let mut needs_auth: Vec<(String, String, String)> = Vec::new();
-        let mut failures: Vec<(String, String)> = Vec::new();
-
-        // Emit events per resolution IN THE GIVEN (alias-sorted) order — the resolver
-        // returns them in the same order as `decls`.
-        for resolution in &resolutions {
-            match resolution {
-                ServerResolution::Connected {
-                    alias,
-                    handle,
-                    auth,
-                } => {
-                    connected.insert(alias.clone(), handle.clone());
-                    connected_handles.push(handle.clone());
-                    if let Some(grant) = auth {
-                        ctx.emit(WorkflowEvent::AuthGranted {
-                            seq: ctx.next_seq(),
-                            ts: ctx.ts(),
-                            server: alias.clone(),
-                            scopes: grant.scopes.clone(),
-                            expires_at: grant.expires_at,
-                            source: grant.source.clone(),
-                        });
-                    }
-                }
-                ServerResolution::NeedsAuth {
-                    alias,
-                    url,
-                    scopes,
-                    tools,
-                    persist,
-                } => {
-                    ctx.emit(WorkflowEvent::AuthRequired {
-                        seq: ctx.next_seq(),
-                        ts: ctx.ts(),
-                        server: alias.clone(),
-                        scopes: scopes.clone(),
-                        tools: tools.clone(),
-                        persist: persist.clone(),
-                    });
-                    needs_auth.push((alias.clone(), url.clone(), persist.clone()));
-                }
-                ServerResolution::Failed { alias, reason } => {
-                    ctx.emit(WorkflowEvent::AuthFailed {
-                        seq: ctx.next_seq(),
-                        ts: ctx.ts(),
-                        server: alias.clone(),
-                        reason: reason.clone(),
-                    });
-                    failures.push((alias.clone(), reason.clone()));
-                }
-            }
-        }
-
-        // Outcome precedence: any Failed wins over any NeedsAuth. Both close whatever DID
-        // connect before ending the run — the body NEVER runs.
-        if !failures.is_empty() {
-            resolver.close(&connected_handles);
-            let msg = failures
-                .iter()
-                .map(|(alias, reason)| format!("{alias}: {reason}"))
-                .collect::<Vec<_>>()
-                .join("; ");
-            let envelope = failed_envelope(&msg);
-            return Ok(ThunkPlan::Immediate(end_run_before_body(
-                &ctx,
-                guard,
-                "failed",
-                "mcp resolution failed".to_string(),
-                envelope,
-            )));
-        }
-        if !needs_auth.is_empty() {
-            resolver.close(&connected_handles);
-            let envelope = needs_auth_envelope(&needs_auth);
-            return Ok(ThunkPlan::Immediate(end_run_before_body(
-                &ctx,
-                guard,
-                "needs-auth",
-                "authentication required".to_string(),
-                envelope,
-            )));
-        }
-
-        // Every declared server connected: publish handles for workflow/mcp-handle, and
-        // remember (resolver, handles) so `finish_run` closes them EXACTLY once.
-        ctx.set_mcp_handles(connected);
-        mcp = Some(McpClose {
-            resolver,
-            handles: connected_handles,
+    // A workflow with no `:mcp` runs the body straight away — byte-identical to the
+    // pre-feature path.
+    if decls.is_empty() {
+        return Ok(ThunkPlan::Run {
+            thunk,
+            teardown: RunTeardown { guard, mcp: None },
         });
     }
 
-    Ok(ThunkPlan::Run {
+    let run_id = {
+        let ctx = context::current_for(task_context)
+            .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
+        ctx.set_mcp_declared(decls.iter().map(|d| d.alias.clone()).collect());
+        ctx.run_id()
+    };
+
+    let Some(resolver) = workflow_mcp::workflow_mcp_resolver() else {
+        let ctx = context::current_for(task_context)
+            .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
+        let envelope = failed_envelope(
+            "workflow declares :mcp servers but this build has no MCP resolver registered",
+        );
+        return Ok(ThunkPlan::Immediate(end_run_before_body(
+            &ctx,
+            guard,
+            "failed",
+            "mcp resolution failed".to_string(),
+            envelope,
+        )));
+    };
+
+    if task_context.is_some() {
+        // Runtime arm (inside a quantum): the real resolver's OAuth/connect I/O would hit
+        // `io_block_on`'s active-quantum guard, so offload it structurally — the blocking
+        // resolve runs on a plain worker; `ResolveContinuation` resumes here with the
+        // encoded resolutions and runs the same gate/event logic as the host arm.
+        let prepared = resolver.resolve_prepared(&decls, &name, &run_id);
+        return Ok(ThunkPlan::Suspend(NativeSuspend {
+            wait: WaitKind::External(prepared),
+            continuation: Box::new(ResolveContinuation {
+                guard,
+                thunk,
+                resolver,
+            }),
+        }));
+    }
+
+    // Host arm (outside a runtime quantum): `io_block_on` is legal — resolve inline.
+    let resolutions = resolver.resolve(&decls, &name, &run_id);
+    match apply_resolutions(task_context, guard, thunk, resolver, resolutions)? {
+        ResolveGate::Exit(value) => Ok(ThunkPlan::Immediate(value)),
+        ResolveGate::Proceed { thunk, teardown } => Ok(ThunkPlan::Run { thunk, teardown }),
+    }
+}
+
+/// The outcome of the shared `:mcp` gate/event logic ([`apply_resolutions`]): either the
+/// run ended before the body (an envelope to return) or every declared server resolved
+/// and the body thunk should run with its teardown state.
+enum ResolveGate {
+    Exit(Value),
+    Proceed { thunk: Value, teardown: RunTeardown },
+}
+
+/// Emit the per-server auth events, apply the Failed-over-NeedsAuth gate precedence, and
+/// either end the run before the body (Failed/NeedsAuth) or publish the connected handles
+/// and hand back the body thunk + teardown. Shared verbatim by the host arm (synchronous
+/// resolve) and the runtime arm's [`ResolveContinuation`] (offloaded resolve), so the two
+/// never diverge. Consumes `guard`: an `Exit` drops it via `end_run_before_body`; a
+/// `Proceed` moves it into the `RunTeardown`.
+fn apply_resolutions(
+    task_context: Option<&TaskContextHandle>,
+    guard: context::WorkflowGuard,
+    thunk: Value,
+    resolver: Rc<dyn WorkflowMcpResolver>,
+    resolutions: Vec<ServerResolution>,
+) -> Result<ResolveGate, SemaError> {
+    let ctx = context::current_for(task_context)
+        .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
+
+    let mut connected: BTreeMap<String, Value> = BTreeMap::new();
+    let mut connected_handles: Vec<Value> = Vec::new();
+    let mut needs_auth: Vec<(String, String, String)> = Vec::new();
+    let mut failures: Vec<(String, String)> = Vec::new();
+
+    // Emit events per resolution IN THE GIVEN (alias-sorted) order — the resolver returns
+    // them in the same order as `decls`.
+    for resolution in &resolutions {
+        match resolution {
+            ServerResolution::Connected {
+                alias,
+                handle,
+                auth,
+            } => {
+                connected.insert(alias.clone(), handle.clone());
+                connected_handles.push(handle.clone());
+                if let Some(grant) = auth {
+                    ctx.emit(WorkflowEvent::AuthGranted {
+                        seq: ctx.next_seq(),
+                        ts: ctx.ts(),
+                        server: alias.clone(),
+                        scopes: grant.scopes.clone(),
+                        expires_at: grant.expires_at,
+                        source: grant.source.clone(),
+                    });
+                }
+            }
+            ServerResolution::NeedsAuth {
+                alias,
+                url,
+                scopes,
+                tools,
+                persist,
+            } => {
+                ctx.emit(WorkflowEvent::AuthRequired {
+                    seq: ctx.next_seq(),
+                    ts: ctx.ts(),
+                    server: alias.clone(),
+                    scopes: scopes.clone(),
+                    tools: tools.clone(),
+                    persist: persist.clone(),
+                });
+                needs_auth.push((alias.clone(), url.clone(), persist.clone()));
+            }
+            ServerResolution::Failed { alias, reason } => {
+                ctx.emit(WorkflowEvent::AuthFailed {
+                    seq: ctx.next_seq(),
+                    ts: ctx.ts(),
+                    server: alias.clone(),
+                    reason: reason.clone(),
+                });
+                failures.push((alias.clone(), reason.clone()));
+            }
+        }
+    }
+
+    // Outcome precedence: any Failed wins over any NeedsAuth. Both close whatever DID
+    // connect before ending the run — the body NEVER runs.
+    if !failures.is_empty() {
+        resolver.close(&connected_handles);
+        let msg = failures
+            .iter()
+            .map(|(alias, reason)| format!("{alias}: {reason}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let envelope = failed_envelope(&msg);
+        return Ok(ResolveGate::Exit(end_run_before_body(
+            &ctx,
+            guard,
+            "failed",
+            "mcp resolution failed".to_string(),
+            envelope,
+        )));
+    }
+    if !needs_auth.is_empty() {
+        resolver.close(&connected_handles);
+        let envelope = needs_auth_envelope(&needs_auth);
+        return Ok(ResolveGate::Exit(end_run_before_body(
+            &ctx,
+            guard,
+            "needs-auth",
+            "authentication required".to_string(),
+            envelope,
+        )));
+    }
+
+    // Every declared server connected: publish handles for workflow/mcp-handle, and
+    // remember (resolver, handles) so `finish_run` closes them EXACTLY once.
+    ctx.set_mcp_handles(connected);
+    Ok(ResolveGate::Proceed {
         thunk,
-        teardown: RunTeardown { guard, mcp },
+        teardown: RunTeardown {
+            guard,
+            mcp: Some(McpClose {
+                resolver,
+                handles: connected_handles,
+            }),
+        },
     })
+}
+
+/// Trace the `Value` edges a pending `workflow/run` teardown carries — its open MCP
+/// handles. Shared by `register`'s trace hook and [`ResolveContinuation`]'s downstream
+/// `ThunkContinuation`.
+fn trace_run_teardown(teardown: &RunTeardown, sink: &mut dyn FnMut(GcEdge<'_>)) {
+    if let Some(mcp) = &teardown.mcp {
+        for handle in &mcp.handles {
+            sink(GcEdge::Value(handle));
+        }
+    }
+}
+
+/// The runtime arm's resume point for `workflow/run`'s offloaded `:mcp` resolve. Parked
+/// on the `resolve_prepared` External wait, it holds the run's scope `guard`, body
+/// `thunk`, and `resolver` across the suspension; on completion it decodes the resolutions
+/// `Value` and runs the shared gate/event logic, then either returns the gate envelope or
+/// drives the body thunk (`NativeOutcome::Call`) with the run teardown.
+///
+/// CORE-2 I2: the only `Value` it retains is `thunk`, which its `trace` emits. Cancellation
+/// or a worker failure tears the run down (drops `guard`, so the scope token is removed;
+/// any half-open connection was dropped inside the worker's drop-on-cancel select).
+struct ResolveContinuation {
+    guard: context::WorkflowGuard,
+    thunk: Value,
+    resolver: Rc<dyn WorkflowMcpResolver>,
+}
+
+impl Trace for ResolveContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.thunk));
+        true
+    }
+}
+
+impl NativeContinuation for ResolveContinuation {
+    fn resume(
+        self: Box<Self>,
+        context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        let task_context = context.task_context.clone();
+        let ResolveContinuation {
+            guard,
+            thunk,
+            resolver,
+        } = *self;
+        match input {
+            ResumeInput::Returned(value) => {
+                let resolutions = workflow_mcp::decode_resolutions(&value);
+                match apply_resolutions(Some(&task_context), guard, thunk, resolver, resolutions)? {
+                    ResolveGate::Exit(value) => Ok(NativeOutcome::Return(value)),
+                    ResolveGate::Proceed { thunk, teardown } => {
+                        Ok(NativeOutcome::Call(NativeCall {
+                            callable: thunk,
+                            args: Vec::new(),
+                            continuation: Box::new(ThunkContinuation {
+                                teardown: Some(teardown),
+                                finish: finish_run,
+                                trace_teardown: trace_run_teardown,
+                                name: "workflow/run",
+                            }),
+                        }))
+                    }
+                }
+            }
+            // A worker-level failure (panic / bound): end the run as failed so it is
+            // journaled, mirroring a `ServerResolution::Failed` gate rather than leaving
+            // the scope dangling.
+            ResumeInput::Failed(error) => {
+                let ctx = context::current_for(Some(&task_context))
+                    .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
+                let envelope = failed_envelope(&error.to_string());
+                Ok(NativeOutcome::Return(end_run_before_body(
+                    &ctx,
+                    guard,
+                    "failed",
+                    "mcp resolution failed".to_string(),
+                    envelope,
+                )))
+            }
+            // Cancellation reaps the run: dropping `guard` removes the scope token; the
+            // worker already dropped any half-open connection. Propagate the cancellation.
+            ResumeInput::Cancelled(reason) => {
+                drop(guard);
+                Err(SemaError::eval(format!(
+                    "workflow/run MCP resolution was cancelled ({reason:?})"
+                )))
+            }
+            ResumeInput::Runtime(_) => {
+                drop(guard);
+                Err(SemaError::eval(
+                    "workflow/run: unexpected runtime response after MCP resolution",
+                ))
+            }
+        }
+    }
 }
 
 pub fn register(env: &sema_core::Env) {
@@ -840,20 +1001,7 @@ pub fn register(env: &sema_core::Env) {
     // the {:status ...} envelope. `name`/`doc` are strings; `meta` is the workflow's
     // metadata map ({:args ... :budget ... :permissions ...}); `thunk` is the (lambda () ...)
     // wrapping the workflow body.
-    register_thunk_fn(
-        env,
-        "workflow/run",
-        run_plan,
-        finish_run,
-        |teardown: &RunTeardown, sink: &mut dyn FnMut(GcEdge<'_>)| {
-            // The only GC-visible state a pending run holds is its open MCP handles.
-            if let Some(mcp) = &teardown.mcp {
-                for handle in &mcp.handles {
-                    sink(GcEdge::Value(handle));
-                }
-            }
-        },
-    );
+    register_thunk_fn(env, "workflow/run", run_plan, finish_run, trace_run_teardown);
 
     // (workflow/phase label) — a MARKER (workflow.js semantics), not a wrapper. Closes
     // the previously-open phase (emitting its phase.ended) then opens `label`. The

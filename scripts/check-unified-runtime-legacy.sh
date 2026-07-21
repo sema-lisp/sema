@@ -242,6 +242,8 @@ scan_active_runtime_callbacks_paths() {
           if $body =~ /\bwith_stdlib_ctx\s*(?:<|\()/;
         print "WORKFLOW_TLS\t$line:$condition\n"
           if $body =~ /\bWORKFLOW\.with\b/;
+        print "IO_BLOCK_ON\t$line:$condition\n"
+          if $body =~ /\bio_block_on\s*\(/;
       }
     ' "$file" || true)
     while IFS=$'\t' read -r token line; do

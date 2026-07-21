@@ -28,6 +28,12 @@
 //! its `E-MCP-SPEC`/`E-MCP-PERSIST`/`W-MCP-TOOLS` diagnostics, so the static checker
 //! and this runtime parser never disagree about what shape is valid.
 
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{
+    CancelDisposition, CancelHook, CancelHookError, CompletionDecoder, CompletionKind,
+    DecodedCompletion, ExternalFailure, InterruptibleResource, NativeCallContext,
+    PreparedExternalOperation, SendPayload, Trace,
+};
 use sema_core::{SemaError, Value};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -461,7 +467,38 @@ pub trait WorkflowMcpResolver {
     /// `defworkflow` name and `run_id` the active run's id — both are for the
     /// resolver's own bookkeeping (e.g. naming a `:persist :workflow`/`:run`
     /// directory), not interpreted by this crate.
+    ///
+    /// Synchronous, blocking path — legal ONLY on a host/plain-worker thread
+    /// (`!in_runtime_quantum()`), because the real resolver drives OAuth/connect
+    /// I/O through `io_block_on`, which rejects an active runtime quantum. Inside
+    /// a quantum, `workflow/run` uses [`resolve_prepared`](Self::resolve_prepared)
+    /// instead.
     fn resolve(&self, decls: &[McpDecl], workflow: &str, run_id: &str) -> Vec<ServerResolution>;
+
+    /// Runtime path: build an interruptible-blocking External offload of the
+    /// whole pre-body resolve, for use INSIDE a runtime quantum (where a
+    /// synchronous [`resolve`](Self::resolve) would hit `io_block_on`'s
+    /// active-quantum guard). The returned operation's blocking job runs the
+    /// resolve off the VM thread (a plain worker where `io_block_on` is legal);
+    /// its decoder — on the VM thread — registers any connected clients and
+    /// encodes the resulting `Vec<ServerResolution>` into the resumed `Value`
+    /// via [`encode_resolutions`], which `workflow/run` decodes back with
+    /// [`decode_resolutions`].
+    ///
+    /// The default runs [`resolve`](Self::resolve) synchronously on the VM
+    /// thread and delivers its (already-`Value`-bearing) result through a
+    /// trivial ready-completion — correct for resolvers that do no blocking I/O
+    /// (test fakes). The real, `sema-mcp`-backed resolver OVERRIDES this to move
+    /// the OAuth/connect work off the quantum.
+    fn resolve_prepared(
+        &self,
+        decls: &[McpDecl],
+        workflow: &str,
+        run_id: &str,
+    ) -> Box<PreparedExternalOperation> {
+        let resolutions = self.resolve(decls, workflow, run_id);
+        Box::new(ready_resolution_external(encode_resolutions(&resolutions)))
+    }
 
     /// Best-effort close of every handle previously returned as `Connected`.
     /// MUST NOT panic or otherwise abort the caller — `workflow/run` calls
@@ -495,6 +532,211 @@ pub fn clear_workflow_mcp_resolver() {
 /// The active resolver on this thread, if one is registered.
 pub fn workflow_mcp_resolver() -> Option<Rc<dyn WorkflowMcpResolver>> {
     RESOLVER.with(|slot| slot.borrow().clone())
+}
+
+// ── resolution ↔ Value codec ──────────────────────────────────────────────────
+//
+// The runtime resolve offload ([`WorkflowMcpResolver::resolve_prepared`]) runs on
+// a worker thread but must not build `Value`s there (an `Rc`-based `Value` is not
+// `Send` and single-thread-refcounted). Its VM-thread decoder therefore encodes
+// the resolved `Vec<ServerResolution>` into a Sema `Value` (a list of maps), which
+// becomes the resumed stack value — so the ONE live edge each `Connected` carries
+// (its opaque handle `Value`) is traced by the runtime's normal resumed-value
+// machinery, no side-channel. `workflow/run`'s resume continuation decodes it back.
+
+fn string_list_value(items: &[String]) -> Value {
+    Value::list(items.iter().map(|s| Value::string(s)).collect())
+}
+
+fn decode_string_list(v: Option<&Value>) -> Vec<String> {
+    v.and_then(Value::as_seq)
+        .map(|items| items.iter().filter_map(|i| i.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+fn encode_grant(grant: &AuthGrant) -> Value {
+    let mut m = BTreeMap::new();
+    m.insert(Value::keyword("scopes"), string_list_value(&grant.scopes));
+    m.insert(
+        Value::keyword("expires-at"),
+        grant
+            .expires_at
+            .map(|x| Value::int(x as i64))
+            .unwrap_or_else(Value::nil),
+    );
+    m.insert(Value::keyword("source"), Value::string(&grant.source));
+    Value::map(m)
+}
+
+fn decode_grant(v: &Value) -> Option<AuthGrant> {
+    let m = v.as_map_ref()?;
+    Some(AuthGrant {
+        scopes: decode_string_list(m.get(&Value::keyword("scopes"))),
+        expires_at: m
+            .get(&Value::keyword("expires-at"))
+            .and_then(Value::as_int)
+            .map(|i| i as u64),
+        source: m.get(&Value::keyword("source"))?.as_str()?.to_string(),
+    })
+}
+
+fn encode_one(resolution: &ServerResolution) -> Value {
+    let mut m = BTreeMap::new();
+    match resolution {
+        ServerResolution::Connected {
+            alias,
+            handle,
+            auth,
+        } => {
+            m.insert(Value::keyword("kind"), Value::string("connected"));
+            m.insert(Value::keyword("alias"), Value::string(alias));
+            m.insert(Value::keyword("handle"), handle.clone());
+            m.insert(
+                Value::keyword("auth"),
+                auth.as_ref().map(encode_grant).unwrap_or_else(Value::nil),
+            );
+        }
+        ServerResolution::NeedsAuth {
+            alias,
+            url,
+            scopes,
+            tools,
+            persist,
+        } => {
+            m.insert(Value::keyword("kind"), Value::string("needs-auth"));
+            m.insert(Value::keyword("alias"), Value::string(alias));
+            m.insert(Value::keyword("url"), Value::string(url));
+            m.insert(Value::keyword("scopes"), string_list_value(scopes));
+            m.insert(Value::keyword("tools"), string_list_value(tools));
+            m.insert(Value::keyword("persist"), Value::string(persist));
+        }
+        ServerResolution::Failed { alias, reason } => {
+            m.insert(Value::keyword("kind"), Value::string("failed"));
+            m.insert(Value::keyword("alias"), Value::string(alias));
+            m.insert(Value::keyword("reason"), Value::string(reason));
+        }
+    }
+    Value::map(m)
+}
+
+fn decode_one(v: &Value) -> Option<ServerResolution> {
+    let m = v.as_map_ref()?;
+    let kind = m.get(&Value::keyword("kind"))?.as_str()?.to_string();
+    let alias = m.get(&Value::keyword("alias"))?.as_str()?.to_string();
+    match kind.as_str() {
+        "connected" => Some(ServerResolution::Connected {
+            alias,
+            handle: m.get(&Value::keyword("handle"))?.clone(),
+            auth: m.get(&Value::keyword("auth")).and_then(decode_grant),
+        }),
+        "needs-auth" => Some(ServerResolution::NeedsAuth {
+            alias,
+            url: m.get(&Value::keyword("url"))?.as_str()?.to_string(),
+            scopes: decode_string_list(m.get(&Value::keyword("scopes"))),
+            tools: decode_string_list(m.get(&Value::keyword("tools"))),
+            persist: m.get(&Value::keyword("persist"))?.as_str()?.to_string(),
+        }),
+        "failed" => Some(ServerResolution::Failed {
+            alias,
+            reason: m.get(&Value::keyword("reason"))?.as_str()?.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// Encode a resolved `Vec<ServerResolution>` as a Sema `Value` (a list of maps).
+/// Built by [`WorkflowMcpResolver::resolve_prepared`]'s VM-thread decoder AFTER
+/// it registers connected clients (so each `Connected.handle` is a live opaque
+/// handle `Value`).
+pub fn encode_resolutions(resolutions: &[ServerResolution]) -> Value {
+    Value::list(resolutions.iter().map(encode_one).collect())
+}
+
+/// Decode the `Value` produced by [`encode_resolutions`] back into resolutions —
+/// `workflow/run`'s resume continuation runs the gate/event logic over these.
+/// Silently drops any malformed entry (the encoder is the only producer, so this
+/// is a defensive round-trip, not user input).
+pub fn decode_resolutions(value: &Value) -> Vec<ServerResolution> {
+    value
+        .as_seq()
+        .map(|items| items.iter().filter_map(decode_one).collect())
+        .unwrap_or_default()
+}
+
+/// Completion tag for the trivial ready-resolution offload (`"wfr0"`).
+const READY_RESOLUTION_KIND: u64 = 0x7766_7230;
+
+/// The default [`WorkflowMcpResolver::resolve_prepared`] path: a
+/// `PreparedExternalOperation` that does NO off-thread work — its blocking job
+/// returns immediately — and whose decoder replays an already-encoded `Value`.
+/// For resolvers (test fakes) whose `resolve` does no `io_block_on`, so running
+/// it on the VM thread inside a quantum is safe; the offload wrapper exists only
+/// so `workflow/run`'s runtime arm has a uniform External wait to suspend on.
+fn ready_resolution_external(encoded: Value) -> PreparedExternalOperation {
+    let kind = CompletionKind::try_from_raw(READY_RESOLUTION_KIND)
+        .expect("ready-resolution completion kind is nonzero");
+    let resource = InterruptibleResource::new(
+        "workflow/mcp-resolve",
+        Box::new(NoopResolveCancelHook),
+    );
+    PreparedExternalOperation::interruptible_blocking(
+        kind,
+        Box::new(ReadyResolutionDecoder {
+            value: Some(encoded),
+        }),
+        resource,
+        || Ok(Box::new(()) as SendPayload),
+    )
+}
+
+/// Decoder for [`ready_resolution_external`]: ignores the (unit) job payload and
+/// returns the pre-encoded resolutions `Value` it captured on the VM thread. Not
+/// `Send`; the runtime keeps it on the VM thread, so holding a `Value` is sound.
+struct ReadyResolutionDecoder {
+    value: Option<Value>,
+}
+
+impl Trace for ReadyResolutionDecoder {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        if let Some(value) = &self.value {
+            sink(GcEdge::Value(value));
+        }
+        true
+    }
+}
+
+impl CompletionDecoder for ReadyResolutionDecoder {
+    fn decode(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        result.map_err(|failure| {
+            SemaError::eval(format!("workflow/mcp-resolve: {}", failure.message()))
+        })?;
+        Ok(self
+            .value
+            .take()
+            .expect("ready-resolution decoder runs once"))
+    }
+}
+
+/// No-op cancel hook for the ready-resolution offload — nothing is in flight.
+struct NoopResolveCancelHook;
+
+impl Trace for NoopResolveCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CancelHook for NoopResolveCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────

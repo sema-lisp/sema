@@ -10,8 +10,9 @@ pub mod server;
 pub mod tools;
 
 pub use builtins::{
-    browser_open_allowed, close_handle, connect_from_config, gated_browser_opener,
-    register_mcp_builtins, ConnectFailure, ConnectOpts,
+    browser_open_allowed, close_handle, connect_from_config, connect_send, gated_browser_opener,
+    host_capability_allowed, register_connected, register_mcp_builtins, ConnectFailure,
+    ConnectOpts, ConnectedClient,
 };
 pub use client::{McpClient, McpClientConfig, McpHttpConfig};
 pub use client_auth::{login_interactive, mcp_login, mcp_login_token, mcp_logout};

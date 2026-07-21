@@ -122,6 +122,22 @@ expect_failure \
   "active-runtime synchronous callback re-entry" \
   CALL_CALLBACK
 
+# A quantum-reachable `io_block_on` must fail: runtime code parks on an External
+# wait; `io_block_on` is a host-only adapter, legal only on the
+# `!in_runtime_quantum()` arm (or inside an `io_spawn_blocking` worker), never
+# textually inside an active-runtime branch.
+expect_failure \
+  "$fixtures/active-runtime-io-block-on.rs" \
+  "$fixtures/empty-allowlist.tsv" \
+  "active-runtime synchronous callback re-entry" \
+  IO_BLOCK_ON
+
+# The same adapter on the negated (`!in_runtime_quantum()`) host arm is the
+# sanctioned shape and must PASS.
+expect_success \
+  "$fixtures/negated-runtime-io-block-on.rs" \
+  "$fixtures/empty-allowlist.tsv"
+
 expect_success \
   "$fixtures/negated-runtime-host-adapter.rs" \
   "$fixtures/negated-runtime-host-allowlist.tsv"

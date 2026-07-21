@@ -781,17 +781,21 @@ fn async_context_mid_call_401_noninteractive_reauth_fails_cleanly() {
          message; got: {outcome}"
     );
 
-    // Reauth was actually ATTEMPTED (not skipped): discovery and DCR both ran
-    // before `NoInteractiveDriver::drive()` cleanly refused the browser leg.
+    // Reauth is attempted (`call_tool_async` re-enters `login()`), but a
+    // non-interactive driver refuses in `preflight()` BEFORE OAuth discovery or
+    // dynamic client registration: registering a throwaway client on the auth
+    // server (and, for a sandbox-denied browser leg, touching the network) is
+    // wasted work when interactive consent cannot succeed. So the reauth
+    // fast-fails without running discovery/DCR — only the original 401 surfaces.
     assert!(
-        marker_dir.join("discovery-hit").exists(),
-        "the 401 branch must have driven OAuth discovery, proving the \
-         reauth-then-retry path actually ran"
+        !marker_dir.join("discovery-hit").exists(),
+        "a non-interactive reauth must fast-fail in preflight() without driving \
+         OAuth discovery"
     );
     assert!(
-        marker_dir.join("register-hit").exists(),
-        "the 401 branch must have reached dynamic client registration before \
-         the non-interactive driver refuses the browser leg"
+        !marker_dir.join("register-hit").exists(),
+        "a non-interactive reauth must refuse before dynamic client registration \
+         — no throwaway client left on the auth server"
     );
 
     // The interpreter/scheduler remains healthy: no orphaned task, ordinary

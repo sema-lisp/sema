@@ -2076,7 +2076,34 @@ impl Runtime {
                     return Ok(true);
                 }
                 let eval_context = Rc::clone(&self.state.borrow()._context);
-                PendingStage::Apply(task, owner, pending.invoke_continuation(&eval_context))
+                // Run the completion continuation under THIS task's dynamic scopes
+                // (LLM / OTel / leaf-usage), mirroring `resume_continuation_value`.
+                // A decoder-backed External completion runs its continuation here —
+                // e.g. an `llm/complete` finalizer's `track_usage`, which writes the
+                // task-scoped `llm/last-usage` slot. Without the swap that write
+                // lands on ambient TLS and is clobbered when the task's next quantum
+                // installs its own (empty) scope, so the usage never reaches
+                // `llm/last-usage`. The empty-scope fast path keeps this free for
+                // tasks with no active LLM/OTel/usage scope.
+                let mut scopes = {
+                    let mut state = self.state.borrow_mut();
+                    let task_mut =
+                        state
+                            .tasks
+                            .get_mut(&task)
+                            .ok_or_else(|| RuntimeFault::Invariant {
+                                message: "resumed task disappeared before continuation".into(),
+                            })?;
+                    TaskScopeSwap::install(task_mut)
+                };
+                let resumed = pending.invoke_continuation(&eval_context);
+                {
+                    let mut state = self.state.borrow_mut();
+                    if let Some(task_mut) = state.tasks.get_mut(&task) {
+                        scopes.restore(task_mut);
+                    }
+                }
+                PendingStage::Apply(task, owner, resumed)
             }
             PendingStage::Invoke(task, owner, call) => {
                 self.invoke_callable(task, owner, call)?;

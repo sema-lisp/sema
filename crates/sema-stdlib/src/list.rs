@@ -2140,8 +2140,20 @@ pub fn register(env: &sema_core::Env) {
                     }),
                 }))
             } else {
-                // Non-callable producer: exact legacy "not callable" error.
-                call_function(&args[0], &[]).map(NativeOutcome::Return)
+                // Non-callable producer: raise the evaluator's exact "not
+                // callable" error directly. We can't route through
+                // `call_function` here — its host-only `with_stdlib_ctx` seam
+                // panics inside a runtime quantum — nor through a
+                // `NativeOutcome::Call`, whose non-callable arm surfaces a
+                // different ("expected callable") message.
+                Err(
+                    SemaError::eval(format!(
+                        "not callable: {} ({})",
+                        args[0],
+                        args[0].type_name()
+                    ))
+                    .with_hint("expected a function, lambda, or keyword"),
+                )
             }
         },
     );

@@ -1835,6 +1835,27 @@ impl VM {
         self.native_signal = None;
     }
 
+    /// Drop every strong heap reference this VM holds *purely as a cache* — the
+    /// resolved global inline-cache slots and the DAP debug-value table — while
+    /// keeping the backing allocations for reuse. Called when the reusable
+    /// scratch callback VM is parked idle in `RuntimeState::scratch_callback_vm`.
+    ///
+    /// A parked scratch VM's frames and stack are already empty, so its inline
+    /// cache is the only thing that can pin a heap value. A slot cached from a
+    /// since-rebound global (e.g. a forced `delay` thunk whose global was
+    /// `set!`-ed away) would otherwise keep an otherwise-unreachable value —
+    /// including a whole garbage cycle — alive across evals, because the
+    /// collector traces the parked VM and a stale cache slot reads as a live
+    /// root. `reset_for_task_with_native_fns` re-sizes the cache for the next
+    /// callback's function table regardless, so releasing here costs nothing in
+    /// steady state.
+    pub fn release_parked_scratch_state(&mut self) {
+        for slot in &mut self.inline_cache {
+            *slot = (u32::MAX, 0, CachedGlobal::Plain(Value::nil()));
+        }
+        self.debug_values.clear();
+    }
+
     pub fn execute(&mut self, closure: Rc<Closure>, ctx: &EvalContext) -> Result<Value, SemaError> {
         ensure_legacy_vm_entry_allowed(ctx)?;
         self.ensure_cache_space(&closure.func);

@@ -4004,6 +4004,11 @@ impl Runtime {
         let quantum_guard = match eval_context.enter_runtime_quantum() {
             Ok(guard) => guard,
             Err(error) => {
+                // Release cached-global pins before parking: an idle pooled VM
+                // must not keep otherwise-garbage values (e.g. a forced `delay`
+                // thunk cached from a since-rebound global) reachable across
+                // evals via the collector's trace of `scratch_callback_vm`.
+                vm.release_parked_scratch_state();
                 self.state.borrow_mut().scratch_callback_vm = Some(vm);
                 let mut state = self.state.borrow_mut();
                 state.tasks.insert(task_id, task);
@@ -4184,6 +4189,11 @@ impl Runtime {
 
         match outcome {
             ElementOutcome::Settled(result) => {
+                // Release cached-global pins before parking: an idle pooled VM
+                // must not keep otherwise-garbage values (e.g. a forced `delay`
+                // thunk cached from a since-rebound global) reachable across
+                // evals via the collector's trace of `scratch_callback_vm`.
+                vm.release_parked_scratch_state();
                 self.state.borrow_mut().scratch_callback_vm = Some(vm);
                 let mut state = self.state.borrow_mut();
                 if state.tasks.insert(task_id, task).is_some() {
@@ -4197,6 +4207,11 @@ impl Runtime {
                 Ok(())
             }
             ElementOutcome::Handoff(next_call) => {
+                // Release cached-global pins before parking: an idle pooled VM
+                // must not keep otherwise-garbage values (e.g. a forced `delay`
+                // thunk cached from a since-rebound global) reachable across
+                // evals via the collector's trace of `scratch_callback_vm`.
+                vm.release_parked_scratch_state();
                 self.state.borrow_mut().scratch_callback_vm = Some(vm);
                 let mut state = self.state.borrow_mut();
                 if state.tasks.insert(task_id, task).is_some() {

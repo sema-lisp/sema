@@ -1,7 +1,10 @@
-// Fixture: the SANCTIONED A2 workflow-journal filesystem shape. `create_dir_all` is used
-// only for the parent chain and the memo subdir; the run dir is created non-recursively
-// and the journal file is claimed atomically with `create_new`. Segment claims use
-// `create_new` in a loop — no exists-probe. This fixture must PASS the policy.
+// Fixture: the SANCTIONED A2+A3 workflow-journal filesystem shape. `create_dir_all` is
+// used only for the parent chain; the run dir is created non-recursively and the journal
+// file is claimed atomically with `create_new`. Segment claims use `create_new` in a loop
+// — no exists-probe. Since A3 journal.rs is WRITE-FREE: every event/memo/sidecar write
+// (and the memo subdir's create_dir_all) lives on the writer THREAD, so there is no
+// `write_all` or `fs::write` here — the VM-thread journal methods only enqueue. This
+// fixture must PASS both the journal (A2) and writer (A3) policies.
 use std::fs;
 use std::fs::OpenOptions;
 use std::io;
@@ -18,10 +21,9 @@ fn ensure_run_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-fn write_memo(dir: &Path, key: &str, json: &str) -> io::Result<()> {
-    let memo_dir = dir.join("memo");
-    fs::create_dir_all(&memo_dir)?;
-    fs::write(memo_dir.join(format!("{key}.json")), json)
+// A memo is ENQUEUED to the writer thread — no filesystem write on the VM thread.
+fn write_memo(writer: &JournalWriter, key: &str, json: String) {
+    writer.enqueue_memo(key.to_string(), json);
 }
 
 fn claim_segment(dir: &Path) -> io::Result<()> {

@@ -14,6 +14,7 @@
 pub mod context;
 pub mod event;
 mod journal;
+pub mod writer;
 
 pub use context::{
     current_for, cur_agent_for, resolve_run_id, set_cur_agent_for, set_workflow_scope, WorkflowCtx,

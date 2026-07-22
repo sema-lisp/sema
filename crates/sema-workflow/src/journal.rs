@@ -1,12 +1,14 @@
 //! The append-only JSONL journal — the system of record for a workflow run.
 //!
-//! Writer shape is copied from `sema_otel::file_exporter::JsonlFileExporter`:
-//! `OpenOptions::new().append(true).create(true)`, a `BufWriter`, one
-//! `serde_json` line + `'\n'` per event, **flush per event** (so a crash mid-run
-//! still leaves a readable prefix), and **swallow write errors** (a journal write
-//! failure must never crash the running workflow — same trust model and rationale
-//! as the OTel exporter). Unlike that exporter's `span_to_json`, this journal
-//! preserves the FULL event vocabulary — it does not drop events.
+//! Every actual filesystem write happens OFF the VM thread on a per-run
+//! [`JournalWriter`] thread (see `writer.rs`): the VM thread only opens/claims the run
+//! directory + `events.jsonl` (bounded pre-dispatch admission) and then renders each
+//! event/memo/sidecar to a `String`/JSON and `try_send`s it to the writer. So this
+//! module holds the writer HANDLE, not a `BufWriter` — no `write_all`/`fs::write` runs
+//! on the quantum. The frozen append-only journal contract is unchanged: one
+//! `serde_json` line + `'\n'` per event, flushed per event (a crash mid-run leaves a
+//! readable prefix), and write errors swallowed (a journal hiccup must never crash the
+//! run — same trust model as the OTel file exporter).
 //!
 //! Rust-side I/O here BYPASSES the Sema VFS sandbox, exactly like the OTel file
 //! exporter. That is intentional and the same trust model: the run directory is an
@@ -25,26 +27,33 @@
 
 use std::fs;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Write};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
+use std::time::Duration;
 
 use crate::event::WorkflowEvent;
+use crate::writer::JournalWriter;
 
-/// One run's journal. Owns the open `events.jsonl` handle and knows the run dir so
-/// the sidecar JSON files (`args.json`, `metadata.json`, `result.json`) land next
-/// to it.
+/// Bounded wait for the host (non-quantum) terminal flush-ack and for unit tests: a
+/// runtime quantum instead parks on the External flush-ack (see `workflow/run`'s
+/// `finish_run`), never this blocking wait.
+const HOST_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One run's journal. Owns the run dir path and the bounded writer HANDLE. Every write
+/// method enqueues onto the writer thread; no filesystem write runs here.
 pub struct Journal {
     dir: PathBuf,
-    writer: BufWriter<File>,
+    writer: JournalWriter,
 }
 
 impl Journal {
-    /// Create a FRESH run and open its `events.jsonl`. The journal file is claimed
-    /// ATOMICALLY with `create_new`, so a fresh run whose journal already exists fails
-    /// with [`io::ErrorKind::AlreadyExists`] rather than appending to (and corrupting)
-    /// another run's frozen event stream — the A2 run-identity guarantee. Errors propagate
-    /// so the workflow runtime can fail the run cleanly (vs. the per-event writes below,
-    /// which swallow failures).
+    /// Create a FRESH run and open its `events.jsonl`, handing the open file to a
+    /// dedicated writer thread. The journal file is claimed ATOMICALLY with `create_new`,
+    /// so a fresh run whose journal already exists fails with [`io::ErrorKind::AlreadyExists`]
+    /// rather than appending to (and corrupting) another run's frozen event stream — the A2
+    /// run-identity guarantee. The open/claim error propagates so the runtime can fail the
+    /// run cleanly (per-event enqueues below are best-effort).
     ///
     /// `runs_root` is normally [`crate::RUNS_ROOT`] (project-local `.sema/runs`),
     /// resolved cwd-relative — NOT `~/.sema`.
@@ -69,33 +78,31 @@ impl Journal {
         let dir = runs_root.as_ref().join(run_id);
         ensure_run_dir(&dir)?;
         let path = dir.join(filename);
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)?;
-        Ok(Self {
-            dir,
-            writer: BufWriter::new(file),
-        })
+        let file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+        Ok(Self::from_open(dir, file))
     }
 
-    /// Write a per-leaf memo value to `memo/<content_key>.json`. The file's EXISTENCE
-    /// is the resume source of truth: present ⇒ that leaf completed with this value, so
-    /// a resumed run short-circuits it. Keeps the frozen `events.jsonl` untouched (the
-    /// memo dir is a NEW best-effort sidecar, like `result.json`). Best-effort by
-    /// design; a failed memo write just means that leaf re-runs on resume.
-    pub fn write_memo(&self, content_key: &str, value: &serde_json::Value) -> io::Result<()> {
-        let memo_dir = self.dir.join("memo");
-        fs::create_dir_all(&memo_dir)?;
-        let path = memo_dir.join(format!("{content_key}.json"));
-        let mut s = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
-        s.push('\n');
-        fs::write(path, s)
+    /// Wrap an already-opened `events.jsonl` handle + its run dir with a fresh writer
+    /// thread. Shared by [`Self::open_named`] and [`next_resume_segment`].
+    fn from_open(dir: PathBuf, file: File) -> Self {
+        let writer = JournalWriter::spawn(dir.clone(), file);
+        Self { dir, writer }
     }
 
-    /// A throwaway journal that writes into a temp directory — for unit tests that
-    /// need a `WorkflowCtx` but don't inspect the journal. Keeps the `BufWriter<File>`
-    /// field shape (no `dyn Write` churn).
+    /// Enqueue a per-leaf memo value to `memo/<content_key>.json`. The file's EXISTENCE
+    /// is the resume source of truth: present ⇒ that leaf completed with this value, so a
+    /// resumed run short-circuits it. The whole-file write happens on the writer thread.
+    /// Best-effort by design; a dropped memo just means that leaf re-runs on resume.
+    /// Cap enforcement (round-trip guard + size/count caps) lives in
+    /// [`crate::context::WorkflowCtx::memo_store`], which decides whether to call this.
+    pub fn write_memo(&self, content_key: &str, value: &serde_json::Value) {
+        let mut json = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+        json.push('\n');
+        self.writer.enqueue_memo(content_key.to_string(), json);
+    }
+
+    /// A throwaway journal that writes into a temp directory — for unit tests that need a
+    /// `WorkflowCtx` but don't inspect the journal.
     #[doc(hidden)]
     pub fn null() -> Self {
         let mut dir = std::env::temp_dir();
@@ -114,10 +121,7 @@ impl Journal {
                 .create(true)
                 .open(std::env::temp_dir().join("sema-wf-null.jsonl"))
                 .expect("temp dir is writable for the null journal");
-            Self {
-                dir,
-                writer: BufWriter::new(f),
-            }
+            Self::from_open(dir, f)
         })
     }
 
@@ -126,53 +130,57 @@ impl Journal {
         &self.dir
     }
 
-    /// Best-effort flush of the buffered writer (e.g. at `run.ended`). Swallows
-    /// errors, matching [`Self::write`].
-    pub fn flush(&mut self) {
-        let _ = self.writer.flush();
+    /// Enqueue a terminal flush barrier and return the ack receiver, WITHOUT waiting. The
+    /// runtime (quantum) terminal path parks on this via an External wait so a normal
+    /// `workflow/run` return means the journal is durable; the host path uses
+    /// [`Self::flush_blocking`].
+    pub fn request_flush(&self) -> Receiver<()> {
+        self.writer.request_flush()
     }
 
-    /// Append one event as a single JSON line + `'\n'`, flushing immediately.
-    ///
-    /// Best-effort: a serialize or write failure is swallowed (returns `Ok(())`) so a
-    /// journaling hiccup cannot crash the workflow — matching the OTel exporter's
-    /// "never crash the VM" contract. The on-disk prefix stays valid JSONL.
-    pub fn write(&mut self, event: &WorkflowEvent) {
-        let mut line = match serde_json::to_string(event) {
+    /// Block (bounded) until the writer has flushed every enqueued message to disk. For
+    /// the host (non-quantum) terminal path and unit tests — NEVER call from inside a
+    /// runtime quantum (park on the External flush-ack instead). Not a filesystem call:
+    /// it waits for the writer thread's ack.
+    pub fn flush_blocking(&self) {
+        let ack = self.writer.request_flush();
+        let _ = ack.recv_timeout(HOST_FLUSH_TIMEOUT);
+    }
+
+    /// Append one event as a single JSON line + `'\n'` (the writer thread appends the
+    /// newline). Best-effort: a serialize failure renders a fallback error line; a full
+    /// queue drops the line and surfaces one `journal.overflow` marker when space returns.
+    pub fn write(&self, event: &WorkflowEvent) {
+        let line = match serde_json::to_string(event) {
             Ok(s) => s,
             Err(e) => format!("{{\"error\":\"workflow journal serialize: {e}\"}}"),
         };
-        line.push('\n');
-        // Swallow both the write and the flush error: journaling must not abort the run.
-        let _ = self.writer.write_all(line.as_bytes());
-        let _ = self.writer.flush();
+        self.writer.enqueue_event(line);
     }
 
-    /// Write `args.json` (the `--args` input, verbatim). Pretty-printed for human
-    /// inspection; this file is NOT part of the byte-identical events.jsonl oracle.
-    pub fn write_args(&self, args: &serde_json::Value) -> io::Result<()> {
-        self.write_sidecar("args.json", args)
+    /// Enqueue `args.json` (the `--args` input, verbatim). Pretty-printed for human
+    /// inspection; NOT part of the byte-identical events.jsonl oracle.
+    pub fn write_args(&self, args: &serde_json::Value) {
+        self.write_sidecar("args.json", args);
     }
 
-    /// Write `metadata.json` (workflow name, code version, budget, permissions). Caller
-    /// constructs the value; this crate does not own the metadata schema yet.
-    pub fn write_metadata(&self, metadata: &serde_json::Value) -> io::Result<()> {
-        self.write_sidecar("metadata.json", metadata)
+    /// Enqueue `metadata.json` (workflow name, code version, budget, permissions).
+    pub fn write_metadata(&self, metadata: &serde_json::Value) {
+        self.write_sidecar("metadata.json", metadata);
     }
 
-    /// Write `result.json` (the final `{:status …}` envelope as JSON).
-    pub fn write_result(&self, result: &serde_json::Value) -> io::Result<()> {
-        self.write_sidecar("result.json", result)
+    /// Enqueue `result.json` (the final `{:status …}` envelope as JSON).
+    pub fn write_result(&self, result: &serde_json::Value) {
+        self.write_sidecar("result.json", result);
     }
 
-    /// Atomically-enough write a pretty-printed JSON sidecar into the run dir. These
-    /// are whole-file writes (truncate), unlike the append-only events stream.
-    fn write_sidecar(&self, name: &str, value: &serde_json::Value) -> io::Result<()> {
-        let path = self.dir.join(name);
+    /// Enqueue a pretty-printed JSON sidecar write into the run dir. These are whole-file
+    /// writes (truncate) on the writer thread, unlike the append-only events stream.
+    fn write_sidecar(&self, name: &str, value: &serde_json::Value) {
         let mut s = serde_json::to_string_pretty(value)
             .unwrap_or_else(|e| format!("{{\"error\":\"workflow {name} serialize: {e}\"}}"));
         s.push('\n');
-        fs::write(path, s)
+        self.writer.enqueue_sidecar(name.to_string(), s);
     }
 }
 
@@ -235,10 +243,7 @@ pub fn next_resume_segment(runs_root: impl AsRef<Path>, run_id: &str) -> io::Res
         let path = dir.join(format!("events.resume-{n}.jsonl"));
         match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => {
-                return Ok(Journal {
-                    dir,
-                    writer: BufWriter::new(file),
-                });
+                return Ok(Journal::from_open(dir, file));
             }
             // Segment already claimed (by us on a prior resume, or a racing resume) — try
             // the next ordinal. The claim above is atomic, so the loser here simply moves on.
@@ -274,7 +279,7 @@ mod tests {
     #[test]
     fn writes_events_jsonl_one_line_per_event() {
         let root = tmp_root();
-        let mut j = Journal::open(&root, "wf_test_0001").unwrap();
+        let j = Journal::open(&root, "wf_test_0001").unwrap();
         j.write(&WorkflowEvent::RunStarted {
             seq: 0,
             ts: "0".into(),
@@ -291,7 +296,8 @@ mod tests {
             reason: None,
             dur_ms: 0,
         });
-        drop(j); // flush/close
+        j.flush_blocking(); // barrier: every event is on disk before we read
+        drop(j);
 
         let body = fs::read_to_string(root.join("wf_test_0001").join("events.jsonl")).unwrap();
         let lines: Vec<&str> = body.lines().collect();
@@ -307,9 +313,9 @@ mod tests {
     fn sidecars_land_in_run_dir() {
         let root = tmp_root();
         let j = Journal::open(&root, "wf_test_0002").unwrap();
-        j.write_args(&serde_json::json!({"name": "x"})).unwrap();
-        j.write_result(&serde_json::json!({"status": "success"}))
-            .unwrap();
+        j.write_args(&serde_json::json!({"name": "x"}));
+        j.write_result(&serde_json::json!({"status": "success"}));
+        j.flush_blocking();
         assert!(j.dir().join("args.json").exists());
         assert!(j.dir().join("result.json").exists());
         fs::remove_dir_all(&root).ok();
@@ -362,8 +368,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             handles.push(std::thread::spawn(move || {
                 barrier.wait();
-                let mut journal =
-                    next_resume_segment(&root, run).expect("segment claim succeeds");
+                let journal = next_resume_segment(&root, run).expect("segment claim succeeds");
                 // Write one event so each claimed segment is a real, distinct file.
                 journal.write(&WorkflowEvent::RunEnded {
                     seq: 0,
@@ -372,6 +377,7 @@ mod tests {
                     reason: None,
                     dur_ms: 0,
                 });
+                journal.flush_blocking();
             }));
         }
         for h in handles {

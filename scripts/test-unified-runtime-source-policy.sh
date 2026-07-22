@@ -198,4 +198,47 @@ expect_journal_failure \
   "$wf_journal_allowlist" \
   WORKFLOW_SEGMENT_EXISTS_PROBE
 
+# ── A3 workflow-writer filesystem policy ────────────────────────────────────
+wf_writer_zero_allowlist="$fixtures/workflow-writer-zero-allowlist.tsv"
+
+expect_writer_success() {
+  local fixture="$1" allowlist="$2" output
+  if ! output="$($scanner --check-workflow-writer "$fixture" "$allowlist" 2>&1)"; then
+    echo "workflow-writer fixture unexpectedly failed: $fixture" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+}
+
+expect_writer_failure() {
+  local fixture="$1" allowlist="$2"
+  shift 2
+  local output
+  if output="$($scanner --check-workflow-writer "$fixture" "$allowlist" 2>&1)"; then
+    echo "workflow-writer fixture unexpectedly passed: $fixture" >&2
+    exit 1
+  fi
+  for expected in "$@"; do
+    if [[ "$output" != *"$expected"* ]]; then
+      echo "workflow-writer fixture did not report '$expected': $fixture" >&2
+      echo "$output" >&2
+      exit 1
+    fi
+  done
+}
+
+# The write-free A3 journal shape (writes moved to the writer thread) PASSES the zero
+# allowlist.
+expect_writer_success \
+  "$fixtures/workflow-journal-clean.rs" \
+  "$wf_writer_zero_allowlist"
+
+# Reintroducing a synchronous `Journal::write` fs call (write_all + fs::write on the VM
+# thread) FAILS — journal.rs must stay write-free.
+expect_writer_failure \
+  "$fixtures/workflow-journal-sync-write.rs" \
+  "$wf_writer_zero_allowlist" \
+  WORKFLOW_WRITE_ALL \
+  WORKFLOW_FS_WRITE
+
 echo "ok: unified-runtime source-policy fixtures"

@@ -5,6 +5,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 host_adapter_allowlist="$repo_root/scripts/unified-runtime-host-adapters.tsv"
 workflow_journal_allowlist="$repo_root/scripts/workflow-journal-fs-allowlist.tsv"
 workflow_journal_src="$repo_root/crates/sema-workflow/src/journal.rs"
+workflow_writer_allowlist="$repo_root/scripts/workflow-writer-fs-allowlist.tsv"
+workflow_writer_src_dir="$repo_root/crates/sema-workflow/src"
 
 # ── Fixture pattern (used by --scan-path) ───────────────────────────────────
 # Broad "legacy async" markers used only to prove the scanner still detects a
@@ -414,6 +416,150 @@ check_workflow_journal_file() {
   rm -f "$hits_file"
 }
 
+# ── A3 workflow-writer filesystem policy ────────────────────────────────────
+# Every `write_all`/`fs::write` in the sema-workflow crate must live on the per-run journal
+# WRITER thread (writer.rs); the VM-thread `Journal` methods only enqueue, so journal.rs
+# stays write-free. Comment-strip + drop the #[cfg(test)] block, then count write_all /
+# fs::write per file.
+
+# Emit "TOKEN<TAB>LINE" for each write_all / fs::write in one file's production module.
+scan_workflow_writer_file() {
+  local file="$1" prod matched ln
+  prod=$(sed -E 's://.*$::' "$file" | sed -n '1,/#\[cfg(test)\]/p')
+  matched=$(printf '%s\n' "$prod" | rg -n --no-heading --color never '\bwrite_all\b' || true)
+  while IFS=: read -r ln _; do
+    [[ -z "$ln" ]] && continue
+    printf 'WORKFLOW_WRITE_ALL\t%s\n' "$ln"
+  done <<< "$matched"
+  matched=$(printf '%s\n' "$prod" | rg -n --no-heading --color never '\bfs::write\b' || true)
+  while IFS=: read -r ln _; do
+    [[ -z "$ln" ]] && continue
+    printf 'WORKFLOW_FS_WRITE\t%s\n' "$ln"
+  done <<< "$matched"
+}
+
+# Emit "TOKEN<TAB>REL<TAB>LINE" across every production .rs in the sema-workflow crate.
+scan_workflow_writer_dir() {
+  cd "$repo_root"
+  local file rel token ln
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    rel=$(repo_relative_path "$file")
+    while IFS=$'\t' read -r token ln; do
+      [[ -z "$token" ]] && continue
+      printf '%s\t%s\t%s\n' "$token" "$rel" "$ln"
+    done < <(scan_workflow_writer_file "$file")
+  done < <(rg --files -g '*.rs' "$workflow_writer_src_dir" | LC_ALL=C sort -u)
+}
+
+# Production gate: pin write_all/fs::write to the exact writer.rs counts; a write in ANY
+# other sema-workflow file (a regressed synchronous Journal write) is unallowlisted.
+check_workflow_writer_dir() {
+  local allowlist="$1"
+  if [[ ! -f "$allowlist" ]]; then
+    echo "workflow-writer fs allowlist is missing: $allowlist" >&2
+    return 2
+  fi
+  local hits_file
+  hits_file=$(mktemp)
+  scan_workflow_writer_dir >"$hits_file"
+  if ! awk -F '\t' '
+    FILENAME == ARGV[1] {
+      if ($0 ~ /^[[:space:]]*(#|$)/) next
+      if (NF < 3 || $3 !~ /^[0-9]+$/) {
+        print "malformed workflow-writer allowlist row: " $0 > "/dev/stderr"
+        invalid = 1
+        next
+      }
+      expected[$1 SUBSEP $2] = $3 + 0
+      next
+    }
+    { key = $1 SUBSEP $2; actual[key]++; sample[key] = $2 ":" $3 }
+    END {
+      for (key in actual) {
+        split(key, part, SUBSEP)
+        if (!(key in expected)) {
+          print "forbidden workflow-writer fs write " part[1] " at " sample[key] \
+            " (journal writes belong on the writer.rs thread)" > "/dev/stderr"
+          invalid = 1
+        } else if (actual[key] != expected[key]) {
+          print "workflow-writer fs count changed for " part[1] " in " part[2] \
+            ": expected " expected[key] ", found " actual[key] > "/dev/stderr"
+          invalid = 1
+        }
+      }
+      for (key in expected) {
+        if (!(key in actual) && expected[key] != 0) {
+          split(key, part, SUBSEP)
+          print "workflow-writer fs allowlist entry is stale for " part[1] " in " part[2] \
+            ": expected " expected[key] ", found 0" > "/dev/stderr"
+          invalid = 1
+        }
+      }
+      exit invalid
+    }
+  ' "$allowlist" "$hits_file"; then
+    rm -f "$hits_file"
+    return 1
+  fi
+  rm -f "$hits_file"
+}
+
+# Single-file fixture gate: check one file's write_all/fs::write against a per-token
+# allowlist (a zero allowlist ⇒ the file must be write-free — the sync-write regression).
+check_workflow_writer_file() {
+  local file="$1" allowlist="$2"
+  if [[ ! -f "$file" ]]; then
+    echo "workflow-writer source is missing: $file" >&2
+    return 2
+  fi
+  if [[ ! -f "$allowlist" ]]; then
+    echo "workflow-writer allowlist is missing: $allowlist" >&2
+    return 2
+  fi
+  local hits_file
+  hits_file=$(mktemp)
+  scan_workflow_writer_file "$file" >"$hits_file"
+  if ! awk -F '\t' '
+    BEGIN { valid["WORKFLOW_WRITE_ALL"] = 1; valid["WORKFLOW_FS_WRITE"] = 1 }
+    FILENAME == ARGV[1] {
+      if ($0 ~ /^[[:space:]]*(#|$)/) next
+      if (NF < 2 || !($1 in valid) || $2 !~ /^[0-9]+$/) {
+        print "malformed workflow-writer allowlist row: " $0 > "/dev/stderr"
+        invalid = 1
+        next
+      }
+      expected[$1] = $2 + 0
+      next
+    }
+    { actual[$1]++; sample[$1] = $2 }
+    END {
+      for (t in actual) {
+        if (!(t in expected)) {
+          print "forbidden workflow-writer fs write " t " at line " sample[t] \
+            " (a synchronous Journal write must move to writer.rs)" > "/dev/stderr"
+          invalid = 1
+        } else if (actual[t] != expected[t]) {
+          print "workflow-writer fs count changed for " t \
+            ": expected " expected[t] ", found " actual[t] > "/dev/stderr"
+          invalid = 1
+        }
+      }
+      for (t in expected) {
+        if (!(t in actual) && expected[t] != 0) {
+          print "workflow-writer fs allowlist entry is stale for " t > "/dev/stderr"
+          invalid = 1
+        }
+      }
+      exit invalid
+    }
+  ' "$allowlist" "$hits_file"; then
+    rm -f "$hits_file"
+    return 1
+  fi
+  rm -f "$hits_file"
+}
+
 check_source_policy_paths() {
   local allowlist="$1"
   shift
@@ -472,6 +618,13 @@ case "${1:-}" in
     fi
     check_workflow_journal_file "$2" "$3"
     ;;
+  --check-workflow-writer)
+    if [[ $# -ne 3 ]]; then
+      echo "usage: $0 --check-workflow-writer FILE ALLOWLIST" >&2
+      exit 2
+    fi
+    check_workflow_writer_file "$2" "$3"
+    ;;
   ""|--check)
     if ! check_source_policy_paths "$host_adapter_allowlist" crates/*/src playground/src; then
       echo "unified-runtime source policy failed" >&2
@@ -479,6 +632,10 @@ case "${1:-}" in
     fi
     if ! check_workflow_journal_file "$workflow_journal_src" "$workflow_journal_allowlist"; then
       echo "workflow-journal filesystem policy failed" >&2
+      exit 1
+    fi
+    if ! check_workflow_writer_dir "$workflow_writer_allowlist"; then
+      echo "workflow-writer filesystem policy failed" >&2
       exit 1
     fi
     bash "$repo_root/scripts/test-unified-runtime-source-policy.sh"

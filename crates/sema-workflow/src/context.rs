@@ -23,10 +23,12 @@
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::io;
 use std::path::Path;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::Receiver;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use sema_core::cycle::GcEdge;
@@ -49,6 +51,65 @@ const RUN_ID_ENV: &str = "SEMA_WORKFLOW_RUN_ID";
 /// Env var that overrides the run-directory base (the CLI sets it from `--run-dir`).
 /// Default is [`RUNS_ROOT`] (`./.sema/runs`).
 const RUN_DIR_ENV: &str = "SEMA_WORKFLOW_RUN_DIR";
+
+/// A3 hard caps captured before any VM-thread encode. They bound the CPU/memory a single
+/// leaf can spend materializing state on the quantum; the on-disk writes themselves are
+/// off the VM thread (see `writer.rs`).
+///
+/// Max memos stored per run. Past it a leaf is simply not memoized (it re-runs on
+/// resume) — the same fallback the round-trip guard already uses.
+pub const MEMO_MAX_COUNT: u64 = 4096;
+/// Max serialized bytes per memo. An over-cap value is NOT stored (never JSON-encoded in
+/// full on the VM thread — the compact form is bounded-checked first).
+pub const MEMO_FILE_MAX_BYTES: usize = 1 << 20; // 1 MiB
+/// Cap for the `value_digest` bounded encode. A value larger than this gets a stable
+/// marker digest instead of a full JSON materialization on the VM thread.
+const DIGEST_MAX_BYTES: usize = 1 << 20; // 1 MiB
+
+/// A `fmt::Write` sink that accepts at most `cap` bytes of a value's compact `Display`
+/// form and then aborts (returns `fmt::Error`), so a huge value is never fully
+/// materialized on the VM thread. Char-boundary safe.
+struct CappedWriter {
+    buf: String,
+    cap: usize,
+    truncated: bool,
+}
+
+impl std::fmt::Write for CappedWriter {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        if self.truncated {
+            return Err(std::fmt::Error);
+        }
+        let remaining = self.cap.saturating_sub(self.buf.len());
+        if s.len() <= remaining {
+            self.buf.push_str(s);
+            Ok(())
+        } else {
+            let mut end = remaining;
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.buf.push_str(&s[..end]);
+            self.truncated = true;
+            Err(std::fmt::Error)
+        }
+    }
+}
+
+/// Render `v`'s compact `Display` form into at most `cap` bytes. Returns `(text,
+/// truncated)`: `truncated` ⇒ `v` exceeds `cap` and was NOT fully materialized (rendering
+/// aborted at the cap). For a `v` within `cap`, `text` is its exact compact form. Shared
+/// by the rendered-value / digest / memo caps so none of them can be tricked into
+/// materializing an unbounded value on the quantum.
+pub fn compact_capped(v: &Value, cap: usize) -> (String, bool) {
+    let mut w = CappedWriter {
+        buf: String::new(),
+        cap,
+        truncated: false,
+    };
+    let _ = write!(w, "{v}");
+    (w.buf, w.truncated)
+}
 
 thread_local! {
     /// HOST-ADAPTER-ONLY fallback scope store for callers outside a runtime quantum.
@@ -114,6 +175,9 @@ pub struct WorkflowCtx {
     code_version: RefCell<String>,
     resume_memos: RefCell<HashMap<String, Value>>,
     key_seen: RefCell<HashMap<String, u32>>,
+    /// Number of memos stored this run, capped at [`MEMO_MAX_COUNT`] so an unbounded fan-out
+    /// can't spill an unbounded number of memo sidecars.
+    memo_count: Cell<u64>,
     /// The run's `--args` JSON string (for the run.started event). Empty if none.
     args_json: String,
     /// Canonical fingerprint of `--args`, folded into resume content-keys. Kept
@@ -187,6 +251,7 @@ impl WorkflowCtx {
             code_version: RefCell::new(String::new()),
             resume_memos: RefCell::new(HashMap::new()),
             key_seen: RefCell::new(HashMap::new()),
+            memo_count: Cell::new(0),
             args_json,
             args_fingerprint,
             fixed_ts,
@@ -269,7 +334,7 @@ impl WorkflowCtx {
     /// Append one event to the journal. Write errors are swallowed by the journal
     /// (same trust model as the OTel file exporter); journaling never aborts the run.
     pub fn emit(&self, event: WorkflowEvent) {
-        self.journal.borrow_mut().write(&event);
+        self.journal.borrow().write(&event);
     }
 
     /// True under the fixed-timestamp test seam (`SEMA_WORKFLOW_FIXED_TS`). Callers
@@ -299,6 +364,15 @@ impl WorkflowCtx {
     /// diffing — NOT resume identity (resume keys on the input-derived content-key and
     /// stores the real value in `memo/`, round-trip-guarded). Stable within a process.
     pub fn value_digest(&self, v: &Value) -> String {
+        // Bound the work: a value larger than the digest cap is never JSON-encoded in full
+        // on the VM thread — it gets a stable marker digest over its bounded compact prefix.
+        // The digest is NOT the resume identity (memo content-keys are, round-trip-guarded),
+        // and the byte-identical goldens only ever digest tiny values, so a capped path here
+        // never changes a golden digest.
+        let (compact, truncated) = compact_capped(v, DIGEST_MAX_BYTES);
+        if truncated {
+            return format!("oversized_{:x}", md5::compute(compact.as_bytes()));
+        }
         let json = sema_core::json::value_to_json_lossy(v);
         let bytes = serde_json::to_vec(&json).unwrap_or_default();
         format!("{:x}", md5::compute(bytes))
@@ -308,7 +382,7 @@ impl WorkflowCtx {
     /// failure is swallowed like a journal write).
     pub fn write_result(&self, envelope: &Value) {
         let json = sema_core::json::value_to_json_lossy(envelope);
-        let _ = self.journal.borrow().write_result(&json);
+        self.journal.borrow().write_result(&json);
     }
 
     /// True when a `:budget` cap (usd and/or tokens) is in force for this run.
@@ -423,22 +497,50 @@ impl WorkflowCtx {
 
     /// Persist a leaf's value as a memo sidecar AND into the in-run map — but ONLY if it
     /// round-trips through JSON identically (`value_to_json_lossy`→`json_to_value` is
-    /// lossy for keyword/string keys, records, typed arrays). A value that doesn't
-    /// survive is left un-memoized, so it re-runs on resume rather than resuming wrong.
-    /// Must be called OUTSIDE any held journal borrow.
+    /// lossy for keyword/string keys, records, typed arrays) AND fits the A3 caps. A value
+    /// that doesn't survive, or exceeds [`MEMO_MAX_COUNT`]/[`MEMO_FILE_MAX_BYTES`], is left
+    /// un-memoized, so it re-runs on resume rather than resuming wrong. The whole-file
+    /// memo write itself is enqueued to the writer thread (no fs on the VM thread).
     pub fn memo_store(&self, content_key: &str, v: &Value) {
-        let json = sema_core::json::value_to_json_lossy(v);
-        if sema_core::json::json_to_value(&json) == *v {
-            let _ = self.journal.borrow().write_memo(content_key, &json);
-            self.resume_memos
-                .borrow_mut()
-                .insert(content_key.to_string(), v.clone());
+        // Cap 1 — per-run memo count.
+        if self.memo_count.get() >= MEMO_MAX_COUNT {
+            return;
         }
+        // Cap 2 (pre-encode) — bound the compact form so an oversized value is never
+        // JSON-encoded in full on the VM thread. Truncated ⇒ over-cap ⇒ not stored.
+        let (_, truncated) = compact_capped(v, MEMO_FILE_MAX_BYTES);
+        if truncated {
+            return;
+        }
+        let json = sema_core::json::value_to_json_lossy(v);
+        // Round-trip guard: a value that doesn't survive JSON is left un-memoized.
+        if sema_core::json::json_to_value(&json) != *v {
+            return;
+        }
+        // Cap 2 (exact) — a value can be compact-small but JSON-large (deep nesting of
+        // short atoms); reject on the serialized size too.
+        let serialized = serde_json::to_vec(&json).unwrap_or_default();
+        if serialized.len() > MEMO_FILE_MAX_BYTES {
+            return;
+        }
+        self.memo_count.set(self.memo_count.get() + 1);
+        self.journal.borrow().write_memo(content_key, &json);
+        self.resume_memos
+            .borrow_mut()
+            .insert(content_key.to_string(), v.clone());
     }
 
-    /// Best-effort flush of the journal writer (e.g. at `run.ended`).
+    /// Enqueue a terminal flush barrier, returning the ack receiver WITHOUT waiting — the
+    /// runtime terminal path parks on it via an External wait (see `workflow/run`'s
+    /// `finish_run`).
+    pub fn request_flush(&self) -> Receiver<()> {
+        self.journal.borrow().request_flush()
+    }
+
+    /// Bounded blocking flush of the journal writer (host / non-quantum path). NEVER call
+    /// inside a runtime quantum — park on the External flush-ack instead.
     pub fn flush(&self) {
-        self.journal.borrow_mut().flush();
+        self.journal.borrow().flush_blocking();
     }
 
     // ── MCP handle registry (docs/plans/2026-06-24-workflow-mcp-auth.md §3) ────
@@ -812,7 +914,7 @@ pub fn set_workflow_scope(
         "code_version": code_version,
         "meta": redact_meta_secrets(sema_core::json::value_to_json_lossy(meta)),
     });
-    let _ = journal.write_metadata(&metadata);
+    journal.write_metadata(&metadata);
     // The `:budget` submap of meta becomes the run's enforced spend caps.
     // The CLI sets SEMA_WORKFLOW_ARGS_JSON to the verbatim `--args` string.
     let args_json = std::env::var("SEMA_WORKFLOW_ARGS_JSON").unwrap_or_default();

@@ -196,6 +196,27 @@ the policy test.
 
 ### Commit A3 — bounded workflow I/O (with A1+A2, flips C12)
 
+**Landed.** Journal I/O is now a per-run bounded FIFO writer thread
+(`crates/sema-workflow/src/writer.rs`) owned by `Journal`; the VM thread only
+renders-and-`try_send`s. `Journal::write`/`write_memo`/`write_sidecar`/`write_result`
+enqueue; `capped_render` is a byte-budgeted renderer (via `context::compact_capped`,
+which aborts at the cap) that returns `pretty_print` verbatim for golden-sized values, and
+`value_digest`/`memo_store` cap their encode the same way. Hard caps (`MEMO_MAX_COUNT`,
+`MEMO_FILE_MAX_BYTES`, `JOURNAL_TOTAL_MAX_BYTES` writer-side odometer, `RENDERED_VALUE_MAX_BYTES`)
+are captured before enqueue; overflow (queue-full or size-cap) drops + surfaces one
+`journal.overflow` marker. Every terminal path (`finish_run` for a body that ran;
+`end_run_before_body` for a pre-body `:mcp` gate) enqueues `run.ended` + `result.json` +
+`Flush(ack)`; the runtime path parks on a `PreparedExternalOperation::interruptible_blocking`
+flush-ack (Cluster W's `resolve_prepared` shape) before returning, the host path bounded-waits,
+and a cancellation skips the barrier (`Journal::drop` `try_send`s `Stop` and detaches — no
+`JoinHandle::join` on any VM/cancel path). Regression:
+`crates/sema/tests/workflow_journal_writer_test.rs`; goldens stay byte-identical. Source
+guard: `scripts/workflow-writer-fs-allowlist.tsv` pins `write_all`/`fs::write` to `writer.rs`
+(journal.rs write-free, its `create_dir_all` count dropped 2→1), with a `workflow-journal-sync-write.rs`
+mutation fixture. **C12 flipped to `MIGRATED`** in `docs/internals/async-runtime-inventory.md`;
+the `runtime-match-map.tsv` re-map + `runtime_conformance_test` inventory reconciliation are
+the deferred C7 work and remain red.
+
 **Implementation**
 
 1. **One bounded FIFO journal writer per run** (new

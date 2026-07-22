@@ -1,5 +1,5 @@
 // Fixture: a REGRESSION of the A2 journal policy. The `create_dir_all` count still matches
-// the allowlist (parent + memo), but `next_resume_segment` reintroduces the exists-probe
+// the allowlist (parent chain only), but `next_resume_segment` reintroduces the exists-probe
 // segment claim (`.exists()` in a loop) that A2 replaced with an atomic `create_new`.
 // That TOCTOU probe lets two concurrent resumes double-claim a segment, so this fixture
 // must FAIL the policy (WORKFLOW_SEGMENT_EXISTS_PROBE has no allowlist row).
@@ -12,12 +12,6 @@ fn ensure_run_dir(dir: &Path) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::create_dir(dir)
-}
-
-fn write_memo(dir: &Path, key: &str, json: &str) -> io::Result<()> {
-    let memo_dir = dir.join("memo");
-    fs::create_dir_all(&memo_dir)?;
-    fs::write(memo_dir.join(format!("{key}.json")), json)
 }
 
 // FORBIDDEN: an exists-probe segment claim (the pre-A2 TOCTOU shape).

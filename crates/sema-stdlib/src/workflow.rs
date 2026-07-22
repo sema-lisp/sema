@@ -22,15 +22,18 @@
 
 use sema_core::cycle::GcEdge;
 use sema_core::runtime::{
-    NativeCall, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, NativeSuspend,
-    ResumeInput, TaskContextHandle, Trace, WaitKind,
+    CancelDisposition, CancelHook, CancelHookError, CompletionDecoder, CompletionKind,
+    DecodedCompletion, ExternalFailure, InterruptibleResource, NativeCall, NativeCallContext,
+    NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation,
+    ResumeInput, SendPayload, TaskContextHandle, Trace, WaitKind,
 };
 use sema_core::{SemaError, Value};
 use sema_workflow::context;
 use sema_workflow::event::WorkflowEvent;
 use std::collections::BTreeMap;
 use std::rc::Rc;
-use std::time::Instant;
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 use crate::workflow_mcp::{self, ServerResolution, WorkflowMcpResolver};
 
@@ -90,10 +93,26 @@ fn cap_text(s: &str) -> String {
     }
 }
 
-/// Render a value for the journal so the dashboard can show the real data, capped via
-/// [`cap_text`].
+/// Max bytes of a value's compact form the journal renders inline before truncating.
+/// Golden values are tiny (far below this), so [`capped_render`] returns `pretty_print`
+/// verbatim for them and the goldens stay byte-identical; only a pathologically large
+/// value is truncated — and it is NEVER materialized in full (the compact form is
+/// bounded-checked via `context::compact_capped`, which aborts at the cap).
+const RENDERED_VALUE_MAX_BYTES: usize = 8192;
+
+/// Render a value for the journal so the dashboard can show the real data, byte-budgeted
+/// so one huge value can't materialize a multi-MB string on the VM thread. A value that
+/// fits renders exactly as before (`pretty_print(v, 100)`) — keeping goldens
+/// byte-identical; an over-cap value is rendered from its bounded compact prefix + a
+/// truncation marker.
 fn capped_render(v: &Value) -> String {
-    cap_text(&sema_core::pretty_print(v, 100))
+    let (compact, truncated) =
+        sema_workflow::context::compact_capped(v, RENDERED_VALUE_MAX_BYTES);
+    if truncated {
+        format!("{compact}\n… (truncated at {RENDERED_VALUE_MAX_BYTES} bytes)")
+    } else {
+        sema_core::pretty_print(v, 100)
+    }
 }
 
 /// Build the success envelope returned by `workflow/run`. PASS-THROUGH: if the
@@ -194,7 +213,7 @@ fn end_run_before_body(
     status: &str,
     reason: String,
     envelope: Value,
-) -> Value {
+) -> (Value, Receiver<()>) {
     close_open_phase(ctx, status);
     ctx.emit(WorkflowEvent::RunEnded {
         seq: ctx.next_seq(),
@@ -204,15 +223,21 @@ fn end_run_before_body(
         dur_ms: ctx.dur_ms(),
     });
     ctx.write_result(&envelope);
+    // Enqueue the terminal flush barrier BEFORE removing the scope, so the pre-body gate
+    // exits are journal-durable exactly like a body that ran (see `terminal_plan`).
+    let ack = ctx.request_flush();
     drop(guard);
-    envelope
+    (envelope, ack)
 }
 
 /// Post-thunk teardown for a `register_thunk_fn` native: given the owning task context
-/// (so the live scope resolves off the task, not TLS), the teardown state, and the
-/// thunk's result, journal/close and return the builtin's value.
+/// (so the live scope resolves off the task, not TLS), the teardown state, the thunk's
+/// result, and whether this is a DURABLE terminal (a normal return / body error, vs. a
+/// cancellation), journal/close and produce the builtin's outcome. Returns a
+/// `NativeOutcome` so `workflow/run`'s terminal can PARK on the External journal
+/// flush-ack (durable normal completion) rather than only returning a value.
 type FinishFn<T> =
-    fn(Option<&TaskContextHandle>, T, Result<Value, SemaError>) -> Result<Value, SemaError>;
+    fn(Option<&TaskContextHandle>, T, Result<Value, SemaError>, bool) -> NativeResult;
 /// Trace the `Value` edges a teardown state carries (a run's open MCP handles; none for
 /// a step).
 type TraceTeardownFn<T> = fn(&T, &mut dyn FnMut(GcEdge<'_>));
@@ -247,7 +272,14 @@ fn register_thunk_fn<T: 'static>(
                 ThunkPlan::Immediate(value) => Ok(value),
                 ThunkPlan::Run { thunk, teardown } => {
                     let result = crate::list::call_function(&thunk, &[]);
-                    finish(None, teardown, result)
+                    // Host arm: no External wait to park on, so a durable terminal flush is a
+                    // bounded blocking wait inside `finish`; the outcome is always a value.
+                    match finish(None, teardown, result, true)? {
+                        NativeOutcome::Return(value) => Ok(value),
+                        _ => Err(SemaError::eval(format!(
+                            "{name}: host teardown must resolve to a value"
+                        ))),
+                    }
                 }
                 // The host arm resolves `:mcp` synchronously (its `io_block_on` is legal
                 // off the quantum), so it never asks for a suspend and cannot drive one.
@@ -341,24 +373,34 @@ impl<T: 'static> NativeContinuation for ThunkContinuation<T> {
         context: &mut NativeCallContext<'_>,
         input: ResumeInput,
     ) -> NativeResult {
-        let result = match input {
-            ResumeInput::Returned(value) => Ok(value),
-            ResumeInput::Failed(error) => Err(error),
-            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
-                "{} thunk was cancelled ({reason:?})",
-                self.name
-            ))),
-            ResumeInput::Runtime(_) => Err(SemaError::eval(format!(
-                "{} teardown received an unexpected runtime response",
-                self.name
-            ))),
+        // `durable` gates the terminal journal flush-ack: a normal return or a body error
+        // parks on the flush barrier (the journal must be on disk when `workflow/run`
+        // returns); a CANCELLATION skips it (the task is being torn down and must settle
+        // promptly without joining the writer).
+        let (result, durable) = match input {
+            ResumeInput::Returned(value) => (Ok(value), true),
+            ResumeInput::Failed(error) => (Err(error), true),
+            ResumeInput::Cancelled(reason) => (
+                Err(SemaError::eval(format!(
+                    "{} thunk was cancelled ({reason:?})",
+                    self.name
+                ))),
+                false,
+            ),
+            ResumeInput::Runtime(_) => (
+                Err(SemaError::eval(format!(
+                    "{} teardown received an unexpected runtime response",
+                    self.name
+                ))),
+                false,
+            ),
         };
         let teardown = self
             .teardown
             .take()
             .expect("thunk continuation resumed once");
         let task_context = context.task_context.clone();
-        (self.finish)(Some(&task_context), teardown, result).map(NativeOutcome::Return)
+        (self.finish)(Some(&task_context), teardown, result, durable)
     }
 }
 
@@ -379,13 +421,14 @@ fn finish_step(
     task_context: Option<&TaskContextHandle>,
     teardown: Option<StepTeardown>,
     result: Result<Value, SemaError>,
-) -> Result<Value, SemaError> {
+    _durable: bool,
+) -> NativeResult {
     let Some(td) = teardown else {
         // Transparent (outside a run): nothing to journal.
-        return result;
+        return result.map(NativeOutcome::Return);
     };
     let Some(ctx) = context::current_for(task_context) else {
-        return result;
+        return result.map(NativeOutcome::Return);
     };
     context::set_cur_agent_for(task_context, None);
     let dur_ms = if ctx.deterministic() {
@@ -427,7 +470,7 @@ fn finish_step(
     if let Ok(ref v) = result {
         ctx.memo_store(&td.content_key, v);
     }
-    result
+    result.map(NativeOutcome::Return)
 }
 
 /// Pre-thunk work for `workflow/step` — see the original inline documentation preserved
@@ -555,10 +598,11 @@ fn finish_checkpoint(
     task_context: Option<&TaskContextHandle>,
     teardown: CheckpointTeardown,
     result: Result<Value, SemaError>,
-) -> Result<Value, SemaError> {
+    _durable: bool,
+) -> NativeResult {
     let value = result?;
     let Some(ctx) = context::current_for(task_context) else {
-        return Ok(value);
+        return Ok(NativeOutcome::Return(value));
     };
     ctx.store_checkpoint(&teardown.key, value.clone());
     let digest = ctx.value_digest(&value);
@@ -572,7 +616,7 @@ fn finish_checkpoint(
         value: capped_render(&value),
     });
     ctx.memo_store(&teardown.resume_key, &value);
-    Ok(value)
+    Ok(NativeOutcome::Return(value))
 }
 
 /// Post-thunk teardown state for `workflow/run`. Holds the scope guard (whose Drop
@@ -616,13 +660,20 @@ impl Drop for RunTeardown {
 
 /// Derive the run envelope from the body's result, journal `run.ended`, write
 /// `result.json`, close any MCP handles, then remove the scope token. Shared by the
-/// legacy and cooperative paths; always returns an envelope (a body error becomes a
+/// legacy and cooperative paths; always produces an envelope (a body error becomes a
 /// failed one).
+///
+/// `durable` (a normal return or a body error, NOT a cancellation) requests the terminal
+/// journal flush barrier: the runtime path PARKS on the External flush-ack so a normal
+/// `workflow/run` return means `events.jsonl`/`result.json` are on disk; the host path
+/// bounded-waits. A cancellation skips the barrier — the task is being torn down and must
+/// settle promptly without joining the writer (the writer drains independently).
 fn finish_run(
     task_context: Option<&TaskContextHandle>,
     mut teardown: RunTeardown,
     result: Result<Value, SemaError>,
-) -> Result<Value, SemaError> {
+    durable: bool,
+) -> NativeResult {
     let (mut status, mut envelope, mut reason) = match &result {
         Ok(v) => ("success", success_envelope(v.clone()), None),
         Err(e) => (
@@ -633,14 +684,15 @@ fn finish_run(
     };
     // Close any resolved MCP handles exactly once, regardless of how the body exited.
     teardown.close_mcp();
-    if let Some(ctx) = context::current_for(task_context) {
+    let ctx = context::current_for(task_context);
+    let ack = if let Some(ctx) = &ctx {
         // A tripped budget cap fails the run regardless of the body's own outcome.
         if ctx.over_budget() {
             status = "failed";
             envelope = budget_failed_envelope();
             reason = Some("budget exceeded".to_string());
         }
-        close_open_phase(&ctx, status);
+        close_open_phase(ctx, status);
         ctx.emit(WorkflowEvent::RunEnded {
             seq: ctx.next_seq(),
             ts: ctx.ts(),
@@ -649,11 +701,168 @@ fn finish_run(
             dur_ms: ctx.dur_ms(),
         });
         ctx.write_result(&envelope);
-    }
+        // Terminal durability barrier — enqueue a flush and keep its ack receiver so a
+        // normal completion guarantees the journal is on disk before returning.
+        durable.then(|| ctx.request_flush())
+    } else {
+        None
+    };
     // Dropping the teardown removes the exact scope token (its `guard`) and is a no-op
     // second MCP close.
     drop(teardown);
-    Ok(envelope)
+    match ack {
+        // Runtime (quantum) normal completion: park on the External flush-ack so the task
+        // resumes — returning the envelope — only once the writer has flushed to disk.
+        Some(ack_rx) if task_context.is_some() => Ok(NativeOutcome::Suspend(
+            build_flush_ack_suspend(envelope, ack_rx),
+        )),
+        // Host (non-quantum) path: bounded blocking wait for the same barrier.
+        Some(ack_rx) => {
+            let _ = ack_rx.recv_timeout(HOST_FLUSH_ACK_TIMEOUT);
+            Ok(NativeOutcome::Return(envelope))
+        }
+        // Cancellation (no barrier) or no live scope: return the envelope directly.
+        None => Ok(NativeOutcome::Return(envelope)),
+    }
+}
+
+// ── terminal journal flush barrier ─────────────────────────────────────────────
+//
+// A normal `workflow/run` return must mean the journal is complete on disk. Every
+// terminal path (a body that ran → `finish_run`; a pre-body `:mcp` gate exit →
+// `end_run_before_body`) enqueues `run.ended` + `result.json` + a `Flush` barrier, then
+// the RUNTIME path parks on THIS External wait: an interruptible-blocking job that just
+// awaits the writer's ack on a blocking-tier worker (no `io_block_on`, no fs on the VM
+// thread — the same shape Cluster W's `resolve_prepared` uses). The decoder replays the
+// run envelope the barrier carried; a cancelled park skips the ack (the writer keeps
+// draining independently) and settles the task promptly without joining the writer.
+
+/// Completion tag for the terminal journal flush barrier (`"wfls"`).
+const FLUSH_ACK_COMPLETION_KIND: u64 = 0x7766_6c73;
+
+/// Bounded wait for the host (non-quantum) terminal flush barrier.
+const HOST_FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Build the External flush-ack suspension: a blocking-tier job awaits `ack_rx`; on ack
+/// the decoder returns `envelope` and the continuation delivers it. Used by every runtime
+/// terminal path so a normal return is journal-durable.
+fn build_flush_ack_suspend(envelope: Value, ack_rx: Receiver<()>) -> NativeSuspend {
+    let kind = CompletionKind::try_from_raw(FLUSH_ACK_COMPLETION_KIND)
+        .expect("flush-ack completion kind is nonzero");
+    let resource =
+        InterruptibleResource::new("workflow/journal-flush", Box::new(FlushCancelHook));
+    let prepared = PreparedExternalOperation::interruptible_blocking(
+        kind,
+        Box::new(FlushDecoder {
+            envelope: Some(envelope),
+        }),
+        resource,
+        move || {
+            // Block on the writer's ack on a blocking-tier worker (NOT the VM thread). A
+            // cancelled park never resolves this meaningfully — the ack may never come and
+            // the cancel hook has already reaped.
+            let _ = ack_rx.recv();
+            Ok(Box::new(()) as SendPayload)
+        },
+    );
+    NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(FlushContinuation),
+    }
+}
+
+/// A terminal envelope whose run already ended (a pre-body gate exit), turned into a
+/// durable `ThunkPlan`: the runtime arm parks on the External flush-ack; the host arm
+/// bounded-waits. `ack` is the flush barrier receiver from `ctx.request_flush()`.
+fn terminal_plan(
+    task_context: Option<&TaskContextHandle>,
+    envelope: Value,
+    ack: Receiver<()>,
+) -> ThunkPlan<RunTeardown> {
+    if task_context.is_some() {
+        ThunkPlan::Suspend(build_flush_ack_suspend(envelope, ack))
+    } else {
+        let _ = ack.recv_timeout(HOST_FLUSH_ACK_TIMEOUT);
+        ThunkPlan::Immediate(envelope)
+    }
+}
+
+/// Decoder for [`build_flush_ack_suspend`]: ignores the (unit) job payload and returns the
+/// run envelope it carried on the VM thread. Holds the envelope `Value` (traced) across the
+/// suspension. Not `Send`; the runtime keeps it on the VM thread.
+struct FlushDecoder {
+    envelope: Option<Value>,
+}
+
+impl Trace for FlushDecoder {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        if let Some(envelope) = &self.envelope {
+            sink(GcEdge::Value(envelope));
+        }
+        true
+    }
+}
+
+impl CompletionDecoder for FlushDecoder {
+    fn decode(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        result.map_err(|failure| {
+            SemaError::eval(format!("workflow/run journal flush: {}", failure.message()))
+        })?;
+        Ok(self.envelope.take().expect("flush decoder runs once"))
+    }
+}
+
+/// Resumes the parked `workflow/run` with the flushed envelope. A cancellation propagates
+/// (the run's result is already computed and best-effort journaled; the task is being torn
+/// down), settling promptly without joining the writer.
+struct FlushContinuation;
+
+impl Trace for FlushContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for FlushContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "workflow/run journal flush was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "workflow/run: unexpected runtime response awaiting journal flush",
+            )),
+        }
+    }
+}
+
+/// No-op cancel hook: the writer drains independently, so a cancelled flush park has
+/// nothing to abort — the resource is reaped and the task settles at once.
+struct FlushCancelHook;
+
+impl Trace for FlushCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CancelHook for FlushCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
 }
 
 /// Pre-thunk work for `workflow/run`: open the run scope, journal `run.started`, resolve
@@ -709,13 +918,14 @@ fn run_plan(
             let ctx = context::current_for(task_context)
                 .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
             let envelope = failed_envelope(&e.to_string());
-            return Ok(ThunkPlan::Immediate(end_run_before_body(
+            let (envelope, ack) = end_run_before_body(
                 &ctx,
                 guard,
                 "failed",
                 "mcp declaration invalid".to_string(),
                 envelope,
-            )));
+            );
+            return Ok(terminal_plan(task_context, envelope, ack));
         }
     };
 
@@ -741,13 +951,14 @@ fn run_plan(
         let envelope = failed_envelope(
             "workflow declares :mcp servers but this build has no MCP resolver registered",
         );
-        return Ok(ThunkPlan::Immediate(end_run_before_body(
+        let (envelope, ack) = end_run_before_body(
             &ctx,
             guard,
             "failed",
             "mcp resolution failed".to_string(),
             envelope,
-        )));
+        );
+        return Ok(terminal_plan(task_context, envelope, ack));
     };
 
     if task_context.is_some() {
@@ -769,7 +980,7 @@ fn run_plan(
     // Host arm (outside a runtime quantum): `io_block_on` is legal — resolve inline.
     let resolutions = resolver.resolve(&decls, &name, &run_id);
     match apply_resolutions(task_context, guard, thunk, resolver, resolutions)? {
-        ResolveGate::Exit(value) => Ok(ThunkPlan::Immediate(value)),
+        ResolveGate::Exit { envelope, ack } => Ok(terminal_plan(task_context, envelope, ack)),
         ResolveGate::Proceed { thunk, teardown } => Ok(ThunkPlan::Run { thunk, teardown }),
     }
 }
@@ -778,7 +989,7 @@ fn run_plan(
 /// run ended before the body (an envelope to return) or every declared server resolved
 /// and the body thunk should run with its teardown state.
 enum ResolveGate {
-    Exit(Value),
+    Exit { envelope: Value, ack: Receiver<()> },
     Proceed { thunk: Value, teardown: RunTeardown },
 }
 
@@ -864,24 +1075,26 @@ fn apply_resolutions(
             .collect::<Vec<_>>()
             .join("; ");
         let envelope = failed_envelope(&msg);
-        return Ok(ResolveGate::Exit(end_run_before_body(
+        let (envelope, ack) = end_run_before_body(
             &ctx,
             guard,
             "failed",
             "mcp resolution failed".to_string(),
             envelope,
-        )));
+        );
+        return Ok(ResolveGate::Exit { envelope, ack });
     }
     if !needs_auth.is_empty() {
         resolver.close(&connected_handles);
         let envelope = needs_auth_envelope(&needs_auth);
-        return Ok(ResolveGate::Exit(end_run_before_body(
+        let (envelope, ack) = end_run_before_body(
             &ctx,
             guard,
             "needs-auth",
             "authentication required".to_string(),
             envelope,
-        )));
+        );
+        return Ok(ResolveGate::Exit { envelope, ack });
     }
 
     // Every declared server connected: publish handles for workflow/mcp-handle, and
@@ -948,7 +1161,9 @@ impl NativeContinuation for ResolveContinuation {
             ResumeInput::Returned(value) => {
                 let resolutions = workflow_mcp::decode_resolutions(&value);
                 match apply_resolutions(Some(&task_context), guard, thunk, resolver, resolutions)? {
-                    ResolveGate::Exit(value) => Ok(NativeOutcome::Return(value)),
+                    ResolveGate::Exit { envelope, ack } => {
+                        Ok(NativeOutcome::Suspend(build_flush_ack_suspend(envelope, ack)))
+                    }
                     ResolveGate::Proceed { thunk, teardown } => {
                         Ok(NativeOutcome::Call(NativeCall {
                             callable: thunk,
@@ -970,13 +1185,14 @@ impl NativeContinuation for ResolveContinuation {
                 let ctx = context::current_for(Some(&task_context))
                     .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
                 let envelope = failed_envelope(&error.to_string());
-                Ok(NativeOutcome::Return(end_run_before_body(
+                let (envelope, ack) = end_run_before_body(
                     &ctx,
                     guard,
                     "failed",
                     "mcp resolution failed".to_string(),
                     envelope,
-                )))
+                );
+                Ok(NativeOutcome::Suspend(build_flush_ack_suspend(envelope, ack)))
             }
             // Cancellation reaps the run: dropping `guard` removes the scope token; the
             // worker already dropped any half-open connection. Propagate the cancellation.
@@ -1208,7 +1424,7 @@ mod continuation_tests {
         // Stand-in teardown that carries two `Value` handles, traced like `RunTeardown`.
         let cont = ThunkContinuation::<Vec<Value>> {
             teardown: Some(vec![Value::int(1), Value::int(2)]),
-            finish: |_tc, _t, r| r,
+            finish: |_tc, _t, r, _d| r.map(NativeOutcome::Return),
             trace_teardown: |t: &Vec<Value>, sink: &mut dyn FnMut(GcEdge<'_>)| {
                 for v in t {
                     sink(GcEdge::Value(v));
@@ -1223,7 +1439,7 @@ mod continuation_tests {
         // A step-shaped teardown (no `Value`) exposes zero edges.
         let empty = ThunkContinuation::<()> {
             teardown: Some(()),
-            finish: |_tc, _t, r| r,
+            finish: |_tc, _t, r, _d| r.map(NativeOutcome::Return),
             trace_teardown: |_t, _sink| {},
             name: "workflow/test",
         };

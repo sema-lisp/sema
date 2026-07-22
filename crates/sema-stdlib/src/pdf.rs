@@ -4,14 +4,22 @@
 //! extraction, xref/trailer walk), so — like `archive.rs` — each one's actual
 //! work lives in a plain `*_work` function returning `Result<T, SemaError>`.
 //! All runtime paths capture a regular-file descriptor before dispatch and read
-//! a capped worker-owned byte snapshot. The input, page, and returned-text caps
-//! are useful guardrails, but none of the PDF operations is terminally bounded:
-//! `lopdf` can allocate and decompress object streams while loading, page
-//! traversal allocates before its count is checked, and `pdf-extract`
-//! decompresses complete content streams into intermediate buffers. The public
-//! operations remain available and offloaded until parser or subprocess
-//! isolation is designed separately. Cancellation discards an eventual result;
-//! it does not interrupt an already-running worker.
+//! a capped worker-owned byte snapshot.
+//!
+//! **R10 splits honestly into a terminal admission arm and a non-terminal parser
+//! arm.** *R10A — input-byte admission (terminal):* the pre-dispatch
+//! `open_pdf_runtime_input` `stat`s the file and rejects an oversized input before
+//! any worker runs, so the input byte count is a genuinely terminal bound. *R10B —
+//! parser quarantine (non-terminal):* the page and returned-text caps are useful
+//! guardrails but only run **post-parse** — `lopdf` can allocate and decompress
+//! object streams while loading, page traversal allocates before its count is
+//! checked, and `pdf-extract` decompresses complete content streams into
+//! intermediate buffers. So the offloaded parse is NOT terminally bounded: it
+//! keeps the `hard_deadline` cleanup net (via `quarantined_compute`), not a
+//! `finite_work` descriptor. Terminally bounding the parser needs subprocess (or
+//! parser) isolation, which is deferred (see `docs/deferred.md`, R10B). The public
+//! operations remain available and offloaded meanwhile. Cancellation discards an
+//! eventual result; it does not interrupt an already-running worker.
 
 use std::collections::BTreeMap;
 use std::io::Read as _;

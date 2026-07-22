@@ -1402,10 +1402,32 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, String> + Send + 'static,
 {
-    let kind = CompletionKind::try_from_raw(FS_COMPLETION_KIND)
-        .expect("compute completion kind is nonzero");
     let bound = QuarantineBound::hard_deadline(FS_CLEANUP_DEADLINE)
         .expect("compute cleanup deadline is nonzero");
+    quarantined_compute_bounded(op, to_value, bound, job)
+}
+
+/// Like [`quarantined_compute`], but the caller supplies the resource's
+/// [`QuarantineBound`] descriptor instead of defaulting to the wall-clock cleanup
+/// deadline. A genuinely *terminally* bounded compute (archive (de)compression,
+/// whose input/output/entry caps are enforced incrementally on the worker) passes
+/// a `QuarantineBound::finite_work` descriptor here so the runtime carries the
+/// declared unit cap, not just a timeout net — the finite work always completes,
+/// so its landing completion reaps the cleanup entry and the reap-attempt bound is
+/// a formality. A non-terminal parser (pdf) keeps the `hard_deadline` net via
+/// [`quarantined_compute`].
+pub(crate) fn quarantined_compute_bounded<T, F>(
+    op: &'static str,
+    to_value: fn(T) -> Value,
+    bound: QuarantineBound,
+    job: F,
+) -> NativeResult
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let kind = CompletionKind::try_from_raw(FS_COMPLETION_KIND)
+        .expect("compute completion kind is nonzero");
     let prepared = PreparedExternalOperation::quarantined_blocking(
         kind,
         Box::new(ComputeDecoder { op, to_value }),

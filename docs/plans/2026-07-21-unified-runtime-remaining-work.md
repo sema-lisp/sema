@@ -659,6 +659,39 @@ offload (`crates/sema-stdlib/src/secret.rs:10-19,232-237`).
 
 ### Commit B9 — csv/markup/crypto split + quarantine bound descriptors (closes R21, R02, R10)
 
+**Landed 2026-07-22.** `csv/parse`(`-maps`) and `html/parse`/`select`/`text`/
+`select-text` became dual-ABI offloaded ops: inside a runtime quantum each
+captures a per-input byte cap BEFORE dispatch (`CSV_INPUT_BYTE_CAP` 64 MiB /
+`MARKUP_INPUT_BYTE_CAP` 32 MiB, lowerable via
+`set_csv_input_byte_cap_override`/`set_markup_input_byte_cap_override` clamped to
+the ceiling) and offloads the parse through `quarantined_compute` over an owned
+`String` snapshot (the selector string too); the worker returns `Send` cell
+strings / normalized HTML / matched outer-HTML/text (and enforces incremental
+row/cell or DOM-node caps), decoded into a `Value` on the VM thread — no
+`Value`/`Env` crosses the boundary. `crypto.rs` (hashing/base64), `markdown/*`
+(streaming), and `csv/encode` stay SYNCHRONOUS with a pre-dispatch input-byte (or,
+for `csv/encode`, row-count) cap enforced only inside a quantum — an explicit
+`SYNCHRONOUS-PROOF` split, not a fake async wrap. **R02 finalization:** the
+archive offload now declares a TERMINAL `QuarantineBound::finite_work` descriptor
+(via a new `io::quarantined_compute_bounded`) carrying the input-byte cap — its
+caps are enforced incrementally on the worker, so the work is finite by
+construction. **R10 split honestly:** R10A input-byte admission is terminal
+(pre-dispatch reject); R10B's offloaded `lopdf`/`pdf-extract` parse keeps the
+`hard_deadline` net (page/output caps are post-parse), so it is NOT terminally
+bounded — subprocess parser isolation is deferred to `docs/deferred.md` (R10B).
+Regression: `crates/sema/tests/quarantined_cpu_async_test.rs` (sibling-runs-first
++ cap boundary/one-over for `csv/parse` and `html/select`, plus async==sync
+parity) with R02/R10's existing oversize-rejection tests still green
+(`archive_pdf_patch_async_test`), a `finite_work` descriptor-presence unit test
+(`archive::tests::archive_offload_declares_finite_work_bound`), and
+`csv_ops`/`markup`/`crypto` cap-boundary/clamp unit tests. **R21 flipped to split
+rows R21A `MIGRATED (B9, split)` / R21B `SYNCHRONOUS-PROOF (B9)`, R02 to
+`MIGRATED (B9)`, and R10 to split rows R10A `MIGRATED (B9, split)` / R10B
+`MIGRATED (B9, split; documented NON-terminal parser bound)`** in
+`docs/internals/async-runtime-inventory.md`; the `runtime-match-map.tsv` re-point
+and the `runtime_conformance_test` inventory reconciliation are the deferred **C7**
+work and remain red.
+
 Gap (verified): `csv_ops.rs`/`markup.rs`/`crypto.rs` are all uncapped VM-thread
 sync; `html/*` parses a full DOM (`markup.rs:122-176`), `csv/parse`
 materializes unbounded rows. R02/R10 are already offloaded+capped but encode

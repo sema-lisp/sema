@@ -1,11 +1,12 @@
 //! Async-offload + bounded-CPU coverage for the `diff/*` and secret/PII
 //! (`secret/*`, `pii/*`, `redact/*`, `hash/digest`) families (B8, ledger rows
-//! R03/R13).
+//! R03/R13) and the csv/markup/crypto families (B9, ledger row R21).
 //!
 //! Two contracts are asserted:
 //!
-//! * **Offloaded arms (`QUARANTINED-BOUNDED`)** — `diff/unified` and the
-//!   `secret/detect`/`secret/redact`/`pii/detect`/`redact/spans` scans run a
+//! * **Offloaded arms (`QUARANTINED-BOUNDED`)** — `diff/unified`, the
+//!   `secret/detect`/`secret/redact`/`pii/detect`/`redact/spans` scans, and
+//!   `csv/parse`(`-maps`) / `html/parse`/`select`/`text`/`select-text` run a
 //!   super-linear or heavy CPU pass, so inside a runtime quantum they capture a
 //!   per-input byte cap BEFORE dispatch and offload through `quarantined_compute`
 //!   (`io.rs`). The offload yields `AwaitIo` the instant it is called, so a
@@ -14,10 +15,12 @@
 //!   via channel receive order, never a wall-clock duration.
 //!
 //! * **Synchronous split arms (`SYNCHRONOUS-PROOF`)** — `diff/stat`/`diff/hunks`/
-//!   `diff/parse`/`diff/apply` and `hash/digest` are O(input), so they stay
+//!   `diff/parse`/`diff/apply`, `hash/digest`, `csv/encode`, the `markdown/*`
+//!   helpers, and the `crypto.rs` hashing/base64 ops are O(input), so they stay
 //!   synchronous but are capped by a pre-dispatch input-byte (and, for the patch
-//!   consumers, hunk-count) bound inside a quantum: bounded input ⇒ bounded
-//!   VM-thread CPU, never a fake async wrap over unbounded work.
+//!   consumers, hunk-count; for `csv/encode`, row-count) bound inside a quantum:
+//!   bounded input ⇒ bounded VM-thread CPU, never a fake async wrap over unbounded
+//!   work.
 //!
 //! Every capped op rejects one byte over the captured limit BEFORE it snapshots
 //! or dispatches the input, so the rejected path allocates nothing extra. The
@@ -70,6 +73,36 @@ fn diff_unified_async_lets_sibling_run_first() {
 }
 
 #[test]
+fn csv_parse_async_lets_sibling_run_first() {
+    let program = r#"
+        (let ((out (channel/new 8)))
+          (async/all
+            (list
+              (async/spawn (fn ()
+                (csv/parse "a,b,c\nd,e,f\ng,h,i\n")
+                (channel/send out "csv")))
+              (async/spawn (fn () (channel/send out "sibling")))))
+          (list (channel/recv out) (channel/recv out)))
+    "#;
+    assert_sibling_wins(program, "csv");
+}
+
+#[test]
+fn html_select_async_lets_sibling_run_first() {
+    let program = r#"
+        (let ((out (channel/new 8)))
+          (async/all
+            (list
+              (async/spawn (fn ()
+                (html/select "<p class=x>a</p><p>b</p><p class=x>c</p>" "p.x")
+                (channel/send out "html")))
+              (async/spawn (fn () (channel/send out "sibling")))))
+          (list (channel/recv out) (channel/recv out)))
+    "#;
+    assert_sibling_wins(program, "html");
+}
+
+#[test]
 fn secret_detect_async_lets_sibling_run_first() {
     let program = r#"
         (let ((out (channel/new 8)))
@@ -85,6 +118,35 @@ fn secret_detect_async_lets_sibling_run_first() {
 }
 
 // === offloaded arm: async result matches the synchronous result ===
+
+#[test]
+fn csv_parse_async_matches_sync() {
+    let interp = Interpreter::new();
+    let sync_v = interp
+        .eval_str_compiled(r#"(csv/parse "a,b\nc,d\n")"#)
+        .expect("sync csv/parse");
+    let async_v = interp
+        .eval_str_compiled(r#"(await (async/spawn (fn () (csv/parse "a,b\nc,d\n"))))"#)
+        .expect("async csv/parse");
+    assert_eq!(sync_v, async_v);
+    assert_eq!(sync_v.as_list().expect("rows").len(), 2);
+}
+
+#[test]
+fn html_select_async_matches_sync() {
+    let interp = Interpreter::new();
+    let html = "<p class=x>alpha</p><p>beta</p><p class=x>gamma</p>";
+    let sync_v = interp
+        .eval_str_compiled(&format!(r#"(html/select "{html}" "p.x")"#))
+        .expect("sync html/select");
+    let async_v = interp
+        .eval_str_compiled(&format!(
+            r#"(await (async/spawn (fn () (html/select "{html}" "p.x"))))"#
+        ))
+        .expect("async html/select");
+    assert_eq!(sync_v, async_v);
+    assert_eq!(sync_v.as_list().expect("matches").len(), 2);
+}
 
 #[test]
 fn diff_unified_async_matches_sync() {
@@ -134,6 +196,48 @@ fn secret_redact_async_matches_sync() {
 }
 
 // === cap boundary + one-over rejection, each capped op ===
+
+/// The offloaded `csv/parse` accepts inputs at the captured cap and rejects one
+/// byte over BEFORE it snapshots or dispatches (no worker job created).
+#[test]
+fn csv_parse_cap_rejects_one_over_before_dispatch() {
+    sema_stdlib::set_csv_input_byte_cap_override(Some(8));
+    let interp = Interpreter::new();
+
+    // Boundary: 8-byte input → accepted (one row, one cell).
+    let ok = interp.eval_str_compiled(r#"(await (async/spawn (fn () (csv/parse "12345678"))))"#);
+    // One-over: a 9-byte input is rejected before dispatch.
+    let over = interp.eval_str_compiled(r#"(await (async/spawn (fn () (csv/parse "123456789"))))"#);
+    sema_stdlib::set_csv_input_byte_cap_override(None);
+
+    ok.expect("8-byte input sits at the boundary and is accepted");
+    let error = over.expect_err("9-byte input is one over the captured cap");
+    assert!(error.to_string().contains("input bytes"), "{error}");
+    assert!(error.to_string().contains('9'), "{error}");
+    assert!(error.to_string().contains('8'), "{error}");
+}
+
+/// The offloaded `html/select` accepts inputs at the captured cap and rejects one
+/// byte over before dispatch. The cap applies to the html argument.
+#[test]
+fn html_select_cap_rejects_one_over_before_dispatch() {
+    sema_stdlib::set_markup_input_byte_cap_override(Some(8));
+    let interp = Interpreter::new();
+
+    // Boundary: 8-byte html → accepted (empty match list).
+    let ok =
+        interp.eval_str_compiled(r#"(await (async/spawn (fn () (html/select "12345678" "p"))))"#);
+    // One-over: a 9-byte html is rejected before dispatch.
+    let over =
+        interp.eval_str_compiled(r#"(await (async/spawn (fn () (html/select "123456789" "p"))))"#);
+    sema_stdlib::set_markup_input_byte_cap_override(None);
+
+    ok.expect("8-byte html sits at the boundary and is accepted");
+    let error = over.expect_err("9-byte html is one over the captured cap");
+    assert!(error.to_string().contains("input bytes"), "{error}");
+    assert!(error.to_string().contains('9'), "{error}");
+    assert!(error.to_string().contains('8'), "{error}");
+}
 
 /// The offloaded `diff/unified` accepts inputs at the captured cap and rejects
 /// one byte over BEFORE it snapshots or dispatches (no worker job created).

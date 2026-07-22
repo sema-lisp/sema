@@ -18,9 +18,14 @@
 //! completed offload. Before dispatch, the runtime branch captures immutable
 //! input-byte, output-byte, and entry caps; path metadata and owned payloads are
 //! checked on the VM thread, and the worker rechecks file inputs and enforces
-//! decompression/write limits. Cancellation discards the eventual completion;
-//! it does not interrupt a worker that has already started. Direct native
-//! calls outside a runtime quantum retain their existing synchronous behavior.
+//! decompression/write limits. Because those caps are enforced incrementally on
+//! the worker (`read_path_bounded` / `BoundedWriter`), the archive work is finite
+//! by construction, so the offload's resource declares a **terminal
+//! `QuarantineBound::finite_work` descriptor** (R02) carrying the input-byte cap —
+//! the runtime carries the declared unit cap, not just the wall-clock cleanup net.
+//! Cancellation discards the eventual completion; it does not interrupt a worker
+//! that has already started. Direct native calls outside a runtime quantum retain
+//! their existing synchronous behavior.
 //!
 //! `gzip/compress`/`gzip/decompress` are pure in-memory
 //! transforms (no file I/O) but their DEFLATE pass is still CPU-bound, so they
@@ -28,9 +33,10 @@
 //! `Vec<u8>` out (both `Send`).
 
 use std::io::{Read as _, Write as _};
+use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};
 
-use sema_core::runtime::NativeOutcome;
+use sema_core::runtime::{NativeOutcome, NativeResult, QuarantineBound};
 use sema_core::{check_arity, Caps, SemaError, Value};
 
 use crate::{register_runtime_fn, register_runtime_fn_gated};
@@ -38,6 +44,35 @@ use crate::{register_runtime_fn, register_runtime_fn_gated};
 const ARCHIVE_INPUT_BYTE_CAP: u64 = 256 * 1024 * 1024;
 const ARCHIVE_OUTPUT_BYTE_CAP: u64 = 512 * 1024 * 1024;
 const ARCHIVE_ENTRY_CAP: usize = 100_000;
+
+/// The declared unit of the archive offload's terminal work bound. The archive
+/// (de)compression ops enforce their input/output/entry caps incrementally on the
+/// worker (`read_path_bounded` / `BoundedWriter`), so the work is finite by
+/// construction — the runtime descriptor carries this terminal input-byte cap via
+/// `QuarantineBound::finite_work` rather than only the wall-clock cleanup net.
+const ARCHIVE_BOUND_KIND: &str = "input-bytes";
+
+/// Build the archive offload's terminal finite-work bound (R02). Shared by every
+/// archive offload and the descriptor-presence unit test, so both agree on the
+/// declared unit and cap.
+fn archive_finite_bound() -> QuarantineBound {
+    QuarantineBound::finite_work(
+        ARCHIVE_BOUND_KIND,
+        NonZeroU64::new(ARCHIVE_INPUT_BYTE_CAP).expect("archive input byte cap is nonzero"),
+    )
+}
+
+/// Offload a terminally-bounded archive job onto the I/O pool, tagging the
+/// resource with the archive finite-work descriptor. Thin wrapper over
+/// [`crate::io::quarantined_compute_bounded`] so every archive op declares the
+/// same bound.
+fn archive_offload<T, F>(op: &'static str, to_value: fn(T) -> Value, job: F) -> NativeResult
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    crate::io::quarantined_compute_bounded(op, to_value, archive_finite_bound(), job)
+}
 
 #[derive(Clone, Copy)]
 struct ArchiveBounds {
@@ -716,7 +751,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 data.len() as u64,
                 bounds.input_bytes,
             )?;
-            return crate::io::quarantined_compute("gzip/compress", Value::bytevector, move || {
+            return archive_offload("gzip/compress", Value::bytevector, move || {
                 gzip_compress_work(&data, Some(bounds.output_bytes)).map_err(|e| e.to_string())
             });
         }
@@ -738,7 +773,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 data.len() as u64,
                 bounds.input_bytes,
             )?;
-            return crate::io::quarantined_compute(
+            return archive_offload(
                 "gzip/decompress",
                 Value::bytevector,
                 move || {
@@ -769,7 +804,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         if sema_core::in_runtime_quantum() {
             let bounds = ARCHIVE_RUNTIME_BOUNDS;
             archive_create_preflight("zip/create", &files, bounds)?;
-            return crate::io::quarantined_compute("zip/create", Value::int, move || {
+            return archive_offload("zip/create", Value::int, move || {
                 zip_create_work(&out_path, &files, Some(bounds)).map_err(|e| e.to_string())
             });
         }
@@ -793,7 +828,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         if sema_core::in_runtime_quantum() {
             let bounds = ARCHIVE_RUNTIME_BOUNDS;
             archive_path_preflight("zip/extract", &zip_path, bounds)?;
-            return crate::io::quarantined_compute("zip/extract", Value::int, move || {
+            return archive_offload("zip/extract", Value::int, move || {
                 zip_extract_work(&zip_path, &dest_dir, Some(bounds)).map_err(|e| e.to_string())
             });
         }
@@ -813,7 +848,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         if sema_core::in_runtime_quantum() {
             let bounds = ARCHIVE_RUNTIME_BOUNDS;
             archive_path_preflight("zip/list", &zip_path, bounds)?;
-            return crate::io::quarantined_compute("zip/list", zip_names_to_value, move || {
+            return archive_offload("zip/list", zip_names_to_value, move || {
                 zip_list_work(&zip_path, Some(bounds)).map_err(|e| e.to_string())
             });
         }
@@ -840,7 +875,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         if sema_core::in_runtime_quantum() {
             let bounds = ARCHIVE_RUNTIME_BOUNDS;
             archive_create_preflight("tar/create", &files, bounds)?;
-            return crate::io::quarantined_compute("tar/create", Value::int, move || {
+            return archive_offload("tar/create", Value::int, move || {
                 tar_create_work(&out_path, &files, Some(bounds)).map_err(|e| e.to_string())
             });
         }
@@ -865,7 +900,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         if sema_core::in_runtime_quantum() {
             let bounds = ARCHIVE_RUNTIME_BOUNDS;
             archive_path_preflight("tar/extract", &tar_path, bounds)?;
-            return crate::io::quarantined_compute("tar/extract", Value::int, move || {
+            return archive_offload("tar/extract", Value::int, move || {
                 tar_extract_work(&tar_path, &dest_dir, Some(bounds)).map_err(|e| e.to_string())
             });
         }
@@ -886,6 +921,30 @@ mod tests {
             .expect_err("one byte over the captured limit must fail");
         assert!(error.to_string().contains("9"));
         assert!(error.to_string().contains("8"));
+    }
+
+    /// R02 finalization: the archive offload declares a TERMINAL finite-work bound
+    /// (the input-byte cap), not just the wall-clock cleanup deadline.
+    #[test]
+    fn archive_offload_declares_finite_work_bound() {
+        use sema_core::runtime::QuarantineBoundDescriptor;
+        let bound = archive_finite_bound();
+        match bound.descriptor() {
+            QuarantineBoundDescriptor::FiniteWork {
+                kind,
+                maximum_units,
+            } => {
+                assert_eq!(kind, ARCHIVE_BOUND_KIND);
+                assert_eq!(maximum_units.get(), ARCHIVE_INPUT_BYTE_CAP);
+            }
+            QuarantineBoundDescriptor::HardDeadline(_) => {
+                panic!("archive offload must carry a terminal finite-work bound, not a deadline")
+            }
+        }
+        assert!(
+            bound.hard_deadline_value().is_none(),
+            "a finite-work bound carries no hard deadline"
+        );
     }
 
     #[test]

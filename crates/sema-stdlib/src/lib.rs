@@ -8,7 +8,19 @@ mod bytevector;
 mod comparison;
 mod context;
 mod crypto;
+/// Lower the per-input byte cap for the hashing/base64 ops under a runtime quantum
+/// (clamped to the hard ceiling), or clear the override with `None`. The B9 seam
+/// for the crypto cap-boundary regression.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use crypto::set_crypto_input_byte_cap_override;
 mod csv_ops;
+/// Lower the per-input byte cap for `csv/parse`(`-maps`) under a runtime quantum
+/// (clamped to the hard ceiling), or clear the override with `None`. The B9 seam
+/// the csv cap-boundary regression drives without a multi-megabyte input.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use csv_ops::set_csv_input_byte_cap_override;
 mod datetime;
 mod diff;
 #[cfg(not(target_arch = "wasm32"))]
@@ -60,6 +72,13 @@ mod map;
 pub use diff::set_diff_input_byte_cap_override;
 #[cfg(not(target_arch = "wasm32"))]
 mod markup;
+/// Lower the per-input byte cap for the `html/*` and `markdown/*` ops under a
+/// runtime quantum (clamped to the hard ceiling), or clear the override with
+/// `None`. The B9 seam the html cap-boundary regression drives without a
+/// multi-megabyte input.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use markup::set_markup_input_byte_cap_override;
 mod math;
 mod meta;
 mod mutable;

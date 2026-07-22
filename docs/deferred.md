@@ -1368,3 +1368,31 @@ The release gates now build the final playground WASM and run the stable
 runtime subset: `unified-runtime.spec.ts` and `debug-http-replay.spec.ts` (13
 tests). The two remaining debugger defects are excluded from that focused gate
 until repaired; the full playground suite remains the local acceptance suite.
+
+## R10B — PDF parser terminal isolation (subprocess/parser isolation deferred)
+
+**Recorded 2026-07-22 (Commit B9).** R10 splits into a terminal admission arm
+and a non-terminal parser arm. **R10A** (input-byte admission) is genuinely
+terminal: `pdf.rs`'s `open_pdf_runtime_input`/`check_pdf_limit` `stat`s the file
+and rejects an oversized PDF on the VM thread BEFORE any worker runs — no worker
+allocation. **R10B** (the offloaded parse) is NOT terminally bounded and is
+deliberately left that way:
+
+- The page and returned-text caps (`check_pdf_pages`/`check_pdf_text_output`) run
+  **post-parse**. `lopdf::Document::load_mem` and `pdf_extract::extract_text_*`
+  can allocate and decompress object/content streams while loading — before the
+  page count or output size is known — so a hostile PDF can drive unbounded
+  intermediate allocation on the worker even though the *input* bytes are capped.
+- Consequently R10B keeps the `hard_deadline` cleanup net (via
+  `quarantined_compute`), **not** a `QuarantineBound::finite_work` descriptor. Its
+  ledger row states a documented NON-terminal parser bound rather than claiming
+  BOUNDED — the honest disposition (contrast R02 archive, whose caps are enforced
+  incrementally on the worker and so declares `finite_work`).
+- **Terminally bounding the PDF parser needs isolation the in-process design
+  can't provide.** `lopdf`/`pdf-extract` expose no incremental-allocation or
+  interrupt hook, so the only way to cap their peak allocation/CPU terminally is
+  to run the parse in a **subprocess** (rlimit/cgroup-bounded, killable) or behind
+  a parser that streams with a hard allocation budget. That is a separate design
+  (process pool, IPC of the byte snapshot and the extracted text/metadata,
+  cross-platform kill+reap) and is deferred. Until then the `pdf/*` ops remain
+  available and offloaded under the hard cleanup deadline.

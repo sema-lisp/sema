@@ -755,6 +755,11 @@ fn main() {
         None => sandbox,
     };
 
+    if let Err(e) = sema_core::os_sandbox::apply_os_sandbox(&sandbox) {
+        eprintln!("Error applying OS sandbox: {e}");
+        std::process::exit(1);
+    }
+
     // Handle subcommands
     if let Some(command) = cli.command {
         match command {

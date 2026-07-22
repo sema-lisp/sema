@@ -444,95 +444,186 @@ impl BackendState {
         )])
     }
 
-    /// Who calls this function: every definition whose body contains a call to `item.name`.
+    /// Collect the incoming calls to `target` found in one file's top-level
+    /// definitions (shared between open documents and scanned files).
+    fn collect_incoming_calls_in_file(
+        uri: &Url,
+        ast: &[sema_core::Value],
+        span_map: &SpanMap,
+        symbol_spans: &[(String, sema_core::Span)],
+        source: &str,
+        target: &str,
+        result: &mut Vec<CallHierarchyIncomingCall>,
+    ) {
+        let lines: Vec<&str> = source.lines().collect();
+        for expr in ast {
+            let items = match expr.as_list() {
+                Some(i) => i,
+                None => continue,
+            };
+            let (name, form_range, name_range) =
+                match def_of_form(expr, span_map, symbol_spans, &lines) {
+                    Some(d) => d,
+                    None => continue,
+                };
+            // Search only the body (skip the head + signature) to avoid matching `(name ...)`
+            // definition shorthands as calls.
+            let body: &[sema_core::Value] = items.get(2..).unwrap_or(&[]);
+            let mut sites = Vec::new();
+            collect_call_sites(body, span_map, symbol_spans, &lines, target, &mut sites);
+            if !sites.is_empty() {
+                result.push(CallHierarchyIncomingCall {
+                    from: Self::call_hierarchy_item(&name, uri, form_range, name_range),
+                    from_ranges: sites,
+                });
+            }
+        }
+    }
+
+    /// Who calls this function: every definition whose body contains a call to
+    /// `item.name`, across open documents and still-fresh scanned files.
     pub(crate) fn handle_call_hierarchy_incoming(
         &self,
         item: &CallHierarchyItem,
     ) -> Option<Vec<CallHierarchyIncomingCall>> {
         let target = &item.name;
         let mut result = Vec::new();
+        let mut open_paths: HashSet<PathBuf> = HashSet::new();
         for (uri_str, cached) in &self.cached_parses {
             let uri = match Url::parse(uri_str) {
                 Ok(u) => u,
                 Err(_) => continue,
             };
-            let lines: Vec<&str> = cached.source.lines().collect();
-            for expr in &cached.ast {
-                let items = match expr.as_list() {
-                    Some(i) => i,
-                    None => continue,
-                };
-                let (name, form_range, name_range) =
-                    match def_of_form(expr, &cached.span_map, &cached.symbol_spans, &lines) {
-                        Some(d) => d,
-                        None => continue,
-                    };
-                // Search only the body (skip the head + signature) to avoid matching `(name ...)`
-                // definition shorthands as calls.
-                let body: &[sema_core::Value] = items.get(2..).unwrap_or(&[]);
-                let mut sites = Vec::new();
-                collect_call_sites(
-                    body,
-                    &cached.span_map,
-                    &cached.symbol_spans,
-                    &lines,
-                    target,
-                    &mut sites,
-                );
-                if !sites.is_empty() {
-                    result.push(CallHierarchyIncomingCall {
-                        from: Self::call_hierarchy_item(&name, &uri, form_range, name_range),
-                        from_ranges: sites,
-                    });
-                }
+            if let Ok(doc_path) = uri.to_file_path() {
+                open_paths.insert(canonicalize_or_raw(&doc_path));
             }
+            Self::collect_incoming_calls_in_file(
+                &uri,
+                &cached.ast,
+                &cached.span_map,
+                &cached.symbol_spans,
+                &cached.source,
+                target,
+                &mut result,
+            );
+        }
+        // Scanned files: dedup against open documents by canonical path and
+        // skip stale entries — same rules as references and rename.
+        for (path, import_cached) in &self.import_cache {
+            if open_paths.contains(&canonicalize_or_raw(path)) {
+                continue;
+            }
+            if !import_cached.is_fresh(path) {
+                continue;
+            }
+            let uri = match Url::from_file_path(path) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            Self::collect_incoming_calls_in_file(
+                &uri,
+                &import_cached.ast,
+                &import_cached.span_map,
+                &import_cached.symbol_spans,
+                &import_cached.source,
+                target,
+                &mut result,
+            );
         }
         Some(result)
     }
 
-    /// Which functions this function calls: known definitions invoked from `item.name`'s body.
+    /// The outgoing calls of `name`'s definition if this file defines it
+    /// (shared between open documents and scanned files).
+    fn outgoing_calls_of_definition(
+        name: &str,
+        ast: &[sema_core::Value],
+        span_map: &SpanMap,
+        symbol_spans: &[(String, sema_core::Span)],
+        source: &str,
+        index: &HashMap<String, (Url, Range, Range)>,
+    ) -> Option<Vec<CallHierarchyOutgoingCall>> {
+        let lines: Vec<&str> = source.lines().collect();
+        for expr in ast {
+            let items = match expr.as_list() {
+                Some(i) => i,
+                None => continue,
+            };
+            let def = match def_of_form(expr, span_map, symbol_spans, &lines) {
+                Some(d) => d,
+                None => continue,
+            };
+            if def.0 != name {
+                continue;
+            }
+            let body: &[sema_core::Value] = items.get(2..).unwrap_or(&[]);
+            let mut calls: HashMap<String, Vec<Range>> = Default::default();
+            collect_outgoing_calls(body, span_map, symbol_spans, &lines, index, &mut calls);
+            let mut out = Vec::new();
+            for (callee, sites) in calls {
+                if callee == name {
+                    continue; // skip self-recursion in outgoing view
+                }
+                if let Some((curi, crange, cname_range)) = index.get(&callee) {
+                    out.push(CallHierarchyOutgoingCall {
+                        to: Self::call_hierarchy_item(&callee, curi, *crange, *cname_range),
+                        from_ranges: sites,
+                    });
+                }
+            }
+            return Some(out);
+        }
+        None
+    }
+
+    /// Which functions this function calls: known definitions invoked from
+    /// `item.name`'s body. The definition is looked up in open documents
+    /// first, then still-fresh scanned files.
     pub(crate) fn handle_call_hierarchy_outgoing(
         &self,
         item: &CallHierarchyItem,
     ) -> Option<Vec<CallHierarchyOutgoingCall>> {
         let name = &item.name;
         let index = self.def_index();
-        for cached in self.cached_parses.values() {
-            let lines: Vec<&str> = cached.source.lines().collect();
-            for expr in &cached.ast {
-                let items = match expr.as_list() {
-                    Some(i) => i,
-                    None => continue,
-                };
-                let def = match def_of_form(expr, &cached.span_map, &cached.symbol_spans, &lines) {
-                    Some(d) => d,
-                    None => continue,
-                };
-                if &def.0 != name {
-                    continue;
+        let mut open_paths: HashSet<PathBuf> = HashSet::new();
+        let mut found: Option<Vec<CallHierarchyOutgoingCall>> = None;
+        for (uri_str, cached) in &self.cached_parses {
+            // Collect every open document's canonical path (even after a
+            // match) so the scan-cache dedup below sees the complete set.
+            if let Ok(uri) = Url::parse(uri_str) {
+                if let Ok(doc_path) = uri.to_file_path() {
+                    open_paths.insert(canonicalize_or_raw(&doc_path));
                 }
-                let body: &[sema_core::Value] = items.get(2..).unwrap_or(&[]);
-                let mut calls: std::collections::HashMap<String, Vec<Range>> = Default::default();
-                collect_outgoing_calls(
-                    body,
+            }
+            if found.is_none() {
+                found = Self::outgoing_calls_of_definition(
+                    name,
+                    &cached.ast,
                     &cached.span_map,
                     &cached.symbol_spans,
-                    &lines,
+                    &cached.source,
                     &index,
-                    &mut calls,
                 );
-                let mut out = Vec::new();
-                for (callee, sites) in calls {
-                    if callee == *name {
-                        continue; // skip self-recursion in outgoing view
-                    }
-                    if let Some((curi, crange, cname_range)) = index.get(&callee) {
-                        out.push(CallHierarchyOutgoingCall {
-                            to: Self::call_hierarchy_item(&callee, curi, *crange, *cname_range),
-                            from_ranges: sites,
-                        });
-                    }
-                }
+            }
+        }
+        if let Some(out) = found {
+            return Some(out);
+        }
+        for (path, import_cached) in &self.import_cache {
+            if open_paths.contains(&canonicalize_or_raw(path)) {
+                continue;
+            }
+            if !import_cached.is_fresh(path) {
+                continue;
+            }
+            if let Some(out) = Self::outgoing_calls_of_definition(
+                name,
+                &import_cached.ast,
+                &import_cached.span_map,
+                &import_cached.symbol_spans,
+                &import_cached.source,
+                &index,
+            ) {
                 return Some(out);
             }
         }

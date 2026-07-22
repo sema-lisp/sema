@@ -1952,6 +1952,78 @@ fn completion_works_on_trailing_empty_line_after_newline() {
     );
 }
 
+// ── call hierarchy across scanned files ──────────────────────
+
+#[test]
+fn call_hierarchy_incoming_finds_caller_in_scanned_file() {
+    // `helper` is defined in the open document; its only caller lives in a
+    // scanned (never-opened) workspace file.
+    let dir = unique_temp_dir("ch-incoming");
+    let caller_path = dir.join("main.sema");
+    let (mut state, uri) = parsed_state("file:///ws/lib.sema", "(defun helper (x) (* x x))");
+    insert_scanned_file(&mut state, &caller_path, "(defun main () (helper 5))\n");
+
+    let item = state
+        .handle_call_hierarchy_prepare(
+            &uri,
+            &Position {
+                line: 0,
+                character: 8,
+            },
+        )
+        .expect("prepare")
+        .remove(0);
+    let incoming = state
+        .handle_call_hierarchy_incoming(&item)
+        .expect("incoming");
+    assert_eq!(
+        incoming.len(),
+        1,
+        "the caller in the scanned file must be found: {incoming:?}"
+    );
+    assert_eq!(incoming[0].from.name, "main");
+    assert_eq!(
+        incoming[0].from.uri,
+        Url::from_file_path(&caller_path).unwrap()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn call_hierarchy_outgoing_finds_callee_in_scanned_file() {
+    // `main` (open) calls `helper`, which is defined only in a scanned file.
+    let dir = unique_temp_dir("ch-outgoing");
+    let callee_path = dir.join("lib.sema");
+    let (mut state, uri) = parsed_state("file:///ws/main.sema", "(defun main () (helper 5))");
+    insert_scanned_file(&mut state, &callee_path, "(defun helper (x) (* x x))\n");
+
+    let item = state
+        .handle_call_hierarchy_prepare(
+            &uri,
+            &Position {
+                line: 0,
+                character: 8,
+            },
+        )
+        .expect("prepare")
+        .remove(0);
+    assert_eq!(item.name, "main");
+    let outgoing = state
+        .handle_call_hierarchy_outgoing(&item)
+        .expect("outgoing");
+    assert_eq!(
+        outgoing.len(),
+        1,
+        "the callee defined in the scanned file must be found: {outgoing:?}"
+    );
+    assert_eq!(outgoing[0].to.name, "helper");
+    assert_eq!(
+        outgoing[0].to.uri,
+        Url::from_file_path(&callee_path).unwrap()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ── hover / signature help: workspace-wide fallback ──────────
 
 #[test]

@@ -508,19 +508,53 @@ impl BackendState {
         None
     }
 
-    /// Index every top-level definition across open documents: name → (uri, form range, name range).
+    /// Index every top-level definition across open documents and still-fresh
+    /// scanned workspace files: name → (uri, form range, name range). Open
+    /// documents are inserted first, so they win over a scanned entry for the
+    /// same name (`or_insert`); scan entries are dedup'd against open
+    /// documents by canonical path, same rules as references and rename.
     pub(crate) fn def_index(&self) -> std::collections::HashMap<String, (Url, Range, Range)> {
         let mut index = std::collections::HashMap::new();
+        let mut open_paths: HashSet<PathBuf> = HashSet::new();
         for (uri_str, cached) in &self.cached_parses {
             let uri = match Url::parse(uri_str) {
                 Ok(u) => u,
                 Err(_) => continue,
             };
+            if let Ok(doc_path) = uri.to_file_path() {
+                open_paths.insert(canonicalize_or_raw(&doc_path));
+            }
             let lines: Vec<&str> = cached.source.lines().collect();
             for expr in &cached.ast {
                 if let Some((name, form_range, name_range)) =
                     def_of_form(expr, &cached.span_map, &cached.symbol_spans, &lines)
                 {
+                    index
+                        .entry(name)
+                        .or_insert((uri.clone(), form_range, name_range));
+                }
+            }
+        }
+
+        for (path, import_cached) in &self.import_cache {
+            if open_paths.contains(&canonicalize_or_raw(path)) {
+                continue;
+            }
+            if !import_cached.is_fresh(path) {
+                continue;
+            }
+            let uri = match Url::from_file_path(path) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            let lines: Vec<&str> = import_cached.source.lines().collect();
+            for expr in &import_cached.ast {
+                if let Some((name, form_range, name_range)) = def_of_form(
+                    expr,
+                    &import_cached.span_map,
+                    &import_cached.symbol_spans,
+                    &lines,
+                ) {
                     index
                         .entry(name)
                         .or_insert((uri.clone(), form_range, name_range));

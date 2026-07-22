@@ -159,6 +159,8 @@ pub(crate) enum LspRequest {
     },
     /// Set the sema binary path (from initializationOptions).
     SetSemaBinary { path: String },
+    /// Set the run sandbox mode.
+    SetRunSandbox { mode: String },
     /// Scan workspace for .sema files (triggered on initialized).
     ScanWorkspace { root: PathBuf },
     /// Continue incremental workspace scanning (directory-by-directory with yielding).
@@ -195,6 +197,11 @@ impl LanguageServer for Backend {
             if let Some(path) = opts.get("semaPath").and_then(|v| v.as_str()) {
                 let _ = self.tx.send(LspRequest::SetSemaBinary {
                     path: path.to_string(),
+                });
+            }
+            if let Some(mode) = opts.get("sema.run.sandbox").and_then(|v| v.as_str()) {
+                let _ = self.tx.send(LspRequest::SetRunSandbox {
+                    mode: mode.to_string(),
                 });
             }
         }
@@ -1003,15 +1010,19 @@ pub async fn run_server() {
                         docs.insert(target_uri.to_string(), text.clone());
                     }
                     let sema_binary = state.sema_binary.clone();
+                    let run_sandbox_mode = state.run_sandbox_mode.clone();
                     let client = client.clone();
                     let handle = handle.clone();
                     std::thread::spawn(move || {
-                        let tmp = BackendState::new_without_builtins(docs, sema_binary);
+                        let tmp = BackendState::new_without_builtins(docs, sema_binary, run_sandbox_mode);
                         tmp.handle_execute_command(&command, &arguments, &client, &handle);
                     });
                 }
                 LspRequest::SetSemaBinary { path } => {
                     state.sema_binary = path;
+                }
+                LspRequest::SetRunSandbox { mode } => {
+                    state.run_sandbox_mode = mode;
                 }
                 LspRequest::ScanWorkspace { root } => {
                     // Start incremental workspace scanning. The scanner

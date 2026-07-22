@@ -607,6 +607,31 @@ ledger/match-map entries are stale.
 
 ### Commit B8 — diff and secret/PII narrowing (closes R03, R13)
 
+**Landed 2026-07-22 — narrow-and-split (R03A/R03B, R13A/R13B).** `diff/unified`
+(super-linear LCS) and `secret/detect`/`secret/redact`/`pii/detect`/`redact/spans`
+(regex + Shannon-entropy scan) became dual-ABI `register_runtime_fn` ops: inside a
+runtime quantum they capture a per-input byte cap BEFORE dispatch (`DIFF_INPUT_BYTE_CAP`
+= 64 MiB / `SECRET_INPUT_BYTE_CAP` = 16 MiB, each lowerable for tests via
+`set_diff_input_byte_cap_override` / `set_secret_input_byte_cap_override` clamped to the
+ceiling) and offload the compute through `quarantined_compute` over an owned `String`
+snapshot (`Send`; a `Finding` is offsets + a `&'static str` kind, so `(text, findings)`
+crosses the thread and the matched substrings are sliced back into a `Value` on the VM
+thread — no `Value`/`Env` crosses, CORE-2 I2 holds). The rejected path reads `len()`
+before any snapshot, so an over-cap input allocates nothing extra. `diff/stat`/`diff/hunks`/
+`diff/parse`/`diff/apply` and `hash/digest` stay SYNCHRONOUS with pre-dispatch input-byte
+(+ hunk-count for the patch consumers) caps enforced only inside a quantum — an explicit
+`SYNCHRONOUS-PROOF` split, not a fake async wrap. The stale/false `secret.rs` module doc
+(which claimed an `fs_offload`/`in_async_context()` offload that never existed) now
+describes the real `quarantined_compute` mechanism. Regression:
+`crates/sema/tests/quarantined_cpu_async_test.rs` (sibling-runs-first for `diff/unified`
+and `secret/detect`; cap boundary + one-over rejection for `diff/unified`, `diff/stat`,
+`secret/detect`, `hash/digest`; async==sync parity) plus `diff::tests`/`secret::tests`
+cap-boundary/clamp unit tests. **R03 flipped to split rows R03A `MIGRATED (B8, split)` /
+R03B `SYNCHRONOUS-PROOF (B8)` and R13 to R13A `MIGRATED (B8, split)` / R13B
+`SYNCHRONOUS-PROOF (B8)`** in `docs/internals/async-runtime-inventory.md`; the
+`runtime-match-map.tsv` re-point and the `runtime_conformance_test` inventory
+reconciliation are the deferred **C7** work and remain red.
+
 Gap (verified): the `diff/*` family is uncapped VM-thread sync
 (`crates/sema-stdlib/src/diff.rs:387-570`; `diff/unified` is super-linear LCS);
 `secret.rs` is fully sync/uncapped and its module doc **falsely claims** an

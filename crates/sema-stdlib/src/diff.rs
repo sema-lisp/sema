@@ -1,21 +1,30 @@
 //! Unified-diff generation and patch application builtins.
 //!
-//! `diff/unified`, `diff/stat`, `diff/hunks`, `diff/parse`, and `diff/apply` are
-//! read-only in-memory transforms registered with plain `register_fn`; they are
-//! not external jobs. `patch/apply-file` is the separate filesystem surface,
-//! gated behind `Caps::FS_WRITE`.
-//!
 //! The unified-diff text produced by `diff/unified` (via the `similar` crate) is
 //! the canonical interchange format: `diff/stat`, `diff/hunks`, `diff/parse`, and
 //! `diff/apply` all consume that same textual shape, so a round-trip
 //! (`diff/unified` then `diff/apply`) reconstructs `new` from `old`.
 //!
-//! `patch/apply-file`'s real work lives in `patch_apply_file_work`. A direct
+//! **Bounded / offloaded CPU (B8 R03 split).** `diff/unified` runs a super-linear
+//! LCS (the `similar` diff), so during a runtime quantum (`in_runtime_quantum()`)
+//! it captures a per-input byte cap BEFORE dispatch and offloads the diff onto the
+//! I/O pool through `quarantined_compute` (`io.rs`) — the LCS runs over an owned
+//! `String` snapshot (`Send`) on a worker, and the resulting diff string is
+//! decoded back into a `Value` on the VM thread. `diff/stat`, `diff/hunks`,
+//! `diff/parse`, and `diff/apply` are O(input) line walks, so they stay
+//! SYNCHRONOUS but are still capped by a pre-dispatch input-byte and hunk-count
+//! bound inside a quantum (an explicit synchronous split, not a fake async wrap):
+//! bounded input ⇒ bounded VM-thread CPU. A direct native call outside the
+//! cooperative runtime (e.g. the stdlib's own unit-test harness) keeps the
+//! uncapped synchronous shape.
+//!
+//! `patch/apply-file` is the separate filesystem surface, gated behind
+//! `Caps::FS_WRITE`. Its real work lives in `patch_apply_file_work`. A direct
 //! native call outside the scheduler runs it synchronously; a runtime quantum
-//! offloads it through `quarantined_compute` (`io.rs`). The runtime path captures patch-byte,
-//! target-byte, output-byte, and hunk-count caps before dispatch, then rechecks
-//! the target and output on the worker. Cancellation discards the eventual
-//! result; it does not interrupt an already-running worker.
+//! offloads it through `quarantined_compute` (`io.rs`). The runtime path captures
+//! patch-byte, target-byte, output-byte, and hunk-count caps before dispatch,
+//! then rechecks the target and output on the worker. Cancellation discards the
+//! eventual result; it does not interrupt an already-running worker.
 
 use std::collections::BTreeMap;
 
@@ -24,7 +33,127 @@ use similar::TextDiff;
 
 use crate::register_fn;
 #[cfg(not(target_arch = "wasm32"))]
-use {crate::register_runtime_fn_gated, sema_core::runtime::NativeOutcome, sema_core::Caps};
+use std::cell::Cell;
+#[cfg(not(target_arch = "wasm32"))]
+use {
+    crate::{register_runtime_fn, register_runtime_fn_gated},
+    sema_core::runtime::NativeOutcome,
+    sema_core::Caps,
+};
+
+/// Per-input byte cap for `diff/*` under a runtime quantum. `diff/unified`'s LCS
+/// is super-linear, so the cap bounds both the offloaded worker's cost and the
+/// synchronous line-walk ops' VM-thread cost. 64 MiB is far above any real diff.
+#[cfg(not(target_arch = "wasm32"))]
+const DIFF_INPUT_BYTE_CAP: u64 = 64 * 1024 * 1024;
+/// Hunk-count cap for the synchronous patch-consuming ops under a quantum.
+/// Shared ceiling with `patch/apply-file`.
+#[cfg(not(target_arch = "wasm32"))]
+const DIFF_HUNK_CAP: usize = PATCH_HUNK_CAP;
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// Optional per-call input-byte cap override (lowered, never raised above the
+    /// hard ceiling). Read on the VM thread pre-dispatch; mirrors
+    /// `git::GIT_MAX_OUTPUT_OVERRIDE`. `None` uses the module ceiling. The seam
+    /// the regression suite drives to exercise the cap boundary without a
+    /// multi-megabyte input string.
+    static DIFF_INPUT_BYTE_CAP_OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// The effective per-input byte cap for the current call: the module ceiling,
+/// lowered by any per-call override (never raised above it).
+#[cfg(not(target_arch = "wasm32"))]
+fn effective_diff_input_byte_cap() -> u64 {
+    DIFF_INPUT_BYTE_CAP_OVERRIDE
+        .with(Cell::get)
+        .map_or(DIFF_INPUT_BYTE_CAP, |over| over.min(DIFF_INPUT_BYTE_CAP))
+}
+
+/// Lower the per-input byte cap (clamped to the hard ceiling) for subsequent
+/// `diff/*` calls on this thread, or clear the override with `None`. Test seam,
+/// mirroring `set_git_max_output_bytes_override`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_diff_input_byte_cap_override(bytes: Option<u64>) {
+    DIFF_INPUT_BYTE_CAP_OVERRIDE.with(|cell| cell.set(bytes));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn check_diff_limit(op: &str, dimension: &str, actual: u64, limit: u64) -> Result<(), SemaError> {
+    if actual > limit {
+        return Err(SemaError::eval(format!(
+            "{op}: {dimension} {actual} exceeds the quarantined limit {limit}"
+        ))
+        .with_hint("reduce or split the diff input"));
+    }
+    Ok(())
+}
+
+/// Pre-dispatch caps for a patch-consuming synchronous op (`diff/stat`,
+/// `diff/hunks`, `diff/parse`). Enforced ONLY inside a runtime quantum so the
+/// synchronous line walk that follows is bounded VM-thread CPU; a direct native
+/// call keeps the uncapped shape. The `actual`/`limit` byte check reads
+/// `patch.len()` — no snapshot is taken, so an over-cap input is rejected without
+/// any excess allocation.
+#[cfg(not(target_arch = "wasm32"))]
+fn check_diff_patch_caps(op: &str, patch: &str) -> Result<(), SemaError> {
+    if sema_core::in_runtime_quantum() {
+        let cap = effective_diff_input_byte_cap();
+        check_diff_limit(op, "input bytes", patch.len() as u64, cap)?;
+        check_diff_limit(op, "hunks", patch_hunk_count(patch) as u64, DIFF_HUNK_CAP as u64)?;
+    }
+    Ok(())
+}
+
+/// Pre-dispatch caps for `diff/apply` (content + patch inputs), enforced only
+/// inside a runtime quantum. See [`check_diff_patch_caps`].
+#[cfg(not(target_arch = "wasm32"))]
+fn check_diff_apply_caps(content: &str, patch: &str) -> Result<(), SemaError> {
+    if sema_core::in_runtime_quantum() {
+        let cap = effective_diff_input_byte_cap();
+        check_diff_limit("diff/apply", "content bytes", content.len() as u64, cap)?;
+        check_diff_limit("diff/apply", "patch bytes", patch.len() as u64, cap)?;
+        check_diff_limit(
+            "diff/apply",
+            "hunks",
+            patch_hunk_count(patch) as u64,
+            DIFF_HUNK_CAP as u64,
+        )?;
+    }
+    Ok(())
+}
+
+/// Decode an offloaded `diff/unified` result (an owned `String`) into a `Value`
+/// on the VM thread. Non-capturing `fn` for `quarantined_compute`'s decoder slot.
+#[cfg(not(target_arch = "wasm32"))]
+fn diff_string_to_value(s: String) -> Value {
+    Value::string(&s)
+}
+
+/// Parse `diff/unified`'s optional context-radius argument (default 3).
+fn diff_context_arg(args: &[Value]) -> Result<usize, SemaError> {
+    if args.len() == 3 {
+        let n = args[2]
+            .as_int()
+            .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?;
+        if n < 0 {
+            return Err(SemaError::eval("diff/unified: context must be >= 0"));
+        }
+        Ok(n as usize)
+    } else {
+        Ok(3)
+    }
+}
+
+/// Produce the unified-diff text for `old` → `new` at the given context radius.
+/// Shared by the offloaded and synchronous `diff/unified` paths.
+fn diff_unified_text(old: &str, new: &str, context: usize) -> String {
+    TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(context)
+        .header("old", "new")
+        .to_string()
+}
 
 #[cfg(not(target_arch = "wasm32"))]
 const PATCH_INPUT_BYTE_CAP: u64 = 64 * 1024 * 1024;
@@ -383,7 +512,38 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, SemaError> {
 
 #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
-    // (diff/unified old new [context]) -> unified-diff string
+    // (diff/unified old new [context]) -> unified-diff string. The LCS is
+    // super-linear, so in a runtime quantum it is capped (per-input byte cap)
+    // and offloaded onto the I/O pool; outside one it runs synchronously.
+    #[cfg(not(target_arch = "wasm32"))]
+    register_runtime_fn(env, "diff/unified", |args| {
+        check_arity!(args, "diff/unified", 2..=3);
+        let old = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let new = args[1]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let context = diff_context_arg(args)?;
+        if sema_core::in_runtime_quantum() {
+            // Cap each input by byte length BEFORE snapshotting (no excess
+            // allocation on the rejected path), then offload the LCS.
+            let cap = effective_diff_input_byte_cap();
+            check_diff_limit("diff/unified", "old bytes", old.len() as u64, cap)?;
+            check_diff_limit("diff/unified", "new bytes", new.len() as u64, cap)?;
+            let old = old.to_string();
+            let new = new.to_string();
+            return crate::io::quarantined_compute(
+                "diff/unified",
+                diff_string_to_value,
+                move || Ok(diff_unified_text(&old, &new, context)),
+            );
+        }
+        Ok(NativeOutcome::Return(Value::string(&diff_unified_text(
+            old, new, context,
+        ))))
+    });
+    #[cfg(target_arch = "wasm32")]
     register_fn(env, "diff/unified", |args| {
         check_arity!(args, "diff/unified", 2..=3);
         let old = args[0]
@@ -392,24 +552,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let new = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        let context: usize = if args.len() == 3 {
-            let n = args[2]
-                .as_int()
-                .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?;
-            if n < 0 {
-                return Err(SemaError::eval("diff/unified: context must be >= 0"));
-            }
-            n as usize
-        } else {
-            3
-        };
-        let diff = TextDiff::from_lines(old, new);
-        let text = diff
-            .unified_diff()
-            .context_radius(context)
-            .header("old", "new")
-            .to_string();
-        Ok(Value::string(&text))
+        let context = diff_context_arg(args)?;
+        Ok(Value::string(&diff_unified_text(old, new, context)))
     });
 
     // (diff/stat patch) -> {:added <int> :removed <int> :hunks <int>}
@@ -418,6 +562,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let patch = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        check_diff_patch_caps("diff/stat", patch)?;
         let mut added = 0i64;
         let mut removed = 0i64;
         let mut hunks = 0i64;
@@ -458,6 +604,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let patch = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        check_diff_patch_caps("diff/hunks", patch)?;
         let hunks = parse_hunks(patch);
         let values: Vec<Value> = hunks.iter().map(hunk_to_value).collect();
         Ok(Value::list(values))
@@ -469,6 +617,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let patch = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        check_diff_patch_caps("diff/parse", patch)?;
 
         // Walk the patch line-by-line, opening a new file section on each `---`
         // header and attaching subsequent hunks to it. Hunks before any file
@@ -575,6 +725,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let patch = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        check_diff_apply_caps(content, patch)?;
         let hunks = parse_hunks(patch);
         let patched = apply_hunks(content, &hunks)?;
         Ok(Value::string(&patched))
@@ -660,6 +812,29 @@ fn patch_apply_file_work(
 mod tests {
     use super::*;
     use sema_core::{Env, Sandbox};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn diff_limit_accepts_boundary_and_rejects_one_over() {
+        assert!(check_diff_limit("diff/unified", "old bytes", 8, 8).is_ok());
+        let error = check_diff_limit("diff/unified", "old bytes", 9, 8)
+            .expect_err("one byte over the captured limit must fail");
+        assert!(error.to_string().contains('9'));
+        assert!(error.to_string().contains('8'));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn diff_input_byte_cap_is_finite_and_clamps_overrides() {
+        assert_eq!(effective_diff_input_byte_cap(), DIFF_INPUT_BYTE_CAP);
+        set_diff_input_byte_cap_override(Some(16));
+        assert_eq!(effective_diff_input_byte_cap(), 16);
+        // An override above the hard ceiling is clamped down, never raised.
+        set_diff_input_byte_cap_override(Some(u64::MAX));
+        assert_eq!(effective_diff_input_byte_cap(), DIFF_INPUT_BYTE_CAP);
+        set_diff_input_byte_cap_override(None);
+        assert_eq!(effective_diff_input_byte_cap(), DIFF_INPUT_BYTE_CAP);
+    }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[test]

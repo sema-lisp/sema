@@ -52,6 +52,12 @@ mod kv;
 pub use kv::set_kv_bounds_override;
 mod list;
 mod map;
+/// Lower the per-input byte cap for `diff/*` under a runtime quantum (clamped to
+/// the hard ceiling), or clear the override with `None`. The B8 seam the diff
+/// cap-boundary regression drives without a multi-megabyte input.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use diff::set_diff_input_byte_cap_override;
 #[cfg(not(target_arch = "wasm32"))]
 mod markup;
 mod math;
@@ -73,6 +79,12 @@ mod regex_ops;
 #[cfg(not(target_arch = "wasm32"))]
 mod runtime_offload;
 mod secret;
+/// Lower the per-input byte cap for the secret/PII ops under a runtime quantum
+/// (clamped to the hard ceiling), or clear the override with `None`. The B8 seam
+/// the secret/PII cap-boundary regression drives without a multi-megabyte input.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use secret::set_secret_input_byte_cap_override;
 #[cfg(not(target_arch = "wasm32"))]
 mod serial;
 #[cfg(not(target_arch = "wasm32"))]

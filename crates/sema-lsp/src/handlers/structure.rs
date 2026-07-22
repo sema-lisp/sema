@@ -396,7 +396,9 @@ impl BackendState {
             };
             let form_range = span_to_range(span, &lines);
             let range = quoted_string_range(&lines, &form_range, path).unwrap_or(form_range);
-            if let Some(resolved) = resolve_import_path(uri, path) {
+            // Only link paths that resolve to an existing file (the import
+            // jump in goto-definition applies the same filter).
+            if let Some(resolved) = resolve_import_path(uri, path).filter(|p| p.exists()) {
                 if let Ok(target) = Url::from_file_path(&resolved) {
                     links.push(DocumentLink {
                         range,

@@ -329,10 +329,13 @@ fn selection_range_unknown_uri_returns_none() {
 
 #[test]
 fn document_links_resolves_import_path() {
+    let dir = unique_temp_dir("doclinks");
+    std::fs::write(dir.join("foo.sema"), "(define x 1)\n").unwrap();
+    let main_uri = Url::from_file_path(dir.join("main.sema")).unwrap();
     //                       0         1         2
     //                       012345678901234567890
     let src = "(import \"./foo.sema\")";
-    let (state, uri) = parsed_state("file:///proj/main.sema", src);
+    let (state, uri) = parsed_state(main_uri.as_str(), src);
     let links = state.handle_document_links(&uri).expect("links");
     assert_eq!(links.len(), 1);
     let link = &links[0];
@@ -340,6 +343,19 @@ fn document_links_resolves_import_path() {
     assert_eq!(link.range.start.character, 9);
     assert_eq!(link.range.end.character, 19);
     assert!(link.target.as_ref().unwrap().path().ends_with("foo.sema"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn document_links_skip_missing_files() {
+    // A link to a file that does not exist is a dead link — the import jump
+    // in goto-definition applies the same filter.
+    let src = "(import \"./missing.sema\")";
+    let (state, uri) = parsed_state("file:///proj/main.sema", src);
+    assert!(
+        state.handle_document_links(&uri).expect("links").is_empty(),
+        "an import of a nonexistent file must not produce a link"
+    );
 }
 
 #[test]

@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use tower_lsp::lsp_types::*;
 
+use crate::helpers::char_col_to_utf16;
 use crate::state::{token_modifiers, token_types, BackendState};
 
 impl BackendState {
@@ -47,7 +48,9 @@ impl BackendState {
             }
         }
 
-        let mut raw_tokens: Vec<(usize, usize, usize, u32, u32)> = Vec::new();
+        let lines: Vec<&str> = cached.source.lines().collect();
+        // (line, UTF-16 start column, UTF-16 length, token type, modifiers)
+        let mut raw_tokens: Vec<(usize, u32, usize, u32, u32)> = Vec::new();
 
         for (name, span) in &cached.symbol_spans {
             let (token_type, modifiers) = if sema_eval::SPECIAL_FORM_NAMES.contains(&name.as_str())
@@ -77,14 +80,16 @@ impl BackendState {
             if span.line != span.end_line || span.line == 0 {
                 continue;
             }
-            // Token length must be in UTF-16 code units (LSP spec), not chars.
-            // Span columns are 1-indexed char columns; sum the UTF-16 width of
-            // the chars in [col, end_col) on the token's line.
+            // Token start and length must be in UTF-16 code units (LSP spec),
+            // not chars. Span columns are 1-indexed char columns; convert the
+            // start, and sum the UTF-16 width of the chars in [col, end_col)
+            // on the token's line.
             let char_count = span.end_col.saturating_sub(span.col);
             if char_count == 0 {
                 continue;
             }
-            let length = match cached.source.lines().nth(span.line - 1) {
+            let line_text = lines.get(span.line - 1).copied();
+            let length = match line_text {
                 Some(line_text) => line_text
                     .chars()
                     .skip(span.col - 1)
@@ -93,7 +98,8 @@ impl BackendState {
                     .sum::<usize>(),
                 None => char_count,
             };
-            raw_tokens.push((span.line, span.col, length, token_type, modifiers));
+            let start = char_col_to_utf16(line_text, span.col);
+            raw_tokens.push((span.line, start, length, token_type, modifiers));
         }
 
         // Sort by position
@@ -106,7 +112,7 @@ impl BackendState {
 
         for &(line, col, length, token_type, modifiers) in &raw_tokens {
             let lsp_line = (line - 1) as u32;
-            let lsp_col = (col - 1) as u32;
+            let lsp_col = col;
 
             // Use saturating_sub to guard against underflow from unexpected
             // out-of-order spans (shouldn't happen after sort, but defensive).

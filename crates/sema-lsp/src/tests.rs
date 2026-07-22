@@ -1667,6 +1667,53 @@ fn semantic_token_length_is_utf16() {
     );
 }
 
+// Semantic-token START columns must be UTF-16 code units, same as lengths:
+// a raw char column for a token after an astral char on its line shifts the
+// token left, and the delta encoding propagates the shift to every later
+// token on that line.
+#[test]
+fn semantic_token_start_column_is_utf16_after_astral_char() {
+    // Line 2's `x` sits after a 🎉 string: char index 10, but UTF-16 column 11.
+    let src = "(define x 1)\n(list \"🎉\" x)";
+    let (state, uri) = parsed_state("file:///semtok2.sema", src);
+    let result = state.handle_semantic_tokens_full(&uri).unwrap();
+    let SemanticTokensResult::Tokens(tokens) = result else {
+        panic!("expected token data");
+    };
+    // Decode the delta encoding back to absolute (line, start) positions.
+    let mut absolute = Vec::new();
+    let (mut line, mut start) = (0u32, 0u32);
+    for token in &tokens.data {
+        line += token.delta_line;
+        start = if token.delta_line == 0 {
+            start + token.delta_start
+        } else {
+            token.delta_start
+        };
+        absolute.push((line, start));
+    }
+    assert!(
+        absolute.contains(&(1, 11)),
+        "token after 🎉 must start at UTF-16 column 11, got {absolute:?}"
+    );
+}
+
+// Folding-range columns must be UTF-16 code units, not char indices.
+#[test]
+fn folding_range_columns_are_utf16_after_astral_char() {
+    // The inner `(f a … c)` form starts after a 🎉 string on its line:
+    // char index 10, but UTF-16 column 11.
+    let src = "(list \"🎉\" (f a\n      b\n      c))";
+    let (state, uri) = parsed_state("file:///fold.sema", src);
+    let ranges = state.handle_folding_ranges(&uri);
+    assert!(
+        ranges
+            .iter()
+            .any(|r| r.start_line == 0 && r.start_character == Some(11)),
+        "inner form after 🎉 must fold from UTF-16 column 11, got {ranges:?}"
+    );
+}
+
 // LSP-1: completion scope queries must convert the incoming UTF-16
 // Position.character to a Sema (char) column. On a line containing an emoji
 // before the cursor, the raw `character + 1` would land in the wrong scope

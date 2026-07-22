@@ -267,14 +267,16 @@ impl BackendState {
             None => return vec![],
         };
 
+        let lines: Vec<&str> = cached.source.lines().collect();
         let mut ranges = Vec::new();
-        Self::collect_folding_ranges(&cached.ast, &cached.span_map, &mut ranges);
+        Self::collect_folding_ranges(&cached.ast, &cached.span_map, &lines, &mut ranges);
         ranges
     }
 
     fn collect_folding_ranges(
         exprs: &[sema_core::Value],
         span_map: &SpanMap,
+        lines: &[&str],
         ranges: &mut Vec<FoldingRange>,
     ) {
         for expr in exprs {
@@ -284,18 +286,26 @@ impl BackendState {
                     // lines (`end_line - line >= 2`). Tiny 1-2-line forms add
                     // folding noise without any benefit.
                     if span.end_line.saturating_sub(span.line) >= 2 {
+                        // Span columns are chars; LSP characters are UTF-16
+                        // code units.
                         ranges.push(FoldingRange {
                             start_line: (span.line - 1) as u32,
-                            start_character: Some((span.col - 1) as u32),
+                            start_character: Some(char_col_to_utf16(
+                                lines.get(span.line - 1).copied(),
+                                span.col,
+                            )),
                             end_line: (span.end_line - 1) as u32,
-                            end_character: Some((span.end_col - 1) as u32),
+                            end_character: Some(char_col_to_utf16(
+                                lines.get(span.end_line - 1).copied(),
+                                span.end_col,
+                            )),
                             kind: Some(FoldingRangeKind::Region),
                             collapsed_text: None,
                         });
                     }
                 }
                 // Recurse into sub-expressions
-                Self::collect_folding_ranges(items, span_map, ranges);
+                Self::collect_folding_ranges(items, span_map, lines, ranges);
             }
         }
     }

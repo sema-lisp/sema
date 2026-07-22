@@ -57,7 +57,7 @@ sema eval [OPTIONS]
 | `--path <FILE>`       | Set file context for imports and error spans                     |
 | `--sandbox <MODE>`    | Sandbox mode (`strict`, `all`, or comma-separated capabilities)  |
 | `--no-llm`            | Disable LLM features                                             |
-| `--timeout <MS>`      | Kill evaluation after N ms (default: 5000)                       |
+| `--timeout <MS>`      | Kill evaluation after N ms; 0 disables (default: 5000)           |
 
 **Examples:**
 

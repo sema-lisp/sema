@@ -391,7 +391,7 @@ enum Commands {
         #[arg(long)]
         path: Option<String>,
 
-        /// Kill evaluation after N milliseconds (default: 5000)
+        /// Kill evaluation after N milliseconds; 0 disables the timeout (default: 5000)
         #[arg(long, default_value = "5000")]
         timeout: u64,
 
@@ -996,11 +996,11 @@ fn main() {
                 expr,
                 json,
                 path,
-                timeout: _timeout,
+                timeout,
                 sandbox,
                 no_llm,
             } => {
-                run_eval(stdin, expr, json, path, sandbox, no_llm);
+                run_eval(stdin, expr, json, path, timeout, sandbox, no_llm);
             }
             Commands::Update {
                 check,
@@ -1649,6 +1649,7 @@ fn run_eval(
     expr: Option<String>,
     json: bool,
     path: Option<String>,
+    timeout_ms: u64,
     sandbox_arg: Option<String>,
     no_llm: bool,
 ) {
@@ -1745,6 +1746,17 @@ fn run_eval(
     let captured_stderr: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
     if json {
         install_capturing_io(&interpreter, &captured_stdout, &captured_stderr);
+    }
+
+    // Arm the VM's wall-clock deadline so runaway loops abort with an eval
+    // error instead of hanging the caller. Armed after (llm/auto-configure)
+    // so setup time is not billed to the user's program; it stays armed
+    // through the async drain so spawned tasks are bounded too. A saturating
+    // deadline (checked_add → None) means "no timeout", same as 0.
+    if timeout_ms > 0 {
+        let deadline =
+            std::time::Instant::now().checked_add(std::time::Duration::from_millis(timeout_ms));
+        interpreter.ctx.set_eval_deadline(deadline);
     }
 
     let start = std::time::Instant::now();

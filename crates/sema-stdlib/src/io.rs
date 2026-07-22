@@ -29,6 +29,12 @@ fn read_line_value(args: &[Value]) -> Result<Value, SemaError> {
     }
 }
 
+// HOST-ADAPTER-ONLY: the non-unix (wasm) `read-line` fallback. wasm has no
+// cooperative runtime and no coordinated stdin owner, so this blocking
+// `std::io::stdin().read_line` runs on the host thread only; it is never reached
+// inside a runtime quantum (the unix path routes through `stream::stdin_*`, the
+// coordinated owner). A raw stdin read placed inside an `in_runtime_quantum()`
+// branch fails `scripts/check-unified-runtime-legacy.sh`.
 #[cfg(target_arch = "wasm32")]
 fn read_line_value(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "read-line", 0);
@@ -57,6 +63,10 @@ fn read_stdin_value(args: &[Value]) -> Result<Value, SemaError> {
     Ok(Value::string_owned(input))
 }
 
+// HOST-ADAPTER-ONLY: the non-unix (wasm) `read-stdin` fallback. Same contract as
+// [`read_line_value`] — a host-thread-only blocking `std::io::stdin` read that is
+// never reached inside a runtime quantum; the unix path uses the coordinated
+// stdin owner (`stream::stdin_text_value`).
 #[cfg(target_arch = "wasm32")]
 fn read_stdin_value(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "read-stdin", 0);
@@ -68,16 +78,198 @@ fn read_stdin_value(args: &[Value]) -> Result<Value, SemaError> {
     Ok(Value::string_owned(input))
 }
 
-// TTY restore-token store (unix only)
+// Count of outstanding DSR (cursor-position) queries. A `CSI…R` is a cursor
+// report only when one is pending; otherwise it's modified-F3 keyboard input
+// (`CSI 1;<mod>R`), which is byte-identical to a CPR reply.
 #[cfg(unix)]
 thread_local! {
-    static TTY_STORE: RefCell<std::collections::BTreeMap<i64, libc::termios>> =
-        const { RefCell::new(std::collections::BTreeMap::new()) };
-    static TTY_COUNTER: Cell<i64> = const { Cell::new(0) };
-    // Count of outstanding DSR (cursor-position) queries. A `CSI…R` is a cursor
-    // report only when one is pending; otherwise it's modified-F3 keyboard input
-    // (`CSI 1;<mod>R`), which is byte-identical to a CPR reply.
     static EXPECT_CPR: Cell<u32> = const { Cell::new(0) };
+}
+
+// ─── Interpreter-owned raw-mode (termios) guard registry (unix) ──────────────
+//
+// `io/tty-raw!` puts the controlling terminal into raw mode and hands back an
+// integer restore token. Raw mode is an *ambient* mutation of a process-global
+// resource, so its cooked-mode `termios` lives in a RESOURCE-OWNED
+// [`RawModeGuard`] parked in an INTERPRETER-SHARED registry (`Rc<TtyRegistry>`,
+// the `fs_watch` ownership model). The terminal is restored **exactly once** —
+// whichever of an explicit `io/tty-restore!`, a cancelled task that entered raw
+// mode (via its task-context [`RawModeTaskGuard`]), or interpreter teardown
+// reaches the guard first performs the restore; the rest are idempotent no-ops.
+// Without this, a task cancelled or an interpreter torn down while holding raw
+// mode would leave the user's terminal wedged.
+
+/// Observable count of terminal raw-mode restores performed (test hook).
+#[cfg(unix)]
+static TTY_RESTORE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// When set, `io/tty-raw!` records a guard even without a controlling terminal
+/// and issues NO termios syscalls, so the cancel/teardown restore path is
+/// observable off a real TTY (test hook, mirroring [`set_fs_test_delay_ms`]).
+#[cfg(unix)]
+static TTY_FORCE_CAPTURE_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Number of terminal raw-mode restores performed since the last reset.
+#[cfg(unix)]
+pub fn tty_restore_count() -> usize {
+    TTY_RESTORE_COUNT.load(AtomicOrdering::SeqCst)
+}
+
+/// Reset the raw-mode restore counter (call before observing restore in a test).
+#[cfg(unix)]
+pub fn reset_tty_restore_count() {
+    TTY_RESTORE_COUNT.store(0, AtomicOrdering::SeqCst);
+}
+
+/// Force `io/tty-raw!` to record a restore guard without a real TTY (test hook).
+#[cfg(unix)]
+pub fn set_tty_force_capture_for_test(on: bool) {
+    TTY_FORCE_CAPTURE_FOR_TEST.store(on, AtomicOrdering::SeqCst);
+}
+
+/// A RESOURCE-OWNED cooked-mode restore token for one `io/tty-raw!` entry. The
+/// saved `termios` is reinstated **once**: the first caller across the explicit,
+/// cancellation, and teardown paths wins; subsequent calls short-circuit on the
+/// `restored` flag. Holds only POD state — no `Value`/`Env` (CORE-2 I2).
+#[cfg(unix)]
+struct RawModeGuard {
+    saved: libc::termios,
+    // False in force-capture test mode: never touch fd 0 (which may be a real
+    // terminal under the harness); only the observable counter moves.
+    real_tty: bool,
+    restored: Cell<bool>,
+}
+
+#[cfg(unix)]
+impl RawModeGuard {
+    fn restore(&self) {
+        if self.restored.replace(true) {
+            return;
+        }
+        if self.real_tty
+            && unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved) } != 0
+        {
+            eprintln!(
+                "io/tty-restore!: tcsetattr failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        TTY_RESTORE_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+}
+
+/// INTERPRETER-SHARED registry of live raw-mode guards, owned via an `Rc` held by
+/// the `io/tty-*` natives (the `fs_watch` model). A weak interpreter-teardown
+/// hook restores every guard still parked here.
+#[cfg(unix)]
+struct TtyRegistry {
+    guards: RefCell<std::collections::BTreeMap<i64, std::rc::Rc<RawModeGuard>>>,
+    next_id: Cell<i64>,
+    teardown_hook_registered: Cell<bool>,
+}
+
+#[cfg(unix)]
+impl TtyRegistry {
+    fn new() -> Self {
+        Self {
+            guards: RefCell::new(std::collections::BTreeMap::new()),
+            next_id: Cell::new(0),
+            teardown_hook_registered: Cell::new(false),
+        }
+    }
+
+    fn enter(&self, guard: std::rc::Rc<RawModeGuard>) -> i64 {
+        let id = self.next_id.get();
+        self.next_id.set(id.wrapping_add(1));
+        self.guards.borrow_mut().insert(id, guard);
+        id
+    }
+
+    /// Restore + drop the guard for `id`. A missing token — already restored by a
+    /// cancelled task or teardown, or never issued — is a no-op; that is what
+    /// makes an explicit `io/tty-restore!` idempotent with the guard paths.
+    fn restore_token(&self, id: i64) {
+        if let Some(guard) = self.guards.borrow_mut().remove(&id) {
+            guard.restore();
+        }
+    }
+
+    fn ensure_teardown_hook(self: &std::rc::Rc<Self>, ctx: &sema_core::EvalContext) {
+        if !self.teardown_hook_registered.replace(true) {
+            let registry = std::rc::Rc::downgrade(self);
+            ctx.register_interpreter_teardown_hook(move || {
+                if let Some(registry) = registry.upgrade() {
+                    registry.restore_all();
+                }
+            });
+        }
+    }
+
+    fn restore_all(&self) {
+        for (_, guard) in std::mem::take(&mut *self.guards.borrow_mut()) {
+            guard.restore();
+        }
+        self.teardown_hook_registered.set(false);
+    }
+}
+
+/// TASK-PRIVATE cancellation cleanup: a task that entered raw mode carries the
+/// guard(s) it opened. When the task settles — including an `async/cancel` that
+/// tears the task down before its Sema-level `io/tty-restore!` runs — this
+/// extension drops and restores the terminal (idempotent with the registry
+/// paths). A spawned child does NOT inherit the parent's raw-mode ownership.
+#[cfg(unix)]
+struct RawModeTaskGuard {
+    guards: RefCell<Vec<std::rc::Rc<RawModeGuard>>>,
+}
+
+#[cfg(unix)]
+impl Trace for RawModeTaskGuard {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        // Holds only POD termios guards — no `Value`/`Env` edges (CORE-2 I2).
+        true
+    }
+}
+
+#[cfg(unix)]
+impl sema_core::runtime::TaskLocalValue for RawModeTaskGuard {
+    fn inherit(&self) -> std::rc::Rc<dyn sema_core::runtime::TaskLocalValue> {
+        // Children start without the parent's terminal ownership.
+        std::rc::Rc::new(RawModeTaskGuard {
+            guards: RefCell::new(Vec::new()),
+        })
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawModeTaskGuard {
+    fn drop(&mut self) {
+        for guard in self.guards.borrow().iter() {
+            guard.restore();
+        }
+    }
+}
+
+/// Attach `guard` to the running task's cancellation cleanup so a cancel while
+/// it holds raw mode restores the terminal. Merges into the task's existing
+/// [`RawModeTaskGuard`] when one is present (a task may enter raw mode twice).
+#[cfg(unix)]
+fn attach_raw_mode_task_guard(
+    handle: &sema_core::runtime::TaskContextHandle,
+    guard: std::rc::Rc<RawModeGuard>,
+) {
+    if let Some(existing) = handle.get_rc::<RawModeTaskGuard>() {
+        existing.guards.borrow_mut().push(guard);
+    } else {
+        handle.borrow_mut().insert(std::rc::Rc::new(RawModeTaskGuard {
+            guards: RefCell::new(vec![guard]),
+        }));
+    }
 }
 
 /// Build a Sema list of active modifier keywords from a modifier bitmask
@@ -337,6 +529,75 @@ fn parse_legacy_csi(csi: &[u8]) -> (&'static str, u32) {
         _ => "unknown",
     };
     (name, mbits)
+}
+
+// Raw-mode guard regression (R08C). These exercise the real `TtyRegistry` /
+// `RawModeGuard` / `RawModeTaskGuard` restore-once logic through the observable
+// counter, so the cancel/teardown/explicit paths are asserted deterministically
+// without a controlling terminal or runtime-reap timing. `real_tty: false` keeps
+// every guard off fd 0. The counter and force flag are process-global; under
+// nextest (process-per-test) that is isolation enough, and these three tests do
+// not run concurrently within one process.
+#[cfg(all(test, unix))]
+mod raw_mode_guard_tests {
+    use std::rc::Rc;
+
+    use super::*;
+
+    fn test_guard() -> Rc<RawModeGuard> {
+        Rc::new(RawModeGuard {
+            saved: unsafe { std::mem::zeroed() },
+            real_tty: false,
+            restored: Cell::new(false),
+        })
+    }
+
+    #[test]
+    fn registry_teardown_restores_guard_once() {
+        reset_tty_restore_count();
+        let registry = Rc::new(TtyRegistry::new());
+        let _id = registry.enter(test_guard());
+        assert_eq!(tty_restore_count(), 0, "entering raw mode restores nothing");
+        registry.restore_all(); // interpreter-teardown hook path
+        assert_eq!(tty_restore_count(), 1, "teardown restores the live guard");
+        registry.restore_all();
+        assert_eq!(tty_restore_count(), 1, "a second teardown is a no-op");
+    }
+
+    #[test]
+    fn task_guard_drop_restores_guard_once() {
+        reset_tty_restore_count();
+        let registry = Rc::new(TtyRegistry::new());
+        let guard = test_guard();
+        let id = registry.enter(Rc::clone(&guard));
+        // The extension a task carries; dropping it is exactly what a cancelled
+        // task's context teardown does to the guard.
+        let task_guard = Rc::new(RawModeTaskGuard {
+            guards: RefCell::new(vec![guard]),
+        });
+        drop(task_guard);
+        assert_eq!(tty_restore_count(), 1, "cancellation restores exactly once");
+        // A later explicit restore (or teardown) of the same token is idempotent.
+        registry.restore_token(id);
+        registry.restore_all();
+        assert_eq!(tty_restore_count(), 1, "restore is not repeated");
+    }
+
+    #[test]
+    fn explicit_restore_is_idempotent_across_paths() {
+        reset_tty_restore_count();
+        let registry = Rc::new(TtyRegistry::new());
+        let guard = test_guard();
+        let id = registry.enter(Rc::clone(&guard));
+        let task_guard = Rc::new(RawModeTaskGuard {
+            guards: RefCell::new(vec![guard]),
+        });
+        registry.restore_token(id); // explicit `io/tty-restore!`
+        assert_eq!(tty_restore_count(), 1);
+        drop(task_guard); // task later settles
+        registry.restore_all(); // interpreter later tears down
+        assert_eq!(tty_restore_count(), 1, "exactly one restore across all paths");
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -3097,54 +3358,73 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     {
         use std::io::IsTerminal;
 
+        // The raw-mode registry is INTERPRETER-SHARED: created once here, owned by
+        // the `io/tty-*` natives via `Rc`, and torn down by a weak interpreter hook.
+        let tty_registry = std::rc::Rc::new(TtyRegistry::new());
+
         // io/tty-raw! — put the controlling TTY into raw mode.
         // Returns a restore-token (integer) on success, nil if stdin is not a TTY.
-        register_fn(env, "io/tty-raw!", |args| {
-            check_arity!(args, "io/tty-raw!", 0);
-            if !std::io::stdin().is_terminal() {
-                return Ok(Value::nil());
-            }
-            // SAFETY: termios is a POD C struct; zero-init is the standard idiom.
-            // tcgetattr (called next) overwrites if successful; we short-circuit if it fails.
-            let mut orig: libc::termios = unsafe { std::mem::zeroed() };
-            if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut orig) } != 0 {
-                return Ok(Value::nil());
-            }
-            let id = TTY_COUNTER.with(|c| {
-                let n = c.get();
-                c.set(n + 1);
-                n
-            });
-            TTY_STORE.with(|s| s.borrow_mut().insert(id, orig));
-            let mut raw = orig;
-            unsafe { libc::cfmakeraw(&mut raw) };
-            raw.c_cc[libc::VMIN] = 1;
-            raw.c_cc[libc::VTIME] = 0;
-            if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
-                return Err(SemaError::eval(format!(
-                    "io/tty-raw!: tcsetattr failed: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            Ok(Value::int(id))
-        });
+        // The saved cooked-mode termios becomes a RESOURCE-OWNED guard: restored on
+        // an explicit `io/tty-restore!`, on cancellation of the task that entered
+        // raw mode, or on interpreter teardown — exactly once.
+        let raw_registry = std::rc::Rc::clone(&tty_registry);
+        env.set(
+            sema_core::intern("io/tty-raw!"),
+            Value::native_fn(NativeFn::with_ctx("io/tty-raw!", move |ctx, args| {
+                check_arity!(args, "io/tty-raw!", 0);
+                let (saved, real_tty) =
+                    if TTY_FORCE_CAPTURE_FOR_TEST.load(AtomicOrdering::SeqCst) {
+                        // Test capture: record a guard without touching fd 0.
+                        (unsafe { std::mem::zeroed::<libc::termios>() }, false)
+                    } else {
+                        if !std::io::stdin().is_terminal() {
+                            return Ok(Value::nil());
+                        }
+                        // SAFETY: termios is a POD C struct; zero-init is the standard idiom.
+                        // tcgetattr overwrites on success; we short-circuit if it fails.
+                        let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+                        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut orig) } != 0 {
+                            return Ok(Value::nil());
+                        }
+                        let mut raw = orig;
+                        unsafe { libc::cfmakeraw(&mut raw) };
+                        raw.c_cc[libc::VMIN] = 1;
+                        raw.c_cc[libc::VTIME] = 0;
+                        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0
+                        {
+                            return Err(SemaError::eval(format!(
+                                "io/tty-raw!: tcsetattr failed: {}",
+                                std::io::Error::last_os_error()
+                            )));
+                        }
+                        (orig, true)
+                    };
+                let guard = std::rc::Rc::new(RawModeGuard {
+                    saved,
+                    real_tty,
+                    restored: Cell::new(false),
+                });
+                let id = raw_registry.enter(std::rc::Rc::clone(&guard));
+                raw_registry.ensure_teardown_hook(ctx);
+                // Inside a runtime quantum the task context is installed; register
+                // the guard for cancellation cleanup on the owning task.
+                if let Some(handle) = ctx.task_context() {
+                    attach_raw_mode_task_guard(&handle, guard);
+                }
+                Ok(Value::int(id))
+            })),
+        );
 
         // io/tty-restore! — restore the TTY to cooked mode using the given restore-token.
-        register_fn(env, "io/tty-restore!", |args| {
+        // Idempotent with the cancellation/teardown guard paths (a token already
+        // restored, or never issued, is a no-op).
+        let restore_registry = std::rc::Rc::clone(&tty_registry);
+        register_fn(env, "io/tty-restore!", move |args| {
             check_arity!(args, "io/tty-restore!", 1);
             let id = args[0]
                 .as_int()
                 .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?;
-            TTY_STORE.with(|s| {
-                if let Some(orig) = s.borrow_mut().remove(&id) {
-                    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &orig) } != 0 {
-                        eprintln!(
-                            "io/tty-restore!: tcsetattr failed: {}",
-                            std::io::Error::last_os_error()
-                        );
-                    }
-                }
-            });
+            restore_registry.restore_token(id);
             Ok(Value::nil())
         });
 

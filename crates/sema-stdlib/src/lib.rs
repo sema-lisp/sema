@@ -29,6 +29,12 @@ pub use io::{
     fs_current_inflight, fs_peak_inflight, reset_fs_inflight, set_fs_byte_cap, set_fs_list_cap,
     set_fs_test_delay_ms, FS_BYTE_CAP_DEFAULT, FS_LIST_CAP_DEFAULT,
 };
+/// Terminal raw-mode restore observability, used by the R08C stdin/TTY guard
+/// regression tests to assert the cancel/teardown restore path fires exactly
+/// once without a controlling terminal.
+#[cfg(unix)]
+#[doc(hidden)]
+pub use io::{reset_tty_restore_count, set_tty_force_capture_for_test, tty_restore_count};
 pub(crate) mod json;
 #[cfg(not(target_arch = "wasm32"))]
 mod kv;

@@ -2474,3 +2474,103 @@ fn stream_file_async_cancel_settles_and_fresh_stream_works() {
     );
     assert_eq!(interp.runtime_resource_gate_count(), 0);
 }
+
+// ─── R08C: terminal raw-mode guard restores on teardown and cancellation ─────
+//
+// These drive the real `io/tty-raw!` native (registry + interpreter-teardown
+// hook + task-context cancellation guard) end to end. There is no reliable pty
+// termios round-trip in this sandbox, so the restore is asserted through the
+// observable `tty_restore_count` counter under `set_tty_force_capture_for_test`,
+// which records a guard without touching fd 0. The counter and force flag are
+// process-global; nextest's process-per-test isolation plus a serialization lock
+// keep the two tests from interleaving.
+#[cfg(unix)]
+static TTY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(unix)]
+#[test]
+fn interpreter_teardown_restores_raw_mode() {
+    let _serialize = TTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    sema_stdlib::set_tty_force_capture_for_test(true);
+    sema_stdlib::reset_tty_restore_count();
+    let interp = Interpreter::new();
+    // A detached task enters raw mode and parks forever; synchronizing on `ready`
+    // guarantees it is parked in raw mode (and never explicitly restores) by the
+    // time the root program returns, so only interpreter teardown can restore it.
+    let outcome = interp
+        .eval_str_compiled(
+            r#"
+            (let ((ready (channel/new 1))
+                  (block (channel/new 1)))
+              (async/spawn (fn ()
+                (io/tty-raw!)
+                (channel/send ready :entered)
+                (channel/recv block)))
+              (channel/recv ready))
+            "#,
+        )
+        .expect("detached raw-mode task parks without wedging the runtime");
+    assert_eq!(outcome, Value::keyword("entered"));
+    assert_eq!(
+        sema_stdlib::tty_restore_count(),
+        0,
+        "a still-parked raw-mode task must not have restored the terminal yet"
+    );
+    drop(interp); // shutdown cancels the parked task + fires the teardown hook
+    assert_eq!(
+        sema_stdlib::tty_restore_count(),
+        1,
+        "interpreter teardown must restore the live raw-mode guard exactly once"
+    );
+    sema_stdlib::set_tty_force_capture_for_test(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn cancelled_task_in_raw_mode_restores_termios() {
+    let _serialize = TTY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    sema_stdlib::set_tty_force_capture_for_test(true);
+    sema_stdlib::reset_tty_restore_count();
+    let interp = Interpreter::new();
+    // A task enters raw mode, then parks forever on an empty channel; cancelling
+    // it tears the task down before any Sema-level `io/tty-restore!` runs. The
+    // sleep lets the victim reach its raw-mode park (the `db_async_test` /
+    // `git_async_test` cancellation idiom) before the cancel.
+    let outcome = interp
+        .eval_str_compiled(
+            r#"
+            (let ((block (channel/new 1))
+                  (victim (async/spawn (fn ()
+                            (io/tty-raw!)
+                            (channel/recv block)))))
+              (async/sleep 20)
+              (async/cancel victim)
+              (try (async/await victim) (catch e :cancelled)))
+            "#,
+        )
+        .expect("cancelling a raw-mode task settles without wedging the runtime");
+    assert_eq!(
+        outcome,
+        Value::keyword("cancelled"),
+        "awaiting the cancelled task must enter the catch, got {outcome:?}"
+    );
+    // Reap of the cancelled task's context (which drops the raw-mode task guard)
+    // can lag the await; drive the runtime until the restore lands, bounded.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while sema_stdlib::tty_restore_count() == 0 && std::time::Instant::now() < deadline {
+        let _ = interp.eval_str_compiled("(async/await (async/spawn (fn () (async/sleep 1))))");
+    }
+    assert_eq!(
+        sema_stdlib::tty_restore_count(),
+        1,
+        "cancelling a task holding raw mode must restore the terminal exactly once"
+    );
+    // A subsequent interpreter teardown must not restore a second time.
+    drop(interp);
+    assert_eq!(
+        sema_stdlib::tty_restore_count(),
+        1,
+        "the guard already restored on cancel must not restore again on teardown"
+    );
+    sema_stdlib::set_tty_force_capture_for_test(false);
+}

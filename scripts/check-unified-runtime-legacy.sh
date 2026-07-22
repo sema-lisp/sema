@@ -248,6 +248,15 @@ scan_active_runtime_callbacks_paths() {
           if $body =~ /\bWORKFLOW\.with\b/;
         print "IO_BLOCK_ON\t$line:$condition\n"
           if $body =~ /\bio_block_on\s*\(/;
+        # R08C stdin/TTY guard: a raw blocking `std::io::stdin()` read
+        # (`read`/`read_line`/`read_to_string`/`read_to_end`/`read_exact`,
+        # optionally through `.lock()`) is a HOST-ADAPTER-ONLY shape — legal only
+        # on the `!in_runtime_quantum()` arm, where the coordinated stdin owner is
+        # unavailable. Inside an active-runtime branch it must fail: runtime code
+        # reads stdin through the coordinated owner (`stream::stdin_*`), which
+        # parks structurally instead of blocking the VM thread.
+        print "RAW_STDIN_READ\t$line:$condition\n"
+          if $body =~ /std::io::stdin\s*\(\s*\)[^;{}]*?\.\s*read(?:_line|_to_string|_to_end|_exact)?\s*\(/;
       }
     ' "$file" || true)
     while IFS=$'\t' read -r token line; do

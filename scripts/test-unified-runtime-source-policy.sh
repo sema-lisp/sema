@@ -138,6 +138,22 @@ expect_success \
   "$fixtures/negated-runtime-io-block-on.rs" \
   "$fixtures/empty-allowlist.tsv"
 
+# R08C: a raw blocking `std::io::stdin()` read inside an active-runtime branch
+# must fail — runtime code reads stdin through the coordinated owner, which parks
+# structurally. The wasm host-adapter fallbacks (`io.rs` `read-line`/`read-stdin`)
+# stay on the `!in_runtime_quantum()` arm and are unaffected.
+expect_failure \
+  "$fixtures/active-runtime-stdin-read.rs" \
+  "$fixtures/empty-allowlist.tsv" \
+  "active-runtime synchronous callback re-entry" \
+  RAW_STDIN_READ
+
+# The same blocking stdin read on the negated (host) arm is the sanctioned shape
+# and must PASS.
+expect_success \
+  "$fixtures/negated-runtime-stdin-read.rs" \
+  "$fixtures/empty-allowlist.tsv"
+
 expect_success \
   "$fixtures/negated-runtime-host-adapter.rs" \
   "$fixtures/negated-runtime-host-allowlist.tsv"

@@ -469,6 +469,30 @@ host-path only). No file-type admission at `stream/open-*`.
 
 ### Commit B5 — stdin/TTY guard completion (closes R08C)
 
+**Landed.** The raw-mode restore token is now a RESOURCE-OWNED `RawModeGuard`
+parked in an INTERPRETER-SHARED `Rc<TtyRegistry>` (the `fs_watch` ownership
+model): `io/tty-raw!` became a `with_ctx` native that mints a guard, registers a
+weak interpreter-teardown hook (`restore_all`), and — when a task context is
+installed (a runtime quantum) — attaches the guard to the owning task via a
+`RawModeTaskGuard` task-context extension (traced, `Value`-free per CORE-2 I2;
+children do not inherit terminal ownership). The terminal is restored **exactly
+once** — whichever of an explicit `io/tty-restore!` (`restore_token`), a cancelled
+task's `RawModeTaskGuard` drop, or interpreter teardown reaches the guard first
+wins; the rest short-circuit on the guard's `restored` flag. The wasm
+`read-line`/`read-stdin` blocking reads are annotated HOST-ADAPTER-ONLY, and a new
+`RAW_STDIN_READ` token in `scripts/check-unified-runtime-legacy.sh` (active-runtime
+scanner) fails any raw `std::io::stdin()` read placed inside an `in_runtime_quantum()`
+branch, with pass/fail fixtures (`active-runtime-stdin-read.rs` /
+`negated-runtime-stdin-read.rs`). Regression: deterministic
+`sema-stdlib` `io::raw_mode_guard_tests::*` (registry teardown / task-guard drop /
+cross-path idempotency, asserted through the observable `tty_restore_count` off a
+real TTY — no pty is available in this environment) plus in-process
+`stream_file_async_test::{interpreter_teardown_restores_raw_mode,cancelled_task_in_raw_mode_restores_termios}`
+driving the real native. **R08C flipped to `MIGRATED (B5)`** in
+`docs/internals/async-runtime-inventory.md`; the `runtime-match-map.tsv` re-map and
+the `runtime_conformance_test` inventory reconciliation are the deferred C7 work and
+remain red.
+
 Landed (`0e67e854`): coordinated `StdinOwner` + lease/wake-socket cancellation
 for line/byte/key/cursor/kitty reads, structural `WaitKind::Timer` parks, and a
 thorough cancellation suite in `stream_file_async_test.rs`. Remaining

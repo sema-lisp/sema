@@ -12,6 +12,7 @@ pub mod mutable_ops;
 pub mod net;
 pub mod num;
 pub mod number;
+pub mod os_sandbox;
 pub mod output_hook;
 pub mod resolve;
 pub mod sandbox;

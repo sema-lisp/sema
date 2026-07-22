@@ -386,6 +386,30 @@ no caps/deadline; `abort: None` at `kv.rs:241` (nothing to interrupt — plain
 
 ### Commit B3 — serial abort/wake, or split (closes R14)
 
+**Landed 2026-07-21 — SPLIT arm (R14A/R14B).** A real `try_clone()`-based abort
+was considered but not shipped: this environment has no serial hardware, so a
+close/break wake of a blocked `read_line` cannot be validated on a tier-1
+platform, and shipping an unverifiable abort is the wrong disposition. Instead
+R14 is split honestly: **R14A** structural gate/open/close waits stay
+`INTERRUPTIBLE` (already landed — queued-op FIFO removal, cancelled-open reject,
+`serial/close` tombstone/close, mid-op tombstone). **R14B** the checkout ops are
+`QUARANTINED-BOUNDED` by the port's read timeout: `serial/open` and every
+checkout dispatch validate the timeout `Some(_)`, non-zero, and
+`<= SERIAL_MAX_OP_TIMEOUT` (60 s) via `validate_op_timeout` /
+`validate_available_timeout` before any blocking op dispatches, so an unbounded
+blocking read is unrepresentable and a cancelled op's blocked worker is
+guaranteed to free within the validated bound; `abort` stays `None` (nothing to
+interrupt). A zero/oversized timeout is rejected up front (a minor tightening —
+a zero read timeout is not a bounded op quantum; all shipped examples use
+2000–5000 ms). Regression:
+`crates/sema/tests/serial_async_test.rs::serial_dispatch_rejects_missing_or_oversized_timeout`
+plus the existing no-hardware cancellation/missing-handle suite;
+`serial::tests::{validate_op_timeout_matrix,serial_max_op_timeout_is_finite_and_covers_default,open_rejects_zero_and_oversized_timeout_before_device_open}`
+guard the bound. **R14 flipped to `MIGRATED (B3)` as split rows R14A/R14B** in
+`docs/internals/async-runtime-inventory.md`; the `runtime-match-map.tsv` re-map
+and the `runtime_conformance_test` inventory reconciliation are the deferred C7
+work and remain red.
+
 Gap (verified): `abort: None` (`crates/sema-stdlib/src/serial.rs:228`); a
 cancelled `read_line` parks the worker until the per-port timeout
 (default 2000 ms, `serial.rs:257-264`) fires.

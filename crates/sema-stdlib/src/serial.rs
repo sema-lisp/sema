@@ -26,7 +26,22 @@
 //! `serial/*` op on the SAME handle either errors clearly (the sync path, and
 //! `serial/close`, on `CheckedOut`) or parks FIFO on the gate. A mid-flight
 //! cancel tombstones the slot (best-effort — the port cannot be reclaimed) and
-//! closes the gate; there is no process to signal, so no abort runs.
+//! closes the gate.
+//!
+//! Cancellation model (ledger R14, split R14A/R14B): the structural gate/open/
+//! close waits are INTERRUPTIBLE (R14A — a queued op leaves the FIFO, a cancelled
+//! open rejects, `serial/close` tombstones). The checkout ops themselves are
+//! QUARANTINED-BOUNDED (R14B): serial hardware exposes no portable read-interrupt,
+//! so — unlike proc/pty (SIGKILL) or SQLite (interrupt handle) — cancellation runs
+//! NO abort (`abort: None`); the port cannot be reclaimed and the blocked worker
+//! only frees when the OS read returns. The port's read timeout, validated
+//! `Some(_)`, non-zero, and `<= SERIAL_MAX_OP_TIMEOUT` at `serial/open` and again
+//! before every checkout dispatch, is therefore the sole bound on worker
+//! occupancy: a blocked `serial/read-line` returns a `TimedOut` error within the
+//! validated timeout, so an unbounded blocking read is unrepresentable. (A real
+//! `try_clone`-based abort/wake was considered but not shipped: it cannot be
+//! validated on a tier-1 platform without serial hardware, and the honest
+//! disposition is the bounded-timeout split rather than an unverifiable abort.)
 //!
 //! `serial/write`'s `flush()` is included in its offload — on most serialport
 //! backends flush maps to `tcdrain(3)`, which blocks until every queued byte
@@ -57,6 +72,66 @@ use crate::runtime_offload::{
 
 /// Completion-kind tag for `serial/*` external waits ("srl\0").
 const SERIAL_COMPLETION_KIND: u64 = 0x7372_6c00;
+
+/// Default per-port read/write timeout when `serial/open` is called without an
+/// explicit `timeout_ms` (the historical value; all `pico-*` examples rely on
+/// it or a small explicit override).
+const DEFAULT_SERIAL_TIMEOUT_MS: u64 = 2000;
+
+/// Upper bound on a serial port's per-operation read/write timeout (R14B).
+///
+/// Serial hardware has no portable way to interrupt a blocked `read(2)`, so —
+/// unlike proc/pty (SIGKILL) or SQLite (interrupt handle) — a cancelled serial
+/// checkout op cannot be woken; the blocked worker only frees when the OS read
+/// returns. The port's configured read timeout is therefore the *only* thing
+/// bounding worker occupancy: a blocked `serial/read-line` returns a `TimedOut`
+/// error after at most this long. Every checkout op validates that its port's
+/// timeout is `Some(_)`, non-zero, and `<= SERIAL_MAX_OP_TIMEOUT` before it
+/// dispatches, so an unbounded blocking read is unrepresentable and a cancelled
+/// op's worker is guaranteed to free within the validated bound. This is R14B's
+/// cancellation backstop in lieu of a (here unverifiable) real abort/wake.
+const SERIAL_MAX_OP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Validate a serial operation timeout as a finite, bounded quantum: `Some(d)`
+/// with `0 < d <= SERIAL_MAX_OP_TIMEOUT`. `None` (no timeout configured) or a
+/// zero timeout is "missing" (no bounded blocking read); a larger value is
+/// "oversized". A checkout op will not dispatch a blocking read/write without a
+/// validated bound, so worker occupancy always stays bounded by `d`.
+fn validate_op_timeout(op: &str, timeout: Option<Duration>) -> Result<Duration, SemaError> {
+    match timeout {
+        Some(d) if d.is_zero() => Err(SemaError::eval(format!(
+            "{op}: a serial read timeout of zero is not a bounded operation timeout"
+        ))
+        .with_hint("open the port with a positive timeout in milliseconds")),
+        Some(d) if d > SERIAL_MAX_OP_TIMEOUT => Err(SemaError::eval(format!(
+            "{op}: read timeout {}ms exceeds the maximum serial op timeout {}ms",
+            d.as_millis(),
+            SERIAL_MAX_OP_TIMEOUT.as_millis()
+        ))
+        .with_hint("open the port with a smaller timeout: (serial/open path baud timeout-ms)")),
+        Some(d) => Ok(d),
+        None => Err(SemaError::eval(format!(
+            "{op}: serial port has no read timeout configured; a bounded timeout is required"
+        ))),
+    }
+}
+
+/// R14B dispatch gate: before a checkout op dispatches a blocking read/write,
+/// confirm the target port's configured timeout is present and bounded. Only an
+/// `Available` port is reachable on the VM thread here — a `CheckedOut` port is
+/// already mid-op on the worker (its timeout was validated when *that* op
+/// dispatched), and a missing/tombstoned slot is surfaced with the exact
+/// invalid-handle / tombstone text by `take` rather than a timeout error. The
+/// port carries its own timeout (`SerialPort::timeout`), so there is no shadow
+/// copy that could drift from the value `serial/open` validated.
+fn validate_available_timeout(op: &'static str, handle: u64) -> Result<(), SemaError> {
+    PORTS.with(|p| match p.borrow().get(&handle) {
+        Some(PortSlot::Available(reader)) => {
+            validate_op_timeout(op, Some(reader.get_ref().timeout())).map(|_| ())
+        }
+        _ => Ok(()),
+    })
+}
 
 /// A registry entry: a buffered handle over a boxed trait object port.
 type Port = BufReader<Box<dyn serialport::SerialPort>>;
@@ -183,14 +258,25 @@ fn with_port<R>(
 /// `Port` and decode the result on the VM thread before releasing the gate. A
 /// second `serial/*` op on a busy handle parks FIFO on the gate; a mid-flight
 /// cancel tombstones the slot (best-effort — the blocking call keeps running
-/// unattended, so the port cannot be reclaimed) and closes the gate. There is
-/// no process to signal, so — unlike proc/pty — cancellation runs no abort.
+/// unattended, so the port cannot be reclaimed) and closes the gate.
+///
+/// R14B: there is no portable way to interrupt a blocked serial read, so — unlike
+/// proc/pty (SIGKILL) or SQLite (interrupt handle) — cancellation runs no abort
+/// (`abort: None`). Instead, worker occupancy is bounded by the port's validated
+/// read timeout: [`validate_available_timeout`] confirms the port carries a
+/// `Some(_)`, non-zero, `<= SERIAL_MAX_OP_TIMEOUT` timeout before this op
+/// dispatches, so a cancelled op's blocked worker is guaranteed to free within
+/// that bound and an unbounded blocking read is unrepresentable.
 fn checkout_runtime<T: Send + 'static>(
     op_name: &'static str,
     handle: u64,
     op: impl FnOnce(&mut Port) -> Result<T, String> + Send + 'static,
     decode: impl FnOnce(T) -> Value + 'static,
 ) -> NativeResult {
+    // R14B dispatch bound: refuse to dispatch a blocking op against a port whose
+    // read timeout is missing/oversized, so worker occupancy stays bounded. A
+    // missing/tombstoned/busy handle short-circuits to `take`'s domain error.
+    validate_available_timeout(op_name, handle)?;
     let kind = CompletionKind::try_from_raw(SERIAL_COMPLETION_KIND)
         .expect("serial completion kind is nonzero");
     let gate = SERIAL_GATES.with(|g| g.borrow().get(&handle).cloned());
@@ -261,8 +347,15 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?
                 as u64
         } else {
-            2000
+            DEFAULT_SERIAL_TIMEOUT_MS
         };
+
+        // R14B admission: validate the requested read timeout as a bounded op
+        // quantum BEFORE any (blocking) device open dispatches, on both the sync
+        // and runtime paths. Every port that lands in the registry therefore
+        // carries a `Some(_)`, non-zero, `<= SERIAL_MAX_OP_TIMEOUT` timeout, so
+        // every later checkout op's worker occupancy is bounded by construction.
+        let timeout = validate_op_timeout("serial/open", Some(Duration::from_millis(timeout_ms)))?;
 
         // There is no existing port to contend over, so `serial/open` offloads
         // the blocking device `open()` as a plain External wait (mirrors
@@ -288,7 +381,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 },
                 move || async move {
                     serialport::new(&path_for_open, baud)
-                        .timeout(Duration::from_millis(timeout_ms))
+                        .timeout(timeout)
                         .open()
                         .map_err(|e| {
                             SemaError::eval(format!("serial/open: {e}"))
@@ -300,7 +393,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         }
 
         let port = serialport::new(&path, baud)
-            .timeout(Duration::from_millis(timeout_ms))
+            .timeout(timeout)
             .open()
             .map_err(|e| {
                 SemaError::eval(format!("serial/open: {e}"))
@@ -595,6 +688,84 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Eval error: serial/close: invalid handle 999"
+        );
+    }
+
+    // ---- R14B: bounded-timeout guard (no serial hardware needed) --------------
+
+    /// The bound is finite and comfortably accommodates the historical default
+    /// and every shipped example (2000–5000 ms), so validating against it never
+    /// rejects real usage while still capping the worst case.
+    #[test]
+    fn serial_max_op_timeout_is_finite_and_covers_default() {
+        assert_eq!(SERIAL_MAX_OP_TIMEOUT, Duration::from_secs(60));
+        assert!(SERIAL_MAX_OP_TIMEOUT >= Duration::from_millis(DEFAULT_SERIAL_TIMEOUT_MS));
+        assert!(SERIAL_MAX_OP_TIMEOUT < Duration::MAX);
+    }
+
+    /// `validate_op_timeout` is the bound every serial checkout op is gated on.
+    /// Since R14B ships `abort: None` (no wake), this validated-bound arm is what
+    /// keeps worker occupancy finite: `None`/zero are rejected as "missing" and a
+    /// value past the ceiling as "oversized"; an in-range timeout passes through.
+    #[test]
+    fn validate_op_timeout_matrix() {
+        // Missing: no configured timeout at all.
+        let none = validate_op_timeout("serial/read-line", None).unwrap_err();
+        assert!(none.to_string().contains("serial/read-line"));
+        assert!(none.to_string().contains("timeout"));
+
+        // Missing: a zero timeout is no bounded operation timeout.
+        let zero =
+            validate_op_timeout("serial/read-line", Some(Duration::ZERO)).unwrap_err();
+        assert!(zero.to_string().contains("timeout"));
+
+        // Oversized: past the ceiling.
+        let over = validate_op_timeout(
+            "serial/read-line",
+            Some(SERIAL_MAX_OP_TIMEOUT + Duration::from_millis(1)),
+        )
+        .unwrap_err();
+        assert!(over.to_string().contains("exceeds the maximum"));
+
+        // In range: accepted, returned verbatim.
+        let ok = validate_op_timeout(
+            "serial/read-line",
+            Some(Duration::from_millis(DEFAULT_SERIAL_TIMEOUT_MS)),
+        )
+        .expect("a default-range timeout must validate");
+        assert_eq!(ok, Duration::from_millis(DEFAULT_SERIAL_TIMEOUT_MS));
+
+        // The ceiling itself is inclusive.
+        assert!(validate_op_timeout("serial/read-line", Some(SERIAL_MAX_OP_TIMEOUT)).is_ok());
+    }
+
+    /// `serial/open` rejects a missing (zero) or oversized timeout up front —
+    /// before the blocking device open — so no port with an unbounded read
+    /// timeout ever reaches the registry. Exercised without hardware because the
+    /// admission short-circuits before the device is touched.
+    #[test]
+    fn open_rejects_zero_and_oversized_timeout_before_device_open() {
+        let e = env();
+        let zero = native(&e, "serial/open")(&[
+            Value::string("/dev/sema-nonexistent-test-device"),
+            Value::int(9600),
+            Value::int(0),
+        ])
+        .unwrap_err();
+        assert!(
+            zero.to_string().contains("serial/open") && zero.to_string().contains("timeout"),
+            "zero timeout must be rejected at open: {zero}"
+        );
+
+        let over = native(&e, "serial/open")(&[
+            Value::string("/dev/sema-nonexistent-test-device"),
+            Value::int(9600),
+            Value::int(999_999_999),
+        ])
+        .unwrap_err();
+        assert!(
+            over.to_string().contains("exceeds the maximum"),
+            "oversized timeout must be rejected at open: {over}"
         );
     }
 }

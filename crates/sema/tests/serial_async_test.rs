@@ -92,6 +92,50 @@ fn serial_open_async_bad_device_errors_cleanly() {
     );
 }
 
+/// R14B bound: a serial checkout op has no portable read-interrupt, so worker
+/// occupancy is bounded by the port's configured read timeout. That timeout is
+/// validated (`Some(_)`, non-zero, `<= SERIAL_MAX_OP_TIMEOUT`) before the
+/// blocking device open dispatches, so a missing (zero) or oversized timeout is
+/// rejected up front — no serial hardware needed, because validation
+/// short-circuits before the device is ever touched. The rejection holds on both
+/// the synchronous top-level path and the async offload path.
+#[test]
+fn serial_dispatch_rejects_missing_or_oversized_timeout() {
+    let interp = Interpreter::new();
+
+    // Oversized: ~11.5 days, far past the 60s ceiling.
+    let oversized = interp
+        .eval_str_compiled(r#"(serial/open "/dev/sema-nonexistent-test-device" 9600 999999999)"#)
+        .expect_err("an oversized serial timeout must be rejected before the device open")
+        .to_string();
+    assert!(
+        oversized.contains("serial/open") && oversized.contains("timeout"),
+        "oversized timeout must be rejected with an actionable serial/open error: {oversized}"
+    );
+
+    // Zero: no bounded operation timeout at all.
+    let zero = interp
+        .eval_str_compiled(r#"(serial/open "/dev/sema-nonexistent-test-device" 9600 0)"#)
+        .expect_err("a zero serial timeout must be rejected before the device open")
+        .to_string();
+    assert!(
+        zero.contains("serial/open") && zero.contains("timeout"),
+        "zero timeout must be rejected with an actionable serial/open error: {zero}"
+    );
+
+    // The same admission holds through the async offload path (spawned task).
+    let async_over = interp
+        .eval_str_compiled(
+            r#"(await (async/spawn (fn () (serial/open "/dev/sema-nonexistent-test-device" 9600 999999999))))"#,
+        )
+        .expect_err("async oversized timeout must be rejected")
+        .to_string();
+    assert!(
+        async_over.contains("timeout"),
+        "async oversized timeout must reject before dispatch: {async_over}"
+    );
+}
+
 /// Cancelling a spawned serial op settles the task (either :cancelled or its
 /// domain error — both mean "no hang") and leaves the registry usable: a fresh
 /// serial op afterward still reports the missing handle cleanly. Exercises the

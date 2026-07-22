@@ -566,6 +566,16 @@ pub fn extract_params(text: &str, name: &str) -> Option<String> {
     extract_params_from_ast(&ast, name)
 }
 
+/// Canonicalize `path`, falling back to the raw path when canonicalization
+/// fails (nonexistent file, permission error). File identity in the scan
+/// cache and the workspace-iterating handlers is canonical-path based, so
+/// one file reachable under several spellings — an un-normalized import
+/// (`a/../lib.sema`), a symlinked root (macOS `/tmp` -> `/private/tmp`), an
+/// open-document URI — maps to a single identity.
+pub(crate) fn canonicalize_or_raw(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Resolve an import/load path relative to a document URI.
 /// Returns the absolute path if resolvable.
 pub fn resolve_import_path(uri: &Url, path_str: &str) -> Option<PathBuf> {

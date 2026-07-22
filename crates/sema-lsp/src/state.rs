@@ -97,6 +97,21 @@ pub(crate) struct ImportCache {
     pub(crate) mtime: std::time::SystemTime,
 }
 
+impl ImportCache {
+    /// Whether this entry still matches the file on disk. Handlers that
+    /// iterate the cache directly (references, rename, workspace symbols,
+    /// the goto-definition workspace fallback) must skip entries that are
+    /// not fresh: their spans index content that no longer exists, and a
+    /// rename edit built from them would corrupt the file. Missing metadata
+    /// counts as stale — a deleted file has nothing to point into.
+    pub(crate) fn is_fresh(&self, path: &Path) -> bool {
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .map(|mtime| mtime == self.mtime)
+            .unwrap_or(false)
+    }
+}
+
 /// Cached parse result for an open document (updated on every didChange).
 pub(crate) struct CachedParse {
     pub(crate) ast: Vec<sema_core::Value>,
@@ -359,12 +374,25 @@ impl BackendState {
 
     /// Get or refresh the cached parse result for an imported file.
     pub(crate) fn get_import_cache(&mut self, path: &Path) -> Option<&ImportCache> {
-        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+        // One canonical key per file: import resolution yields un-normalized
+        // paths (`a/../lib.sema`), and clients may address a file through a
+        // symlinked root; distinct keys for the same file would duplicate
+        // results in every handler that iterates this map.
+        let path = canonicalize_or_raw(path);
+        let mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+            Ok(mtime) => mtime,
+            Err(_) => {
+                // File deleted or unreadable — drop any stale entry so the
+                // iterating handlers stop seeing it.
+                self.import_cache.remove(&path);
+                return None;
+            }
+        };
 
         // Check if cache is still valid
-        if let Some(cached) = self.import_cache.get(path) {
+        if let Some(cached) = self.import_cache.get(&path) {
             if cached.mtime == mtime {
-                return self.import_cache.get(path);
+                return self.import_cache.get(&path);
             }
         }
 
@@ -382,15 +410,24 @@ impl BackendState {
             }
         }
 
-        // Read and parse the file
-        let text = std::fs::read_to_string(path).ok()?;
-        let (ast, span_map, symbol_spans) = sema_reader::read_many_with_symbol_spans(&text).ok()?;
+        // Read and parse the file. On failure, drop any previously cached
+        // entry: it describes content that is gone, and serving it to the
+        // iterating handlers would point them at stale offsets.
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            self.import_cache.remove(&path);
+            return None;
+        };
+        let Ok((ast, span_map, symbol_spans)) = sema_reader::read_many_with_symbol_spans(&text)
+        else {
+            self.import_cache.remove(&path);
+            return None;
+        };
         // Drop quoted (data) symbol occurrences (see filter_quoted_symbol_spans).
         let symbol_spans = filter_quoted_symbol_spans(&ast, &span_map, symbol_spans);
         let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
 
         self.import_cache.insert(
-            path.to_path_buf(),
+            path.clone(),
             ImportCache {
                 ast,
                 span_map,
@@ -400,7 +437,7 @@ impl BackendState {
                 mtime,
             },
         );
-        self.import_cache.get(path)
+        self.import_cache.get(&path)
     }
 
     /// Index every top-level definition across open documents: name → (uri, form range, name range).

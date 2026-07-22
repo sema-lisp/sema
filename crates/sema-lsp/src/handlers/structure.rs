@@ -73,14 +73,16 @@ impl BackendState {
     pub(crate) fn handle_workspace_symbols(&self, query: &str) -> Vec<SymbolInformation> {
         let mut results = Vec::new();
         let query_lower = query.to_lowercase();
-        let mut searched_uris: HashSet<String> = HashSet::new();
+        let mut searched_paths: HashSet<PathBuf> = HashSet::new();
 
         for (doc_uri_str, cached) in &self.cached_parses {
             let doc_uri = match Url::parse(doc_uri_str) {
                 Ok(u) => u,
                 Err(_) => continue,
             };
-            searched_uris.insert(doc_uri_str.clone());
+            if let Ok(doc_path) = doc_uri.to_file_path() {
+                searched_paths.insert(canonicalize_or_raw(&doc_path));
+            }
 
             let doc_lines: Vec<&str> = self
                 .documents
@@ -111,16 +113,21 @@ impl BackendState {
             }
         }
 
-        // Also search workspace files not currently open (import_cache)
+        // Also search workspace files not currently open (import_cache).
+        // Skip files already returned via cached_parses — by canonical path,
+        // since one file may be addressed under several spellings — and
+        // entries whose on-disk file changed or vanished since the scan.
         for (path, import_cached) in &self.import_cache {
+            if searched_paths.contains(&canonicalize_or_raw(path)) {
+                continue;
+            }
+            if !import_cached.is_fresh(path) {
+                continue;
+            }
             let import_uri = match Url::from_file_path(path) {
                 Ok(u) => u,
                 Err(_) => continue,
             };
-            // Skip files already returned via cached_parses
-            if searched_uris.contains(import_uri.as_str()) {
-                continue;
-            }
 
             let import_lines: Vec<&str> = import_cached.source.lines().collect();
             let symbols = document_symbols_from_ast(
@@ -743,7 +750,9 @@ impl BackendState {
                     Some(p) if p.exists() => p,
                     _ => continue,
                 };
-                if let Some(import_cached) = import_cache.get(&resolved) {
+                // Cache keys are canonical paths (see get_import_cache);
+                // resolve_import_path may yield an un-normalized spelling.
+                if let Some(import_cached) = import_cache.get(&canonicalize_or_raw(&resolved)) {
                     if let Some(params_str) = extract_params_from_ast(&import_cached.ast, func_name)
                     {
                         let names = parse_param_names(&params_str);

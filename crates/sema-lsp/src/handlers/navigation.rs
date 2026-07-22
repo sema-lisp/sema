@@ -87,7 +87,7 @@ impl BackendState {
         // treat top-level symbols as workspace-global. Without this, a
         // definition in a sibling file that is not explicitly imported is
         // unreachable even though the scan has already parsed it.
-        let mut searched_uris = std::collections::HashSet::new();
+        let mut searched_paths = std::collections::HashSet::new();
         let mut locations = Vec::new();
 
         for (doc_uri_str, cached) in &self.cached_parses {
@@ -95,7 +95,9 @@ impl BackendState {
                 Ok(u) => u,
                 Err(_) => continue,
             };
-            searched_uris.insert(doc_uri_str.clone());
+            if let Ok(doc_path) = doc_uri.to_file_path() {
+                searched_paths.insert(canonicalize_or_raw(&doc_path));
+            }
             let doc_lines: Vec<&str> = cached.source.lines().collect();
             let defs = user_definitions_from_ast(
                 &cached.ast,
@@ -116,15 +118,20 @@ impl BackendState {
         }
 
         // Files known only from the workspace scan (import_cache); skip files
-        // already covered above via their open-document parse.
+        // already covered above via their open-document parse — by canonical
+        // path, since one file may be addressed under several spellings —
+        // and entries whose on-disk file changed or vanished since the scan.
         for (path, import_cached) in &self.import_cache {
+            if searched_paths.contains(&canonicalize_or_raw(path)) {
+                continue;
+            }
+            if !import_cached.is_fresh(path) {
+                continue;
+            }
             let import_uri = match Url::from_file_path(path) {
                 Ok(u) => u,
                 Err(_) => continue,
             };
-            if searched_uris.contains(import_uri.as_str()) {
-                continue;
-            }
             let import_lines: Vec<&str> = import_cached.source.lines().collect();
             let defs = user_definitions_from_ast(
                 &import_cached.ast,
@@ -203,14 +210,16 @@ impl BackendState {
         // Top-level/global symbol — search all open documents, but skip
         // occurrences that are shadowed by local bindings in each document.
         let mut locations = Vec::new();
-        let mut searched_uris = std::collections::HashSet::new();
+        let mut searched_paths = std::collections::HashSet::new();
 
         for (doc_uri_str, cached) in &self.cached_parses {
             let doc_uri = match Url::parse(doc_uri_str) {
                 Ok(u) => u,
                 Err(_) => continue,
             };
-            searched_uris.insert(doc_uri_str.clone());
+            if let Ok(doc_path) = doc_uri.to_file_path() {
+                searched_paths.insert(canonicalize_or_raw(&doc_path));
+            }
             let doc_lines: Vec<&str> = self
                 .documents
                 .get(doc_uri_str)
@@ -233,16 +242,21 @@ impl BackendState {
             }
         }
 
-        // Also search workspace files not currently open (import_cache)
+        // Also search workspace files not currently open (import_cache).
+        // Skip files already searched via cached_parses — by canonical path,
+        // since one file may be addressed under several spellings — and
+        // entries whose on-disk file changed or vanished since the scan.
         for (path, import_cached) in &self.import_cache {
+            if searched_paths.contains(&canonicalize_or_raw(path)) {
+                continue;
+            }
+            if !import_cached.is_fresh(path) {
+                continue;
+            }
             let import_uri = match Url::from_file_path(path) {
                 Ok(u) => u,
                 Err(_) => continue,
             };
-            // Skip files already searched via cached_parses
-            if searched_uris.contains(import_uri.as_str()) {
-                continue;
-            }
             let import_lines: Vec<&str> = import_cached.source.lines().collect();
             for (name, span) in &import_cached.symbol_spans {
                 if name != symbol {
@@ -433,14 +447,16 @@ impl BackendState {
 
         // Top-level/global symbol — rename across all documents,
         // but skip occurrences shadowed by local bindings.
-        let mut searched_uris = std::collections::HashSet::new();
+        let mut searched_paths = std::collections::HashSet::new();
 
         for (doc_uri_str, cached) in &self.cached_parses {
             let doc_uri = match Url::parse(doc_uri_str) {
                 Ok(u) => u,
                 Err(_) => continue,
             };
-            searched_uris.insert(doc_uri_str.clone());
+            if let Ok(doc_path) = doc_uri.to_file_path() {
+                searched_paths.insert(canonicalize_or_raw(&doc_path));
+            }
             let doc_lines: Vec<&str> = self
                 .documents
                 .get(doc_uri_str)
@@ -465,15 +481,24 @@ impl BackendState {
             }
         }
 
-        // Also rename in workspace files not currently open (import_cache)
+        // Also rename in workspace files not currently open (import_cache).
+        // Skip files already renamed via cached_parses — by canonical path,
+        // since one file may be addressed under several spellings (duplicate
+        // edits for one file would each be applied, corrupting it) — and
+        // entries whose on-disk file changed or vanished since the scan:
+        // their stale offsets would corrupt the file too, so missing that
+        // file is the safe behavior.
         for (path, import_cached) in &self.import_cache {
+            if searched_paths.contains(&canonicalize_or_raw(path)) {
+                continue;
+            }
+            if !import_cached.is_fresh(path) {
+                continue;
+            }
             let import_uri = match Url::from_file_path(path) {
                 Ok(u) => u,
                 Err(_) => continue,
             };
-            if searched_uris.contains(import_uri.as_str()) {
-                continue;
-            }
             let import_lines: Vec<&str> = import_cached.source.lines().collect();
             let mut edits = Vec::new();
             for (name, span) in &import_cached.symbol_spans {

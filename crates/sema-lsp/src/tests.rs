@@ -1407,6 +1407,21 @@ fn arg_positions_with_comment() {
     assert_eq!(positions[1], (1, 2)); // 'b'
 }
 
+#[test]
+fn arg_positions_after_astral_char_on_line() {
+    // The scan works in bytes (char_indices); the span's boundary columns
+    // count chars. With a 🎉 (4 UTF-8 bytes, 1 char) before the nested form,
+    // an unconverted boundary makes the scan start inside the string literal
+    // and desync its string-state machine, dropping every argument position.
+    let text = "(fmt \"🎉\" (add 1 2))";
+    let lines: Vec<&str> = text.lines().collect();
+    // Inner `(add 1 2)`: `(` at char col 10, one-past-`)` at char col 19.
+    let span = sema_core::Span::new(1, 10, 1, 19);
+    let positions = find_arg_positions_in_form(&span, &lines, 2);
+    // `1` at byte 17, `2` at byte 19.
+    assert_eq!(positions, vec![(0, 17), (0, 19)]);
+}
+
 // ── top_level_ranges ─────────────────────────────────────────
 
 #[test]
@@ -1643,6 +1658,36 @@ fn inlay_hint_arg_position_uses_utf16_after_emoji() {
         b_hint.position.character, 8,
         "arg position must be a UTF-16 column, not a byte offset"
     );
+}
+
+// Inlay parameter hints must survive astral chars in an earlier argument:
+// the argument scan compares byte offsets from `char_indices` against the
+// form span's boundary columns, which count chars — the byte overshoot from
+// the astral chars made the scan break before reaching the later arguments.
+#[test]
+fn inlay_hints_survive_astral_chars_in_earlier_argument() {
+    let src = "(defun f (a b) a)\n(f \"🎉🎉\" x)";
+    let (mut state, uri) = parsed_state("file:///inlay2.sema", src);
+    let full = Range {
+        start: Position {
+            line: 0,
+            character: 0,
+        },
+        end: Position {
+            line: 10,
+            character: 0,
+        },
+    };
+    let hints = state
+        .handle_inlay_hints(&uri, &full)
+        .expect("hints for the (f ...) call");
+    let b_hint = hints
+        .iter()
+        .find(|h| matches!(&h.label, InlayHintLabel::String(s) if s == "b:"))
+        .expect("expected a `b:` inlay hint for the argument after the 🎉🎉 string");
+    assert_eq!(b_hint.position.line, 1);
+    // `x` is at UTF-16 column 10 (each 🎉 counts as 2 units).
+    assert_eq!(b_hint.position.character, 10);
 }
 
 // LSP-2: semantic-token length must be in UTF-16 code units. A user-defined

@@ -864,6 +864,36 @@ TLS remains (handled in C4).
 
 ### Commit C4 — LLM residual scope + accounting proof (closes C07A, C08, C10, C07D)
 
+**Landed 2026-07-22.** The two residual ambient TLS scopes moved into `LlmDynScope`
+(one field + read/write line each, per the `eec95fb4` pattern): `CUSTOM_PRICING`
+(`pricing.rs`) is a TASK-SNAPSHOT `custom_pricing` field (snapshot/restore via new
+`pricing::{snapshot_custom_pricing,restore_custom_pricing,custom_pricing_is_empty}`) so a
+sibling's `(llm/set-pricing …)` never reprices a suspended task, and the nested-budget
+save stack (`BUDGET_STACK`) is a TASK-PRIVATE `budget_stack` field so interleaved nested
+`llm/with-budget` scopes each restore their own outer frame out of LIFO order (the active
+`budget` frame stays `Rc`-shared, `capture_llm_scope` resets a spawned child's stack).
+Both are added to the empty-scope fast-path predicates. The sync-only provider offload
+(`complete_once_async`, the `complete_future == None` fallback) now takes a bounded per-job
+deadline resolved pre-dispatch from `request.timeout_ms` (`sync_only_offload_deadline_ms`,
+defaulted 5 min / clamped 10 min): on elapse the awaiting future is dropped with a
+non-retryable `Config` error while the orphaned blocking worker runs to completion — an
+explicit best-effort quarantine (no fake abort for a blocking-only API). The
+cancelled/discarded contract is sacrosanct: `track_usage` runs only in the VM-thread
+finalizer on resume, so a cancelled or deadline-abandoned completion charges nothing.
+Regression: `llm_root_nonblocking_test::{sibling_custom_pricing_change_does_not_reprice_suspended_task,
+interleaved_nested_budget_scopes_restore_their_own_frames}` (red on the ambient-TLS version)
+and `llm_fake_test::{cancelled_inflight_completion_charges_nothing,sync_only_provider_offload_enforces_a_deadline}`
+(FakeProvider — mandatory per AGENTS.md for accounting changes). Source guard: an
+`IO_BLOCK_ON` restricted token pins every provider/host `io_block_on` site to its exact
+per-file count in `scripts/unified-runtime-host-adapters.tsv` (openai 6, anthropic/gemini/
+ollama 3, embeddings 4, runtime_offload 2, http 1, ws 5, server 4, mcp/builtins 8,
+workflow_mcp 3, sema-io wrapper 1), and a quantum-reachable `io_block_on` fails both the
+restricted counter and the active-runtime scanner (`active-runtime-io-block-on.rs` fixture;
+`negated-runtime-io-block-on.rs` on the host arm passes with its own allowlist). **C07A,
+C08, C10 flipped to `MIGRATED (C4)` and C07D to `MIGRATED (C4, narrowed)`** in
+`docs/internals/async-runtime-inventory.md`; the `runtime-match-map.tsv` re-map and the
+`runtime_conformance_test` inventory reconciliation are the deferred C7 work and remain red.
+
 Landed (`eec95fb4` + Task 2): fallback/rate/retry/call-tag/last-usage state in
 `LlmDynScope` (TASK-SNAPSHOT/TASK-PRIVATE) with isolation regressions
 (`llm_root_nonblocking_test.rs`); pacing parks on `WaitKind::Timer`

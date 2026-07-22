@@ -322,6 +322,17 @@ struct LlmDynScope {
     network_max_retries: u32,
     /// The active budget frame, shared by `Rc` so concurrent siblings charge one aggregate.
     budget: Option<Rc<RefCell<BudgetFrame>>>,
+    /// Saved outer budget frames for nested `llm/with-budget` scopes (TASK-PRIVATE
+    /// bookkeeping). A push saves the frame in force; the matching pop restores it.
+    /// Parking this stack onto the task is what lets interleaved nested budget scopes
+    /// each restore their OWN outer frame — an ambient stack shared across suspensions
+    /// would pop a sibling's frame out of LIFO order. The saved frames are shared by
+    /// `Rc` (a restored outer frame is the same aggregate), but the stack structure is
+    /// per-task.
+    budget_stack: Vec<Option<Rc<RefCell<BudgetFrame>>>>,
+    /// Custom per-model pricing overrides (TASK-SNAPSHOT config). Parked onto the task so
+    /// a sibling's `(llm/set-pricing ...)` never reprices a suspended task's usage.
+    custom_pricing: std::collections::HashMap<String, (f64, f64)>,
     /// The cassette selected by this scope. Spawned siblings share one tape so
     /// replay and recording remain coherent across quantum boundaries.
     cassette: Option<CassetteScope>,
@@ -342,6 +353,8 @@ impl Default for LlmDynScope {
             retry_base_ms: 500,
             network_max_retries: 3,
             budget: None,
+            budget_stack: Vec::new(),
+            custom_pricing: std::collections::HashMap::new(),
             cassette: None,
         }
     }
@@ -362,6 +375,8 @@ fn read_llm_scope() -> LlmDynScope {
         retry_base_ms: RETRY_BASE_MS.with(|base| base.get()),
         network_max_retries: NETWORK_MAX_RETRIES.with(|retries| retries.get()),
         budget: ACTIVE_BUDGET.with(|b| b.borrow().clone()),
+        budget_stack: BUDGET_STACK.with(|s| s.borrow().clone()),
+        custom_pricing: pricing::snapshot_custom_pricing(),
         cassette: CASSETTE.with(|c| c.borrow().clone()),
     }
 }
@@ -381,6 +396,8 @@ fn write_llm_scope(s: LlmDynScope) -> LlmDynScope {
     RETRY_BASE_MS.with(|base| base.set(s.retry_base_ms));
     NETWORK_MAX_RETRIES.with(|retries| retries.set(s.network_max_retries));
     ACTIVE_BUDGET.with(|b| *b.borrow_mut() = s.budget);
+    BUDGET_STACK.with(|stack| *stack.borrow_mut() = s.budget_stack);
+    pricing::restore_custom_pricing(s.custom_pricing);
     CASSETTE.with(|c| *c.borrow_mut() = s.cassette);
     prev
 }
@@ -391,6 +408,11 @@ fn capture_llm_scope() -> Box<dyn std::any::Any> {
     // `last-usage` describes the most recent request made by this task. A new
     // task inherits dynamic configuration, but starts without request history.
     scope.last_usage = None;
+    // The budget save-stack is TASK-PRIVATE lexical bookkeeping: a child inherits the
+    // ACTIVE budget frame (`budget`, shared by `Rc`, so a fan-out charges one aggregate)
+    // but starts its own nesting fresh — like `last_usage`, its own `with-budget` scopes
+    // push/pop against an empty stack.
+    scope.budget_stack = Vec::new();
     Box::new(scope)
 }
 
@@ -424,6 +446,8 @@ fn llm_scope_captured_is_empty(ctx: &Box<dyn std::any::Any>) -> bool {
 fn llm_scope_ambient_is_empty() -> bool {
     !CACHE_ENABLED.with(Cell::get)
         && !ACTIVE_BUDGET.with(|b| b.borrow().is_some())
+        && BUDGET_STACK.with(|s| s.borrow().is_empty())
+        && pricing::custom_pricing_is_empty()
         && CALL_TAGS.with(|t| t.borrow().is_empty())
         && CALL_META.with(|m| m.borrow().is_empty())
         && LAST_USAGE.with(|u| u.borrow().is_none())
@@ -443,6 +467,8 @@ fn llm_scope_ambient_is_empty() -> bool {
 fn llm_dyn_scope_is_default(s: &LlmDynScope) -> bool {
     !s.cache_enabled
         && s.budget.is_none()
+        && s.budget_stack.is_empty()
+        && s.custom_pricing.is_empty()
         && s.cassette.is_none()
         && s.call_tags.is_empty()
         && s.call_meta.is_empty()
@@ -9608,13 +9634,40 @@ struct CompleteOutcome {
     retry_events: Vec<RetryEvent>,
 }
 
+/// Default per-job deadline (ms) for the sync-only provider blocking offload when the
+/// request carries no explicit `:timeout`.
+#[cfg(not(target_arch = "wasm32"))]
+const SYNC_ONLY_DEFAULT_TIMEOUT_MS: u64 = 300_000; // 5 minutes
+/// Hard ceiling (ms) clamped over any caller-supplied `:timeout` for the sync-only
+/// blocking offload, so a blocking `complete()` with no interrupt handle can never
+/// occupy a worker unbounded.
+#[cfg(not(target_arch = "wasm32"))]
+const SYNC_ONLY_MAX_TIMEOUT_MS: u64 = 600_000; // 10 minutes
+
+/// Resolve the sync-only blocking offload's per-job deadline BEFORE dispatch: a positive
+/// caller `:timeout` (`request.timeout_ms`) is honored up to the hard ceiling; anything
+/// missing or zero falls back to the default. The result is always finite, so an
+/// unbounded blocking `complete()` is unrepresentable.
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_only_offload_deadline_ms(timeout_ms: Option<u64>) -> u64 {
+    timeout_ms
+        .filter(|&ms| ms > 0)
+        .unwrap_or(SYNC_ONLY_DEFAULT_TIMEOUT_MS)
+        .min(SYNC_ONLY_MAX_TIMEOUT_MS)
+}
+
 /// One completion attempt for the async wire stage. Providers with a native
 /// async path (`complete_future`) are awaited in-place inside the spawned pool
 /// future — aborting the task drops the in-flight request (TRUE cancellation,
 /// connection torn down). Sync-only providers (the `complete_future` default —
 /// e.g. the FakeProvider test double) fall back to an admission-controlled
-/// blocking offload, where cancellation stays best-effort (result discarded,
-/// call runs to completion on the worker).
+/// blocking offload under a bounded per-job deadline
+/// ([`sync_only_offload_deadline_ms`], resolved pre-dispatch). Cancellation on this
+/// arm is explicitly a BEST-EFFORT QUARANTINE: a provider that exposes only a blocking
+/// API has no interrupt handle, so on cancel or deadline the awaiting future is dropped
+/// and the result discarded (never charged — `track_usage` runs only in the VM-thread
+/// finalizer on resume) while the orphaned worker runs to completion on its own. There
+/// is no fake abort.
 #[cfg(not(target_arch = "wasm32"))]
 async fn complete_once_async(
     provider: &std::sync::Arc<dyn LlmProvider>,
@@ -9623,9 +9676,24 @@ async fn complete_once_async(
     match provider.complete_future(request.clone()) {
         Some(fut) => fut.await,
         None => {
+            let deadline = std::time::Duration::from_millis(sync_only_offload_deadline_ms(
+                request.timeout_ms,
+            ));
             let p = provider.clone();
             let req = request.clone();
-            sema_io::io_offload_blocking(move || p.complete(req)).await
+            match tokio::time::timeout(deadline, sema_io::io_offload_blocking(move || p.complete(req)))
+                .await
+            {
+                Ok(result) => result,
+                // Fail fast on the deadline (a non-retryable Config error): retrying a
+                // purely-blocking API we cannot interrupt would only strand more workers.
+                Err(_elapsed) => Err(crate::types::LlmError::Config(format!(
+                    "sync-only provider blocking call exceeded its {} ms deadline \
+                     (best-effort quarantine: the result is discarded and never charged; \
+                     the orphaned worker runs to completion on its own)",
+                    deadline.as_millis()
+                ))),
+            }
         }
     }
 }

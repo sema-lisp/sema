@@ -1064,3 +1064,102 @@ fn agent_run_preserves_tool_correlation_across_turns() {
         "the re-sent tool result must keep its tool name"
     );
 }
+
+/// Accounting invariant (AGENTS.md, C4): a cancelled/discarded completion charges
+/// NOTHING. A native sync-only completion is IN FLIGHT on the blocking tier (`chat_delay`
+/// keeps the worker busy); a sibling cancels the parked task before the worker returns.
+/// `track_usage` runs only in the VM-thread finalizer on resume, and a cancelled task
+/// never resumes — so session usage stays zero even after the orphaned worker finishes.
+#[test]
+fn cancelled_inflight_completion_charges_nothing() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .chat_delay(200)
+        .reply_with_usage("late", 1000, 500)
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (define pending (async/spawn (fn () (llm/complete "in-flight"))))
+            (async/spawn (fn () (sleep 20) (async/cancel pending)))
+            (define outcome (try (async/await pending) (catch e :cancelled)))
+            ;; Wait past the provider's in-flight delay so the orphaned worker has
+            ;; certainly finished — its discarded result must STILL not be charged.
+            (sleep 300)
+            (list outcome
+                  (:total-tokens (llm/session-usage))
+                  (:cost-usd (llm/session-usage)))
+            "#,
+        )
+        .expect("in-flight completion is cancellable");
+
+    let items = value.as_list().expect("cancel outcome + usage");
+    assert_eq!(items[0], Value::keyword("cancelled"));
+    assert_eq!(
+        items[1].as_int(),
+        Some(0),
+        "a cancelled in-flight completion must charge no tokens"
+    );
+    assert_eq!(
+        items[2].as_float(),
+        Some(0.0),
+        "a cancelled in-flight completion must charge no cost"
+    );
+    assert_eq!(
+        recorder.call_count(),
+        1,
+        "the provider was dispatched exactly once (its result discarded)"
+    );
+}
+
+/// A sync-only provider (no `complete_future` — only a blocking `complete()`) is offloaded
+/// under a bounded per-job deadline resolved pre-dispatch from `:timeout` (C4). A blocking
+/// call that outlives the deadline is abandoned promptly with an error rather than parking
+/// the task for the whole call: the deadline is a real bound, and the orphaned worker is a
+/// best-effort quarantine (its result is discarded, never charged). Without the deadline
+/// the call would return the provider's late reply after the full 2s `chat_delay`.
+#[test]
+fn sync_only_provider_offload_enforces_a_deadline() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .chat_delay(2000)
+        .reply_with_usage("too-late", 1000, 500)
+        .build();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let started = std::time::Instant::now();
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (try (llm/complete "slow" {:timeout 60}) (catch e :deadline))
+            "#,
+        )
+        .expect("a sync-only completion is bounded by its deadline");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        value,
+        Value::keyword("deadline"),
+        "the bounded deadline must fire instead of returning the late reply"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(1500),
+        "the deadline (60ms) must settle the call well before the 2s chat delay; got {elapsed:?}"
+    );
+    // The abandoned completion never reaches the finalizer, so nothing is charged.
+    let usage = interp
+        .eval_str_compiled(r#"(:total-tokens (llm/session-usage))"#)
+        .expect("session usage is readable");
+    assert_eq!(
+        usage.as_int(),
+        Some(0),
+        "a deadline-abandoned completion must charge nothing"
+    );
+}

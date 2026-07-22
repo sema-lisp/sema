@@ -37,3 +37,19 @@ HOST_OUTPUT_HOOK	crates/sema-wasm/src/lib.rs	2	wasm host installs inert no-op st
 HOST_OUTPUT_HOOK	crates/sema-dap/src/server.rs	4	DAP redirects program stdout/stderr into Output events (install + clear) so prints do not corrupt the JSON-RPC protocol stream
 HOST_OUTPUT_HOOK	crates/sema-mcp/src/tools.rs	4	MCP eval_with_capture buffers program output (install + clear) so it stays out of the protocol stream
 HOST_OUTPUT_HOOK	crates/sema-eval/src/debug_session.rs	2	debug-session stderr capture test helper (install + clear)
+# IO_BLOCK_ON (C07D): every host-only block-on adapter, pinned per file. Legal ONLY off an
+# active runtime quantum — on a plain host/VM thread or inside a pool blocking/reactor
+# worker; the runtime path suspends on an External wait instead. A quantum-reachable
+# io_block_on additionally trips the active-runtime scanner (see the io-block-on fixtures).
+IO_BLOCK_ON	crates/sema-io/src/lib.rs	1	the io_block_on public wrapper that forwards to the core host-only block-on adapter
+IO_BLOCK_ON	crates/sema-llm/src/anthropic.rs	3	sync LlmProvider impl (complete/stream/embed) drives reqwest off the quantum; the runtime path offloads via complete_future/interruptible_async
+IO_BLOCK_ON	crates/sema-llm/src/openai.rs	6	sync LlmProvider impl (complete with two sequential 400-compat retries, stream, embed) drives reqwest off the quantum
+IO_BLOCK_ON	crates/sema-llm/src/gemini.rs	3	sync LlmProvider impl (complete/stream/embed) drives reqwest off the quantum
+IO_BLOCK_ON	crates/sema-llm/src/ollama.rs	3	sync LlmProvider impl (complete/stream/embed) drives reqwest off the quantum
+IO_BLOCK_ON	crates/sema-llm/src/embeddings.rs	4	sync embed/rerank provider impls drive reqwest off the quantum
+IO_BLOCK_ON	crates/sema-stdlib/src/runtime_offload.rs	2	offload machinery drives its future via io_block_on on a plain executor worker (blocking tier), never the VM thread
+IO_BLOCK_ON	crates/sema-stdlib/src/http.rs	1	top-level synchronous http path on a host thread (non-quantum); runtime http suspends structurally
+IO_BLOCK_ON	crates/sema-stdlib/src/ws.rs	5	host synchronous websocket connect/send/recv/close on a host thread (non-quantum)
+IO_BLOCK_ON	crates/sema-stdlib/src/server.rs	4	host synchronous server request/response ops on a host thread (non-quantum)
+IO_BLOCK_ON	crates/sema-mcp/src/builtins.rs	8	host/worker MCP connection ops (connect/list-tools/call/close/login) driven off the VM thread on a plain worker
+IO_BLOCK_ON	crates/sema/src/workflow_mcp.rs	3	workflow MCP connect/refresh driven via io_block_on on a plain worker, off the VM thread

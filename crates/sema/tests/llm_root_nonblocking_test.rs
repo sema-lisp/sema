@@ -765,3 +765,121 @@ fn cache_and_cassette_do_no_filesystem_io_on_the_quantum() {
     );
     let _ = std::fs::remove_file(&cassette);
 }
+
+/// Custom pricing is TASK-SNAPSHOT config (C4): it is parked onto a suspended task via
+/// the LLM dynamic scope, so a sibling's `(llm/set-pricing ...)` cannot reprice work
+/// already recorded by a parked task. Task A prices its model expensively and parks;
+/// while parked, task B reprices the SAME model cheaply. When A resumes and reads its
+/// last-usage cost, it MUST reflect A's own (expensive) snapshot — not B's change. On
+/// the pre-C4 ambient-TLS pricing, A would read B's cheap price and this fails.
+#[test]
+#[serial]
+fn sibling_custom_pricing_change_does_not_reprice_suspended_task() {
+    let fake = FakeProvider::builder("fake").model("fake-chat").echo().build();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (let ((out (channel/new 2)))
+              (async/spawn
+                (fn ()
+                  (llm/set-pricing "fake-chat" 6000.0 12000.0)   ; A: expensive snapshot
+                  (llm/complete "a")                             ; records A's usage
+                  (sleep 40)                                     ; park while B reprices
+                  (channel/send out (list "a" (:cost-usd (llm/last-usage))))))
+              (async/spawn
+                (fn ()
+                  (sleep 15)
+                  (llm/set-pricing "fake-chat" 1.0 2.0)          ; B: cheap — A must not see it
+                  (llm/complete "b")
+                  (channel/send out (list "b" (:cost-usd (llm/last-usage))))))
+              (list (channel/recv out) (channel/recv out)))
+            "#,
+        )
+        .expect("custom pricing stays task-private across suspension");
+
+    let rows = value.as_list().expect("two task rows");
+    let row = |label: &str| {
+        rows.iter()
+            .find_map(|value| {
+                let values = value.as_list()?;
+                (values.first()?.as_str() == Some(label)).then_some(values)
+            })
+            .unwrap_or_else(|| panic!("missing result for {label}"))
+    };
+    // usage is (prompt=10, completion=5); A: (10*6000 + 5*12000)/1e6 = 0.12,
+    // B: (10*1 + 5*2)/1e6 = 0.00002.
+    let cost = |values: &[sema_core::Value]| values[1].as_float().expect("cost float");
+    assert!(
+        (cost(row("a")) - 0.12).abs() < 1e-9,
+        "task A must price with its OWN expensive snapshot; got {}",
+        cost(row("a"))
+    );
+    assert!(
+        (cost(row("b")) - 0.00002).abs() < 1e-9,
+        "task B prices with its own cheap snapshot; got {}",
+        cost(row("b"))
+    );
+}
+
+/// Nested `llm/with-budget` scopes keep their save-stack TASK-PRIVATE (C4). Two tasks
+/// each open an outer then an inner budget and park inside the inner while the sibling
+/// does the same, so their pushes interleave. When each inner scope tears down it must
+/// restore that task's OWN outer frame. On the pre-C4 ambient `BUDGET_STACK` the pops
+/// cross out of LIFO order and a task restores the wrong (or no) frame.
+#[test]
+#[serial]
+fn interleaved_nested_budget_scopes_restore_their_own_frames() {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (let ((out (channel/new 2)))
+              (async/spawn
+                (fn ()
+                  (llm/with-budget {:max-cost-usd 1.0}
+                    (fn ()
+                      (sleep 10)                                   ; let B enter its outer
+                      (llm/with-budget {:max-cost-usd 2.0}
+                        (fn () (sleep 40)))                        ; park in inner while B nests
+                      ;; inner popped: active frame must be A's OWN outer (1.0)
+                      (channel/send out (list "a" (:limit (llm/budget-remaining))))))))
+              (async/spawn
+                (fn ()
+                  (llm/with-budget {:max-cost-usd 10.0}
+                    (fn ()
+                      (sleep 20)                                   ; enter after A's outer
+                      (llm/with-budget {:max-cost-usd 20.0}
+                        (fn () (sleep 10)))                        ; B's inner pops while A parks
+                      (channel/send out (list "b" (:limit (llm/budget-remaining))))))))
+              (list (channel/recv out) (channel/recv out)))
+            "#,
+        )
+        .expect("nested budget scopes settle");
+
+    let rows = value.as_list().expect("two task rows");
+    let row = |label: &str| {
+        rows.iter()
+            .find_map(|value| {
+                let values = value.as_list()?;
+                (values.first()?.as_str() == Some(label)).then_some(values)
+            })
+            .unwrap_or_else(|| panic!("missing result for {label}"))
+    };
+    let limit = |values: &[sema_core::Value]| values[1].as_float().expect("budget limit float");
+    assert!(
+        (limit(row("a")) - 1.0).abs() < 1e-9,
+        "task A's inner teardown must restore A's outer budget (1.0); got {}",
+        limit(row("a"))
+    );
+    assert!(
+        (limit(row("b")) - 10.0).abs() < 1e-9,
+        "task B's inner teardown must restore B's outer budget (10.0); got {}",
+        limit(row("b"))
+    );
+}

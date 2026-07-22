@@ -134,10 +134,11 @@ expect_failure \
   IO_BLOCK_ON
 
 # The same adapter on the negated (`!in_runtime_quantum()`) host arm is the
-# sanctioned shape and must PASS.
+# sanctioned shape and must PASS — it is a counted host adapter, so it carries its
+# own exact-count IO_BLOCK_ON allowlist (as every retained provider/host site does).
 expect_success \
   "$fixtures/negated-runtime-io-block-on.rs" \
-  "$fixtures/empty-allowlist.tsv"
+  "$fixtures/negated-runtime-io-block-on-allowlist.tsv"
 
 # R08C: a raw blocking `std::io::stdin()` read inside an active-runtime branch
 # must fail — runtime code reads stdin through the coordinated owner, which parks

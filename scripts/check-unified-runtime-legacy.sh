@@ -68,6 +68,7 @@ restricted_tokens=(
   'SET_CALL_CALLBACK|\bset_call_callback[[:space:]]*\('
   'WORKFLOW_TLS|\bWORKFLOW\.with\b'
   'HOST_OUTPUT_HOOK|\bset_host_std(out|err)_hook[[:space:]]*\('
+  'IO_BLOCK_ON|\bio_block_on[[:space:]]*\('
 )
 
 # Exact-file allowlist (no globs). A purged identifier surviving here is a KNOWN,
@@ -295,6 +296,7 @@ check_restricted_paths() {
       valid["SET_CALL_OWNED_CALLBACK"] = 1
       valid["WORKFLOW_TLS"] = 1
       valid["HOST_OUTPUT_HOOK"] = 1
+      valid["IO_BLOCK_ON"] = 1
     }
     FILENAME == ARGV[1] {
       if ($0 ~ /^[[:space:]]*(#|$)/) next

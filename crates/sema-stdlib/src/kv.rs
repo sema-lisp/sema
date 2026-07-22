@@ -135,6 +135,35 @@ thread_local! {
     /// suite drives so an over-cap test needs neither a 64 MiB file nor a million
     /// keys — mirrors `sqlite::DB_RESULT_CAPS_OVERRIDE`.
     static KV_BOUNDS_OVERRIDE: Cell<Option<KvBounds>> = const { Cell::new(None) };
+    /// Whether this thread's interpreter has an interpreter-teardown hook wired
+    /// for the kv registry (C6) — see `proc.rs`'s `PROC_TEARDOWN_REGISTERED`.
+    static KV_TEARDOWN_REGISTERED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Register the interpreter-teardown hook for the kv registry against `ctx`
+/// exactly once per interpreter (C6). Called at `kv/open` so a store opened but
+/// never `kv/close`d is still released on interpreter drop.
+fn ensure_teardown_hook(ctx: &sema_core::EvalContext) {
+    if !KV_TEARDOWN_REGISTERED.with(|c| c.replace(true)) {
+        ctx.register_interpreter_teardown_hook(teardown_stores);
+    }
+}
+
+/// Interpreter-drop teardown for the kv registry (C6). Every store is
+/// write-through durable (each `kv/set`/`kv/delete` flushes the whole store to
+/// disk before it resolves), so dropping an `Available` slot loses nothing — no
+/// surprise (potentially unbounded) flush is performed on the drop path. A
+/// `CheckedOut` store is held by an offloaded flush worker (best-effort per R09A)
+/// and its slot is simply dropped. Gates are closed so any parked waiter fails
+/// fast.
+fn teardown_stores() {
+    KV_STORES.with(|s| s.borrow_mut().clear());
+    KV_GATES.with(|g| {
+        for (_, gate) in g.borrow_mut().drain() {
+            let _ = gate.close();
+        }
+    });
+    KV_TEARDOWN_REGISTERED.with(|c| c.set(false));
 }
 
 /// The effective store bounds for the current call: the module hard ceilings,
@@ -435,14 +464,18 @@ fn checkout_runtime<R: Send + 'static>(
 }
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
-    crate::register_runtime_fn_path_gated(
+    crate::register_runtime_fn_path_gated_ctx(
         env,
         sandbox,
         sema_core::Caps::FS_WRITE,
         "kv/open",
         &[1],
-        |args| {
+        |ctx, args| {
             check_arity!(args, "kv/open", 2);
+            // A store is about to enter the registry: wire the
+            // interpreter-teardown hook (idempotent) on the VM thread before the
+            // (possibly offloaded) read dispatches — the async decoder has no `ctx`.
+            ensure_teardown_hook(ctx);
             let name = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
@@ -789,5 +822,44 @@ mod tests {
         // Overwriting an existing key is admitted even at the item cap.
         check_item_cap("kv/set", name, &store, "a", bounds)
             .expect("overwriting an existing key at the item cap is admitted");
+    }
+
+    /// C6 guard: `ensure_teardown_hook` wires exactly one hook (idempotent), and
+    /// firing it clears the kv registry and resets the flag. An in-memory-only
+    /// store (a path under a scratch dir that is never written because no flush
+    /// runs on teardown) stands in for an open store.
+    #[test]
+    fn teardown_hook_registered_exactly_once_and_clears_registry() {
+        let ctx = sema_core::EvalContext::new();
+        KV_STORES.with(|s| s.borrow_mut().clear());
+        KV_TEARDOWN_REGISTERED.with(|c| c.set(false));
+
+        KV_STORES.with(|s| {
+            s.borrow_mut().insert(
+                "guard-store".to_string(),
+                KvSlot::Available(KvStore {
+                    path: "/definitely/not/written".to_string(),
+                    data: serde_json::Map::new(),
+                }),
+            )
+        });
+
+        assert!(!KV_TEARDOWN_REGISTERED.with(Cell::get));
+        ensure_teardown_hook(&ctx);
+        assert!(
+            KV_TEARDOWN_REGISTERED.with(Cell::get),
+            "ensure_teardown_hook must register the interpreter hook"
+        );
+        ensure_teardown_hook(&ctx); // second call is a no-op
+
+        assert!(ctx.try_run_interpreter_teardown_hooks());
+        assert!(
+            KV_STORES.with(|s| s.borrow().is_empty()),
+            "teardown must clear the kv registry"
+        );
+        assert!(
+            !KV_TEARDOWN_REGISTERED.with(Cell::get),
+            "teardown must reset the hook flag so a fresh interpreter re-registers"
+        );
     }
 }

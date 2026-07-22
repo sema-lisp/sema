@@ -6551,6 +6551,141 @@ fn interpreter_drop_stops_live_spinner_threads() {
     );
 }
 
+// C6 (closes ledger row C14): the KV/serial/SQLite registries are per-thread TLS
+// maps. Before the interpreter-teardown hooks they survived an interpreter drop,
+// so a store/connection opened but never closed leaked across the drop — a fresh
+// interpreter on the same thread observed the stale resource. With the hooks, the
+// dropped interpreter's teardown closes the Available slots (dropping the store /
+// connection) and closes their gates, so a fresh same-thread interpreter starts
+// clean. (Serial needs real hardware to open, so its teardown is proven by
+// `serial::tests::teardown_hook_registered_exactly_once_and_clears_registry`;
+// KV + SQLite are exercised end-to-end here.)
+#[test]
+fn interpreter_drop_closes_kv_serial_sqlite_slots_and_gates() {
+    let kv_path = std::env::temp_dir().join(format!(
+        "sema-c6-kv-{}-{:?}.json",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&kv_path);
+
+    // Interpreter A opens a kv store and an in-memory SQLite db, then is dropped
+    // without ever calling kv/close or db/close.
+    {
+        let interp = Interpreter::new();
+        let program = format!(
+            r#"(begin
+                 (kv/open "c6store" "{kv}")
+                 (kv/set "c6store" "k" 1)
+                 (db/open-memory "c6db")
+                 (db/exec-batch "c6db" "CREATE TABLE t (v INTEGER)")
+                 (list (kv/get "c6store" "k") (db/tables "c6db")))"#,
+            kv = kv_path.display()
+        );
+        let opened = interp
+            .eval_str_compiled(&program)
+            .expect("A opens a kv store and a sqlite db");
+        let parts = opened.as_list().expect("result list");
+        assert_eq!(parts[0].as_int(), Some(1), "store must be usable before drop");
+        assert_eq!(
+            parts[1].as_list().map(|l| l.len()),
+            Some(1),
+            "db must be usable before drop"
+        );
+        drop(interp); // teardown closes both registries on this thread
+    }
+
+    // Interpreter B on the SAME thread must not observe A's leaked resources.
+    {
+        let interp = Interpreter::new();
+        let kv_err = interp
+            .eval_str_compiled(r#"(kv/get "c6store" "k")"#)
+            .expect_err("A's kv store must not survive A's interpreter drop");
+        assert!(
+            kv_err.to_string().contains("not open"),
+            "expected a closed-store error, got: {kv_err}"
+        );
+        let db_err = interp
+            .eval_str_compiled(r#"(db/tables "c6db")"#)
+            .expect_err("A's sqlite db must not survive A's interpreter drop");
+        assert!(
+            db_err.to_string().contains("no open database"),
+            "expected a closed-db error, got: {db_err}"
+        );
+    }
+
+    let _ = std::fs::remove_file(&kv_path);
+}
+
+// C6 two-interpreter isolation: interpreter teardown operates on the dropping
+// thread's registry only. Interpreter B runs on its own thread with a kv store
+// keyed by the same name as interpreter A's; dropping A on the main thread must
+// leave B's store intact. Every cross-thread wait is bounded so the test can
+// never hang.
+#[test]
+fn interpreter_drop_does_not_disturb_another_thread_registry() {
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    let pid = std::process::id();
+    let path_b = std::env::temp_dir().join(format!("sema-c6-iso-b-{pid}.json"));
+    let _ = std::fs::remove_file(&path_b);
+
+    let (b_ready_tx, b_ready_rx) = channel::<()>();
+    let (proceed_tx, proceed_rx) = channel::<()>();
+    let (b_result_tx, b_result_rx) = channel::<Option<i64>>();
+
+    let path_b_thread = path_b.clone();
+    let thread_b = std::thread::spawn(move || {
+        let interp = Interpreter::new();
+        let program = format!(
+            r#"(begin (kv/open "shared" "{p}") (kv/set "shared" "k" 42) :ok)"#,
+            p = path_b_thread.display()
+        );
+        interp.eval_str_compiled(&program).expect("B opens its store");
+        b_ready_tx.send(()).expect("signal B ready");
+        proceed_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("main thread proceeded");
+        // A's drop on the main thread must not have touched B's thread-local store.
+        let value = interp
+            .eval_str_compiled(r#"(kv/get "shared" "k")"#)
+            .expect("B's store is still open");
+        b_result_tx.send(value.as_int()).expect("send B result");
+        drop(interp);
+    });
+
+    b_ready_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("B became ready");
+
+    // Interpreter A opens+drops a store under the SAME name on the main thread.
+    {
+        let path_a = std::env::temp_dir().join(format!("sema-c6-iso-a-{pid}.json"));
+        let _ = std::fs::remove_file(&path_a);
+        let interp = Interpreter::new();
+        let program = format!(
+            r#"(begin (kv/open "shared" "{p}") (kv/set "shared" "k" 7) :ok)"#,
+            p = path_a.display()
+        );
+        interp.eval_str_compiled(&program).expect("A opens its store");
+        drop(interp); // clears the MAIN thread's registry only
+        let _ = std::fs::remove_file(&path_a);
+    }
+
+    proceed_tx.send(()).expect("release B");
+    let b_value = b_result_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("B reported its store value");
+    thread_b.join().expect("thread B joined");
+    assert_eq!(
+        b_value,
+        Some(42),
+        "interpreter A's drop must not disturb interpreter B's registry on another thread"
+    );
+    let _ = std::fs::remove_file(&path_b);
+}
+
 // Regression tests: deftool params stored as BTreeMap (alphabetical keys).
 // Lambda handlers must receive args in declaration order, not alphabetical.
 // The actual json_args_to_sema ordering fix is tested via unit tests in

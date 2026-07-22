@@ -71,6 +71,45 @@ thread_local! {
     /// offloaded op and reused for later ops (dropped on `pty/close`). The gate
     /// provides FIFO mutual exclusion for the checkout slot.
     static PTY_GATES: RefCell<HashMap<i64, ResourceGateHandle>> = RefCell::new(HashMap::new());
+    /// Whether this thread's interpreter has an interpreter-teardown hook wired
+    /// for the pty registry (C6) — see `proc.rs`'s `PROC_TEARDOWN_REGISTERED`.
+    static PTY_TEARDOWN_REGISTERED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Register the interpreter-teardown hook for the pty registry against `ctx`
+/// exactly once per interpreter (C6) — see `proc.rs`'s `ensure_teardown_hook`
+/// (identical design, just for `Pty`). Called at `pty/spawn` so a pty child
+/// spawned but never `pty/wait`ed/`pty/close`d is still reaped on drop.
+fn ensure_teardown_hook(ctx: &sema_core::EvalContext) {
+    if !PTY_TEARDOWN_REGISTERED.with(|c| c.replace(true)) {
+        ctx.register_interpreter_teardown_hook(teardown_ptys);
+    }
+}
+
+/// Interpreter-drop teardown for the pty registry (C6) — see `proc.rs`'s
+/// `teardown_procs`. Every `Available` slot's child is SIGKILLed by process group
+/// via the existing group-kill machinery (the pty child is its own
+/// session/group leader) and reaped with a bounded `wait()`; dropping the `Pty`
+/// closes the master and detaches the reader thread (EOF exits it). `CheckedOut`
+/// slots hold no child. Gates are closed so any parked waiter fails fast.
+fn teardown_ptys() {
+    let slots: Vec<PtySlot> =
+        PTYS.with(|p| p.borrow_mut().drain().map(|(_, slot)| slot).collect());
+    for slot in slots {
+        if let PtySlot::Available(mut pty) = slot {
+            if let Some(pid) = pty.child.process_id() {
+                group_sigkill_abort(pid)();
+            }
+            let _ = pty.child.kill();
+            let _ = pty.child.wait();
+        }
+    }
+    PTY_GATES.with(|g| {
+        for (_, gate) in g.borrow_mut().drain() {
+            let _ = gate.close();
+        }
+    });
+    PTY_TEARDOWN_REGISTERED.with(|c| c.set(false));
 }
 
 /// Take `id`'s pty out of its slot once its gate is owned, marking the slot
@@ -169,7 +208,7 @@ fn with_pty<R>(
     })
 }
 
-fn spawn(args: &[Value]) -> Result<Value, SemaError> {
+fn spawn(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "pty/spawn", 1..=2);
     let argv = args[0]
         .as_list()
@@ -243,6 +282,9 @@ fn spawn(args: &[Value]) -> Result<Value, SemaError> {
         n.set(id + 1);
         id
     });
+    // A live pty child now enters the registry: wire the interpreter-teardown
+    // hook so it is reaped on drop even if `pty/wait`/`pty/close` is never called.
+    ensure_teardown_hook(ctx);
     PTYS.with(|p| {
         p.borrow_mut().insert(
             id,
@@ -495,7 +537,7 @@ fn pty_close_runtime(id: i64) -> NativeResult {
 }
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "pty/spawn", spawn);
+    crate::register_fn_gated_ctx(env, sandbox, Caps::PROCESS, "pty/spawn", spawn);
 
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "pty/read", |args| {
         check_arity!(args, "pty/read", 1);
@@ -732,5 +774,39 @@ mod tests {
         assert_eq!(first.as_int(), Some(7));
         assert_eq!(second.as_int(), Some(7));
         call(&e, "pty/close", &[h]);
+    }
+
+    /// C6 guard: `ensure_teardown_hook` wires exactly one hook (idempotent), and
+    /// firing it drains the pty registry and resets the flag. A `Tombstone` slot
+    /// stands in for a live pty so the drain is asserted without pty hardware —
+    /// the real kill+reap is covered by `proc_pty_async_test.rs`.
+    #[test]
+    fn teardown_hook_registered_exactly_once_and_drains_registry() {
+        let ctx = EvalContext::new();
+        PTYS.with(|p| p.borrow_mut().clear());
+        PTY_TEARDOWN_REGISTERED.with(|c| c.set(false));
+
+        PTYS.with(|p| {
+            p.borrow_mut()
+                .insert(99, PtySlot::Tombstone("guard".to_string()))
+        });
+
+        assert!(!PTY_TEARDOWN_REGISTERED.with(Cell::get));
+        ensure_teardown_hook(&ctx);
+        assert!(
+            PTY_TEARDOWN_REGISTERED.with(Cell::get),
+            "ensure_teardown_hook must register the interpreter hook"
+        );
+        ensure_teardown_hook(&ctx); // second call is a no-op
+
+        assert!(ctx.try_run_interpreter_teardown_hooks());
+        assert!(
+            PTYS.with(|p| p.borrow().is_empty()),
+            "teardown must drain the pty registry"
+        );
+        assert!(
+            !PTY_TEARDOWN_REGISTERED.with(Cell::get),
+            "teardown must reset the hook flag so a fresh interpreter re-registers"
+        );
     }
 }

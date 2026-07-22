@@ -298,6 +298,40 @@ fn register_fn_gated(
     }
 }
 
+/// Like [`register_fn_gated`], but the body also receives the evaluator
+/// [`EvalContext`] on both the sync and runtime paths (via
+/// [`NativeFn::with_ctx`](sema_core::NativeFn::with_ctx)). Used by resource
+/// registries (`proc/spawn`, `pty/spawn`) that must register an
+/// interpreter-teardown hook against the owning interpreter's context the first
+/// time they create a live OS resource, so a spawned-but-never-closed child is
+/// reaped on interpreter drop (C6). The body cannot structurally suspend — these
+/// creation ops are synchronous even inside a runtime quantum.
+#[cfg(not(target_arch = "wasm32"))]
+fn register_fn_gated_ctx(
+    env: &Env,
+    sandbox: &Sandbox,
+    cap: Caps,
+    name: &str,
+    f: impl Fn(&sema_core::EvalContext, &[Value]) -> Result<Value, sema_core::SemaError> + 'static,
+) {
+    if sandbox.is_unrestricted() {
+        env.set(
+            sema_core::intern(name),
+            Value::native_fn(sema_core::NativeFn::with_ctx(name, f)),
+        );
+    } else {
+        let sandbox = sandbox.clone();
+        let fn_name = name.to_string();
+        env.set(
+            sema_core::intern(name),
+            Value::native_fn(sema_core::NativeFn::with_ctx(name, move |ctx, args| {
+                sandbox.check(cap, &fn_name)?;
+                f(ctx, args)
+            })),
+        );
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn register_fn_path_gated(
     env: &Env,
@@ -377,6 +411,62 @@ fn register_runtime_fn_path_gated(
                 ))),
             },
             move |_ctx, args| for_runtime(args),
+        )),
+    );
+}
+
+/// Like [`register_runtime_fn_path_gated`], but the body also receives the
+/// evaluator [`EvalContext`] on both ABIs (via
+/// [`NativeFn::with_ctx_runtime`](sema_core::NativeFn::with_ctx_runtime)). Used
+/// by resource registries (`kv/open`, `serial/open`, `db/open`,
+/// `db/open-memory`) whose open op still offloads on the runtime path yet must
+/// register an interpreter-teardown hook against the owning interpreter's
+/// context (C6). The sandbox capability + path checks are applied identically to
+/// [`register_runtime_fn_path_gated`].
+#[cfg(not(target_arch = "wasm32"))]
+fn register_runtime_fn_path_gated_ctx(
+    env: &Env,
+    sandbox: &Sandbox,
+    cap: Caps,
+    name: &str,
+    path_args: &[usize],
+    f: impl Fn(&sema_core::EvalContext, &[Value]) -> sema_core::runtime::NativeResult + 'static,
+) {
+    use sema_core::runtime::NativeOutcome;
+    type RuntimeFnBodyCtx =
+        dyn Fn(&sema_core::EvalContext, &[Value]) -> sema_core::runtime::NativeResult;
+    let checked: std::rc::Rc<RuntimeFnBodyCtx> = if sandbox.is_unrestricted() {
+        std::rc::Rc::new(f)
+    } else {
+        let sandbox = sandbox.clone();
+        let fn_name = name.to_string();
+        let path_indices: Vec<usize> = path_args.to_vec();
+        std::rc::Rc::new(move |ctx: &sema_core::EvalContext, args: &[Value]| {
+            sandbox.check(cap, &fn_name)?;
+            for &idx in &path_indices {
+                if let Some(val) = args.get(idx) {
+                    if let Some(p) = val.as_str() {
+                        sandbox.check_path(p, &fn_name)?;
+                    }
+                }
+            }
+            f(ctx, args)
+        })
+    };
+    let for_func = checked.clone();
+    let for_runtime = checked;
+    let func_name = name.to_string();
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(sema_core::NativeFn::with_ctx_runtime(
+            name,
+            move |ctx, args| match for_func(ctx, args)? {
+                NativeOutcome::Return(value) => Ok(value),
+                _ => Err(sema_core::SemaError::eval(format!(
+                    "{func_name}: native suspended outside the cooperative runtime"
+                ))),
+            },
+            move |call, args| for_runtime(call.eval_context, args),
         )),
     );
 }

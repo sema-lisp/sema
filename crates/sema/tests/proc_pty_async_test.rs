@@ -491,6 +491,115 @@ fn pty_cancel_while_queued_behind_busy_handle() {
     assert_eq!(parts[2].as_int(), Some(9));
 }
 
+// === C6 (closes ledger row C14): interpreter drop reaps live proc/pty children ===
+//
+// A child spawned via `proc/spawn`/`pty/spawn` and left in the per-thread
+// registry (never `proc/wait`/`proc/close`d) must be SIGKILLed and reaped when
+// the owning interpreter is dropped. Before the interpreter-teardown hooks the
+// registry survived the drop and the `sleep 30` child leaked (a fresh interpreter
+// on the same thread never touches it either). The child writes its own pid to a
+// file; after `drop(interp)` that pid must become unkillable (`ESRCH`) within a
+// bounded window. Reuses the existing process-group SIGKILL machinery.
+
+#[cfg(unix)]
+fn read_child_pid(path: &std::path::Path) -> i32 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            let trimmed = contents.trim();
+            if let Ok(pid) = trimmed.parse::<i32>() {
+                return pid;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child never wrote its pid to {path:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// `kill(pid, 0)` returns 0 while the process exists (including as a zombie) and
+/// `-1`/`ESRCH` once it is gone AND reaped. Our teardown SIGKILLs then `wait()`s,
+/// so a reaped child reads as gone here.
+#[cfg(unix)]
+fn process_alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(unix)]
+fn wait_until_dead(pid: i32) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !process_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    !process_alive(pid)
+}
+
+#[cfg(unix)]
+#[test]
+fn interpreter_drop_reaps_live_proc_and_pty_children() {
+    let unique = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+
+    // proc: spawn a long-lived child, leave it in the registry, drop the
+    // interpreter, and assert the child was reaped.
+    let proc_pidfile = std::env::temp_dir().join(format!("sema-c6-proc-{unique}.pid"));
+    let _ = std::fs::remove_file(&proc_pidfile);
+    let proc_pid = {
+        let interp = Interpreter::new();
+        let program = format!(
+            r#"(proc/spawn (list "sh" "-c" "echo $$ > '{p}'; exec sleep 30"))"#,
+            p = proc_pidfile.display()
+        );
+        interp
+            .eval_str_compiled(&program)
+            .expect("spawn a long-lived proc child");
+        let pid = read_child_pid(&proc_pidfile);
+        assert!(
+            process_alive(pid),
+            "the proc child must be alive before the interpreter is dropped"
+        );
+        drop(interp);
+        pid
+    };
+    assert!(
+        wait_until_dead(proc_pid),
+        "interpreter drop must SIGKILL+reap the live proc child (pid {proc_pid})"
+    );
+    let _ = std::fs::remove_file(&proc_pidfile);
+
+    // pty: same, only when a real pty can be allocated in this environment.
+    if pty_available() {
+        let pty_pidfile = std::env::temp_dir().join(format!("sema-c6-pty-{unique}.pid"));
+        let _ = std::fs::remove_file(&pty_pidfile);
+        let pty_pid = {
+            let interp = Interpreter::new();
+            let program = format!(
+                r#"(pty/spawn (list "sh" "-c" "echo $$ > '{p}'; exec sleep 30"))"#,
+                p = pty_pidfile.display()
+            );
+            interp
+                .eval_str_compiled(&program)
+                .expect("spawn a long-lived pty child");
+            let pid = read_child_pid(&pty_pidfile);
+            assert!(
+                process_alive(pid),
+                "the pty child must be alive before the interpreter is dropped"
+            );
+            drop(interp);
+            pid
+        };
+        assert!(
+            wait_until_dead(pty_pid),
+            "interpreter drop must SIGKILL+reap the live pty child (pid {pty_pid})"
+        );
+        let _ = std::fs::remove_file(&pty_pidfile);
+    }
+}
+
 /// `pty/wait` called twice (sequentially) on the same handle inside one async
 /// task returns the same exit code both times — matches
 /// `pty.rs::tests::double_wait_returns_same_code_sync` through the offload.

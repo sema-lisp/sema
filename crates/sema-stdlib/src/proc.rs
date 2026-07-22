@@ -91,6 +91,54 @@ thread_local! {
     /// offloaded op and reused for later ops (dropped on `proc/close`). The gate
     /// provides FIFO mutual exclusion for the checkout slot.
     static PROC_GATES: RefCell<HashMap<i64, ResourceGateHandle>> = RefCell::new(HashMap::new());
+    /// Whether this thread's interpreter has an interpreter-teardown hook wired
+    /// for the proc registry (C6). Flipped once by [`ensure_teardown_hook`] the
+    /// first time a child is spawned; reset by [`teardown_procs`] so a fresh
+    /// interpreter reused on the same thread re-registers. Mirrors the
+    /// `teardown_hook_registered` flag the fs_watch / spinner registries hold.
+    static PROC_TEARDOWN_REGISTERED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Register the interpreter-teardown hook for the proc registry against `ctx`
+/// exactly once per interpreter (C6). Called at spawn time — the only point a
+/// live child enters the registry — so a child spawned but never `proc/wait`ed
+/// or `proc/close`d is still reaped when the interpreter is dropped. The hook is
+/// interpreter-shared (registered on the owning interpreter's `EvalContext`),
+/// captures no `Value`/`Env` (CORE-2 I2 holds trivially), and reaches the
+/// per-thread registry through the thread-local.
+fn ensure_teardown_hook(ctx: &sema_core::EvalContext) {
+    if !PROC_TEARDOWN_REGISTERED.with(|c| c.replace(true)) {
+        ctx.register_interpreter_teardown_hook(teardown_procs);
+    }
+}
+
+/// Interpreter-drop teardown for the proc registry (C6). Runs on the VM thread
+/// after the persistent runtime has already been shut down (so no quantum is
+/// active and every offloaded op has been cancelled/reaped), or on the panic
+/// path as a best-effort. For every `Available` slot it SIGKILLs the child's
+/// process group via the existing group-kill machinery and reaps the leader with
+/// a bounded `wait()` (SIGKILL is uncatchable, so the child exits promptly);
+/// dropping the `Proc` detaches its pump threads, which see EOF on the dead
+/// child's closed pipes and exit on their own — no unbounded join. `CheckedOut`
+/// slots hold no child (it was taken out for an offloaded worker whose cancel
+/// path already SIGKILLed it); draining the map drops them. Gates are closed so
+/// any (post-shutdown there are none) parked waiter fails fast.
+fn teardown_procs() {
+    let slots: Vec<ProcSlot> =
+        PROCS.with(|p| p.borrow_mut().drain().map(|(_, slot)| slot).collect());
+    for slot in slots {
+        if let ProcSlot::Available(mut proc) = slot {
+            group_sigkill_abort(proc.child.id())();
+            let _ = proc.child.kill();
+            let _ = proc.child.wait();
+        }
+    }
+    PROC_GATES.with(|g| {
+        for (_, gate) in g.borrow_mut().drain() {
+            let _ = gate.close();
+        }
+    });
+    PROC_TEARDOWN_REGISTERED.with(|c| c.set(false));
 }
 
 /// Take `id`'s process out of its slot once its gate is owned, marking the slot
@@ -213,7 +261,7 @@ pub(crate) fn poll_ready(id: i64) -> Option<(bool, bool)> {
     })
 }
 
-fn spawn(args: &[Value]) -> Result<Value, SemaError> {
+fn spawn(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "proc/spawn", 1..=2);
     let argv = args[0]
         .as_list()
@@ -273,6 +321,9 @@ fn spawn(args: &[Value]) -> Result<Value, SemaError> {
         n.set(id + 1);
         id
     });
+    // A live child now enters the registry: wire the interpreter-teardown hook so
+    // it is reaped on drop even if `proc/wait`/`proc/close` is never called.
+    ensure_teardown_hook(ctx);
     PROCS.with(|p| {
         p.borrow_mut().insert(
             id,
@@ -543,7 +594,7 @@ fn proc_close_runtime(id: i64) -> NativeResult {
 }
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "proc/spawn", spawn);
+    crate::register_fn_gated_ctx(env, sandbox, Caps::PROCESS, "proc/spawn", spawn);
 
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "proc/read-stdout", |args| {
         check_arity!(args, "proc/read-stdout", 1);
@@ -808,5 +859,40 @@ mod tests {
         assert_eq!(first.as_int(), Some(7));
         assert_eq!(second.as_int(), Some(7));
         call(&e, "proc/close", &[h]);
+    }
+
+    /// C6 guard: `ensure_teardown_hook` wires exactly one interpreter-teardown
+    /// hook (idempotent via the flag), and firing it drains the proc registry and
+    /// resets the flag so a fresh interpreter re-registers. Exercised with a
+    /// `Tombstone` slot (no OS child) so the drain is asserted without process
+    /// machinery — the real kill+reap is covered by `proc_pty_async_test.rs`.
+    #[test]
+    fn teardown_hook_registered_exactly_once_and_drains_registry() {
+        let ctx = EvalContext::new();
+        PROCS.with(|p| p.borrow_mut().clear());
+        PROC_TEARDOWN_REGISTERED.with(|c| c.set(false));
+
+        PROCS.with(|p| {
+            p.borrow_mut()
+                .insert(99, ProcSlot::Tombstone("guard".to_string()))
+        });
+
+        assert!(!PROC_TEARDOWN_REGISTERED.with(Cell::get));
+        ensure_teardown_hook(&ctx);
+        assert!(
+            PROC_TEARDOWN_REGISTERED.with(Cell::get),
+            "ensure_teardown_hook must register the interpreter hook"
+        );
+        ensure_teardown_hook(&ctx); // second call is a no-op
+
+        assert!(ctx.try_run_interpreter_teardown_hooks());
+        assert!(
+            PROCS.with(|p| p.borrow().is_empty()),
+            "teardown must drain the proc registry"
+        );
+        assert!(
+            !PROC_TEARDOWN_REGISTERED.with(Cell::get),
+            "teardown must reset the hook flag so a fresh interpreter re-registers"
+        );
     }
 }

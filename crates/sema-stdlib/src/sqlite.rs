@@ -129,6 +129,35 @@ thread_local! {
     /// Optional per-call result-cap override (lowered, never raised above the
     /// hard ceilings). `None` uses the module ceilings.
     static DB_RESULT_CAPS_OVERRIDE: Cell<Option<DbResultCaps>> = const { Cell::new(None) };
+    /// Whether this thread's interpreter has an interpreter-teardown hook wired
+    /// for the db registry (C6) — see `proc.rs`'s `PROC_TEARDOWN_REGISTERED`.
+    static DB_TEARDOWN_REGISTERED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Register the interpreter-teardown hook for the db registry against `ctx`
+/// exactly once per interpreter (C6). Called at `db/open`/`db/open-memory` so a
+/// connection opened but never `db/close`d is still closed on interpreter drop.
+fn ensure_teardown_hook(ctx: &sema_core::EvalContext) {
+    if !DB_TEARDOWN_REGISTERED.with(|c| c.replace(true)) {
+        ctx.register_interpreter_teardown_hook(teardown_connections);
+    }
+}
+
+/// Interpreter-drop teardown for the db registry (C6). Dropping every slot
+/// closes the underlying connection (an `Available` connection's OS handle; a
+/// `CheckedOut` connection is held by an offloaded worker whose statement was
+/// interrupted on cancel — R16A — so the slot is simply dropped). The captured
+/// interrupt handles are dropped too, and gates are closed so any parked waiter
+/// fails fast.
+fn teardown_connections() {
+    DB_CONNECTIONS.with(|c| c.borrow_mut().clear());
+    DB_INTERRUPTS.with(|m| m.borrow_mut().clear());
+    DB_GATES.with(|g| {
+        for (_, gate) in g.borrow_mut().drain() {
+            let _ = gate.close();
+        }
+    });
+    DB_TEARDOWN_REGISTERED.with(|c| c.set(false));
 }
 
 /// Bounded result caps resolved pre-dispatch and enforced incrementally by the
@@ -598,13 +627,17 @@ fn tables_to_value(names: Vec<String>) -> Value {
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // (db/open path) or (db/open name path)
-    crate::register_runtime_fn_path_gated(
+    crate::register_runtime_fn_path_gated_ctx(
         env,
         sandbox,
         sema_core::Caps::FS_WRITE,
         "db/open",
         &[0],
-        |args| {
+        |ctx, args| {
+            // A connection is about to enter the registry: wire the
+            // interpreter-teardown hook (idempotent) on the VM thread before the
+            // open dispatches — the async decoder (`finish_open`) has no `ctx`.
+            ensure_teardown_hook(ctx);
             let (key, path) = match args.len() {
                 1 => {
                     let path = args[0]
@@ -651,13 +684,14 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     );
 
     // (db/open-memory) or (db/open-memory name)
-    crate::register_runtime_fn_path_gated(
+    crate::register_runtime_fn_path_gated_ctx(
         env,
         sandbox,
         sema_core::Caps::FS_WRITE,
         "db/open-memory",
         &[],
-        |args| {
+        |ctx, args| {
+            ensure_teardown_hook(ctx);
             let name = if args.is_empty() {
                 ":memory:".to_string()
             } else if args.len() == 1 {
@@ -1052,5 +1086,45 @@ mod tests {
         DB_INTERRUPTS.with(|m| {
             m.borrow_mut().remove(&key);
         });
+    }
+
+    /// C6 guard: `ensure_teardown_hook` wires exactly one hook (idempotent), and
+    /// firing it closes every open connection (clearing connections, interrupt
+    /// handles, and gates) and resets the flag. A real in-memory connection is
+    /// used so the drop actually closes a live handle.
+    #[test]
+    fn teardown_hook_registered_exactly_once_and_closes_connections() {
+        let ctx = sema_core::EvalContext::new();
+        DB_CONNECTIONS.with(|c| c.borrow_mut().clear());
+        DB_INTERRUPTS.with(|m| m.borrow_mut().clear());
+        DB_TEARDOWN_REGISTERED.with(|c| c.set(false));
+
+        let key = "guard-teardown-db".to_string();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        finish_open("db/open-memory", key.clone(), conn).expect("install connection");
+        assert!(DB_CONNECTIONS.with(|c| c.borrow().contains_key(&key)));
+        assert!(DB_INTERRUPTS.with(|m| m.borrow().contains_key(&key)));
+
+        assert!(!DB_TEARDOWN_REGISTERED.with(Cell::get));
+        ensure_teardown_hook(&ctx);
+        assert!(
+            DB_TEARDOWN_REGISTERED.with(Cell::get),
+            "ensure_teardown_hook must register the interpreter hook"
+        );
+        ensure_teardown_hook(&ctx); // second call is a no-op
+
+        assert!(ctx.try_run_interpreter_teardown_hooks());
+        assert!(
+            DB_CONNECTIONS.with(|c| c.borrow().is_empty()),
+            "teardown must close and drop every connection"
+        );
+        assert!(
+            DB_INTERRUPTS.with(|m| m.borrow().is_empty()),
+            "teardown must drop every captured interrupt handle"
+        );
+        assert!(
+            !DB_TEARDOWN_REGISTERED.with(Cell::get),
+            "teardown must reset the hook flag so a fresh interpreter re-registers"
+        );
     }
 }

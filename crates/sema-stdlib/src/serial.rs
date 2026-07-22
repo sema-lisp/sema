@@ -57,7 +57,7 @@
 //! At top level (no scheduler) every builtin keeps today's synchronous shape
 //! byte-for-byte.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::rc::Rc;
@@ -167,6 +167,33 @@ thread_local! {
     /// offloaded op and reused for later ops (dropped on `serial/close`). The gate
     /// provides FIFO mutual exclusion for the checkout slot.
     static SERIAL_GATES: RefCell<HashMap<u64, ResourceGateHandle>> = RefCell::new(HashMap::new());
+    /// Whether this thread's interpreter has an interpreter-teardown hook wired
+    /// for the serial registry (C6) — see `proc.rs`'s `PROC_TEARDOWN_REGISTERED`.
+    static SERIAL_TEARDOWN_REGISTERED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Register the interpreter-teardown hook for the serial registry against `ctx`
+/// exactly once per interpreter (C6). Called at `serial/open` so a port opened
+/// but never `serial/close`d is still closed on interpreter drop.
+fn ensure_teardown_hook(ctx: &sema_core::EvalContext) {
+    if !SERIAL_TEARDOWN_REGISTERED.with(|c| c.replace(true)) {
+        ctx.register_interpreter_teardown_hook(teardown_ports);
+    }
+}
+
+/// Interpreter-drop teardown for the serial registry (C6). Dropping every slot
+/// closes the underlying device (an `Available` port's OS handle; a `CheckedOut`
+/// port is held by an offloaded worker whose blocked read is bounded by the
+/// port's validated timeout — R14B — and cannot be reclaimed, so the slot is
+/// simply dropped). Gates are closed so any parked waiter fails fast.
+fn teardown_ports() {
+    PORTS.with(|p| p.borrow_mut().clear());
+    SERIAL_GATES.with(|g| {
+        for (_, gate) in g.borrow_mut().drain() {
+            let _ = gate.close();
+        }
+    });
+    SERIAL_TEARDOWN_REGISTERED.with(|c| c.set(false));
 }
 
 /// Take `handle`'s port out of its slot once its gate is owned, marking the slot
@@ -329,7 +356,13 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     // (serial/open path baud) => handle (int)
     // (serial/open path baud timeout_ms) => handle (int)
-    crate::register_runtime_fn_path_gated(env, sandbox, Caps::SERIAL, "serial/open", &[], |args| {
+    crate::register_runtime_fn_path_gated_ctx(
+        env,
+        sandbox,
+        Caps::SERIAL,
+        "serial/open",
+        &[],
+        |ctx, args| {
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("serial/open", "2-3", args.len()));
         }
@@ -356,6 +389,12 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         // carries a `Some(_)`, non-zero, `<= SERIAL_MAX_OP_TIMEOUT` timeout, so
         // every later checkout op's worker occupancy is bounded by construction.
         let timeout = validate_op_timeout("serial/open", Some(Duration::from_millis(timeout_ms)))?;
+
+        // Wire the interpreter-teardown hook (idempotent) before the (possibly
+        // offloaded) open dispatches: the async decoder that inserts the port has
+        // no `ctx`, so registration must happen here on the VM thread. A failed
+        // open leaves the hook cleaning an empty registry — harmless.
+        ensure_teardown_hook(ctx);
 
         // There is no existing port to contend over, so `serial/open` offloads
         // the blocking device `open()` as a plain External wait (mirrors
@@ -408,7 +447,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .insert(handle, PortSlot::Available(reader))
         });
         Ok(NativeOutcome::Return(Value::int(handle as i64)))
-    });
+        },
+    );
 
     // (serial/close handle) => nil
     //
@@ -766,6 +806,40 @@ mod tests {
         assert!(
             over.to_string().contains("exceeds the maximum"),
             "oversized timeout must be rejected at open: {over}"
+        );
+    }
+
+    /// C6 guard: `ensure_teardown_hook` wires exactly one hook (idempotent), and
+    /// firing it clears the serial registry and resets the flag. A `Tombstone`
+    /// slot stands in for an open port so the drain is asserted without serial
+    /// hardware.
+    #[test]
+    fn teardown_hook_registered_exactly_once_and_clears_registry() {
+        let ctx = sema_core::EvalContext::new();
+        PORTS.with(|p| p.borrow_mut().clear());
+        SERIAL_TEARDOWN_REGISTERED.with(|c| c.set(false));
+
+        PORTS.with(|p| {
+            p.borrow_mut()
+                .insert(7, PortSlot::Tombstone("guard".to_string()))
+        });
+
+        assert!(!SERIAL_TEARDOWN_REGISTERED.with(Cell::get));
+        ensure_teardown_hook(&ctx);
+        assert!(
+            SERIAL_TEARDOWN_REGISTERED.with(Cell::get),
+            "ensure_teardown_hook must register the interpreter hook"
+        );
+        ensure_teardown_hook(&ctx); // second call is a no-op
+
+        assert!(ctx.try_run_interpreter_teardown_hooks());
+        assert!(
+            PORTS.with(|p| p.borrow().is_empty()),
+            "teardown must clear the serial registry"
+        );
+        assert!(
+            !SERIAL_TEARDOWN_REGISTERED.with(Cell::get),
+            "teardown must reset the hook flag so a fresh interpreter re-registers"
         );
     }
 }

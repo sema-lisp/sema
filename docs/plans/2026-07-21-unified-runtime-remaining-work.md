@@ -961,6 +961,37 @@ child-narrowing.
 
 ### Commit C6 — registry ownership and teardown re-audit (closes C14)
 
+**Landed 2026-07-22.** The KV / proc / PTY / serial / SQLite registries stay
+per-thread TLS maps but each now registers **exactly one** interpreter-teardown
+hook (`ensure_teardown_hook` → `EvalContext::register_interpreter_teardown_hook`,
+the fs_watch / B5 `TtyRegistry` / B6 `SpinnerRegistry` model) the first time a
+resource is created (`proc/spawn`/`pty/spawn` gained `ctx` via a new
+`register_fn_gated_ctx`; `kv/open`/`serial/open`/`db/open`/`db/open-memory` via a
+new `register_runtime_fn_path_gated_ctx`, both in `lib.rs`). On interpreter drop
+the hook closes `Available` slots (dropping the store/connection/port),
+SIGKILL+reaps live proc/PTY children via the existing group-kill machinery
+(`group_sigkill_abort` + a bounded `wait()`; dropping the handle detaches the
+pump/reader threads — no unbounded join), drops `CheckedOut` slots (their resource
+is owned by a worker the runtime-shutdown cancel already tore down), closes each
+handle's gate so a parked waiter fails fast, and resets its per-thread hook flag
+so a fresh same-thread interpreter re-registers. Teardown runs after
+`runtime.shutdown()` (or best-effort on the panic path), never inside an active
+quantum, and preserves CORE-2 I2 (the hooks are zero-capture free fns; the
+`ctx`-carrying natives capture no `Value`/`Env`). KV skips a teardown flush (every
+`kv/set`/`kv/delete` is already write-through durable), and serial's blocked-read
+worker stays bounded by its validated timeout (R14B). Regression:
+`proc_pty_async_test::interpreter_drop_reaps_live_proc_and_pty_children` (a
+`sleep 30` child's pid becomes `ESRCH` within a bounded window after drop; red
+before the hook),
+`integration_test::{interpreter_drop_closes_kv_serial_sqlite_slots_and_gates,interpreter_drop_does_not_disturb_another_thread_registry}`
+(a fresh same-thread interpreter sees no leaked kv store / db; a second
+interpreter on another thread is untouched), and per-module
+`{proc,pty,serial,sqlite,kv}::tests::teardown_hook_registered_exactly_once_*`
+presence guards. **C14 flipped to `MIGRATED (C6)`** in
+`docs/internals/async-runtime-inventory.md`; the `runtime-match-map.tsv` re-map
+and the `runtime_conformance_test` inventory reconciliation are the deferred **C7**
+work and remain red.
+
 Only after B1–B6: C14's contract depends on the R rows. Current state
 (verified): `fs_watch` is the model (interpreter-owned, teardown hook); KV,
 proc, PTY, serial, SQLite registries are per-thread TLS maps with **no

@@ -75,6 +75,13 @@ mod sqlite;
 pub use sqlite::set_db_result_caps_override;
 mod stream;
 
+/// Inject a per-op delay into the file-stream checkout worker (milliseconds).
+/// Test hook only, mirroring [`set_fs_test_delay_ms`]; lets a cancellation
+/// regression cancel a regular-file read while its worker is still occupied.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use stream::set_stream_checkout_test_delay_ms;
+
 /// Read one source line through the process-wide stdin coordinator.
 ///
 /// This is an internal integration seam for the native headless REPL. Keeping

@@ -664,6 +664,164 @@ fn stream_file_async_copy_file_to_file_fails_fast_with_chunk_guidance() {
     let _ = std::fs::remove_file(&dst_path);
 }
 
+/// A named pipe (FIFO) created via `mkfifo`, removed on drop. Unix-only —
+/// non-regular file admission is a Unix concern (see `io::admit_regular_file`).
+#[cfg(unix)]
+struct FifoFixture(std::path::PathBuf);
+
+#[cfg(unix)]
+impl FifoFixture {
+    fn new(tag: &str) -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("sema-stream-fifo-{tag}-{nanos}"));
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo failed for {}", path.display());
+        FifoFixture(path)
+    }
+    fn path(&self) -> String {
+        self.0.to_string_lossy().to_string()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FifoFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Run `sema --no-llm -e PROGRAM` with no stdin, killing it if it does not
+/// settle within `timeout` (a blocking open/read on a non-regular file would
+/// pin a worker forever — the timeout is the hang tooth). Returns the exit
+/// status and captured stdout/stderr.
+#[cfg(unix)]
+fn run_sema_with_deadline(
+    program: &str,
+    timeout: std::time::Duration,
+) -> (std::process::ExitStatus, String, String) {
+    use std::process::Stdio;
+    use std::time::Instant;
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["--no-llm", "-e", program])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sema");
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll sema child") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().expect("reap timed-out sema");
+            panic!(
+                "sema program did not settle within {timeout:?} (a blocking open/read pinned a worker?); stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    let output = child.wait_with_output().expect("collect sema output");
+    (
+        status,
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+/// `stream/open-input` on a FIFO inside a runtime quantum must be REJECTED by
+/// admission before any checkout/quarantine offload. A FIFO opened for read
+/// blocks until a peer opens the write end (never, here), which would pin a
+/// runtime worker with no portable abort. Admission (a non-blocking stat)
+/// refuses it up front with actionable guidance toward the coordinated stdin
+/// owner / `proc` APIs.
+#[cfg(unix)]
+#[test]
+fn stream_open_input_rejects_fifo_in_quantum_with_guidance() {
+    let fifo = FifoFixture::new("open-input");
+    let program = format!(
+        r#"(await (async/spawn (fn () (stream/open-input "{path}"))))"#,
+        path = fifo.path()
+    );
+    let (status, _stdout, stderr) =
+        run_sema_with_deadline(&program, std::time::Duration::from_secs(10));
+    assert!(
+        !status.success(),
+        "opening a FIFO for input inside a quantum must fail, not succeed: {stderr}"
+    );
+    assert!(
+        stderr.contains("named pipe (FIFO)") && stderr.contains("not a regular file"),
+        "expected a non-regular-file rejection naming the FIFO, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("*stdin*") || stderr.contains("proc/"),
+        "expected actionable guidance toward the coordinated stdin owner / proc APIs, got: {stderr}"
+    );
+}
+
+/// A cancelled regular-file `stream/read` settles promptly and reaps its
+/// stream gate. Regular files are admitted precisely because every checked-out
+/// read is bounded by one capped chunk (no portable abort exists); the test
+/// injects a worker delay so cancellation lands while the read is genuinely
+/// in flight, then asserts the sibling progressed, the awaited task raised
+/// `:cancelled`, and the stream's runtime gate was released.
+#[test]
+fn cancelled_regular_file_read_settles_and_reaps_within_one_chunk() {
+    let f = TempFile::with_contents("cancel-read", &"x".repeat(4096));
+    sema_stdlib::set_stream_checkout_test_delay_ms(200);
+    let interp = Interpreter::new();
+    let program = format!(
+        r#"
+        (let ((events (channel/new 2))
+              (victim (async/spawn (fn ()
+                        (let ((s (stream/open-input "{path}")))
+                          (stream/read s 4096))))))
+          (async/spawn (fn () (channel/send events :sibling)))
+          (async/sleep 20)
+          (async/cancel victim)
+          (list (channel/recv events)
+                (try (await victim) (catch e (:type e)))))
+        "#,
+        path = f.path()
+    );
+    let result = interp.eval_str_compiled(&program);
+    sema_stdlib::set_stream_checkout_test_delay_ms(0);
+    let result = result.expect("cancelled regular-file read settles without hanging");
+    let items = result.as_list().expect("result list");
+    assert_eq!(
+        items[0],
+        Value::keyword("sibling"),
+        "sibling must progress while the regular-file read is checked out"
+    );
+    assert_eq!(
+        items[1],
+        Value::keyword("cancelled"),
+        "awaiting the cancelled read must raise the :cancelled condition, got {:?}",
+        items[1]
+    );
+    // The bounded worker drains within one chunk; once its completion is
+    // discarded the checked-out stream (and its owner gate) is released.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while interp.runtime_resource_gate_count() != 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "the cancelled read's stream gate must be reaped"
+    );
+}
+
 fn assert_open_stdin_operations_are_cancellable(program: &str, expected_cancellations: usize) {
     use std::process::Stdio;
     use std::time::{Duration, Instant};

@@ -1213,6 +1213,55 @@ fn fs_write_cap_check(op: &str, len: usize) -> Result<(), SemaError> {
     Ok(())
 }
 
+/// Reject a non-regular target (FIFO, socket, character/block device) before a
+/// quarantined or checked-out blocking file op is dispatched inside a runtime
+/// quantum. A blocking `open(2)`/`read(2)`/`write(2)` on such a target is
+/// unbounded — opening a FIFO parks until a peer opens the other end, a
+/// character device can stream without EOF — and there is no portable way to
+/// abort or cancel the parked blocking worker. Regular files bound every
+/// offloaded op to a capped chunk by construction, so this admission stat (a
+/// non-blocking `stat(2)`) is what keeps the cooperative runtime's file I/O
+/// finite. A missing/unstattable path passes through so the real open surfaces
+/// the canonical error, matching [`fs_byte_cap_check`]. Host
+/// (`!in_runtime_quantum`) callers keep their bounded synchronous path and are
+/// never admitted here.
+#[cfg(unix)]
+pub(crate) fn admit_regular_file(op: &str, path: &str) -> Result<(), SemaError> {
+    use std::os::unix::fs::FileTypeExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let ft = meta.file_type();
+        let kind = if ft.is_fifo() {
+            Some("named pipe (FIFO)")
+        } else if ft.is_socket() {
+            Some("socket")
+        } else if ft.is_char_device() {
+            Some("character device")
+        } else if ft.is_block_device() {
+            Some("block device")
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            return Err(SemaError::eval(format!(
+                "{op}: {path} is a {kind}, not a regular file"
+            ))
+            .with_hint(
+                "the cooperative runtime only checks out regular files; a blocking read on a pipe or device cannot be bounded or cancelled — read the coordinated *stdin* stream, or drive a device through the proc/* APIs",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Non-unix fallback: named pipes and device nodes are not classified through
+/// `FileTypeExt`, so admission is a no-op and the bounded synchronous path
+/// stands. (Runtime offload of file streams is a native, primarily Unix
+/// feature; wasm has no cooperative file I/O at all.)
+#[cfg(not(unix))]
+pub(crate) fn admit_regular_file(_op: &str, _path: &str) -> Result<(), SemaError> {
+    Ok(())
+}
+
 // ── Cooperative line streaming (file/for-each-line, file/fold-lines[-bytes]) ─
 //
 // The file reader is moved to a blocking worker for one bounded batch of lines,
@@ -2249,6 +2298,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .map(|s| NativeOutcome::Return(Value::string_owned(s)));
         }
         if sema_core::in_runtime_quantum() {
+            admit_regular_file("file/read", path)?;
             fs_byte_cap_check("file/read", path)?;
             let path = path.to_string();
             return fs_quarantined("file/read", Value::string_owned, move || {
@@ -2275,6 +2325,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
             if sema_core::in_runtime_quantum() {
+                admit_regular_file("file/write", path)?;
                 fs_write_cap_check("file/write", content.len())?;
                 let path = path.to_string();
                 let content = content.to_string();
@@ -2308,6 +2359,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 return Ok(NativeOutcome::Return(Value::bytevector(data)));
             }
             if sema_core::in_runtime_quantum() {
+                admit_regular_file("file/read-bytes", path)?;
                 fs_byte_cap_check("file/read-bytes", path)?;
                 let path = path.to_string();
                 return fs_quarantined("file/read-bytes", Value::bytevector, move || {
@@ -2335,6 +2387,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .as_bytevector()
                 .ok_or_else(|| SemaError::type_error("bytevector", args[1].type_name()))?;
             if sema_core::in_runtime_quantum() {
+                admit_regular_file("file/write-bytes", path)?;
                 fs_write_cap_check("file/write-bytes", bv.len())?;
                 let path = path.to_string();
                 let bv = bv.to_vec();

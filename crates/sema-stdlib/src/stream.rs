@@ -582,6 +582,7 @@ mod io_streams {
     use std::collections::VecDeque;
     use std::io::{BufRead, BufReader, BufWriter, Read, Write};
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
 
@@ -615,6 +616,27 @@ mod io_streams {
         assert_send::<BufReader<std::fs::File>>();
         assert_send::<BufWriter<std::fs::File>>();
     };
+
+    /// Test-only artificial delay injected at the START of a checked-out
+    /// blocking op, so a cancellation regression test can reliably cancel a
+    /// regular-file read while its worker is still occupied (regular-file reads
+    /// otherwise complete in microseconds, leaving no window). Runs on the
+    /// blocking-tier worker, never the VM thread. Default `0` is a no-op.
+    static STREAM_CHECKOUT_TEST_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+    fn stream_checkout_test_delay() {
+        let ms = STREAM_CHECKOUT_TEST_DELAY_MS.load(Ordering::Relaxed);
+        if ms > 0 {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
+    }
+
+    /// Set the per-op checkout worker delay (milliseconds). Test hook only,
+    /// mirroring `crate::io::set_fs_test_delay_ms`; production callers never
+    /// touch it (the default is `0`).
+    pub fn set_stream_checkout_test_delay_ms(ms: u64) {
+        STREAM_CHECKOUT_TEST_DELAY_MS.store(ms, Ordering::SeqCst);
+    }
 
     /// `op` was attempted while an offload had this stream's underlying file
     /// checked out.
@@ -849,6 +871,17 @@ mod io_streams {
     // busy stream parks FIFO on the gate; a mid-flight cancel tombstones the slot
     // (best-effort — the resource cannot be reclaimed). There is no process to
     // signal, so cancellation runs no abort.
+    //
+    // Cancellation arm (R17A split). The structural edges — the gate wait, an
+    // `stream/close`, and a foreign-runtime close — are INTERRUPTIBLE (landed).
+    // The checked-out read/write ops themselves are a BOUNDED-CHUNK QUARANTINE:
+    // a portable abort for a blocked regular-file `read(2)` does not exist and
+    // closing the fd out from under the worker is racy, so `abort` stays `None`.
+    // The bound is instead structural: `stream/open-*` (and the `io.rs` quantum
+    // offloads) ADMIT only regular files (`crate::io::admit_regular_file`), so a
+    // FIFO/socket/device whose blocking read is unbounded can never be checked
+    // out. Every op the worker can run is therefore capped at one chunk, so a
+    // cancelled op's worker frees within that bound and the slot then tombstones.
 
     fn input_gate(stream: &Rc<StreamBox>) -> Option<ResourceGateHandle> {
         let inner = stream.borrow_inner();
@@ -999,6 +1032,14 @@ mod io_streams {
         let s_remove = stream.clone();
         let s_reinstall = stream.clone();
         let s_tomb = stream.clone();
+        // A regular-file read runs to completion on the blocking tier (no
+        // portable abort exists); the test-only delay lets a cancellation
+        // regression prove the worker occupancy stays bounded by one capped
+        // chunk. In production the delay is `0` — a no-op.
+        let op = move |reader: &mut BufReader<std::fs::File>| {
+            stream_checkout_test_delay();
+            op(reader)
+        };
         checkout_external(CheckoutOp {
             op_name,
             kind,
@@ -1011,6 +1052,8 @@ mod io_streams {
             decode: Box::new(decode),
             success_value: None,
             tombstone: Rc::new(move |msg| tombstone_input(&s_tomb, msg)),
+            // No portable abort for a blocked regular-file read; the bound is
+            // admission (only regular files reach here) + one capped chunk.
             abort: None,
             reclaim: None,
             terminal_on_success,
@@ -1034,6 +1077,12 @@ mod io_streams {
         let s_remove = stream.clone();
         let s_reinstall = stream.clone();
         let s_tomb = stream.clone();
+        // See `checkout_input_lifecycle`: the test-only delay bounds the
+        // cancellation window; production runs with `0`.
+        let op = move |writer: &mut BufWriter<std::fs::File>| {
+            stream_checkout_test_delay();
+            op(writer)
+        };
         checkout_external(CheckoutOp {
             op_name,
             kind,
@@ -1046,6 +1095,9 @@ mod io_streams {
             decode: Box::new(decode),
             success_value: None,
             tombstone: Rc::new(move |msg| tombstone_output(&s_tomb, msg)),
+            // See `checkout_input_lifecycle`: admission + one capped chunk are
+            // the cancellation bound; a blocked regular-file write has no
+            // portable abort.
             abort: None,
             reclaim: None,
             terminal_on_success: op_name == "stream/close",
@@ -2623,12 +2675,15 @@ mod io_streams {
         Value::stream(FileOutputStream::from_writer(writer))
     }
 
-    /// `stream/open-input`'s dispatch: under the unified runtime the blocking
-    /// `File::open` suspends structurally on a quarantined-bounded External wait —
-    /// mirrors `db/open`, there is no existing stream to contend over. Sync stays
-    /// today's shape.
+    /// `stream/open-input`'s dispatch: under the unified runtime the target is
+    /// first admitted (a non-blocking stat rejecting FIFOs/sockets/device nodes,
+    /// whose blocking `open`/`read` cannot be bounded or cancelled), then the
+    /// blocking `File::open` suspends structurally on a quarantined-bounded
+    /// External wait — mirrors `db/open`, there is no existing stream to contend
+    /// over. Sync stays today's (host-adapter) shape and is not admitted.
     pub(super) fn open_input(path: &str) -> NativeResult {
         if in_runtime_quantum() {
+            crate::io::admit_regular_file("stream/open-input", path)?;
             let path = path.to_string();
             return crate::io::quarantined_compute(
                 "stream/open-input",
@@ -2648,6 +2703,7 @@ mod io_streams {
     /// `stream/open-output`'s dispatch — see `open_input`.
     pub(super) fn open_output(path: &str) -> NativeResult {
         if in_runtime_quantum() {
+            crate::io::admit_regular_file("stream/open-output", path)?;
             let path = path.to_string();
             return crate::io::quarantined_compute(
                 "stream/open-output",
@@ -2786,6 +2842,9 @@ pub(crate) fn stdin_text_value(op: &str) -> Result<String, SemaError> {
 
 #[cfg(unix)]
 pub(crate) use io_streams::{acquire_stdin_input, StdinInputLease, StdinInputPoll};
+
+#[cfg(not(target_arch = "wasm32"))]
+pub use io_streams::set_stream_checkout_test_delay_ms;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn register_io(env: &Env, sandbox: &Sandbox) {

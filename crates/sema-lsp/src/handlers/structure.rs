@@ -157,6 +157,34 @@ impl BackendState {
         results
     }
 
+    /// Build the SignatureHelp for a user-defined function from its params
+    /// string (as extracted by `extract_params_from_ast`).
+    fn user_signature_help(
+        func_name: &str,
+        params_str: &str,
+        active_param: usize,
+    ) -> SignatureHelp {
+        let param_names = parse_param_names(params_str);
+        let label = format!("({func_name} {})", param_names.join(" "));
+        let parameters: Vec<ParameterInformation> = param_names
+            .iter()
+            .map(|p| ParameterInformation {
+                label: ParameterLabel::Simple(p.clone()),
+                documentation: None,
+            })
+            .collect();
+        SignatureHelp {
+            signatures: vec![SignatureInformation {
+                label,
+                documentation: None,
+                parameters: Some(parameters),
+                active_parameter: Some(active_param as u32),
+            }],
+            active_signature: Some(0),
+            active_parameter: Some(active_param as u32),
+        }
+    }
+
     pub(crate) fn handle_signature_help(
         &mut self,
         uri: &Url,
@@ -172,26 +200,11 @@ impl BackendState {
         let cached = self.cached_parses.get(uri_str)?;
 
         if let Some(params_str) = extract_params_from_ast(&cached.ast, &func_name) {
-            let param_names = parse_param_names(&params_str);
-            let label = format!("({func_name} {})", param_names.join(" "));
-            let parameters: Vec<ParameterInformation> = param_names
-                .iter()
-                .map(|p| ParameterInformation {
-                    label: ParameterLabel::Simple(p.clone()),
-                    documentation: None,
-                })
-                .collect();
-
-            return Some(SignatureHelp {
-                signatures: vec![SignatureInformation {
-                    label,
-                    documentation: None,
-                    parameters: Some(parameters),
-                    active_parameter: Some(active_param as u32),
-                }],
-                active_signature: Some(0),
-                active_parameter: Some(active_param as u32),
-            });
+            return Some(Self::user_signature_help(
+                &func_name,
+                &params_str,
+                active_param,
+            ));
         }
 
         // Try imported files
@@ -206,26 +219,11 @@ impl BackendState {
                 None => continue,
             };
             if let Some(params_str) = extract_params_from_ast(&cached.ast, &func_name) {
-                let param_names = parse_param_names(&params_str);
-                let label = format!("({func_name} {})", param_names.join(" "));
-                let parameters: Vec<ParameterInformation> = param_names
-                    .iter()
-                    .map(|p| ParameterInformation {
-                        label: ParameterLabel::Simple(p.clone()),
-                        documentation: None,
-                    })
-                    .collect();
-
-                return Some(SignatureHelp {
-                    signatures: vec![SignatureInformation {
-                        label,
-                        documentation: None,
-                        parameters: Some(parameters),
-                        active_parameter: Some(active_param as u32),
-                    }],
-                    active_signature: Some(0),
-                    active_parameter: Some(active_param as u32),
-                });
+                return Some(Self::user_signature_help(
+                    &func_name,
+                    &params_str,
+                    active_param,
+                ));
             }
         }
 
@@ -265,7 +263,17 @@ impl BackendState {
             });
         }
 
-        None
+        // Fall back to a workspace-wide search (other open documents, then
+        // still-fresh scanned files), mirroring goto-definition Phase 3d.
+        // Builtin docs outrank a workspace match — only an explicit import
+        // shadows a builtin signature.
+        let (ast, _module_name) = self.find_workspace_definition(uri, &func_name)?;
+        let params_str = extract_params_from_ast(ast, &func_name)?;
+        Some(Self::user_signature_help(
+            &func_name,
+            &params_str,
+            active_param,
+        ))
     }
 
     pub(crate) fn handle_folding_ranges(&self, uri: &Url) -> Vec<FoldingRange> {

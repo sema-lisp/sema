@@ -442,6 +442,72 @@ impl BackendState {
         self.import_cache.get(&path)
     }
 
+    /// Search the whole workspace for a top-level definition of `symbol`:
+    /// other open documents first, then still-fresh scanned files (dedup'd
+    /// against open documents by canonical path — same rules as references
+    /// and rename). Skips `current_uri`: its definitions were already
+    /// consulted by the caller. Returns the defining file's AST (for
+    /// signature/docstring extraction) plus a short display name (file stem)
+    /// for attribution.
+    pub(crate) fn find_workspace_definition(
+        &self,
+        current_uri: &Url,
+        symbol: &str,
+    ) -> Option<(&[sema_core::Value], String)> {
+        let mut open_paths: HashSet<PathBuf> = HashSet::new();
+        let mut found: Option<(&[sema_core::Value], String)> = None;
+        for (doc_uri_str, cached) in &self.cached_parses {
+            // Collect every open document's canonical path (even after a
+            // match) so the scan-cache dedup below sees the complete set.
+            if let Ok(doc_uri) = Url::parse(doc_uri_str) {
+                if let Ok(doc_path) = doc_uri.to_file_path() {
+                    open_paths.insert(canonicalize_or_raw(&doc_path));
+                }
+            }
+            if found.is_some() || doc_uri_str == current_uri.as_str() {
+                continue;
+            }
+            // Names only; ranges discarded — &[] skips UTF-16 mapping.
+            let defs =
+                user_definitions_from_ast(&cached.ast, &cached.span_map, &cached.symbol_spans, &[]);
+            if defs.iter().any(|(name, _)| name == symbol) {
+                let stem = Path::new(doc_uri_str)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(doc_uri_str)
+                    .to_string();
+                found = Some((&cached.ast, stem));
+            }
+        }
+        if found.is_some() {
+            return found;
+        }
+
+        for (path, import_cached) in &self.import_cache {
+            if open_paths.contains(&canonicalize_or_raw(path)) {
+                continue;
+            }
+            if !import_cached.is_fresh(path) {
+                continue;
+            }
+            let defs = user_definitions_from_ast(
+                &import_cached.ast,
+                &import_cached.span_map,
+                &import_cached.symbol_spans,
+                &[],
+            );
+            if defs.iter().any(|(name, _)| name == symbol) {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                return Some((&import_cached.ast, stem));
+            }
+        }
+        None
+    }
+
     /// Index every top-level definition across open documents: name → (uri, form range, name range).
     pub(crate) fn def_index(&self) -> std::collections::HashMap<String, (Url, Range, Range)> {
         let mut index = std::collections::HashMap::new();

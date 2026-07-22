@@ -1952,6 +1952,97 @@ fn completion_works_on_trailing_empty_line_after_newline() {
     );
 }
 
+// ── hover / signature help: workspace-wide fallback ──────────
+
+#[test]
+fn hover_finds_definition_in_scanned_workspace_file() {
+    let dir = unique_temp_dir("hover-ws");
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet \"world\")\n");
+    insert_scanned_file(
+        &mut state,
+        &dir.join("library.sema"),
+        "(define (greet name) name)\n",
+    );
+
+    let hover = state
+        .handle_hover(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 1,
+            },
+        )
+        .expect("hover must fall back to the workspace definition");
+    let HoverContents::Markup(content) = hover.contents else {
+        panic!("expected markdown hover");
+    };
+    // Params render with their list parens, matching the current-doc and
+    // "Imported from" hover branches.
+    assert!(
+        content.value.contains("(greet (name))"),
+        "hover must show the signature: {}",
+        content.value
+    );
+    assert!(
+        content.value.contains("*Defined in `library`*"),
+        "a workspace match is attributed to its file, not an import: {}",
+        content.value
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn hover_finds_definition_in_other_open_document() {
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet \"world\")\n");
+    insert_parsed_doc(
+        &mut state,
+        "file:///ws/library.sema",
+        "(define (greet name) name)\n",
+    );
+
+    let hover = state
+        .handle_hover(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 1,
+            },
+        )
+        .expect("hover must fall back to other open documents");
+    let HoverContents::Markup(content) = hover.contents else {
+        panic!("expected markdown hover");
+    };
+    assert!(
+        content.value.contains("*Defined in `library`*"),
+        "got: {}",
+        content.value
+    );
+}
+
+#[test]
+fn signature_help_finds_definition_in_scanned_workspace_file() {
+    let dir = unique_temp_dir("sig-ws");
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet x)\n");
+    insert_scanned_file(
+        &mut state,
+        &dir.join("library.sema"),
+        "(define (greet name) name)\n",
+    );
+
+    let help = state
+        .handle_signature_help(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 7,
+            },
+        )
+        .expect("signature help must fall back to the workspace definition");
+    assert_eq!(help.signatures.len(), 1);
+    assert_eq!(help.signatures[0].label, "(greet name)");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ── workspace scanner ────────────────────────────────────────
 
 /// The scanner must follow symlinked directories and files (DirEntry

@@ -383,6 +383,75 @@ fn cache_hit_does_not_recharge_usage() {
     );
 }
 
+/// A cache hit served from DISK (not the in-memory cache) must charge ZERO usage —
+/// identical to the in-memory hit. C3 moved the disk read off the runtime quantum
+/// (an offloaded blocking-tier peek); the accounting invariant is unchanged. Run 1
+/// populates the on-disk cache with a real call; run 2 starts with an EMPTY in-memory
+/// cache (fresh interpreter + `reset_runtime_state`), so the same prompt can only be
+/// served from disk.
+#[test]
+fn disk_cache_hit_charges_zero_usage() {
+    // Unique prompt so the on-disk cache key never collides with another test/run.
+    let prompt = format!("disk-cache-probe-{}-{}", std::process::id(), line!());
+
+    // Run 1: a real completion (150 tokens) populates the on-disk cache.
+    let rec_fake = FakeProvider::builder("fake")
+        .model("m")
+        .reply_with_usage("cached-on-disk", 100, 50)
+        .build();
+    {
+        let interp = Interpreter::new();
+        reset_runtime_state();
+        register_test_provider(Box::new(rec_fake));
+        let total = interp
+            .eval_str_compiled(&format!(
+                r#"(llm/with-cache {{:ttl 3600}} (fn () (llm/complete "{prompt}" {{:model "m"}})))
+                   (:total-tokens (llm/session-usage))"#
+            ))
+            .expect("run 1 populates the disk cache");
+        assert_eq!(total.as_int(), Some(150), "run 1 charges the real provider call");
+    }
+
+    // Run 2: fresh interpreter (empty in-memory cache) + a fake that ERRORS if called.
+    // The same prompt must be served from the ON-DISK cache via the offloaded peek,
+    // charging ZERO usage and never touching the provider.
+    let must_not_call = FakeProvider::builder("fake")
+        .model("m")
+        .error(sema_llm::types::LlmError::Api {
+            status: 500,
+            message: "disk cache hit must not call the provider".into(),
+        })
+        .build();
+    let recorder = must_not_call.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(must_not_call));
+    let result = interp
+        .eval_str_compiled(&format!(
+            r#"(llm/with-cache {{:ttl 3600}}
+                 (fn ()
+                   (let ((answer (llm/complete "{prompt}" {{:model "m"}})))
+                     (list answer (:total-tokens (llm/session-usage))))))"#
+        ))
+        .expect("run 2 serves from the on-disk cache");
+    let items = result.as_list().expect("list result");
+    assert_eq!(
+        items[0].as_str(),
+        Some("cached-on-disk"),
+        "disk cache hit serves the recorded content"
+    );
+    assert_eq!(
+        items[1].as_int(),
+        Some(0),
+        "disk cache hit charges ZERO usage (no provider call)"
+    );
+    assert_eq!(
+        recorder.call_count(),
+        0,
+        "disk cache hit must not call the provider"
+    );
+}
+
 /// Prompt-cache token counts flow through to session/last usage. Providers that
 /// surface `cache_read_input_tokens` / `cache_creation_input_tokens` (Anthropic
 /// distinctly, OpenAI/Gemini as a subset of prompt tokens) must be visible to

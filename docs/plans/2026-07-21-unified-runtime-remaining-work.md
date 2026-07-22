@@ -810,6 +810,34 @@ Gap (verified): `SEMA_OTEL_FILE` uses `with_simple_exporter`
 
 ### Commit C3 — LLM cache/cassette disk I/O off the quantum (closes C09)
 
+**Landed 2026-07-22.** The cache disk READ moved off the VM thread: prep does a
+MEM-only probe (a mem hit short-circuits with zero usage), and the
+`RuntimeCompleteDriver` gained a `CachePeek` phase that offloads the disk read to
+the blocking tier (`interruptible_blocking`) before pacing/providers — a disk hit
+populates the in-memory cache, counts the hit, and finalizes inline with ZERO usage
+(identical to the mem hit; never recharges), while a sibling runs during the park.
+`store_cached` renders the JSON on the VM thread and offloads the disk WRITE
+(`io_spawn_blocking` when a quantum is active, synchronous on the host thread). The
+cassette tape LOAD became a dual-ABI offloaded External job (`llm/with-cassette` /
+`llm/cassette-load` suspend on a blocking-tier `Tape::load`, then install the scope
+and call the body under a scope-teardown continuation; wasm keeps the synchronous
+path); cassette SAVE renders pending NDJSON on the VM thread via
+`Cassette::take_pending_append` and appends off the quantum
+(`crate::cassette::append_ndjson`). Every raw cache/cassette fs site routes through
+`note_off_quantum_fs`, which fires a `debug_assert!(!in_runtime_quantum())` and bumps
+a release-safe seam counter (`quantum_fs_calls`) the regression reads. Regression:
+`llm_fake_test::disk_cache_hit_charges_zero_usage`,
+`llm_root_nonblocking_test::{disk_cache_hit_parks_while_a_sibling_runs,
+cache_and_cassette_do_no_filesystem_io_on_the_quantum}`,
+`cassette::tests::take_pending_append_renders_and_marks_persisted`; the full
+`llm_cassette_test`/`llm_fake_test`/`llm_root_nonblocking_test` suites and
+`sema-llm` unit tests stay green. Source guard: `note_off_quantum_fs` +
+`check-unified-runtime-legacy.sh --check` passes (the host-path `with-cassette` body
+call bumps the `CALL_CALLBACK` allowlist count for `builtins.rs` 15→16). **C09
+flipped to `MIGRATED (C3)`** in `docs/internals/async-runtime-inventory.md`; the
+`runtime-match-map.tsv` re-map and the `runtime_conformance_test` inventory
+reconciliation are the deferred **C7** work and remain red.
+
 Gap (verified): `load_cached` disk read runs in `complete_offload_prep` on the
 VM thread pre-dispatch (`crates/sema-llm/src/builtins.rs:6862` via `:7359`);
 `store_cached` writes on resume (`:6878-6880` via `:7521`); cassette

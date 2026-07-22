@@ -198,6 +198,7 @@ impl Tape {
     /// Load a tape from an NDJSON file. A missing file yields an empty tape (the
     /// normal first-run/record case). Malformed lines are skipped.
     pub fn load(path: &Path) -> Tape {
+        crate::builtins::note_off_quantum_fs("cassette tape load");
         let mut tape = Tape::default();
         if let Ok(text) = std::fs::read_to_string(path) {
             for line in text.lines() {
@@ -213,8 +214,10 @@ impl Tape {
         tape
     }
 
-    /// Serialize the tape as NDJSON, creating parent directories as needed.
+    /// Serialize the tape as NDJSON, creating parent directories as needed. MUST run
+    /// off the runtime quantum (used by the host path and in-crate tests).
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        crate::builtins::note_off_quantum_fs("cassette tape save");
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
@@ -278,6 +281,13 @@ pub enum Decision {
 impl Cassette {
     pub fn load(path: PathBuf, mode: CassetteMode) -> Cassette {
         let tape = Tape::load(&path);
+        Cassette::from_tape(path, mode, tape)
+    }
+
+    /// Build a cassette around an ALREADY-loaded tape. The runtime path offloads the
+    /// `Tape::load` disk read to the blocking tier (so the quantum never touches the
+    /// filesystem) and reconstructs the cassette here on the VM thread.
+    pub fn from_tape(path: PathBuf, mode: CassetteMode, tape: Tape) -> Cassette {
         let persisted_entries = tape.len();
         Cassette {
             mode,
@@ -312,43 +322,78 @@ impl Cassette {
 
     /// Append only this instance's newly recorded entries. Independent task scopes
     /// may load the same path before either finishes; append-only persistence keeps
-    /// both sets of entries instead of letting the last full-file rewrite win.
+    /// both sets of entries instead of letting the last full-file rewrite win. MUST
+    /// run off the runtime quantum — the runtime routes this through
+    /// `take_pending_append` + a blocking-tier [`append_ndjson`] instead.
     pub fn save(&mut self) -> std::io::Result<()> {
         if !self.dirty {
             return Ok(());
         }
-        if let Some(parent) = self.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
+        let encoded = self.render_pending();
+        append_ndjson(&self.path, &encoded)?;
+        self.persisted_entries = self.tape.len();
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Render this instance's not-yet-persisted entries as NDJSON (no filesystem
+    /// access). Bounded by the entries appended since load.
+    fn render_pending(&self) -> String {
         let mut encoded = String::new();
         for entry in self.tape.entries.iter().skip(self.persisted_entries) {
             encoded.push_str(&serde_json::to_string(entry).unwrap_or_default());
             encoded.push('\n');
         }
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&self.path)?;
-        let file_len = file.metadata()?.len();
-        if file_len > 0 {
-            file.seek(SeekFrom::End(-1))?;
-            let mut tail = [0_u8; 1];
-            file.read_exact(&mut tail)?;
-            if tail[0] != b'\n' {
-                // A prior append may have written a prefix before returning an
-                // error. Isolate that malformed tail so this retry begins on a
-                // fresh NDJSON line; `Tape::load` skips the quarantined prefix.
-                file.write_all(b"\n")?;
-            }
+        encoded
+    }
+
+    /// The VM-thread half of an off-quantum save: render the pending NDJSON (bounded)
+    /// and mark it persisted, handing the `(path, bytes)` to a blocking-tier writer
+    /// that performs the [`append_ndjson`]. Returns `None` when nothing is pending.
+    /// Because the append is fire-and-forget best-effort (the tape's existing trust
+    /// model), the entries are marked persisted up front so a later `save`/drop is a
+    /// no-op rather than a double append.
+    pub fn take_pending_append(&mut self) -> Option<(PathBuf, String)> {
+        if !self.dirty {
+            return None;
         }
-        file.write_all(encoded.as_bytes())?;
+        let encoded = self.render_pending();
         self.persisted_entries = self.tape.len();
         self.dirty = false;
-        Ok(())
+        Some((self.path.clone(), encoded))
     }
+}
+
+/// Append `encoded` NDJSON to `path`, quarantining any incomplete trailing line so a
+/// retry begins on a fresh line (`Tape::load` skips the quarantined prefix). This is
+/// the single filesystem site for cassette persistence and MUST run OFF the runtime
+/// quantum: the VM thread renders via [`Cassette::take_pending_append`] and a
+/// blocking-tier worker (or the host thread) performs this append.
+pub fn append_ndjson(path: &Path, encoded: &str) -> std::io::Result<()> {
+    crate::builtins::note_off_quantum_fs("cassette append");
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(path)?;
+    let file_len = file.metadata()?.len();
+    if file_len > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut tail = [0_u8; 1];
+        file.read_exact(&mut tail)?;
+        if tail[0] != b'\n' {
+            // A prior append may have written a prefix before returning an error.
+            // Isolate that malformed tail so this retry begins on a fresh NDJSON line.
+            file.write_all(b"\n")?;
+        }
+    }
+    file.write_all(encoded.as_bytes())?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -485,6 +530,32 @@ mod tests {
             Decision::Replay(_)
         ));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn take_pending_append_renders_and_marks_persisted() {
+        let path = std::env::temp_dir().join(format!(
+            "sema-cassette-pending-{}-{}/tape.ndjson",
+            std::process::id(),
+            line!()
+        ));
+        let mut cass = Cassette::load(path.clone(), CassetteMode::Record);
+        cass.record_entry(TapeEntry::from_response("k", &resp("v", 1, 1)));
+
+        // The VM-thread half renders the pending NDJSON and marks it persisted.
+        let (rendered_path, encoded) = cass.take_pending_append().expect("pending entry");
+        assert_eq!(rendered_path, path);
+        assert!(encoded.contains("\"key\":\"k\""));
+        assert!(
+            cass.take_pending_append().is_none(),
+            "entries are marked persisted, so a second render yields nothing"
+        );
+
+        // The rendered bytes append (the off-quantum writer's half) and reload cleanly.
+        append_ndjson(&path, &encoded).expect("append rendered bytes");
+        let replay = Cassette::load(path.clone(), CassetteMode::Replay);
+        assert!(matches!(replay.decide("k"), Decision::Replay(_)));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

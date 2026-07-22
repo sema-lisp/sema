@@ -658,3 +658,110 @@ fn cancelling_rate_pacing_issues_no_request_or_usage_charge() {
         "the cancelled paced call must not reach the provider"
     );
 }
+
+/// A disk-cache HIT parks the root task on the offloaded disk read (C3), so a sibling
+/// spawned beforehand runs to completion while the root is suspended. If the disk read
+/// ran synchronously on the quantum the root would send its cached answer before ever
+/// yielding, and the order would flip. Run 1 populates the on-disk cache; run 2 (fresh
+/// interpreter, empty in-memory cache) can only be served from disk.
+#[test]
+#[serial]
+fn disk_cache_hit_parks_while_a_sibling_runs() {
+    let prompt = format!("disk-park-probe-{}", std::process::id());
+
+    // Run 1: populate the on-disk cache with a real completion.
+    let rec_fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .reply("cached")
+        .build();
+    {
+        let interp = Interpreter::new();
+        reset_runtime_state();
+        register_test_provider(Box::new(rec_fake));
+        interp
+            .eval_str_compiled(&format!(
+                r#"(llm/with-cache {{:ttl 3600}} (fn () (llm/complete "{prompt}" {{:model "fake-chat"}})))"#
+            ))
+            .expect("run 1 populates the disk cache");
+    }
+
+    // Run 2: a fake that ERRORS if the provider is called — the hit is served from
+    // disk. The instant sibling only lands "sibling" first if the root parked on the
+    // offloaded peek.
+    let must_not_call = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .error(LlmError::Api {
+            status: 500,
+            message: "disk cache hit must not call the provider".into(),
+        })
+        .build();
+    let recorder = must_not_call.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(must_not_call));
+    let value = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (llm/with-cache {{:ttl 3600}}
+              (fn ()
+                (let ((out (channel/new 2)))
+                  (async/spawn (fn () (channel/send out "sibling")))
+                  (channel/send out (llm/complete "{prompt}" {{:model "fake-chat"}}))
+                  (list (channel/recv out) (channel/recv out)))))
+            "#
+        ))
+        .expect("disk cache hit settles with a runnable sibling");
+
+    assert_eq!(
+        strings(&value),
+        ["sibling", "cached"],
+        "the sibling runs while the root parks on the offloaded cache disk read"
+    );
+    assert_eq!(
+        recorder.call_count(),
+        0,
+        "the disk cache hit must not call the provider"
+    );
+}
+
+/// The cache and cassette disk legs MUST run OFF the runtime quantum (C3). This drives
+/// a cache miss+store and a cassette record (tape load + save) through the cooperative
+/// runtime and asserts the release-safe seam counter — every raw cache/cassette fs site
+/// bumps it when it runs while a quantum is active — stays at 0.
+#[test]
+#[serial]
+fn cache_and_cassette_do_no_filesystem_io_on_the_quantum() {
+    use sema_llm::builtins::{quantum_fs_calls, reset_quantum_fs_calls};
+
+    let prompt = format!("seam-probe-{}", std::process::id());
+    let cassette = std::env::temp_dir().join(format!("sema-seam-{}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&cassette);
+
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .reply("a")
+        .reply("b")
+        .build();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+    reset_quantum_fs_calls();
+
+    interp
+        .eval_str_compiled(&format!(
+            r#"
+            (llm/with-cache {{:ttl 3600}} (fn () (llm/complete "{prompt}" {{:model "fake-chat"}})))
+            (llm/with-cassette "{cass}" {{:mode :record}}
+              (fn () (llm/complete "{prompt}-cass" {{:model "fake-chat"}})))
+            "#,
+            cass = cassette.display()
+        ))
+        .expect("cache + cassette workload runs under the runtime");
+
+    assert_eq!(
+        quantum_fs_calls(),
+        0,
+        "cache/cassette filesystem I/O must never run on the runtime quantum"
+    );
+    let _ = std::fs::remove_file(&cassette);
+}

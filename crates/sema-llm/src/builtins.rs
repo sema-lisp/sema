@@ -291,7 +291,7 @@ impl CassetteState {
 impl Drop for CassetteState {
     fn drop(&mut self) {
         if let Some(cassette) = self.cassette.get_mut().as_mut() {
-            let _ = cassette.save();
+            persist_cassette_off_quantum(cassette);
         }
     }
 }
@@ -542,6 +542,138 @@ fn cassette_scope(cassette: crate::cassette::Cassette) -> CassetteScope {
     Rc::new(CassetteState::new(cassette))
 }
 
+/// Persist a cassette's pending entries OFF the runtime quantum. Renders the pending
+/// NDJSON on the VM thread (bounded), then appends on a blocking-tier worker when a
+/// quantum is active (best-effort, matching the tape's existing trust model — the
+/// durable record→replay path tears down after a suspended provider call, so it
+/// appends synchronously here off the quantum), or synchronously on the host thread
+/// otherwise.
+fn persist_cassette_off_quantum(cassette: &mut crate::cassette::Cassette) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if sema_core::in_runtime_quantum() {
+            if let Some((path, encoded)) = cassette.take_pending_append() {
+                sema_io::io_spawn_blocking(move || {
+                    let _ = crate::cassette::append_ndjson(&path, &encoded);
+                });
+            }
+            return;
+        }
+    }
+    let _ = cassette.save();
+}
+
+/// Install an already-loaded cassette into a fresh scope, disabling the response
+/// cache for its dynamic extent (a cache hit would short-circuit before the tape —
+/// see [`crate::cassette`]), and return the teardown that flushes the tape (off the
+/// quantum) and restores the prior cassette + cache state. Shared by both ABIs of
+/// `llm/with-cassette`.
+fn install_loaded_cassette(cassette: crate::cassette::Cassette) -> Box<dyn FnOnce()> {
+    let active = cassette_scope(cassette);
+    let prev_cassette = install_cassette_scope(Some(Rc::clone(&active)));
+    let prev_cache = CACHE_ENABLED.with(|c| c.replace(false));
+    Box::new(move || {
+        {
+            let mut guard = active.borrow_mut();
+            persist_cassette_off_quantum(&mut guard);
+        }
+        install_cassette_scope(prev_cassette);
+        CACHE_ENABLED.with(|c| c.set(prev_cache));
+    })
+}
+
+/// Parse `(llm/with-cassette "path" [{:mode :auto}] thunk)` → (path, mode, body thunk).
+fn parse_with_cassette_args(
+    args: &[Value],
+) -> Result<(std::path::PathBuf, crate::cassette::CassetteMode, Value), SemaError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(SemaError::arity("llm/with-cassette", "2 or 3", args.len()));
+    }
+    let path = args[0]
+        .as_str()
+        .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+    let (mode, body_fn) = if args.len() == 3 {
+        let opts = args[1]
+            .as_map_ref()
+            .ok_or_else(|| SemaError::type_error("map", args[1].type_name()))?;
+        let mode = get_opt_effort(opts, "mode")
+            .map(|s| crate::cassette::CassetteMode::parse(&s))
+            .unwrap_or(crate::cassette::CassetteMode::Auto);
+        (mode, args[2].clone())
+    } else {
+        (crate::cassette::CassetteMode::Auto, args[1].clone())
+    };
+    if body_fn.as_lambda_rc().is_none() && body_fn.as_native_fn_rc().is_none() {
+        return Err(SemaError::type_error("function", body_fn.type_name()));
+    }
+    Ok((std::path::PathBuf::from(path), mode, body_fn))
+}
+
+/// Parse `(llm/cassette-load "path" [{:mode :replay}])` → (path, mode).
+fn parse_cassette_load_args(
+    args: &[Value],
+) -> Result<(std::path::PathBuf, crate::cassette::CassetteMode), SemaError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(SemaError::arity("llm/cassette-load", "1 or 2", args.len()));
+    }
+    let path = args[0]
+        .as_str()
+        .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+    let mode = if args.len() == 2 {
+        let opts = args[1]
+            .as_map_ref()
+            .ok_or_else(|| SemaError::type_error("map", args[1].type_name()))?;
+        get_opt_effort(opts, "mode")
+            .map(|s| crate::cassette::CassetteMode::parse(&s))
+            .unwrap_or(crate::cassette::CassetteMode::Auto)
+    } else {
+        crate::cassette::CassetteMode::Auto
+    };
+    Ok((std::path::PathBuf::from(path), mode))
+}
+
+/// Runtime-ABI arm of `llm/with-cassette`: OFFLOAD the tape load off the quantum, then
+/// resume by installing the scope and calling the body under a scope-teardown guard.
+#[cfg(not(target_arch = "wasm32"))]
+fn with_cassette_runtime(args: &[Value]) -> sema_core::runtime::NativeResult {
+    let (path, mode, body_fn) = parse_with_cassette_args(args)?;
+    suspend_cassette_load(path, mode, CassetteLoadThen::WithBody(body_fn))
+}
+
+/// wasm has no cooperative-runtime External wait: load synchronously and call the body.
+#[cfg(target_arch = "wasm32")]
+fn with_cassette_runtime(args: &[Value]) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::{NativeCall, NativeOutcome};
+    let (path, mode, body_fn) = parse_with_cassette_args(args)?;
+    let cassette = crate::cassette::Cassette::load(path, mode);
+    let teardown = install_loaded_cassette(cassette);
+    Ok(NativeOutcome::Call(NativeCall {
+        callable: body_fn,
+        args: Vec::new(),
+        continuation: Box::new(ScopeGuardContinuation {
+            teardown: Some(teardown),
+        }),
+    }))
+}
+
+/// Runtime-ABI arm of `llm/cassette-load`: OFFLOAD the tape load off the quantum, then
+/// install it in the ambient scope.
+#[cfg(not(target_arch = "wasm32"))]
+fn cassette_load_runtime(args: &[Value]) -> sema_core::runtime::NativeResult {
+    let (path, mode) = parse_cassette_load_args(args)?;
+    suspend_cassette_load(path, mode, CassetteLoadThen::Install)
+}
+
+/// wasm has no cooperative-runtime External wait: load synchronously and install.
+#[cfg(target_arch = "wasm32")]
+fn cassette_load_runtime(args: &[Value]) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::NativeOutcome;
+    let (path, mode) = parse_cassette_load_args(args)?;
+    let cassette = crate::cassette::Cassette::load(path, mode);
+    install_cassette(cassette);
+    Ok(NativeOutcome::Return(Value::nil()))
+}
+
 fn cassette_decide(key: &str) -> Option<crate::cassette::Decision> {
     let scope = current_cassette_scope()?;
     let decision = scope.borrow().decide(key);
@@ -589,6 +721,41 @@ pub fn io_peak_inflight() -> usize {
 pub fn reset_io_inflight() {
     IO_INFLIGHT.store(0, std::sync::atomic::Ordering::SeqCst);
     IO_PEAK.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// How many raw cache/cassette filesystem sites executed while a runtime quantum was
+/// active on the calling thread. Under the cooperative runtime this MUST stay 0 — the
+/// disk legs are offloaded onto the blocking tier (cache read/write, cassette
+/// load/save). The `debug_assert` in [`note_off_quantum_fs`] catches a regression in
+/// debug builds; this counter is the release-safe seam the tests read.
+static QUANTUM_FS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Guard for every raw cache/cassette filesystem site: they MUST run OFF the
+/// cooperative runtime quantum (on a blocking-tier worker or the host thread). Fires
+/// a `debug_assert` and bumps [`QUANTUM_FS_CALLS`] if invoked while a quantum is
+/// active on this thread.
+pub(crate) fn note_off_quantum_fs(site: &str) {
+    let on_quantum = sema_core::in_runtime_quantum();
+    if on_quantum {
+        QUANTUM_FS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    debug_assert!(
+        !on_quantum,
+        "{site}: cache/cassette filesystem I/O ran on the runtime quantum"
+    );
+}
+
+/// Test seam: number of cache/cassette fs sites that ran on a quantum thread (must be
+/// 0). See [`note_off_quantum_fs`].
+#[doc(hidden)]
+pub fn quantum_fs_calls() -> u64 {
+    QUANTUM_FS_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reset the quantum-fs seam counter (test helper).
+#[doc(hidden)]
+pub fn reset_quantum_fs_calls() {
+    QUANTUM_FS_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// RAII gauge for one offloaded completion future: bumps `IO_INFLIGHT` + `IO_PEAK`
@@ -708,7 +875,7 @@ pub fn take_cassette() -> Option<crate::cassette::Cassette> {
         Ok(mut state) => state.cassette.get_mut().take(),
         Err(scope) => {
             let mut active = scope.borrow_mut();
-            let _ = active.save();
+            persist_cassette_off_quantum(&mut active);
             let cassette = active.clone();
             Some(cassette)
         }
@@ -5899,83 +6066,60 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
     // --- Cassette (record/replay) builtins ---
 
-    register_scope_fn_ctx(env, "llm/with-cassette", |args| {
-        // (llm/with-cassette "path.jsonl" [{:mode :auto}] thunk)
-        if args.len() < 2 || args.len() > 3 {
-            return Err(SemaError::arity("llm/with-cassette", "2 or 3", args.len()));
-        }
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let (mode, body_fn) = if args.len() == 3 {
-            let opts = args[1]
-                .as_map_ref()
-                .ok_or_else(|| SemaError::type_error("map", args[1].type_name()))?;
-            let mode = get_opt_effort(opts, "mode")
-                .map(|s| crate::cassette::CassetteMode::parse(&s))
-                .unwrap_or(crate::cassette::CassetteMode::Auto);
-            (mode, &args[2])
-        } else {
-            (crate::cassette::CassetteMode::Auto, &args[1])
-        };
-        if body_fn.as_lambda_rc().is_none() && body_fn.as_native_fn_rc().is_none() {
-            return Err(SemaError::type_error("function", body_fn.type_name()));
-        }
-        let cassette = crate::cassette::Cassette::load(std::path::PathBuf::from(path), mode);
-        // Swap in the cassette and disable the response cache for the dynamic extent
-        // (a cache hit would short-circuit before the tape — see crate::cassette).
-        let active_cassette = cassette_scope(cassette);
-        let prev_cassette = install_cassette_scope(Some(Rc::clone(&active_cassette)));
-        let prev_cache = CACHE_ENABLED.with(|c| c.replace(false));
-        Ok((
-            body_fn.clone(),
-            Box::new(move || {
-                // Flush the tape, then restore the prior cassette + cache state.
-                let _ = active_cassette.borrow_mut().save();
-                install_cassette_scope(prev_cassette);
-                CACHE_ENABLED.with(|c| c.set(prev_cache));
-            }),
-        ))
-    });
+    // (llm/with-cassette "path.jsonl" [{:mode :auto}] thunk). The tape LOAD is a disk
+    // read; under the cooperative runtime it OFFLOADS to the blocking tier so the
+    // quantum never touches the filesystem, then installs the scope and calls the body.
+    env.set(
+        sema_core::intern("llm/with-cassette"),
+        Value::native_fn(NativeFn::with_ctx_runtime(
+            "llm/with-cassette",
+            |ctx, args| {
+                // Host (non-quantum) path: synchronous load, body call, then flush.
+                let (path, mode, body_fn) = parse_with_cassette_args(args)?;
+                let cassette = crate::cassette::Cassette::load(path, mode);
+                let teardown = install_loaded_cassette(cassette);
+                let result = sema_core::call_callback(ctx, &body_fn, &[]);
+                teardown();
+                result
+            },
+            |_native_ctx, args| with_cassette_runtime(args),
+        )),
+    );
 
-    register_fn(env, "llm/cassette-load", |args| {
-        // (llm/cassette-load "path" [{:mode :replay}]) — install in the current
-        // ambient scope. Tasks spawned afterward inherit this cassette; tasks that
-        // already exist retain the scope they captured at spawn time.
-        if args.is_empty() || args.len() > 2 {
-            return Err(SemaError::arity("llm/cassette-load", "1 or 2", args.len()));
-        }
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let mode = if args.len() == 2 {
-            let opts = args[1]
-                .as_map_ref()
-                .ok_or_else(|| SemaError::type_error("map", args[1].type_name()))?;
-            get_opt_effort(opts, "mode")
-                .map(|s| crate::cassette::CassetteMode::parse(&s))
-                .unwrap_or(crate::cassette::CassetteMode::Auto)
-        } else {
-            crate::cassette::CassetteMode::Auto
-        };
-        let cassette = crate::cassette::Cassette::load(std::path::PathBuf::from(path), mode);
-        install_cassette(cassette);
-        Ok(Value::nil())
-    });
+    // (llm/cassette-load "path" [{:mode :replay}]) — install in the current ambient
+    // scope. Tasks spawned afterward inherit this cassette; tasks that already exist
+    // retain the scope they captured at spawn time. The tape load offloads off the
+    // quantum under the runtime.
+    env.set(
+        sema_core::intern("llm/cassette-load"),
+        Value::native_fn(NativeFn::with_ctx_runtime(
+            "llm/cassette-load",
+            |_ctx, args| {
+                let (path, mode) = parse_cassette_load_args(args)?;
+                let cassette = crate::cassette::Cassette::load(path, mode);
+                install_cassette(cassette);
+                Ok(Value::nil())
+            },
+            |_native_ctx, args| cassette_load_runtime(args),
+        )),
+    );
 
     register_fn(env, "llm/cassette-save", |_args| {
-        let saved = current_cassette_scope().map(|scope| scope.borrow_mut().save());
-        match saved {
-            Some(Ok(())) => Ok(Value::bool(true)),
-            Some(Err(e)) => Err(SemaError::eval(format!("cassette save failed: {e}"))),
+        // Flush the active tape OFF the quantum (best-effort under the runtime; the
+        // in-memory tape is authoritative, disk persistence is best-effort).
+        match current_cassette_scope() {
+            Some(scope) => {
+                let mut guard = scope.borrow_mut();
+                persist_cassette_off_quantum(&mut guard);
+                Ok(Value::bool(true))
+            }
             None => Ok(Value::bool(false)),
         }
     });
 
     register_fn(env, "llm/cassette-eject", |_args| {
-        let cass = take_cassette();
-        if let Some(mut cass) = cass {
-            let _ = cass.save();
+        if let Some(mut cass) = take_cassette() {
+            persist_cassette_off_quantum(&mut cass);
             Ok(Value::bool(true))
         } else {
             Ok(Value::bool(false))
@@ -6854,15 +6998,28 @@ fn cache_file_path(key: &str) -> std::path::PathBuf {
 }
 
 fn load_cached(key: &str) -> Option<CachedResponse> {
-    let mem_hit = CACHE_MEM.with(|c| c.borrow().get(key).cloned());
-    if let Some(cached) = mem_hit {
+    if let Some(cached) = load_cached_mem(key) {
         return Some(cached);
     }
-    let path = cache_file_path(key);
-    let data = std::fs::read_to_string(&path).ok()?;
-    let cached: CachedResponse = serde_json::from_str(&data).ok()?;
+    let cached = read_cached_from_disk(&cache_file_path(key))?;
     CACHE_MEM.with(|c| c.borrow_mut().insert(key.to_string(), cached.clone()));
     Some(cached)
+}
+
+/// In-memory (per-task-scope) cache probe only — never touches disk. The VM-thread
+/// preparation stage uses this so a mem hit short-circuits while the disk read is
+/// offloaded onto the runtime's blocking tier (the cache-peek phase below).
+fn load_cached_mem(key: &str) -> Option<CachedResponse> {
+    CACHE_MEM.with(|c| c.borrow().get(key).cloned())
+}
+
+/// Read one cache entry off DISK. The single cache-read filesystem site; MUST run OFF
+/// the runtime quantum — on the blocking tier (the driver's cache-peek phase) or the
+/// host thread. A missing/corrupt file is a miss (`None`), never an error.
+fn read_cached_from_disk(path: &std::path::Path) -> Option<CachedResponse> {
+    note_off_quantum_fs("llm cache read");
+    let data = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
 }
 
 fn store_cached(key: &str, response: &ChatResponse) {
@@ -6873,11 +7030,53 @@ fn store_cached(key: &str, response: &ChatResponse) {
         completion_tokens: response.usage.completion_tokens,
         cached_at: unix_timestamp(),
     };
+    // In-memory cache is authoritative for in-process reuse; update it on the VM
+    // thread. Render the JSON here (bounded — a single response) and push the DISK
+    // write off the quantum.
     CACHE_MEM.with(|c| c.borrow_mut().insert(key.to_string(), cached.clone()));
-    let dir = cache_dir();
-    let _ = std::fs::create_dir_all(&dir);
     if let Ok(json) = serde_json::to_string(&cached) {
-        let _ = std::fs::write(cache_file_path(key), json);
+        persist_cache_file_off_quantum(cache_file_path(key), json);
+    }
+}
+
+/// Persist a cache entry OFF the runtime quantum: on a blocking-tier worker when a
+/// quantum is active, or synchronously on the host thread otherwise. Best-effort —
+/// the in-memory cache already covers in-process reuse, so a dropped disk write only
+/// forgoes cross-process persistence (the entry's existing trust model).
+fn persist_cache_file_off_quantum(path: std::path::PathBuf, json: String) {
+    let write = move || {
+        note_off_quantum_fs("llm cache write");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, json);
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if sema_core::in_runtime_quantum() {
+            sema_io::io_spawn_blocking(write);
+            return;
+        }
+    }
+    write();
+}
+
+/// Build the ZERO-usage `ChatResponse` served by a cache hit. A hit made NO provider
+/// call, so it reports zero tokens: `track_usage` must not recharge session cost or
+/// burn the budget for a cached response (the disk hit is identical to the mem hit).
+fn cache_hit_response(cached: CachedResponse, usage_model: String) -> ChatResponse {
+    ChatResponse {
+        content: cached.content,
+        role: "assistant".to_string(),
+        model: cached.model,
+        tool_calls: vec![],
+        usage: Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            model: usage_model,
+            ..Default::default()
+        },
+        stop_reason: Some("cache_hit".to_string()),
     }
 }
 
@@ -7134,25 +7333,10 @@ fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
     if let Some(cached) = load_cached(&cache_key) {
         if is_cache_valid(&cached) {
             CACHE_HITS.with(|c| c.set(c.get() + 1));
-            // A cache hit makes no provider call: no tokens are consumed and no
-            // money is spent. Report ZERO usage so the caller's `track_usage` does
-            // not re-charge session cost or burn the budget for a cached response
-            // (the provider never saw this request). The cached token counts live
-            // in the on-disk/in-memory entry if ever needed; the live accounting
-            // must reflect actual spend.
-            let resp = ChatResponse {
-                content: cached.content,
-                role: "assistant".to_string(),
-                model: cached.model,
-                tool_calls: vec![],
-                usage: Usage {
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    model: key_request.model.clone(),
-                    ..Default::default()
-                },
-                stop_reason: Some("cache_hit".to_string()),
-            };
+            // A cache hit makes no provider call: no tokens are consumed and no money
+            // is spent. Report ZERO usage so the caller's `track_usage` does not
+            // re-charge session cost or burn the budget for a cached response.
+            let resp = cache_hit_response(cached, key_request.model.clone());
             // Cache-hit span: no provider served it; tag gen_ai.cache.hit=true with
             // zero usage (matches the zero-usage accounting invariant).
             span.set_dispatch("", &resp.model);
@@ -7356,33 +7540,20 @@ fn complete_offload_prep(request: ChatRequest) -> Result<CompletePrep, SemaError
         let mut key_request = request.clone();
         key_request.model = key_model;
         let key = compute_cache_key(&key_request);
-        if let Some(cached) = load_cached(&key) {
+        // MEM-only probe on the VM thread — a mem hit short-circuits with ZERO usage
+        // exactly like `do_complete`. The DISK read is offloaded by the driver's
+        // cache-peek phase (so no fs touches the quantum), where the hit/miss counters
+        // are bumped once the disk result lands.
+        if let Some(cached) = load_cached_mem(&key) {
             if is_cache_valid(&cached) {
                 CACHE_HITS.with(|c| c.set(c.get() + 1));
-                // A cache hit made no provider call → ZERO usage (mirrors
-                // `do_complete`), so `track_usage` does not recharge or burn budget.
-                let resp = ChatResponse {
-                    content: cached.content,
-                    role: "assistant".to_string(),
-                    model: cached.model,
-                    tool_calls: vec![],
-                    usage: Usage {
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        model: key_request.model.clone(),
-                        ..Default::default()
-                    },
-                    stop_reason: Some("cache_hit".to_string()),
-                };
+                let resp = cache_hit_response(cached, key_request.model.clone());
                 span.set_dispatch("", &resp.model);
                 span.set_response(&response_facts("", &resp));
                 drop(span);
                 return Ok(CompletePrep::Inline(resp));
             }
         }
-        // Cache miss (no entry, or entry present but invalid) — mirror the sync
-        // `do_complete` so `(llm/cache-stats)` :misses is accurate for async traffic.
-        CACHE_MISSES.with(|c| c.set(c.get() + 1));
         Some(key)
     } else {
         None
@@ -7560,6 +7731,14 @@ fn finalize_complete_success(
 #[cfg(not(target_arch = "wasm32"))]
 const AGENT_COMPLETE_COMPLETION_KIND: u64 = 0x6c6c_6d63; // "llmc"
 
+/// Completion-kind tag for the offloaded cache disk-read peek.
+#[cfg(not(target_arch = "wasm32"))]
+const CACHE_PEEK_COMPLETION_KIND: u64 = 0x6361_6368; // "cach"
+
+/// Completion-kind tag for an offloaded cassette tape LOAD (disk read).
+#[cfg(not(target_arch = "wasm32"))]
+const CASSETTE_LOAD_COMPLETION_KIND: u64 = 0x6373_6c64; // "csld"
+
 /// True when a provider call must offload and suspend on the unified runtime's
 /// External wait. Root-main and spawned tasks obey the same boundary.
 #[cfg(not(target_arch = "wasm32"))]
@@ -7627,6 +7806,7 @@ fn dispatch_complete_runtime_plan(
         next_provider: 0,
         last_error: None,
         phase: RuntimeCompletePhase::Ready,
+        cache_peeked: false,
         usage_accum_slot: current_usage_accum(),
         budget_slot: active_budget(),
     })
@@ -7636,9 +7816,20 @@ fn dispatch_complete_runtime_plan(
 #[cfg(not(target_arch = "wasm32"))]
 type CompleteAttemptSlot = Rc<RefCell<Option<Result<CompleteOutcome, crate::types::LlmError>>>>;
 
+/// Delivery slot for the offloaded cache-peek disk read. Outer `Option` = "the
+/// decoder ran"; inner `Option<CachedResponse>` = "a well-formed on-disk entry" (or a
+/// miss). Validity/TTL is checked on the VM thread when the read lands.
+#[cfg(not(target_arch = "wasm32"))]
+type CachePeekSlot = Rc<RefCell<Option<Option<CachedResponse>>>>;
+
 #[cfg(not(target_arch = "wasm32"))]
 enum RuntimeCompletePhase {
     Ready,
+    /// Parked on the offloaded cache disk read (blocking tier); a hit finalizes inline
+    /// with zero usage, a miss proceeds to the provider chain.
+    CachePeek {
+        slot: CachePeekSlot,
+    },
     Pacing,
     Sema {
         provider: String,
@@ -7657,6 +7848,9 @@ struct RuntimeCompleteDriver {
     next_provider: usize,
     last_error: Option<crate::types::LlmError>,
     phase: RuntimeCompletePhase,
+    /// Whether the offloaded cache disk peek has already run (it runs at most once,
+    /// before pacing and the provider chain).
+    cache_peeked: bool,
     usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
     budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
 }
@@ -7672,6 +7866,17 @@ impl sema_core::runtime::Trace for RuntimeCompleteDriver {
 impl RuntimeCompleteDriver {
     fn advance(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
         use sema_core::runtime::{NativeCall, NativeOutcome, NativeSuspend, WaitKind};
+
+        // ── Cache disk peek (once, before pacing/providers) ──────────────────
+        // The on-disk read is offloaded to the blocking tier so the quantum never
+        // touches the filesystem; a hit finalizes inline with ZERO usage and leaves
+        // any sibling task runnable while parked.
+        if !self.cache_peeked {
+            self.cache_peeked = true;
+            if let Some(key) = self.plan.cache_key.clone() {
+                return self.suspend_cache_peek(key);
+            }
+        }
 
         if self.plan.rate_limit_wait_ms > 0 {
             let delay = std::time::Duration::from_millis(self.plan.rate_limit_wait_ms);
@@ -7730,6 +7935,69 @@ impl RuntimeCompleteDriver {
 
             return self.suspend_native_attempt(provider, provider_name, request);
         }
+    }
+
+    /// Suspend on the offloaded cache disk read for `key`. The read runs on the
+    /// blocking tier (`interruptible_blocking`), never the VM quantum.
+    fn suspend_cache_peek(
+        mut self: Box<Self>,
+        key: String,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{
+            CompletionKind, InterruptibleResource, NativeOutcome, NativeSuspend,
+            PreparedExternalOperation, SendPayload, WaitKind,
+        };
+        let slot: CachePeekSlot = Rc::new(RefCell::new(None));
+        let decoder = Box::new(CachePeekDecoder {
+            slot: Rc::clone(&slot),
+        });
+        self.phase = RuntimeCompletePhase::CachePeek { slot };
+        let kind = CompletionKind::try_from_raw(CACHE_PEEK_COMPLETION_KIND)
+            .expect("cache-peek completion kind is nonzero");
+        let resource =
+            InterruptibleResource::new("llm/cache-peek", Box::new(CompleteNoopCancelHook));
+        let path = cache_file_path(&key);
+        let prepared = PreparedExternalOperation::interruptible_blocking(
+            kind,
+            decoder,
+            resource,
+            move || Ok(Box::new(read_cached_from_disk(&path)) as SendPayload),
+        );
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::External(Box::new(prepared)),
+            continuation: self,
+        }))
+    }
+
+    /// Resume after the offloaded cache disk read. A valid on-disk entry is a HIT:
+    /// populate the in-memory cache, count the hit, and finalize inline with ZERO
+    /// usage — identical to the mem hit, so `track_usage` never recharges. Otherwise
+    /// count the miss and proceed to the provider chain.
+    fn finish_cache_peek(
+        mut self: Box<Self>,
+        disk: Option<CachedResponse>,
+    ) -> sema_core::runtime::NativeResult {
+        if let Some(cached) = disk {
+            if is_cache_valid(&cached) {
+                CACHE_HITS.with(|c| c.set(c.get() + 1));
+                let Self { plan, finalize, .. } = *self;
+                if let Some(key) = &plan.cache_key {
+                    CACHE_MEM.with(|c| c.borrow_mut().insert(key.clone(), cached.clone()));
+                }
+                let usage_model = cached.model.clone();
+                let resp = cache_hit_response(cached, usage_model);
+                plan.span.set_dispatch("", &resp.model);
+                plan.span.set_response(&response_facts("", &resp));
+                drop(plan.span);
+                track_usage(&resp.usage)?;
+                return finalize.finish(resp);
+            }
+        }
+        // Miss (no entry, or entry present but invalid) — count it once here (deferred
+        // from prep) so `(llm/cache-stats)` :misses is accurate, then run providers.
+        CACHE_MISSES.with(|c| c.set(c.get() + 1));
+        self.phase = RuntimeCompletePhase::Ready;
+        self.advance()
     }
 
     fn suspend_native_attempt(
@@ -7844,6 +8112,14 @@ impl sema_core::runtime::NativeContinuation for RuntimeCompleteDriver {
         use sema_core::runtime::ResumeInput;
 
         match (&self.phase, input) {
+            (RuntimeCompletePhase::CachePeek { slot }, ResumeInput::Returned(_)) => {
+                let disk = slot.borrow_mut().take().flatten();
+                self.finish_cache_peek(disk)
+            }
+            (RuntimeCompletePhase::CachePeek { .. }, ResumeInput::Failed(_)) => {
+                // A failed disk read is a cache miss, not a fatal error — run providers.
+                self.finish_cache_peek(None)
+            }
             (RuntimeCompletePhase::Pacing, ResumeInput::Returned(_)) => {
                 let mut this = self;
                 this.phase = RuntimeCompletePhase::Ready;
@@ -7935,6 +8211,187 @@ impl sema_core::runtime::CompletionDecoder for CompleteAttemptDecoder {
         *slot = Some(result);
         Ok(Value::nil())
     }
+}
+
+/// Decoder for the offloaded cache disk peek: hands the on-disk `Option<CachedResponse>`
+/// back to the driver. Holds no `Value`, so it emits no GC edges.
+#[cfg(not(target_arch = "wasm32"))]
+struct CachePeekDecoder {
+    slot: CachePeekSlot,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for CachePeekDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CompletionDecoder for CachePeekDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        let payload = result
+            .map_err(|failure| SemaError::eval(format!("cache peek: {}", failure.message())))?;
+        let cached =
+            sema_core::runtime::downcast_send_payload::<Option<CachedResponse>>(payload, "cache-peek")
+                .map_err(|failure| SemaError::eval(format!("cache peek: {}", failure.message())))?;
+        *self.slot.borrow_mut() = Some(cached);
+        Ok(Value::nil())
+    }
+}
+
+/// What to do once an offloaded cassette tape LOAD lands.
+#[cfg(not(target_arch = "wasm32"))]
+enum CassetteLoadThen {
+    /// `llm/with-cassette`: install the loaded cassette scope, then CALL the body
+    /// thunk under a scope-teardown continuation.
+    WithBody(Value),
+    /// `llm/cassette-load`: install the cassette in the ambient scope, then return nil.
+    Install,
+}
+
+/// Continuation that reconstructs a cassette from an offloaded tape read and either
+/// runs the `with-cassette` body or installs the ambient scope. Traces the body thunk
+/// (a `Value` that may capture live state).
+#[cfg(not(target_arch = "wasm32"))]
+struct CassetteLoadContinuation {
+    slot: Rc<RefCell<Option<crate::cassette::Tape>>>,
+    path: std::path::PathBuf,
+    mode: crate::cassette::CassetteMode,
+    then: CassetteLoadThen,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for CassetteLoadContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        if let CassetteLoadThen::WithBody(body) = &self.then {
+            sink(sema_core::cycle::GcEdge::Value(body));
+        }
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::NativeContinuation for CassetteLoadContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome, ResumeInput};
+        match input {
+            ResumeInput::Returned(_) => {
+                let Self {
+                    slot,
+                    path,
+                    mode,
+                    then,
+                } = *self;
+                let tape = slot.borrow_mut().take().ok_or_else(|| {
+                    SemaError::eval("cassette load result was not delivered")
+                })?;
+                let cassette = crate::cassette::Cassette::from_tape(path, mode, tape);
+                match then {
+                    CassetteLoadThen::Install => {
+                        install_cassette(cassette);
+                        Ok(NativeOutcome::Return(Value::nil()))
+                    }
+                    CassetteLoadThen::WithBody(body_fn) => {
+                        let teardown = install_loaded_cassette(cassette);
+                        Ok(NativeOutcome::Call(NativeCall {
+                            callable: body_fn,
+                            args: Vec::new(),
+                            continuation: Box::new(ScopeGuardContinuation {
+                                teardown: Some(teardown),
+                            }),
+                        }))
+                    }
+                }
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "llm/with-cassette load was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "cassette load received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// Decoder for an offloaded cassette tape LOAD: hands the loaded `Tape` to the
+/// continuation. Holds no `Value`, so it emits no GC edges.
+#[cfg(not(target_arch = "wasm32"))]
+struct CassetteLoadDecoder {
+    slot: Rc<RefCell<Option<crate::cassette::Tape>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for CassetteLoadDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CompletionDecoder for CassetteLoadDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        let payload = result
+            .map_err(|failure| SemaError::eval(format!("cassette load: {}", failure.message())))?;
+        let tape = sema_core::runtime::downcast_send_payload::<crate::cassette::Tape>(
+            payload,
+            "cassette-load",
+        )
+        .map_err(|failure| SemaError::eval(format!("cassette load: {}", failure.message())))?;
+        *self.slot.borrow_mut() = Some(tape);
+        Ok(Value::nil())
+    }
+}
+
+/// Suspend on an offloaded cassette tape LOAD (disk read) so the quantum never touches
+/// the filesystem, resuming into `then`.
+#[cfg(not(target_arch = "wasm32"))]
+fn suspend_cassette_load(
+    path: std::path::PathBuf,
+    mode: crate::cassette::CassetteMode,
+    then: CassetteLoadThen,
+) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::{
+        CompletionKind, InterruptibleResource, NativeOutcome, NativeSuspend,
+        PreparedExternalOperation, SendPayload, WaitKind,
+    };
+    let slot: Rc<RefCell<Option<crate::cassette::Tape>>> = Rc::new(RefCell::new(None));
+    let decoder = Box::new(CassetteLoadDecoder {
+        slot: Rc::clone(&slot),
+    });
+    let kind = CompletionKind::try_from_raw(CASSETTE_LOAD_COMPLETION_KIND)
+        .expect("cassette load kind is nonzero");
+    let resource =
+        InterruptibleResource::new("llm/with-cassette", Box::new(CompleteNoopCancelHook));
+    let load_path = path.clone();
+    let prepared = PreparedExternalOperation::interruptible_blocking(
+        kind,
+        decoder,
+        resource,
+        move || Ok(Box::new(crate::cassette::Tape::load(&load_path)) as SendPayload),
+    );
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(CassetteLoadContinuation {
+            slot,
+            path,
+            mode,
+            then,
+        }),
+    }))
 }
 
 /// No-op cancel hook for the completion External wait: the executor aborts the
@@ -12960,6 +13417,7 @@ mod tests {
             next_provider: 0,
             last_error: None,
             phase: RuntimeCompletePhase::Ready,
+            cache_peeked: false,
             usage_accum_slot: None,
             budget_slot: None,
         };

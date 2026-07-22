@@ -10,7 +10,7 @@ SET_EVAL_CALLBACK	crates/sema/src/lib.rs	1	embedding builder construction instal
 CALL_CALLBACK	crates/sema-core/src/context.rs	5	host-only callback API definition/fallback plus in-file rejection and compatibility tests
 CALL_CALLBACK	crates/sema-core/src/value.rs	1	host-only multimethod dispatch selector; runtime dispatch is structural
 CALL_CALLBACK	crates/sema-eval/src/eval.rs	1	host-only legacy force callback; runtime force uses its structural continuation
-CALL_CALLBACK	crates/sema-llm/src/builtins.rs	15	plain-value LLM compatibility and synchronous tool-loop paths; runtime variants use traced structural continuations
+CALL_CALLBACK	crates/sema-llm/src/builtins.rs	16	plain-value LLM compatibility and synchronous tool-loop paths (incl. the non-quantum llm/with-cassette body call; the runtime arm offloads the tape load and calls the body via a structural continuation)
 CALL_CALLBACK	crates/sema-stdlib/src/context.rs	1	plain-value context/with adapter; runtime invocation uses ContextWithContinuation
 CALL_CALLBACK	crates/sema-stdlib/src/io.rs	1	host-only file/for-each-line adapter; runtime file-line callbacks are structural
 CALL_CALLBACK	crates/sema-stdlib/src/list.rs	2	host-only plain-value HOF dispatch; runtime HOFs use structural callback continuations

@@ -74,9 +74,22 @@ thread_local! {
     // Keep MCP connections in a thread-local map so each Sema evaluator can own its own
     // client state without introducing cross-thread sharing.
     static CONNECTIONS: RefCell<HashMap<String, Rc<ConnEntry>>> = RefCell::new(HashMap::new());
-    // Host-only compatibility authority for Rust entry points without an
-    // evaluator context (`connect_from_config`, workflow OAuth helpers). Sema
-    // natives capture their registering evaluator's sandbox directly.
+    // HOST-ADAPTER-ONLY (C5 / ledger C04). A deliberately retained ambient
+    // last-wins authority slot for Rust host entry points that have NO evaluator
+    // context to capture a sandbox from — `connect_from_config`, `host_capability_allowed`,
+    // and the workflow OAuth browser-opener helpers (`browser_open_allowed`).
+    // `register_mcp_builtins` writes the registering evaluator's sandbox here, and
+    // the reads on lines below `.clone()`/check it before any thread hop.
+    //
+    // This is NOT the authority for Sema-callable MCP natives: those each capture
+    // their registering evaluator's sandbox directly (`ee24c700`), so two
+    // interpreters on one thread never cross-authorize (regression:
+    // `mcp_builtin_test.rs`). The seam is single-thread host-only: it is never read
+    // on a background/worker thread (`resolved_browser_opener`/`BrowserAuthority`
+    // carry an already-resolved `bool` across every thread hop) and never inside a
+    // runtime quantum. It is pinned by a `HOST_SANDBOX` row in
+    // `scripts/unified-runtime-host-adapters.tsv`; adding an unallowlisted
+    // `HOST_SANDBOX.with` site fails `scripts/check-unified-runtime-legacy.sh`.
     static HOST_SANDBOX: RefCell<Sandbox> = RefCell::new(Sandbox::allow_all());
 }
 

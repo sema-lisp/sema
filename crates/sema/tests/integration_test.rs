@@ -7370,6 +7370,41 @@ fn test_sandbox_fs_write_denied() {
     assert_permission_denied(&result.unwrap_err());
 }
 
+// C5 (closes ledger row C04): the non-MCP `EvalContext.sandbox` is ROOT-SHARED —
+// a task spawned with `async/spawn` runs under the SAME sandbox as its parent and
+// cannot widen it. Registered natives capture their evaluator's sandbox at
+// `register_stdlib` time and every task on the interpreter dispatches through those
+// same closures, so a denied capability stays denied across the spawn boundary
+// (there is no per-task sandbox a child could escalate). This locks the
+// child-same-or-narrower contract for the plain evaluator; MCP's per-evaluator
+// authority isolation is proven separately in `mcp_builtin_test.rs`.
+#[test]
+fn spawned_child_sandbox_is_same_or_narrower() {
+    let sandbox = sema_core::Sandbox::deny(sema_core::Caps::FS_WRITE);
+    let interp = Interpreter::new_with_sandbox(&sandbox);
+
+    // A denied capability stays denied inside a spawned child: the child inherits
+    // the parent's sandbox and cannot escalate to permit the write. The permission
+    // error is raised on the VM thread (pre-dispatch gate) and propagates back
+    // through `async/await`.
+    let denied = interp.eval_str_compiled(
+        r#"(async/await (async/spawn (fn () (file/write "/tmp/sema-c5-sandbox-child.txt" "hi"))))"#,
+    );
+    assert!(
+        denied.is_err(),
+        "a spawned child must not widen a parent's denied FS_WRITE"
+    );
+    assert_permission_denied(&denied.unwrap_err());
+
+    // The same child still runs everything the parent's sandbox permits — the
+    // sandbox is inherited unchanged (same authority, neither widened nor
+    // spuriously narrowed).
+    let allowed = interp
+        .eval_str_compiled(r#"(async/await (async/spawn (fn () (+ 40 2))))"#)
+        .expect("a spawned child keeps every capability the parent's sandbox allows");
+    assert_eq!(allowed, sema_core::Value::int(42));
+}
+
 #[test]
 fn test_sandbox_fs_read_denied() {
     let sandbox = sema_core::Sandbox::deny(sema_core::Caps::FS_READ);

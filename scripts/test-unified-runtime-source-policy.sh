@@ -61,7 +61,8 @@ expect_failure \
   WITH_STDLIB_CTX \
   SET_CALL_CALLBACK \
   SET_CALL_OWNED_CALLBACK \
-  HOST_OUTPUT_HOOK
+  HOST_OUTPUT_HOOK \
+  HOST_SANDBOX
 
 # This fixture is deliberately allowlisted by exact token counts. It must still
 # fail because it places synchronous callback re-entry inside an active runtime

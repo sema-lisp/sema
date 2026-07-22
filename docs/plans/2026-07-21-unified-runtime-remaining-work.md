@@ -926,6 +926,23 @@ jobs have a concurrency bound but no per-job time bound.
 
 ### Commit C5 — sandbox residual evidence (closes C04)
 
+**Landed 2026-07-22.** Evidence/annotation only — no behavior change. `HOST_SANDBOX`
+(`crates/sema-mcp/src/builtins.rs`) is documented as a deliberate HOST-ADAPTER-ONLY
+ambient authority slot for the three evaluator-context-less Rust entry points
+(`connect_from_config`/`host_capability_allowed`/`browser_open_allowed`) and pinned by
+a `HOST_SANDBOX` row (`crates/sema-mcp/src/builtins.rs`, exact count 6 — install +
+2 authority-capture tests + 3 reads) in `scripts/unified-runtime-host-adapters.tsv`,
+with a non-allowlisted `HOST_SANDBOX.with` fixture use
+(`unallowlisted-host-adapters.rs`) that fails `scripts/check-unified-runtime-legacy.sh`.
+The NON-MCP `EvalContext.sandbox` child-narrowing contract is locked by a new
+regression `integration_test::spawned_child_sandbox_is_same_or_narrower` (a task
+spawned via `async/spawn` inherits its parent's FS_WRITE denial and cannot widen it;
+an allowed capability still runs). The MCP per-evaluator authority isolation
+(`ee24c700`, `mcp_builtin_test.rs:240-283`) stays green. **C04 flipped to
+`MIGRATED (C5)`** in `docs/internals/async-runtime-inventory.md`; the
+`runtime-match-map.tsv` re-map and the `runtime_conformance_test` inventory
+reconciliation are the deferred **C7** work and remain red.
+
 Landed (`ee24c700`): per-native captured sandboxes + `BrowserAuthority`
 snapshot-before-thread-hop + interpreter-isolation regression
 (`mcp_builtin_test.rs:240-283`). Remaining (verified): `HOST_SANDBOX`

@@ -8,4 +8,6 @@ fn unallowlisted_host_adapter(ctx: &EvalContext) {
     with_stdlib_ctx(|ctx| callback(ctx));
     set_call_callback(ctx, call);
     set_call_owned_callback(ctx, call_owned);
+    set_host_stdout_hook(Some(Box::new(|_s: &str| {})));
+    set_host_stderr_hook(Some(Box::new(|_s: &str| {})));
 }

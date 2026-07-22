@@ -479,13 +479,13 @@ where
 
     let buf = Arc::new(Mutex::new(String::new()));
     let out = buf.clone();
-    sema_core::set_stdout_hook(Some(Box::new(move |s: &str| {
+    sema_core::set_host_stdout_hook(Some(Box::new(move |s: &str| {
         if let Ok(mut b) = out.lock() {
             b.push_str(s);
         }
     })));
     let err = buf.clone();
-    sema_core::set_stderr_hook(Some(Box::new(move |s: &str| {
+    sema_core::set_host_stderr_hook(Some(Box::new(move |s: &str| {
         if let Ok(mut b) = err.lock() {
             b.push_str(s);
         }
@@ -497,8 +497,8 @@ where
     // into an error result.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
 
-    sema_core::set_stdout_hook(None);
-    sema_core::set_stderr_hook(None);
+    sema_core::set_host_stdout_hook(None);
+    sema_core::set_host_stderr_hook(None);
 
     let captured = buf.lock().map(|b| b.clone()).unwrap_or_default();
 

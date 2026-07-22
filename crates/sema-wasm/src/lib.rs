@@ -567,16 +567,18 @@ fn js_err(error: &JsValue) -> String {
 type WasmNativeFn = Box<dyn Fn(&[Value]) -> Result<Value, SemaError>>;
 
 /// Make `sema_core::write_stdout`/`write_stderr`'s NON-capturing fallback
-/// (`STDOUT_HOOK`/`STDERR_HOOK`) an inert no-op, so `append_output`'s new
-/// `write_stdout` forward has zero effect outside a capturing runtime root.
+/// (`HOST_STDOUT_HOOK`/`HOST_STDERR_HOOK`) an inert no-op, so `append_output`'s
+/// new `write_stdout` forward has zero effect outside a capturing runtime root.
 /// Without this, the fallback is `print!`/`eprint!` — real syscalls
 /// that are `unsupported` on wasm32-unknown-unknown and `.expect()`-panic
 /// there (the same class of bug this session already found and fixed for
 /// `Instant::now()`/`std::thread::spawn`). Idempotent; called once per
-/// `WasmInterpreter` construction via `register_wasm_io`.
+/// `WasmInterpreter` construction via `register_wasm_io`. HOST-ADAPTER-ONLY: the
+/// wasm host owns the process, so installing the core fallback hooks is
+/// sanctioned (see `sema_core::set_host_stdout_hook`).
 fn install_noop_core_output_hooks() {
-    sema_core::set_stdout_hook(Some(Box::new(|_s: &str| {})));
-    sema_core::set_stderr_hook(Some(Box::new(|_s: &str| {})));
+    sema_core::set_host_stdout_hook(Some(Box::new(|_s: &str| {})));
+    sema_core::set_host_stderr_hook(Some(Box::new(|_s: &str| {})));
 }
 
 fn register_wasm_io(env: &Env) {

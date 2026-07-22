@@ -6,24 +6,53 @@ use crate::runtime::{RootId, RuntimeId};
 
 type OutputHook = Option<Box<dyn Fn(&str) + Send>>;
 
-// Thread-local output hooks for capturing program stdout/stderr.
-// Used by the DAP server to redirect program output into DAP `Output` events
-// instead of letting it corrupt the JSON-RPC protocol stream on stdout.
+// HOST-ADAPTER-ONLY fallback output hooks (C05 / Commit C1).
+//
+// These thread-local hooks let a HOST adapter keep program stdout/stderr off the
+// process's real streams: the DAP server redirects program output into `Output`
+// events so prints don't corrupt the JSON-RPC stream, the MCP `eval_with_capture`
+// buffers it out of the protocol stream, the wasm host installs inert no-op
+// sinks (a real `print!` is an unsupported syscall on wasm32), and the
+// debug-session tests capture stderr. They are the fallback taken only when the
+// currently running root did NOT opt into root-tagged capture
+// (`OUTPUT_CAPTURE_ROUTES`, below) — the runtime-tagged path is unaffected.
+//
+// Contract (enforced): a hook is a non-suspending `Fn(&str)` — it MUST NOT block
+// or structurally suspend, because it runs an arbitrary host closure on the VM
+// thread inside a quantum where there is no runtime wait to yield to. A hook is
+// free to print, but a hook that itself calls `write_stdout`/`write_stderr`
+// re-enters as a PASS-THROUGH (a direct `print!`/`eprint!`), never an unbounded
+// recursion: `IN_HOST_OUTPUT_HOOK` latches the thread for the duration of one
+// hook invocation. Installation is HOST-ADAPTER-ONLY — the `set_host_*` naming
+// and the `HOST_OUTPUT_HOOK` source-policy allowlist pin every install site.
 thread_local! {
-    static STDOUT_HOOK: RefCell<OutputHook> = RefCell::new(None);
-    static STDERR_HOOK: RefCell<OutputHook> = RefCell::new(None);
+    static HOST_STDOUT_HOOK: RefCell<OutputHook> = RefCell::new(None);
+    static HOST_STDERR_HOOK: RefCell<OutputHook> = RefCell::new(None);
+    // Latched for the duration of one host output-hook invocation on this
+    // thread so a hook that itself prints passes straight through instead of
+    // re-entering the hook (unbounded recursion). Shared across stdout/stderr so
+    // a cross-stream print inside a hook (a stdout hook that writes stderr) also
+    // passes through.
+    static IN_HOST_OUTPUT_HOOK: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Set the thread-local stdout capture hook.
-/// Pass `None` to clear.
-pub fn set_stdout_hook(hook: OutputHook) {
-    STDOUT_HOOK.with(|cell| *cell.borrow_mut() = hook);
+/// Install the thread-local HOST-ADAPTER-ONLY stdout capture hook; `None` clears.
+///
+/// HOST-ADAPTER-ONLY: only a host embedding (DAP/MCP/wasm/debug-session) that
+/// owns the process may install this. The hook must be a non-suspending
+/// `Fn(&str)` (see the module contract above); a hook that prints re-enters as a
+/// pass-through via the re-entrancy latch, never recursion. Runtime code routes
+/// output through root-tagged capture, never this fallback.
+pub fn set_host_stdout_hook(hook: OutputHook) {
+    HOST_STDOUT_HOOK.with(|cell| *cell.borrow_mut() = hook);
 }
 
-/// Set the thread-local stderr capture hook.
-/// Pass `None` to clear.
-pub fn set_stderr_hook(hook: OutputHook) {
-    STDERR_HOOK.with(|cell| *cell.borrow_mut() = hook);
+/// Install the thread-local HOST-ADAPTER-ONLY stderr capture hook; `None` clears.
+///
+/// See [`set_host_stdout_hook`] for the HOST-ADAPTER-ONLY / non-suspending
+/// contract and the re-entrancy latch.
+pub fn set_host_stderr_hook(hook: OutputHook) {
+    HOST_STDERR_HOOK.with(|cell| *cell.borrow_mut() = hook);
 }
 
 /// One line of program output captured for a root that opted into
@@ -166,36 +195,73 @@ fn output_capture_route_count() -> usize {
     OUTPUT_CAPTURE_ROUTES.with(|routes| routes.borrow().len())
 }
 
+/// RAII latch that closes the host output-hook re-entrancy hole. [`enter`] hands
+/// back `Some` only for the outermost hook invocation on this thread; while the
+/// guard is held, a hook that calls `write_stdout`/`write_stderr` again sees
+/// `None` and passes straight through. `Drop` clears the latch even if the hook
+/// panics, so a panicking hook can't wedge the thread into permanent pass-through.
+///
+/// [`enter`]: HostHookGuard::enter
+struct HostHookGuard;
+
+impl HostHookGuard {
+    fn enter() -> Option<Self> {
+        IN_HOST_OUTPUT_HOOK.with(|latched| {
+            if latched.get() {
+                None
+            } else {
+                latched.set(true);
+                Some(HostHookGuard)
+            }
+        })
+    }
+}
+
+impl Drop for HostHookGuard {
+    fn drop(&mut self) {
+        IN_HOST_OUTPUT_HOOK.with(|latched| latched.set(false));
+    }
+}
+
 /// Write a string to stdout: captured for the current quantum's root if it
-/// opted into `capture_output`, otherwise through the DAP hook (if set) or
-/// via `print!`, exactly as before capture existed.
+/// opted into `capture_output`, otherwise routed through the HOST-ADAPTER-ONLY
+/// fallback hook (if a host installed one) or via `print!`. A hook that itself
+/// prints re-enters through the latch as a direct `print!`, never recursion.
 pub fn write_stdout(s: &str) {
     if try_capture(false, s) {
         return;
     }
-    STDOUT_HOOK.with(|cell| {
-        if let Some(hook) = cell.borrow().as_ref() {
-            hook(s);
-        } else {
-            print!("{}", s);
-        }
-    });
+    match HostHookGuard::enter() {
+        Some(_guard) => HOST_STDOUT_HOOK.with(|cell| {
+            if let Some(hook) = cell.borrow().as_ref() {
+                hook(s);
+            } else {
+                print!("{}", s);
+            }
+        }),
+        // Re-entrant call from inside a running hook: pass through directly.
+        None => print!("{}", s),
+    }
 }
 
-/// Write a string to stderr: captured for the current quantum's root if it
-/// opted into `capture_output`, otherwise through the DAP hook (if set) or
-/// via `eprint!`, exactly as before capture existed.
+/// Write a string to stderr: mirrors [`write_stdout`] — root capture first, then
+/// the HOST-ADAPTER-ONLY fallback hook or `eprint!`, guarded by the same
+/// re-entrancy latch so a hook that prints passes through instead of recursing.
 pub fn write_stderr(s: &str) {
     if try_capture(true, s) {
         return;
     }
-    STDERR_HOOK.with(|cell| {
-        if let Some(hook) = cell.borrow().as_ref() {
-            hook(s);
-        } else {
-            eprint!("{}", s);
-        }
-    });
+    match HostHookGuard::enter() {
+        Some(_guard) => HOST_STDERR_HOOK.with(|cell| {
+            if let Some(hook) = cell.borrow().as_ref() {
+                hook(s);
+            } else {
+                eprint!("{}", s);
+            }
+        }),
+        // Re-entrant call from inside a running hook: pass through directly.
+        None => eprint!("{}", s),
+    }
 }
 
 #[cfg(test)]
@@ -265,13 +331,59 @@ mod tests {
         assert_eq!(output_capture_route_count(), 1);
 
         drop(sink_b);
-        set_stdout_hook(Some(Box::new(|_| {})));
+        set_host_stdout_hook(Some(Box::new(|_| {})));
         set_current_root(Some(root_b));
         write_stdout("dead route falls through");
         set_current_root(None);
 
         assert_eq!(capturing_root_count(), 0);
         assert_eq!(output_capture_route_count(), 0);
-        set_stdout_hook(None);
+        set_host_stdout_hook(None);
+    }
+
+    #[test]
+    fn reentrant_host_hook_passes_through_without_recursion() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // A host hook that itself prints. Without the re-entrancy latch its
+        // nested `write_stdout` would call the hook again — unbounded recursion
+        // (a stack overflow that aborts the process). With the latch, the nested
+        // write passes straight through, so the hook runs exactly once and the
+        // test returns.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_hook = calls.clone();
+        set_host_stdout_hook(Some(Box::new(move |_s: &str| {
+            calls_hook.fetch_add(1, Ordering::SeqCst);
+            write_stdout("nested-from-hook");
+        })));
+
+        write_stdout("outer");
+        set_host_stdout_hook(None);
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn host_hook_delivers_output_during_a_quantum() {
+        use std::sync::{Arc, Mutex};
+
+        // A DAP/MCP-style capture hook: a current root is published (a runtime
+        // quantum is active) but it did not opt into root-tagged capture, so
+        // output must still reach the host fallback hook.
+        let buf = Arc::new(Mutex::new(String::new()));
+        let sink = buf.clone();
+        set_host_stdout_hook(Some(Box::new(move |s: &str| {
+            sink.lock().unwrap().push_str(s);
+        })));
+
+        let (_runtime, root) = runtime_and_root();
+        set_current_root(Some(root));
+        write_stdout("hello ");
+        write_stdout("world");
+        set_current_root(None);
+        set_host_stdout_hook(None);
+
+        assert_eq!(buf.lock().unwrap().as_str(), "hello world");
     }
 }

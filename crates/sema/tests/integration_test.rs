@@ -6118,6 +6118,34 @@ fn test_println_error() {
     assert_eq!(eval(r#"(println-error)"#), Value::nil());
 }
 
+// C1: a HOST-ADAPTER-ONLY output hook that itself prints must NOT recurse — the
+// re-entrancy latch in `write_stdout` routes the nested write straight through.
+// Drive a real Sema `print` (which calls `sema_core::write_stdout`) through such
+// a hook and prove it delivers exactly once and returns. Without the latch, the
+// nested write would invoke the hook again, recursing until the stack overflows
+// and aborts the test process.
+#[test]
+fn host_stdout_hook_reentrancy_is_bounded_through_vm_print() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_hook = calls.clone();
+    sema_core::set_host_stdout_hook(Some(Box::new(move |_s: &str| {
+        calls_hook.fetch_add(1, Ordering::SeqCst);
+        // Re-enter from inside the hook; the latch passes this through directly.
+        sema_core::write_stdout("nested-from-hook");
+    })));
+
+    let result = Interpreter::new().eval_str(r#"(print "hi")"#);
+    sema_core::set_host_stdout_hook(None);
+
+    assert!(result.is_ok(), "print through host hook failed: {result:?}");
+    // `print` calls `write_stdout` once; the nested write passed through the
+    // latch rather than invoking the hook again (which would recurse unbounded).
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 // System: sys/interactive?
 
 #[test]

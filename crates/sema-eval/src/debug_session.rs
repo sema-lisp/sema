@@ -68,11 +68,11 @@ mod tests {
     fn capture_stderr(f: impl FnOnce()) -> String {
         let buf = Arc::new(Mutex::new(String::new()));
         let buf_hook = buf.clone();
-        sema_core::set_stderr_hook(Some(Box::new(move |s: &str| {
+        sema_core::set_host_stderr_hook(Some(Box::new(move |s: &str| {
             buf_hook.lock().unwrap().push_str(s);
         })));
         f();
-        sema_core::set_stderr_hook(None);
+        sema_core::set_host_stderr_hook(None);
         let out = buf.lock().unwrap().clone();
         out
     }

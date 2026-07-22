@@ -959,14 +959,14 @@ fn backend_thread(
                     // Redirect program stdout/stderr into DAP Output events so they
                     // don't corrupt the JSON-RPC protocol stream on the server's stdout.
                     let event_tx_stdout = event_tx.clone();
-                    sema_core::set_stdout_hook(Some(Box::new(move |s: &str| {
+                    sema_core::set_host_stdout_hook(Some(Box::new(move |s: &str| {
                         let _ = event_tx_stdout.blocking_send(DebugEvent::Output {
                             category: "stdout".to_string(),
                             output: s.to_string(),
                         });
                     })));
                     let event_tx_stderr = event_tx.clone();
-                    sema_core::set_stderr_hook(Some(Box::new(move |s: &str| {
+                    sema_core::set_host_stderr_hook(Some(Box::new(move |s: &str| {
                         let _ = event_tx_stderr.blocking_send(DebugEvent::Output {
                             category: "stderr".to_string(),
                             output: s.to_string(),
@@ -1005,8 +1005,8 @@ fn backend_thread(
                     // Clear the hooks immediately after execution so any server-side
                     // prints (e.g. error logging) go back to the real stdout/stderr.
                     sema_eval::set_debug_session_active(false);
-                    sema_core::set_stdout_hook(None);
-                    sema_core::set_stderr_hook(None);
+                    sema_core::set_host_stdout_hook(None);
+                    sema_core::set_host_stderr_hook(None);
 
                     // An uncaught top-level error settles the root Failed. With the
                     // uncaught-exception filter enabled, stop and let the user

@@ -726,6 +726,27 @@ their caps only module-locally, and R10's page/output caps are post-parse
 
 ### Commit C1 — output fallback hook guard (closes C05)
 
+**Landed 2026-07-22.** The fallback hook family is renamed HOST-ADAPTER-ONLY
+(`set_host_stdout_hook`/`set_host_stderr_hook`, thread-locals
+`HOST_STDOUT_HOOK`/`HOST_STDERR_HOOK`); the four installers (sema-wasm, sema-dap,
+sema-mcp `eval_with_capture`, the `debug_session` test helper) call the renamed
+API. `write_stdout`/`write_stderr` now gate hook invocation on a per-thread
+re-entrancy latch (`IN_HOST_OUTPUT_HOOK`, via a `HostHookGuard` RAII that clears
+on drop even if the hook panics): the outermost call runs the hook, and a hook
+that itself prints re-enters as a PASS-THROUGH (direct `print!`/`eprint!`),
+closing the unbounded-recursion hole. The non-suspending contract (`Fn(&str)`,
+no blocking/suspension) is documented on the module and both setters. Regression:
+`output_hook::tests::{reentrant_host_hook_passes_through_without_recursion,
+host_hook_delivers_output_during_a_quantum}` and
+`integration_test::host_stdout_hook_reentrancy_is_bounded_through_vm_print`
+(a real Sema `print` through a re-entrant host hook fires once and returns).
+Source guard: a `HOST_OUTPUT_HOOK` restricted token pins every install site to
+its exact count in `scripts/unified-runtime-host-adapters.tsv`, with the
+`unallowlisted-host-adapters.rs` fixture proving an unallowlisted install fails.
+**C05 flipped to `MIGRATED (C1)`** in `docs/internals/async-runtime-inventory.md`;
+the `runtime-match-map.tsv` re-map and `runtime_conformance_test` inventory
+reconciliation are the deferred C7 work and remain red.
+
 Landed: root-tagged capture routes (`crates/sema-core/src/output_hook.rs:36-162`)
 with weak-sink pruning tests. Gap (verified): the untagged fallback
 `STDOUT_HOOK`/`STDERR_HOOK` (`output_hook.rs:12-27`) run arbitrary closures on

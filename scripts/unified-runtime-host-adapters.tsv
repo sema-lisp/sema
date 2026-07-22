@@ -32,3 +32,8 @@ WITH_STDLIB_CTX	crates/sema-llm/src/builtins.rs	2	host-only Lisp-provider trait 
 WITH_STDLIB_CTX	crates/sema-stdlib/src/io.rs	3	host-only file-line callback adapters guarded away from runtime paths
 WITH_STDLIB_CTX	crates/sema-stdlib/src/list.rs	3	host-only plain-value HOF adapters; runtime HOFs dispatch structurally
 WORKFLOW_TLS	crates/sema-workflow/src/context.rs	1	host-adapter-only fallback scope store read only when !in_runtime_quantum(); the runtime path lives on the owning task context
+HOST_OUTPUT_HOOK	crates/sema-core/src/output_hook.rs	8	host-adapter-only fallback hook setter definitions plus their re-entrancy/quantum-delivery regression tests; runtime output routes through root-tagged capture
+HOST_OUTPUT_HOOK	crates/sema-wasm/src/lib.rs	2	wasm host installs inert no-op stdout/stderr sinks so the fallback never issues a print! syscall (unsupported on wasm32)
+HOST_OUTPUT_HOOK	crates/sema-dap/src/server.rs	4	DAP redirects program stdout/stderr into Output events (install + clear) so prints do not corrupt the JSON-RPC protocol stream
+HOST_OUTPUT_HOOK	crates/sema-mcp/src/tools.rs	4	MCP eval_with_capture buffers program output (install + clear) so it stays out of the protocol stream
+HOST_OUTPUT_HOOK	crates/sema-eval/src/debug_session.rs	2	debug-session stderr capture test helper (install + clear)

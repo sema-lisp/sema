@@ -61,6 +61,12 @@ mod serial;
 mod server;
 #[cfg(not(target_arch = "wasm32"))]
 mod sqlite;
+/// Lower the per-call `db/query`/`db/tables` result caps (clamped to the hard
+/// ceilings) on this thread, or clear the override with `None`. The bounded-
+/// result seam for advanced callers and the regression suite.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use sqlite::set_db_result_caps_override;
 mod stream;
 
 /// Read one source line through the process-wide stdin coordinator.

@@ -11,7 +11,11 @@
 //! `db/open`/`db/open-memory` offload the open itself via `fs_offload`
 //! (io.rs): there is no existing connection to contend over, so the poller
 //! simply inserts the freshly-opened `Connection` into the registry on
-//! completion — mirroring `file/read`'s shape exactly.
+//! completion — mirroring `file/read`'s shape exactly. Every opened connection
+//! carries a bounded `busy_timeout` (so a checkout op blocked on a locked
+//! database yields `SQLITE_BUSY` in bounded time rather than pinning a worker
+//! forever) and has its `Send` [`rusqlite::InterruptHandle`] captured beside
+//! the registry (`DB_INTERRUPTS`) for the cancellation path below.
 //!
 //! `db/exec`/`db/exec-batch`/`db/query`/`db/query-one`/`db/tables` run
 //! against an EXISTING connection, so they use the CHECKOUT pattern (see
@@ -29,6 +33,23 @@
 //! (`Vec<(String, SqlValue)>` per row) — `rusqlite::types::Value` is already
 //! `Send`, so it crosses the boundary directly with no extra wrapper type.
 //!
+//! ## Interrupt-then-reclaim cancellation (`INTERRUPTIBLE`)
+//!
+//! A checkout op is offloaded through [`checkout_runtime`], which hands the
+//! checkout `CheckoutOp` a real `abort` (fire the connection's interrupt
+//! handle + flag the op interrupted) and a `reclaim` closure. On `async/cancel`
+//! the runtime fires the abort: the blocked statement returns `SQLITE_INTERRUPT`
+//! promptly, the worker op rolls back an open transaction
+//! (`!conn.is_autocommit()`), and the connection is handed back through a shared
+//! cell. The reclaim step then reinstalls the connection `Available` (never
+//! tombstones it) so the handle stays usable, and the closed gate lets a fresh
+//! op re-create it. Late results are rejected — the cancelled task settled the
+//! moment the abort fired. Bounded result caps (`DB_MAX_RESULT_ROWS`/
+//! `DB_MAX_RESULT_BYTES`, with an optional lower per-call override) are resolved
+//! pre-dispatch and enforced incrementally inside `collect_query_rows`/
+//! `collect_tables`, so an oversized result is rejected at the boundary without
+//! ever buffering the whole set.
+//!
 //! `db/last-insert-id` reads `Connection::last_insert_rowid()` — an in-memory
 //! field on the handle, no I/O — so it stays fully synchronous even inside
 //! async context, but is still checkout-aware (`with_conn`) so it reports a
@@ -38,11 +59,14 @@
 //! At top level (no scheduler) every builtin keeps today's synchronous shape
 //! byte-for-byte.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
+use std::time::Duration;
 
-use rusqlite::{params_from_iter, types::Value as SqlValue, Connection};
+use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, InterruptHandle};
 use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateHandle};
 use sema_core::{check_arity, in_runtime_quantum, SemaError, Value};
 
@@ -53,6 +77,20 @@ use crate::runtime_offload::{
 /// Completion-kind tag for `db/*` external waits ("db\0\0").
 const DB_COMPLETION_KIND: u64 = 0x6462_0000;
 
+/// Busy timeout every opened connection carries: a checkout op blocked on a
+/// locked database yields `SQLITE_BUSY` after this bound instead of parking a
+/// blocking worker forever. Distinct from rusqlite's own default so a
+/// `PRAGMA busy_timeout` read proves `db/open` set it.
+const DB_BUSY_TIMEOUT_MS: u64 = 10_000;
+
+/// Hard ceiling on the rows a single `db/query`/`db/tables` result may buffer
+/// before it is rejected. The result is eagerly materialized into a Sema
+/// list-of-maps on the VM thread, so an unbounded query would exhaust memory;
+/// this cap makes an oversized result a clean error, not an OOM.
+const DB_MAX_RESULT_ROWS: u64 = 1_000_000;
+/// Hard ceiling on the bytes a single result may buffer (summed cell sizes).
+const DB_MAX_RESULT_BYTES: u64 = 512 * 1024 * 1024;
+
 // `Connection` moves across the offload boundary (open + every checkout op).
 // This compiles only if it stays `Send`; a future rusqlite upgrade that
 // breaks it fails here, not with an opaque trait-bound error deep in
@@ -60,15 +98,17 @@ const DB_COMPLETION_KIND: u64 = 0x6462_0000;
 const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<Connection>();
+    // The interrupt handle crosses to the abort hook and must stay `Send`.
+    assert_send::<InterruptHandle>();
 };
 
 /// A registry slot. `CheckedOut` is the moment between an offload taking the
-/// `Connection` out and the poller reinstalling it; every other `db/*` op
-/// treats it as "busy, try again once the in-flight op resolves". `Tombstone`
-/// is terminal: set only when an offload is cancelled mid-flight (the
-/// `Connection` is stuck inside an uncancellable background thread — see
-/// `spawn_conn_op`'s doc comment) or its worker vanishes unexpectedly;
-/// `db/close` is the only way to free a tombstoned slot.
+/// `Connection` out and the poller (or the interrupt-reclaim path) reinstalling
+/// it; every other `db/*` op treats it as "busy, try again once the in-flight
+/// op resolves". `Tombstone` is terminal: set only when an offloaded op's worker
+/// vanishes unexpectedly (panic / lost completion). A cancelled interrupt does
+/// NOT tombstone — it reclaims the connection and reinstalls it `Available` (see
+/// the module doc comment); `db/close` frees a tombstoned slot.
 enum DbSlot {
     Available(Connection),
     CheckedOut,
@@ -81,6 +121,79 @@ thread_local! {
     /// offloaded op and reused for later ops (dropped on `db/close`). The gate
     /// provides FIFO mutual exclusion for the checkout slot.
     static DB_GATES: RefCell<HashMap<String, ResourceGateHandle>> = RefCell::new(HashMap::new());
+    /// Per-handle `Send` interrupt handle captured at open, kept alongside the
+    /// slot so a checkout op's `abort` can interrupt the connection even while
+    /// it is `CheckedOut`. Dropped on `db/close`.
+    static DB_INTERRUPTS: RefCell<HashMap<String, Arc<InterruptHandle>>> =
+        RefCell::new(HashMap::new());
+    /// Optional per-call result-cap override (lowered, never raised above the
+    /// hard ceilings). `None` uses the module ceilings.
+    static DB_RESULT_CAPS_OVERRIDE: Cell<Option<DbResultCaps>> = const { Cell::new(None) };
+}
+
+/// Bounded result caps resolved pre-dispatch and enforced incrementally by the
+/// row collectors.
+#[derive(Clone, Copy)]
+struct DbResultCaps {
+    max_rows: u64,
+    max_bytes: u64,
+}
+
+/// The effective result caps for the current call: the module hard ceilings,
+/// lowered by any per-call override (never raised above the ceilings). Read on
+/// the VM thread pre-dispatch, then captured by the offloaded op.
+fn effective_result_caps() -> DbResultCaps {
+    let ceiling = DbResultCaps {
+        max_rows: DB_MAX_RESULT_ROWS,
+        max_bytes: DB_MAX_RESULT_BYTES,
+    };
+    DB_RESULT_CAPS_OVERRIDE
+        .with(Cell::get)
+        .map_or(ceiling, |over| DbResultCaps {
+            max_rows: over.max_rows.min(ceiling.max_rows),
+            max_bytes: over.max_bytes.min(ceiling.max_bytes),
+        })
+}
+
+/// Lower the per-call result caps (clamped to the hard ceilings) for subsequent
+/// `db/query`/`db/tables` calls on this thread, or clear the override with
+/// `None`. The hard ceilings and the interrupt/reclaim path are unaffected;
+/// this is the seam a bounded-result caller (and the regression suite) drives.
+pub fn set_db_result_caps_override(caps: Option<(u64, u64)>) {
+    DB_RESULT_CAPS_OVERRIDE.with(|cell| {
+        cell.set(caps.map(|(max_rows, max_bytes)| DbResultCaps { max_rows, max_bytes }));
+    });
+}
+
+/// A checkout op failure: a rusqlite error (rendered `op: {e}`, and possibly
+/// triggering an interrupt rollback), or a pre-buffered result-cap rejection
+/// (its message already carries the `op:` prefix).
+#[derive(Debug)]
+enum DbOpError {
+    Sqlite(rusqlite::Error),
+    Cap(String),
+}
+
+fn db_op_err_to_sema(op: &str, error: DbOpError) -> SemaError {
+    match error {
+        DbOpError::Sqlite(error) => SemaError::eval(format!("{op}: {error}")),
+        DbOpError::Cap(message) => SemaError::eval(message),
+    }
+}
+
+fn sql_value_bytes(value: &SqlValue) -> u64 {
+    match value {
+        SqlValue::Null => 1,
+        SqlValue::Integer(_) | SqlValue::Real(_) => 8,
+        SqlValue::Text(text) => text.len() as u64,
+        SqlValue::Blob(bytes) => bytes.len() as u64,
+    }
+}
+
+fn row_bytes(row: &[(String, SqlValue)]) -> u64 {
+    row.iter()
+        .map(|(name, value)| name.len() as u64 + sql_value_bytes(value))
+        .sum()
 }
 
 fn sema_to_sql(v: &Value) -> SqlValue {
@@ -139,6 +252,39 @@ fn eval_msg(op: &str, e: impl std::fmt::Display) -> String {
     SemaError::eval(format!("{op}: {e}")).to_string()
 }
 
+/// Finish opening a connection: apply the bounded busy timeout, capture its
+/// (`Send`) interrupt handle for the checkout abort path, and install it
+/// `Available` under `key`. Shared by `db/open`/`db/open-memory` (sync path and
+/// async decode).
+fn finish_open(op: &'static str, key: String, conn: Connection) -> Result<Value, SemaError> {
+    conn.busy_timeout(Duration::from_millis(DB_BUSY_TIMEOUT_MS))
+        .map_err(|e| SemaError::eval(format!("{op}: {e}")))?;
+    let interrupt = Arc::new(conn.get_interrupt_handle());
+    DB_INTERRUPTS.with(|m| {
+        m.borrow_mut().insert(key.clone(), interrupt);
+    });
+    DB_CONNECTIONS.with(|c| {
+        c.borrow_mut().insert(key.clone(), DbSlot::Available(conn));
+    });
+    Ok(Value::string(&key))
+}
+
+/// Build the checkout abort hook: flag the op interrupted (so the worker rolls
+/// back an open transaction before releasing the connection) and fire the
+/// connection's SQLite interrupt handle so a blocked statement returns
+/// `SQLITE_INTERRUPT` promptly. Always returns a closure, so every sqlite
+/// `CheckoutOp` carries a real `abort: Some(_)`.
+fn checkout_interrupt_abort(handle: String, interrupted: Arc<AtomicBool>) -> Box<dyn FnOnce()> {
+    Box::new(move || {
+        interrupted.store(true, Ordering::SeqCst);
+        DB_INTERRUPTS.with(|m| {
+            if let Some(interrupt) = m.borrow().get(&handle) {
+                interrupt.interrupt();
+            }
+        });
+    })
+}
+
 /// Sync-path / non-offloaded accessor: look up `handle` for an op that only
 /// needs `&Connection`, translating the other slot states into a clear,
 /// `op`-specific error instead of ever panicking on the enum shape. Used both
@@ -185,23 +331,44 @@ fn take_conn(op_name: &'static str, handle: &str) -> Result<Connection, SemaErro
 /// take the `Connection` out of the slot, run `op` off the VM thread on the
 /// executor's blocking tier, reinstall the `Connection` and decode the result on
 /// the VM thread, then release the gate. `op` runs on the blocking worker;
-/// `decode` builds the final `Value`. A mid-op cancel tombstones the slot
-/// (best-effort — the blocking statement keeps running unattended) and closes
-/// the gate so every queued sibling wakes with a terminal error.
+/// `decode` builds the final `Value`.
+///
+/// Cancellation is INTERRUPTIBLE: the abort fires the connection's interrupt
+/// handle so a blocked statement returns `SQLITE_INTERRUPT` promptly; the worker
+/// op then rolls back an open transaction and hands the connection back through
+/// a shared cell, and the reclaim step reinstalls it `Available` (the slot is
+/// NOT tombstoned) so the handle stays usable while the closed gate lets a fresh
+/// op re-create it. Only a worker LOSS (panic / lost completion) tombstones.
 fn checkout_runtime<T: Send + 'static>(
     op_name: &'static str,
     handle: String,
-    op: impl FnOnce(&mut Connection) -> Result<T, String> + Send + 'static,
+    op: impl FnOnce(&Connection) -> Result<T, DbOpError> + Send + 'static,
     decode: impl FnOnce(T) -> Value + 'static,
 ) -> NativeResult {
     let kind =
         CompletionKind::try_from_raw(DB_COMPLETION_KIND).expect("db completion kind is nonzero");
     let gate = DB_GATES.with(|g| g.borrow().get(&handle).cloned());
+
+    // Shared connection cell: a mid-op cancel interrupts the worker, then the
+    // reclaim step retrieves the connection from here and reinstalls it
+    // `Available` — instead of tombstoning the slot.
+    let shared: Arc<Mutex<Option<Connection>>> = Arc::new(Mutex::new(None));
+    let shared_take = Arc::clone(&shared);
+    let shared_reclaim = Arc::clone(&shared);
+
+    // Set by the abort on cancellation so the worker op rolls back an open
+    // transaction before it releases the reclaimed connection.
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let interrupted_op = Arc::clone(&interrupted);
+
     let h_take = handle.clone();
     let h_reinstall = handle.clone();
+    let h_reclaim = handle.clone();
     let h_tomb = handle.clone();
     let h_remove = handle.clone();
+    let h_abort = handle.clone();
     let h_store = handle;
+
     checkout_external(CheckoutOp {
         op_name,
         kind,
@@ -219,12 +386,40 @@ fn checkout_runtime<T: Send + 'static>(
                 }
             });
         }),
-        take: Box::new(move || take_conn(op_name, &h_take)),
-        op: Box::new(op),
-        reinstall: Box::new(move |conn| {
-            DB_CONNECTIONS.with(|c| {
-                c.borrow_mut().insert(h_reinstall, DbSlot::Available(conn));
-            });
+        take: Box::new(move || {
+            let conn = take_conn(op_name, &h_take)?;
+            *shared_take.lock().unwrap_or_else(PoisonError::into_inner) = Some(conn);
+            Ok(shared_take)
+        }),
+        op: Box::new(
+            move |res: &mut Arc<Mutex<Option<Connection>>>| -> Result<T, String> {
+                let guard = res.lock().unwrap_or_else(PoisonError::into_inner);
+                let Some(conn) = guard.as_ref() else {
+                    return Err(format!(
+                        "{op_name}: connection was reclaimed after cancellation"
+                    ));
+                };
+                match op(conn) {
+                    Ok(value) => Ok(value),
+                    Err(DbOpError::Sqlite(error)) => {
+                        // A cancelled op is interrupted mid-statement; roll back
+                        // any open transaction so the reclaimed connection is
+                        // clean for the next caller.
+                        if interrupted_op.load(Ordering::SeqCst) && !conn.is_autocommit() {
+                            let _ = conn.execute_batch("ROLLBACK");
+                        }
+                        Err(eval_msg(op_name, error))
+                    }
+                    Err(DbOpError::Cap(message)) => Err(message),
+                }
+            },
+        ),
+        reinstall: Box::new(move |res: Arc<Mutex<Option<Connection>>>| {
+            if let Some(conn) = res.lock().unwrap_or_else(PoisonError::into_inner).take() {
+                DB_CONNECTIONS.with(|c| {
+                    c.borrow_mut().insert(h_reinstall, DbSlot::Available(conn));
+                });
+            }
         }),
         decode: Box::new(move |t| Ok(decode(t))),
         success_value: None,
@@ -234,34 +429,84 @@ fn checkout_runtime<T: Send + 'static>(
                     .insert(h_tomb.clone(), DbSlot::Tombstone(msg));
             });
         }),
-        abort: None,
+        abort: Some(checkout_interrupt_abort(h_abort, interrupted)),
+        reclaim: Some(Box::new(move || -> bool {
+            // On cancel the interrupted worker op is either still running (lock
+            // held → retry next reap) or has returned the connection into the
+            // shared cell (take it and reinstall Available). Either way the slot
+            // ends usable rather than tombstoned.
+            match shared_reclaim.try_lock() {
+                Ok(mut guard) => {
+                    if let Some(conn) = guard.take() {
+                        DB_CONNECTIONS.with(|c| {
+                            c.borrow_mut()
+                                .insert(h_reclaim.clone(), DbSlot::Available(conn));
+                        });
+                    }
+                    true
+                }
+                Err(TryLockError::WouldBlock) => false,
+                Err(TryLockError::Poisoned(poison)) => {
+                    if let Some(conn) = poison.into_inner().take() {
+                        DB_CONNECTIONS.with(|c| {
+                            c.borrow_mut()
+                                .insert(h_reclaim.clone(), DbSlot::Available(conn));
+                        });
+                    }
+                    true
+                }
+            }
+        })),
         terminal_on_success: false,
     })
 }
 
 /// Run `sql` against `conn` with `params`, collecting every row into owned
 /// `(column, value)` pairs — the `Send` intermediate that crosses the offload
-/// boundary. `Value`/map construction happens in `rows_to_value`/
-/// `row_to_value`, on the VM thread, never inside the offload.
+/// boundary. The result caps are enforced incrementally: the collector rejects
+/// at the row/byte boundary without buffering the whole result. `Value`/map
+/// construction happens in `rows_to_value`/`row_to_value`, on the VM thread,
+/// never inside the offload.
 fn collect_query_rows(
     conn: &Connection,
     sql: &str,
     params: &[SqlValue],
-) -> rusqlite::Result<Vec<Vec<(String, SqlValue)>>> {
-    let mut stmt = conn.prepare(sql)?;
+    caps: DbResultCaps,
+) -> Result<Vec<Vec<(String, SqlValue)>>, DbOpError> {
+    let mut stmt = conn.prepare(sql).map_err(DbOpError::Sqlite)?;
     let col_count = stmt.column_count();
     let col_names: Vec<String> = (0..col_count)
         .map(|i| stmt.column_name(i).unwrap().to_string())
         .collect();
-    let rows = stmt.query_map(params_from_iter(params.iter()), |row| {
-        let mut r = Vec::with_capacity(col_count);
-        for (i, name) in col_names.iter().enumerate() {
-            let val: SqlValue = row.get(i)?;
-            r.push((name.clone(), val));
+    let mut rows = stmt
+        .query_map(params_from_iter(params.iter()), |row| {
+            let mut r = Vec::with_capacity(col_count);
+            for (i, name) in col_names.iter().enumerate() {
+                let val: SqlValue = row.get(i)?;
+                r.push((name.clone(), val));
+            }
+            Ok(r)
+        })
+        .map_err(DbOpError::Sqlite)?;
+    let mut out: Vec<Vec<(String, SqlValue)>> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    while let Some(row) = rows.next().transpose().map_err(DbOpError::Sqlite)? {
+        if out.len() as u64 >= caps.max_rows {
+            return Err(DbOpError::Cap(format!(
+                "db/query: result exceeds the maximum of {} rows",
+                caps.max_rows
+            )));
         }
-        Ok(r)
-    })?;
-    rows.collect()
+        total_bytes = total_bytes.saturating_add(row_bytes(&row));
+        if total_bytes > caps.max_bytes {
+            return Err(DbOpError::Cap(format!(
+                "db/query: result exceeds the maximum of {} bytes",
+                caps.max_bytes
+            )));
+        }
+        out.push(row);
+    }
+    Ok(out)
 }
 
 /// Run `sql` against `conn` with `params`, stepping the cursor exactly once —
@@ -275,21 +520,23 @@ fn collect_first_query_row(
     conn: &Connection,
     sql: &str,
     params: &[SqlValue],
-) -> rusqlite::Result<Option<Vec<(String, SqlValue)>>> {
-    let mut stmt = conn.prepare(sql)?;
+) -> Result<Option<Vec<(String, SqlValue)>>, DbOpError> {
+    let mut stmt = conn.prepare(sql).map_err(DbOpError::Sqlite)?;
     let col_count = stmt.column_count();
     let col_names: Vec<String> = (0..col_count)
         .map(|i| stmt.column_name(i).unwrap().to_string())
         .collect();
-    let mut rows = stmt.query_map(params_from_iter(params.iter()), |row| {
-        let mut r = Vec::with_capacity(col_count);
-        for (i, name) in col_names.iter().enumerate() {
-            let val: SqlValue = row.get(i)?;
-            r.push((name.clone(), val));
-        }
-        Ok(r)
-    })?;
-    rows.next().transpose()
+    let mut rows = stmt
+        .query_map(params_from_iter(params.iter()), |row| {
+            let mut r = Vec::with_capacity(col_count);
+            for (i, name) in col_names.iter().enumerate() {
+                let val: SqlValue = row.get(i)?;
+                r.push((name.clone(), val));
+            }
+            Ok(r)
+        })
+        .map_err(DbOpError::Sqlite)?;
+    rows.next().transpose().map_err(DbOpError::Sqlite)
 }
 
 fn row_pairs_to_map(row: Vec<(String, SqlValue)>) -> BTreeMap<Value, Value> {
@@ -315,14 +562,33 @@ fn row_to_value(row: Option<Vec<(String, SqlValue)>>) -> Value {
     }
 }
 
-fn collect_tables(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-    )?;
-    let names = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+fn collect_tables(conn: &Connection, caps: DbResultCaps) -> Result<Vec<String>, DbOpError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )
+        .map_err(DbOpError::Sqlite)?;
+    let mut rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(DbOpError::Sqlite)?;
+    let mut names: Vec<String> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    while let Some(name) = rows.next().transpose().map_err(DbOpError::Sqlite)? {
+        if names.len() as u64 >= caps.max_rows {
+            return Err(DbOpError::Cap(format!(
+                "db/tables: result exceeds the maximum of {} rows",
+                caps.max_rows
+            )));
+        }
+        total_bytes = total_bytes.saturating_add(name.len() as u64);
+        if total_bytes > caps.max_bytes {
+            return Err(DbOpError::Cap(format!(
+                "db/tables: result exceeds the maximum of {} bytes",
+                caps.max_bytes
+            )));
+        }
+        names.push(name);
+    }
     Ok(names)
 }
 
@@ -366,13 +632,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     "db/open",
                     kind,
                     "db/open",
-                    move |conn: Connection| {
-                        DB_CONNECTIONS.with(|c| {
-                            c.borrow_mut()
-                                .insert(key_for_decode.clone(), DbSlot::Available(conn))
-                        });
-                        Ok(Value::string(&key_for_decode))
-                    },
+                    move |conn: Connection| finish_open("db/open", key_for_decode, conn),
                     move || async move {
                         let conn = Connection::open(&path).map_err(|e| eval_msg("db/open", e))?;
                         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
@@ -386,8 +646,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 Connection::open(&path).map_err(|e| SemaError::eval(format!("db/open: {e}")))?;
             conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
                 .map_err(|e| SemaError::eval(format!("db/open: {e}")))?;
-            DB_CONNECTIONS.with(|c| c.borrow_mut().insert(key.clone(), DbSlot::Available(conn)));
-            Ok(NativeOutcome::Return(Value::string(&key)))
+            finish_open("db/open", key, conn).map(NativeOutcome::Return)
         },
     );
 
@@ -418,13 +677,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     "db/open-memory",
                     kind,
                     "db/open-memory",
-                    move |conn: Connection| {
-                        DB_CONNECTIONS.with(|c| {
-                            c.borrow_mut()
-                                .insert(name_for_decode.clone(), DbSlot::Available(conn))
-                        });
-                        Ok(Value::string(&name_for_decode))
-                    },
+                    move |conn: Connection| finish_open("db/open-memory", name_for_decode, conn),
                     move || async move {
                         let conn = Connection::open_in_memory()
                             .map_err(|e| eval_msg("db/open-memory", e))?;
@@ -439,8 +692,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .map_err(|e| SemaError::eval(format!("db/open-memory: {e}")))?;
             conn.execute_batch("PRAGMA foreign_keys=ON;")
                 .map_err(|e| SemaError::eval(format!("db/open-memory: {e}")))?;
-            DB_CONNECTIONS.with(|c| c.borrow_mut().insert(name.clone(), DbSlot::Available(conn)));
-            Ok(NativeOutcome::Return(Value::string(&name)))
+            finish_open("db/open-memory", name, conn).map(NativeOutcome::Return)
         },
     );
 
@@ -472,7 +724,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     move |conn| {
                         conn.execute(&sql, params_from_iter(params.iter()))
                             .map(|n| n as i64)
-                            .map_err(|e| eval_msg("db/exec", e))
+                            .map_err(DbOpError::Sqlite)
                     },
                     Value::int,
                 );
@@ -511,10 +763,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 return checkout_runtime(
                     "db/exec-batch",
                     handle,
-                    move |conn| {
-                        conn.execute_batch(&sql)
-                            .map_err(|e| eval_msg("db/exec-batch", e))
-                    },
+                    move |conn| conn.execute_batch(&sql).map_err(DbOpError::Sqlite),
                     |()| Value::nil(),
                 );
             }
@@ -548,22 +797,23 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
                 .to_string();
             let params: Vec<SqlValue> = args[2..].iter().map(sema_to_sql).collect();
+            // Resolve the result caps pre-dispatch on the VM thread; the
+            // offloaded op captures the (Copy) caps and enforces them.
+            let caps = effective_result_caps();
 
             if in_runtime_quantum() {
                 return checkout_runtime(
                     "db/query",
                     handle,
-                    move |conn| {
-                        collect_query_rows(conn, &sql, &params).map_err(|e| eval_msg("db/query", e))
-                    },
+                    move |conn| collect_query_rows(conn, &sql, &params, caps),
                     rows_to_value,
                 );
             }
 
             with_conn("db/query", &handle, |conn| {
-                collect_query_rows(conn, &sql, &params)
+                collect_query_rows(conn, &sql, &params, caps)
                     .map(rows_to_value)
-                    .map_err(|e| SemaError::eval(format!("db/query: {e}")))
+                    .map_err(|e| db_op_err_to_sema("db/query", e))
             })
             .map(NativeOutcome::Return)
         },
@@ -594,10 +844,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 return checkout_runtime(
                     "db/query-one",
                     handle,
-                    move |conn| {
-                        collect_first_query_row(conn, &sql, &params)
-                            .map_err(|e| eval_msg("db/query-one", e))
-                    },
+                    move |conn| collect_first_query_row(conn, &sql, &params),
                     row_to_value,
                 );
             }
@@ -605,7 +852,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             with_conn("db/query-one", &handle, |conn| {
                 collect_first_query_row(conn, &sql, &params)
                     .map(row_to_value)
-                    .map_err(|e| SemaError::eval(format!("db/query-one: {e}")))
+                    .map_err(|e| db_op_err_to_sema("db/query-one", e))
             })
             .map(NativeOutcome::Return)
         },
@@ -646,20 +893,21 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
                 .to_string();
+            let caps = effective_result_caps();
 
             if in_runtime_quantum() {
                 return checkout_runtime(
                     "db/tables",
                     handle,
-                    move |conn| collect_tables(conn).map_err(|e| eval_msg("db/tables", e)),
+                    move |conn| collect_tables(conn, caps),
                     tables_to_value,
                 );
             }
 
             with_conn("db/tables", &handle, |conn| {
-                collect_tables(conn)
+                collect_tables(conn, caps)
                     .map(tables_to_value)
-                    .map_err(|e| SemaError::eval(format!("db/tables: {e}")))
+                    .map_err(|e| db_op_err_to_sema("db/tables", e))
             })
             .map(NativeOutcome::Return)
         },
@@ -687,6 +935,9 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         DB_CONNECTIONS.with(|c| {
             c.borrow_mut().remove(&handle);
         });
+        DB_INTERRUPTS.with(|m| {
+            m.borrow_mut().remove(&handle);
+        });
         let remove_handle = handle;
         finish_terminal_gate(
             gate,
@@ -701,4 +952,105 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             Ok(Value::nil()),
         )
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every sqlite `CheckoutOp` is built by `checkout_runtime`, which wraps
+    /// `checkout_interrupt_abort` in `abort: Some(_)` unconditionally — so every
+    /// exec/exec-batch/query/query-one/tables checkout carries a real interrupt
+    /// abort. This proves `db/open` captures the interrupt handle the abort fires
+    /// and applies the bounded busy timeout.
+    #[test]
+    fn open_captures_interrupt_handle_and_sets_busy_timeout() {
+        let key = "guard-open-db".to_string();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        finish_open("db/open-memory", key.clone(), conn).expect("install connection");
+
+        assert!(
+            DB_INTERRUPTS.with(|m| m.borrow().contains_key(&key)),
+            "open must capture the interrupt handle the checkout abort fires"
+        );
+
+        let ms: i64 = DB_CONNECTIONS.with(|c| {
+            let conns = c.borrow();
+            let DbSlot::Available(conn) = conns.get(&key).expect("open connection") else {
+                panic!("connection must be Available after open");
+            };
+            conn.query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .expect("read busy_timeout")
+        });
+        assert_eq!(
+            ms, DB_BUSY_TIMEOUT_MS as i64,
+            "db/open must apply the bounded busy timeout"
+        );
+
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let abort = checkout_interrupt_abort(key.clone(), Arc::clone(&interrupted));
+        abort();
+        assert!(
+            interrupted.load(Ordering::SeqCst),
+            "the checkout abort must flag the op interrupted so it rolls back"
+        );
+
+        DB_CONNECTIONS.with(|c| {
+            c.borrow_mut().remove(&key);
+        });
+        DB_INTERRUPTS.with(|m| {
+            m.borrow_mut().remove(&key);
+        });
+    }
+
+    /// Result caps are enforced incrementally: a query one row past the cap is
+    /// rejected without buffering the whole set.
+    #[test]
+    fn result_row_cap_rejects_at_boundary_plus_one() {
+        let key = "guard-cap-db".to_string();
+        let conn = Connection::open_in_memory().expect("open memory db");
+        finish_open("db/open-memory", key.clone(), conn).expect("install connection");
+
+        DB_CONNECTIONS.with(|c| {
+            let conns = c.borrow();
+            let DbSlot::Available(conn) = conns.get(&key).expect("open connection") else {
+                panic!("connection must be Available");
+            };
+            conn.execute_batch(
+                "CREATE TABLE t (v INTEGER);
+                 INSERT INTO t (v)
+                   WITH RECURSIVE c(x) AS (
+                     SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 4
+                   )
+                   SELECT x FROM c;",
+            )
+            .expect("seed four rows");
+
+            let caps = DbResultCaps {
+                max_rows: 3,
+                max_bytes: DB_MAX_RESULT_BYTES,
+            };
+            let err = collect_query_rows(conn, "SELECT v FROM t ORDER BY v", &[], caps)
+                .expect_err("four rows must exceed the three-row cap");
+            let DbOpError::Cap(message) = err else {
+                panic!("boundary+1 must be a Cap rejection, not a rusqlite error");
+            };
+            assert!(
+                message.contains("exceeds the maximum of 3 rows"),
+                "unexpected cap message: {message}"
+            );
+
+            // Exactly at the cap succeeds (no rejection buffering the whole set).
+            let rows = collect_query_rows(conn, "SELECT v FROM t ORDER BY v LIMIT 3", &[], caps)
+                .expect("three rows are within the cap");
+            assert_eq!(rows.len(), 3);
+        });
+
+        DB_CONNECTIONS.with(|c| {
+            c.borrow_mut().remove(&key);
+        });
+        DB_INTERRUPTS.with(|m| {
+            m.borrow_mut().remove(&key);
+        });
+    }
 }

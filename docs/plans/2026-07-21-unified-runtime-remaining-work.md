@@ -288,6 +288,28 @@ is proc/pty's `group_sigkill_abort` (`runtime_offload.rs:492`).
 
 ### Commit B1 — SQLite interrupt + result bounds (closes R16A, R16B)
 
+**Landed.** `db/open`/`open-memory` set a bounded `busy_timeout` and capture the
+connection's `Send` `InterruptHandle` beside the registry (`DB_INTERRUPTS`).
+Every checkout op (exec/exec-batch/query/query-one/tables) now carries a real
+`abort: Some(_)` (fire the interrupt + flag the op) plus a `reclaim` hook: the
+generic checkout machinery gained an interrupt-then-reclaim mode
+(`CheckoutOp.reclaim` + `CheckoutCancelHook` returning `PendingReap` and reaping
+via the reclaim closure, `crates/sema-stdlib/src/runtime_offload.rs`; the gate
+registry is untouched). On cancel the worker maps `SQLITE_INTERRUPT`, issues
+`ROLLBACK` when `!conn.is_autocommit()`, and hands the connection back through a
+shared cell so the reap reinstalls it `Available` instead of tombstoning; the
+closed gate lets a fresh op re-create it. Result caps
+(`DB_MAX_RESULT_ROWS`/`DB_MAX_RESULT_BYTES`, optional lower per-call override via
+`set_db_result_caps_override`) are resolved pre-dispatch and enforced
+incrementally inside `collect_query_rows`/`collect_tables` (reject at boundary+1
+without buffering the whole result). Regression:
+`crates/sema/tests/db_async_test.rs::{db_cancel_interrupts_long_query_and_reclaims_connection,
+db_query_result_row_cap_rejects_at_boundary_plus_one, db_open_sets_busy_timeout}`
+plus the `sqlite::tests` abort-presence/cap guards. **R16A and R16B flipped to
+`MIGRATED`** in `docs/internals/async-runtime-inventory.md`; the
+`runtime-match-map.tsv` re-map and the `runtime_conformance_test` inventory
+reconciliation are the deferred C7 work and remain red.
+
 Gap (verified): `abort: None` at `crates/sema-stdlib/src/sqlite.rs:237`; no
 `get_interrupt_handle` anywhere; `collect_query_rows` (`sqlite.rs:246-265`) and
 `collect_tables` (`sqlite.rs:318-327`) buffer unbounded; no `busy_timeout`.

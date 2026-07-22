@@ -381,3 +381,143 @@ fn db_cancelled_sibling_does_not_corrupt_shared_handle() {
     );
     assert_eq!(interp.runtime_resource_gate_count(), 0);
 }
+
+// === Interrupt-then-reclaim: a cancelled long query is interrupted, rolled
+// back, and the connection is reinstalled Available (not tombstoned) ===
+//
+// The victim opens a tx (BEGIN + INSERT), signals "ready", then parks in an
+// infinite recursive-CTE `count(*)` — a statement that never returns on its
+// own. Without the interrupt handle this whole program HANGS; with it, cancel
+// fires the interrupt so the query returns `SQLITE_INTERRUPT` promptly, the
+// worker rolls back the open transaction, and the reclaim step reinstalls the
+// SAME connection Available. A retry loop (yielding via `async/sleep` so the
+// runtime drains the reap) then proves the handle is usable afterwards and the
+// INSERT was rolled back (count == 0). A sibling task completing while the CTE
+// is in flight proves the scheduler was never stalled.
+#[test]
+fn db_cancel_interrupts_long_query_and_reclaims_connection() {
+    let interp = Interpreter::new();
+    let program = r#"
+        (let ((out (channel/new 8)))
+          (let ((victim (async/spawn (fn ()
+                          (db/open-memory "cte-cancel")
+                          (db/exec-batch "cte-cancel"
+                            "CREATE TABLE t (v INTEGER); BEGIN; INSERT INTO t (v) VALUES (1);")
+                          (channel/send out "ready")
+                          (db/query "cte-cancel"
+                            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) AS n FROM c")))))
+            (channel/recv out)
+            (async/spawn (fn () (channel/send out "sibling")))
+            (let ((sib (channel/recv out)))
+              (await (async (async/sleep 30)))
+              (async/cancel victim)
+              (let ((caught (try (async/await victim) (catch e :cancelled))))
+                (let ((rolled
+                        (let retry ((n 400))
+                          (if (<= n 0)
+                            :never-usable
+                            (let ((r (try (db/query-one "cte-cancel" "SELECT count(*) AS c FROM t")
+                                          (catch e :retry))))
+                              (if (= r :retry)
+                                (begin (await (async (async/sleep 2))) (retry (- n 1)))
+                                r))))))
+                  (db/close "cte-cancel")
+                  (list sib caught rolled))))))
+    "#;
+    let result = interp
+        .eval_str_compiled(program)
+        .expect("interrupted db chain settles without hanging");
+    let parts: Vec<Value> = result.as_list().expect("result list").to_vec();
+
+    assert_eq!(
+        parts[0],
+        Value::string("sibling"),
+        "a sibling must complete while the long query is in flight (scheduler not stalled)"
+    );
+    assert_eq!(
+        parts[1],
+        Value::keyword("cancelled"),
+        "awaiting the cancelled long query must raise the :cancelled condition, got {:?}",
+        parts[1]
+    );
+    let rolled = parts[2]
+        .as_map_ref()
+        .and_then(|m| m.get(&Value::keyword("c")).and_then(|v| v.as_int()));
+    assert_eq!(
+        rolled,
+        Some(0),
+        "the reclaimed connection must be usable and the interrupted tx rolled back \
+         (count 0), got {:?}",
+        parts[2]
+    );
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "the cancelled op's gate must close so the registry returns to baseline"
+    );
+}
+
+// === Bounded result rows: a query one row past the cap is rejected at the
+// boundary without buffering the whole result ===
+#[test]
+fn db_query_result_row_cap_rejects_at_boundary_plus_one() {
+    let interp = Interpreter::new();
+    // Lower the per-call cap (clamped to the hard ceiling) so the boundary test
+    // stays cheap: three rows allowed, the fourth rejected.
+    sema_stdlib::set_db_result_caps_override(Some((3, u64::MAX)));
+
+    let over = interp.eval_str_compiled(
+        r#"
+        (db/open-memory "cap-db")
+        (db/exec-batch "cap-db"
+          "CREATE TABLE t (v INTEGER);
+           INSERT INTO t (v)
+             WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 4)
+             SELECT x FROM c;")
+        (db/query "cap-db" "SELECT v FROM t ORDER BY v")
+        "#,
+    );
+    let err = over.expect_err("four rows must exceed the three-row cap");
+    assert!(
+        err.to_string().contains("exceeds the maximum of 3 rows"),
+        "unexpected cap error: {err}"
+    );
+
+    // The connection stays usable: a result exactly at the cap succeeds.
+    let ok = interp
+        .eval_str_compiled(
+            r#"
+            (let ((rows (db/query "cap-db" "SELECT v FROM t ORDER BY v LIMIT 3")))
+              (db/close "cap-db")
+              (length rows))
+            "#,
+        )
+        .expect("an at-cap query succeeds");
+    assert_eq!(ok.as_int(), Some(3), "a result at the cap must be returned");
+
+    sema_stdlib::set_db_result_caps_override(None);
+}
+
+// === db/open applies a bounded busy timeout ===
+//
+// A fresh rusqlite connection defaults to a 5000ms busy timeout; db/open sets a
+// distinct 10000ms, observable via `PRAGMA busy_timeout`.
+#[test]
+fn db_open_sets_busy_timeout() {
+    let interp = Interpreter::new();
+    let result = interp
+        .eval_str_compiled(
+            r#"
+            (db/open-memory "busy-db")
+            (let ((row (db/query-one "busy-db" "PRAGMA busy_timeout")))
+              (db/close "busy-db")
+              (:timeout row))
+            "#,
+        )
+        .expect("busy_timeout pragma query");
+    assert_eq!(
+        result.as_int(),
+        Some(10_000),
+        "db/open must apply the bounded busy timeout, got {result:?}"
+    );
+}

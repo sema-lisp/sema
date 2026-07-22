@@ -341,6 +341,7 @@ fn checkout_runtime<T: Send + 'static>(
             });
         }),
         abort,
+        reclaim: None,
         terminal_on_success: false,
     })
 }
@@ -534,6 +535,7 @@ fn proc_close_runtime(id: i64) -> NativeResult {
                     });
                 }),
                 abort: None,
+                reclaim: None,
                 terminal_on_success: true,
             })
         }

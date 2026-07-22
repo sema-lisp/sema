@@ -226,6 +226,7 @@ fn checkout_runtime<T: Send + 'static>(
             });
         }),
         abort: None,
+        reclaim: None,
         terminal_on_success: false,
     })
 }

@@ -682,6 +682,13 @@ type CheckoutJob<Res, T> = Box<dyn FnOnce(&mut Res) -> Result<T, String> + Send>
 /// error). MUST NOT capture a `Value`/`Env` (it is not traced).
 type CheckoutDecode<T> = Box<dyn FnOnce(T) -> Result<Value, SemaError>>;
 
+/// A reclaim step for interrupt-then-reclaim cancellation. Returns `true` once
+/// the interrupted resource has been handed back and reinstalled (the cancel is
+/// fully reaped), or `false` while the interrupted worker op is still running
+/// (retry on the next reap turn). Runs on the VM thread; MUST NOT capture a
+/// `Value`/`Env` (it is not traced).
+pub(crate) type ReclaimReap = Box<dyn FnMut() -> bool>;
+
 /// The module-supplied pieces of one checkout offload. `Res` is the `Send`
 /// resource; `T` is the op's `Send` result payload.
 pub(crate) struct CheckoutOp<Res: Send + 'static, T: Send + 'static> {
@@ -720,6 +727,12 @@ pub(crate) struct CheckoutOp<Res: Send + 'static, T: Send + 'static> {
     /// Extra teardown to run on cancel besides the tombstone (e.g. a
     /// process-group SIGKILL). Runs on the VM thread.
     pub abort: Option<Box<dyn FnOnce()>>,
+    /// Optional interrupt-then-reclaim cancellation. When `Some`, a mid-op
+    /// cancel runs `abort` (the interrupt) and then, instead of tombstoning the
+    /// slot, keeps the checked-out resource alive (`PendingReap`) and reinstalls
+    /// it once the interrupted worker op hands it back. `None` keeps the
+    /// tombstone-on-cancel contract every other checkout module relies on.
+    pub reclaim: Option<ReclaimReap>,
     /// Close the gate when both the worker op and VM-thread decode succeed.
     /// Recoverable op/flush/decode errors retain and release the gate.
     pub terminal_on_success: bool,
@@ -921,6 +934,7 @@ impl<Res: Send + 'static, T: Send + 'static> NativeContinuation for AcquireCont<
                     decode,
                     tombstone,
                     abort,
+                    reclaim,
                     success_value,
                     terminal_on_success,
                     ..
@@ -945,6 +959,7 @@ impl<Res: Send + 'static, T: Send + 'static> NativeContinuation for AcquireCont<
                             Box::new(CheckoutCancelHook {
                                 tombstone,
                                 abort,
+                                reclaim,
                                 op_name,
                                 lifecycle: Rc::clone(&lifecycle),
                             }),
@@ -1063,6 +1078,7 @@ struct CheckoutCancelHook {
     op_name: &'static str,
     tombstone: Rc<dyn Fn(String)>,
     abort: Option<Box<dyn FnOnce()>>,
+    reclaim: Option<ReclaimReap>,
     lifecycle: Rc<GateLifecycle>,
 }
 
@@ -1074,17 +1090,38 @@ impl Trace for CheckoutCancelHook {
 
 impl CancelHook for CheckoutCancelHook {
     fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        // Fire the abort first (e.g. a SQLite interrupt or process-group
+        // SIGKILL) so a worker blocked in the op returns promptly.
+        if let Some(abort) = self.abort.take() {
+            abort();
+        }
+        if let Some(mut reclaim) = self.reclaim.take() {
+            // Interrupt-then-reclaim: the resource is reinstalled once the
+            // interrupted worker op hands it back, so the slot is NOT
+            // tombstoned. Reclaim now if the op already returned; otherwise keep
+            // the resource for a later reap turn. The gate is still closed by
+            // the cancelled continuation (a fresh op re-creates it).
+            if reclaim() {
+                return Ok(CancelDisposition::Reaped);
+            }
+            self.reclaim = Some(reclaim);
+            return Ok(CancelDisposition::PendingReap);
+        }
         (self.tombstone)(format!(
             "{} was cancelled while in flight; the resource cannot be reclaimed",
             self.op_name
         ));
         self.lifecycle.mark_terminal();
-        if let Some(abort) = self.abort.take() {
-            abort();
-        }
         Ok(CancelDisposition::Reaped)
     }
     fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        if let Some(mut reclaim) = self.reclaim.take() {
+            if reclaim() {
+                return Ok(CancelDisposition::Reaped);
+            }
+            self.reclaim = Some(reclaim);
+            return Ok(CancelDisposition::PendingReap);
+        }
         Ok(CancelDisposition::Reaped)
     }
 }
@@ -1239,6 +1276,7 @@ mod checkout_trace_tests {
                 op_name: "t",
                 tombstone: Rc::new(|_| {}),
                 abort: None,
+                reclaim: None,
                 lifecycle: lifecycle(),
             }),
             0

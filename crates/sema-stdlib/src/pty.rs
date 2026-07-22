@@ -307,6 +307,7 @@ fn checkout_runtime<T: Send + 'static>(
             });
         }),
         abort,
+        reclaim: None,
         terminal_on_success: false,
     })
 }
@@ -486,6 +487,7 @@ fn pty_close_runtime(id: i64) -> NativeResult {
                     });
                 }),
                 abort: None,
+                reclaim: None,
                 terminal_on_success: true,
             })
         }

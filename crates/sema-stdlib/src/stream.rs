@@ -1012,6 +1012,7 @@ mod io_streams {
             success_value: None,
             tombstone: Rc::new(move |msg| tombstone_input(&s_tomb, msg)),
             abort: None,
+            reclaim: None,
             terminal_on_success,
         })
     }
@@ -1046,6 +1047,7 @@ mod io_streams {
             success_value: None,
             tombstone: Rc::new(move |msg| tombstone_output(&s_tomb, msg)),
             abort: None,
+            reclaim: None,
             terminal_on_success: op_name == "stream/close",
         })
     }

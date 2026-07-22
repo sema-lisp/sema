@@ -239,6 +239,7 @@ fn checkout_runtime<R: Send + 'static>(
             });
         }),
         abort: None,
+        reclaim: None,
         terminal_on_success: false,
     })
 }

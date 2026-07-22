@@ -1952,6 +1952,121 @@ fn completion_works_on_trailing_empty_line_after_newline() {
     );
 }
 
+// ── completion: cross-file user symbols ──────────────────────
+
+#[test]
+fn completion_offers_symbols_from_scanned_workspace_files() {
+    let dir = unique_temp_dir("comp-ws");
+    let (mut state, uri) = parsed_state("file:///ws/main.sema", "(define x 1)\n");
+    insert_scanned_file(
+        &mut state,
+        &dir.join("library.sema"),
+        "(define (greet name) name)\n",
+    );
+
+    let items = state.handle_complete(
+        &uri,
+        &Position {
+            line: 1,
+            character: 0,
+        },
+    );
+    let greet = items
+        .iter()
+        .find(|i| i.label == "greet")
+        .expect("scanned-file symbol must be offered");
+    assert_eq!(greet.kind, Some(CompletionItemKind::FUNCTION));
+    assert_eq!(
+        greet.detail.as_deref(),
+        Some("(name)"),
+        "params from the scanned definition must surface as detail"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn completion_dedups_scanned_symbols_against_open_document() {
+    // The same name defined in the open document and in a scanned file must
+    // yield one item — the open document's.
+    let dir = unique_temp_dir("comp-dedup");
+    let source = "(define (greet name) name)\n";
+    let (mut state, uri) = parsed_state("file:///ws/main.sema", source);
+    state
+        .cached_user_defs
+        .insert(uri.as_str().to_string(), vec!["greet".to_string()]);
+    insert_scanned_file(&mut state, &dir.join("library.sema"), source);
+
+    let items = state.handle_complete(
+        &uri,
+        &Position {
+            line: 1,
+            character: 0,
+        },
+    );
+    let greet_items: Vec<_> = items.iter().filter(|i| i.label == "greet").collect();
+    assert_eq!(
+        greet_items.len(),
+        1,
+        "open-document definition must win: {greet_items:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn completion_prefers_builtins_over_scanned_symbols() {
+    let dir = unique_temp_dir("comp-builtin");
+    let (mut state, uri) = parsed_state("file:///ws/main.sema", "(define x 1)\n");
+    state.builtin_names.insert("greet".to_string());
+    insert_scanned_file(
+        &mut state,
+        &dir.join("library.sema"),
+        "(define (greet name) name)\n",
+    );
+
+    let items = state.handle_complete(
+        &uri,
+        &Position {
+            line: 1,
+            character: 0,
+        },
+    );
+    let greet_items: Vec<_> = items.iter().filter(|i| i.label == "greet").collect();
+    assert_eq!(greet_items.len(), 1, "builtin must win: {greet_items:?}");
+    assert!(
+        greet_items[0].data.is_none(),
+        "the surviving item must be the builtin (no uri payload), got {:?}",
+        greet_items[0]
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn completion_resolve_enriches_scanned_file_definition() {
+    let dir = unique_temp_dir("comp-resolve");
+    let mut state = BackendState::new_without_builtins(HashMap::new(), "sema".to_string());
+    insert_scanned_file(
+        &mut state,
+        &dir.join("library.sema"),
+        "(defun greet (name)\n  \"Say hello.\"\n  name)\n",
+    );
+
+    let item = CompletionItem {
+        label: "greet".to_string(),
+        kind: Some(CompletionItemKind::FUNCTION),
+        ..Default::default()
+    };
+    let resolved = state.handle_completion_resolve(item);
+    let doc = match resolved.documentation {
+        Some(Documentation::MarkupContent(c)) => c.value,
+        other => panic!("expected markdown documentation, got {other:?}"),
+    };
+    // The resolve path renders the flattened signature form (see
+    // user_definition_signature), unlike hover's raw-params form.
+    assert!(doc.contains("(greet name)"), "got: {doc}");
+    assert!(doc.contains("Say hello."), "got: {doc}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ── call hierarchy across scanned files ──────────────────────
 
 #[test]

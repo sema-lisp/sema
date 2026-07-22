@@ -84,6 +84,44 @@ impl BackendState {
             }
         }
 
+        // Workspace symbols from still-fresh scanned files, so a sibling
+        // file's definitions complete without opening it. On a name clash,
+        // whatever was emitted above wins (special forms, builtins, the
+        // current document's user definitions). Full-cache iteration per
+        // request is the same pattern references and rename use.
+        let mut emitted: std::collections::HashSet<String> =
+            items.iter().map(|i| i.label.clone()).collect();
+        let mut scanned: Vec<_> = self
+            .import_cache
+            .iter()
+            .filter(|(path, entry)| entry.is_fresh(path))
+            .collect();
+        // Deterministic completion order despite arbitrary map order.
+        scanned.sort_by(|a, b| a.0.cmp(b.0));
+        for (path, entry) in scanned {
+            let uri_string = match Url::from_file_path(path) {
+                Ok(u) => u.to_string(),
+                Err(_) => continue,
+            };
+            // Names only; ranges discarded — &[] skips UTF-16 mapping.
+            let defs =
+                user_definitions_from_ast(&entry.ast, &entry.span_map, &entry.symbol_spans, &[]);
+            for (name, _) in defs {
+                if !(prefix.is_empty() || name.starts_with(prefix)) || emitted.contains(&name) {
+                    continue;
+                }
+                let detail = extract_params_from_ast(&entry.ast, &name);
+                emitted.insert(name.clone());
+                items.push(CompletionItem {
+                    label: name,
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    detail,
+                    data: Some(serde_json::Value::String(uri_string.clone())),
+                    ..Default::default()
+                });
+            }
+        }
+
         // Local bindings from scope tree
         if let Some(cached) = self.cached_parses.get(uri_str) {
             let sema_line = position.line as usize + 1;
@@ -147,6 +185,15 @@ impl BackendState {
                 return Some(doc);
             }
         }
+        // Scanned workspace files (covers items completed from the scan cache).
+        for (path, entry) in &self.import_cache {
+            if !entry.is_fresh(path) {
+                continue;
+            }
+            if let Some(doc) = extract_docstring_from_ast(&entry.ast, name) {
+                return Some(doc);
+            }
+        }
         None
     }
 
@@ -175,6 +222,15 @@ impl BackendState {
         }
         for cached in self.cached_parses.values() {
             if let Some(params) = extract_params_from_ast(&cached.ast, name) {
+                return Some(render(params));
+            }
+        }
+        // Scanned workspace files (covers items completed from the scan cache).
+        for (path, entry) in &self.import_cache {
+            if !entry.is_fresh(path) {
+                continue;
+            }
+            if let Some(params) = extract_params_from_ast(&entry.ast, name) {
                 return Some(render(params));
             }
         }

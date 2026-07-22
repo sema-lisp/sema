@@ -83,6 +83,61 @@ impl Drop for ServerGuard {
     }
 }
 
+/// Spawns `sema lsp` and completes the `initialize`/`initialized` handshake.
+fn start_initialized_server(
+    sema: &std::path::Path,
+) -> (
+    ServerGuard,
+    ChildStdin,
+    BufReader<std::process::ChildStdout>,
+) {
+    // Run from an empty temp dir so the `initialized` workspace scan finds nothing (fast + stable).
+    let mut child = Command::new(sema)
+        .arg("lsp")
+        .current_dir(std::env::temp_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn `sema lsp`");
+
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let guard = ServerGuard(child);
+
+    send(
+        &mut stdin,
+        &json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "processId": null, "rootUri": null, "capabilities": {} }
+        }),
+    );
+    wait_for_response(&mut reader, 1);
+    send(
+        &mut stdin,
+        &json!({ "jsonrpc": "2.0", "method": "initialized", "params": {} }),
+    );
+
+    (guard, stdin, reader)
+}
+
+/// Polls the child until it exits or `timeout` elapses.
+fn wait_for_exit(
+    child: &mut Child,
+    timeout: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("wait on `sema lsp`") {
+            return Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn lsp_formatting_and_selection_range_round_trip() {
     let Some(sema) = find_sema_binary() else {
@@ -103,7 +158,7 @@ fn lsp_formatting_and_selection_range_round_trip() {
 
     let mut stdin = child.stdin.take().unwrap();
     let mut reader = BufReader::new(child.stdout.take().unwrap());
-    let _guard = ServerGuard(child);
+    let mut guard = ServerGuard(child);
 
     // initialize
     send(
@@ -189,7 +244,8 @@ fn lsp_formatting_and_selection_range_round_trip() {
         "expected a parent selection range"
     );
 
-    // shutdown
+    // shutdown, await the response, then exit — the server must terminate
+    // promptly with code 0 (LSP lifecycle; regression for the exit hang).
     send(
         &mut stdin,
         &json!({ "jsonrpc": "2.0", "id": 4, "method": "shutdown", "params": null }),
@@ -199,4 +255,60 @@ fn lsp_formatting_and_selection_range_round_trip() {
         &mut stdin,
         &json!({ "jsonrpc": "2.0", "method": "exit", "params": null }),
     );
+    let status = wait_for_exit(&mut guard.0, std::time::Duration::from_secs(3))
+        .expect("server did not exit within 3s of shutdown + exit");
+    assert_eq!(status.code(), Some(0), "clean shutdown/exit must exit 0");
+}
+
+/// Regression: `shutdown` + `exit` sent back-to-back — without reading the
+/// shutdown response first — must terminate the process promptly with exit
+/// code 0. tower-lsp's own exit handling never ends the process (tower-lsp
+/// issue #399), so the stdio transport watches the lifecycle frames itself.
+#[test]
+fn lsp_exits_zero_on_immediate_shutdown_exit() {
+    let Some(sema) = find_sema_binary() else {
+        eprintln!("skipping lsp_e2e: `sema` binary not found next to test runner — build it first");
+        return;
+    };
+    let (mut guard, mut stdin, _reader) = start_initialized_server(&sema);
+
+    send(
+        &mut stdin,
+        &json!({ "jsonrpc": "2.0", "id": 2, "method": "shutdown", "params": null }),
+    );
+    send(
+        &mut stdin,
+        &json!({ "jsonrpc": "2.0", "method": "exit", "params": null }),
+    );
+
+    let started = std::time::Instant::now();
+    let status = wait_for_exit(&mut guard.0, std::time::Duration::from_secs(3))
+        .expect("server did not exit within 3s of back-to-back shutdown + exit");
+    eprintln!("shutdown+exit terminated in {:?}", started.elapsed());
+    assert_eq!(status.code(), Some(0), "shutdown-then-exit must exit 0");
+}
+
+/// Regression: an `exit` notification without a prior `shutdown` request must
+/// terminate the process promptly with exit code 1 (per the LSP spec).
+#[test]
+fn lsp_exits_one_on_exit_without_shutdown() {
+    let Some(sema) = find_sema_binary() else {
+        eprintln!("skipping lsp_e2e: `sema` binary not found next to test runner — build it first");
+        return;
+    };
+    let (mut guard, mut stdin, _reader) = start_initialized_server(&sema);
+
+    send(
+        &mut stdin,
+        &json!({ "jsonrpc": "2.0", "method": "exit", "params": null }),
+    );
+
+    let started = std::time::Instant::now();
+    let status = wait_for_exit(&mut guard.0, std::time::Duration::from_secs(3))
+        .expect("server did not exit within 3s of exit-without-shutdown");
+    eprintln!(
+        "exit-without-shutdown terminated in {:?}",
+        started.elapsed()
+    );
+    assert_eq!(status.code(), Some(1), "exit without shutdown must exit 1");
 }

@@ -518,6 +518,31 @@ cancellation or interpreter teardown**; non-unix `read_line_value` raw-blocks
 
 ### Commit B6 — spinner lifecycle ownership (closes R19)
 
+**Landed.** The `SPINNERS`/`SPINNER_COUNTER` thread-locals became an
+interpreter-owned `Rc<SpinnerRegistry>` captured into the `term/spinner-*`
+natives with a weak `register_interpreter_teardown_hook` (the `fs_watch`/B5
+`TtyRegistry` model). Each render thread now parks on a `Condvar` wait-timeout
+(`SpinnerStop::park_frame`) instead of a bare `thread::sleep` frame loop, so
+`stop` sets a flag and wakes it immediately. `term/spinner-stop` is dual-ABI: in
+a runtime quantum it signals stop on the VM thread and offloads only the bounded
+join via `PreparedExternalOperation::interruptible_blocking`
+(`build_spinner_join_suspend`, the `workflow/run` flush-ack shape), so a sibling
+task runs while the thread winds down; the host (non-quantum) path joins inline,
+bounded by one frame interval via the condvar wake. Interpreter teardown
+(`SpinnerRegistry::stop_all`) stops+joins every live spinner (bounded by one
+interval each) — no live render thread survives teardown. CORE-2 I2 holds: the
+registry, handles, decoder, and cancel hook are all `Value`-free POD. Regression:
+`integration_test::{spinner_stop_in_quantum_lets_sibling_run,interpreter_drop_stops_live_spinner_threads}`
+(plus the existing `test_term_spinner_*` smoke tests) and
+`sema-stdlib` `terminal::tests::{teardown_hook_stops_and_joins_live_spinner,stop_wakes_and_joins_render_thread_promptly}`.
+Source guard: a new `SPINNER_FRAME_SLEEP` scan (`--check-spinner-park`, pinned to
+zero via `scripts/spinner-park-allowlist.tsv`) fails any `thread::sleep`
+reintroduced into `terminal.rs`, with pass/fail fixtures
+(`spinner-condvar-park.rs` / `spinner-frame-sleep.rs`). **R19 flipped to
+`MIGRATED (B6)`** in `docs/internals/async-runtime-inventory.md`; the
+`runtime-match-map.tsv` re-map + the `runtime_conformance_test` inventory
+reconciliation are the deferred C7 work and remain red.
+
 Gap (verified, all four parts missing): `SPINNERS` thread-local
 (`crates/sema-stdlib/src/terminal.rs:37-40`); per-spinner sleeping thread with
 no `Drop`/teardown (an unstopped spinner runs to process exit);

@@ -106,6 +106,11 @@ mod system;
 pub use system::mark_sigwinch_pending_for_test;
 #[cfg(not(target_arch = "wasm32"))]
 mod terminal;
+/// Live spinner render-thread gauge (B6 R19), used by the spinner lifecycle
+/// regression to assert interpreter teardown leaves no live spinner thread.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use terminal::spinner_live_thread_count;
 mod text;
 mod toml_ops;
 mod typed_array;

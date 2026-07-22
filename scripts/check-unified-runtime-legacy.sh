@@ -7,6 +7,8 @@ workflow_journal_allowlist="$repo_root/scripts/workflow-journal-fs-allowlist.tsv
 workflow_journal_src="$repo_root/crates/sema-workflow/src/journal.rs"
 workflow_writer_allowlist="$repo_root/scripts/workflow-writer-fs-allowlist.tsv"
 workflow_writer_src_dir="$repo_root/crates/sema-workflow/src"
+spinner_park_src="$repo_root/crates/sema-stdlib/src/terminal.rs"
+spinner_park_allowlist="$repo_root/scripts/spinner-park-allowlist.tsv"
 
 # ── Fixture pattern (used by --scan-path) ───────────────────────────────────
 # Broad "legacy async" markers used only to prove the scanner still detects a
@@ -569,6 +571,82 @@ check_workflow_writer_file() {
   rm -f "$hits_file"
 }
 
+# ── B6 spinner lifecycle policy (R19) ───────────────────────────────────────
+# The spinner render thread must PARK on its condvar (`wait_timeout_while`) between
+# frames, so `term/spinner-stop` and interpreter teardown wake it immediately. A
+# bare `thread::sleep` frame loop is the legacy shape: its sleeping thread could
+# only be stopped after a full interval and never on teardown (an unstopped spinner
+# ran to process exit). This pins `terminal.rs` to ZERO `thread::sleep` — the
+# render loop is condvar-parked and the offloaded join blocks on the worker, never
+# a frame sleep. Comment-strip + drop the #[cfg(test)] block, then count
+# thread::sleep in the production module.
+
+# Emit "SPINNER_FRAME_SLEEP<TAB>LINE" for each thread::sleep in one file's prod module.
+scan_spinner_park_file() {
+  local file="$1" prod matched ln
+  prod=$(sed -E 's://.*$::' "$file" | sed -n '1,/#\[cfg(test)\]/p')
+  matched=$(printf '%s\n' "$prod" | rg -n --no-heading --color never 'thread::sleep' || true)
+  while IFS=: read -r ln _; do
+    [[ -z "$ln" ]] && continue
+    printf 'SPINNER_FRAME_SLEEP\t%s\n' "$ln"
+  done <<< "$matched"
+}
+
+# Pin terminal.rs to the allowlisted thread::sleep count (zero); a reintroduced bare
+# frame sleep in the spinner loop is unallowlisted and fails.
+check_spinner_park_file() {
+  local file="$1" allowlist="$2"
+  if [[ ! -f "$file" ]]; then
+    echo "spinner source is missing: $file" >&2
+    return 2
+  fi
+  if [[ ! -f "$allowlist" ]]; then
+    echo "spinner-park allowlist is missing: $allowlist" >&2
+    return 2
+  fi
+  local hits_file
+  hits_file=$(mktemp)
+  scan_spinner_park_file "$file" >"$hits_file"
+  if ! awk -F '\t' '
+    BEGIN { valid["SPINNER_FRAME_SLEEP"] = 1 }
+    FILENAME == ARGV[1] {
+      if ($0 ~ /^[[:space:]]*(#|$)/) next
+      if (NF < 2 || !($1 in valid) || $2 !~ /^[0-9]+$/) {
+        print "malformed spinner-park allowlist row: " $0 > "/dev/stderr"
+        invalid = 1
+        next
+      }
+      expected[$1] = $2 + 0
+      next
+    }
+    { actual[$1]++; sample[$1] = $2 }
+    END {
+      for (t in actual) {
+        if (!(t in expected)) {
+          print "forbidden spinner frame sleep " t " at line " sample[t] \
+            " (the spinner render loop must park on its condvar, not thread::sleep)" > "/dev/stderr"
+          invalid = 1
+        } else if (actual[t] != expected[t]) {
+          print "spinner-park sleep count changed for " t \
+            ": expected " expected[t] ", found " actual[t] > "/dev/stderr"
+          invalid = 1
+        }
+      }
+      for (t in expected) {
+        if (!(t in actual) && expected[t] != 0) {
+          print "spinner-park allowlist entry is stale for " t > "/dev/stderr"
+          invalid = 1
+        }
+      }
+      exit invalid
+    }
+  ' "$allowlist" "$hits_file"; then
+    rm -f "$hits_file"
+    return 1
+  fi
+  rm -f "$hits_file"
+}
+
 check_source_policy_paths() {
   local allowlist="$1"
   shift
@@ -634,6 +712,13 @@ case "${1:-}" in
     fi
     check_workflow_writer_file "$2" "$3"
     ;;
+  --check-spinner-park)
+    if [[ $# -ne 3 ]]; then
+      echo "usage: $0 --check-spinner-park FILE ALLOWLIST" >&2
+      exit 2
+    fi
+    check_spinner_park_file "$2" "$3"
+    ;;
   ""|--check)
     if ! check_source_policy_paths "$host_adapter_allowlist" crates/*/src playground/src; then
       echo "unified-runtime source policy failed" >&2
@@ -645,6 +730,10 @@ case "${1:-}" in
     fi
     if ! check_workflow_writer_dir "$workflow_writer_allowlist"; then
       echo "workflow-writer filesystem policy failed" >&2
+      exit 1
+    fi
+    if ! check_spinner_park_file "$spinner_park_src" "$spinner_park_allowlist"; then
+      echo "spinner lifecycle policy failed" >&2
       exit 1
     fi
     bash "$repo_root/scripts/test-unified-runtime-source-policy.sh"

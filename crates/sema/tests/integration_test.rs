@@ -6453,6 +6453,76 @@ fn test_term_spinner_update() {
     );
 }
 
+// R19 (B6) spinner lifecycle ownership. In a runtime quantum `term/spinner-stop`
+// offloads its bounded join via an External wait and yields the instant it is
+// called, so a zero-delay sibling task completes first. If the stop blocked the
+// VM thread (the legacy inline join), the spinner task would send before yielding
+// and win the race. Ordering is asserted via channel receive order — never a
+// wall-clock duration — matching the archive/db/kv async-offload suites.
+#[test]
+fn spinner_stop_in_quantum_lets_sibling_run() {
+    let interp = Interpreter::new();
+    let result = interp
+        .eval_str_compiled(
+            r#"
+            (let ((out (channel/new 8)))
+              (async/all
+                (list
+                  (async/spawn (fn ()
+                    (let ((id (term/spinner-start "work")))
+                      (term/spinner-stop id)
+                      (channel/send out "spinner"))))
+                  (async/spawn (fn () (channel/send out "sibling")))))
+              (list (channel/recv out) (channel/recv out)))
+            "#,
+        )
+        .expect("spinner-stop offload lets a sibling run");
+    let received: Vec<String> = result
+        .as_list()
+        .expect("channel receives list")
+        .iter()
+        .map(|v| v.as_str().expect("string value").to_string())
+        .collect();
+    assert_eq!(
+        received,
+        vec!["sibling".to_string(), "spinner".to_string()],
+        "the sibling must complete while spinner-stop is parked on its offloaded join, got {received:?}"
+    );
+}
+
+// A spinner started but never stopped must be stopped+joined by interpreter
+// teardown — no live render thread survives the drop. Probed via the live-thread
+// gauge (not terminal output). nextest's process-per-test isolation keeps the
+// gauge local; the baseline read tolerates a shared-process runner too.
+#[test]
+fn interpreter_drop_stops_live_spinner_threads() {
+    let baseline = sema_stdlib::spinner_live_thread_count();
+    let interp = Interpreter::new();
+    interp
+        .eval_str_compiled(r#"(term/spinner-start "unstopped")"#)
+        .expect("start a spinner and leave it running");
+
+    // Wait (bounded) for the render thread to actually start.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while sema_stdlib::spinner_live_thread_count() <= baseline
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        sema_stdlib::spinner_live_thread_count(),
+        baseline + 1,
+        "the spinner render thread must be live before teardown"
+    );
+
+    drop(interp); // teardown hook stops+joins the live spinner
+    assert_eq!(
+        sema_stdlib::spinner_live_thread_count(),
+        baseline,
+        "interpreter teardown must stop and join every live spinner thread"
+    );
+}
+
 // Regression tests: deftool params stored as BTreeMap (alphabetical keys).
 // Lambda handlers must receive args in declaration order, not alphabetical.
 // The actual json_args_to_sema ordering fix is tested via unit tests in

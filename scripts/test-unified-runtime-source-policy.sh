@@ -257,4 +257,41 @@ expect_writer_failure \
   WORKFLOW_WRITE_ALL \
   WORKFLOW_FS_WRITE
 
+# ── B6 spinner lifecycle policy (R19) ───────────────────────────────────────
+spinner_park_allowlist="$repo_root/scripts/spinner-park-allowlist.tsv"
+
+expect_spinner_success() {
+  local fixture="$1" output
+  if ! output="$($scanner --check-spinner-park "$fixture" "$spinner_park_allowlist" 2>&1)"; then
+    echo "spinner-park fixture unexpectedly failed: $fixture" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+}
+
+expect_spinner_failure() {
+  local fixture="$1"
+  shift
+  local output
+  if output="$($scanner --check-spinner-park "$fixture" "$spinner_park_allowlist" 2>&1)"; then
+    echo "spinner-park fixture unexpectedly passed: $fixture" >&2
+    exit 1
+  fi
+  for expected in "$@"; do
+    if [[ "$output" != *"$expected"* ]]; then
+      echo "spinner-park fixture did not report '$expected': $fixture" >&2
+      echo "$output" >&2
+      exit 1
+    fi
+  done
+}
+
+# The sanctioned condvar-parking render loop (no thread::sleep) PASSES.
+expect_spinner_success "$fixtures/spinner-condvar-park.rs"
+
+# A reintroduced bare `thread::sleep` frame loop FAILS the spinner-park policy.
+expect_spinner_failure \
+  "$fixtures/spinner-frame-sleep.rs" \
+  SPINNER_FRAME_SLEEP
+
 echo "ok: unified-runtime source-policy fixtures"

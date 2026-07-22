@@ -295,4 +295,47 @@ expect_spinner_failure \
   "$fixtures/spinner-frame-sleep.rs" \
   SPINNER_FRAME_SLEEP
 
+# ── C2 OTel file-exporter writer filesystem policy (C06) ────────────────────
+otel_writer_zero_allowlist="$fixtures/otel-file-writer-zero-allowlist.tsv"
+
+expect_otel_writer_success() {
+  local fixture="$1" allowlist="$2" output
+  if ! output="$($scanner --check-otel-file-writer "$fixture" "$allowlist" 2>&1)"; then
+    echo "sema-otel file-writer fixture unexpectedly failed: $fixture" >&2
+    echo "$output" >&2
+    exit 1
+  fi
+}
+
+expect_otel_writer_failure() {
+  local fixture="$1" allowlist="$2"
+  shift 2
+  local output
+  if output="$($scanner --check-otel-file-writer "$fixture" "$allowlist" 2>&1)"; then
+    echo "sema-otel file-writer fixture unexpectedly passed: $fixture" >&2
+    exit 1
+  fi
+  for expected in "$@"; do
+    if [[ "$output" != *"$expected"* ]]; then
+      echo "sema-otel file-writer fixture did not report '$expected': $fixture" >&2
+      echo "$output" >&2
+      exit 1
+    fi
+  done
+}
+
+# The sanctioned C2 shape (render + enqueue, writes on the writer thread) PASSES the zero
+# allowlist — a non-writer sema-otel path is write-free.
+expect_otel_writer_success \
+  "$fixtures/otel-file-writer-clean.rs" \
+  "$otel_writer_zero_allowlist"
+
+# Reintroducing a synchronous per-span-end fs write (write_all + fs::write on the VM thread)
+# FAILS — non-writer sema-otel paths must stay write-free.
+expect_otel_writer_failure \
+  "$fixtures/otel-file-writer-sync-write.rs" \
+  "$otel_writer_zero_allowlist" \
+  SEMA_OTEL_WRITE_ALL \
+  SEMA_OTEL_FS_WRITE
+
 echo "ok: unified-runtime source-policy fixtures"

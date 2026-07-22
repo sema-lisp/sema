@@ -654,7 +654,9 @@ fn build_provider() -> Option<SdkTracerProvider> {
 
     if let Some(path) = file {
         if let Ok(exp) = JsonlFileExporter::new(&path) {
-            // Simple exporter → deterministic immediate JSONL capture.
+            // Simple processor → one span per `export()` call; the exporter renders on the
+            // VM thread and enqueues to its own writer thread (no VM-thread disk I/O), with
+            // a bounded flush on provider shutdown so the file is complete on return.
             builder = builder.with_simple_exporter(exp);
         }
     }

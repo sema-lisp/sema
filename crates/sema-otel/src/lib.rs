@@ -84,6 +84,10 @@ mod imp;
 pub use compat::compat_active;
 #[cfg(not(target_arch = "wasm32"))]
 pub use imp::*;
+// Test-only seam: lets the file-export regression assert the writer runs off the VM thread.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use file_exporter::last_writer_thread_id;
 
 // Re-export so embedded hosts can name `TelemetryMode::OwnProvider(..)`'s payload
 // without taking a direct `opentelemetry_sdk` dependency.

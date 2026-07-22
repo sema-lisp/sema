@@ -9,6 +9,8 @@ workflow_writer_allowlist="$repo_root/scripts/workflow-writer-fs-allowlist.tsv"
 workflow_writer_src_dir="$repo_root/crates/sema-workflow/src"
 spinner_park_src="$repo_root/crates/sema-stdlib/src/terminal.rs"
 spinner_park_allowlist="$repo_root/scripts/spinner-park-allowlist.tsv"
+otel_file_writer_allowlist="$repo_root/scripts/sema-otel-file-writer-fs-allowlist.tsv"
+otel_file_writer_src_dir="$repo_root/crates/sema-otel/src"
 
 # ── Fixture pattern (used by --scan-path) ───────────────────────────────────
 # Broad "legacy async" markers used only to prove the scanner still detects a
@@ -573,6 +575,151 @@ check_workflow_writer_file() {
   rm -f "$hits_file"
 }
 
+# ── C2 OTel file-exporter writer filesystem policy (C06) ────────────────────
+# Every `write_all`/`fs::write` in the sema-otel crate must live on the dedicated file
+# WRITER thread (file_exporter.rs `writer_loop`); the VM thread only renders + `try_send`s,
+# and the OTLP batch path does no `fs` writes here. Comment-strip + drop the #[cfg(test)]
+# block, then count write_all / fs::write per file. Same shape as the A3 workflow-writer
+# guard, with sema-otel-specific tokens.
+
+# Emit "TOKEN<TAB>LINE" for each write_all / fs::write in one file's production module.
+scan_otel_writer_file() {
+  local file="$1" prod matched ln
+  prod=$(sed -E 's://.*$::' "$file" | sed -n '1,/#\[cfg(test)\]/p')
+  matched=$(printf '%s\n' "$prod" | rg -n --no-heading --color never '\bwrite_all\b' || true)
+  while IFS=: read -r ln _; do
+    [[ -z "$ln" ]] && continue
+    printf 'SEMA_OTEL_WRITE_ALL\t%s\n' "$ln"
+  done <<< "$matched"
+  matched=$(printf '%s\n' "$prod" | rg -n --no-heading --color never '\bfs::write\b' || true)
+  while IFS=: read -r ln _; do
+    [[ -z "$ln" ]] && continue
+    printf 'SEMA_OTEL_FS_WRITE\t%s\n' "$ln"
+  done <<< "$matched"
+}
+
+# Emit "TOKEN<TAB>REL<TAB>LINE" across every production .rs in the sema-otel crate.
+scan_otel_writer_dir() {
+  cd "$repo_root"
+  local file rel token ln
+  while IFS= read -r file; do
+    [[ -z "$file" ]] && continue
+    rel=$(repo_relative_path "$file")
+    while IFS=$'\t' read -r token ln; do
+      [[ -z "$token" ]] && continue
+      printf '%s\t%s\t%s\n' "$token" "$rel" "$ln"
+    done < <(scan_otel_writer_file "$file")
+  done < <(rg --files -g '*.rs' "$otel_file_writer_src_dir" | LC_ALL=C sort -u)
+}
+
+# Production gate: pin write_all/fs::write to the exact file_exporter.rs counts; a write in
+# ANY other sema-otel file (a regressed synchronous per-span-end write) is unallowlisted.
+check_otel_writer_dir() {
+  local allowlist="$1"
+  if [[ ! -f "$allowlist" ]]; then
+    echo "sema-otel file-writer fs allowlist is missing: $allowlist" >&2
+    return 2
+  fi
+  local hits_file
+  hits_file=$(mktemp)
+  scan_otel_writer_dir >"$hits_file"
+  if ! awk -F '\t' '
+    FILENAME == ARGV[1] {
+      if ($0 ~ /^[[:space:]]*(#|$)/) next
+      if (NF < 3 || $3 !~ /^[0-9]+$/) {
+        print "malformed sema-otel file-writer allowlist row: " $0 > "/dev/stderr"
+        invalid = 1
+        next
+      }
+      expected[$1 SUBSEP $2] = $3 + 0
+      next
+    }
+    { key = $1 SUBSEP $2; actual[key]++; sample[key] = $2 ":" $3 }
+    END {
+      for (key in actual) {
+        split(key, part, SUBSEP)
+        if (!(key in expected)) {
+          print "forbidden sema-otel fs write " part[1] " at " sample[key] \
+            " (span export writes belong on the file_exporter.rs writer thread)" > "/dev/stderr"
+          invalid = 1
+        } else if (actual[key] != expected[key]) {
+          print "sema-otel file-writer fs count changed for " part[1] " in " part[2] \
+            ": expected " expected[key] ", found " actual[key] > "/dev/stderr"
+          invalid = 1
+        }
+      }
+      for (key in expected) {
+        if (!(key in actual) && expected[key] != 0) {
+          split(key, part, SUBSEP)
+          print "sema-otel file-writer fs allowlist entry is stale for " part[1] " in " part[2] \
+            ": expected " expected[key] ", found 0" > "/dev/stderr"
+          invalid = 1
+        }
+      }
+      exit invalid
+    }
+  ' "$allowlist" "$hits_file"; then
+    rm -f "$hits_file"
+    return 1
+  fi
+  rm -f "$hits_file"
+}
+
+# Single-file fixture gate: check one file's write_all/fs::write against a per-token
+# allowlist (a zero allowlist ⇒ the file must be write-free — the sync-write regression).
+check_otel_writer_file() {
+  local file="$1" allowlist="$2"
+  if [[ ! -f "$file" ]]; then
+    echo "sema-otel file-writer source is missing: $file" >&2
+    return 2
+  fi
+  if [[ ! -f "$allowlist" ]]; then
+    echo "sema-otel file-writer allowlist is missing: $allowlist" >&2
+    return 2
+  fi
+  local hits_file
+  hits_file=$(mktemp)
+  scan_otel_writer_file "$file" >"$hits_file"
+  if ! awk -F '\t' '
+    BEGIN { valid["SEMA_OTEL_WRITE_ALL"] = 1; valid["SEMA_OTEL_FS_WRITE"] = 1 }
+    FILENAME == ARGV[1] {
+      if ($0 ~ /^[[:space:]]*(#|$)/) next
+      if (NF < 2 || !($1 in valid) || $2 !~ /^[0-9]+$/) {
+        print "malformed sema-otel file-writer allowlist row: " $0 > "/dev/stderr"
+        invalid = 1
+        next
+      }
+      expected[$1] = $2 + 0
+      next
+    }
+    { actual[$1]++; sample[$1] = $2 }
+    END {
+      for (t in actual) {
+        if (!(t in expected)) {
+          print "forbidden sema-otel fs write " t " at line " sample[t] \
+            " (a synchronous per-span-end write must move to the writer thread)" > "/dev/stderr"
+          invalid = 1
+        } else if (actual[t] != expected[t]) {
+          print "sema-otel file-writer fs count changed for " t \
+            ": expected " expected[t] ", found " actual[t] > "/dev/stderr"
+          invalid = 1
+        }
+      }
+      for (t in expected) {
+        if (!(t in actual) && expected[t] != 0) {
+          print "sema-otel file-writer fs allowlist entry is stale for " t > "/dev/stderr"
+          invalid = 1
+        }
+      }
+      exit invalid
+    }
+  ' "$allowlist" "$hits_file"; then
+    rm -f "$hits_file"
+    return 1
+  fi
+  rm -f "$hits_file"
+}
+
 # ── B6 spinner lifecycle policy (R19) ───────────────────────────────────────
 # The spinner render thread must PARK on its condvar (`wait_timeout_while`) between
 # frames, so `term/spinner-stop` and interpreter teardown wake it immediately. A
@@ -721,6 +868,13 @@ case "${1:-}" in
     fi
     check_spinner_park_file "$2" "$3"
     ;;
+  --check-otel-file-writer)
+    if [[ $# -ne 3 ]]; then
+      echo "usage: $0 --check-otel-file-writer FILE ALLOWLIST" >&2
+      exit 2
+    fi
+    check_otel_writer_file "$2" "$3"
+    ;;
   ""|--check)
     if ! check_source_policy_paths "$host_adapter_allowlist" crates/*/src playground/src; then
       echo "unified-runtime source policy failed" >&2
@@ -736,6 +890,10 @@ case "${1:-}" in
     fi
     if ! check_spinner_park_file "$spinner_park_src" "$spinner_park_allowlist"; then
       echo "spinner lifecycle policy failed" >&2
+      exit 1
+    fi
+    if ! check_otel_writer_dir "$otel_file_writer_allowlist"; then
+      echo "sema-otel file-writer filesystem policy failed" >&2
       exit 1
     fi
     bash "$repo_root/scripts/test-unified-runtime-source-policy.sh"

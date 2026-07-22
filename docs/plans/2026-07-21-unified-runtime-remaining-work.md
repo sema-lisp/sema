@@ -768,6 +768,28 @@ the VM thread inside quantums with no re-entrancy or blocking guard
 
 ### Commit C2 — OTel file export off the VM thread (closes C06)
 
+**Landed 2026-07-22.** The `SEMA_OTEL_FILE` JSONL exporter now has the A3 bounded-FIFO
+writer-thread shape (`crates/sema-otel/src/file_exporter.rs`): `export()` renders each span
+to a JSON line ON the VM thread (bounded — attributes are already per-field truncated) and
+`try_send`s it to a dedicated `sema-otel-file` writer thread that owns the `BufWriter<File>`
+and performs every `write_all`+`flush`; a full queue drops the line per the best-effort
+file-sink contract. `JsonlFileExporter::drop` `try_send`s `Stop` and DETACHES (never joins),
+so no drop/shutdown path can block on the writer from a quantum. `shutdown_with_timeout` (the
+method `SimpleSpanProcessor` actually forwards to) parks on a terminal `Flush` ack bounded by
+the SDK-supplied timeout, so the file is complete on disk once `SdkTracerProvider::shutdown`
+returns; `force_flush` does the same, bounded. The OTLP batch export path is UNCHANGED. Span
+mutation stays synchronous — only the disk write moved off-thread. Regression
+(`crates/sema-otel/tests/file_export.rs`): `span_export_runs_on_a_dedicated_writer_thread`
+(the writer thread id, recorded via the `last_writer_thread_id` doc-hidden seam, differs from
+the emitting thread) and `all_spans_are_on_disk_after_provider_shutdown` (25 spans all
+flushed after `drop(guard)`), with the existing `otel_*` matrix green. Source guard:
+`scripts/sema-otel-file-writer-fs-allowlist.tsv` pins `write_all`/`fs::write` in `sema-otel`
+to `file_exporter.rs` (count 1), wired into `check-unified-runtime-legacy.sh --check` plus a
+`--check-otel-file-writer` single-file gate with `otel-file-writer-{clean,sync-write}.rs`
+pass/fail fixtures. **C06 flipped to `MIGRATED (C2)`** in
+`docs/internals/async-runtime-inventory.md`; the `runtime-match-map.tsv` re-map and the
+`runtime_conformance_test` inventory reconciliation are the deferred C7 work and remain red.
+
 Gap (verified): `SEMA_OTEL_FILE` uses `with_simple_exporter`
 (`crates/sema-otel/src/imp.rs:655-658`) — `JsonlFileExporter` does synchronous
 `write_all`+`flush` per span end, on the VM thread at span-guard drop

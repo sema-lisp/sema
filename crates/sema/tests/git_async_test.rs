@@ -170,6 +170,31 @@ impl ScratchRepo {
         bin
     }
 
+    /// A fake `git` on PATH that forks a descendant into its own process group
+    /// (a delayed marker writer) and then floods stdout far past the (lowered)
+    /// output cap. The over-cap drain must SIGKILL the whole group — reaping the
+    /// descendant before it can write its marker — and reject the task with the
+    /// structured over-cap error. Returns the wrapper's PATH dir and the marker a
+    /// direct-child-only kill would leak.
+    #[cfg(unix)]
+    fn install_over_cap_git_wrapper(&self) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = self.dir.join("over-cap-fake-bin");
+        std::fs::create_dir(&bin).unwrap();
+        let wrapper = bin.join("git");
+        let descendant = self.dir.join("over-cap-descendant");
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\n( sleep 1; printf leaked > over-cap-descendant ) &\ni=0\nwhile [ $i -lt 8192 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n'; i=$((i+1)); done\nwait\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, permissions).unwrap();
+        (bin, descendant)
+    }
+
     #[cfg(unix)]
     fn install_escaped_git_wrapper(&self) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -577,6 +602,51 @@ fn git_cancel_bounds_drains_held_by_escaped_descendant() {
     assert!(
         !leaked.exists(),
         "cancellation waited for an escaped descendant to release inherited pipes"
+    );
+}
+
+/// A runtime `git/*` whose subprocess floods stdout past the pre-dispatch output
+/// cap must kill the entire Git process group (via the same hook cancellation
+/// uses) and reject the task with a structured over-cap error — never buffer a
+/// hostile pipe to exhaustion. The fake `git` forks a descendant that would
+/// write a delayed marker; a direct-child-only kill would leak it.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn git_output_over_cap_kills_group_and_errors() {
+    if !git_available() {
+        eprintln!("skipping git_output_over_cap_kills_group_and_errors: no git on PATH");
+        return;
+    }
+    let repo = ScratchRepo::new("over-cap");
+    let (bin, descendant) = repo.install_over_cap_git_wrapper();
+    let prior_path = std::env::var_os("PATH").unwrap_or_default();
+    let joined_path =
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&prior_path)))
+            .unwrap();
+    let _path = EnvVarGuard::set("PATH", joined_path);
+    let _cwd = TestDir::enter(&repo.dir);
+
+    // Lower the per-pipe cap so the wrapper's output trips it within one chunk —
+    // no multi-megabyte fixture required. Cleared before any assertion can unwind.
+    sema_stdlib::set_git_max_output_bytes_override(Some(64));
+    let interp = Interpreter::new();
+    let result = interp.eval_str_compiled("(await (async/spawn (fn () (git/diff))))");
+    sema_stdlib::set_git_max_output_bytes_override(None);
+
+    let err = result.expect_err("git output over the cap must reject the task");
+    let message = err.to_string();
+    assert!(
+        message.contains("output exceeded") && message.contains("64"),
+        "expected a structured over-cap error naming the cap, got: {message}"
+    );
+
+    // The group SIGKILL must also reap the wrapper's forked descendant before its
+    // delayed marker write — a direct-child-only kill would let it leak.
+    std::thread::sleep(std::time::Duration::from_millis(1_300));
+    assert!(
+        !descendant.exists(),
+        "over-cap cleanup left a process-group descendant alive"
     );
 }
 

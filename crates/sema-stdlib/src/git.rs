@@ -15,6 +15,7 @@
 //! Parsing and deduplication live in plain functions (`parse_status_entries`,
 //! `recent_files_value`, …) shared by synchronous and runtime paths.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -36,6 +37,45 @@ const GIT_COMPLETION_KIND: u64 = 0x6769_7400; // "git\0"
 /// pipe-delivery latency while keeping runtime shutdown cleanup bounded when a
 /// foreign descendant escaped the group but retained an output descriptor.
 const GIT_CANCEL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Hard ceiling on the bytes a single offloaded `git` invocation may buffer from
+/// EACH of stdout/stderr before the process group is killed. The offload's
+/// `decode` closure materializes the whole output into a `Value` on the VM
+/// thread, so an unbounded `git log`/`git diff` (a pathological or hostile repo)
+/// would exhaust memory; a capped incremental drain turns that into a clean,
+/// structured over-cap error instead of an OOM — never a `read_to_end` of a
+/// hostile pipe.
+const GIT_MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Chunk size for the incremental pipe drain. Large enough to keep syscall
+/// overhead low, small enough that the cap is enforced within one chunk of the
+/// boundary.
+const GIT_DRAIN_CHUNK: usize = 64 * 1024;
+
+thread_local! {
+    /// Optional per-call output-byte cap override (lowered, never raised above
+    /// the hard ceiling). Read on the VM thread pre-dispatch and captured by the
+    /// offloaded job — mirrors `sqlite::DB_RESULT_CAPS_OVERRIDE`. `None` uses the
+    /// module ceiling.
+    static GIT_MAX_OUTPUT_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// The effective per-pipe output cap for the current call: the module ceiling,
+/// lowered by any per-call override (never raised above it). Read on the VM
+/// thread pre-dispatch, then captured by the offloaded job.
+fn effective_git_max_output_bytes() -> usize {
+    GIT_MAX_OUTPUT_OVERRIDE
+        .with(Cell::get)
+        .map_or(GIT_MAX_OUTPUT_BYTES, |over| over.min(GIT_MAX_OUTPUT_BYTES))
+}
+
+/// Lower the per-pipe output cap (clamped to the hard ceiling) for subsequent
+/// offloaded `git/*` calls on this thread, or clear the override with `None`.
+/// The seam the regression suite drives to exercise the over-cap path without a
+/// multi-megabyte fixture; mirrors `set_db_result_caps_override`.
+pub fn set_git_max_output_bytes_override(bytes: Option<usize>) {
+    GIT_MAX_OUTPUT_OVERRIDE.with(|cell| cell.set(bytes));
+}
 
 /// Run `git` with `args`, returning raw (untrimmed) stdout on a zero exit. On a
 /// non-zero exit, surface git's stderr. If the `git` binary can't be launched at
@@ -271,26 +311,61 @@ fn terminate_git_child(child: &mut tokio::process::Child, pid: u32) {
     let _ = child.start_kill();
 }
 
-async fn drain_git_pipe<R>(mut pipe: R) -> std::io::Result<Vec<u8>>
+/// The over-cap signal shared by both pipe drains and the invocation future: the
+/// first drain to exceed the cap sets the flag and wakes the future so it can
+/// kill the process group promptly (which lets the sibling drain read EOF).
+type OverCapSignal = tokio::sync::mpsc::Sender<()>;
+
+/// Drain one pipe incrementally, never buffering more than `cap` bytes. On
+/// exceeding the cap the drain stops reading, publishes the over-cap fact, wakes
+/// the invocation future (which kills the process group), and returns the bytes
+/// read so far (discarded on the over-cap error path). This is a bounded,
+/// pre-dispatch-capped admission — never `read_to_end` of a hostile pipe.
+async fn drain_git_pipe<R>(
+    mut pipe: R,
+    cap: usize,
+    over_cap: Arc<AtomicBool>,
+    signal: OverCapSignal,
+) -> std::io::Result<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
 
     let mut bytes = Vec::new();
-    pipe.read_to_end(&mut bytes).await?;
+    let mut chunk = vec![0u8; GIT_DRAIN_CHUNK];
+    loop {
+        let read = pipe.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() > cap {
+            // Only the first drain to trip needs to wake the future and kill the
+            // group; the other drain then reads EOF as the child dies.
+            if !over_cap.swap(true, Ordering::AcqRel) {
+                let _ = signal.try_send(());
+            }
+            bytes.truncate(cap);
+            return Ok(bytes);
+        }
+    }
     Ok(bytes)
 }
 
 /// The `Send` future that runs one `git` invocation off the VM thread on the
 /// executor's blocking worker (via `io_block_on` inside `runtime_offload`).
 /// Stdout and stderr are drained concurrently with the child wait, preventing a
-/// full pipe from deadlocking the process. Cancellation kills the process group
-/// on Unix (the direct child elsewhere), then still joins both drains and awaits
-/// the child before publishing the completion proof. `kill_on_drop` remains a
-/// fallback for executor panic/drop paths.
+/// full pipe from deadlocking the process. Each drain is capped at
+/// `max_output_bytes`: exceeding it kills the process group (the same hook
+/// cancellation uses) and resolves the invocation with a structured over-cap
+/// error rather than buffering a hostile pipe to exhaustion. Cancellation kills
+/// the process group on Unix (the direct child elsewhere), then still joins both
+/// drains and awaits the child before publishing the completion proof.
+/// `kill_on_drop` remains a fallback for executor panic/drop paths.
 async fn git_run_future(
     full_args: Vec<String>,
+    max_output_bytes: usize,
     mut cancel: crate::runtime_offload::CancelWaiter,
     completion: GitCompletionGuard,
 ) -> Result<RawGitOutput, String> {
@@ -325,17 +400,50 @@ async fn git_run_future(
             return Err("git: subprocess pipes were not captured".to_string());
         }
     };
-    let stdout_drain = tokio::spawn(drain_git_pipe(stdout));
-    let stderr_drain = tokio::spawn(drain_git_pipe(stderr));
+    let over_cap = Arc::new(AtomicBool::new(false));
+    let (over_cap_tx, mut over_cap_rx) = tokio::sync::mpsc::channel::<()>(2);
+    let stdout_drain = tokio::spawn(drain_git_pipe(
+        stdout,
+        max_output_bytes,
+        Arc::clone(&over_cap),
+        over_cap_tx.clone(),
+    ));
+    let stderr_drain = tokio::spawn(drain_git_pipe(
+        stderr,
+        max_output_bytes,
+        Arc::clone(&over_cap),
+        over_cap_tx,
+    ));
     let stdout_abort = stdout_drain.abort_handle();
     let stderr_abort = stderr_drain.abort_handle();
 
     let mut cancelled = false;
     let mut cancel_resolved = false;
+    let mut over_capped = false;
     let drains = async { tokio::join!(stdout_drain, stderr_drain) };
     tokio::pin!(drains);
     let (stdout, stderr) = tokio::select! {
         result = &mut drains => result,
+        over = over_cap_rx.recv() => {
+            // An over-cap drain woke us: kill the process group so the sibling
+            // drain reads EOF, then join the drains bounded by the same grace as
+            // cancellation. `None` (both senders dropped without tripping) means
+            // the drains already finished — just await them.
+            if over.is_some() && over_cap.load(Ordering::Acquire) {
+                over_capped = true;
+                terminate_git_child(&mut child, pid);
+                match tokio::time::timeout(GIT_CANCEL_DRAIN_GRACE, &mut drains).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        stdout_abort.abort();
+                        stderr_abort.abort();
+                        drains.await
+                    }
+                }
+            } else {
+                drains.await
+            }
+        }
         signal = &mut cancel => {
             cancel_resolved = true;
             if signal.is_ok() {
@@ -389,6 +497,16 @@ async fn git_run_future(
         completion.mark_reaped();
     }
 
+    // An over-cap kill is a hard failure independent of the (now-terminated)
+    // child's exit status and of any drain the grace timeout had to abort, so
+    // surface the structured error before unwrapping the drains. A genuine
+    // cancellation still wins (the runtime settles it via the cancel hook).
+    if over_capped && !cancelled {
+        return Err(format!(
+            "git: output exceeded the {max_output_bytes}-byte limit; the process group was terminated"
+        ));
+    }
+
     let status = status.map_err(|error| format!("git: failed while waiting for `git`: {error}"))?;
     let stdout = stdout
         .map_err(|error| format!("git: stdout drain task failed: {error}"))?
@@ -412,6 +530,9 @@ fn git_external_runtime(
 ) -> NativeResult {
     let kind =
         CompletionKind::try_from_raw(GIT_COMPLETION_KIND).expect("git completion kind is nonzero");
+    // Resolve the output cap on the VM thread (pre-dispatch) so the offloaded job
+    // carries a fixed finite admission, never reading a thread-local on a worker.
+    let max_output_bytes = effective_git_max_output_bytes();
     let (cancel_tx, cancel_rx) = crate::runtime_offload::cancel_channel();
     let completion = GitCompletionGuard::default();
     let dispatch = GitDispatchGuard::new(completion.clone());
@@ -422,7 +543,7 @@ fn git_external_runtime(
         kind,
         resource,
         decode,
-        move || git_run_future(full_args, cancel_rx, dispatch.start()),
+        move || git_run_future(full_args, max_output_bytes, cancel_rx, dispatch.start()),
     )
 }
 
@@ -826,6 +947,60 @@ mod tests {
             completion.disposition(),
             CancelDisposition::PendingReap,
             "a started worker cannot be declared reaped merely because its guard dropped"
+        );
+    }
+
+    #[test]
+    fn git_output_cap_is_finite_and_clamps_overrides() {
+        assert_eq!(effective_git_max_output_bytes(), GIT_MAX_OUTPUT_BYTES);
+        set_git_max_output_bytes_override(Some(16));
+        assert_eq!(effective_git_max_output_bytes(), 16);
+        // An override never raises the cap above the hard ceiling.
+        set_git_max_output_bytes_override(Some(usize::MAX));
+        assert_eq!(effective_git_max_output_bytes(), GIT_MAX_OUTPUT_BYTES);
+        set_git_max_output_bytes_override(None);
+        assert_eq!(effective_git_max_output_bytes(), GIT_MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn drain_git_pipe_caps_output_and_signals_over_cap() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+
+        // Over-cap: the drain truncates to the cap, sets the flag, and wakes the
+        // invocation future exactly once.
+        let over_cap = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(2);
+        let flag = Arc::clone(&over_cap);
+        let data = [b'x'; 100];
+        let bytes = runtime
+            .block_on(drain_git_pipe(&data[..], 16, flag, tx))
+            .expect("capped drain reads without error");
+        assert_eq!(bytes.len(), 16, "the drain truncates to the cap");
+        assert!(over_cap.load(Ordering::Acquire), "over-cap flag must be set");
+        assert!(
+            matches!(rx.try_recv(), Ok(())),
+            "over-cap must wake the invocation future"
+        );
+
+        // Under-cap: the drain reads to EOF and never signals.
+        let under = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(2);
+        let flag = Arc::clone(&under);
+        let data = [b'y'; 8];
+        let bytes = runtime
+            .block_on(drain_git_pipe(&data[..], 16, flag, tx))
+            .expect("under-cap drain reads without error");
+        assert_eq!(bytes, [b'y'; 8], "under-cap output is returned whole");
+        assert!(
+            !under.load(Ordering::Acquire),
+            "under-cap must not set the over-cap flag"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "under-cap must not wake the invocation future"
         );
     }
 }

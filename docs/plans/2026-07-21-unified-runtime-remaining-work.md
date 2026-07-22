@@ -566,6 +566,26 @@ no `Drop`/teardown (an unstopped spinner runs to process exit);
 
 ### Commit B7 — git output caps + watcher evidence (closes R06, R05)
 
+**Landed 2026-07-22.** `drain_git_pipe` is now a capped incremental drain: a
+pre-dispatch per-pipe byte cap (`GIT_MAX_OUTPUT_BYTES` = 64 MiB, lowered for tests
+via `set_git_max_output_bytes_override` clamped to the ceiling) is resolved on the
+VM thread and carried onto the offloaded job; the first pipe to exceed it wakes the
+invocation future (a bounded `mpsc` signal) which kills the owned process group via
+the existing `terminate_git_child` hook and rejects the task with a structured
+over-cap error — never `read_to_end` of a hostile pipe. The INTERRUPTIBLE
+group-kill + async-reap contract is otherwise unchanged. Regression:
+`git_async_test::git_output_over_cap_kills_group_and_errors` (a fake `git` floods
+stdout past a lowered cap and forks a process-group descendant — the group SIGKILL
+reaps it before its delayed marker) plus `git::tests::{git_output_cap_is_finite_and_clamps_overrides,drain_git_pipe_caps_output_and_signals_over_cap}`;
+the existing git-async cancellation suite stays green. **R06 flipped to
+`MIGRATED (B7)`** and **R05 reclassified to `MIGRATED (B7, reclassified)`** — R05 is
+already the shipped model (bounded non-blocking `fs/watch-events` drain +
+interpreter-owned teardown from `0fc50a4d`), so its ledger row now states what
+shipped rather than the obsolete "external watcher event wait" target (no
+`fs_watch` code change). The `runtime-match-map.tsv` re-point (stale
+`git.rs`/`fs_watch.rs` payloads) and the `runtime_conformance_test` inventory
+reconciliation are the deferred **C7** work and remain red.
+
 Landed: R06 group-kill + bounded-drain cancellation evidence (`28b0f49e`,
 `git_async_test.rs:420-581`); R05 interpreter-owned watcher with teardown +
 isolation tests (`0fc50a4d`). Remaining (verified): `drain_git_pipe` uses

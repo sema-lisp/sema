@@ -17,6 +17,12 @@ mod event;
 mod fs_watch;
 #[cfg(not(target_arch = "wasm32"))]
 mod git;
+/// Lower the per-pipe output-byte cap for offloaded `git/*` calls (clamped to
+/// the hard ceiling), or clear the override with `None`. The seam the git-async
+/// over-cap regression drives without a multi-megabyte fixture.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use git::set_git_max_output_bytes_override;
 #[cfg(not(target_arch = "wasm32"))]
 mod http;
 #[cfg(not(target_arch = "wasm32"))]

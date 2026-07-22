@@ -73,6 +73,13 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
          (sema_vm::runtime::Runtime), NOT a tokio runtime — this is the canonical \
          async engine the unified-runtime migration is built on",
     ),
+    (
+        "sema-stdlib/src/git.rs",
+        1,
+        "in-file #[cfg(test)] fixture driving the async over-cap drain off a \
+         current-thread runtime (B7); the production git offload routes through \
+         sema-io",
+    ),
 ];
 
 /// Strip `//` line comments, tracking double-quote string state per line so a

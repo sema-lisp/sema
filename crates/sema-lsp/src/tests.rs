@@ -1936,6 +1936,44 @@ fn completion_works_on_trailing_empty_line_after_newline() {
     );
 }
 
+// ── workspace scanner ────────────────────────────────────────
+
+/// The scanner must follow symlinked directories and files (DirEntry
+/// metadata does not traverse symlinks); the canonical-path visited set is
+/// what protects it from symlink cycles.
+#[cfg(unix)]
+#[test]
+fn workspace_scanner_follows_symlinks_without_cycling() {
+    let dir = unique_temp_dir("scan-symlink");
+    let real = dir.join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("lib.sema"), "(define x 1)\n").unwrap();
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    // A symlinked directory, a symlinked file, and a cycle back to the root.
+    std::os::unix::fs::symlink(&real, root.join("linked")).unwrap();
+    std::os::unix::fs::symlink(real.join("lib.sema"), root.join("alias.sema")).unwrap();
+    std::os::unix::fs::symlink(&root, real.join("back")).unwrap();
+
+    let mut scanner = crate::state::WorkspaceScanner::new(&root);
+    let mut files = Vec::new();
+    while let Some(batch) = scanner.next_dir() {
+        files.extend(batch);
+    }
+
+    assert!(
+        files
+            .iter()
+            .any(|f| f.file_name().and_then(|n| n.to_str()) == Some("alias.sema")),
+        "symlinked .sema files must be discovered: {files:?}"
+    );
+    assert!(
+        files.iter().any(|f| f.ends_with("linked/lib.sema")),
+        "files inside symlinked directories must be discovered: {files:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ── goto-definition: workspace-wide fallback (Phase 3d) ──────
 
 /// Parse `source` and insert it into `state` as an open document, mirroring

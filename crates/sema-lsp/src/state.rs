@@ -62,12 +62,14 @@ impl WorkspaceScanner {
             if name_str.starts_with('.') || name_str == "target" || name_str == "node_modules" {
                 continue;
             }
-            // Follow symlinks for file discovery; cycles are detected via canonicalize + visited set
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+            // Type-check through symlinks (`DirEntry::metadata` does not
+            // traverse them, which would skip symlinked dirs and files);
+            // cycles are prevented by the canonical-path visited set below.
             let path = entry.path();
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue, // broken symlink or unreadable
+            };
             if meta.is_dir() {
                 if let Ok(canonical) = std::fs::canonicalize(&path) {
                     if self.visited.insert(canonical) {

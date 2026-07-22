@@ -82,7 +82,76 @@ impl BackendState {
             }
         }
 
-        None
+        // Phase 3d: Fall back to a workspace-wide search over open documents
+        // and the workspace scan cache, mirroring how references and rename
+        // treat top-level symbols as workspace-global. Without this, a
+        // definition in a sibling file that is not explicitly imported is
+        // unreachable even though the scan has already parsed it.
+        let mut searched_uris = std::collections::HashSet::new();
+        let mut locations = Vec::new();
+
+        for (doc_uri_str, cached) in &self.cached_parses {
+            let doc_uri = match Url::parse(doc_uri_str) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            searched_uris.insert(doc_uri_str.clone());
+            let doc_lines: Vec<&str> = cached.source.lines().collect();
+            let defs = user_definitions_from_ast(
+                &cached.ast,
+                &cached.span_map,
+                &cached.symbol_spans,
+                &doc_lines,
+            );
+            for (name, range) in &defs {
+                if name == &symbol {
+                    if let Some(range) = range {
+                        locations.push(Location {
+                            uri: doc_uri.clone(),
+                            range: *range,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Files known only from the workspace scan (import_cache); skip files
+        // already covered above via their open-document parse.
+        for (path, import_cached) in &self.import_cache {
+            let import_uri = match Url::from_file_path(path) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            if searched_uris.contains(import_uri.as_str()) {
+                continue;
+            }
+            let import_lines: Vec<&str> = import_cached.source.lines().collect();
+            let defs = user_definitions_from_ast(
+                &import_cached.ast,
+                &import_cached.span_map,
+                &import_cached.symbol_spans,
+                &import_lines,
+            );
+            for (name, range) in &defs {
+                if name == &symbol {
+                    if let Some(range) = range {
+                        locations.push(Location {
+                            uri: import_uri.clone(),
+                            range: *range,
+                        });
+                    }
+                }
+            }
+        }
+
+        match locations.len() {
+            0 => None,
+            1 => Some(GotoDefinitionResponse::Scalar(locations.remove(0))),
+            // Same top-level name defined in several files: return them all
+            // (cache iteration order is arbitrary — picking one would be a
+            // coin flip; clients render an array as a location picker).
+            _ => Some(GotoDefinitionResponse::Array(locations)),
+        }
     }
 
     pub(crate) fn handle_references(&self, uri: &Url, position: &Position) -> Vec<Location> {

@@ -1819,3 +1819,195 @@ fn completion_works_on_trailing_empty_line_after_newline() {
         "completion should offer items on the trailing empty line"
     );
 }
+
+// ── goto-definition: workspace-wide fallback (Phase 3d) ──────
+
+/// Parse `source` and insert it into `state` as an open document, mirroring
+/// the production build path (same steps as `parsed_state`).
+fn insert_parsed_doc(state: &mut BackendState, uri: &str, source: &str) {
+    let (ast, span_map, symbol_spans) = sema_reader::read_many_with_symbol_spans(source).unwrap();
+    let symbol_spans = crate::helpers::filter_quoted_symbol_spans(&ast, &span_map, symbol_spans);
+    let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
+    state.cached_parses.insert(
+        uri.to_string(),
+        CachedParse {
+            ast,
+            span_map,
+            symbol_spans,
+            scope_tree,
+            source: source.to_string(),
+        },
+    );
+    state.documents.insert(uri.to_string(), source.to_string());
+}
+
+/// Parse `source` and insert it into `state.import_cache` under `path`,
+/// as the post-`initialized` workspace scan does for unopened files.
+fn insert_scanned_file(state: &mut BackendState, path: &str, source: &str) {
+    let (ast, span_map, symbol_spans) = sema_reader::read_many_with_symbol_spans(source).unwrap();
+    let symbol_spans = crate::helpers::filter_quoted_symbol_spans(&ast, &span_map, symbol_spans);
+    let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
+    state.import_cache.insert(
+        std::path::PathBuf::from(path),
+        crate::state::ImportCache {
+            ast,
+            span_map,
+            symbol_spans,
+            scope_tree,
+            source: source.to_string(),
+            mtime: std::time::SystemTime::now(),
+        },
+    );
+}
+
+#[test]
+fn goto_definition_finds_symbol_in_other_open_document() {
+    // main.sema calls `greet` but neither defines nor imports it; the
+    // definition lives in a sibling document that happens to be open.
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet \"world\")\n");
+    insert_parsed_doc(
+        &mut state,
+        "file:///ws/library.sema",
+        "(define (greet name) name)\n",
+    );
+
+    // Cursor on `greet` in main.sema.
+    let result = state
+        .handle_goto_definition(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 1,
+            },
+        )
+        .expect("expected a cross-document definition");
+    match result {
+        GotoDefinitionResponse::Scalar(location) => {
+            assert_eq!(location.uri.as_str(), "file:///ws/library.sema");
+            assert_eq!(location.range.start.line, 0);
+        }
+        other => panic!("expected a scalar location, got {other:?}"),
+    }
+}
+
+#[test]
+fn goto_definition_finds_symbol_in_scanned_workspace_file() {
+    // The defining file was discovered by the workspace scan but never opened:
+    // it exists only in import_cache. No import statement links the two files.
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet \"world\")\n");
+    insert_scanned_file(
+        &mut state,
+        "/ws/library.sema",
+        "(define (greet name) name)\n",
+    );
+
+    let result = state
+        .handle_goto_definition(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 1,
+            },
+        )
+        .expect("expected a definition from the workspace scan cache");
+    match result {
+        GotoDefinitionResponse::Scalar(location) => {
+            assert_eq!(location.uri.as_str(), "file:///ws/library.sema");
+            assert_eq!(location.range.start.line, 0);
+        }
+        other => panic!("expected a scalar location, got {other:?}"),
+    }
+}
+
+#[test]
+fn goto_definition_returns_all_candidates_when_name_defined_in_multiple_files() {
+    // Two workspace files both define `greet`: cache iteration order is
+    // arbitrary, so the handler must return every candidate, not a coin flip.
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet \"world\")\n");
+    insert_scanned_file(&mut state, "/ws/a.sema", "(define (greet name) name)\n");
+    insert_scanned_file(&mut state, "/ws/b.sema", "(define (greet name) 42)\n");
+
+    let result = state
+        .handle_goto_definition(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 1,
+            },
+        )
+        .expect("expected definitions from both files");
+    match result {
+        GotoDefinitionResponse::Array(mut locations) => {
+            locations.sort_by(|a, b| a.uri.as_str().cmp(b.uri.as_str()));
+            let uris: Vec<&str> = locations.iter().map(|l| l.uri.as_str()).collect();
+            assert_eq!(uris, vec!["file:///ws/a.sema", "file:///ws/b.sema"]);
+        }
+        other => panic!("expected an array of locations, got {other:?}"),
+    }
+}
+
+#[test]
+fn goto_definition_skips_scan_cache_entry_for_open_document() {
+    // A file that is both open (cached_parses) and in the scan cache must not
+    // yield two locations for its single definition.
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet \"world\")\n");
+    insert_parsed_doc(
+        &mut state,
+        "file:///ws/library.sema",
+        "(define (greet name) name)\n",
+    );
+    insert_scanned_file(
+        &mut state,
+        "/ws/library.sema",
+        "(define (greet name) name)\n",
+    );
+
+    let result = state
+        .handle_goto_definition(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 1,
+            },
+        )
+        .expect("expected exactly one definition");
+    assert!(
+        matches!(result, GotoDefinitionResponse::Scalar(_)),
+        "open-document and scan-cache copies of the same file must dedup, got {result:?}"
+    );
+}
+
+#[test]
+fn goto_definition_still_prefers_local_scope_over_workspace() {
+    // A locally-bound `greet` must resolve to the local binding (Phase 3b),
+    // not fall through to a same-named definition elsewhere in the workspace.
+    let source = "(define (run) (let ((greet 1)) (greet)))\n";
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", source);
+    insert_scanned_file(
+        &mut state,
+        "/ws/library.sema",
+        "(define (greet name) name)\n",
+    );
+
+    // Cursor on the `greet` call inside the `let` body (column of the second `greet`).
+    let call_col = source.rfind("greet").unwrap() as u32 + 1;
+    let result = state
+        .handle_goto_definition(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: call_col,
+            },
+        )
+        .expect("expected the local binding");
+    match result {
+        GotoDefinitionResponse::Scalar(location) => {
+            assert_eq!(
+                location.uri.as_str(),
+                "file:///ws/main.sema",
+                "local let-binding must win over the workspace definition"
+            );
+        }
+        other => panic!("expected a scalar location, got {other:?}"),
+    }
+}

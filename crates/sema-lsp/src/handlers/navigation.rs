@@ -370,10 +370,14 @@ impl BackendState {
         for (name, span) in &cached.symbol_spans {
             if name == symbol {
                 let range = span_to_range(span, &lines);
+                // End is inclusive: extract_symbol_at treats a cursor at the
+                // end of a token as on-symbol (the following char is a
+                // non-symbol char by token-boundary definition), and rename
+                // accepts that position — prepare must agree.
                 if position.line >= range.start.line
                     && position.line <= range.end.line
                     && position.character >= range.start.character
-                    && position.character < range.end.character
+                    && position.character <= range.end.character
                 {
                     return Some(PrepareRenameResponse::RangeWithPlaceholder {
                         range,

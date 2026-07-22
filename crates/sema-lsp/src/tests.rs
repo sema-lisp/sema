@@ -1868,6 +1868,30 @@ fn references_top_level_skips_shadowing_param() {
     );
 }
 
+// prepare_rename must accept the cursor sitting at the END of a symbol:
+// extract_symbol_at (and therefore rename itself) treats end-of-token as
+// on-symbol, and prepare/rename must agree or the client aborts the rename.
+#[test]
+fn prepare_rename_accepts_cursor_at_symbol_end() {
+    let (state, uri) = parsed_state("file:///pr.sema", "(define foo 1)");
+    // `foo` spans characters 8..11; position 11 is just after its last char.
+    let response = state
+        .handle_prepare_rename(
+            &uri,
+            &Position {
+                line: 0,
+                character: 11,
+            },
+        )
+        .expect("prepare_rename must accept the cursor at the symbol's end");
+    match response {
+        PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } => {
+            assert_eq!(placeholder, "foo");
+        }
+        other => panic!("expected a range with placeholder, got {other:?}"),
+    }
+}
+
 #[test]
 fn navigation_handlers_tolerate_past_eof_and_unopened_uri() {
     // Graceful degradation: a position past EOF and a never-opened URI must not panic.

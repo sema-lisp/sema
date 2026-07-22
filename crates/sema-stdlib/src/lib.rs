@@ -32,6 +32,12 @@ pub use io::{
 pub(crate) mod json;
 #[cfg(not(target_arch = "wasm32"))]
 mod kv;
+/// Lower the per-thread `kv/open`/`kv/set` store bounds (clamped to the hard
+/// ceilings), or clear the override with `None`. The bounded-store seam for
+/// advanced callers and the regression suite.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use kv::set_kv_bounds_override;
 mod list;
 mod map;
 #[cfg(not(target_arch = "wasm32"))]

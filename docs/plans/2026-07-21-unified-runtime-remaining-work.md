@@ -338,6 +338,33 @@ Gap (verified): `abort: None` at `crates/sema-stdlib/src/sqlite.rs:237`; no
 
 ### Commit B2 — KV persistence bounds + honest R09A disposition (closes R09A, R09B)
 
+**Landed.** Stores are bounded before any blocking work dispatches. `KvBounds`
+(`KV_MAX_STORE_BYTES` = 64 MiB, `KV_MAX_ITEMS` = 1_000_000) is captured on the VM
+thread and carried by value onto the worker. `kv/open` preflights the backing
+file's size — a metadata stat pre-dispatch (no allocation) on the runtime path,
+plus `read_or_init_store` reading through a `Read::take(cap+1)` capped reader that
+rejects an oversized (or growing/TOCTOU) file without allocating its whole
+contents. `kv/set` splits admission: `check_value_bytes` rejects an over-cap value
+pre-dispatch **without peeking the store** (so it never races the FIFO gate with a
+spurious busy error), and `check_item_cap` rejects a *new* key past the item cap on
+the exclusively-owned store (sync `with_store_mut`, or the checkout worker via a new
+`admit` closure) **before** the mutation — so an over-cap set reinstalls the store
+byte-for-byte intact. `flush_store` re-checks the serialized whole-store size as the
+final gate before it ever touches disk. A test-only `set_kv_bounds_override`
+(clamped to the hard ceilings, mirroring `set_db_result_caps_override`) lets the
+regression suite drive over-cap paths without 64 MiB files. Regression:
+`kv_async_test::{kv_open_rejects_oversized_store,kv_set_over_cap_value_fails_with_store_intact}`
+(existing cancel/concurrency suites stay green); guard: `kv::tests::{runtime_bounds_are_finite_and_clamp_overrides,oversized_store_load_rejected_by_metadata_and_capped_read,set_admission_rejects_over_cap_value_and_item_count}`.
+**R09A flipped to `MIGRATED (B2, narrowed)`** and **R09B to `MIGRATED (B2)`** in
+`docs/internals/async-runtime-inventory.md`; the `runtime-match-map.tsv` re-map and
+the `runtime_conformance_test` inventory reconciliation are the deferred C7 work and
+remain red. **Honest R09A disposition:** the JSON backend is a plain
+`std::fs::write` with no interrupt handle, so `abort` stays `None` (nothing to
+interrupt) — a mid-op cancel keeps the best-effort tombstone-and-discard fallback,
+which R09A's contract now states explicitly as its fallback arm rather than a faked
+abort. Likewise, R09B claims the byte/item cap — not a wall-clock timer — as the
+finite-work bound, since `fs::write` cannot honor a deadline.
+
 Gap (verified): `read_or_init_store` unbounded `read_to_string` + parse,
 `flush_store` whole-store write (`crates/sema-stdlib/src/kv.rs:170-179,458-463`);
 no caps/deadline; `abort: None` at `kv.rs:241` (nothing to interrupt — plain

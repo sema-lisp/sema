@@ -403,3 +403,96 @@ fn kv_cancelled_sibling_does_not_corrupt_shared_store() {
     assert_eq!(interp.runtime_resource_gate_count(), 0);
     let _ = std::fs::remove_file(&path);
 }
+
+// === Persistence bounds (B2) ===
+//
+// `kv/open` rejects an oversized backing file — pre-dispatch on the runtime
+// path (metadata preflight, no allocation) and via the capped read on the sync
+// path. Store bounds are lowered through the test-only override so the file need
+// not actually reach the 64 MiB shipped ceiling.
+#[test]
+fn kv_open_rejects_oversized_store() {
+    let interp = Interpreter::new();
+    let kv = TempKv::new("oversized");
+    let path = kv.path();
+    std::fs::write(kv.path(), vec![b'x'; 4096]).expect("seed oversized backing file");
+    sema_stdlib::set_kv_bounds_override(Some((1024, 1_000_000)));
+
+    // Sync top-level open: rejected by the capped read.
+    let sync_err = interp
+        .eval_str_compiled(&format!(r#"(kv/open "oversized" "{path}")"#))
+        .expect_err("oversized store must be rejected at kv/open");
+    assert!(
+        sync_err.to_string().contains("kv store limit"),
+        "sync open error: {sync_err}"
+    );
+
+    // Runtime (async) open: rejected pre-dispatch by the metadata preflight.
+    let async_msg = interp
+        .eval_str_compiled(&format!(
+            r#"(try (async/await (async/spawn (fn () (kv/open "oversized-async" "{path}"))))
+                 (catch e (:message e)))"#
+        ))
+        .expect("runtime open try/catch resolves");
+    assert!(
+        async_msg
+            .as_str()
+            .is_some_and(|m| m.contains("kv store limit")),
+        "runtime open error: {async_msg:?}"
+    );
+
+    sema_stdlib::set_kv_bounds_override(None);
+}
+
+// An over-cap `kv/set` (a value whose serialized form alone exceeds the
+// whole-store byte cap) fails cleanly — the store keeps its earlier keys, stays
+// usable, and nothing over-cap lands on disk.
+#[test]
+fn kv_set_over_cap_value_fails_with_store_intact() {
+    let interp = Interpreter::new();
+    let kv = TempKv::new("set-over-cap");
+    let path = kv.path();
+    sema_stdlib::set_kv_bounds_override(Some((64, 1_000_000)));
+
+    let big = "x".repeat(256);
+    let result = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (kv/open "cap" "{path}")
+            (kv/set "cap" "ok" "hello")
+            (let ((caught (try (kv/set "cap" "big" "{big}") (catch e (:message e))))
+                  (kept (kv/get "cap" "ok"))
+                  (missing (kv/get "cap" "big"))
+                  (ks (kv/keys "cap")))
+              (kv/close "cap")
+              (list caught kept missing ks))
+            "#
+        ))
+        .expect("over-cap set is a clean error, not a wedge");
+    let parts: Vec<Value> = result.as_list().expect("list").to_vec();
+    assert!(
+        parts[0]
+            .as_str()
+            .is_some_and(|m| m.contains("kv store limit")),
+        "over-cap set error message: {:?}",
+        parts[0]
+    );
+    assert_eq!(parts[1], Value::string("hello"), "existing key must survive");
+    assert!(parts[2].is_nil(), "the over-cap key must not have landed");
+    assert_eq!(
+        parts[3],
+        Value::list(vec![Value::string("ok")]),
+        "keys must be unchanged by the rejected set"
+    );
+
+    // The on-disk store reflects only the in-cap write (nothing oversized was
+    // ever flushed), read back under the full shipped bounds.
+    sema_stdlib::set_kv_bounds_override(None);
+    let on_disk = interp
+        .eval_str_compiled(&format!(
+            r#"(kv/open "cap-check" "{path}")
+               (let ((ks (kv/keys "cap-check"))) (kv/close "cap-check") ks)"#
+        ))
+        .expect("re-read store from disk");
+    assert_eq!(on_disk, Value::list(vec![Value::string("ok")]));
+}

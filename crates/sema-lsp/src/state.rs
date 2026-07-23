@@ -175,6 +175,8 @@ pub(crate) struct BackendState {
     pub(crate) cached_parses: HashMap<String, CachedParse>,
     /// Path to the sema binary (from initializationOptions or default).
     pub(crate) sema_binary: String,
+    /// Sandbox mode for code execution via Run code lens (e.g., "off", "strict").
+    pub(crate) run_sandbox_mode: String,
 }
 
 /// Resolve the default `sema` binary used by the eval subprocess.
@@ -351,6 +353,7 @@ impl BackendState {
             import_cache: HashMap::new(),
             cached_parses: HashMap::new(),
             sema_binary: default_sema_binary(),
+            run_sandbox_mode: "off".to_string(),
         }
     }
 
@@ -358,6 +361,7 @@ impl BackendState {
     pub(crate) fn new_without_builtins(
         documents: HashMap<String, String>,
         sema_binary: String,
+        run_sandbox_mode: String,
     ) -> Self {
         BackendState {
             builtin_names: HashSet::new(),
@@ -367,6 +371,7 @@ impl BackendState {
             import_cache: HashMap::new(),
             cached_parses: HashMap::new(),
             sema_binary,
+            run_sandbox_mode,
         }
     }
 

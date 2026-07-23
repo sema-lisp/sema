@@ -41,8 +41,13 @@ impl BackendState {
         indexed_ranges
             .into_iter()
             .map(|(form_index, range)| {
+                let title = if self.run_sandbox_mode == "strict" {
+                    "▶ Run (strict)".to_string()
+                } else {
+                    "▶ Run".to_string()
+                };
                 let command = Command {
-                    title: "▶ Run".to_string(),
+                    title,
                     command: "sema.runTopLevel".to_string(),
                     arguments: Some(vec![serde_json::json!({
                         "uri": uri.as_str(),

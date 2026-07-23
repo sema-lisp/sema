@@ -247,9 +247,8 @@ fn diff_unified_cap_rejects_one_over_before_dispatch() {
     let interp = Interpreter::new();
 
     // Boundary: both inputs are exactly 8 bytes → accepted (empty diff).
-    let ok = interp.eval_str_compiled(
-        r#"(await (async/spawn (fn () (diff/unified "12345678" "12345678"))))"#,
-    );
+    let ok = interp
+        .eval_str_compiled(r#"(await (async/spawn (fn () (diff/unified "12345678" "12345678"))))"#);
     // One-over: a 9-byte `old` is rejected before dispatch.
     let over = interp.eval_str_compiled(
         r#"(await (async/spawn (fn () (diff/unified "123456789" "12345678"))))"#,
@@ -271,8 +270,7 @@ fn diff_stat_sync_cap_rejects_one_over() {
     let interp = Interpreter::new();
 
     let ok = interp.eval_str_compiled(r#"(await (async/spawn (fn () (diff/stat "12345678"))))"#);
-    let over =
-        interp.eval_str_compiled(r#"(await (async/spawn (fn () (diff/stat "123456789"))))"#);
+    let over = interp.eval_str_compiled(r#"(await (async/spawn (fn () (diff/stat "123456789"))))"#);
     sema_stdlib::set_diff_input_byte_cap_override(None);
 
     ok.expect("8-byte patch sits at the boundary and is accepted");
@@ -289,11 +287,11 @@ fn diff_apply_sync_cap_rejects_one_over() {
     let interp = Interpreter::new();
 
     // Boundary: 8-byte content, empty patch → content unchanged.
-    let ok = interp
-        .eval_str_compiled(r#"(await (async/spawn (fn () (diff/apply "12345678" ""))))"#);
+    let ok =
+        interp.eval_str_compiled(r#"(await (async/spawn (fn () (diff/apply "12345678" ""))))"#);
     // One-over: a 9-byte content is rejected before the patch is parsed.
-    let over = interp
-        .eval_str_compiled(r#"(await (async/spawn (fn () (diff/apply "123456789" ""))))"#);
+    let over =
+        interp.eval_str_compiled(r#"(await (async/spawn (fn () (diff/apply "123456789" ""))))"#);
     sema_stdlib::set_diff_input_byte_cap_override(None);
 
     ok.expect("8-byte content sits at the boundary and is accepted");
@@ -327,8 +325,7 @@ fn hash_digest_sync_cap_rejects_one_over() {
     sema_stdlib::set_secret_input_byte_cap_override(Some(8));
     let interp = Interpreter::new();
 
-    let ok =
-        interp.eval_str_compiled(r#"(await (async/spawn (fn () (hash/digest "12345678"))))"#);
+    let ok = interp.eval_str_compiled(r#"(await (async/spawn (fn () (hash/digest "12345678"))))"#);
     let over =
         interp.eval_str_compiled(r#"(await (async/spawn (fn () (hash/digest "123456789"))))"#);
     sema_stdlib::set_secret_input_byte_cap_override(None);

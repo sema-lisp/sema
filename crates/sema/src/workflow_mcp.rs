@@ -137,7 +137,8 @@ impl WorkflowMcpResolver for RealResolver {
 
         let kind = CompletionKind::try_from_raw(WORKFLOW_MCP_RESOLVE_KIND)
             .expect("workflow mcp resolve completion kind is nonzero");
-        let resource = InterruptibleResource::new("workflow/mcp-resolve", Box::new(ResolveCancelHook));
+        let resource =
+            InterruptibleResource::new("workflow/mcp-resolve", Box::new(ResolveCancelHook));
         let decoder = Box::new(ResolveDecoder);
 
         // The job is a SYNCHRONOUS blocking closure (not one `io_block_on`'d

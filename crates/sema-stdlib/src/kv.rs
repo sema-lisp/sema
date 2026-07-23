@@ -442,7 +442,9 @@ fn checkout_runtime<R: Send + 'static>(
             // mutation, so an over-cap rejection reinstalls the store unchanged.
             admit(store)?;
             let r = mutate(store);
-            flush_store(store, bounds).map(|()| r).map_err(|e| e.to_string())
+            flush_store(store, bounds)
+                .map(|()| r)
+                .map_err(|e| e.to_string())
         }),
         reinstall: Box::new(move |store| {
             KV_STORES.with(|s| {
@@ -743,8 +745,14 @@ mod tests {
 
         set_kv_bounds_override(Some((u64::MAX, usize::MAX)));
         let raised = effective_bounds();
-        assert_eq!(raised.max_store_bytes, KV_MAX_STORE_BYTES, "override cannot raise the byte ceiling");
-        assert_eq!(raised.max_items, KV_MAX_ITEMS, "override cannot raise the item ceiling");
+        assert_eq!(
+            raised.max_store_bytes, KV_MAX_STORE_BYTES,
+            "override cannot raise the byte ceiling"
+        );
+        assert_eq!(
+            raised.max_items, KV_MAX_ITEMS,
+            "override cannot raise the item ceiling"
+        );
 
         set_kv_bounds_override(Some((16, 2)));
         let lowered = effective_bounds();
@@ -802,7 +810,10 @@ mod tests {
         let big = serde_json::Value::String("x".repeat(64));
         let over_value = check_value_bytes("kv/set", name, "k", &big, bounds)
             .expect_err("a value over the byte cap must be rejected");
-        assert!(over_value.to_string().contains("kv store limit"), "{over_value}");
+        assert!(
+            over_value.to_string().contains("kv store limit"),
+            "{over_value}"
+        );
         let small = serde_json::Value::from(1);
         check_value_bytes("kv/set", name, "k", &small, bounds)
             .expect("an in-cap value is admitted");

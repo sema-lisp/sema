@@ -2146,14 +2146,12 @@ pub fn register(env: &sema_core::Env) {
                 // panics inside a runtime quantum — nor through a
                 // `NativeOutcome::Call`, whose non-callable arm surfaces a
                 // different ("expected callable") message.
-                Err(
-                    SemaError::eval(format!(
-                        "not callable: {} ({})",
-                        args[0],
-                        args[0].type_name()
-                    ))
-                    .with_hint("expected a function, lambda, or keyword"),
-                )
+                Err(SemaError::eval(format!(
+                    "not callable: {} ({})",
+                    args[0],
+                    args[0].type_name()
+                ))
+                .with_hint("expected a function, lambda, or keyword"))
             }
         },
     );

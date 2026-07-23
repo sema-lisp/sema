@@ -550,7 +550,12 @@ fn string_list_value(items: &[String]) -> Value {
 
 fn decode_string_list(v: Option<&Value>) -> Vec<String> {
     v.and_then(Value::as_seq)
-        .map(|items| items.iter().filter_map(|i| i.as_str().map(String::from)).collect())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|i| i.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -675,10 +680,8 @@ const READY_RESOLUTION_KIND: u64 = 0x7766_7230;
 fn ready_resolution_external(encoded: Value) -> PreparedExternalOperation {
     let kind = CompletionKind::try_from_raw(READY_RESOLUTION_KIND)
         .expect("ready-resolution completion kind is nonzero");
-    let resource = InterruptibleResource::new(
-        "workflow/mcp-resolve",
-        Box::new(NoopResolveCancelHook),
-    );
+    let resource =
+        InterruptibleResource::new("workflow/mcp-resolve", Box::new(NoopResolveCancelHook));
     PreparedExternalOperation::interruptible_blocking(
         kind,
         Box::new(ReadyResolutionDecoder {

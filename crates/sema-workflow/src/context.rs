@@ -665,11 +665,7 @@ impl WorkflowTaskState {
 
     /// The innermost live run scope, if any.
     fn current_ctx(&self) -> Option<Rc<WorkflowCtx>> {
-        self.inner
-            .borrow()
-            .scopes
-            .last()
-            .map(|s| Rc::clone(&s.ctx))
+        self.inner.borrow().scopes.last().map(|s| Rc::clone(&s.ctx))
     }
 
     fn cur_agent(&self) -> Option<String> {
@@ -891,7 +887,10 @@ pub fn set_workflow_scope(
         if !events.exists() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("cannot resume: no prior run journal at {}", events.display()),
+                format!(
+                    "cannot resume: no prior run journal at {}",
+                    events.display()
+                ),
             ));
         }
         let journal = crate::journal::next_resume_segment(&runs_root, &id)?;
@@ -1349,7 +1348,10 @@ mod tests {
             assert!(matches!(edge, GcEdge::Value(_)));
             edges += 1;
         }));
-        assert_eq!(edges, 3, "state bag + resume memo + MCP handle each trace once");
+        assert_eq!(
+            edges, 3,
+            "state bag + resume memo + MCP handle each trace once"
+        );
     }
 
     #[test]
@@ -1389,10 +1391,16 @@ mod tests {
         let inner = WorkflowCtx::new("inner".into(), Journal::null(), BTreeMap::new());
         let outer_token = state.install(outer);
         let inner_token = state.install(inner);
-        assert_eq!(state.current_ctx().map(|c| c.run_id.clone()).as_deref(), Some("inner"));
+        assert_eq!(
+            state.current_ctx().map(|c| c.run_id.clone()).as_deref(),
+            Some("inner")
+        );
 
         assert!(state.remove(outer_token));
-        assert!(!state.remove(outer_token), "removing the same token twice is idempotent");
+        assert!(
+            !state.remove(outer_token),
+            "removing the same token twice is idempotent"
+        );
         assert_eq!(
             state.current_ctx().map(|c| c.run_id.clone()).as_deref(),
             Some("inner"),
@@ -1469,8 +1477,7 @@ mod tests {
             "a\0b", // NUL
             "a\nb", // control char
         ] {
-            let err = validate_explicit_run_id(bad)
-                .expect_err(&format!("should reject {bad:?}"));
+            let err = validate_explicit_run_id(bad).expect_err(&format!("should reject {bad:?}"));
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "for {bad:?}");
         }
     }

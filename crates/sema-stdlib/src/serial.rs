@@ -363,90 +363,91 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         "serial/open",
         &[],
         |ctx, args| {
-        if args.len() < 2 || args.len() > 3 {
-            return Err(SemaError::arity("serial/open", "2-3", args.len()));
-        }
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
-        let baud = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?
-            as u32;
-        let timeout_ms = if args.len() == 3 {
-            args[2]
+            if args.len() < 2 || args.len() > 3 {
+                return Err(SemaError::arity("serial/open", "2-3", args.len()));
+            }
+            let path = args[0]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+                .to_string();
+            let baud = args[1]
                 .as_int()
-                .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?
-                as u64
-        } else {
-            DEFAULT_SERIAL_TIMEOUT_MS
-        };
+                .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?
+                as u32;
+            let timeout_ms = if args.len() == 3 {
+                args[2]
+                    .as_int()
+                    .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?
+                    as u64
+            } else {
+                DEFAULT_SERIAL_TIMEOUT_MS
+            };
 
-        // R14B admission: validate the requested read timeout as a bounded op
-        // quantum BEFORE any (blocking) device open dispatches, on both the sync
-        // and runtime paths. Every port that lands in the registry therefore
-        // carries a `Some(_)`, non-zero, `<= SERIAL_MAX_OP_TIMEOUT` timeout, so
-        // every later checkout op's worker occupancy is bounded by construction.
-        let timeout = validate_op_timeout("serial/open", Some(Duration::from_millis(timeout_ms)))?;
+            // R14B admission: validate the requested read timeout as a bounded op
+            // quantum BEFORE any (blocking) device open dispatches, on both the sync
+            // and runtime paths. Every port that lands in the registry therefore
+            // carries a `Some(_)`, non-zero, `<= SERIAL_MAX_OP_TIMEOUT` timeout, so
+            // every later checkout op's worker occupancy is bounded by construction.
+            let timeout =
+                validate_op_timeout("serial/open", Some(Duration::from_millis(timeout_ms)))?;
 
-        // Wire the interpreter-teardown hook (idempotent) before the (possibly
-        // offloaded) open dispatches: the async decoder that inserts the port has
-        // no `ctx`, so registration must happen here on the VM thread. A failed
-        // open leaves the hook cleaning an empty registry — harmless.
-        ensure_teardown_hook(ctx);
+            // Wire the interpreter-teardown hook (idempotent) before the (possibly
+            // offloaded) open dispatches: the async decoder that inserts the port has
+            // no `ctx`, so registration must happen here on the VM thread. A failed
+            // open leaves the hook cleaning an empty registry — harmless.
+            ensure_teardown_hook(ctx);
 
-        // There is no existing port to contend over, so `serial/open` offloads
-        // the blocking device `open()` as a plain External wait (mirrors
-        // `db/open`'s shape): the decoder inserts the freshly-`BufReader`-wrapped
-        // port into the registry on completion.
-        if in_runtime_quantum() {
-            let kind = CompletionKind::try_from_raw(SERIAL_COMPLETION_KIND)
-                .expect("serial completion kind is nonzero");
-            let path_for_open = path;
-            return crate::runtime_offload::external_io_interruptible_try(
-                "serial/open",
-                kind,
-                "serial/open",
-                move |port: Box<dyn serialport::SerialPort>| {
-                    let handle = next_handle();
-                    let reader = BufReader::new(port);
-                    PORTS.with(|ports| {
-                        ports
-                            .borrow_mut()
-                            .insert(handle, PortSlot::Available(reader))
-                    });
-                    Ok(Value::int(handle as i64))
-                },
-                move || async move {
-                    serialport::new(&path_for_open, baud)
-                        .timeout(timeout)
-                        .open()
-                        .map_err(|e| {
-                            SemaError::eval(format!("serial/open: {e}"))
-                                .with_hint(format!("path={path_for_open}, baud={baud}"))
-                                .to_string()
-                        })
-                },
-            );
-        }
+            // There is no existing port to contend over, so `serial/open` offloads
+            // the blocking device `open()` as a plain External wait (mirrors
+            // `db/open`'s shape): the decoder inserts the freshly-`BufReader`-wrapped
+            // port into the registry on completion.
+            if in_runtime_quantum() {
+                let kind = CompletionKind::try_from_raw(SERIAL_COMPLETION_KIND)
+                    .expect("serial completion kind is nonzero");
+                let path_for_open = path;
+                return crate::runtime_offload::external_io_interruptible_try(
+                    "serial/open",
+                    kind,
+                    "serial/open",
+                    move |port: Box<dyn serialport::SerialPort>| {
+                        let handle = next_handle();
+                        let reader = BufReader::new(port);
+                        PORTS.with(|ports| {
+                            ports
+                                .borrow_mut()
+                                .insert(handle, PortSlot::Available(reader))
+                        });
+                        Ok(Value::int(handle as i64))
+                    },
+                    move || async move {
+                        serialport::new(&path_for_open, baud)
+                            .timeout(timeout)
+                            .open()
+                            .map_err(|e| {
+                                SemaError::eval(format!("serial/open: {e}"))
+                                    .with_hint(format!("path={path_for_open}, baud={baud}"))
+                                    .to_string()
+                            })
+                    },
+                );
+            }
 
-        let port = serialport::new(&path, baud)
-            .timeout(timeout)
-            .open()
-            .map_err(|e| {
-                SemaError::eval(format!("serial/open: {e}"))
-                    .with_hint(format!("path={path}, baud={baud}"))
-            })?;
+            let port = serialport::new(&path, baud)
+                .timeout(timeout)
+                .open()
+                .map_err(|e| {
+                    SemaError::eval(format!("serial/open: {e}"))
+                        .with_hint(format!("path={path}, baud={baud}"))
+                })?;
 
-        let handle = next_handle();
-        let reader = BufReader::new(port);
-        PORTS.with(|ports| {
-            ports
-                .borrow_mut()
-                .insert(handle, PortSlot::Available(reader))
-        });
-        Ok(NativeOutcome::Return(Value::int(handle as i64)))
+            let handle = next_handle();
+            let reader = BufReader::new(port);
+            PORTS.with(|ports| {
+                ports
+                    .borrow_mut()
+                    .insert(handle, PortSlot::Available(reader))
+            });
+            Ok(NativeOutcome::Return(Value::int(handle as i64)))
         },
     );
 
@@ -755,8 +756,7 @@ mod tests {
         assert!(none.to_string().contains("timeout"));
 
         // Missing: a zero timeout is no bounded operation timeout.
-        let zero =
-            validate_op_timeout("serial/read-line", Some(Duration::ZERO)).unwrap_err();
+        let zero = validate_op_timeout("serial/read-line", Some(Duration::ZERO)).unwrap_err();
         assert!(zero.to_string().contains("timeout"));
 
         // Oversized: past the ceiling.

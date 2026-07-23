@@ -266,9 +266,11 @@ fn attach_raw_mode_task_guard(
     if let Some(existing) = handle.get_rc::<RawModeTaskGuard>() {
         existing.guards.borrow_mut().push(guard);
     } else {
-        handle.borrow_mut().insert(std::rc::Rc::new(RawModeTaskGuard {
-            guards: RefCell::new(vec![guard]),
-        }));
+        handle
+            .borrow_mut()
+            .insert(std::rc::Rc::new(RawModeTaskGuard {
+                guards: RefCell::new(vec![guard]),
+            }));
     }
 }
 
@@ -596,7 +598,11 @@ mod raw_mode_guard_tests {
         assert_eq!(tty_restore_count(), 1);
         drop(task_guard); // task later settles
         registry.restore_all(); // interpreter later tears down
-        assert_eq!(tty_restore_count(), 1, "exactly one restore across all paths");
+        assert_eq!(
+            tty_restore_count(),
+            1,
+            "exactly one restore across all paths"
+        );
     }
 }
 
@@ -3394,33 +3400,31 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             sema_core::intern("io/tty-raw!"),
             Value::native_fn(NativeFn::with_ctx("io/tty-raw!", move |ctx, args| {
                 check_arity!(args, "io/tty-raw!", 0);
-                let (saved, real_tty) =
-                    if TTY_FORCE_CAPTURE_FOR_TEST.load(AtomicOrdering::SeqCst) {
-                        // Test capture: record a guard without touching fd 0.
-                        (unsafe { std::mem::zeroed::<libc::termios>() }, false)
-                    } else {
-                        if !std::io::stdin().is_terminal() {
-                            return Ok(Value::nil());
-                        }
-                        // SAFETY: termios is a POD C struct; zero-init is the standard idiom.
-                        // tcgetattr overwrites on success; we short-circuit if it fails.
-                        let mut orig: libc::termios = unsafe { std::mem::zeroed() };
-                        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut orig) } != 0 {
-                            return Ok(Value::nil());
-                        }
-                        let mut raw = orig;
-                        unsafe { libc::cfmakeraw(&mut raw) };
-                        raw.c_cc[libc::VMIN] = 1;
-                        raw.c_cc[libc::VTIME] = 0;
-                        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0
-                        {
-                            return Err(SemaError::eval(format!(
-                                "io/tty-raw!: tcsetattr failed: {}",
-                                std::io::Error::last_os_error()
-                            )));
-                        }
-                        (orig, true)
-                    };
+                let (saved, real_tty) = if TTY_FORCE_CAPTURE_FOR_TEST.load(AtomicOrdering::SeqCst) {
+                    // Test capture: record a guard without touching fd 0.
+                    (unsafe { std::mem::zeroed::<libc::termios>() }, false)
+                } else {
+                    if !std::io::stdin().is_terminal() {
+                        return Ok(Value::nil());
+                    }
+                    // SAFETY: termios is a POD C struct; zero-init is the standard idiom.
+                    // tcgetattr overwrites on success; we short-circuit if it fails.
+                    let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+                    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut orig) } != 0 {
+                        return Ok(Value::nil());
+                    }
+                    let mut raw = orig;
+                    unsafe { libc::cfmakeraw(&mut raw) };
+                    raw.c_cc[libc::VMIN] = 1;
+                    raw.c_cc[libc::VTIME] = 0;
+                    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
+                        return Err(SemaError::eval(format!(
+                            "io/tty-raw!: tcsetattr failed: {}",
+                            std::io::Error::last_os_error()
+                        )));
+                    }
+                    (orig, true)
+                };
                 let guard = std::rc::Rc::new(RawModeGuard {
                     saved,
                     real_tty,

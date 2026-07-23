@@ -773,14 +773,9 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 data.len() as u64,
                 bounds.input_bytes,
             )?;
-            return archive_offload(
-                "gzip/decompress",
-                Value::bytevector,
-                move || {
-                    gzip_decompress_work(&data, Some(bounds.output_bytes))
-                        .map_err(|e| e.to_string())
-                },
-            );
+            return archive_offload("gzip/decompress", Value::bytevector, move || {
+                gzip_decompress_work(&data, Some(bounds.output_bytes)).map_err(|e| e.to_string())
+            });
         }
         Ok(NativeOutcome::Return(Value::bytevector(
             gzip_decompress_work(&data, None)?,

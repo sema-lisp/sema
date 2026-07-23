@@ -190,7 +190,10 @@ fn effective_result_caps() -> DbResultCaps {
 /// this is the seam a bounded-result caller (and the regression suite) drives.
 pub fn set_db_result_caps_override(caps: Option<(u64, u64)>) {
     DB_RESULT_CAPS_OVERRIDE.with(|cell| {
-        cell.set(caps.map(|(max_rows, max_bytes)| DbResultCaps { max_rows, max_bytes }));
+        cell.set(caps.map(|(max_rows, max_bytes)| DbResultCaps {
+            max_rows,
+            max_bytes,
+        }));
     });
 }
 

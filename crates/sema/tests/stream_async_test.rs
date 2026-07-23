@@ -787,10 +787,8 @@ fn blocking_stream_compatibility_native_preserves_public_arity_error() {
         .model("fake-model")
         .reply("must-not-dispatch")
         .build();
-    let (result, recorder) = eval_with_fake(
-        r#"(try (llm/stream) (catch error (:message error)))"#,
-        fake,
-    );
+    let (result, recorder) =
+        eval_with_fake(r#"(try (llm/stream) (catch error (:message error)))"#, fake);
 
     let message = result
         .expect("arity error should be catchable")

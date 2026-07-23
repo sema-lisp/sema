@@ -157,9 +157,9 @@ pub fn run_once_generated(src: &str, fake: FakeProvider, workflow_name: &str) ->
                 .filter(|l| !l.trim().is_empty())
                 .map(|l| serde_json::from_str(l).expect("valid event json"))
                 .collect();
-            let is_target = parsed.first().is_some_and(|e| {
-                e["event"] == "run.started" && e["workflow"] == workflow_name
-            });
+            let is_target = parsed
+                .first()
+                .is_some_and(|e| e["event"] == "run.started" && e["workflow"] == workflow_name);
             if is_target {
                 result = std::fs::read_to_string(dir.join("result.json"))
                     .ok()

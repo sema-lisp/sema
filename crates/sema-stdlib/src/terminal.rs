@@ -197,7 +197,11 @@ fn spawn_spinner(
             }
             SPINNER_LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
         })
-        .map_err(|e| SemaError::eval(format!("term/spinner-start: failed to spawn render thread: {e}")))
+        .map_err(|e| {
+            SemaError::eval(format!(
+                "term/spinner-start: failed to spawn render thread: {e}"
+            ))
+        })
 }
 
 /// Clear the spinner's line and, if a non-empty symbol/text was given, print
@@ -492,24 +496,27 @@ pub fn register(env: &sema_core::Env) {
     let start_registry = Rc::clone(&spinner_registry);
     env.set(
         sema_core::intern("term/spinner-start"),
-        Value::native_fn(NativeFn::with_ctx("term/spinner-start", move |ctx, args| {
-            check_arity!(args, "term/spinner-start", 1);
-            let msg = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                .to_string();
+        Value::native_fn(NativeFn::with_ctx(
+            "term/spinner-start",
+            move |ctx, args| {
+                check_arity!(args, "term/spinner-start", 1);
+                let msg = args[0]
+                    .as_str()
+                    .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+                    .to_string();
 
-            let stop = Arc::new(SpinnerStop::new());
-            let message = Arc::new(Mutex::new(msg));
-            let thread = spawn_spinner(Arc::clone(&stop), Arc::clone(&message))?;
-            let id = start_registry.insert(SpinnerHandle {
-                stop,
-                message,
-                thread: Some(thread),
-            });
-            start_registry.ensure_teardown_hook(ctx);
-            Ok(Value::int(id))
-        })),
+                let stop = Arc::new(SpinnerStop::new());
+                let message = Arc::new(Mutex::new(msg));
+                let thread = spawn_spinner(Arc::clone(&stop), Arc::clone(&message))?;
+                let id = start_registry.insert(SpinnerHandle {
+                    stop,
+                    message,
+                    thread: Some(thread),
+                });
+                start_registry.ensure_teardown_hook(ctx);
+                Ok(Value::int(id))
+            },
+        )),
     );
 
     // (term/spinner-stop id) or (term/spinner-stop id {:symbol "✔" :text "Done" :color :green})

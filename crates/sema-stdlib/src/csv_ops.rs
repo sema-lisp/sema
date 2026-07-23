@@ -81,11 +81,7 @@ fn check_csv_limit(op: &str, dimension: &str, actual: u64, limit: u64) -> Result
 /// incrementally (rejecting at boundary+1). Shared by the synchronous and
 /// offloaded `csv/parse` paths; the result is `Send`, so it can cross the offload
 /// thread boundary (the `Value` table is built by [`csv_rows_to_value`]).
-fn csv_parse_work(
-    s: &str,
-    row_cap: usize,
-    cell_cap: usize,
-) -> Result<Vec<Vec<String>>, SemaError> {
+fn csv_parse_work(s: &str, row_cap: usize, cell_cap: usize) -> Result<Vec<Vec<String>>, SemaError> {
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(false)
         .from_reader(s.as_bytes());
@@ -131,9 +127,8 @@ fn csv_parse_maps_work(
     let headers: Vec<String> = rdr
         .headers()
         .map_err(|e| {
-            SemaError::eval(format!("csv/parse-maps: parse error: {e}")).with_hint(
-                "csv/parse-maps expects a header row followed by comma-separated values",
-            )
+            SemaError::eval(format!("csv/parse-maps: parse error: {e}"))
+                .with_hint("csv/parse-maps expects a header row followed by comma-separated values")
         })?
         .iter()
         .map(|h| h.to_string())
@@ -209,7 +204,12 @@ pub fn register(env: &sema_core::Env) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         if sema_core::in_runtime_quantum() {
-            check_csv_limit("csv/parse", "input bytes", s.len() as u64, effective_csv_input_byte_cap())?;
+            check_csv_limit(
+                "csv/parse",
+                "input bytes",
+                s.len() as u64,
+                effective_csv_input_byte_cap(),
+            )?;
             let snapshot = s.to_string();
             return crate::io::quarantined_compute("csv/parse", csv_rows_to_value, move || {
                 csv_parse_work(&snapshot, CSV_MAX_ROWS, CSV_MAX_CELLS_PER_ROW)
@@ -250,16 +250,18 @@ pub fn register(env: &sema_core::Env) {
                 effective_csv_input_byte_cap(),
             )?;
             let snapshot = s.to_string();
-            return crate::io::quarantined_compute("csv/parse-maps", csv_maps_to_value, move || {
-                csv_parse_maps_work(&snapshot, CSV_MAX_ROWS, CSV_MAX_CELLS_PER_ROW)
-                    .map_err(|e| e.to_string())
-            });
+            return crate::io::quarantined_compute(
+                "csv/parse-maps",
+                csv_maps_to_value,
+                move || {
+                    csv_parse_maps_work(&snapshot, CSV_MAX_ROWS, CSV_MAX_CELLS_PER_ROW)
+                        .map_err(|e| e.to_string())
+                },
+            );
         }
-        Ok(NativeOutcome::Return(csv_maps_to_value(csv_parse_maps_work(
-            s,
-            CSV_MAX_ROWS,
-            CSV_MAX_CELLS_PER_ROW,
-        )?)))
+        Ok(NativeOutcome::Return(csv_maps_to_value(
+            csv_parse_maps_work(s, CSV_MAX_ROWS, CSV_MAX_CELLS_PER_ROW)?,
+        )))
     });
     #[cfg(target_arch = "wasm32")]
     register_fn(env, "csv/parse-maps", |args| {

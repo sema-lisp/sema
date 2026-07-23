@@ -7965,10 +7965,7 @@ impl RuntimeCompleteDriver {
 
     /// Suspend on the offloaded cache disk read for `key`. The read runs on the
     /// blocking tier (`interruptible_blocking`), never the VM quantum.
-    fn suspend_cache_peek(
-        mut self: Box<Self>,
-        key: String,
-    ) -> sema_core::runtime::NativeResult {
+    fn suspend_cache_peek(mut self: Box<Self>, key: String) -> sema_core::runtime::NativeResult {
         use sema_core::runtime::{
             CompletionKind, InterruptibleResource, NativeOutcome, NativeSuspend,
             PreparedExternalOperation, SendPayload, WaitKind,
@@ -7983,12 +7980,10 @@ impl RuntimeCompleteDriver {
         let resource =
             InterruptibleResource::new("llm/cache-peek", Box::new(CompleteNoopCancelHook));
         let path = cache_file_path(&key);
-        let prepared = PreparedExternalOperation::interruptible_blocking(
-            kind,
-            decoder,
-            resource,
-            move || Ok(Box::new(read_cached_from_disk(&path)) as SendPayload),
-        );
+        let prepared =
+            PreparedExternalOperation::interruptible_blocking(kind, decoder, resource, move || {
+                Ok(Box::new(read_cached_from_disk(&path)) as SendPayload)
+            });
         Ok(NativeOutcome::Suspend(NativeSuspend {
             wait: WaitKind::External(Box::new(prepared)),
             continuation: self,
@@ -8262,9 +8257,11 @@ impl sema_core::runtime::CompletionDecoder for CachePeekDecoder {
     ) -> sema_core::runtime::DecodedCompletion {
         let payload = result
             .map_err(|failure| SemaError::eval(format!("cache peek: {}", failure.message())))?;
-        let cached =
-            sema_core::runtime::downcast_send_payload::<Option<CachedResponse>>(payload, "cache-peek")
-                .map_err(|failure| SemaError::eval(format!("cache peek: {}", failure.message())))?;
+        let cached = sema_core::runtime::downcast_send_payload::<Option<CachedResponse>>(
+            payload,
+            "cache-peek",
+        )
+        .map_err(|failure| SemaError::eval(format!("cache peek: {}", failure.message())))?;
         *self.slot.borrow_mut() = Some(cached);
         Ok(Value::nil())
     }
@@ -8317,9 +8314,10 @@ impl sema_core::runtime::NativeContinuation for CassetteLoadContinuation {
                     mode,
                     then,
                 } = *self;
-                let tape = slot.borrow_mut().take().ok_or_else(|| {
-                    SemaError::eval("cassette load result was not delivered")
-                })?;
+                let tape = slot
+                    .borrow_mut()
+                    .take()
+                    .ok_or_else(|| SemaError::eval("cassette load result was not delivered"))?;
                 let cassette = crate::cassette::Cassette::from_tape(path, mode, tape);
                 match then {
                     CassetteLoadThen::Install => {
@@ -8403,12 +8401,10 @@ fn suspend_cassette_load(
     let resource =
         InterruptibleResource::new("llm/with-cassette", Box::new(CompleteNoopCancelHook));
     let load_path = path.clone();
-    let prepared = PreparedExternalOperation::interruptible_blocking(
-        kind,
-        decoder,
-        resource,
-        move || Ok(Box::new(crate::cassette::Tape::load(&load_path)) as SendPayload),
-    );
+    let prepared =
+        PreparedExternalOperation::interruptible_blocking(kind, decoder, resource, move || {
+            Ok(Box::new(crate::cassette::Tape::load(&load_path)) as SendPayload)
+        });
     Ok(NativeOutcome::Suspend(NativeSuspend {
         wait: WaitKind::External(Box::new(prepared)),
         continuation: Box::new(CassetteLoadContinuation {
@@ -9676,13 +9672,15 @@ async fn complete_once_async(
     match provider.complete_future(request.clone()) {
         Some(fut) => fut.await,
         None => {
-            let deadline = std::time::Duration::from_millis(sync_only_offload_deadline_ms(
-                request.timeout_ms,
-            ));
+            let deadline =
+                std::time::Duration::from_millis(sync_only_offload_deadline_ms(request.timeout_ms));
             let p = provider.clone();
             let req = request.clone();
-            match tokio::time::timeout(deadline, sema_io::io_offload_blocking(move || p.complete(req)))
-                .await
+            match tokio::time::timeout(
+                deadline,
+                sema_io::io_offload_blocking(move || p.complete(req)),
+            )
+            .await
             {
                 Ok(result) => result,
                 // Fail fast on the deadline (a non-retryable Config error): retrying a

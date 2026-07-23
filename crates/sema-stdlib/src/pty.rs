@@ -93,8 +93,7 @@ fn ensure_teardown_hook(ctx: &sema_core::EvalContext) {
 /// closes the master and detaches the reader thread (EOF exits it). `CheckedOut`
 /// slots hold no child. Gates are closed so any parked waiter fails fast.
 fn teardown_ptys() {
-    let slots: Vec<PtySlot> =
-        PTYS.with(|p| p.borrow_mut().drain().map(|(_, slot)| slot).collect());
+    let slots: Vec<PtySlot> = PTYS.with(|p| p.borrow_mut().drain().map(|(_, slot)| slot).collect());
     for slot in slots {
         if let PtySlot::Available(mut pty) = slot {
             if let Some(pid) = pty.child.process_id() {

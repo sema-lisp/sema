@@ -6586,7 +6586,11 @@ fn interpreter_drop_closes_kv_serial_sqlite_slots_and_gates() {
             .eval_str_compiled(&program)
             .expect("A opens a kv store and a sqlite db");
         let parts = opened.as_list().expect("result list");
-        assert_eq!(parts[0].as_int(), Some(1), "store must be usable before drop");
+        assert_eq!(
+            parts[0].as_int(),
+            Some(1),
+            "store must be usable before drop"
+        );
         assert_eq!(
             parts[1].as_list().map(|l| l.len()),
             Some(1),
@@ -6642,7 +6646,9 @@ fn interpreter_drop_does_not_disturb_another_thread_registry() {
             r#"(begin (kv/open "shared" "{p}") (kv/set "shared" "k" 42) :ok)"#,
             p = path_b_thread.display()
         );
-        interp.eval_str_compiled(&program).expect("B opens its store");
+        interp
+            .eval_str_compiled(&program)
+            .expect("B opens its store");
         b_ready_tx.send(()).expect("signal B ready");
         proceed_rx
             .recv_timeout(Duration::from_secs(30))
@@ -6668,7 +6674,9 @@ fn interpreter_drop_does_not_disturb_another_thread_registry() {
             r#"(begin (kv/open "shared" "{p}") (kv/set "shared" "k" 7) :ok)"#,
             p = path_a.display()
         );
-        interp.eval_str_compiled(&program).expect("A opens its store");
+        interp
+            .eval_str_compiled(&program)
+            .expect("A opens its store");
         drop(interp); // clears the MAIN thread's registry only
         let _ = std::fs::remove_file(&path_a);
     }

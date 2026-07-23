@@ -477,7 +477,11 @@ fn kv_set_over_cap_value_fails_with_store_intact() {
         "over-cap set error message: {:?}",
         parts[0]
     );
-    assert_eq!(parts[1], Value::string("hello"), "existing key must survive");
+    assert_eq!(
+        parts[1],
+        Value::string("hello"),
+        "existing key must survive"
+    );
     assert!(parts[2].is_nil(), "the over-cap key must not have landed");
     assert_eq!(
         parts[3],

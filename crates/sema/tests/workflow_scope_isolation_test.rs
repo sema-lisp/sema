@@ -250,7 +250,11 @@ fn spawned_child_inherits_workflow_and_step_attribution() {
     out.value.expect("program evaluated");
 
     let tool_calls = events_of(&out.events, "agent.tool_call");
-    assert_eq!(tool_calls.len(), 1, "the child's tool call must reach the run journal");
+    assert_eq!(
+        tool_calls.len(),
+        1,
+        "the child's tool call must reach the run journal"
+    );
     assert_eq!(tool_calls[0]["tool_name"], "child-probe");
     let lead = events_of(&out.events, "agent.started")
         .iter()

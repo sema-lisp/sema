@@ -78,7 +78,10 @@ impl Journal {
         let dir = runs_root.as_ref().join(run_id);
         ensure_run_dir(&dir)?;
         let path = dir.join(filename);
-        let file = OpenOptions::new().write(true).create_new(true).open(&path)?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
         Ok(Self::from_open(dir, file))
     }
 

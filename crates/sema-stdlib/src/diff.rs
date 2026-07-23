@@ -100,7 +100,12 @@ fn check_diff_patch_caps(op: &str, patch: &str) -> Result<(), SemaError> {
     if sema_core::in_runtime_quantum() {
         let cap = effective_diff_input_byte_cap();
         check_diff_limit(op, "input bytes", patch.len() as u64, cap)?;
-        check_diff_limit(op, "hunks", patch_hunk_count(patch) as u64, DIFF_HUNK_CAP as u64)?;
+        check_diff_limit(
+            op,
+            "hunks",
+            patch_hunk_count(patch) as u64,
+            DIFF_HUNK_CAP as u64,
+        )?;
     }
     Ok(())
 }

@@ -161,7 +161,11 @@ pub fn register(env: &sema_core::Env) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         if sema_core::in_runtime_quantum() {
-            check_markup_limit("markdown/to-html", md.len() as u64, effective_markup_input_byte_cap())?;
+            check_markup_limit(
+                "markdown/to-html",
+                md.len() as u64,
+                effective_markup_input_byte_cap(),
+            )?;
         }
         let parser = pulldown_cmark::Parser::new(md);
         let mut out = String::new();
@@ -176,7 +180,11 @@ pub fn register(env: &sema_core::Env) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         if sema_core::in_runtime_quantum() {
-            check_markup_limit("markdown/headings", md.len() as u64, effective_markup_input_byte_cap())?;
+            check_markup_limit(
+                "markdown/headings",
+                md.len() as u64,
+                effective_markup_input_byte_cap(),
+            )?;
         }
         let parser = pulldown_cmark::Parser::new(md);
 
@@ -225,7 +233,11 @@ pub fn register(env: &sema_core::Env) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         if sema_core::in_runtime_quantum() {
-            check_markup_limit("markdown/frontmatter", md.len() as u64, effective_markup_input_byte_cap())?;
+            check_markup_limit(
+                "markdown/frontmatter",
+                md.len() as u64,
+                effective_markup_input_byte_cap(),
+            )?;
         }
 
         let mut m: BTreeMap<Value, Value> = BTreeMap::new();
@@ -259,7 +271,11 @@ pub fn register(env: &sema_core::Env) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         if sema_core::in_runtime_quantum() {
-            check_markup_limit("html/parse", html.len() as u64, effective_markup_input_byte_cap())?;
+            check_markup_limit(
+                "html/parse",
+                html.len() as u64,
+                effective_markup_input_byte_cap(),
+            )?;
             let snapshot = html.to_string();
             return crate::io::quarantined_compute("html/parse", Value::string_owned, move || {
                 html_parse_work(&snapshot).map_err(|e| e.to_string())
@@ -281,12 +297,18 @@ pub fn register(env: &sema_core::Env) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
         if sema_core::in_runtime_quantum() {
-            check_markup_limit("html/select", html.len() as u64, effective_markup_input_byte_cap())?;
+            check_markup_limit(
+                "html/select",
+                html.len() as u64,
+                effective_markup_input_byte_cap(),
+            )?;
             let html = html.to_string();
             let sel = sel.to_string();
-            return crate::io::quarantined_compute("html/select", html_strings_to_value, move || {
-                html_select_work(&html, &sel).map_err(|e| e.to_string())
-            });
+            return crate::io::quarantined_compute(
+                "html/select",
+                html_strings_to_value,
+                move || html_select_work(&html, &sel).map_err(|e| e.to_string()),
+            );
         }
         Ok(NativeOutcome::Return(html_strings_to_value(
             html_select_work(html, sel)?,
@@ -300,7 +322,11 @@ pub fn register(env: &sema_core::Env) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         if sema_core::in_runtime_quantum() {
-            check_markup_limit("html/text", html.len() as u64, effective_markup_input_byte_cap())?;
+            check_markup_limit(
+                "html/text",
+                html.len() as u64,
+                effective_markup_input_byte_cap(),
+            )?;
             let snapshot = html.to_string();
             return crate::io::quarantined_compute("html/text", Value::string_owned, move || {
                 html_text_work(&snapshot).map_err(|e| e.to_string())

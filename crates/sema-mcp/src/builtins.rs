@@ -808,8 +808,8 @@ pub async fn connect_send(
     opts: &ConnectOpts,
     browser_allowed: bool,
 ) -> Result<ConnectedClient, ConnectFailure> {
-    let config_json =
-        value_to_config_json(config).map_err(|error| connect_outcome_to_failure(ConnectOutcome::Sema(error)))?;
+    let config_json = value_to_config_json(config)
+        .map_err(|error| connect_outcome_to_failure(ConnectOutcome::Sema(error)))?;
     match connect_dispatch_async(
         config_json,
         opts.clone(),

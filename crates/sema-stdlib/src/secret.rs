@@ -382,14 +382,25 @@ pub fn register(env: &sema_core::Env) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         if sema_core::in_runtime_quantum() {
-            check_secret_limit("secret/detect", s.len() as u64, effective_secret_input_byte_cap())?;
+            check_secret_limit(
+                "secret/detect",
+                s.len() as u64,
+                effective_secret_input_byte_cap(),
+            )?;
             let snapshot = s.to_string();
-            return crate::io::quarantined_compute("secret/detect", detect_pair_to_value, move || {
-                let findings = detect_secrets(&snapshot);
-                Ok((snapshot, findings))
-            });
+            return crate::io::quarantined_compute(
+                "secret/detect",
+                detect_pair_to_value,
+                move || {
+                    let findings = detect_secrets(&snapshot);
+                    Ok((snapshot, findings))
+                },
+            );
         }
-        Ok(NativeOutcome::Return(findings_to_list(s, &detect_secrets(s))))
+        Ok(NativeOutcome::Return(findings_to_list(
+            s,
+            &detect_secrets(s),
+        )))
     });
     #[cfg(target_arch = "wasm32")]
     register_fn(env, "secret/detect", |args| {
@@ -407,12 +418,20 @@ pub fn register(env: &sema_core::Env) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         if sema_core::in_runtime_quantum() {
-            check_secret_limit("secret/redact", s.len() as u64, effective_secret_input_byte_cap())?;
+            check_secret_limit(
+                "secret/redact",
+                s.len() as u64,
+                effective_secret_input_byte_cap(),
+            )?;
             let snapshot = s.to_string();
-            return crate::io::quarantined_compute("secret/redact", secret_string_to_value, move || {
-                let findings = detect_secrets(&snapshot);
-                Ok(redact_findings(&snapshot, &findings))
-            });
+            return crate::io::quarantined_compute(
+                "secret/redact",
+                secret_string_to_value,
+                move || {
+                    let findings = detect_secrets(&snapshot);
+                    Ok(redact_findings(&snapshot, &findings))
+                },
+            );
         }
         Ok(NativeOutcome::Return(Value::string(&redact_findings(
             s,
@@ -435,7 +454,11 @@ pub fn register(env: &sema_core::Env) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         if sema_core::in_runtime_quantum() {
-            check_secret_limit("pii/detect", s.len() as u64, effective_secret_input_byte_cap())?;
+            check_secret_limit(
+                "pii/detect",
+                s.len() as u64,
+                effective_secret_input_byte_cap(),
+            )?;
             let snapshot = s.to_string();
             return crate::io::quarantined_compute("pii/detect", detect_pair_to_value, move || {
                 let findings = detect_pii(&snapshot);
@@ -464,16 +487,22 @@ pub fn register(env: &sema_core::Env) {
             .ok_or_else(|| SemaError::type_error("list", args[1].type_name()))?;
         let in_quantum = sema_core::in_runtime_quantum();
         if in_quantum {
-            check_secret_limit("redact/spans", text.len() as u64, effective_secret_input_byte_cap())?;
+            check_secret_limit(
+                "redact/spans",
+                text.len() as u64,
+                effective_secret_input_byte_cap(),
+            )?;
         }
         // Span parsing reads `Value`s, so it runs on the VM thread either way;
         // only the sort/dedup/rewrite over `text` is offloaded.
         let edits = collect_span_edits(text, spans);
         if in_quantum {
             let snapshot = text.to_string();
-            return crate::io::quarantined_compute("redact/spans", secret_string_to_value, move || {
-                Ok(apply_span_edits(snapshot, edits))
-            });
+            return crate::io::quarantined_compute(
+                "redact/spans",
+                secret_string_to_value,
+                move || Ok(apply_span_edits(snapshot, edits)),
+            );
         }
         Ok(NativeOutcome::Return(Value::string(&apply_span_edits(
             text.to_string(),
@@ -503,7 +532,11 @@ pub fn register(env: &sema_core::Env) {
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         #[cfg(not(target_arch = "wasm32"))]
         if sema_core::in_runtime_quantum() {
-            check_secret_limit("hash/digest", s.len() as u64, effective_secret_input_byte_cap())?;
+            check_secret_limit(
+                "hash/digest",
+                s.len() as u64,
+                effective_secret_input_byte_cap(),
+            )?;
         }
         let hash = Sha256::digest(s.as_bytes());
         let hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();

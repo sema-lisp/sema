@@ -979,7 +979,10 @@ mod tests {
             .block_on(drain_git_pipe(&data[..], 16, flag, tx))
             .expect("capped drain reads without error");
         assert_eq!(bytes.len(), 16, "the drain truncates to the cap");
-        assert!(over_cap.load(Ordering::Acquire), "over-cap flag must be set");
+        assert!(
+            over_cap.load(Ordering::Acquire),
+            "over-cap flag must be set"
+        );
         assert!(
             matches!(rx.try_recv(), Ok(())),
             "over-cap must wake the invocation future"

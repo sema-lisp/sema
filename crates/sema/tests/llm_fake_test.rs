@@ -409,7 +409,11 @@ fn disk_cache_hit_charges_zero_usage() {
                    (:total-tokens (llm/session-usage))"#
             ))
             .expect("run 1 populates the disk cache");
-        assert_eq!(total.as_int(), Some(150), "run 1 charges the real provider call");
+        assert_eq!(
+            total.as_int(),
+            Some(150),
+            "run 1 charges the real provider call"
+        );
     }
 
     // Run 2: fresh interpreter (empty in-memory cache) + a fake that ERRORS if called.

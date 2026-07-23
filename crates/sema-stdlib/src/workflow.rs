@@ -106,8 +106,7 @@ const RENDERED_VALUE_MAX_BYTES: usize = 8192;
 /// byte-identical; an over-cap value is rendered from its bounded compact prefix + a
 /// truncation marker.
 fn capped_render(v: &Value) -> String {
-    let (compact, truncated) =
-        sema_workflow::context::compact_capped(v, RENDERED_VALUE_MAX_BYTES);
+    let (compact, truncated) = sema_workflow::context::compact_capped(v, RENDERED_VALUE_MAX_BYTES);
     if truncated {
         format!("{compact}\n… (truncated at {RENDERED_VALUE_MAX_BYTES} bytes)")
     } else {
@@ -329,7 +328,10 @@ fn register_scoped_fn(
             move |args| for_legacy(None, args),
             move |ctx, args| {
                 let task_context = ctx.task_context.clone();
-                Ok(NativeOutcome::Return(for_runtime(Some(&task_context), args)?))
+                Ok(NativeOutcome::Return(for_runtime(
+                    Some(&task_context),
+                    args,
+                )?))
             },
         )),
     );
@@ -749,8 +751,7 @@ const HOST_FLUSH_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 fn build_flush_ack_suspend(envelope: Value, ack_rx: Receiver<()>) -> NativeSuspend {
     let kind = CompletionKind::try_from_raw(FLUSH_ACK_COMPLETION_KIND)
         .expect("flush-ack completion kind is nonzero");
-    let resource =
-        InterruptibleResource::new("workflow/journal-flush", Box::new(FlushCancelHook));
+    let resource = InterruptibleResource::new("workflow/journal-flush", Box::new(FlushCancelHook));
     let prepared = PreparedExternalOperation::interruptible_blocking(
         kind,
         Box::new(FlushDecoder {
@@ -1161,9 +1162,9 @@ impl NativeContinuation for ResolveContinuation {
             ResumeInput::Returned(value) => {
                 let resolutions = workflow_mcp::decode_resolutions(&value);
                 match apply_resolutions(Some(&task_context), guard, thunk, resolver, resolutions)? {
-                    ResolveGate::Exit { envelope, ack } => {
-                        Ok(NativeOutcome::Suspend(build_flush_ack_suspend(envelope, ack)))
-                    }
+                    ResolveGate::Exit { envelope, ack } => Ok(NativeOutcome::Suspend(
+                        build_flush_ack_suspend(envelope, ack),
+                    )),
                     ResolveGate::Proceed { thunk, teardown } => {
                         Ok(NativeOutcome::Call(NativeCall {
                             callable: thunk,
@@ -1192,7 +1193,9 @@ impl NativeContinuation for ResolveContinuation {
                     "mcp resolution failed".to_string(),
                     envelope,
                 );
-                Ok(NativeOutcome::Suspend(build_flush_ack_suspend(envelope, ack)))
+                Ok(NativeOutcome::Suspend(build_flush_ack_suspend(
+                    envelope, ack,
+                )))
             }
             // Cancellation reaps the run: dropping `guard` removes the scope token; the
             // worker already dropped any half-open connection. Propagate the cancellation.
@@ -1217,7 +1220,13 @@ pub fn register(env: &sema_core::Env) {
     // the {:status ...} envelope. `name`/`doc` are strings; `meta` is the workflow's
     // metadata map ({:args ... :budget ... :permissions ...}); `thunk` is the (lambda () ...)
     // wrapping the workflow body.
-    register_thunk_fn(env, "workflow/run", run_plan, finish_run, trace_run_teardown);
+    register_thunk_fn(
+        env,
+        "workflow/run",
+        run_plan,
+        finish_run,
+        trace_run_teardown,
+    );
 
     // (workflow/phase label) — a MARKER (workflow.js semantics), not a wrapper. Closes
     // the previously-open phase (emitting its phase.ended) then opens `label`. The

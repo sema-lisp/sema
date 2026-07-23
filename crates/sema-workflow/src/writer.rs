@@ -99,8 +99,9 @@ impl JournalWriter {
     pub fn enqueue_event(&self, line: String) {
         let dropped = self.dropped.get();
         if dropped > 0 {
-            let marker =
-                format!(r#"{{"event":"journal.overflow","reason":"queue-full","dropped":{dropped}}}"#);
+            let marker = format!(
+                r#"{{"event":"journal.overflow","reason":"queue-full","dropped":{dropped}}}"#
+            );
             if self.tx.try_send(WriterMsg::Event(marker)).is_ok() {
                 self.dropped.set(0);
             }

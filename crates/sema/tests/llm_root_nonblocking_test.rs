@@ -775,7 +775,10 @@ fn cache_and_cassette_do_no_filesystem_io_on_the_quantum() {
 #[test]
 #[serial]
 fn sibling_custom_pricing_change_does_not_reprice_suspended_task() {
-    let fake = FakeProvider::builder("fake").model("fake-chat").echo().build();
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .echo()
+        .build();
     let interp = Interpreter::new();
     reset_runtime_state();
     register_test_provider(Box::new(fake));

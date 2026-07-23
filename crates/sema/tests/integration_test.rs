@@ -14513,6 +14513,38 @@ fn test_eval_error_json() {
 }
 
 #[test]
+fn test_eval_timeout_kills_runaway_loop() {
+    // Omega combinator: loops forever under TCO. The 10s ceiling is generous
+    // headroom for slow CI over the 300ms deadline — without a working
+    // --timeout the eval never returns at all.
+    let start = std::time::Instant::now();
+    let output = sema_cmd()
+        .args([
+            "eval",
+            "--expr",
+            "((fn (f) (f f)) (fn (f) (f f)))",
+            "--json",
+            "--no-llm",
+            "--timeout",
+            "300",
+        ])
+        .output()
+        .expect("failed to run sema eval");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "--timeout did not abort the runaway loop"
+    );
+    assert!(output.status.success(), "expected exit 0 for --json error");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["ok"], false);
+    let msg = json["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("time budget"),
+        "expected deadline error, got: {msg}"
+    );
+}
+
+#[test]
 fn test_eval_expr_no_json() {
     let output = sema_cmd()
         .args(["eval", "--expr", "(+ 10 20)", "--no-llm"])

@@ -570,6 +570,7 @@ mod tests {
         let hits = vec![sema_mcp::docs_search::SearchHit {
             name: "string/split".into(),
             module: "strings".into(),
+            signature: String::new(),
             summary: "Split a string by a delimiter".into(),
             score: 1.0,
         }];

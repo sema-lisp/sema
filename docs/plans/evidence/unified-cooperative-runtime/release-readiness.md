@@ -10,6 +10,18 @@ Date: 2026-07-16. Branch: `codex/unified-async-runtime`.
 > [finish-remediation plan](../../2026-07-18-unified-runtime-finish-remediation.md)
 > and [terminal-inventory follow-up](../../2026-07-19-unified-runtime-terminal-inventory.md)
 > until a final verification record lands.
+>
+> **Final terminal-inventory sign-off — 2026-07-23.** The terminal-inventory
+> follow-up is now **Complete**: every async-runtime ledger row that a live
+> discovery match points at is terminal, and the `--check` inventory gate is green
+> (931 exact production matches, all mapped rows `MIGRATED`/`REMOVED`/
+> `SYNCHRONOUS-PROOF`). The 68 already-proven core/eval/VM/executor/stdlib/host
+> rows were stamped after a per-row audit against current code, evidenced by the
+> legacy-purge gate + the exact off-quantum host-adapter allowlist. The A1–C6
+> commits closed the +26 missed resource/context rows; C7 regenerated
+> `runtime-match-map.tsv` and signed off the ledger. Residual honest deferrals:
+> R10B (PDF parser non-terminal bound) and R14B (serial hardware coverage) —
+> see `docs/deferred.md`.
 
 This report assesses the unified cooperative runtime migration against
 release-readiness after the core migration, P7 verification, and the

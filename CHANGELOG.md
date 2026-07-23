@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- **Unified async runtime — terminal-inventory ledger signed off; conformance
+  gate green.** The async-runtime migration inventory
+  (`docs/internals/async-runtime-inventory.md`) is now terminal for every
+  production-matched row. The 68 already-proven core/eval/VM/executor/stdlib/host
+  rows were stamped `MIGRATED` after per-row verification against current code —
+  the legacy-symbol purge gate (`check-unified-runtime-legacy.sh --check`), the
+  exact off-quantum host-adapter allowlist, and the adversarial verification are
+  the evidence — joining the A1–C6 resource/context rows.
+  `docs/plans/evidence/unified-cooperative-runtime/runtime-match-map.tsv` was
+  regenerated to the 931 current discovery matches (line-shift inherits, the
+  B8/B9/B3 split-row remaps `R03→R03A` / `R13→R13A` / `R14→R14B` /
+  `R21→R21A`/`R21B`, and hand-classified new payloads), and
+  `check-unified-runtime-inventory.sh` now accepts commit-annotated terminal
+  statuses (`MIGRATED (B7)`, …) via a terminal-prefix match. All nine
+  `runtime_conformance_test` cases pass, including
+  `unified_runtime_inventory_mapping_covers_exact_current_matches`.
 - **WebSocket waits and event selection use source-driven runtime wakes.**
   Client handshakes and client/server message and close waits are event-driven;
   cancelling a pending receive preserves the installed receiver and connection.

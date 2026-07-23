@@ -1,6 +1,11 @@
 # Unified Runtime Terminal Inventory
 
-**Status:** In progress; independently re-audited 2026-07-20
+**Status:** Complete 2026-07-23. Tasks 1–7 (core/host/evidence) plus Tasks 8–9
+(the +26 missed resource/context rows, closed by commits A1–C6) all landed, and
+the C7 final sign-off stamped every production-matched ledger row terminal after
+a per-row audit against current code. `check-unified-runtime-inventory.sh --check`
+is green (931 matches, all mapped rows terminal); the full ledger in
+`docs/internals/async-runtime-inventory.md` is the record.
 
 ## Goal
 

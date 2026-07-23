@@ -869,6 +869,47 @@ tracked as bugs to fix later — the audit checked them and closed them):
   the (usually larger) compile step blocking. Not worth the complexity for a
   one-shot, per-module cost.
 
+## Unified runtime terminal-inventory — residual deferrals (2026-07-23, C7 sign-off)
+
+Recorded when the terminal-inventory ledger was signed off
+(`docs/plans/2026-07-19-unified-runtime-terminal-inventory.md`, Tasks 8–9 + C7).
+Both are honest **narrowed-terminal** dispositions, not gaps to silently close.
+
+- **R10B — PDF parser is not terminally bounded (subprocess isolation deferred).**
+  `pdf/*` offloads `lopdf`/`pdf-extract` parsing over an owned byte snapshot under
+  the quarantine `hard_deadline` cleanup net, and input-byte admission (R10A) is a
+  terminal pre-dispatch reject. But the page/output caps run *post-parse*: `lopdf`
+  can allocate/decompress object streams before the caps apply, so the parse step
+  is bounded only by the wall-clock cleanup deadline, not a terminal `finite_work`
+  unit cap. A truly terminal bound needs subprocess parser isolation (parse in a
+  killable child under an RLIMIT), which is out of scope for the cooperative-runtime
+  wave. Ledger row R10B is `MIGRATED (B9, split; documented NON-terminal parser
+  bound)` — it does not claim BOUNDED.
+- **R14B — serial bounded-checkout cancellation is unverifiable without hardware.**
+  Serial ports expose no portable read-interrupt, so a cancelled `serial/read-line`
+  cannot be aborted; R14B instead validates the port read timeout (`Some(_)`,
+  non-zero, `<= SERIAL_MAX_OP_TIMEOUT`) before every dispatch, so a blocked worker
+  frees within the validated bound. The `cancelled-op-settles-within-timeout`
+  regression can only run against a loopback/pty-backed port; this environment has
+  no serial hardware, so that arm is covered by the timeout-validation unit tests
+  plus the no-hardware cancellation suite. Revisit if serial hardware coverage
+  becomes available in CI.
+- **B4 `io.rs` whole-file value-ABI read scanner guard — deferred (not a clean
+  scan).** R08B's contract is already structural: `stream/open-*` and the `io.rs`
+  quantum offloads admit only regular files (`io::admit_regular_file`), and the
+  whole-file value-ABI reads (`file/read`, `file/read-bytes`) on the
+  `!in_runtime_quantum()` host arm are HOST-ADAPTER-ONLY. A source guard to fail a
+  raw whole-file read *reintroduced on the VM thread inside a quantum* cannot use
+  the existing `RAW_STDIN_READ`-style active-runtime scanner: the legitimate
+  in-quantum reads (`crates/sema-stdlib/src/io.rs` `std::fs::read_to_string`/`read`
+  at the offloaded arms) sit **inside `quarantined_compute` worker closures** that
+  the brace-matched `if in_runtime_quantum() { … }` block scan cannot distinguish
+  from a direct VM-thread read, so the rule would false-positive and regress the
+  green source-policy. A precise guard needs closure-aware analysis or a refactor
+  that hoists the read out of the quantum block; deferred as a follow-up. (Unlike
+  stdin, a file read inside a quantum is legal when offloaded, so the
+  zero-tolerance stdin model does not transfer.)
+
 ## Unified runtime migration — deferred
 
 **Context (updated 2026-07-16, post-P5 purge).** Every eval entry point drives

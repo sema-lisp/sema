@@ -1,6 +1,11 @@
 # Unified Runtime Remaining Work
 
-**Status:** Planned 2026-07-21 (not started)
+**Status:** Complete 2026-07-23. Parts A (A1–A3 workflow correctness), B (B1–B9
+resource bounds/cancellation), and C (C1–C6 context isolation + C7 evidence
+reconciliation) all landed. C7 signed off the terminal-inventory ledger: the
+`runtime-match-map.tsv` was regenerated to the current discovery scan, the 68
+already-proven rows were stamped `MIGRATED` after per-row verification, and
+`runtime_conformance_test` is fully green.
 
 ## Context
 
@@ -1013,6 +1018,26 @@ B6; TTY fixed in B5).
 - **Guard**: teardown-hook presence unit tests per module; ledger flips C14.
 
 ### Commit C7 — evidence reconciliation and final gate
+
+**Landed 2026-07-23.** The `runtime-match-map.tsv` was regenerated from
+`--write-mapping`'s discovery scan to the 931 current production matches:
+line-shifted payloads inherit their reviewed row, the split-row remaps
+(`R03→R03A`, `R13→R13A`, `R14→R14B`, and the new `csv_ops.rs`/`markup.rs`/
+`crypto.rs` files → `R21A`/`R21A`/`R21B`) were hand-classified against the actual
+sites, and the 221 genuinely-new payloads were hand-classified to the row family
+of their site (verified each maps to a real runtime-primitive line). The 68
+already-proven core/eval/VM/executor/stdlib/host rows the mapping references were
+stamped `MIGRATED` after a **genuine per-row audit** against current code — the
+legacy-purge gate (all bridge symbols deleted), the exact off-quantum
+host-adapter allowlist, the coordinator-flagged nuanced rows (R18C `sleep` dual-ABI
+Timer suspend; R08A bounded `quarantined_compute`; R07A/R11/R12/R20A `runtime_offload`
+with `io_block_on` only on non-quantum host arms; R15A SRV-1 re-arming cooperative
+accept loop), and the audit's terminal classification are the agreeing evidence.
+`check-unified-runtime-inventory.sh` learned a terminal-prefix match so
+commit-annotated statuses (`MIGRATED (B7)`, `SYNCHRONOUS-PROOF (B8)`) are accepted
+while `LEGACY`/`ADAPTER` still fail (the invalid-fixture test stays green). All
+nine `runtime_conformance_test` cases pass. Deferrals recorded: R10B parser
+isolation, R14B serial hardware coverage (`docs/deferred.md`).
 
 - Regenerate the discovery scans and `runtime-match-map.tsv`
   (`--write-mapping`), hand-classifying only genuinely new payloads; the audit

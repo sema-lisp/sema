@@ -119,8 +119,7 @@ check_mapping_files() {
       invalid = 1
       next
     }
-    ledger[$1] != "MIGRATED" && ledger[$1] != "REMOVED" &&
-      ledger[$1] != "SYNCHRONOUS-PROOF" {
+    ledger[$1] !~ /^(MIGRATED|REMOVED|SYNCHRONOUS-PROOF)([[:space:]]|$)/ {
       print "runtime inventory mapping references nonterminal ledger row " $1 \
         " (" ledger[$1] ")" > "/dev/stderr"
       invalid = 1

@@ -125,6 +125,23 @@ impl BackendState {
             }
         }
 
-        None
+        // Fall back to a workspace-wide search (other open documents, then
+        // still-fresh scanned files), mirroring goto-definition Phase 3d.
+        // Attributed as "Defined in" so the user can tell a workspace match
+        // from an explicit import ("Imported from").
+        let (ast, module_name) = self.find_workspace_definition(uri, &symbol)?;
+        let mut hover_text = format!("```sema\n({symbol}");
+        if let Some(params) = extract_params_from_ast(ast, &symbol) {
+            hover_text.push(' ');
+            hover_text.push_str(&params);
+        }
+        hover_text.push_str(&format!(")\n```\n\n*Defined in `{module_name}`*"));
+        Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: hover_text,
+            }),
+            range: None,
+        })
     }
 }

@@ -62,12 +62,14 @@ impl WorkspaceScanner {
             if name_str.starts_with('.') || name_str == "target" || name_str == "node_modules" {
                 continue;
             }
-            // Follow symlinks for file discovery; cycles are detected via canonicalize + visited set
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+            // Type-check through symlinks (`DirEntry::metadata` does not
+            // traverse them, which would skip symlinked dirs and files);
+            // cycles are prevented by the canonical-path visited set below.
             let path = entry.path();
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue, // broken symlink or unreadable
+            };
             if meta.is_dir() {
                 if let Ok(canonical) = std::fs::canonicalize(&path) {
                     if self.visited.insert(canonical) {
@@ -95,6 +97,21 @@ pub(crate) struct ImportCache {
     pub(crate) source: String,
     /// Modification time when we last read the file.
     pub(crate) mtime: std::time::SystemTime,
+}
+
+impl ImportCache {
+    /// Whether this entry still matches the file on disk. Handlers that
+    /// iterate the cache directly (references, rename, workspace symbols,
+    /// the goto-definition workspace fallback) must skip entries that are
+    /// not fresh: their spans index content that no longer exists, and a
+    /// rename edit built from them would corrupt the file. Missing metadata
+    /// counts as stale — a deleted file has nothing to point into.
+    pub(crate) fn is_fresh(&self, path: &Path) -> bool {
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .map(|mtime| mtime == self.mtime)
+            .unwrap_or(false)
+    }
 }
 
 /// Cached parse result for an open document (updated on every didChange).
@@ -359,12 +376,25 @@ impl BackendState {
 
     /// Get or refresh the cached parse result for an imported file.
     pub(crate) fn get_import_cache(&mut self, path: &Path) -> Option<&ImportCache> {
-        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+        // One canonical key per file: import resolution yields un-normalized
+        // paths (`a/../lib.sema`), and clients may address a file through a
+        // symlinked root; distinct keys for the same file would duplicate
+        // results in every handler that iterates this map.
+        let path = canonicalize_or_raw(path);
+        let mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+            Ok(mtime) => mtime,
+            Err(_) => {
+                // File deleted or unreadable — drop any stale entry so the
+                // iterating handlers stop seeing it.
+                self.import_cache.remove(&path);
+                return None;
+            }
+        };
 
         // Check if cache is still valid
-        if let Some(cached) = self.import_cache.get(path) {
+        if let Some(cached) = self.import_cache.get(&path) {
             if cached.mtime == mtime {
-                return self.import_cache.get(path);
+                return self.import_cache.get(&path);
             }
         }
 
@@ -382,15 +412,24 @@ impl BackendState {
             }
         }
 
-        // Read and parse the file
-        let text = std::fs::read_to_string(path).ok()?;
-        let (ast, span_map, symbol_spans) = sema_reader::read_many_with_symbol_spans(&text).ok()?;
+        // Read and parse the file. On failure, drop any previously cached
+        // entry: it describes content that is gone, and serving it to the
+        // iterating handlers would point them at stale offsets.
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            self.import_cache.remove(&path);
+            return None;
+        };
+        let Ok((ast, span_map, symbol_spans)) = sema_reader::read_many_with_symbol_spans(&text)
+        else {
+            self.import_cache.remove(&path);
+            return None;
+        };
         // Drop quoted (data) symbol occurrences (see filter_quoted_symbol_spans).
         let symbol_spans = filter_quoted_symbol_spans(&ast, &span_map, symbol_spans);
         let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
 
         self.import_cache.insert(
-            path.to_path_buf(),
+            path.clone(),
             ImportCache {
                 ast,
                 span_map,
@@ -400,22 +439,122 @@ impl BackendState {
                 mtime,
             },
         );
-        self.import_cache.get(path)
+        self.import_cache.get(&path)
     }
 
-    /// Index every top-level definition across open documents: name → (uri, form range, name range).
+    /// Search the whole workspace for a top-level definition of `symbol`:
+    /// other open documents first, then still-fresh scanned files (dedup'd
+    /// against open documents by canonical path — same rules as references
+    /// and rename). Skips `current_uri`: its definitions were already
+    /// consulted by the caller. Returns the defining file's AST (for
+    /// signature/docstring extraction) plus a short display name (file stem)
+    /// for attribution.
+    pub(crate) fn find_workspace_definition(
+        &self,
+        current_uri: &Url,
+        symbol: &str,
+    ) -> Option<(&[sema_core::Value], String)> {
+        let mut open_paths: HashSet<PathBuf> = HashSet::new();
+        let mut found: Option<(&[sema_core::Value], String)> = None;
+        for (doc_uri_str, cached) in &self.cached_parses {
+            // Collect every open document's canonical path (even after a
+            // match) so the scan-cache dedup below sees the complete set.
+            if let Ok(doc_uri) = Url::parse(doc_uri_str) {
+                if let Ok(doc_path) = doc_uri.to_file_path() {
+                    open_paths.insert(canonicalize_or_raw(&doc_path));
+                }
+            }
+            if found.is_some() || doc_uri_str == current_uri.as_str() {
+                continue;
+            }
+            // Names only; ranges discarded — &[] skips UTF-16 mapping.
+            let defs =
+                user_definitions_from_ast(&cached.ast, &cached.span_map, &cached.symbol_spans, &[]);
+            if defs.iter().any(|(name, _)| name == symbol) {
+                let stem = Path::new(doc_uri_str)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(doc_uri_str)
+                    .to_string();
+                found = Some((&cached.ast, stem));
+            }
+        }
+        if found.is_some() {
+            return found;
+        }
+
+        for (path, import_cached) in &self.import_cache {
+            if open_paths.contains(&canonicalize_or_raw(path)) {
+                continue;
+            }
+            if !import_cached.is_fresh(path) {
+                continue;
+            }
+            let defs = user_definitions_from_ast(
+                &import_cached.ast,
+                &import_cached.span_map,
+                &import_cached.symbol_spans,
+                &[],
+            );
+            if defs.iter().any(|(name, _)| name == symbol) {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                return Some((&import_cached.ast, stem));
+            }
+        }
+        None
+    }
+
+    /// Index every top-level definition across open documents and still-fresh
+    /// scanned workspace files: name → (uri, form range, name range). Open
+    /// documents are inserted first, so they win over a scanned entry for the
+    /// same name (`or_insert`); scan entries are dedup'd against open
+    /// documents by canonical path, same rules as references and rename.
     pub(crate) fn def_index(&self) -> std::collections::HashMap<String, (Url, Range, Range)> {
         let mut index = std::collections::HashMap::new();
+        let mut open_paths: HashSet<PathBuf> = HashSet::new();
         for (uri_str, cached) in &self.cached_parses {
             let uri = match Url::parse(uri_str) {
                 Ok(u) => u,
                 Err(_) => continue,
             };
+            if let Ok(doc_path) = uri.to_file_path() {
+                open_paths.insert(canonicalize_or_raw(&doc_path));
+            }
             let lines: Vec<&str> = cached.source.lines().collect();
             for expr in &cached.ast {
                 if let Some((name, form_range, name_range)) =
                     def_of_form(expr, &cached.span_map, &cached.symbol_spans, &lines)
                 {
+                    index
+                        .entry(name)
+                        .or_insert((uri.clone(), form_range, name_range));
+                }
+            }
+        }
+
+        for (path, import_cached) in &self.import_cache {
+            if open_paths.contains(&canonicalize_or_raw(path)) {
+                continue;
+            }
+            if !import_cached.is_fresh(path) {
+                continue;
+            }
+            let uri = match Url::from_file_path(path) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            let lines: Vec<&str> = import_cached.source.lines().collect();
+            for expr in &import_cached.ast {
+                if let Some((name, form_range, name_range)) = def_of_form(
+                    expr,
+                    &import_cached.span_map,
+                    &import_cached.symbol_spans,
+                    &lines,
+                ) {
                     index
                         .entry(name)
                         .or_insert((uri.clone(), form_range, name_range));

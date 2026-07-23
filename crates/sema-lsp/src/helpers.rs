@@ -248,6 +248,18 @@ pub fn char_col_to_utf16(line: Option<&str>, col_1indexed: usize) -> u32 {
     }
 }
 
+/// Convert a 1-indexed Sema char column to a byte offset in `line` (the
+/// byte-offset sibling of [`char_col_to_utf16`], for source-scanning code
+/// that walks `char_indices`). A column past the end of the line maps to
+/// `line.len()`.
+pub(crate) fn char_col_to_byte(line: &str, col_1indexed: usize) -> usize {
+    let char_idx = col_1indexed.saturating_sub(1);
+    line.char_indices()
+        .nth(char_idx)
+        .map(|(i, _)| i)
+        .unwrap_or(line.len())
+}
+
 /// Convert a 0-indexed LSP UTF-16 `character` offset to a 1-indexed Sema char
 /// column (the inverse of [`char_col_to_utf16`]). Used when mapping an incoming
 /// editor `Position` to the column the scope/lexer machinery expects.
@@ -554,6 +566,16 @@ pub fn extract_params(text: &str, name: &str) -> Option<String> {
     extract_params_from_ast(&ast, name)
 }
 
+/// Canonicalize `path`, falling back to the raw path when canonicalization
+/// fails (nonexistent file, permission error). File identity in the scan
+/// cache and the workspace-iterating handlers is canonical-path based, so
+/// one file reachable under several spellings — an un-normalized import
+/// (`a/../lib.sema`), a symlinked root (macOS `/tmp` -> `/private/tmp`), an
+/// open-document URI — maps to a single identity.
+pub(crate) fn canonicalize_or_raw(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Resolve an import/load path relative to a document URI.
 /// Returns the absolute path if resolvable.
 pub fn resolve_import_path(uri: &Url, path_str: &str) -> Option<PathBuf> {
@@ -657,9 +679,7 @@ pub(crate) fn find_arg_positions_in_form(
 ) -> Vec<(usize, usize)> {
     let mut positions = Vec::new();
     let start_line = form_span.line.saturating_sub(1); // 0-indexed
-    let start_col = form_span.col; // 1-indexed, points at '('
     let end_line = form_span.end_line.saturating_sub(1);
-    let end_col = form_span.end_col.saturating_sub(1);
 
     // State machine to walk through the form text
     let mut depth = 0i32;
@@ -674,19 +694,26 @@ pub(crate) fn find_arg_positions_in_form(
             Some(l) => l,
             None => break,
         };
-        let col_start = if line_idx == start_line { start_col } else { 1 };
-        let col_end = if line_idx == end_line {
-            end_col + 1
+        // The scan below walks `char_indices` (byte offsets); the span's
+        // boundary columns count chars. Convert them to byte offsets so a
+        // multi-byte char earlier on the line can't desync the scan.
+        let start_byte = if line_idx == start_line {
+            char_col_to_byte(line, form_span.col) // points at '('
+        } else {
+            0
+        };
+        let end_byte = if line_idx == end_line {
+            char_col_to_byte(line, form_span.end_col) // one past ')'
         } else {
             line.len()
         };
 
         for (byte_idx, ch) in line.char_indices() {
             let col_0 = byte_idx; // 0-indexed byte position
-            if col_0 + 1 < col_start && line_idx == start_line {
+            if col_0 < start_byte && line_idx == start_line {
                 continue;
             }
-            if col_0 > col_end && line_idx == end_line {
+            if col_0 > end_byte && line_idx == end_line {
                 break;
             }
 

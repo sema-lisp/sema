@@ -329,10 +329,13 @@ fn selection_range_unknown_uri_returns_none() {
 
 #[test]
 fn document_links_resolves_import_path() {
+    let dir = unique_temp_dir("doclinks");
+    std::fs::write(dir.join("foo.sema"), "(define x 1)\n").unwrap();
+    let main_uri = Url::from_file_path(dir.join("main.sema")).unwrap();
     //                       0         1         2
     //                       012345678901234567890
     let src = "(import \"./foo.sema\")";
-    let (state, uri) = parsed_state("file:///proj/main.sema", src);
+    let (state, uri) = parsed_state(main_uri.as_str(), src);
     let links = state.handle_document_links(&uri).expect("links");
     assert_eq!(links.len(), 1);
     let link = &links[0];
@@ -340,6 +343,19 @@ fn document_links_resolves_import_path() {
     assert_eq!(link.range.start.character, 9);
     assert_eq!(link.range.end.character, 19);
     assert!(link.target.as_ref().unwrap().path().ends_with("foo.sema"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn document_links_skip_missing_files() {
+    // A link to a file that does not exist is a dead link — the import jump
+    // in goto-definition applies the same filter.
+    let src = "(import \"./missing.sema\")";
+    let (state, uri) = parsed_state("file:///proj/main.sema", src);
+    assert!(
+        state.handle_document_links(&uri).expect("links").is_empty(),
+        "an import of a nonexistent file must not produce a link"
+    );
 }
 
 #[test]
@@ -1407,6 +1423,21 @@ fn arg_positions_with_comment() {
     assert_eq!(positions[1], (1, 2)); // 'b'
 }
 
+#[test]
+fn arg_positions_after_astral_char_on_line() {
+    // The scan works in bytes (char_indices); the span's boundary columns
+    // count chars. With a 🎉 (4 UTF-8 bytes, 1 char) before the nested form,
+    // an unconverted boundary makes the scan start inside the string literal
+    // and desync its string-state machine, dropping every argument position.
+    let text = "(fmt \"🎉\" (add 1 2))";
+    let lines: Vec<&str> = text.lines().collect();
+    // Inner `(add 1 2)`: `(` at char col 10, one-past-`)` at char col 19.
+    let span = sema_core::Span::new(1, 10, 1, 19);
+    let positions = find_arg_positions_in_form(&span, &lines, 2);
+    // `1` at byte 17, `2` at byte 19.
+    assert_eq!(positions, vec![(0, 17), (0, 19)]);
+}
+
 // ── top_level_ranges ─────────────────────────────────────────
 
 #[test]
@@ -1645,6 +1676,36 @@ fn inlay_hint_arg_position_uses_utf16_after_emoji() {
     );
 }
 
+// Inlay parameter hints must survive astral chars in an earlier argument:
+// the argument scan compares byte offsets from `char_indices` against the
+// form span's boundary columns, which count chars — the byte overshoot from
+// the astral chars made the scan break before reaching the later arguments.
+#[test]
+fn inlay_hints_survive_astral_chars_in_earlier_argument() {
+    let src = "(defun f (a b) a)\n(f \"🎉🎉\" x)";
+    let (mut state, uri) = parsed_state("file:///inlay2.sema", src);
+    let full = Range {
+        start: Position {
+            line: 0,
+            character: 0,
+        },
+        end: Position {
+            line: 10,
+            character: 0,
+        },
+    };
+    let hints = state
+        .handle_inlay_hints(&uri, &full)
+        .expect("hints for the (f ...) call");
+    let b_hint = hints
+        .iter()
+        .find(|h| matches!(&h.label, InlayHintLabel::String(s) if s == "b:"))
+        .expect("expected a `b:` inlay hint for the argument after the 🎉🎉 string");
+    assert_eq!(b_hint.position.line, 1);
+    // `x` is at UTF-16 column 10 (each 🎉 counts as 2 units).
+    assert_eq!(b_hint.position.character, 10);
+}
+
 // LSP-2: semantic-token length must be in UTF-16 code units. A user-defined
 // name containing an astral char is 1 char wider than its UTF-16 width per
 // such char.
@@ -1664,6 +1725,53 @@ fn semantic_token_length_is_utf16() {
         tokens.data.iter().any(|t| t.length == 3),
         "expected a token of UTF-16 length 3, got {:?}",
         tokens.data.iter().map(|t| t.length).collect::<Vec<_>>()
+    );
+}
+
+// Semantic-token START columns must be UTF-16 code units, same as lengths:
+// a raw char column for a token after an astral char on its line shifts the
+// token left, and the delta encoding propagates the shift to every later
+// token on that line.
+#[test]
+fn semantic_token_start_column_is_utf16_after_astral_char() {
+    // Line 2's `x` sits after a 🎉 string: char index 10, but UTF-16 column 11.
+    let src = "(define x 1)\n(list \"🎉\" x)";
+    let (state, uri) = parsed_state("file:///semtok2.sema", src);
+    let result = state.handle_semantic_tokens_full(&uri).unwrap();
+    let SemanticTokensResult::Tokens(tokens) = result else {
+        panic!("expected token data");
+    };
+    // Decode the delta encoding back to absolute (line, start) positions.
+    let mut absolute = Vec::new();
+    let (mut line, mut start) = (0u32, 0u32);
+    for token in &tokens.data {
+        line += token.delta_line;
+        start = if token.delta_line == 0 {
+            start + token.delta_start
+        } else {
+            token.delta_start
+        };
+        absolute.push((line, start));
+    }
+    assert!(
+        absolute.contains(&(1, 11)),
+        "token after 🎉 must start at UTF-16 column 11, got {absolute:?}"
+    );
+}
+
+// Folding-range columns must be UTF-16 code units, not char indices.
+#[test]
+fn folding_range_columns_are_utf16_after_astral_char() {
+    // The inner `(f a … c)` form starts after a 🎉 string on its line:
+    // char index 10, but UTF-16 column 11.
+    let src = "(list \"🎉\" (f a\n      b\n      c))";
+    let (state, uri) = parsed_state("file:///fold.sema", src);
+    let ranges = state.handle_folding_ranges(&uri);
+    assert!(
+        ranges
+            .iter()
+            .any(|r| r.start_line == 0 && r.start_character == Some(11)),
+        "inner form after 🎉 must fold from UTF-16 column 11, got {ranges:?}"
     );
 }
 
@@ -1776,6 +1884,30 @@ fn references_top_level_skips_shadowing_param() {
     );
 }
 
+// prepare_rename must accept the cursor sitting at the END of a symbol:
+// extract_symbol_at (and therefore rename itself) treats end-of-token as
+// on-symbol, and prepare/rename must agree or the client aborts the rename.
+#[test]
+fn prepare_rename_accepts_cursor_at_symbol_end() {
+    let (state, uri) = parsed_state("file:///pr.sema", "(define foo 1)");
+    // `foo` spans characters 8..11; position 11 is just after its last char.
+    let response = state
+        .handle_prepare_rename(
+            &uri,
+            &Position {
+                line: 0,
+                character: 11,
+            },
+        )
+        .expect("prepare_rename must accept the cursor at the symbol's end");
+    match response {
+        PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } => {
+            assert_eq!(placeholder, "foo");
+        }
+        other => panic!("expected a range with placeholder, got {other:?}"),
+    }
+}
+
 #[test]
 fn navigation_handlers_tolerate_past_eof_and_unopened_uri() {
     // Graceful degradation: a position past EOF and a never-opened URI must not panic.
@@ -1818,4 +1950,847 @@ fn completion_works_on_trailing_empty_line_after_newline() {
         !items.is_empty(),
         "completion should offer items on the trailing empty line"
     );
+}
+
+// ── completion: cross-file user symbols ──────────────────────
+
+#[test]
+fn completion_offers_symbols_from_scanned_workspace_files() {
+    let dir = unique_temp_dir("comp-ws");
+    let (mut state, uri) = parsed_state("file:///ws/main.sema", "(define x 1)\n");
+    insert_scanned_file(
+        &mut state,
+        &dir.join("library.sema"),
+        "(define (greet name) name)\n",
+    );
+
+    let items = state.handle_complete(
+        &uri,
+        &Position {
+            line: 1,
+            character: 0,
+        },
+    );
+    let greet = items
+        .iter()
+        .find(|i| i.label == "greet")
+        .expect("scanned-file symbol must be offered");
+    assert_eq!(greet.kind, Some(CompletionItemKind::FUNCTION));
+    assert_eq!(
+        greet.detail.as_deref(),
+        Some("(name)"),
+        "params from the scanned definition must surface as detail"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn completion_dedups_scanned_symbols_against_open_document() {
+    // The same name defined in the open document and in a scanned file must
+    // yield one item — the open document's.
+    let dir = unique_temp_dir("comp-dedup");
+    let source = "(define (greet name) name)\n";
+    let (mut state, uri) = parsed_state("file:///ws/main.sema", source);
+    state
+        .cached_user_defs
+        .insert(uri.as_str().to_string(), vec!["greet".to_string()]);
+    insert_scanned_file(&mut state, &dir.join("library.sema"), source);
+
+    let items = state.handle_complete(
+        &uri,
+        &Position {
+            line: 1,
+            character: 0,
+        },
+    );
+    let greet_items: Vec<_> = items.iter().filter(|i| i.label == "greet").collect();
+    assert_eq!(
+        greet_items.len(),
+        1,
+        "open-document definition must win: {greet_items:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn completion_prefers_builtins_over_scanned_symbols() {
+    let dir = unique_temp_dir("comp-builtin");
+    let (mut state, uri) = parsed_state("file:///ws/main.sema", "(define x 1)\n");
+    state.builtin_names.insert("greet".to_string());
+    insert_scanned_file(
+        &mut state,
+        &dir.join("library.sema"),
+        "(define (greet name) name)\n",
+    );
+
+    let items = state.handle_complete(
+        &uri,
+        &Position {
+            line: 1,
+            character: 0,
+        },
+    );
+    let greet_items: Vec<_> = items.iter().filter(|i| i.label == "greet").collect();
+    assert_eq!(greet_items.len(), 1, "builtin must win: {greet_items:?}");
+    assert!(
+        greet_items[0].data.is_none(),
+        "the surviving item must be the builtin (no uri payload), got {:?}",
+        greet_items[0]
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn completion_resolve_enriches_scanned_file_definition() {
+    let dir = unique_temp_dir("comp-resolve");
+    let mut state = BackendState::new_without_builtins(HashMap::new(), "sema".to_string());
+    insert_scanned_file(
+        &mut state,
+        &dir.join("library.sema"),
+        "(defun greet (name)\n  \"Say hello.\"\n  name)\n",
+    );
+
+    let item = CompletionItem {
+        label: "greet".to_string(),
+        kind: Some(CompletionItemKind::FUNCTION),
+        ..Default::default()
+    };
+    let resolved = state.handle_completion_resolve(item);
+    let doc = match resolved.documentation {
+        Some(Documentation::MarkupContent(c)) => c.value,
+        other => panic!("expected markdown documentation, got {other:?}"),
+    };
+    // The resolve path renders the flattened signature form (see
+    // user_definition_signature), unlike hover's raw-params form.
+    assert!(doc.contains("(greet name)"), "got: {doc}");
+    assert!(doc.contains("Say hello."), "got: {doc}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── call hierarchy across scanned files ──────────────────────
+
+#[test]
+fn call_hierarchy_incoming_finds_caller_in_scanned_file() {
+    // `helper` is defined in the open document; its only caller lives in a
+    // scanned (never-opened) workspace file.
+    let dir = unique_temp_dir("ch-incoming");
+    let caller_path = dir.join("main.sema");
+    let (mut state, uri) = parsed_state("file:///ws/lib.sema", "(defun helper (x) (* x x))");
+    insert_scanned_file(&mut state, &caller_path, "(defun main () (helper 5))\n");
+
+    let item = state
+        .handle_call_hierarchy_prepare(
+            &uri,
+            &Position {
+                line: 0,
+                character: 8,
+            },
+        )
+        .expect("prepare")
+        .remove(0);
+    let incoming = state
+        .handle_call_hierarchy_incoming(&item)
+        .expect("incoming");
+    assert_eq!(
+        incoming.len(),
+        1,
+        "the caller in the scanned file must be found: {incoming:?}"
+    );
+    assert_eq!(incoming[0].from.name, "main");
+    assert_eq!(
+        incoming[0].from.uri,
+        Url::from_file_path(&caller_path).unwrap()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn call_hierarchy_outgoing_finds_callee_in_scanned_file() {
+    // `main` (open) calls `helper`, which is defined only in a scanned file.
+    let dir = unique_temp_dir("ch-outgoing");
+    let callee_path = dir.join("lib.sema");
+    let (mut state, uri) = parsed_state("file:///ws/main.sema", "(defun main () (helper 5))");
+    insert_scanned_file(&mut state, &callee_path, "(defun helper (x) (* x x))\n");
+
+    let item = state
+        .handle_call_hierarchy_prepare(
+            &uri,
+            &Position {
+                line: 0,
+                character: 8,
+            },
+        )
+        .expect("prepare")
+        .remove(0);
+    assert_eq!(item.name, "main");
+    let outgoing = state
+        .handle_call_hierarchy_outgoing(&item)
+        .expect("outgoing");
+    assert_eq!(
+        outgoing.len(),
+        1,
+        "the callee defined in the scanned file must be found: {outgoing:?}"
+    );
+    assert_eq!(outgoing[0].to.name, "helper");
+    assert_eq!(
+        outgoing[0].to.uri,
+        Url::from_file_path(&callee_path).unwrap()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── hover / signature help: workspace-wide fallback ──────────
+
+#[test]
+fn hover_finds_definition_in_scanned_workspace_file() {
+    let dir = unique_temp_dir("hover-ws");
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet \"world\")\n");
+    insert_scanned_file(
+        &mut state,
+        &dir.join("library.sema"),
+        "(define (greet name) name)\n",
+    );
+
+    let hover = state
+        .handle_hover(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 1,
+            },
+        )
+        .expect("hover must fall back to the workspace definition");
+    let HoverContents::Markup(content) = hover.contents else {
+        panic!("expected markdown hover");
+    };
+    // Params render with their list parens, matching the current-doc and
+    // "Imported from" hover branches.
+    assert!(
+        content.value.contains("(greet (name))"),
+        "hover must show the signature: {}",
+        content.value
+    );
+    assert!(
+        content.value.contains("*Defined in `library`*"),
+        "a workspace match is attributed to its file, not an import: {}",
+        content.value
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn hover_finds_definition_in_other_open_document() {
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet \"world\")\n");
+    insert_parsed_doc(
+        &mut state,
+        "file:///ws/library.sema",
+        "(define (greet name) name)\n",
+    );
+
+    let hover = state
+        .handle_hover(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 1,
+            },
+        )
+        .expect("hover must fall back to other open documents");
+    let HoverContents::Markup(content) = hover.contents else {
+        panic!("expected markdown hover");
+    };
+    assert!(
+        content.value.contains("*Defined in `library`*"),
+        "got: {}",
+        content.value
+    );
+}
+
+#[test]
+fn signature_help_finds_definition_in_scanned_workspace_file() {
+    let dir = unique_temp_dir("sig-ws");
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet x)\n");
+    insert_scanned_file(
+        &mut state,
+        &dir.join("library.sema"),
+        "(define (greet name) name)\n",
+    );
+
+    let help = state
+        .handle_signature_help(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 7,
+            },
+        )
+        .expect("signature help must fall back to the workspace definition");
+    assert_eq!(help.signatures.len(), 1);
+    assert_eq!(help.signatures[0].label, "(greet name)");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── workspace scanner ────────────────────────────────────────
+
+/// The scanner must follow symlinked directories and files (DirEntry
+/// metadata does not traverse symlinks); the canonical-path visited set is
+/// what protects it from symlink cycles.
+#[cfg(unix)]
+#[test]
+fn workspace_scanner_follows_symlinks_without_cycling() {
+    let dir = unique_temp_dir("scan-symlink");
+    let real = dir.join("real");
+    std::fs::create_dir_all(&real).unwrap();
+    std::fs::write(real.join("lib.sema"), "(define x 1)\n").unwrap();
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    // A symlinked directory, a symlinked file, and a cycle back to the root.
+    std::os::unix::fs::symlink(&real, root.join("linked")).unwrap();
+    std::os::unix::fs::symlink(real.join("lib.sema"), root.join("alias.sema")).unwrap();
+    std::os::unix::fs::symlink(&root, real.join("back")).unwrap();
+
+    let mut scanner = crate::state::WorkspaceScanner::new(&root);
+    let mut files = Vec::new();
+    while let Some(batch) = scanner.next_dir() {
+        files.extend(batch);
+    }
+
+    assert!(
+        files
+            .iter()
+            .any(|f| f.file_name().and_then(|n| n.to_str()) == Some("alias.sema")),
+        "symlinked .sema files must be discovered: {files:?}"
+    );
+    assert!(
+        files.iter().any(|f| f.ends_with("linked/lib.sema")),
+        "files inside symlinked directories must be discovered: {files:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── goto-definition: workspace-wide fallback (Phase 3d) ──────
+
+/// Parse `source` and insert it into `state` as an open document, mirroring
+/// the production build path (same steps as `parsed_state`).
+fn insert_parsed_doc(state: &mut BackendState, uri: &str, source: &str) {
+    let (ast, span_map, symbol_spans) = sema_reader::read_many_with_symbol_spans(source).unwrap();
+    let symbol_spans = crate::helpers::filter_quoted_symbol_spans(&ast, &span_map, symbol_spans);
+    let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
+    state.cached_parses.insert(
+        uri.to_string(),
+        CachedParse {
+            ast,
+            span_map,
+            symbol_spans,
+            scope_tree,
+            source: source.to_string(),
+        },
+    );
+    state.documents.insert(uri.to_string(), source.to_string());
+}
+
+/// Unique per-test temp dir, canonicalized so expected URIs stay stable on
+/// platforms where the temp root is itself a symlink (macOS `/var`).
+fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    let dir =
+        std::env::temp_dir().join(format!("sema-lsp-{prefix}-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::canonicalize(&dir).unwrap()
+}
+
+/// Write `source` to `path`, parse it, and insert it into
+/// `state.import_cache` keyed by `path` with the file's real mtime — as the
+/// post-`initialized` workspace scan does for unopened files. The file must
+/// be real: handlers that iterate the cache skip entries whose on-disk file
+/// is missing or has a different mtime.
+fn insert_scanned_file(state: &mut BackendState, path: &std::path::Path, source: &str) {
+    std::fs::write(path, source).unwrap();
+    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).unwrap();
+    let (ast, span_map, symbol_spans) = sema_reader::read_many_with_symbol_spans(source).unwrap();
+    let symbol_spans = crate::helpers::filter_quoted_symbol_spans(&ast, &span_map, symbol_spans);
+    let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
+    state.import_cache.insert(
+        path.to_path_buf(),
+        crate::state::ImportCache {
+            ast,
+            span_map,
+            symbol_spans,
+            scope_tree,
+            source: source.to_string(),
+            mtime,
+        },
+    );
+}
+
+/// Push `path`'s mtime into the future so it no longer matches the mtime a
+/// scan-cache entry recorded (deterministic regardless of mtime granularity).
+fn bump_mtime(path: &std::path::Path) {
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+        .unwrap();
+}
+
+#[test]
+fn goto_definition_finds_symbol_in_other_open_document() {
+    // main.sema calls `greet` but neither defines nor imports it; the
+    // definition lives in a sibling document that happens to be open.
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet \"world\")\n");
+    insert_parsed_doc(
+        &mut state,
+        "file:///ws/library.sema",
+        "(define (greet name) name)\n",
+    );
+
+    // Cursor on `greet` in main.sema.
+    let result = state
+        .handle_goto_definition(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 1,
+            },
+        )
+        .expect("expected a cross-document definition");
+    match result {
+        GotoDefinitionResponse::Scalar(location) => {
+            assert_eq!(location.uri.as_str(), "file:///ws/library.sema");
+            assert_eq!(location.range.start.line, 0);
+        }
+        other => panic!("expected a scalar location, got {other:?}"),
+    }
+}
+
+#[test]
+fn goto_definition_finds_symbol_in_scanned_workspace_file() {
+    // The defining file was discovered by the workspace scan but never opened:
+    // it exists only in import_cache. No import statement links the two files.
+    let dir = unique_temp_dir("goto-scan");
+    let library = dir.join("library.sema");
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet \"world\")\n");
+    insert_scanned_file(&mut state, &library, "(define (greet name) name)\n");
+
+    let result = state
+        .handle_goto_definition(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 1,
+            },
+        )
+        .expect("expected a definition from the workspace scan cache");
+    match result {
+        GotoDefinitionResponse::Scalar(location) => {
+            assert_eq!(location.uri, Url::from_file_path(&library).unwrap());
+            assert_eq!(location.range.start.line, 0);
+        }
+        other => panic!("expected a scalar location, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn goto_definition_returns_all_candidates_when_name_defined_in_multiple_files() {
+    // Two workspace files both define `greet`: cache iteration order is
+    // arbitrary, so the handler must return every candidate, not a coin flip.
+    let dir = unique_temp_dir("goto-multi");
+    let file_a = dir.join("a.sema");
+    let file_b = dir.join("b.sema");
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet \"world\")\n");
+    insert_scanned_file(&mut state, &file_a, "(define (greet name) name)\n");
+    insert_scanned_file(&mut state, &file_b, "(define (greet name) 42)\n");
+
+    let result = state
+        .handle_goto_definition(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 1,
+            },
+        )
+        .expect("expected definitions from both files");
+    match result {
+        GotoDefinitionResponse::Array(mut locations) => {
+            locations.sort_by(|a, b| a.uri.as_str().cmp(b.uri.as_str()));
+            let uris: Vec<&str> = locations.iter().map(|l| l.uri.as_str()).collect();
+            let mut expected = [
+                Url::from_file_path(&file_a).unwrap(),
+                Url::from_file_path(&file_b).unwrap(),
+            ];
+            expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+            let expected: Vec<&str> = expected.iter().map(|u| u.as_str()).collect();
+            assert_eq!(uris, expected);
+        }
+        other => panic!("expected an array of locations, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn goto_definition_skips_scan_cache_entry_for_open_document() {
+    // A file that is both open (cached_parses) and in the scan cache must not
+    // yield two locations for its single definition.
+    let dir = unique_temp_dir("goto-dedup");
+    let library = dir.join("library.sema");
+    let source = "(define (greet name) name)\n";
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet \"world\")\n");
+    insert_scanned_file(&mut state, &library, source);
+    insert_parsed_doc(
+        &mut state,
+        Url::from_file_path(&library).unwrap().as_str(),
+        source,
+    );
+
+    let result = state
+        .handle_goto_definition(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 1,
+            },
+        )
+        .expect("expected exactly one definition");
+    assert!(
+        matches!(result, GotoDefinitionResponse::Scalar(_)),
+        "open-document and scan-cache copies of the same file must dedup, got {result:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The same file addressed through a symlink by the editor and through its
+/// real path by the workspace scan is still one file: dedup must compare
+/// canonical paths, not URI strings.
+#[cfg(unix)]
+#[test]
+fn goto_definition_dedups_symlinked_open_document_against_scan_entry() {
+    let dir = unique_temp_dir("goto-symlink");
+    let real = dir.join("library.sema");
+    let link = dir.join("link.sema");
+    let source = "(define (greet name) name)\n";
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet \"world\")\n");
+    insert_scanned_file(&mut state, &real, source);
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    insert_parsed_doc(
+        &mut state,
+        Url::from_file_path(&link).unwrap().as_str(),
+        source,
+    );
+
+    let result = state
+        .handle_goto_definition(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 1,
+            },
+        )
+        .expect("expected exactly one definition");
+    assert!(
+        matches!(result, GotoDefinitionResponse::Scalar(_)),
+        "symlinked open document and scan entry are one file, got {result:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn goto_definition_skips_stale_and_deleted_scan_cache_entries() {
+    // Scan entries whose on-disk file was modified or deleted since parsing
+    // have stale spans; only the still-fresh file may answer.
+    let dir = unique_temp_dir("goto-stale");
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet \"world\")\n");
+    let fresh = dir.join("fresh.sema");
+    insert_scanned_file(&mut state, &fresh, "(define (greet name) name)\n");
+    let stale = dir.join("stale.sema");
+    insert_scanned_file(&mut state, &stale, "(define (greet name) 1)\n");
+    bump_mtime(&stale);
+    let deleted = dir.join("deleted.sema");
+    insert_scanned_file(&mut state, &deleted, "(define (greet name) 2)\n");
+    std::fs::remove_file(&deleted).unwrap();
+
+    let result = state
+        .handle_goto_definition(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 1,
+            },
+        )
+        .expect("expected the fresh definition");
+    match result {
+        GotoDefinitionResponse::Scalar(location) => {
+            assert_eq!(location.uri, Url::from_file_path(&fresh).unwrap());
+        }
+        other => panic!("stale/deleted scan entries must be skipped, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn goto_definition_still_prefers_local_scope_over_workspace() {
+    // A locally-bound `greet` must resolve to the local binding (Phase 3b),
+    // not fall through to a same-named definition elsewhere in the workspace.
+    let dir = unique_temp_dir("goto-local");
+    let source = "(define (run) (let ((greet 1)) (greet)))\n";
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", source);
+    insert_scanned_file(
+        &mut state,
+        &dir.join("library.sema"),
+        "(define (greet name) name)\n",
+    );
+
+    // Cursor on the `greet` call inside the `let` body (column of the second `greet`).
+    let call_col = source.rfind("greet").unwrap() as u32 + 1;
+    let result = state
+        .handle_goto_definition(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: call_col,
+            },
+        )
+        .expect("expected the local binding");
+    match result {
+        GotoDefinitionResponse::Scalar(location) => {
+            assert_eq!(
+                location.uri.as_str(),
+                "file:///ws/main.sema",
+                "local let-binding must win over the workspace definition"
+            );
+        }
+        other => panic!("expected a scalar location, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ── scan-cache identity and invalidation ─────────────────────
+
+#[test]
+fn get_import_cache_uses_one_key_per_file() {
+    // resolve_import_path yields un-normalized paths (`a/../lib.sema`); the
+    // same file must not occupy two cache keys.
+    let dir = unique_temp_dir("cache-canon");
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::write(dir.join("lib.sema"), "(define x 1)\n").unwrap();
+    let mut state = BackendState::new_without_builtins(HashMap::new(), "sema".to_string());
+
+    let indirect = dir.join("a").join("..").join("lib.sema");
+    assert!(state.get_import_cache(&indirect).is_some());
+    assert!(state.get_import_cache(&dir.join("lib.sema")).is_some());
+    assert_eq!(
+        state.import_cache.len(),
+        1,
+        "one file must occupy one cache key"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn get_import_cache_evicts_entry_for_deleted_file() {
+    let dir = unique_temp_dir("cache-deleted");
+    let path = dir.join("lib.sema");
+    std::fs::write(&path, "(define x 1)\n").unwrap();
+    let mut state = BackendState::new_without_builtins(HashMap::new(), "sema".to_string());
+    assert!(state.get_import_cache(&path).is_some());
+    assert_eq!(state.import_cache.len(), 1);
+
+    std::fs::remove_file(&path).unwrap();
+    assert!(state.get_import_cache(&path).is_none());
+    assert!(
+        state.import_cache.is_empty(),
+        "the entry for a deleted file must be evicted"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn get_import_cache_evicts_entry_when_reparse_fails() {
+    let dir = unique_temp_dir("cache-reparse");
+    let path = dir.join("lib.sema");
+    std::fs::write(&path, "(define x 1)\n").unwrap();
+    let mut state = BackendState::new_without_builtins(HashMap::new(), "sema".to_string());
+    assert!(state.get_import_cache(&path).is_some());
+
+    // Replace with unparseable content at a different mtime.
+    std::fs::write(&path, "(define x").unwrap();
+    bump_mtime(&path);
+    assert!(state.get_import_cache(&path).is_none());
+    assert!(
+        state.import_cache.is_empty(),
+        "the entry for a file that no longer parses must be evicted"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Build a state with `lib.sema` on disk (in the scan cache) and the same
+/// file open in the editor through a symlink. The two spellings are one
+/// file; handlers that merge open documents with the scan cache must not
+/// produce doubled results for it.
+#[cfg(unix)]
+fn symlinked_open_and_scanned_state(
+    prefix: &str,
+    source: &str,
+) -> (BackendState, Url, std::path::PathBuf) {
+    let dir = unique_temp_dir(prefix);
+    let real = dir.join("lib.sema");
+    let link = dir.join("link.sema");
+    let mut state = BackendState::new_without_builtins(HashMap::new(), "sema".to_string());
+    insert_scanned_file(&mut state, &real, source);
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let link_uri = Url::from_file_path(&link).unwrap();
+    insert_parsed_doc(&mut state, link_uri.as_str(), source);
+    (state, link_uri, dir)
+}
+
+#[cfg(unix)]
+#[test]
+fn references_dedup_symlinked_open_document_against_scan_entry() {
+    let (state, link_uri, dir) =
+        symlinked_open_and_scanned_state("refs-canon", "(define foo 1)\n(+ foo 1)\n");
+    let refs = state.handle_references(
+        &link_uri,
+        &Position {
+            line: 0,
+            character: 8,
+        },
+    );
+    assert_eq!(
+        refs.len(),
+        2,
+        "the symlinked open document and the scan entry are one file: {refs:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn rename_does_not_emit_duplicate_edits_for_symlinked_file() {
+    // Duplicate edits for one file under two URIs would each be applied by
+    // the client — corrupting the file.
+    let (state, link_uri, dir) =
+        symlinked_open_and_scanned_state("rename-canon", "(define foo 1)\n(+ foo 1)\n");
+    let edit = state
+        .handle_rename(
+            &link_uri,
+            &Position {
+                line: 0,
+                character: 8,
+            },
+            "bar",
+        )
+        .expect("rename should produce edits");
+    let changes = edit.changes.expect("changes");
+    assert_eq!(
+        changes.len(),
+        1,
+        "one file must receive one set of edits: {changes:?}"
+    );
+    assert_eq!(changes[&link_uri].len(), 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_symbols_dedup_symlinked_open_document_against_scan_entry() {
+    let (state, _link_uri, dir) =
+        symlinked_open_and_scanned_state("symbols-canon", "(define foo 1)\n");
+    let results = state.handle_workspace_symbols("foo");
+    assert_eq!(
+        results.len(),
+        1,
+        "one definition must yield one workspace symbol: {results:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Build a state with a `main.sema` open document plus three scanned files:
+/// one fresh, one whose mtime changed after the scan, one deleted since.
+fn state_with_fresh_stale_deleted(
+    prefix: &str,
+    main_source: &str,
+    scanned_source: &str,
+) -> (BackendState, Url, std::path::PathBuf, Url) {
+    let dir = unique_temp_dir(prefix);
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", main_source);
+    let fresh = dir.join("fresh.sema");
+    insert_scanned_file(&mut state, &fresh, scanned_source);
+    let stale = dir.join("stale.sema");
+    insert_scanned_file(&mut state, &stale, scanned_source);
+    bump_mtime(&stale);
+    let deleted = dir.join("deleted.sema");
+    insert_scanned_file(&mut state, &deleted, scanned_source);
+    std::fs::remove_file(&deleted).unwrap();
+    let fresh_uri = Url::from_file_path(&fresh).unwrap();
+    (state, main_uri, dir, fresh_uri)
+}
+
+#[test]
+fn references_skip_stale_and_deleted_scan_cache_entries() {
+    let (state, main_uri, dir, fresh_uri) =
+        state_with_fresh_stale_deleted("refs-stale", "(define foo 1)\n(+ foo 1)\n", "(+ foo 2)\n");
+    let refs = state.handle_references(
+        &main_uri,
+        &Position {
+            line: 0,
+            character: 8,
+        },
+    );
+    let uris: Vec<&str> = refs.iter().map(|l| l.uri.as_str()).collect();
+    assert!(
+        uris.contains(&fresh_uri.as_str()),
+        "the fresh scan entry must contribute: {uris:?}"
+    );
+    assert_eq!(
+        refs.len(),
+        3,
+        "stale/deleted scan entries must not contribute: {refs:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn rename_skips_stale_and_deleted_scan_cache_entries() {
+    // Editing a file that changed since the scan would apply edits at stale
+    // offsets — skipping it is the safe behavior.
+    let (state, main_uri, dir, fresh_uri) = state_with_fresh_stale_deleted(
+        "rename-stale",
+        "(define foo 1)\n(+ foo 1)\n",
+        "(+ foo 2)\n",
+    );
+    let edit = state
+        .handle_rename(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 8,
+            },
+            "bar",
+        )
+        .expect("rename should produce edits");
+    let changes = edit.changes.expect("changes");
+    let mut uris: Vec<&str> = changes.keys().map(|u| u.as_str()).collect();
+    uris.sort_unstable();
+    let mut expected = vec![main_uri.as_str(), fresh_uri.as_str()];
+    expected.sort_unstable();
+    assert_eq!(
+        uris, expected,
+        "only the open document and the fresh scan entry may be edited"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn workspace_symbols_skip_stale_and_deleted_scan_cache_entries() {
+    let (state, _main_uri, dir, fresh_uri) =
+        state_with_fresh_stale_deleted("symbols-stale", "(define other 1)\n", "(define foo 1)\n");
+    let results = state.handle_workspace_symbols("foo");
+    let uris: Vec<&str> = results.iter().map(|s| s.location.uri.as_str()).collect();
+    assert_eq!(
+        uris,
+        vec![fresh_uri.as_str()],
+        "only the fresh scan entry may contribute symbols"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }

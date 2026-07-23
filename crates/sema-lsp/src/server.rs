@@ -723,13 +723,36 @@ pub async fn run_server() {
     let stdout = tokio::io::stdout();
     let (stdin, mut stdin_writer) = tokio::io::duplex(64 * 1024);
 
+    // TODO(tower-lsp#399): drop this once the upstream bug is fixed.
+    // tower-lsp's `serve` future never resolves after the `exit` notification:
+    // its read loop parks on stdin (which editors hold open while waiting for
+    // the process to die), and a shutdown+exit sent back-to-back cancels the
+    // still-queued `shutdown` handler outright (`pending.cancel_all()`), so
+    // not even the force-exit watchdog armed in `Backend::shutdown` runs.
+    // The LSP spec requires `exit` to terminate the server promptly — code 0
+    // if `shutdown` was received first, 1 otherwise — so the inbound-frame
+    // normalizer watches for the lifecycle messages itself and reports `exit`
+    // here. The grace sleep lets the transport flush a pending `shutdown`
+    // response before the process goes away.
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<bool>();
     tokio::spawn(async move {
-        let _ = normalize_lsp_input(raw_stdin, &mut stdin_writer).await;
+        let _ = normalize_lsp_input(raw_stdin, &mut stdin_writer, exit_tx).await;
+    });
+    tokio::spawn(async move {
+        if let Ok(shutdown_seen) = exit_rx.await {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            std::process::exit(if shutdown_seen { 0 } else { 1 });
+        }
     });
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<LspRequest>();
 
     let (service, socket) = LspService::new(|client| Backend::new(client, tx.clone()));
+    // The service now owns the only senders; drop ours so the backend thread's
+    // `blocking_recv` observes channel closure (and the join below can finish)
+    // if `serve` ever returns without a `shutdown` request having been
+    // dispatched.
+    drop(tx);
 
     // Extract the client for publishing diagnostics from the backend thread.
     let client = service.inner().client.clone();
@@ -1058,7 +1081,17 @@ pub async fn run_server() {
     let _ = backend_handle.join();
 }
 
-async fn normalize_lsp_input<R, W>(mut input: R, mut output: W) -> std::io::Result<()>
+/// Copies LSP frames from `input` to `output`, normalizing each message body
+/// (the tower-lsp#399 `shutdown` params workaround) and watching for the
+/// shutdown/exit lifecycle messages. When the client sends the `exit`
+/// notification, the frame is forwarded and then `exit_signal` reports whether
+/// a `shutdown` request preceded it, so [`run_server`] can terminate the
+/// process with the spec-mandated exit code.
+async fn normalize_lsp_input<R, W>(
+    mut input: R,
+    mut output: W,
+    exit_signal: tokio::sync::oneshot::Sender<bool>,
+) -> std::io::Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -1067,6 +1100,8 @@ where
 
     let mut pending = Vec::new();
     let mut chunk = [0; 8192];
+    let mut shutdown_seen = false;
+    let mut exit_signal = Some(exit_signal);
 
     loop {
         let read = input.read(&mut chunk).await?;
@@ -1096,6 +1131,10 @@ where
             pending.drain(..frame_len);
 
             let body = &frame[body_start..];
+            let method = lsp_message_method(body);
+            if method.as_deref() == Some("shutdown") {
+                shutdown_seen = true;
+            }
             let normalized = normalize_lsp_message_body(body);
             if normalized == body {
                 output.write_all(&frame).await?;
@@ -1104,8 +1143,19 @@ where
                 output.write_all(header.as_bytes()).await?;
                 output.write_all(&normalized).await?;
             }
+            if method.as_deref() == Some("exit") {
+                if let Some(signal) = exit_signal.take() {
+                    let _ = signal.send(shutdown_seen);
+                }
+            }
         }
     }
+}
+
+/// Extracts the JSON-RPC `method` from an LSP message body, if any.
+fn lsp_message_method(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    Some(value.as_object()?.get("method")?.as_str()?.to_string())
 }
 
 pub(crate) fn normalize_lsp_message_body(body: &[u8]) -> Vec<u8> {

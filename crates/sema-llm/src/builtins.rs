@@ -5861,6 +5861,30 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
         Ok(Value::nil())
     });
+
+    // (tool/invoke tool args) — Direct invocation of a deftool handler
+    register_fn_ctx(env, "tool/invoke", |ctx, args| {
+        if args.len() != 2 {
+            return Err(SemaError::arity("tool/invoke", "2", args.len()));
+        }
+        let tool_def = args[0]
+            .as_tool_def_rc()
+            .ok_or_else(|| SemaError::type_error("tool", args[0].type_name()))?;
+        let _ = args[1]
+            .as_map_rc()
+            .ok_or_else(|| SemaError::type_error("map", args[1].type_name()))?;
+
+        if let Err(msg) = validate_extraction(&args[1], &tool_def.parameters) {
+            return Err(SemaError::Llm(format!(
+                "invalid arguments for tool '{name}': {msg}",
+                name = tool_def.name
+            )));
+        }
+
+        let json_args = sema_core::value_to_json_lossy(&args[1]);
+        let sema_args = json_args_to_sema(&tool_def.parameters, &json_args, &tool_def.handler);
+        sema_core::call_callback(ctx, &tool_def.handler, &sema_args)
+    });
 }
 
 fn require_matching_bytevectors<'a>(

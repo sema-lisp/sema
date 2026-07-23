@@ -206,6 +206,12 @@ eval_tests! {
     agent_pred: r#"(begin (deftool greet "Greet" {:name {:type :string}} (lambda (name) name)) (defagent greeter {:system "You greet." :tools [greet]}) (agent? greeter))"# => Value::bool(true),
     agent_name: r#"(begin (deftool greet "Greet" {:name {:type :string}} (lambda (name) name)) (defagent greeter {:system "You greet." :tools [greet]}) (agent/name greeter))"# => Value::string("greeter"),
     agent_system: r#"(begin (deftool greet "Greet" {:name {:type :string}} (lambda (name) name)) (defagent greeter {:system "You greet." :tools [greet]}) (agent/system greeter))"# => Value::string("You greet."),
+    tool_invoke_ping: r#"(begin (deftool ping "Return pong" {} (lambda () "pong")) (tool/invoke ping {}))"# => Value::string("pong"),
+    tool_invoke_typed: r#"(begin (deftool add-numbers "Add" {:a {:type :number} :b {:type :number}} (lambda (a b) (+ a b))) (tool/invoke add-numbers {:a 2 :b 3}))"# => Value::int(5),
+}
+
+eval_error_tests! {
+    tool_invoke_invalid_args: r#"(begin (deftool calc "Add" {:x {:type :number}} (lambda (x) x)) (tool/invoke calc {}))"# => "invalid arguments for tool 'calc': missing key: x",
 }
 
 // ============================================================

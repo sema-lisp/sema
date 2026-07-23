@@ -4498,8 +4498,9 @@ mod tests {
             !script.contains("File to execute"),
             "top-level FILE positional must not shadow the subcommand slot"
         );
-        // The nested groups must still be intact (spot-check one).
-        assert!(script.contains("_sema__notebook_commands"));
+        // The nested groups must still be intact (spot-check one). clap_complete
+        // names nested subcommand groups `_sema__subcmd__<name>_commands`.
+        assert!(script.contains("_sema__subcmd__notebook_commands"));
     }
 
     use super::{compile_source_to_bytecode, run_bytecode_bytes};

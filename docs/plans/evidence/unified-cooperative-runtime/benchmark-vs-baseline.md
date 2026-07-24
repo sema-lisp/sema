@@ -261,3 +261,35 @@ overhead on the genuinely-parked half (TaskScopeSwap probes, task-id publish,
 quantum guard) — diffuse, no single lever left. The squeeze pass ends here;
 0.58×–1.4× across the matrix vs the pre-migration engine is the recorded
 end-state.
+
+## Pre-merge-to-main A/B — `jake bench` VM suite regresses 3–5× (2026-07-24)
+
+Candidate `e0e5acb8` (main `14c44309` + `origin/codex/unified-async-runtime`
+merged) vs baseline main `14c44309`. Method: `jake bench.save` (release, fat
+LTO, cgu=1, mode=vm, 10 runs + 3 warmup), macOS arm64; min-time (tightest,
+contention-robust) reported with mean cross-checked. This suite is the standard
+whole-program compute benchmark set (`examples/benchmarks/*.sema`) — distinct
+from and complementary to the async-focused hyperfine matrix above, which never
+included these programs.
+
+| program | baseline min | candidate min | ratio | σ (base→cand) |
+|---|---|---|---|---|
+| deriv | 0.645 s | 3.081 s | **4.78×** | 0.007→0.036 |
+| string-pipeline | 0.541 s | 2.122 s | **3.92×** | 0.014→0.011 |
+| higher-order-fold | 0.535 s | 1.740 s | **3.25×** | 0.072→0.048 |
+| mandelbrot | 0.153 s | 0.175 s | 1.15× | tight |
+| hashmap-bench | 3.219 s | 3.550 s | 1.10× | tight |
+| tak / nqueens / closure-storm / throw-catch / upvalue-counter | — | — | ≤1.06× | noise |
+
+`deriv` and `higher-order-fold` are byte-identical between baseline and
+candidate; `string-pipeline`'s only diff is let-binding whitespace. Self-timed
+program clocks confirm the harness (`deriv` prints 3066 ms; `higher-order-fold`
+foldl-part 743 ms + map-part 270 ms — `map`/`foldl` per-element cost is
+comparable, so the regression is the universal-flip's per-op + allocation/GC
+overhead on large-list-building loops, NOT foldl-specific). This is the cons-1m
+allocator/GC-registry suspect (PERF-RESIDUAL-1) at higher allocation scale, and
+it was outside the accepted-residuals decision. **Merge-innocent** (branch-tip
+hot path == candidate hot path; profile identical; main un-diverged from fork
+`3f111e83`). **Release gate**: tracked in `docs/deferred.md` PERF-RESIDUAL-1
+(REOPENED). Reproduce: `jake bench.save` on each side; compare
+`target/bench/bench-<sha>.json` min fields.

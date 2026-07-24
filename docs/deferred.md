@@ -1358,7 +1358,38 @@ decoded `Value` must carry a `Trace` impl (GC invariant I2); macrotask fairness 
 roots; cancel latency for a root suspended in an External wait; the worker-protocol rewrite
 dropping the SAB; `MessageChannel` vs `setTimeout(0)` throttling in background tabs.
 
-## PERF-RESIDUAL-1 — post-flip runtime overhead (MOSTLY RESOLVED 2026-07-17, Slice 0c; one row remains)
+## PERF-RESIDUAL-1 — post-flip runtime overhead (REOPENED 2026-07-24 — allocation-heavy compute regresses 3–5×; RELEASE GATE)
+
+**REOPENED 2026-07-24 (pre-merge-to-main A/B, candidate `e0e5acb8` vs baseline
+`14c44309`).** The `jake bench` VM suite — which the branch's async-focused
+hyperfine suite never covered — shows the allocator/GC-registry residual below
+(cons-1m 1.38×) is NOT the mild tail it looked like; on allocation/HOF-heavy
+compute it balloons to **3–5×**:
+
+| jake bench program | baseline (min) | candidate (min) | ratio |
+|---|---|---|---|
+| `deriv` (symbolic diff, deep recursion) | 0.645 s | 3.081 s | **4.78×** |
+| `string-pipeline` (source unchanged bar whitespace) | 0.541 s | 2.122 s | **3.92×** |
+| `higher-order-fold` (foldl/map/filter × 10k list) | 0.535 s | 1.740 s | **3.25×** |
+| `mandelbrot` / `hashmap-bench` | — | — | 1.15× / 1.11× |
+| `tak` / `nqueens` / `closure-storm` / `throw-catch` | — | — | ≤1.06× (noise) |
+
+Attribution is proven merge-innocent: the runtime hot-path code is identical
+between the branch tip (`63b13180`) and the merge (only an error-path trace fix
++ test-only changes differ), the regressed programs are byte-identical, the
+release profile is identical, and main did not diverge from the branch fork
+point `3f111e83` on the VM/eval hot path (1 non-perf commit). `map` and `foldl`
+dispatch through the same `NativeOutcome::Call` path at comparable per-element
+cost, so this is NOT foldl-specific — it is the universal-flip's per-op
+(instruction-accounting + cooperative dispatch + allocation/GC-registry)
+overhead on programs that repeatedly build large lists, i.e. the cons-1m suspect
+below at scale. **Owner decision (2026-07-24): merge lands on main now (clean +
+green: 7221 tests, 81 examples), but this is a RELEASE GATE — no release until
+the allocation-heavy path is diagnosed and recovered to an accepted band.**
+Next: profile `deriv` + a foldl-over-10k microbench (samply + instruction
+counts) to size the fix (targeted fast-path miss vs. fundamental flip cost).
+
+---
 
 **Recorded 2026-07-17 (Slice 0b close-out). Status update, same day: acceptance rescinded — owner redirected the program to a deeper optimization pass (Slice 0c) before P6-1: samply/sample profiling with full symbols, then divan/criterion micro-benchmarks instrumenting the cooperative scheduler, then targeted squeezes. This entry became the 0c work list; outcome: sleep-storm/deep-await/cons-1m
 RESOLVED (0.88×/1.11×/1.03×), spawn-storm/primes faster-than-baseline.

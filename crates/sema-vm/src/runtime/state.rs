@@ -1256,6 +1256,13 @@ impl Runtime {
             iters = iters.wrapping_add(1);
             if iters.is_multiple_of(64) {
                 clock_now = self.state.borrow().clock.now();
+                // `clock_now` only advances here, so `saturating_duration_since`
+                // is constant between refreshes — checking the wall-clock bound
+                // once per refresh is equivalent to the old per-iteration check
+                // and skips the `Instant` subtraction on the other 63 of 64.
+                if clock_now.saturating_duration_since(start) >= budget.wall_clock_limit {
+                    break;
+                }
             }
             // The cooperative debug barrier is armed (a task paused at a
             // breakpoint/step this turn, applied inline by `visit_ready`): stop
@@ -1287,9 +1294,6 @@ impl Runtime {
                         wait.id, wait.generation
                     ),
                 });
-            }
-            if clock_now.saturating_duration_since(start) >= budget.wall_clock_limit {
-                break;
             }
             if self.state.borrow().shutting_down && self.cancel_waiting()? {
                 work_items += 1;

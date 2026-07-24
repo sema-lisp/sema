@@ -13,6 +13,11 @@ sema-core.workspace = true
 sema-reader.workspace = true
 sema-stdlib.workspace = true
 sema-vm.workspace = true
+# Wasm32-safe `Instant` (see the comment in sema-vm's Cargo.toml): the
+# persistent-runtime `Drop` teardown below builds a `ShutdownOptions` deadline,
+# whose type must match sema-vm's runtime module on every target.
+web-time = "1.1.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 sema-llm.workspace = true
+sema-io.workspace = true

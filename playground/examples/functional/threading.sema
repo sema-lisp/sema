@@ -57,8 +57,8 @@
 
 (println "\n--- Nil-safe threading (some->) ---")
 (define people
-  {:alice  {:age 30 :address {:city "Paris"}}
-   :bob    {:age 25 :address nil}})
+  {:alice {:age 30 :address {:city "Paris"}}
+   :bob {:age 25 :address nil}})
 (println
   (format "  alice's city: ~a"
     (some-> (get people :alice) (get :address) (get :city))))

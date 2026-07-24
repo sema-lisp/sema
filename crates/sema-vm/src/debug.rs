@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::mpsc;
 
+use sema_core::runtime::{NativeCall, NativeOutcome, NativeSuspend, RuntimeRequest};
 use sema_core::Value;
 
 #[derive(Debug, Clone)]
@@ -143,7 +144,7 @@ pub enum DebugEvent {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     Breakpoint,
     Step,
@@ -404,12 +405,72 @@ pub enum VmExecResult {
     /// Execution yielded after exhausting the instruction budget.
     /// Call `run_cooperative` again to continue.
     Yielded,
-    /// Execution suspended for async yield (channel op, await, sleep).
-    AsyncYield(sema_core::YieldReason),
+    /// Execution stopped at an opcode boundary after consuming its instruction quantum.
+    QuantumExpired { instructions: usize },
+    /// Execution suspended because a native returned a structural, non-`Return`
+    /// [`NativeOutcome`] through the runtime ABI. The runtime consumes the
+    /// carried outcome to drive the suspension (a wait, a call, or a runtime
+    /// request) and later resumes the parked frame.
+    Pending(VmPendingOutcome),
+}
+
+/// The non-`Return` half of a [`NativeOutcome`]: what a native asked the runtime
+/// to do when it did not produce an immediate value. Carried out of the VM in
+/// [`VmExecResult::Pending`] and turned back into a [`NativeOutcome`] by the
+/// runtime.
+pub enum VmPendingOutcome {
+    Call(NativeCall),
+    Suspend(NativeSuspend),
+    Runtime(RuntimeRequest),
+}
+
+impl VmPendingOutcome {
+    /// Splits a non-`Return` [`NativeOutcome`] into a `VmPendingOutcome`.
+    ///
+    /// A `Return` is an immediate value, never a suspension, so it must never
+    /// reach here — the caller decides `Return` vs pending before calling this.
+    pub fn from_outcome(outcome: NativeOutcome) -> Self {
+        match outcome {
+            NativeOutcome::Call(call) => Self::Call(call),
+            NativeOutcome::Suspend(suspend) => Self::Suspend(suspend),
+            NativeOutcome::Runtime(request) => Self::Runtime(request),
+            NativeOutcome::Return(_) => {
+                unreachable!("a Return outcome must not be lowered to a VM pending outcome")
+            }
+        }
+    }
+
+    /// Rebuilds the owned [`NativeOutcome`] the runtime dispatches.
+    pub fn into_outcome(self) -> NativeOutcome {
+        match self {
+            Self::Call(call) => NativeOutcome::Call(call),
+            Self::Suspend(suspend) => NativeOutcome::Suspend(suspend),
+            Self::Runtime(request) => NativeOutcome::Runtime(request),
+        }
+    }
+}
+
+impl std::fmt::Debug for VmPendingOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The continuations held here are not `Debug`; a variant tag is enough
+        // for the diagnostic use sites that format a `VmExecResult`.
+        let tag = match self {
+            Self::Call(_) => "Call",
+            Self::Suspend(_) => "Suspend",
+            Self::Runtime(_) => "Runtime",
+        };
+        f.debug_tuple("VmPendingOutcome").field(&tag).finish()
+    }
+}
+
+/// One budgeted VM dispatch result with exact instruction consumption.
+pub struct VmQuantumResult {
+    pub outcome: Result<VmExecResult, sema_core::SemaError>,
+    pub instructions: usize,
 }
 
 /// Information about why and where the VM stopped.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopInfo {
     pub reason: StopReason,
     pub file: Option<PathBuf>,

@@ -21,8 +21,8 @@ Henry,33,88,London")
     records))
 
 ;; Statistics
-(define ages    (map (fn (r) (get r :age)) typed-records))
-(define scores  (map (fn (r) (get r :score)) typed-records))
+(define ages (map (fn (r) (get r :age)) typed-records))
+(define scores (map (fn (r) (get r :score)) typed-records))
 (println
   (format "Average age: ~a" (round (/ (foldl + 0 ages) (float (length ages))))))
 (println
@@ -66,10 +66,10 @@ Henry,33,88,London")
           (list (get r :name)
             (str score)
             (cond
-              ((>= score 90)  "A")
-              ((>= score 80)  "B")
-              ((>= score 70)  "C")
-              (else           "D")))))
+              ((>= score 90) "A")
+              ((>= score 80) "B")
+              ((>= score 70) "C")
+              (else "D")))))
       ranked)))
 (println "\nExported CSV:")
 (println (csv/encode export-rows))

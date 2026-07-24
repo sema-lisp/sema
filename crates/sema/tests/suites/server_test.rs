@@ -13,6 +13,81 @@ fn eval_err(input: &str) -> SemaError {
     interp.eval_str(input).unwrap_err()
 }
 
+struct LoopbackServer {
+    url: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LoopbackServer {
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    fn finish(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("loopback server thread panicked");
+        }
+    }
+}
+
+impl Drop for LoopbackServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn spawn_loopback_server(
+    handler: impl FnOnce(std::net::TcpStream) + Send + 'static,
+) -> LoopbackServer {
+    use std::io::ErrorKind;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback server");
+    let address = listener.local_addr().expect("read loopback address");
+    listener
+        .set_nonblocking(true)
+        .expect("make loopback accept cancellable");
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let thread = std::thread::spawn(move || loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("make accepted loopback socket blocking");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set loopback read timeout");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .expect("set loopback write timeout");
+                handler(stream);
+                return;
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if thread_stop.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("loopback accept failed: {error}"),
+        }
+    });
+
+    LoopbackServer {
+        url: format!("ws://{address}"),
+        stop,
+        thread: Some(thread),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Web server integration tests (server-based, require network)
 // ---------------------------------------------------------------------------
@@ -1221,6 +1296,295 @@ fn test_http_stream_non_function() {
 #[test]
 fn test_http_websocket_non_function() {
     let _ = eval_err(r#"(http/websocket 42)"#);
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket runtime integration tests (ephemeral loopback only)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_ws_runtime_connect_completes_in_spawned_task() {
+    use tungstenite::Message;
+
+    let server = spawn_loopback_server(|stream| {
+        let mut socket = tungstenite::accept(stream).expect("accept websocket handshake");
+        let marker = socket.read().expect("read connected marker");
+        assert_eq!(marker.into_text().unwrap().as_str(), "connected");
+        socket
+            .send(Message::Text("ack".into()))
+            .expect("send handshake ack");
+        let _ = socket.read();
+    });
+
+    let output = eval(&format!(
+        r#"
+        (await
+          (async
+            (with-open (sock (ws/connect "{}" {{:timeout 1000}}))
+              (ws/send sock "connected")
+              (:text (ws/recv-timeout sock 1000)))))
+        "#,
+        server.url()
+    ));
+    assert_eq!(output, Value::string("ack"));
+    server.finish();
+}
+
+#[test]
+fn test_ws_runtime_handshake_failure_keeps_eval_error_domain() {
+    use std::io::Write;
+
+    let server = spawn_loopback_server(|mut stream| {
+        stream
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            .expect("write rejected handshake");
+        stream.flush().expect("flush rejected handshake");
+    });
+
+    let output = eval(&format!(
+        r#"
+        (await
+          (async
+            (try
+              (ws/connect "{}" {{:timeout 1000}})
+              (catch e (list (:type e) (:message e))))))
+        "#,
+        server.url()
+    ));
+    let values = output.as_list_rc().expect("caught error must be a list");
+    assert_eq!(values.first(), Some(&Value::keyword("eval")));
+    assert!(
+        values
+            .get(1)
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("ws/connect")),
+        "caught handshake error must retain its message: {output}"
+    );
+    server.finish();
+}
+
+#[test]
+fn test_ws_runtime_cancelled_recv_preserves_connection_receiver() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tungstenite::Message;
+
+    let waiting = Arc::new(AtomicBool::new(false));
+    let server_waiting = waiting.clone();
+    let server = spawn_loopback_server(move |stream| {
+        let mut socket = tungstenite::accept(stream).expect("accept websocket handshake");
+        let marker = socket.read().expect("read waiting marker");
+        assert_eq!(marker.into_text().unwrap().as_str(), "waiting");
+        server_waiting.store(true, Ordering::Release);
+        let release = socket.read().expect("read release marker");
+        assert_eq!(release.into_text().unwrap().as_str(), "release");
+        socket
+            .send(Message::Text("still-open".into()))
+            .expect("send post-cancel event");
+        let _ = socket.read();
+    });
+
+    let interpreter = Interpreter::new();
+    interpreter.global_env.set_str(
+        "test/ws-waiting?",
+        Value::native_fn(sema_core::NativeFn::simple("test/ws-waiting?", move |_| {
+            Ok(Value::bool(waiting.load(Ordering::Acquire)))
+        })),
+    );
+    let output = interpreter
+        .eval_str(&format!(
+            r#"
+        (await
+          (async
+            (with-open (sock (ws/connect "{}" {{:timeout 1000}}))
+              (let ((pending (async (ws/send sock "waiting") (ws/recv sock))))
+                (let wait ((remaining 2000))
+                  (cond
+                    ((test/ws-waiting?) #t)
+                    ((= remaining 0) (error "cancelled recv did not park"))
+                    (else (async/sleep 1) (wait (- remaining 1)))))
+                (async/cancel pending)
+                (ws/send sock "release")
+                (let ((event (ws/recv-timeout sock 1000)))
+                  (list (async/cancelled? pending) (:text event)))))))
+        "#,
+            server.url()
+        ))
+        .expect("evaluate cancelled websocket receive");
+    assert_eq!(
+        output,
+        Value::list(vec![Value::bool(true), Value::string("still-open")])
+    );
+    server.finish();
+}
+
+#[test]
+fn test_ws_runtime_server_close_wakes_recv_to_nil() {
+    let server = spawn_loopback_server(|stream| {
+        let mut socket = tungstenite::accept(stream).expect("accept websocket handshake");
+        let close = socket.read().expect("read close marker");
+        assert_eq!(close.into_text().unwrap().as_str(), "close");
+        socket.close(None).expect("send server close frame");
+    });
+
+    let output = eval(&format!(
+        r#"
+        (await
+          (async
+            (with-open (sock (ws/connect "{}" {{:timeout 1000}}))
+              (ws/send sock "close")
+              (ws/recv sock)
+              (null? (ws/recv-timeout sock 1000)))))
+        "#,
+        server.url()
+    ));
+    assert_eq!(output, Value::bool(true));
+    server.finish();
+}
+
+#[test]
+fn test_ws_runtime_connect_cancel_aborts_pending_pump() {
+    use std::io::{ErrorKind, Read};
+    use std::sync::mpsc;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    let accepted = Arc::new(AtomicBool::new(false));
+    let server_accepted = accepted.clone();
+    let (closed_tx, closed_rx) = mpsc::sync_channel(1);
+    let server = spawn_loopback_server(move |mut stream| {
+        server_accepted.store(true, Ordering::Release);
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => {
+                    closed_tx.send(()).expect("report closed connection");
+                    return;
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    return;
+                }
+                Err(_) => {
+                    closed_tx.send(()).expect("report reset connection");
+                    return;
+                }
+            }
+        }
+    });
+
+    let interpreter = Interpreter::new();
+    interpreter.global_env.set_str(
+        "test/ws-accepted?",
+        Value::native_fn(sema_core::NativeFn::simple(
+            "test/ws-accepted?",
+            move |_| Ok(Value::bool(accepted.load(Ordering::Acquire))),
+        )),
+    );
+    let output = interpreter
+        .eval_str(&format!(
+            r#"
+        (let ((pending (async (ws/connect "{}" {{:timeout 10000}}))))
+          (let wait ((remaining 2000))
+            (cond
+              ((test/ws-accepted?) #t)
+              ((= remaining 0) (error "loopback server did not accept ws/connect"))
+              (else (async/sleep 1) (wait (- remaining 1)))))
+          (async/cancel pending))
+        "#,
+            server.url()
+        ))
+        .expect("evaluate deterministic ws/connect cancellation");
+    assert_eq!(output, Value::bool(true));
+    closed_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("cancelling ws/connect must abort the in-progress pump socket");
+    server.finish();
+}
+
+#[test]
+fn test_ws_runtime_two_pending_receivers_rearm_for_second_generation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tungstenite::Message;
+
+    let waiters_ready = Arc::new(AtomicUsize::new(0));
+    let server_waiters_ready = waiters_ready.clone();
+    let server = spawn_loopback_server(move |stream| {
+        let mut socket = tungstenite::accept(stream).expect("accept websocket handshake");
+        for _ in 0..2 {
+            let marker = socket.read().expect("read receiver waiting marker");
+            assert!(matches!(
+                marker.into_text().unwrap().as_str(),
+                "first-waiting" | "second-waiting"
+            ));
+            server_waiters_ready.fetch_add(1, Ordering::AcqRel);
+        }
+        let release = socket.read().expect("read release marker");
+        assert_eq!(release.into_text().unwrap().as_str(), "release");
+        socket
+            .send(Message::Text("one".into()))
+            .expect("send first event");
+        let second = socket.read().expect("read second-generation marker");
+        assert_eq!(second.into_text().unwrap().as_str(), "second");
+        socket
+            .send(Message::Text("two".into()))
+            .expect("send second event");
+        let _ = socket.read();
+    });
+
+    let interpreter = Interpreter::new();
+    interpreter.global_env.set_str(
+        "test/ws-waiters-ready?",
+        Value::native_fn(sema_core::NativeFn::simple(
+            "test/ws-waiters-ready?",
+            move |_| Ok(Value::bool(waiters_ready.load(Ordering::Acquire) == 2)),
+        )),
+    );
+    let output = interpreter
+        .eval_str(&format!(
+            r#"
+        (await
+          (async
+            (with-open (sock (ws/connect "{}" {{:timeout 1000}}))
+              (let ((first (async (ws/send sock "first-waiting") (ws/recv sock)))
+                    (second (async (ws/send sock "second-waiting") (ws/recv sock))))
+                (let wait-ready ((remaining 2000))
+                  (cond
+                    ((test/ws-waiters-ready?) #t)
+                    ((= remaining 0) (error "websocket receivers did not park"))
+                    (else (async/sleep 1) (wait-ready (- remaining 1)))))
+                (ws/send sock "release")
+                (let wait-first ((remaining 2000))
+                  (cond
+                    ((or (async/resolved? first) (async/resolved? second)) #t)
+                    ((= remaining 0) (error "first websocket event was not consumed"))
+                    (else (async/sleep 1) (wait-first (- remaining 1)))))
+                (ws/send sock "second")
+                (list (:text (async/timeout 1000 first))
+                      (:text (async/timeout 1000 second)))))))
+        "#,
+            server.url()
+        ))
+        .expect("evaluate two pending websocket receives");
+    let values = output.as_list_rc().expect("receive results must be a list");
+    let mut texts = values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("receive result must be text")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    texts.sort();
+    assert_eq!(texts, vec!["one".to_string(), "two".to_string()]);
+    server.finish();
 }
 
 // ---------------------------------------------------------------------------

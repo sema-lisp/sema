@@ -1,17 +1,17 @@
 ;; Maze Generator — writes maze data to VFS files
 ;; Run this first, then run maze-solver.sema!
 
-(define width   12)
-(define height  8)
+(define width 12)
+(define height 8)
 
 (define (pos x y) (str x "," y))
 
 (define (shuffle lst)
   (if (<= (length lst) 1)
     lst
-    (let* ((i       (math/random-int 0 (- (length lst) 1)))
-           (picked  (nth lst i))
-           (rest    (append (take i lst) (drop (+ i 1) lst))))
+    (let* ((i (math/random-int 0 (- (length lst) 1)))
+           (picked (nth lst i))
+           (rest (append (take i lst) (drop (+ i 1) lst))))
       (cons picked (shuffle rest)))))
 
 (define directions (list (list 0 -1) (list 0 1) (list -1 0) (list 1 0)))
@@ -31,14 +31,14 @@
       (shuffle directions))))
 
 (define (generate-maze)
-  (let loop ((stack  (list (list 0 0)))
-             (grid   (assoc {} (pos 1 1) #t)))
+  (let loop ((stack (list (list 0 0)))
+             (grid (assoc {} (pos 1 1) #t)))
     (if (null? stack)
       grid
-      (let* ((cell       (car stack))
-             (cx         (car cell))
-             (cy         (cadr cell))
-             (neighbors  (unvisited-neighbors grid cx cy)))
+      (let* ((cell (car stack))
+             (cx (car cell))
+             (cy (cadr cell))
+             (neighbors (unvisited-neighbors grid cx cy)))
         (if (null? neighbors)
           (loop (cdr stack) grid)
           (let* ((next (car neighbors))
@@ -61,28 +61,28 @@
     (not (get grid (pos x y) #f))))
 
 (define (box-char grid x y)
-  (let* ((u     (wall? grid x (- y 1)))
-         (d     (wall? grid x (+ y 1)))
-         (l     (wall? grid (- x 1) y))
-         (r     (wall? grid (+ x 1) y))
-         (bits  (+ (if u 1 0) (if d 2 0) (if l 4 0) (if r 8 0))))
+  (let* ((u (wall? grid x (- y 1)))
+         (d (wall? grid x (+ y 1)))
+         (l (wall? grid (- x 1) y))
+         (r (wall? grid (+ x 1) y))
+         (bits (+ (if u 1 0) (if d 2 0) (if l 4 0) (if r 8 0))))
     (cond
-      ((= bits 15)  "┼─")
-      ((= bits 14)  "┬─")
-      ((= bits 13)  "┴─")
-      ((= bits 11)  "├─")
-      ((= bits 7)   "┤ ")
-      ((= bits 6)   "┐ ")
-      ((= bits 10)  "┌─")
-      ((= bits 5)   "┘ ")
-      ((= bits 9)   "└─")
-      ((= bits 12)  "──")
-      ((= bits 3)   "│ ")
-      ((= bits 1)   "│ ")
-      ((= bits 2)   "│ ")
-      ((= bits 4)   "─ ")
-      ((= bits 8)   "──")
-      (else         "· "))))
+      ((= bits 15) "┼─")
+      ((= bits 14) "┬─")
+      ((= bits 13) "┴─")
+      ((= bits 11) "├─")
+      ((= bits 7) "┤ ")
+      ((= bits 6) "┐ ")
+      ((= bits 10) "┌─")
+      ((= bits 5) "┘ ")
+      ((= bits 9) "└─")
+      ((= bits 12) "──")
+      ((= bits 3) "│ ")
+      ((= bits 1) "│ ")
+      ((= bits 2) "│ ")
+      ((= bits 4) "─ ")
+      ((= bits 8) "──")
+      (else "· "))))
 
 (define (render grid)
   (string/join
@@ -98,8 +98,8 @@
     "\n"))
 
 ;; Generate and save
-(define grid       (generate-maze))
-(define maze-text  (render grid))
+(define grid (generate-maze))
+(define maze-text (render grid))
 
 (file/mkdir "mazes")
 

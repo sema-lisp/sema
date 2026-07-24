@@ -8,10 +8,10 @@
   (error "No maze found! Run maze-generator.sema first to create one."))
 
 ;; Read grid data
-(define raw     (file/read "mazes/grid-data.txt"))
-(define lines   (string/split raw "\n"))
-(define grid-w  (int (first lines)))
-(define grid-h  (int (nth lines 1)))
+(define raw (file/read "mazes/grid-data.txt"))
+(define lines (string/split raw "\n"))
+(define grid-w (int (first lines)))
+(define grid-h (int (nth lines 1)))
 
 ;; Rebuild grid map from passable cells
 (define grid
@@ -19,13 +19,13 @@
     {}
     (drop 2 lines)))
 
-(define directions  (list (list 0 1) (list 0 -1) (list 1 0) (list -1 0)))
-(define (pos x y)   (str x "," y))
+(define directions (list (list 0 1) (list 0 -1) (list 1 0) (list -1 0)))
+(define (pos x y) (str x "," y))
 
 ;; BFS solver
 (define (reconstruct-path parent start-key end-key)
-  (let loop ((key   end-key)
-             (path  (assoc {} end-key #t)))
+  (let loop ((key end-key)
+             (path (assoc {} end-key #t)))
     (if (equal? key start-key)
       path
       (let ((prev (get parent key #f)))
@@ -34,17 +34,17 @@
           path)))))
 
 (define (solve start-x start-y end-x end-y)
-  (let ((start-key  (pos start-x start-y))
-        (end-key    (pos end-x end-y)))
-    (let bfs ((queue    (list (list start-x start-y)))
-              (visited  (assoc {} start-key #t))
-              (parent   {}))
+  (let ((start-key (pos start-x start-y))
+        (end-key (pos end-x end-y)))
+    (let bfs ((queue (list (list start-x start-y)))
+              (visited (assoc {} start-key #t))
+              (parent {}))
       (if (null? queue)
         {}
-        (let* ((current     (car queue))
-               (rest-queue  (cdr queue))
-               (cx          (car current))
-               (cy          (cadr current)))
+        (let* ((current (car queue))
+               (rest-queue (cdr queue))
+               (cx (car current))
+               (cy (cadr current)))
           (if (and (= cx end-x) (= cy end-y))
             (reconstruct-path parent start-key end-key)
             (let* ((nbrs
@@ -79,28 +79,28 @@
     (not (get grid (pos x y) #f))))
 
 (define (box-char x y)
-  (let* ((u     (wall? x (- y 1)))
-         (d     (wall? x (+ y 1)))
-         (l     (wall? (- x 1) y))
-         (r     (wall? (+ x 1) y))
-         (bits  (+ (if u 1 0) (if d 2 0) (if l 4 0) (if r 8 0))))
+  (let* ((u (wall? x (- y 1)))
+         (d (wall? x (+ y 1)))
+         (l (wall? (- x 1) y))
+         (r (wall? (+ x 1) y))
+         (bits (+ (if u 1 0) (if d 2 0) (if l 4 0) (if r 8 0))))
     (cond
-      ((= bits 15)  "┼─")
-      ((= bits 14)  "┬─")
-      ((= bits 13)  "┴─")
-      ((= bits 11)  "├─")
-      ((= bits 7)   "┤ ")
-      ((= bits 6)   "┐ ")
-      ((= bits 10)  "┌─")
-      ((= bits 5)   "┘ ")
-      ((= bits 9)   "└─")
-      ((= bits 12)  "──")
-      ((= bits 3)   "│ ")
-      ((= bits 1)   "│ ")
-      ((= bits 2)   "│ ")
-      ((= bits 4)   "─ ")
-      ((= bits 8)   "──")
-      (else         "· "))))
+      ((= bits 15) "┼─")
+      ((= bits 14) "┬─")
+      ((= bits 13) "┴─")
+      ((= bits 11) "├─")
+      ((= bits 7) "┤ ")
+      ((= bits 6) "┐ ")
+      ((= bits 10) "┌─")
+      ((= bits 5) "┘ ")
+      ((= bits 9) "└─")
+      ((= bits 12) "──")
+      ((= bits 3) "│ ")
+      ((= bits 1) "│ ")
+      ((= bits 2) "│ ")
+      ((= bits 4) "─ ")
+      ((= bits 8) "──")
+      (else "· "))))
 
 ;; Render with solution path
 (define (render-solved path)
@@ -119,8 +119,8 @@
     "\n"))
 
 ;; Solve from top-left to bottom-right
-(define path         (solve 1 1 (- grid-w 2) (- grid-h 2)))
-(define solved-text  (render-solved path))
+(define path (solve 1 1 (- grid-w 2) (- grid-h 2)))
+(define solved-text (render-solved path))
 
 (file/write "mazes/solved.txt" solved-text)
 

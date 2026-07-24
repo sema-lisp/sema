@@ -1,0 +1,13 @@
+# Workflow WRITER filesystem policy (A3 — bounded journal I/O off the VM thread).
+#
+# Every `write_all` / `fs::write` in the sema-workflow crate MUST live on the per-run
+# journal WRITER thread (writer.rs). The VM-thread `Journal` methods (journal.rs) only
+# render + `try_send`; journal.rs keeps ONLY the run-dir open/claim (create_new /
+# create_dir), never a synchronous write. This pins the writes to writer.rs at exact
+# counts; a `write_all`/`fs::write` in ANY other sema-workflow file (a regressed synchronous
+# `Journal::write`) is unallowlisted and fails. The scan comment-strips and counts the
+# production module only (the #[cfg(test)] block is never shipped).
+#
+# Format: TOKEN<TAB>FILE<TAB>COUNT<TAB>reason
+WORKFLOW_WRITE_ALL	crates/sema-workflow/src/writer.rs	2	events.jsonl line + the journal-size-cap overflow marker, on the writer thread
+WORKFLOW_FS_WRITE	crates/sema-workflow/src/writer.rs	2	memo sidecar + whole-file sidecar (args/metadata/result), on the writer thread

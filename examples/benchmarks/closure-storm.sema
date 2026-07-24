@@ -55,9 +55,9 @@
 (define (compose f g)
   (fn (x) (f (g x))))
 
-(define inc           (fn (x) (+ x 1)))
-(define dbl           (fn (x) (* x 2)))
-(define inc-then-dbl  (compose dbl inc))
+(define inc (fn (x) (+ x 1)))
+(define dbl (fn (x) (* x 2)))
+(define inc-then-dbl (compose dbl inc))
 
 (define t2 (time-ms))
 (define result3

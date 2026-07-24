@@ -22,8 +22,8 @@
 
 (println "\n=== Word Frequency Counting ===\n")
 
-(define sentence  "the cat sat on the mat the cat ate the rat on the mat")
-(define words     (string/split sentence " "))
+(define sentence "the cat sat on the mat the cat ate the rat on the mat")
+(define words (string/split sentence " "))
 
 ;; Count with ordered map (foldl)
 (define freq
@@ -69,9 +69,9 @@
 (println (format "From entries: ~a" from-entries))
 
 ;; Merge maps
-(define defaults   (map/new :color "blue" :size "medium" :count 1))
-(define overrides  (map/new :color "red" :count 5))
-(define merged     (merge defaults overrides))
+(define defaults (map/new :color "blue" :size "medium" :count 1))
+(define overrides (map/new :color "red" :count 5))
+(define merged (merge defaults overrides))
 (println (format "\nDefaults: ~a" defaults))
 (println (format "Overrides: ~a" overrides))
 (println (format "Merged: ~a" merged))

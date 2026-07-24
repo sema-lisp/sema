@@ -5,8 +5,8 @@
 ;; Section 1: Read & Tokenize
 ;; ============================================================
 
-(define text    (file/read "examples/markov-corpus.txt"))
-(define tokens  (regex/find-all "[A-Za-z',;:!?.]+|[.]" text))
+(define text (file/read "examples/markov-corpus.txt"))
+(define tokens (regex/find-all "[A-Za-z',;:!?.]+|[.]" text))
 
 (println "=== Markov Chain Text Generator ===\n")
 (println (str "Tokens in corpus: " (length tokens)))
@@ -21,16 +21,16 @@
   (let loop ((i 0) (table {}))
     (if (>= i (- (length tokens) 2))
       table
-      (let* ((w1        (nth tokens i))
-             (w2        (nth tokens (+ i 1)))
-             (w3        (nth tokens (+ i 2)))
-             (key       (str w1 " " w2))
-             (existing  (get table key '())))
+      (let* ((w1 (nth tokens i))
+             (w2 (nth tokens (+ i 1)))
+             (w3 (nth tokens (+ i 2)))
+             (key (str w1 " " w2))
+             (existing (get table key '())))
         (loop (+ i 1)
           (assoc table key (cons w3 existing)))))))
 
-(define table     (build-trigram-table tokens))
-(define all-keys  (keys table))
+(define table (build-trigram-table tokens))
+(define all-keys (keys table))
 
 (println (str "Unique bigram keys: " (length all-keys)))
 (println "")
@@ -41,10 +41,10 @@
 ;; Pick a random starting bigram, then walk the chain.
 
 (define (generate n)
-  (let* ((start-key  (list/pick all-keys))
-         (pair       (regex/find-all "[A-Za-z',;:!?.]+|[.]" start-key))
-         (w1         (nth pair 0))
-         (w2         (nth pair 1)))
+  (let* ((start-key (list/pick all-keys))
+         (pair (regex/find-all "[A-Za-z',;:!?.]+|[.]" start-key))
+         (w1 (nth pair 0))
+         (w2 (nth pair 1)))
     (let loop ((w1 w1) (w2 w2) (count 2) (acc (list w2 w1)))
       (if (>= count n)
         (string/join (reverse acc) " ")

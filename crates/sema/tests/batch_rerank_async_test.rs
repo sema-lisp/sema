@@ -1,13 +1,11 @@
 //! Async-offload coverage for `llm/batch` and `llm/rerank` (WP-LLM-BATCH-RERANK).
 //!
-//! `llm/batch` offloads the WHOLE batch call (the provider's own internal
-//! concurrency — `join_all` over `io_block_on` for the real providers — runs
-//! unchanged inside the offload) via a blocking-tier `AwaitIo` yield; usage/cost
-//! accounting lands on the VM thread in the poller. `llm/rerank` gets the
-//! `llm/embed`-style async branch: a native async `rerank_future` hook on the
-//! provider trait (mirroring `embed_future`) for true-cancel, falling back to an
-//! admission-controlled blocking offload for providers (like `FakeProvider`) that
-//! don't implement it.
+//! For native providers, `llm/batch` offloads the whole batch call (including the
+//! provider's internal concurrency) through one blocking-tier External wait. For
+//! Sema-defined providers it sequences structural callbacks on the VM. Usage/cost
+//! accounting lands on the VM thread in both cases. `llm/rerank` uses a native async
+//! `rerank_future` hook for true cancellation, falling back to an admission-controlled
+//! blocking offload for providers (like `FakeProvider`) that do not implement it.
 //!
 //! Deterministic + keyless (`FakeProvider`, see AGENTS.md "LLM / agent paths").
 //! Neither builtin asserts otel spans or the process-global in-flight gauge here,
@@ -16,6 +14,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use sema_core::Value;
 use sema_eval::Interpreter;
@@ -150,6 +149,129 @@ fn batch_sync_top_level_unchanged() {
     let texts: Vec<&str> = items.iter().map(|v| v.as_str().unwrap()).collect();
     assert_eq!(texts, vec!["s0", "s1"]);
     assert_eq!(recorder.call_count(), 2);
+}
+
+#[test]
+fn batch_sema_provider_callbacks_preserve_context_and_runtime_control_flow() {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (llm/define-provider :sema-provider
+              {:complete (fn (request)
+                           (define pending
+                             (async/spawn
+                               (fn ()
+                                 (sleep 50)
+                                 (:content (first (:messages request))))))
+                           (string-append
+                             (context/get :prefix) ":" (async/await pending)))
+               :default-model "sema-model"})
+            (context/with {:prefix "ctx"}
+              (fn ()
+                (let ((out (channel/new 2)))
+                  (async/spawn
+                    (fn () (sleep 10) (channel/send out "sibling")))
+                  (channel/send out (llm/batch (list "a" "b")))
+                  (list (channel/recv out) (channel/recv out)))))
+            "#,
+        )
+        .expect("Sema-defined batch callbacks can suspend in caller context");
+
+    let received = value.as_list().expect("channel results");
+    assert_eq!(received[0].as_str(), Some("sibling"));
+    let batch = received[1].as_list().expect("ordered batch result");
+    assert_eq!(batch[0].as_str(), Some("ctx:a"));
+    assert_eq!(batch[1].as_str(), Some("ctx:b"));
+}
+
+#[test]
+fn batch_sema_provider_invokes_later_callbacks_before_returning_an_earlier_error() {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (define calls 0)
+            (llm/define-provider :sema-provider
+              {:complete (fn (request)
+                           (set! calls (+ calls 1))
+                           (define text (:content (first (:messages request))))
+                           (if (= text "bad") (error "bad request") text))
+               :default-model "sema-model"})
+            (try
+              (llm/batch (list "bad" "after"))
+              (catch error calls))
+            "#,
+        )
+        .expect("batch callback failure remains catchable");
+
+    assert_eq!(
+        value.as_int(),
+        Some(2),
+        "batch_complete semantics invoke every request before folding the first error"
+    );
+}
+
+#[test]
+fn cancelling_batch_sema_provider_stops_before_the_next_callback_and_usage_fold() {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+
+    let started = Instant::now();
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (define calls 0)
+            (llm/define-provider :sema-provider
+              {:complete (fn (request)
+                           (set! calls (+ calls 1))
+                           (sleep 1000)
+                           (:content (first (:messages request))))
+               :default-model "sema-model"})
+            (define pending
+              (async/spawn (fn () (llm/batch (list "first" "second")))))
+            (async/spawn (fn () (sleep 20) (async/cancel pending)))
+            (list (try (async/await pending) (catch error :cancelled))
+                  calls
+                  (:total-tokens (llm/session-usage)))
+            "#,
+        )
+        .expect("Sema-defined batch callback is cancellable");
+
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "cancellation must not wait out the callback sleep"
+    );
+    let items = value.as_list().expect("cancel result, calls, and usage");
+    assert_eq!(items[0], Value::keyword("cancelled"));
+    assert_eq!(items[1].as_int(), Some(1));
+    assert_eq!(items[2].as_int(), Some(0));
+}
+
+#[test]
+fn batch_sema_provider_accounts_each_success_exactly_once() {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (llm/define-provider :sema-provider
+              {:complete (fn (request)
+                           {:content (:content (first (:messages request)))
+                            :usage {:prompt-tokens 3 :completion-tokens 2}})
+               :default-model "sema-model"})
+            (llm/batch (list "a" "b"))
+            (:total-tokens (llm/session-usage))
+            "#,
+        )
+        .expect("Sema-defined batch usage is accounted");
+
+    assert_eq!(value.as_int(), Some(10));
 }
 
 // ── llm/rerank ───────────────────────────────────────────────────────

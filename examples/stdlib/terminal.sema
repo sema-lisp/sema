@@ -70,9 +70,9 @@
 (assert-eq (term/strip "no codes here") "no codes here" "strip plain")
 
 ;; Colored log levels pattern
-(define (log-error msg)  (println (term/style "✗ ERROR" :bold :red) " " msg))
-(define (log-warn msg)   (println (term/style "⚠ WARN " :bold :yellow) " " msg))
-(define (log-info msg)   (println (term/style "ℹ INFO " :bold :blue) " " msg))
+(define (log-error msg) (println (term/style "✗ ERROR" :bold :red) " " msg))
+(define (log-warn msg) (println (term/style "⚠ WARN " :bold :yellow) " " msg))
+(define (log-info msg) (println (term/style "ℹ INFO " :bold :blue) " " msg))
 (define (log-success msg)
   (println (term/style "✔ OK   " :bold :green) " " msg))
 ;; Just verify they don't error
@@ -91,9 +91,9 @@
 ;; Conditional styling pattern
 (define (color-status code)
   (cond
-    ((< code 300)  (term/green (number/to-string code)))
-    ((< code 400)  (term/yellow (number/to-string code)))
-    (else          (term/red (number/to-string code)))))
+    ((< code 300) (term/green (number/to-string code)))
+    ((< code 400) (term/yellow (number/to-string code)))
+    (else (term/red (number/to-string code)))))
 
 (assert-eq (term/strip (color-status 200)) "200" "color-status 200")
 (assert-eq (term/strip (color-status 301)) "301" "color-status 301")

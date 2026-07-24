@@ -1,8 +1,8 @@
 ;; Pico Light & Sound Show
 ;; Generative sequences computed in Sema, streamed to hardware
 
-(define pico     (serial/open "/dev/tty.usbmodem1201" 115200 3000))
-(define (cmd s)  (serial/send pico s))
+(define pico (serial/open "/dev/tty.usbmodem1201" 115200 3000))
+(define (cmd s) (serial/send pico s))
 (try (serial/read-line pico) (catch e nil))
 (cmd "PING")
 
@@ -10,12 +10,12 @@
 
 ;; ── Helpers ─────────────────────────────────────────────
 
-(define (led! pin val)    (cmd (str "PIN_SET " pin " " val)))
-(define (leds-off)        (dotimes (i 8) (led! i 0)))
-(define (all-leds val)    (dotimes (i 8) (led! i val)))
-(define (neo! idx r g b)  (cmd (str "NEOPIXEL 3 " idx " " r " " g " " b)))
-(define (neos-off)        (dotimes (i 3) (neo! i 0 0 0)))
-(define (tone! freq ms)   (cmd (str "TONE 18 " freq " " ms)))
+(define (led! pin val) (cmd (str "PIN_SET " pin " " val)))
+(define (leds-off) (dotimes (i 8) (led! i 0)))
+(define (all-leds val) (dotimes (i 8) (led! i val)))
+(define (neo! idx r g b) (cmd (str "NEOPIXEL 3 " idx " " r " " g " " b)))
+(define (neos-off) (dotimes (i 3) (neo! i 0 0 0)))
+(define (tone! freq ms) (cmd (str "TONE 18 " freq " " ms)))
 
 ;; ── Act 1: Boot Sequence ────────────────────────────────
 
@@ -42,17 +42,17 @@
         (x (* c (- 1.0 (abs (- (mod (/ h 60.0) 2.0) 1.0)))))
         (m (- v c)))
     (cond
-      ((< h 60)   (list (floor (+ c m)) (floor (+ x m)) (floor m)))
-      ((< h 120)  (list (floor (+ x m)) (floor (+ c m)) (floor m)))
-      ((< h 180)  (list (floor m) (floor (+ c m)) (floor (+ x m))))
-      ((< h 240)  (list (floor m) (floor (+ x m)) (floor (+ c m))))
-      ((< h 300)  (list (floor (+ x m)) (floor m) (floor (+ c m))))
-      (else       (list (floor (+ c m)) (floor m) (floor (+ x m)))))))
+      ((< h 60) (list (floor (+ c m)) (floor (+ x m)) (floor m)))
+      ((< h 120) (list (floor (+ x m)) (floor (+ c m)) (floor m)))
+      ((< h 180) (list (floor m) (floor (+ c m)) (floor (+ x m))))
+      ((< h 240) (list (floor m) (floor (+ x m)) (floor (+ c m))))
+      ((< h 300) (list (floor (+ x m)) (floor m) (floor (+ c m))))
+      (else (list (floor (+ c m)) (floor m) (floor (+ x m)))))))
 
 (dotimes (cycle 3)
   (dotimes (i 10)
-    (let ((freq  (nth penta i))
-          (hue   (mod (+ (* cycle 120) (* i 36)) 360)))
+    (let ((freq (nth penta i))
+          (hue (mod (+ (* cycle 120) (* i 36)) 360)))
       (let ((rgb (hsv->rgb hue)))
         (neo! 0 (nth rgb 0) (nth rgb 1) (nth rgb 2))
         (neo! 1 (nth rgb 1) (nth rgb 2) (nth rgb 0))

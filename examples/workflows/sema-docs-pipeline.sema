@@ -34,9 +34,9 @@
 (define (ask prompt) (llm/complete prompt))
 (define (slug s)
   (string/replace (string/replace (string/lower s) "/" "-") " " "-"))
-(define (drafted? d)   (and (map? d) (contains? d :draft)))
-(define (reviewed? r)  (and (map? r) (contains? r :notes)))
-(define (revised? r)   (and (map? r) (contains? r :body)))
+(define (drafted? d) (and (map? d) (contains? d :draft)))
+(define (reviewed? r) (and (map? r) (contains? r :notes)))
+(define (revised? r) (and (map? r) (contains? r :body)))
 
 ;; --- leaf agents (each journals a representative tool call so the drill-in is rich) ---
 
@@ -116,7 +116,7 @@
     final)
   (file/write "out/index.md" (str "# Sema Features\n\n" index "\n"))
 
-  {:status     :success
-   :topics     (count chosen)
-   :reviewed   (count reviews)
-   :published  (count final)})
+  {:status :success
+   :topics (count chosen)
+   :reviewed (count reviews)
+   :published (count final)})

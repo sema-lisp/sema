@@ -40,9 +40,9 @@
 (llm/cache-clear)
 (println (format "provider: ~a   all registered: ~a\n" provider (llm/providers)))
 
-(define pass-count  0)
-(define fail-count  0)
-(define failures    '())
+(define pass-count 0)
+(define fail-count 0)
+(define failures '())
 (define (check name ok detail)
   (if ok
     (begin
@@ -80,9 +80,9 @@
    :max-turns 6})
 
 (defagent sub-llm-bot
-  {:system     "You are a test agent. Use your tool to answer. Be terse."
-   :tools      [ask-sub-llm]
-   :max-turns  4})
+  {:system "You are a test agent. Use your tool to answer. Be terse."
+   :tools [ask-sub-llm]
+   :max-turns 4})
 
 (define two-round-msg
   "Call the note tool twice: first with text='alpha', then with text='beta'. One call per turn. After both succeed, reply with exactly: done")
@@ -91,8 +91,8 @@
 (println "── 1. concurrent llm/complete overlap")
 (define t0 (sys/elapsed))
 (llm/complete "Reply with exactly: warm" {:max-tokens 10})
-(define t-single  (elapsed-ms t0))
-(define t0b       (sys/elapsed))
+(define t-single (elapsed-ms t0))
+(define t0b (sys/elapsed))
 (async/all
   (map (fn (p) (async/spawn (fn () (llm/complete p {:max-tokens 10}))))
     (list "Reply with exactly: one"
@@ -109,9 +109,9 @@
 
 ;; ── 2. Non-blocking agent/run: sibling runs DURING the rounds ────────────────
 (println "── 2. sibling task interleaves with a multi-round agent")
-(define ticks  (channel/new 2000))
-(define snaps  (channel/new 64))
-(define t0c    (sys/elapsed))
+(define ticks (channel/new 2000))
+(define snaps (channel/new 64))
+(define t0c (sys/elapsed))
 (async/all
   (list
     (async/spawn
@@ -201,9 +201,9 @@
 ;; extension): a ticker runs beside the agent's :on-text round; ticks observed
 ;; between the first and last delta prove siblings interleave mid-stream.
 ;; Soft-checked — a provider may legitimately deliver a short reply as one chunk.
-(define delta-count   0)
-(define stream-ticks  (channel/new 2000))
-(define stream-snaps  '())
+(define delta-count 0)
+(define stream-ticks (channel/new 2000))
+(define stream-snaps '())
 (define stream-pair
   (async/all
     (list
@@ -236,8 +236,8 @@
 
 ;; ── 6. Mixed I/O storm ───────────────────────────────────────────────────────
 (println "── 6. mixed I/O storm (agent + completes + http + shell + ticker)")
-(define storm-ticks  (channel/new 2000))
-(define t0g          (sys/elapsed))
+(define storm-ticks (channel/new 2000))
+(define t0g (sys/elapsed))
 (define storm
   (async/all
     (list (async/spawn (fn () (agent/run stress-bot two-round-msg)))
@@ -258,9 +258,9 @@
           (dotimes (i 200)
             (async/sleep 10)
             (channel/send storm-ticks 1)))))))
-(define t-storm      (elapsed-ms t0g))
-(define storm-http   (nth storm 3))
-(define storm-shell  (nth storm 4))
+(define t-storm (elapsed-ms t0g))
+(define storm-http (nth storm 3))
+(define storm-shell (nth storm 4))
 (check "storm: agent + completes + shell + ticker settled concurrently"
   (and (> (string-length (:stdout storm-shell)) 0)
     (> (channel/count storm-ticks) 0))

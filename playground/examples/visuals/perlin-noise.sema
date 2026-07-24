@@ -1,7 +1,7 @@
 ;; Value noise terrain generator
-(define width   60)
-(define height  20)
-(define seed    (math/random-int 1 999999))
+(define width 60)
+(define height 20)
+(define seed (math/random-int 1 999999))
 
 (define (hash x y)
   (let* ((h
@@ -20,12 +20,12 @@
 (define (lerp a b t) (+ a (* (- b a) t)))
 
 (define (value-noise x y)
-  (let* ((ix  (floor x))
-         (iy  (floor y))
-         (fx  (- x ix))
-         (fy  (- y iy))
-         (u   (fade fx))
-         (v   (fade fy)))
+  (let* ((ix (floor x))
+         (iy (floor y))
+         (fx (- x ix))
+         (fy (- y iy))
+         (u (fade fx))
+         (v (fade fy)))
     (lerp (lerp (hash ix iy) (hash (+ ix 1) iy) u)
       (lerp (hash ix (+ iy 1)) (hash (+ ix 1) (+ iy 1)) u)
       v)))
@@ -42,13 +42,13 @@
 
 (define (terrain-char val)
   (cond
-    ((< val 0.30)  "~")
-    ((< val 0.38)  ".")
-    ((< val 0.50)  ",")
-    ((< val 0.60)  ";")
-    ((< val 0.72)  ":")
-    ((< val 0.85)  "%")
-    (#t            "#")))
+    ((< val 0.30) "~")
+    ((< val 0.38) ".")
+    ((< val 0.50) ",")
+    ((< val 0.60) ";")
+    ((< val 0.72) ":")
+    ((< val 0.85) "%")
+    (#t "#")))
 
 (for-each
   (fn (y)

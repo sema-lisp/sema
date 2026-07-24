@@ -19,10 +19,10 @@
 ;;   sema examples/llm/rag-docs-search.sema
 ;; First run embeds the whole corpus and caches it to /tmp; later runs are instant.
 
-(define corpus-glob  "crates/sema-docs/entries/stdlib/**/*.md")
-(define cache-path   "/tmp/sema-docs.vec")
-(define clip-chars   900)
-(define batch-size   64)
+(define corpus-glob "crates/sema-docs/entries/stdlib/**/*.md")
+(define cache-path "/tmp/sema-docs.vec")
+(define clip-chars 900)
+(define batch-size 64)
 
 ;; Read + embed every doc, add it to the store, and persist the store to the cache.
 (define (build-index!)
@@ -59,18 +59,18 @@
 (println f"\nQ: ${question}")
 
 ;; Retrieve: embed the query, cosine top-12 (high recall, coarse order).
-(define query-vec   (llm/embed question))
-(define candidates  (vector-store/search "docs" query-vec 12))
+(define query-vec (llm/embed question))
+(define candidates (vector-store/search "docs" query-vec 12))
 
 ;; Rerank: cross-encoder reorders to the 4 most relevant (precision).
-(define candidate-texts  (map (lambda (c) (:text (:metadata c))) candidates))
-(define reranked         (llm/rerank question candidate-texts {:top-k 4}))
+(define candidate-texts (map (lambda (c) (:text (:metadata c))) candidates))
+(define reranked (llm/rerank question candidate-texts {:top-k 4}))
 
 (println "\nTop matches after reranking (cross-encoder relevance):")
 (for-each
   (lambda (r)
-    (let ((name   (:id (nth candidates (:index r))))
-          (score  (math/round-to (:score r) 3)))
+    (let ((name (:id (nth candidates (:index r))))
+          (score (math/round-to (:score r) 3)))
       (println f"  ${score}  ${name}")))
   reranked)
 

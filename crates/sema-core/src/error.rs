@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
+use crate::runtime::{CancelReason, OperationId, RootId, ScopeId};
 use crate::value::Value;
 
 /// Check arity of a native function's arguments, returning `SemaError::Arity` on mismatch.
@@ -327,6 +328,8 @@ const CONDITION_TYPES: &[&str] = &[
     "llm",
     "reader",
     "permission-denied",
+    "cancelled",
+    "timeout",
 ];
 
 /// The `:message` of a condition map, for `Display` of `SemaError::Condition`.
@@ -355,9 +358,88 @@ fn is_condition_map(value: &Value) -> bool {
             .is_some_and(|m| m.as_str().is_some())
 }
 
+fn cancel_reason_keyword(reason: CancelReason) -> &'static str {
+    match reason {
+        CancelReason::Root => "root",
+        CancelReason::Owner => "owner",
+        CancelReason::Explicit => "explicit",
+        CancelReason::Timeout => "timeout",
+        CancelReason::HostStop => "host-stop",
+        CancelReason::ResourceDisconnect => "resource-disconnect",
+        CancelReason::InterpreterShutdown => "interpreter-shutdown",
+    }
+}
+
+fn insert_decimal(condition: &mut BTreeMap<Value, Value>, key: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        condition.insert(Value::keyword(key), Value::int(value as i64));
+    }
+}
+
+fn insert_optional_string(condition: &mut BTreeMap<Value, Value>, key: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        condition.insert(Value::keyword(key), Value::string(value));
+    }
+}
+
 impl SemaError {
     pub fn eval(msg: impl Into<String>) -> Self {
         SemaError::Eval(msg.into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn cancelled_condition(
+        message: &str,
+        reason: CancelReason,
+        root_id: Option<RootId>,
+        scope_id: Option<ScopeId>,
+        operation_id: Option<OperationId>,
+        operation: Option<&str>,
+        duration_ms: Option<u64>,
+        resource_kind: Option<&str>,
+    ) -> Self {
+        let mut condition = BTreeMap::from([
+            (Value::keyword("type"), Value::keyword("cancelled")),
+            (Value::keyword("message"), Value::string(message)),
+            (
+                Value::keyword("reason"),
+                Value::keyword(cancel_reason_keyword(reason)),
+            ),
+        ]);
+        insert_decimal(&mut condition, "root-id", root_id.map(RootId::get));
+        insert_decimal(&mut condition, "scope-id", scope_id.map(ScopeId::get));
+        insert_decimal(
+            &mut condition,
+            "operation-id",
+            operation_id.map(OperationId::get),
+        );
+        insert_optional_string(&mut condition, "operation", operation);
+        insert_decimal(&mut condition, "duration-ms", duration_ms);
+        insert_optional_string(&mut condition, "resource-kind", resource_kind);
+        SemaError::Condition(Value::map(condition))
+    }
+
+    pub fn timeout_condition(
+        message: &str,
+        operation: &str,
+        duration_ms: u64,
+        operation_id: Option<OperationId>,
+    ) -> Self {
+        let mut condition = BTreeMap::from([
+            (Value::keyword("type"), Value::keyword("timeout")),
+            (Value::keyword("message"), Value::string(message)),
+            (Value::keyword("operation"), Value::string(operation)),
+            (
+                Value::keyword("duration-ms"),
+                Value::int(duration_ms as i64),
+            ),
+        ]);
+        insert_decimal(
+            &mut condition,
+            "operation-id",
+            operation_id.map(OperationId::get),
+        );
+        SemaError::Condition(Value::map(condition))
     }
 
     /// The error a `throw`/`raise` of `value` raises: a caught condition map

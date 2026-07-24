@@ -14,10 +14,10 @@
 (define (script-args)
   (let loop ((args (sys/args)) (found #f))
     (cond
-      ((null? args)         '())
-      (found                (cons (car args) (loop (cdr args) #t)))
-      ((= (car args) "--")  (loop (cdr args) #t))
-      (else                 (loop (cdr args) #f)))))
+      ((null? args) '())
+      (found (cons (car args) (loop (cdr args) #t)))
+      ((= (car args) "--") (loop (cdr args) #t))
+      (else (loop (cdr args) #f)))))
 
 (define args (script-args))
 

@@ -4,11 +4,11 @@
 (println "=== Brainfuck Interpreter ===\n")
 
 ;; --- Tape operations (map of index -> value) ---
-(define tape  (map/new))
-(define ptr   0)
+(define tape (map/new))
+(define ptr 0)
 
-(define (tape-get t p)    (get t p 0))
-(define (tape-set t p v)  (assoc t p v))
+(define (tape-get t p) (get t p 0))
+(define (tape-set t p v) (assoc t p v))
 
 ;; --- Find matching bracket ---
 (define (find-matching-bracket program pos dir)
@@ -96,8 +96,8 @@
 
 (println "\n--- Exclamation Marks ---")
 ;; Prints "!!!" — ASCII 33 = 3*11
-(define excl-bf      "+++[>+++++++++++<-]>.")
-(define excl-result  (bf-run excl-bf))
+(define excl-bf "+++[>+++++++++++<-]>.")
+(define excl-result (bf-run excl-bf))
 (println
   (format "Output: ~a (ASCII ~a)"
     excl-result
@@ -138,10 +138,10 @@
     (list "Alphabet" alpha-bf)))
 (for-each
   (fn (p)
-    (let* ((name   (first p))
-           (code   (nth p 1))
-           (len    (string/length code))
-           (loops  (length (filter (fn (c) (= c #\[)) (string/to-list code)))))
+    (let* ((name (first p))
+           (code (nth p 1))
+           (len (string/length code))
+           (loops (length (filter (fn (c) (= c #\[)) (string/to-list code)))))
       (println
         (format "  ~a: ~a chars, ~a loops"
           (string/pad-right name 14)

@@ -47,17 +47,17 @@
 
 ;; Note frequencies (Hz)
 (define notes
-  {:C4    262
-   :D4    294
-   :E4    330
-   :F4    349
-   :G4    392
-   :A4    440
-   :B4    494
-   :C5    523
-   :D5    587
-   :E5    659
-   :rest  0})
+  {:C4 262
+   :D4 294
+   :E4 330
+   :F4 349
+   :G4 392
+   :A4 440
+   :B4 494
+   :C5 523
+   :D5 587
+   :E5 659
+   :rest 0})
 
 ;; Simple melody: Twinkle Twinkle Little Star
 (define melody
@@ -79,8 +79,8 @@
 
 (for-each
   (fn (note-pair)
-    (let ((n    (car note-pair))
-          (dur  (cadr note-pair)))
+    (let ((n (car note-pair))
+          (dur (cadr note-pair)))
       (let ((freq (get notes n)))
         (if (= freq 0)
           (sleep dur)

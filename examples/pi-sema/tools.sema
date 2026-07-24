@@ -7,8 +7,8 @@
 
 ;; ---- Workspace root ----
 
-(define workspace-root              ".")
-(define (set-workspace-root! path)  (set! workspace-root path))
+(define workspace-root ".")
+(define (set-workspace-root! path) (set! workspace-root path))
 
 ;; ============================================================
 ;; Tool 1: read-file
@@ -21,12 +21,12 @@
     (try
       (let ((resolved (resolve-path workspace-root path)))
         (if (file/exists? resolved)
-          (let* ((content   (file/read resolved))
-                 (total     (count-lines content))
-                 (numbered  (lines->numbered content)))
+          (let* ((content (file/read resolved))
+                 (total (count-lines content))
+                 (numbered (lines->numbered content)))
             (if (> total 2000)
-              (let* ((lines      (string/split numbered "\n"))
-                     (truncated  (string/join (take lines 2000) "\n")))
+              (let* ((lines (string/split numbered "\n"))
+                     (truncated (string/join (take lines 2000) "\n")))
                 (string/append truncated
                   (format "\n\n[truncated — showing first 2000 of ~a lines]"
                     total)))
@@ -109,8 +109,8 @@
       (let ((resolved (resolve-path workspace-root path)))
         (if (not (file/exists? resolved))
           (format "Error: File not found: ~a" path)
-          (let* ((content      (file/read resolved))
-                 (occurrences  (count-occurrences content old_string)))
+          (let* ((content (file/read resolved))
+                 (occurrences (count-occurrences content old_string)))
             (cond
               ((= occurrences 0)
                 (format
@@ -257,10 +257,10 @@
     :description  "Directory path to list (default: current directory)"}}
   (lambda (path)
     (try
-      (let* ((target    (if (= path "") "." path))
-             (resolved  (resolve-path workspace-root target))
-             (result    (shell "sh" "-c" (format "ls -la '~a'" resolved)))
-             (output    (string/trim (:stdout result))))
+      (let* ((target (if (= path "") "." path))
+             (resolved (resolve-path workspace-root target))
+             (result (shell "sh" "-c" (format "ls -la '~a'" resolved)))
+             (output (string/trim (:stdout result))))
         (if (= output "")
           (format "Error: Directory is empty or not found: ~a" path)
           output))

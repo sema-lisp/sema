@@ -342,8 +342,8 @@ fn test_dap_conditional_breakpoint_only_stops_when_truthy() {
 
     let dir = unique_temp_dir("cond_bp");
     let program_path = dir.join("cond.sema");
-    // `f` is called three times; the breakpoint inside its body (line 2) carries
-    // the condition `(= n 2)`, so it must fire only on the second call.
+    // `f` is called three times; the prelude-macro condition on line 2 expands
+    // to `(= n 2)`, so the breakpoint must fire only on the second call.
     std::fs::write(
         &program_path,
         "(define (f n)\n  (+ n 100))\n(f 1)\n(f 2)\n(f 3)\n",
@@ -374,7 +374,7 @@ fn test_dap_conditional_breakpoint_only_stops_when_truthy() {
         "setBreakpoints",
         Some(serde_json::json!({
             "source": { "path": program_path.to_string_lossy() },
-            "breakpoints": [{ "line": 2, "condition": "(= n 2)" }],
+            "breakpoints": [{ "line": 2, "condition": "(-> n (= 2))" }],
         })),
     );
     let resp = read_dap(&mut reader).unwrap();
@@ -765,7 +765,12 @@ fn test_dap_evaluate_and_set_variable_while_stopped() {
     let program_path = dir.join("test_eval_set.sema");
     std::fs::write(
         &program_path,
-        "(define global 5)\n(define (f x)\n  (+ x global))\n(f 10)\n",
+        "(defmacro debug-double (x) (list '+ x x))\n\
+         (define-syntax debug-inc (syntax-rules () ((_ x) (+ x 1))))\n\
+         (define global 5)\n\
+         (define (f x)\n\
+           (+ x global))\n\
+         (f 10)\n",
     )
     .unwrap();
 
@@ -793,7 +798,7 @@ fn test_dap_evaluate_and_set_variable_while_stopped() {
         "setBreakpoints",
         Some(serde_json::json!({
             "source": { "path": program_path.to_string_lossy() },
-            "breakpoints": [{ "line": 3 }],
+            "breakpoints": [{ "line": 5 }],
         })),
     );
     let _resp = read_dap(&mut reader).unwrap();
@@ -845,6 +850,51 @@ fn test_dap_evaluate_and_set_variable_while_stopped() {
     send_dap(
         &mut stdin,
         7,
+        "evaluate",
+        Some(serde_json::json!({
+            "expression": "(-> x (+ global))",
+            "frameId": frame_id,
+            "context": "watch",
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["command"], "evaluate");
+    assert_eq!(resp["success"], true);
+    assert_eq!(resp["body"]["result"], "15");
+
+    send_dap(
+        &mut stdin,
+        8,
+        "evaluate",
+        Some(serde_json::json!({
+            "expression": "(debug-double x)",
+            "frameId": frame_id,
+            "context": "watch",
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["command"], "evaluate");
+    assert_eq!(resp["success"], true);
+    assert_eq!(resp["body"]["result"], "20");
+
+    send_dap(
+        &mut stdin,
+        9,
+        "evaluate",
+        Some(serde_json::json!({
+            "expression": "(debug-inc x)",
+            "frameId": frame_id,
+            "context": "watch",
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["command"], "evaluate");
+    assert_eq!(resp["success"], true);
+    assert_eq!(resp["body"]["result"], "11");
+
+    send_dap(
+        &mut stdin,
+        10,
         "scopes",
         Some(serde_json::json!({ "frameId": frame_id })),
     );
@@ -859,7 +909,7 @@ fn test_dap_evaluate_and_set_variable_while_stopped() {
 
     send_dap(
         &mut stdin,
-        8,
+        11,
         "setVariable",
         Some(serde_json::json!({
             "variablesReference": locals_ref,
@@ -875,7 +925,7 @@ fn test_dap_evaluate_and_set_variable_while_stopped() {
 
     send_dap(
         &mut stdin,
-        9,
+        12,
         "evaluate",
         Some(serde_json::json!({
             "expression": "(+ x global)",
@@ -887,11 +937,11 @@ fn test_dap_evaluate_and_set_variable_while_stopped() {
     assert_eq!(resp["success"], true);
     assert_eq!(resp["body"]["result"], "37");
 
-    send_dap(&mut stdin, 10, "continue", Some(serde_json::json!({})));
+    send_dap(&mut stdin, 13, "continue", Some(serde_json::json!({})));
     let _resp = read_dap(&mut reader).unwrap();
     assert!(wait_for_event(&mut reader, "terminated", 50));
 
-    send_dap(&mut stdin, 11, "disconnect", None);
+    send_dap(&mut stdin, 14, "disconnect", None);
     let _ = read_dap(&mut reader);
     let status = child.wait().expect("failed to wait for child");
     assert!(status.success());
@@ -1383,8 +1433,8 @@ fn test_dap_inspection_after_termination_does_not_hang() {
 }
 
 /// A debugged program that uses async must run to termination: the DAP backend
-/// initializes the async scheduler before `execute_debug`, so `(await (async
-/// ...))` resolves instead of erroring with "no async scheduler registered".
+/// drives the program on the unified cooperative runtime, so `(await (async ...))`
+/// is an ordinary runtime suspension that resolves rather than erroring.
 #[test]
 fn test_dap_async_program_runs_to_termination() {
     let binary = sema_binary();

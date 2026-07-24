@@ -17,8 +17,8 @@
   (define (expand bs)
     (if (null? bs)
       `(list ,body)
-      (let ((clause  (car bs))
-            (rest    (cdr bs)))
+      (let ((clause (car bs))
+            (rest (cdr bs)))
         (if (and (list? clause) (= (car clause) :when))
           ;; Filter clause: (:when pred)
           `(let ((__result ,(expand rest)))
@@ -89,10 +89,10 @@
   (format "\nFizzBuzz 1-20: ~a"
     (for/list ((n (range 1 21)))
       (cond
-        ((= 0 (math/remainder n 15))  "FizzBuzz")
-        ((= 0 (math/remainder n 3))   "Fizz")
-        ((= 0 (math/remainder n 5))   "Buzz")
-        (else                         (str n))))))
+        ((= 0 (math/remainder n 15)) "FizzBuzz")
+        ((= 0 (math/remainder n 3)) "Fizz")
+        ((= 0 (math/remainder n 5)) "Buzz")
+        (else (str n))))))
 
 ;; for/map: build a lookup table
 (define squares-map
@@ -117,9 +117,9 @@
     (for/any? ((n (list 4 6 8 9 10)))
       (let loop ((i 2))
         (cond
-          ((> (* i i) n)               #t)
-          ((= 0 (math/remainder n i))  #f)
-          (else                        (loop (+ i 1))))))))
+          ((> (* i i) n) #t)
+          ((= 0 (math/remainder n i)) #f)
+          (else (loop (+ i 1))))))))
 
 (println
   (format "All positive in (1 2 3 4)? ~a"

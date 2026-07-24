@@ -41,6 +41,28 @@ struct TestDir {
     prev: PathBuf,
 }
 
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
+
 impl TestDir {
     fn enter(dir: &Path) -> Self {
         let prev = std::env::current_dir().expect("cwd");
@@ -94,6 +116,101 @@ impl ScratchRepo {
         std::fs::write(dir.join(".gitignore"), "ignored.txt\n").unwrap();
 
         ScratchRepo { dir }
+    }
+
+    #[cfg(unix)]
+    fn install_blocking_external_diff(&self) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let helper = self.dir.join("external-diff-helper.sh");
+        let started = self.dir.join("external-diff-started");
+        let descendant = self.dir.join("external-diff-descendant");
+        std::fs::write(
+            &helper,
+            "#!/bin/sh\nprintf started > external-diff-started\n( sleep 1; printf leaked > external-diff-descendant ) &\nwait\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&helper, permissions).unwrap();
+        std::fs::write(self.dir.join(".gitattributes"), "a.txt diff=sema-cancel\n").unwrap();
+
+        let output = std::process::Command::new("git")
+            .args([
+                "config",
+                "diff.sema-cancel.command",
+                "./external-diff-helper.sh",
+            ])
+            .current_dir(&self.dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "failed to configure external diff: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (started, descendant)
+    }
+
+    #[cfg(unix)]
+    fn install_exiting_git_wrapper(&self) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = self.dir.join("fake-bin");
+        std::fs::create_dir(&bin).unwrap();
+        let wrapper = bin.join("git");
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\nparent=$$\n/bin/sh -c '\nparent=$1\nwhile [ \"$(ps -o ppid= -p $$ | tr -d \" \" )\" = \"$parent\" ]; do sleep 0.01; done\nprintf exited > direct-child-exited\nsleep 1\nprintf leaked > inherited-pipe-descendant\n' child \"$parent\" &\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, permissions).unwrap();
+        bin
+    }
+
+    /// A fake `git` on PATH that forks a descendant into its own process group
+    /// (a delayed marker writer) and then floods stdout far past the (lowered)
+    /// output cap. The over-cap drain must SIGKILL the whole group — reaping the
+    /// descendant before it can write its marker — and reject the task with the
+    /// structured over-cap error. Returns the wrapper's PATH dir and the marker a
+    /// direct-child-only kill would leak.
+    #[cfg(unix)]
+    fn install_over_cap_git_wrapper(&self) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = self.dir.join("over-cap-fake-bin");
+        std::fs::create_dir(&bin).unwrap();
+        let wrapper = bin.join("git");
+        let descendant = self.dir.join("over-cap-descendant");
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\n( sleep 1; printf leaked > over-cap-descendant ) &\ni=0\nwhile [ $i -lt 8192 ]; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n'; i=$((i+1)); done\nwait\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, permissions).unwrap();
+        (bin, descendant)
+    }
+
+    #[cfg(unix)]
+    fn install_escaped_git_wrapper(&self) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin = self.dir.join("escaped-fake-bin");
+        std::fs::create_dir(&bin).unwrap();
+        let wrapper = bin.join("git");
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\n\"$SEMA_GIT_HELPER_BIN\" --exact escaped_process_group_pipe_holder --ignored --nocapture &\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, permissions).unwrap();
+        bin
     }
 }
 
@@ -320,4 +437,238 @@ fn git_async_error_matches_sync_outside_repo() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Cancelling a runtime `git/diff` kills the entire Git process group. The
+/// external diff helper forks a descendant that writes a delayed marker; a
+/// direct-child-only kill leaves that descendant alive and fails this test.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn git_diff_cancel_kills_external_diff_descendant() {
+    if !git_available() {
+        eprintln!("skipping git_diff_cancel_kills_external_diff_descendant: no git on PATH");
+        return;
+    }
+    let repo = ScratchRepo::new("cancel-descendant");
+    let (started, descendant) = repo.install_blocking_external_diff();
+    let _cwd = TestDir::enter(&repo.dir);
+
+    let interp = Interpreter::new();
+    let result = interp
+        .eval_str_compiled(
+            r#"
+            (let ((pending (async/spawn (fn () (git/diff)))))
+              (let wait-for-helper ((remaining 4000))
+                (cond
+                  ((file/exists? "external-diff-started") nil)
+                  ((= remaining 0) (error "external diff helper did not start"))
+                  (else
+                    (async/sleep 5)
+                    (wait-for-helper (- remaining 1)))))
+              (let ((requested (async/cancel pending))
+                    (settled (try (async/await pending) (catch error :cancelled))))
+                (list requested settled)))
+            "#,
+        )
+        .expect("cancelled git/diff settles");
+    assert_eq!(
+        result,
+        Value::list(vec![Value::bool(true), Value::keyword("cancelled")])
+    );
+    assert!(started.exists(), "external diff helper must have started");
+
+    std::thread::sleep(std::time::Duration::from_millis(1_300));
+    assert!(
+        !descendant.exists(),
+        "external diff descendant survived cancellation and wrote its marker"
+    );
+}
+
+/// The Git leader may exit before a descendant that inherited its output pipes.
+/// Cancellation must still target the original Unix process group while that
+/// descendant holds the drains open.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn git_cancel_after_direct_exit_kills_inherited_pipe_descendant() {
+    if !git_available() {
+        eprintln!(
+            "skipping git_cancel_after_direct_exit_kills_inherited_pipe_descendant: no git on PATH"
+        );
+        return;
+    }
+    let repo = ScratchRepo::new("cancel-after-exit");
+    let bin = repo.install_exiting_git_wrapper();
+    let prior_path = std::env::var_os("PATH").unwrap_or_default();
+    let joined_path =
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&prior_path)))
+            .unwrap();
+    let _path = EnvVarGuard::set("PATH", joined_path);
+    let _cwd = TestDir::enter(&repo.dir);
+
+    let result = Interpreter::new()
+        .eval_str_compiled(
+            r#"
+            (let ((pending (async/spawn (fn () (git/diff)))))
+              (let wait-for-direct-exit ((remaining 4000))
+                (cond
+                  ((file/exists? "direct-child-exited") nil)
+                  ((= remaining 0) (error "git wrapper did not exit"))
+                  (else
+                    (async/sleep 5)
+                    (wait-for-direct-exit (- remaining 1)))))
+              (let ((requested (async/cancel pending))
+                    (settled (try (async/await pending) (catch error :cancelled))))
+                (list requested settled)))
+            "#,
+        )
+        .expect("cancelled git wrapper settles");
+    assert_eq!(
+        result,
+        Value::list(vec![Value::bool(true), Value::keyword("cancelled")])
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(1_300));
+    assert!(
+        !repo.dir.join("inherited-pipe-descendant").exists(),
+        "inherited-pipe descendant survived after the direct child exited"
+    );
+}
+
+/// An inherited-pipe descendant can escape Git's process group. Cancellation
+/// must finish bounded cleanup without waiting for that foreign process to
+/// close stdout/stderr naturally.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn git_cancel_bounds_drains_held_by_escaped_descendant() {
+    if !git_available() {
+        eprintln!("skipping git_cancel_bounds_drains_held_by_escaped_descendant: no git on PATH");
+        return;
+    }
+    let repo = ScratchRepo::new("cancel-escaped");
+    let bin = repo.install_escaped_git_wrapper();
+    let prior_path = std::env::var_os("PATH").unwrap_or_default();
+    let joined_path =
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&prior_path)))
+            .unwrap();
+    let ready = repo.dir.join("escaped-helper-ready");
+    let pid_path = repo.dir.join("escaped-helper-pid");
+    let leaked = repo.dir.join("escaped-helper-natural-release");
+    let _path = EnvVarGuard::set("PATH", joined_path);
+    let _helper = EnvVarGuard::set("SEMA_GIT_HELPER_BIN", std::env::current_exe().unwrap());
+    let _ready = EnvVarGuard::set("SEMA_GIT_ESCAPED_READY", &ready);
+    let _pid = EnvVarGuard::set("SEMA_GIT_ESCAPED_PID", &pid_path);
+    let _leaked = EnvVarGuard::set("SEMA_GIT_ESCAPED_LEAKED", &leaked);
+    let _cwd = TestDir::enter(&repo.dir);
+
+    let interp = Interpreter::new();
+    let started = std::time::Instant::now();
+    let result = interp
+        .eval_str_compiled(
+            r#"
+            (let ((pending (async/spawn (fn () (git/diff)))))
+              (let wait-for-escaped-helper ((remaining 4000))
+                (cond
+                  ((file/exists? "escaped-helper-ready") nil)
+                  ((= remaining 0) (error "escaped helper did not start"))
+                  (else
+                    (async/sleep 5)
+                    (wait-for-escaped-helper (- remaining 1)))))
+              (let ((requested (async/cancel pending))
+                    (settled (try (async/await pending) (catch error :cancelled))))
+                (list requested settled)))
+            "#,
+        )
+        .expect("cancelled git with escaped descendant settles");
+    drop(interp);
+    let elapsed = started.elapsed();
+
+    let helper_pid: i32 = std::fs::read_to_string(&pid_path).unwrap().parse().unwrap();
+    // SAFETY: the helper writes its own pid after successfully entering a new
+    // session; this test owns that short-lived helper process.
+    unsafe {
+        libc::kill(helper_pid, libc::SIGKILL);
+    }
+    assert_eq!(
+        result,
+        Value::list(vec![Value::bool(true), Value::keyword("cancelled")])
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(1_500),
+        "escaped-pipe cancellation plus interpreter shutdown took {elapsed:?}"
+    );
+    assert!(
+        !leaked.exists(),
+        "cancellation waited for an escaped descendant to release inherited pipes"
+    );
+}
+
+/// A runtime `git/*` whose subprocess floods stdout past the pre-dispatch output
+/// cap must kill the entire Git process group (via the same hook cancellation
+/// uses) and reject the task with a structured over-cap error — never buffer a
+/// hostile pipe to exhaustion. The fake `git` forks a descendant that would
+/// write a delayed marker; a direct-child-only kill would leak it.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn git_output_over_cap_kills_group_and_errors() {
+    if !git_available() {
+        eprintln!("skipping git_output_over_cap_kills_group_and_errors: no git on PATH");
+        return;
+    }
+    let repo = ScratchRepo::new("over-cap");
+    let (bin, descendant) = repo.install_over_cap_git_wrapper();
+    let prior_path = std::env::var_os("PATH").unwrap_or_default();
+    let joined_path =
+        std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&prior_path)))
+            .unwrap();
+    let _path = EnvVarGuard::set("PATH", joined_path);
+    let _cwd = TestDir::enter(&repo.dir);
+
+    // Lower the per-pipe cap so the wrapper's output trips it within one chunk —
+    // no multi-megabyte fixture required. Cleared before any assertion can unwind.
+    sema_stdlib::set_git_max_output_bytes_override(Some(64));
+    let interp = Interpreter::new();
+    let result = interp.eval_str_compiled("(await (async/spawn (fn () (git/diff))))");
+    sema_stdlib::set_git_max_output_bytes_override(None);
+
+    let err = result.expect_err("git output over the cap must reject the task");
+    let message = err.to_string();
+    assert!(
+        message.contains("output exceeded") && message.contains("64"),
+        "expected a structured over-cap error naming the cap, got: {message}"
+    );
+
+    // The group SIGKILL must also reap the wrapper's forked descendant before its
+    // delayed marker write — a direct-child-only kill would let it leak.
+    std::thread::sleep(std::time::Duration::from_millis(1_300));
+    assert!(
+        !descendant.exists(),
+        "over-cap cleanup left a process-group descendant alive"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "subprocess fixture invoked by git_cancel_bounds_drains_held_by_escaped_descendant"]
+fn escaped_process_group_pipe_holder() {
+    // SAFETY: this isolated helper process intentionally leaves the Git-owned
+    // process group to exercise cancellation of foreign inherited-pipe holders.
+    let session = unsafe { libc::setsid() };
+    assert_ne!(
+        session,
+        -1,
+        "setsid failed: {}",
+        std::io::Error::last_os_error()
+    );
+
+    let ready = std::env::var_os("SEMA_GIT_ESCAPED_READY").unwrap();
+    let pid_path = std::env::var_os("SEMA_GIT_ESCAPED_PID").unwrap();
+    let leaked = std::env::var_os("SEMA_GIT_ESCAPED_LEAKED").unwrap();
+    std::fs::write(pid_path, std::process::id().to_string()).unwrap();
+    std::fs::write(ready, "ready").unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(10));
+    std::fs::write(leaked, "natural release").unwrap();
 }

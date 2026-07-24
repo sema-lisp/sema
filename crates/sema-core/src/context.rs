@@ -1,14 +1,27 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, HashMap};
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
-use std::time::Instant;
+use std::rc::{Rc, Weak};
 
+use web_time::Instant;
+
+use crate::runtime::{
+    apply_dynamic_mutations, DynamicStackIdentities, DynamicTaskState, ModuleTaskState,
+    NativeCallContext, ScopeId, TaskContextHandle,
+};
 use crate::{CallFrame, Env, Sandbox, SemaError, Span, SpanMap, StackTrace, Value};
 
 const MAX_SPAN_TABLE_ENTRIES: usize = 200_000;
 
 /// Function-pointer type for the full evaluator callback: (ctx, expr, env) -> Result<Value, SemaError>
 pub type EvalCallbackFn = fn(&EvalContext, &Value, &Env) -> Result<Value, SemaError>;
+
+/// Function-pointer type for macro expansion with an explicit runtime-native
+/// context. The expansion implementation may run bounded restricted evaluators,
+/// but it must not drive the scheduler or retain any borrowed input.
+pub type MacroExpandCallbackFn =
+    for<'a> fn(&NativeCallContext<'a>, &Value, &Env) -> Result<Value, SemaError>;
 
 /// Function-pointer type for calling a function value with evaluated arguments: (ctx, func, args) -> Result<Value, SemaError>
 pub type CallCallbackFn = fn(&EvalContext, &Value, &[Value]) -> Result<Value, SemaError>;
@@ -17,6 +30,73 @@ pub type CallCallbackFn = fn(&EvalContext, &Value, &[Value]) -> Result<Value, Se
 /// caller passes a buffer it owns and will not reuse, and the callee may move
 /// values out of it (leaving nil behind). See [`call_callback_owned`].
 pub type CallOwnedCallbackFn = fn(&EvalContext, &Value, &mut [Value]) -> Result<Value, SemaError>;
+
+type InterpreterTeardownHook = Box<dyn Fn()>;
+
+pub type ContextStackMap = BTreeMap<Value, Vec<Value>>;
+
+/// Legacy-compatible dynamic stack storage whose mutable guard renews opaque
+/// entry identities on drop. Direct mutation therefore cannot bypass the ABA
+/// protection used by task-root snapshots.
+#[derive(Default)]
+pub struct ContextStacks {
+    values: RefCell<ContextStackMap>,
+    identities: RefCell<DynamicStackIdentities>,
+}
+
+impl ContextStacks {
+    pub fn borrow(&self) -> Ref<'_, ContextStackMap> {
+        self.values.borrow()
+    }
+
+    pub fn borrow_mut(&self) -> ContextStacksMut<'_> {
+        ContextStacksMut {
+            values: self.values.borrow_mut(),
+            identities: self.identities.borrow_mut(),
+        }
+    }
+
+    fn snapshot(&self) -> (ContextStackMap, DynamicStackIdentities) {
+        (
+            self.values.borrow().clone(),
+            self.identities.borrow().clone(),
+        )
+    }
+
+    fn borrow_parts_mut(
+        &self,
+    ) -> (
+        RefMut<'_, ContextStackMap>,
+        RefMut<'_, DynamicStackIdentities>,
+    ) {
+        (self.values.borrow_mut(), self.identities.borrow_mut())
+    }
+}
+
+pub struct ContextStacksMut<'a> {
+    values: RefMut<'a, ContextStackMap>,
+    identities: RefMut<'a, DynamicStackIdentities>,
+}
+
+impl Deref for ContextStacksMut<'_> {
+    type Target = ContextStackMap;
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl DerefMut for ContextStacksMut<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.values
+    }
+}
+
+impl Drop for ContextStacksMut<'_> {
+    fn drop(&mut self) {
+        *self.identities = DynamicStackIdentities::from_stacks(&self.values);
+    }
+}
 
 pub struct EvalContext {
     pub module_cache: RefCell<BTreeMap<PathBuf, BTreeMap<String, Value>>>,
@@ -38,11 +118,46 @@ pub struct EvalContext {
     pub sandbox: Sandbox,
     pub user_context: RefCell<Vec<BTreeMap<Value, Value>>>,
     pub hidden_context: RefCell<Vec<BTreeMap<Value, Value>>>,
-    pub context_stacks: RefCell<BTreeMap<Value, Vec<Value>>>,
+    pub context_stacks: ContextStacks,
+    /// Interpreter-wide roots for callbacks registered by `sys/on-signal`.
+    /// This store is intentionally separate from task-local dynamic context:
+    /// any root may dispatch a subscription installed by another root.
+    signal_callbacks: RefCell<[Vec<Value>; 3]>,
+    /// Weak, non-Value hooks that release host resources at interpreter
+    /// teardown even when an embedder retains the global environment.
+    interpreter_teardown_hooks: RefCell<Vec<InterpreterTeardownHook>>,
     pub eval_fn: Cell<Option<EvalCallbackFn>>,
+    macro_expand_fn: Cell<Option<MacroExpandCallbackFn>>,
     pub call_fn: Cell<Option<CallCallbackFn>>,
     pub call_owned_fn: Cell<Option<CallOwnedCallbackFn>>,
     pub interactive: Cell<bool>,
+    task_context: RefCell<Option<InstalledTaskContext>>,
+    legacy_call_env: RefCell<Option<Weak<Env>>>,
+    runtime_quantum_active: Cell<bool>,
+}
+
+#[derive(Clone)]
+struct InstalledTaskContext {
+    handle: TaskContextHandle,
+    // Cache the typed Rcs at installation so EvalContext compatibility methods
+    // do not need to re-borrow the task-local extension map during a native's
+    // own short, scoped task-context operation.
+    // The canonical state is still the extension owned by `handle`; every
+    // installation refreshes this cached clone of the same Rc.
+    dynamic: Option<Rc<DynamicTaskState>>,
+    module: Option<Rc<ModuleTaskState>>,
+}
+
+impl InstalledTaskContext {
+    fn new(handle: TaskContextHandle) -> Self {
+        let dynamic = handle.get_rc::<DynamicTaskState>();
+        let module = handle.get_rc::<ModuleTaskState>();
+        Self {
+            handle,
+            dynamic,
+            module,
+        }
+    }
 }
 
 /// RAII guard for a module-load scope: pops the load stack when dropped, so the
@@ -50,13 +165,69 @@ pub struct EvalContext {
 /// by [`EvalContext::enter_module_load`].
 pub struct ModuleLoadGuard<'a> {
     ctx: &'a EvalContext,
-    path: PathBuf,
+    scope: ModuleLoadScope,
+}
+
+#[derive(Debug)]
+enum ModuleLoadScope {
+    Ambient(PathBuf),
+    Task {
+        state: Rc<ModuleTaskState>,
+        scope: ScopeId,
+    },
+}
+
+pub struct TaskContextGuard<'a> {
+    ctx: &'a EvalContext,
+    previous: Option<InstalledTaskContext>,
+}
+
+/// Restores the value-ABI native call environment when a VM dispatch returns
+/// or unwinds. The weak handle avoids making `EvalContext` an owner of an
+/// interpreter or isolated module environment.
+#[doc(hidden)]
+#[must_use = "the call environment guard must live for the native invocation"]
+pub struct LegacyCallEnvGuard<'a> {
+    ctx: &'a EvalContext,
+    previous: Option<Weak<Env>>,
+}
+
+impl Drop for TaskContextGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx.task_context.replace(self.previous.take());
+    }
+}
+
+impl Drop for LegacyCallEnvGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx.legacy_call_env.replace(self.previous.take());
+    }
 }
 
 impl Drop for ModuleLoadGuard<'_> {
     fn drop(&mut self) {
-        self.ctx.end_module_load(&self.path);
+        match &self.scope {
+            ModuleLoadScope::Ambient(path) => self.ctx.end_module_load(path),
+            ModuleLoadScope::Task { state, scope } => {
+                state.remove_loading(*scope);
+            }
+        }
     }
+}
+
+fn check_module_cycle(stack: &[PathBuf], path: &PathBuf) -> Result<(), SemaError> {
+    let Some(pos) = stack.iter().position(|candidate| candidate == path) else {
+        return Ok(());
+    };
+    let mut cycle: Vec<String> = stack[pos..]
+        .iter()
+        .map(|entry| entry.display().to_string())
+        .collect();
+    cycle.push(path.display().to_string());
+    Err(SemaError::eval(format!(
+        "cyclic import detected: {}",
+        cycle.join(" -> ")
+    )))
 }
 
 impl EvalContext {
@@ -77,11 +248,17 @@ impl EvalContext {
             sandbox: Sandbox::allow_all(),
             user_context: RefCell::new(vec![BTreeMap::new()]),
             hidden_context: RefCell::new(vec![BTreeMap::new()]),
-            context_stacks: RefCell::new(BTreeMap::new()),
+            context_stacks: ContextStacks::default(),
+            signal_callbacks: RefCell::default(),
+            interpreter_teardown_hooks: RefCell::default(),
             eval_fn: Cell::new(None),
+            macro_expand_fn: Cell::new(None),
             call_fn: Cell::new(None),
             call_owned_fn: Cell::new(None),
             interactive: Cell::new(false),
+            task_context: RefCell::new(None),
+            legacy_call_env: RefCell::new(None),
+            runtime_quantum_active: Cell::new(false),
         }
     }
 
@@ -102,30 +279,180 @@ impl EvalContext {
             sandbox,
             user_context: RefCell::new(vec![BTreeMap::new()]),
             hidden_context: RefCell::new(vec![BTreeMap::new()]),
-            context_stacks: RefCell::new(BTreeMap::new()),
+            context_stacks: ContextStacks::default(),
+            signal_callbacks: RefCell::default(),
+            interpreter_teardown_hooks: RefCell::default(),
             eval_fn: Cell::new(None),
+            macro_expand_fn: Cell::new(None),
             call_fn: Cell::new(None),
             call_owned_fn: Cell::new(None),
             interactive: Cell::new(false),
+            task_context: RefCell::new(None),
+            legacy_call_env: RefCell::new(None),
+            runtime_quantum_active: Cell::new(false),
+        }
+    }
+
+    pub fn task_context(&self) -> Option<TaskContextHandle> {
+        self.task_context
+            .borrow()
+            .as_ref()
+            .map(|installed| installed.handle.clone())
+    }
+
+    pub fn install_task_context(&self, handle: TaskContextHandle) -> Option<TaskContextHandle> {
+        self.task_context
+            .replace(Some(InstalledTaskContext::new(handle)))
+            .map(|installed| installed.handle)
+    }
+
+    pub fn scope_task_context(&self, handle: TaskContextHandle) -> TaskContextGuard<'_> {
+        TaskContextGuard {
+            ctx: self,
+            previous: self
+                .task_context
+                .replace(Some(InstalledTaskContext::new(handle))),
+        }
+    }
+
+    /// Installs the globals of the VM invoking a native through its synchronous
+    /// value ABI. Nested VM dispatches replace this weak handle for their scope
+    /// and the guard restores the previous environment on every exit path.
+    #[doc(hidden)]
+    pub fn scope_legacy_call_env(&self, env: &Rc<Env>) -> LegacyCallEnvGuard<'_> {
+        LegacyCallEnvGuard {
+            ctx: self,
+            previous: self.legacy_call_env.replace(Some(Rc::downgrade(env))),
+        }
+    }
+
+    /// Returns the synchronous VM environment installed for the current native
+    /// invocation. Direct host calls have no installed environment.
+    #[doc(hidden)]
+    pub fn legacy_call_env(&self) -> Option<Rc<Env>> {
+        self.legacy_call_env
+            .borrow()
+            .as_ref()
+            .and_then(Weak::upgrade)
+    }
+
+    fn dynamic_task_state(&self) -> Option<Rc<DynamicTaskState>> {
+        self.task_context
+            .borrow()
+            .as_ref()
+            .and_then(|installed| installed.dynamic.clone())
+    }
+
+    fn module_task_state(&self) -> Option<Rc<ModuleTaskState>> {
+        self.task_context
+            .borrow()
+            .as_ref()
+            .and_then(|installed| installed.module.clone())
+    }
+
+    pub fn enter_runtime_quantum(&self) -> Result<RuntimeQuantumGuard<'_>, SemaError> {
+        if self.runtime_quantum_active.replace(true) {
+            return Err(SemaError::eval(
+                "internal error: runtime VM quantum is already active",
+            ));
+        }
+        // Mirror the per-context flag into a thread-local so context-free
+        // host-adapter guards reject synchronous or blocking entry during any
+        // active runtime quantum, including one owned by a different context.
+        let previous_thread_local = crate::in_runtime_quantum();
+        crate::set_runtime_quantum(true);
+        Ok(RuntimeQuantumGuard {
+            ctx: self,
+            previous_thread_local,
+        })
+    }
+
+    pub fn runtime_quantum_active(&self) -> bool {
+        self.runtime_quantum_active.get()
+    }
+
+    pub fn take_task_context(&self) -> Option<TaskContextHandle> {
+        self.task_context
+            .borrow_mut()
+            .take()
+            .map(|installed| installed.handle)
+    }
+
+    #[doc(hidden)]
+    pub fn register_signal_callback(&self, signal_index: usize, callback: Value) {
+        self.signal_callbacks.borrow_mut()[signal_index].push(callback);
+    }
+
+    #[doc(hidden)]
+    pub fn signal_callbacks(&self, signal_index: usize) -> Vec<Value> {
+        self.signal_callbacks.borrow()[signal_index].clone()
+    }
+
+    #[doc(hidden)]
+    pub fn register_interpreter_teardown_hook(&self, hook: impl Fn() + 'static) {
+        self.interpreter_teardown_hooks
+            .borrow_mut()
+            .push(Box::new(hook));
+    }
+
+    #[doc(hidden)]
+    pub fn try_run_interpreter_teardown_hooks(&self) -> bool {
+        let hooks = match self.interpreter_teardown_hooks.try_borrow_mut() {
+            Ok(mut hooks) => std::mem::take(&mut *hooks),
+            Err(_) => return false,
+        };
+        for hook in hooks {
+            hook();
+        }
+        true
+    }
+
+    /// Compatibility name for hosts built against the signal-specific hook API.
+    #[doc(hidden)]
+    pub fn register_signal_teardown_hook(&self, hook: impl Fn() + 'static) {
+        self.register_interpreter_teardown_hook(hook);
+    }
+
+    /// Compatibility name for hosts built against the signal-specific hook API.
+    #[doc(hidden)]
+    pub fn try_run_signal_teardown_hooks(&self) -> bool {
+        self.try_run_interpreter_teardown_hooks()
+    }
+
+    #[doc(hidden)]
+    pub fn clear_signal_callbacks(&self) {
+        for callbacks in self.signal_callbacks.borrow_mut().iter_mut() {
+            callbacks.clear();
         }
     }
 
     pub fn push_file_path(&self, path: PathBuf) {
+        if let Some(state) = self.module_task_state() {
+            state
+                .push_current_file(path)
+                .expect("module current-file scope identity exhausted");
+            return;
+        }
         self.current_file.borrow_mut().push(path);
     }
 
     pub fn pop_file_path(&self) {
+        if let Some(state) = self.module_task_state() {
+            state.pop_current_file();
+            return;
+        }
         self.current_file.borrow_mut().pop();
     }
 
     pub fn current_file_dir(&self) -> Option<PathBuf> {
-        self.current_file
-            .borrow()
-            .last()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        self.current_file_path()
+            .and_then(|path| path.parent().map(|dir| dir.to_path_buf()))
     }
 
     pub fn current_file_path(&self) -> Option<PathBuf> {
+        if let Some(state) = self.module_task_state() {
+            return state.current_file();
+        }
         self.current_file.borrow().last().cloned()
     }
 
@@ -158,6 +485,10 @@ impl EvalContext {
     }
 
     pub fn set_module_exports(&self, names: Vec<String>) {
+        if let Some(state) = self.module_task_state() {
+            state.set_current_exports(names);
+            return;
+        }
         let mut stack = self.module_exports.borrow_mut();
         if let Some(top) = stack.last_mut() {
             *top = Some(names);
@@ -165,10 +496,19 @@ impl EvalContext {
     }
 
     pub fn clear_module_exports(&self) {
+        if let Some(state) = self.module_task_state() {
+            state
+                .push_exports(None)
+                .expect("module export scope identity exhausted");
+            return;
+        }
         self.module_exports.borrow_mut().push(None);
     }
 
     pub fn take_module_exports(&self) -> Option<Vec<String>> {
+        if let Some(state) = self.module_task_state() {
+            return state.pop_exports().flatten();
+        }
         self.module_exports.borrow_mut().pop().flatten()
     }
 
@@ -176,25 +516,21 @@ impl EvalContext {
     /// returned [`ModuleLoadGuard`] pops the load stack when dropped, keeping it
     /// balanced on any exit path. Errors if `path` is already being loaded.
     pub fn enter_module_load(&self, path: PathBuf) -> Result<ModuleLoadGuard<'_>, SemaError> {
-        self.begin_module_load(&path)?;
-        Ok(ModuleLoadGuard { ctx: self, path })
+        let scope = self.begin_module_load(&path)?;
+        Ok(ModuleLoadGuard { ctx: self, scope })
     }
 
-    fn begin_module_load(&self, path: &PathBuf) -> Result<(), SemaError> {
-        let mut stack = self.module_load_stack.borrow_mut();
-        if let Some(pos) = stack.iter().position(|p| p == path) {
-            let mut cycle: Vec<String> = stack[pos..]
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect();
-            cycle.push(path.display().to_string());
-            return Err(SemaError::eval(format!(
-                "cyclic import detected: {}",
-                cycle.join(" -> ")
-            )));
+    fn begin_module_load(&self, path: &PathBuf) -> Result<ModuleLoadScope, SemaError> {
+        if let Some(state) = self.module_task_state() {
+            check_module_cycle(&state.loading(), path)?;
+            let scope = state
+                .push_loading(path.clone())
+                .map_err(|error| SemaError::eval(format!("module load scope: {error}")))?;
+            return Ok(ModuleLoadScope::Task { state, scope });
         }
-        stack.push(path.clone());
-        Ok(())
+        check_module_cycle(&self.module_load_stack.borrow(), path)?;
+        self.module_load_stack.borrow_mut().push(path.clone());
+        Ok(ModuleLoadScope::Ambient(path.clone()))
     }
 
     fn end_module_load(&self, path: &PathBuf) {
@@ -302,6 +638,9 @@ impl EvalContext {
     // --- User context methods ---
 
     pub fn context_get(&self, key: &Value) -> Option<Value> {
+        if let Some(state) = self.dynamic_task_state() {
+            return state.user_get(key);
+        }
         let frames = self.user_context.borrow();
         for frame in frames.iter().rev() {
             if let Some(v) = frame.get(key) {
@@ -312,6 +651,10 @@ impl EvalContext {
     }
 
     pub fn context_set(&self, key: Value, value: Value) {
+        if let Some(state) = self.dynamic_task_state() {
+            state.user_set(key, value);
+            return;
+        }
         let mut frames = self.user_context.borrow_mut();
         if let Some(top) = frames.last_mut() {
             top.insert(key, value);
@@ -319,11 +662,17 @@ impl EvalContext {
     }
 
     pub fn context_has(&self, key: &Value) -> bool {
+        if let Some(state) = self.dynamic_task_state() {
+            return state.user_get(key).is_some();
+        }
         let frames = self.user_context.borrow();
         frames.iter().any(|frame| frame.contains_key(key))
     }
 
     pub fn context_remove(&self, key: &Value) -> Option<Value> {
+        if let Some(state) = self.dynamic_task_state() {
+            return state.user_remove(key);
+        }
         let mut frames = self.user_context.borrow_mut();
         let mut first_found = None;
         for frame in frames.iter_mut().rev() {
@@ -337,6 +686,9 @@ impl EvalContext {
     }
 
     pub fn context_all(&self) -> BTreeMap<Value, Value> {
+        if let Some(state) = self.dynamic_task_state() {
+            return state.user_all();
+        }
         let frames = self.user_context.borrow();
         let mut merged = BTreeMap::new();
         for frame in frames.iter() {
@@ -348,14 +700,30 @@ impl EvalContext {
     }
 
     pub fn context_push_frame(&self) {
+        if let Some(state) = self.dynamic_task_state() {
+            state
+                .push_user_frame(BTreeMap::new())
+                .expect("dynamic user-context scope identity exhausted");
+            return;
+        }
         self.user_context.borrow_mut().push(BTreeMap::new());
     }
 
     pub fn context_push_frame_with(&self, bindings: BTreeMap<Value, Value>) {
+        if let Some(state) = self.dynamic_task_state() {
+            state
+                .push_user_frame(bindings)
+                .expect("dynamic user-context scope identity exhausted");
+            return;
+        }
         self.user_context.borrow_mut().push(bindings);
     }
 
     pub fn context_pop_frame(&self) {
+        if let Some(state) = self.dynamic_task_state() {
+            state.pop_user_frame();
+            return;
+        }
         let mut frames = self.user_context.borrow_mut();
         if frames.len() > 1 {
             frames.pop();
@@ -363,6 +731,10 @@ impl EvalContext {
     }
 
     pub fn context_clear(&self) {
+        if let Some(state) = self.dynamic_task_state() {
+            state.user_clear();
+            return;
+        }
         let mut frames = self.user_context.borrow_mut();
         frames.clear();
         frames.push(BTreeMap::new());
@@ -371,6 +743,9 @@ impl EvalContext {
     // --- Hidden context methods ---
 
     pub fn hidden_get(&self, key: &Value) -> Option<Value> {
+        if let Some(state) = self.dynamic_task_state() {
+            return state.hidden_get(key);
+        }
         let frames = self.hidden_context.borrow();
         for frame in frames.iter().rev() {
             if let Some(v) = frame.get(key) {
@@ -381,6 +756,10 @@ impl EvalContext {
     }
 
     pub fn hidden_set(&self, key: Value, value: Value) {
+        if let Some(state) = self.dynamic_task_state() {
+            state.hidden_set(key, value);
+            return;
+        }
         let mut frames = self.hidden_context.borrow_mut();
         if let Some(top) = frames.last_mut() {
             top.insert(key, value);
@@ -388,15 +767,28 @@ impl EvalContext {
     }
 
     pub fn hidden_has(&self, key: &Value) -> bool {
+        if let Some(state) = self.dynamic_task_state() {
+            return state.hidden_get(key).is_some();
+        }
         let frames = self.hidden_context.borrow();
         frames.iter().any(|frame| frame.contains_key(key))
     }
 
     pub fn hidden_push_frame(&self) {
+        if let Some(state) = self.dynamic_task_state() {
+            state
+                .push_hidden_frame(BTreeMap::new())
+                .expect("dynamic hidden-context scope identity exhausted");
+            return;
+        }
         self.hidden_context.borrow_mut().push(BTreeMap::new());
     }
 
     pub fn hidden_pop_frame(&self) {
+        if let Some(state) = self.dynamic_task_state() {
+            state.pop_hidden_frame();
+            return;
+        }
         let mut frames = self.hidden_context.borrow_mut();
         if frames.len() > 1 {
             frames.pop();
@@ -405,15 +797,73 @@ impl EvalContext {
 
     // --- Stack methods ---
 
+    /// Capture an independent root-authority snapshot of the interpreter-wide
+    /// dynamic state. Stack entry identities are shared with the publication
+    /// baseline so a stale root cannot remove an equal replacement entry.
+    #[doc(hidden)]
+    pub fn snapshot_dynamic_task_state(&self) -> DynamicTaskState {
+        let user_frames = self.user_context.borrow().clone();
+        let hidden_frames = self.hidden_context.borrow().clone();
+        let (stacks, identities) = self.context_stacks.snapshot();
+        DynamicTaskState::root_with_stack_identities(
+            user_frames,
+            hidden_frames,
+            stacks,
+            &identities,
+        )
+    }
+
+    /// Capture the transient module-resolution scopes inherited by a new root.
+    /// These scopes are task-private and never publish back at settlement.
+    #[doc(hidden)]
+    pub fn snapshot_module_task_state(&self) -> ModuleTaskState {
+        ModuleTaskState::from_snapshot(
+            self.current_file.borrow().clone(),
+            self.module_load_stack.borrow().clone(),
+            self.module_exports.borrow().clone(),
+        )
+    }
+
+    /// Publish and drain one root snapshot's mutation journal. Child snapshots
+    /// carry no journal and return `false` without changing interpreter state.
+    #[doc(hidden)]
+    pub fn publish_dynamic_task_state(&self, state: &DynamicTaskState) -> bool {
+        let mut user_frames = self.user_context.borrow_mut();
+        let mut hidden_frames = self.hidden_context.borrow_mut();
+        let (mut stacks, mut identities) = self.context_stacks.borrow_parts_mut();
+        assert!(
+            identities.matches_stacks(&stacks),
+            "dynamic stack identities must match their value entries"
+        );
+        let Some(mutations) = state.drain_mutations() else {
+            return false;
+        };
+        apply_dynamic_mutations(
+            &mut user_frames,
+            &mut hidden_frames,
+            &mut stacks,
+            &mut identities,
+            &mutations,
+        );
+        true
+    }
+
     pub fn context_stack_push(&self, key: Value, value: Value) {
-        self.context_stacks
-            .borrow_mut()
-            .entry(key)
-            .or_default()
-            .push(value);
+        if let Some(state) = self.dynamic_task_state() {
+            state
+                .stack_push(key, value)
+                .expect("dynamic context-stack scope identity exhausted");
+            return;
+        }
+        let (mut stacks, mut identities) = self.context_stacks.borrow_parts_mut();
+        stacks.entry(key.clone()).or_default().push(value);
+        identities.push(key);
     }
 
     pub fn context_stack_get(&self, key: &Value) -> Vec<Value> {
+        if let Some(state) = self.dynamic_task_state() {
+            return state.stack_get(key);
+        }
         self.context_stacks
             .borrow()
             .get(key)
@@ -422,13 +872,35 @@ impl EvalContext {
     }
 
     pub fn context_stack_pop(&self, key: &Value) -> Option<Value> {
-        let mut stacks = self.context_stacks.borrow_mut();
+        if let Some(state) = self.dynamic_task_state() {
+            return state.stack_pop(key);
+        }
+        let (mut stacks, mut identities) = self.context_stacks.borrow_parts_mut();
         let stack = stacks.get_mut(key)?;
         let val = stack.pop();
+        if val.is_some() {
+            assert!(
+                identities.pop(key),
+                "dynamic stack identity must have a matching value entry"
+            );
+        }
         if stack.is_empty() {
             stacks.remove(key);
+            identities.remove(key);
         }
         val
+    }
+}
+
+pub struct RuntimeQuantumGuard<'a> {
+    ctx: &'a EvalContext,
+    previous_thread_local: bool,
+}
+
+impl Drop for RuntimeQuantumGuard<'_> {
+    fn drop(&mut self) {
+        self.ctx.runtime_quantum_active.set(false);
+        crate::set_runtime_quantum(self.previous_thread_local);
     }
 }
 
@@ -441,10 +913,581 @@ impl Default for EvalContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::BTreeMap;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::path::PathBuf;
 
     use crate::{Caps, Sandbox, Value};
+
+    #[test]
+    fn scoped_legacy_call_env_restores_nested_environments() {
+        let context = EvalContext::new();
+        let outer = Rc::new(Env::new());
+        let inner = Rc::new(Env::new());
+
+        assert!(context.legacy_call_env().is_none());
+        let outer_guard = context.scope_legacy_call_env(&outer);
+        assert!(Rc::ptr_eq(
+            &context.legacy_call_env().expect("outer call env"),
+            &outer
+        ));
+        {
+            let _inner_guard = context.scope_legacy_call_env(&inner);
+            assert!(Rc::ptr_eq(
+                &context.legacy_call_env().expect("inner call env"),
+                &inner
+            ));
+        }
+        assert!(Rc::ptr_eq(
+            &context.legacy_call_env().expect("restored outer call env"),
+            &outer
+        ));
+        drop(outer_guard);
+        assert!(context.legacy_call_env().is_none());
+    }
+
+    #[test]
+    fn scoped_legacy_call_env_restores_after_panic() {
+        let context = EvalContext::new();
+        let call_env = Rc::new(Env::new());
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = context.scope_legacy_call_env(&call_env);
+            panic!("expected test panic");
+        }));
+
+        assert!(result.is_err());
+        assert!(context.legacy_call_env().is_none());
+    }
+
+    #[test]
+    fn task_context_handle_lifecycle_and_child_inheritance() {
+        let context = EvalContext::new();
+        assert!(context.task_context().is_none());
+        assert!(EvalContext::default().task_context().is_none());
+        assert!(EvalContext::new_with_sandbox(Sandbox::deny(Caps::FS_READ))
+            .task_context()
+            .is_none());
+
+        let handle = crate::runtime::TaskContextHandle::default();
+        context.install_task_context(handle.clone());
+        let clone = context.task_context().unwrap();
+        clone
+            .borrow_mut()
+            .insert(std::rc::Rc::new(TestTaskLocal(4)));
+        assert_eq!(handle.borrow().get::<TestTaskLocal>().unwrap().0, 4);
+
+        let child = handle.inherit_for_child();
+        assert_eq!(child.borrow().get::<TestTaskLocal>().unwrap().0, 0);
+        assert_eq!(handle.borrow().get::<TestTaskLocal>().unwrap().0, 4);
+        assert!(context.take_task_context().is_some());
+        assert!(context.task_context().is_none());
+    }
+
+    #[test]
+    fn installed_dynamic_state_is_accessible_while_task_context_is_borrowed() {
+        let context = EvalContext::new();
+        let handle = crate::runtime::TaskContextHandle::default();
+        let dynamic = Rc::new(DynamicTaskState::root(
+            vec![BTreeMap::new()],
+            vec![BTreeMap::new()],
+            BTreeMap::new(),
+        ));
+        handle.borrow_mut().insert(Rc::clone(&dynamic));
+        let _scope = context.scope_task_context(handle.clone());
+
+        let held_by_native_call = handle.borrow_mut();
+        context.context_set(Value::keyword("key"), Value::int(42));
+        assert_eq!(
+            context.context_get(&Value::keyword("key")),
+            Some(Value::int(42))
+        );
+        drop(held_by_native_call);
+
+        assert_eq!(
+            dynamic.user_get(&Value::keyword("key")),
+            Some(Value::int(42))
+        );
+    }
+
+    #[test]
+    fn installed_module_state_is_accessible_while_task_context_is_borrowed() {
+        let context = EvalContext::new();
+        context.push_file_path(PathBuf::from("ambient/entry.sema"));
+        let handle = crate::runtime::TaskContextHandle::default();
+        let module = Rc::new(context.snapshot_module_task_state());
+        handle.borrow_mut().insert(Rc::clone(&module));
+        let _scope = context.scope_task_context(handle.clone());
+
+        let held_by_native_call = handle.borrow_mut();
+        assert_eq!(
+            context.current_file_path(),
+            Some(PathBuf::from("ambient/entry.sema"))
+        );
+        context.push_file_path(PathBuf::from("task/module.sema"));
+        context.clear_module_exports();
+        context.set_module_exports(vec!["answer".to_string()]);
+        let load = context
+            .enter_module_load(PathBuf::from("task/module.sema"))
+            .expect("task-local module-load scope");
+
+        assert_eq!(
+            context.current_file_path(),
+            Some(PathBuf::from("task/module.sema"))
+        );
+        assert_eq!(
+            context.take_module_exports(),
+            Some(vec!["answer".to_string()])
+        );
+        assert_eq!(module.loading(), vec![PathBuf::from("task/module.sema")]);
+        drop(load);
+        assert!(module.loading().is_empty());
+        context.pop_file_path();
+        assert_eq!(
+            context.current_file_path(),
+            Some(PathBuf::from("ambient/entry.sema"))
+        );
+        drop(held_by_native_call);
+
+        assert_eq!(
+            context.current_file.borrow().as_slice(),
+            &[PathBuf::from("ambient/entry.sema")]
+        );
+        assert!(context.module_exports.borrow().is_empty());
+        assert!(context.module_load_stack.borrow().is_empty());
+    }
+
+    #[test]
+    fn module_load_guards_do_not_cross_task_states_with_colliding_scope_ids() {
+        let context_a = EvalContext::new();
+        let context_b = EvalContext::new();
+        let state_a = Rc::new(ModuleTaskState::default());
+        let state_b = Rc::new(ModuleTaskState::default());
+        let handle_a = crate::runtime::TaskContextHandle::default();
+        let handle_b = crate::runtime::TaskContextHandle::default();
+        handle_a.borrow_mut().insert(Rc::clone(&state_a));
+        handle_b.borrow_mut().insert(Rc::clone(&state_b));
+        let _scope_a = context_a.scope_task_context(handle_a);
+        let _scope_b = context_b.scope_task_context(handle_b);
+
+        let guard_a = context_a
+            .enter_module_load(PathBuf::from("same.sema"))
+            .expect("task A load scope");
+        let guard_b = context_b
+            .enter_module_load(PathBuf::from("same.sema"))
+            .expect("task B load scope");
+        assert_eq!(state_a.loading(), state_b.loading());
+
+        drop(guard_a);
+        assert!(state_a.loading().is_empty());
+        assert_eq!(state_b.loading(), vec![PathBuf::from("same.sema")]);
+        drop(guard_b);
+        assert!(state_b.loading().is_empty());
+    }
+
+    #[test]
+    fn dynamic_snapshot_publication_rejects_an_equal_value_aba_pop() {
+        let context = EvalContext::new();
+        let key = Value::keyword("stack");
+        let value = Value::keyword("same");
+        context.context_stack_push(key.clone(), value.clone());
+        let stale = context.snapshot_dynamic_task_state();
+        let recreating = context.snapshot_dynamic_task_state();
+
+        assert_eq!(stale.stack_pop(&key), Some(value.clone()));
+        assert_eq!(recreating.stack_pop(&key), Some(value.clone()));
+        recreating
+            .stack_push(key.clone(), value.clone())
+            .expect("scope ID available");
+
+        assert!(context.publish_dynamic_task_state(&recreating));
+        assert!(context.publish_dynamic_task_state(&stale));
+        assert_eq!(context.context_stack_get(&key), vec![value]);
+    }
+
+    #[test]
+    fn legacy_stack_mutation_renews_identity_seen_by_later_snapshots() {
+        let context = EvalContext::new();
+        let key = Value::keyword("stack");
+        let value = Value::keyword("same");
+        context.context_stack_push(key.clone(), value.clone());
+        let stale = context.snapshot_dynamic_task_state();
+        assert_eq!(stale.stack_pop(&key), Some(value.clone()));
+
+        assert_eq!(context.context_stack_pop(&key), Some(value.clone()));
+        context.context_stack_push(key.clone(), value.clone());
+        assert!(context.publish_dynamic_task_state(&stale));
+
+        assert_eq!(context.context_stack_get(&key), vec![value]);
+    }
+
+    #[test]
+    fn direct_equal_stack_replacement_invalidates_stale_snapshot_identity() {
+        let context = EvalContext::new();
+        let key = Value::keyword("stack");
+        let value = Value::keyword("same");
+        context.context_stack_push(key.clone(), value.clone());
+        let stale = context.snapshot_dynamic_task_state();
+        assert_eq!(stale.stack_pop(&key), Some(value.clone()));
+
+        context
+            .context_stacks
+            .borrow_mut()
+            .insert(key.clone(), vec![value.clone()]);
+        assert!(context.publish_dynamic_task_state(&stale));
+
+        assert_eq!(context.context_stack_get(&key), vec![value]);
+    }
+
+    #[test]
+    fn popping_a_direct_empty_stack_keeps_publication_sidecar_aligned() {
+        let context = EvalContext::new();
+        let key = Value::keyword("empty-stack");
+        context
+            .context_stacks
+            .borrow_mut()
+            .insert(key.clone(), Vec::new());
+        let root = context.snapshot_dynamic_task_state();
+        root.user_set(Value::keyword("published"), Value::int(1));
+
+        assert_eq!(context.context_stack_pop(&key), None);
+        assert!(context.publish_dynamic_task_state(&root));
+        assert_eq!(
+            context.context_get(&Value::keyword("published")),
+            Some(Value::int(1))
+        );
+    }
+
+    #[test]
+    fn publication_borrow_conflict_leaves_the_root_journal_retryable() {
+        let context = EvalContext::new();
+        let key = Value::keyword("retry");
+        let root = context.snapshot_dynamic_task_state();
+        root.user_set(key.clone(), Value::int(42));
+        let held = context.user_context.borrow_mut();
+
+        let conflicted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            context.publish_dynamic_task_state(&root)
+        }));
+        assert!(conflicted.is_err());
+        drop(held);
+
+        assert!(context.publish_dynamic_task_state(&root));
+        assert_eq!(context.context_get(&key), Some(Value::int(42)));
+    }
+
+    #[test]
+    fn scoped_task_context_restores_the_exact_handle_after_panic() {
+        let context = EvalContext::new();
+        let outer = crate::runtime::TaskContextHandle::default();
+        let inner = crate::runtime::TaskContextHandle::default();
+        outer
+            .borrow_mut()
+            .insert(std::rc::Rc::new(TestTaskLocal(1)));
+        inner
+            .borrow_mut()
+            .insert(std::rc::Rc::new(TestTaskLocal(2)));
+        context.install_task_context(outer);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _scope = context.scope_task_context(inner.clone());
+            assert_eq!(
+                context
+                    .task_context()
+                    .unwrap()
+                    .borrow()
+                    .get::<TestTaskLocal>()
+                    .unwrap()
+                    .0,
+                2
+            );
+            panic!("test unwind");
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(
+            context
+                .task_context()
+                .unwrap()
+                .borrow()
+                .get::<TestTaskLocal>()
+                .unwrap()
+                .0,
+            1
+        );
+    }
+
+    #[test]
+    fn runtime_quantum_guard_restores_outer_context_thread_local() {
+        let outer = EvalContext::new();
+        let inner = EvalContext::new();
+        assert!(!crate::in_runtime_quantum());
+
+        let outer_guard = outer.enter_runtime_quantum().unwrap();
+        assert!(outer.runtime_quantum_active());
+        assert!(crate::in_runtime_quantum());
+
+        {
+            let _inner_guard = inner.enter_runtime_quantum().unwrap();
+            assert!(inner.runtime_quantum_active());
+            assert!(crate::in_runtime_quantum());
+        }
+
+        assert!(outer.runtime_quantum_active());
+        assert!(crate::in_runtime_quantum());
+        drop(outer_guard);
+        assert!(!outer.runtime_quantum_active());
+        assert!(!crate::in_runtime_quantum());
+    }
+
+    thread_local! {
+        static EVAL_CALLS: Cell<usize> = const { Cell::new(0) };
+        static BORROWED_CALLS: Cell<usize> = const { Cell::new(0) };
+        static OWNED_CALLS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    fn eval_probe(
+        _context: &EvalContext,
+        expression: &Value,
+        _environment: &Env,
+    ) -> Result<Value, SemaError> {
+        EVAL_CALLS.set(EVAL_CALLS.get() + 1);
+        Ok(expression.clone())
+    }
+
+    fn borrowed_call_probe(
+        _context: &EvalContext,
+        _function: &Value,
+        args: &[Value],
+    ) -> Result<Value, SemaError> {
+        BORROWED_CALLS.set(BORROWED_CALLS.get() + 1);
+        Ok(args.first().cloned().unwrap_or_else(Value::nil))
+    }
+
+    fn owned_call_probe(
+        _context: &EvalContext,
+        _function: &Value,
+        args: &mut [Value],
+    ) -> Result<Value, SemaError> {
+        OWNED_CALLS.set(OWNED_CALLS.get() + 1);
+        Ok(args
+            .first_mut()
+            .map_or_else(Value::nil, |value| std::mem::replace(value, Value::nil())))
+    }
+
+    #[test]
+    fn call_callbacks_remain_available_to_host_code() {
+        BORROWED_CALLS.set(0);
+        OWNED_CALLS.set(0);
+        let context = EvalContext::new();
+        set_call_callback(&context, borrowed_call_probe);
+        set_call_owned_callback(&context, owned_call_probe);
+        let function = Value::int(1);
+
+        assert_eq!(
+            call_callback(&context, &function, &[Value::int(21)]).expect("borrowed host call"),
+            Value::int(21)
+        );
+        let mut owned_args = [Value::int(22)];
+        assert_eq!(
+            call_callback_owned(&context, &function, &mut owned_args).expect("owned host call"),
+            Value::int(22)
+        );
+        assert_eq!(owned_args, [Value::nil()]);
+        assert_eq!(BORROWED_CALLS.get(), 1);
+        assert_eq!(OWNED_CALLS.get(), 1);
+    }
+
+    #[test]
+    fn eval_callback_remains_available_to_host_code() {
+        EVAL_CALLS.set(0);
+        let context = EvalContext::new();
+        let environment = Env::new();
+        set_eval_callback(&context, eval_probe);
+
+        assert_eq!(
+            eval_callback(&context, &Value::int(23), &environment).expect("host evaluation"),
+            Value::int(23)
+        );
+        assert_eq!(EVAL_CALLS.get(), 1);
+    }
+
+    #[test]
+    fn eval_callback_rejects_same_and_cross_context_runtime_quantums() {
+        EVAL_CALLS.set(0);
+        let runtime_context = EvalContext::new();
+        let callback_context = EvalContext::new();
+        let environment = Env::new();
+        set_eval_callback(&runtime_context, eval_probe);
+        set_eval_callback(&callback_context, eval_probe);
+
+        let quantum = runtime_context
+            .enter_runtime_quantum()
+            .expect("enter runtime quantum");
+        let same_context = eval_callback(&runtime_context, &Value::int(1), &environment)
+            .expect_err("same-context runtime evaluation must be rejected");
+        let cross_context = eval_callback(&callback_context, &Value::int(2), &environment)
+            .expect_err("cross-context runtime evaluation must be rejected");
+        drop(quantum);
+
+        assert!(same_context.to_string().contains("host-only"));
+        assert!(cross_context.to_string().contains("host-only"));
+        assert_eq!(EVAL_CALLS.get(), 0);
+    }
+
+    #[test]
+    fn call_callbacks_reject_an_active_runtime_quantum_before_invocation() {
+        BORROWED_CALLS.set(0);
+        OWNED_CALLS.set(0);
+        let context = EvalContext::new();
+        set_call_callback(&context, borrowed_call_probe);
+        set_call_owned_callback(&context, owned_call_probe);
+        let function = Value::int(1);
+        let mut owned_args = [Value::int(22)];
+        let _quantum = context
+            .enter_runtime_quantum()
+            .expect("enter runtime quantum");
+
+        let borrowed_error = call_callback(&context, &function, &[Value::int(21)])
+            .expect_err("borrowed callback must be host-only");
+        let owned_error = call_callback_owned(&context, &function, &mut owned_args)
+            .expect_err("owned callback must be host-only");
+
+        assert!(borrowed_error.to_string().contains("host-only"));
+        assert!(owned_error.to_string().contains("host-only"));
+        assert_eq!(owned_args, [Value::int(22)]);
+        assert_eq!(BORROWED_CALLS.get(), 0);
+        assert_eq!(OWNED_CALLS.get(), 0);
+    }
+
+    #[test]
+    fn call_callback_rejects_another_context_during_a_thread_runtime_quantum() {
+        BORROWED_CALLS.set(0);
+        let runtime_context = EvalContext::new();
+        let callback_context = EvalContext::new();
+        set_call_callback(&callback_context, borrowed_call_probe);
+        let _quantum = runtime_context
+            .enter_runtime_quantum()
+            .expect("enter runtime quantum");
+
+        let error = call_callback(&callback_context, &Value::int(1), &[])
+            .expect_err("thread-local runtime quantum must reject ambient callbacks");
+
+        assert!(error.to_string().contains("host-only"));
+        assert_eq!(BORROWED_CALLS.get(), 0);
+    }
+
+    #[test]
+    fn stdlib_context_rejects_an_active_runtime_quantum_before_invocation() {
+        let runtime_context = EvalContext::new();
+        let invoked = Cell::new(false);
+        let _quantum = runtime_context
+            .enter_runtime_quantum()
+            .expect("enter runtime quantum");
+
+        let rejected = catch_unwind(AssertUnwindSafe(|| {
+            with_stdlib_ctx(|_| invoked.set(true));
+        }));
+
+        assert!(rejected.is_err(), "stdlib context must be host-only");
+        assert!(!invoked.get(), "stdlib closure must not be invoked");
+    }
+
+    struct TestTaskLocal(u32);
+
+    impl crate::runtime::Trace for TestTaskLocal {
+        fn trace(&self, _sink: &mut dyn FnMut(crate::cycle::GcEdge<'_>)) -> bool {
+            true
+        }
+    }
+
+    impl crate::runtime::TaskLocalValue for TestTaskLocal {
+        fn inherit(&self) -> std::rc::Rc<dyn crate::runtime::TaskLocalValue> {
+            std::rc::Rc::new(Self(0))
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn macro_expand_probe(
+        context: &crate::runtime::NativeCallContext<'_>,
+        expr: &Value,
+        env: &Env,
+    ) -> Result<Value, SemaError> {
+        let env_marker = env
+            .get(crate::intern("macro-expand-env"))
+            .expect("expansion env marker");
+        let call_env_marker = context
+            .call_env
+            .as_ref()
+            .and_then(|call_env| call_env.get(crate::intern("macro-expand-call-env")))
+            .expect("call env marker");
+        let task_marker = context
+            .task_context
+            .get_rc::<TestTaskLocal>()
+            .expect("task context marker");
+        let eval_marker = context
+            .eval_context
+            .context_get(&Value::keyword("macro-expand-context"))
+            .expect("eval context marker");
+        Ok(Value::list(vec![
+            expr.clone(),
+            env_marker,
+            call_env_marker,
+            Value::int(i64::from(task_marker.0)),
+            eval_marker,
+            Value::bool(context.cancellation.is_requested()),
+        ]))
+    }
+
+    #[test]
+    fn macro_expand_callback_is_optional_per_context_and_receives_exact_inputs() {
+        let eval_context = EvalContext::new();
+        eval_context.context_set(Value::keyword("macro-expand-context"), Value::int(44));
+        let env = Env::new();
+        env.set(crate::intern("macro-expand-env"), Value::int(11));
+        let call_env = Rc::new(Env::new());
+        call_env.set(crate::intern("macro-expand-call-env"), Value::int(22));
+        let task_context = TaskContextHandle::default();
+        task_context.borrow_mut().insert(Rc::new(TestTaskLocal(33)));
+        let native_context = crate::runtime::NativeCallContext {
+            eval_context: &eval_context,
+            task_context,
+            call_env: Some(call_env),
+            cancellation: crate::runtime::CancellationView::new(true, None),
+        };
+        let expr = Value::int(55);
+
+        assert!(try_macro_expand_callback(&native_context, &expr, &env).is_none());
+
+        set_macro_expand_callback(&eval_context, macro_expand_probe);
+        let expanded = try_macro_expand_callback(&native_context, &expr, &env)
+            .expect("callback registered")
+            .expect("callback succeeds");
+        assert_eq!(
+            expanded,
+            Value::list(vec![
+                Value::int(55),
+                Value::int(11),
+                Value::int(22),
+                Value::int(33),
+                Value::int(44),
+                Value::bool(true),
+            ])
+        );
+
+        let other_context = EvalContext::new();
+        let other_native_context = crate::runtime::NativeCallContext {
+            eval_context: &other_context,
+            task_context: TaskContextHandle::default(),
+            call_env: None,
+            cancellation: crate::runtime::CancellationView::default(),
+        };
+        assert!(try_macro_expand_callback(&other_native_context, &expr, &env).is_none());
+    }
 
     // --- File path tracking ---
 
@@ -612,20 +1655,52 @@ thread_local! {
 }
 
 /// Get a reference to the shared stdlib EvalContext.
-/// Use this for stdlib callback invocations instead of creating throwaway contexts.
+/// Use this for host-side stdlib callback invocations instead of creating
+/// throwaway contexts. Panics before invoking `f` during a runtime quantum.
 pub fn with_stdlib_ctx<F, R>(f: F) -> R
 where
     F: FnOnce(&EvalContext) -> R,
 {
-    STDLIB_CTX.with(f)
+    STDLIB_CTX.with(|context| {
+        assert!(
+            !context.runtime_quantum_active() && !crate::in_runtime_quantum(),
+            "with_stdlib_ctx is a host-only adapter; runtime code must carry its EvalContext explicitly"
+        );
+        f(context)
+    })
 }
 
-/// Register the full evaluator callback. Called by `sema-eval` during interpreter init.
-/// Stores into both `ctx` and the shared `STDLIB_CTX` so that stdlib simple-fn closures
-/// (which lack a ctx parameter) can still invoke the evaluator.
+/// Register the full evaluator callback for host compatibility.
+/// Stores it on both `ctx` and the shared host-only `STDLIB_CTX`.
 pub fn set_eval_callback(ctx: &EvalContext, f: EvalCallbackFn) {
     ctx.eval_fn.set(Some(f));
     STDLIB_CTX.with(|stdlib| stdlib.eval_fn.set(Some(f)));
+}
+
+/// Register this evaluator context's runtime-aware macro expander.
+///
+/// Unlike the legacy evaluator and call callbacks, this is deliberately not
+/// copied into `STDLIB_CTX`: every invocation must carry an explicit task,
+/// cancellation snapshot, and call environment in [`NativeCallContext`].
+pub fn set_macro_expand_callback(ctx: &EvalContext, f: MacroExpandCallbackFn) {
+    ctx.macro_expand_fn.set(Some(f));
+}
+
+/// Invoke the macro expander registered on the exact evaluator context.
+///
+/// `None` means no expansion provider is installed. Low-level VM embedders use
+/// that to retain their direct-compilation fallback without acquiring ambient
+/// evaluator state.
+pub fn try_macro_expand_callback(
+    context: &NativeCallContext<'_>,
+    expr: &Value,
+    env: &Env,
+) -> Option<Result<Value, SemaError>> {
+    context
+        .eval_context
+        .macro_expand_fn
+        .get()
+        .map(|expand| expand(context, expr, env))
 }
 
 /// Register the call-value callback. Called by `sema-eval` during interpreter init.
@@ -635,9 +1710,10 @@ pub fn set_call_callback(ctx: &EvalContext, f: CallCallbackFn) {
     STDLIB_CTX.with(|stdlib| stdlib.call_fn.set(Some(f)));
 }
 
-/// Evaluate an expression using the registered evaluator.
-/// Returns an error if no evaluator has been registered.
+/// Evaluate an expression using the registered host-compatibility evaluator.
+/// Runtime code must use the restricted structural evaluator instead.
 pub fn eval_callback(ctx: &EvalContext, expr: &Value, env: &Env) -> Result<Value, SemaError> {
+    reject_callback_during_runtime_quantum(ctx, "eval")?;
     let f = ctx.eval_fn.get().ok_or_else(|| {
         SemaError::eval("eval callback not registered — Interpreter::new() must be called first")
     })?;
@@ -647,6 +1723,7 @@ pub fn eval_callback(ctx: &EvalContext, expr: &Value, env: &Env) -> Result<Value
 /// Call a function value with arguments using the registered callback.
 /// Returns an error if no callback has been registered.
 pub fn call_callback(ctx: &EvalContext, func: &Value, args: &[Value]) -> Result<Value, SemaError> {
+    reject_callback_during_runtime_quantum(ctx, "call")?;
     let f = ctx.call_fn.get().ok_or_else(|| {
         SemaError::eval("call callback not registered — Interpreter::new() must be called first")
     })?;
@@ -672,8 +1749,21 @@ pub fn call_callback_owned(
     func: &Value,
     args: &mut [Value],
 ) -> Result<Value, SemaError> {
+    reject_callback_during_runtime_quantum(ctx, "call")?;
     if let Some(f) = ctx.call_owned_fn.get() {
         return f(ctx, func, args);
     }
     call_callback(ctx, func, args)
+}
+
+fn reject_callback_during_runtime_quantum(
+    ctx: &EvalContext,
+    adapter: &str,
+) -> Result<(), SemaError> {
+    if ctx.runtime_quantum_active() || crate::in_runtime_quantum() {
+        return Err(SemaError::eval(format!(
+            "internal error: {adapter} callback is a host-only adapter; runtime code must use structural evaluation"
+        )));
+    }
+    Ok(())
 }

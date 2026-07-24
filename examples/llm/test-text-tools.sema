@@ -34,8 +34,8 @@ Sema runs on all major platforms. The interpreter is implemented in Rust, provid
 
 ;; --- 2. Chunk by Separator ---
 (println "\n=== 2. Chunk by Separator ===")
-(define csv-like  "alice,bob,charlie,diana")
-(define parts     (text/chunk-by-separator csv-like ","))
+(define csv-like "alice,bob,charlie,diana")
+(define parts (text/chunk-by-separator csv-like ","))
 (println (format "Split by comma: ~a" parts))
 
 (define paragraphs (text/chunk-by-separator article "\n\n"))
@@ -43,8 +43,8 @@ Sema runs on all major platforms. The interpreter is implemented in Rust, provid
 
 ;; --- 3. Sentence Splitting ---
 (println "\n=== 3. Sentence Splitting ===")
-(define text       "Hello world. How are you? I'm fine! This is great.")
-(define sentences  (text/split-sentences text))
+(define text "Hello world. How are you? I'm fine! This is great.")
+(define sentences (text/split-sentences text))
 (println (format "Sentences: ~a" sentences))
 (println (format "Count: ~a" (length sentences)))
 

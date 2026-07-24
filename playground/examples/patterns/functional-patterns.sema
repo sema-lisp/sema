@@ -1,11 +1,11 @@
 ;; Functional programming patterns and idioms
 
 ;; === Currying ===
-(define (curry2 f)  (fn (a) (fn (b) (f a b))))
-(define add         (curry2 +))
-(define add5        (add 5))
-(define double      ((curry2 *) 2))
-(define triple      ((curry2 *) 3))
+(define (curry2 f) (fn (a) (fn (b) (f a b))))
+(define add (curry2 +))
+(define add5 (add 5))
+(define double ((curry2 *) 2))
+(define triple ((curry2 *) 3))
 (println
   (format "add5(3) = ~a, double(7) = ~a, triple(7) = ~a"
     (add5 3)
@@ -20,8 +20,8 @@
 (println (format "pipe(double, +10, square)(5) = ~a" (process 5)))
 
 ;; === Option/Maybe ===
-(define (maybe-map f val)       (if (nil? val) nil (f val)))
-(define (maybe-or val default)  (if (nil? val) default val))
+(define (maybe-map f val) (if (nil? val) nil (f val)))
+(define (maybe-or val default) (if (nil? val) default val))
 
 (define config {:db {:host "localhost" :port 5432} :cache nil})
 (println
@@ -33,17 +33,17 @@
       "not configured")))
 
 ;; === Error handling ===
-(define (safe-divide a b)  (try (/ a b) (catch e nil)))
-(define (try-parse s)      (try {:ok (int s)} (catch e {:error (:message e)})))
+(define (safe-divide a b) (try (/ a b) (catch e nil)))
+(define (try-parse s) (try {:ok (int s)} (catch e {:error (:message e)})))
 (println (format "\n10/3 = ~a, 10/0 = ~a" (safe-divide 10 3) (safe-divide 10 0)))
 (println (format "parse \"99\": ~a" (try-parse "99")))
 (println (format "parse \"nope\": ~a" (try-parse "nope")))
 
 ;; === Binary Search Tree ===
-(define (make-tree val left right)  (list val left right))
-(define (tree-val t)                (first t))
-(define (tree-left t)               (nth t 1))
-(define (tree-right t)              (nth t 2))
+(define (make-tree val left right) (list val left right))
+(define (tree-val t) (first t))
+(define (tree-left t) (nth t 1))
+(define (tree-right t) (nth t 2))
 
 (define (tree-insert tree val)
   (if (nil? tree)
@@ -73,9 +73,9 @@
 (define (collatz n)
   (let loop ((x n) (steps 0))
     (cond
-      ((= x 1)    steps)
-      ((even? x)  (loop (/ x 2) (+ steps 1)))
-      (else       (loop (+ (* 3 x) 1) (+ steps 1))))))
+      ((= x 1) steps)
+      ((even? x) (loop (/ x 2) (+ steps 1)))
+      (else (loop (+ (* 3 x) 1) (+ steps 1))))))
 
 (println "\nCollatz sequence lengths:")
 (for-each

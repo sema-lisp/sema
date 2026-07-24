@@ -317,8 +317,8 @@ enum Commands {
         #[arg(long)]
         max_blank_lines: Option<usize>,
 
-        /// Output result as JSON (useful for editor integrations)
-        #[arg(long)]
+        /// Emit read-only NDJSON results for editor integrations
+        #[arg(long, conflicts_with = "diff")]
         json: bool,
     },
     /// Start the Language Server Protocol (LSP) server
@@ -703,7 +703,106 @@ fn build_interpreter(sandbox: &sema_core::Sandbox) -> Interpreter {
     let interpreter = Interpreter::new_with_sandbox(sandbox);
     sema_mcp::register_mcp_builtins(&interpreter.global_env, sandbox);
     sema::workflow_mcp::register_real_resolver();
+    install_ctrlc_handler(&interpreter);
     interpreter
+}
+
+/// Install a process-wide Ctrl-C handler that cancels every live root on this
+/// interpreter's persistent runtime, replacing the native CLI's former
+/// reliance on `check_interrupt` polling (that TLS stays for wasm's SAB-cancel
+/// path — see `crates/sema-core/src/async_signal.rs` — but nothing on native
+/// installs the callback that would make it fire, so a native script had no
+/// interruption path at all before this).
+///
+/// `ctrlc::set_handler` runs the closure on its own dedicated thread (not the
+/// raw OS signal handler itself), so it needs no async-signal-safety, but it
+/// DOES need to be `Send` — the closure below captures only
+/// [`RuntimeCommandHandle`](sema_vm::runtime::RuntimeCommandHandle) (a
+/// channel handle, `Send + Sync`, holding no `Rc`/`Value`/`Env`) plus plain
+/// `Send` bookkeeping (an `Instant` and an `AtomicU64`), never the
+/// `Interpreter` itself.
+///
+/// First Ctrl-C requests a graceful cancel (`cancel_all`): every live root
+/// settles `Cancelled(HostStop)`, which the existing drive loop
+/// (`Interpreter::drive_handle_to_settlement`) already surfaces as a normal
+/// `SemaError` through whichever `eval_str*` call is driving the program, so
+/// callers see the CLI's ordinary error-exit path with no new branch needed.
+/// A second Ctrl-C within 2s of the first — the runtime is unresponsive, or a
+/// Sema program is deliberately swallowing the cancellation — hard-exits
+/// immediately (`128 + SIGINT`), the conventional double-interrupt escape
+/// hatch. Ctrl-C presses spaced further apart than that are treated as
+/// independent requests (e.g. a REPL session cancelling one long-running
+/// command, then later cancelling an unrelated one) rather than accumulating
+/// toward a hard exit.
+///
+/// Only meaningful while raw terminal mode is OFF (a plain blocking eval —
+/// `-e`, a script file, or code running between REPL prompts): reedline only
+/// enables raw mode for the duration of `read_line` and disables `ISIG`, so a
+/// Ctrl-C keypress at the REPL prompt itself never reaches this handler as a
+/// real `SIGINT` — it is delivered to reedline as a raw key event and handled
+/// entirely by the REPL's own `Signal::CtrlC` branch, unchanged.
+fn install_ctrlc_handler(interpreter: &Interpreter) {
+    let handle = interpreter.command_handle();
+    let start = std::time::Instant::now();
+    let last_sigint_ms = std::sync::atomic::AtomicU64::new(0);
+    // A second interpreter in the same process would hit MultipleHandlers here,
+    // leaving Ctrl-C pinned to the FIRST interpreter's (possibly dead) handle —
+    // single-press would then no-op (double-press still hard-exits). Every
+    // current build_interpreter call site is a mutually exclusive subcommand
+    // path, so the install runs once per process.
+    let _ = ctrlc::set_handler(move || {
+        let now_ms = start.elapsed().as_millis() as u64;
+        let previous_ms = last_sigint_ms.swap(now_ms, std::sync::atomic::Ordering::SeqCst);
+        if is_double_interrupt(previous_ms, now_ms) {
+            // Exit code 130 = 128 + SIGINT(2), the shell convention for
+            // "killed by Ctrl-C" (matches what the OS default SIGINT
+            // disposition would have produced had we never installed a
+            // handler).
+            std::process::exit(130);
+        }
+        handle.cancel_all();
+    });
+}
+
+/// The double-interrupt decision `install_ctrlc_handler` applies on every
+/// `SIGINT`: `previous_ms`/`now_ms` are millis-since-process-start of the
+/// prior and current signal (`0` for "no prior signal yet"). `true` means
+/// hard-exit instead of another graceful `cancel_all` — the second Ctrl-C
+/// arrived within `DOUBLE_INTERRUPT_WINDOW_MS` of the first, the
+/// conventional "it's not responding, just kill it" escape hatch. Pulled out
+/// of the signal-handler closure as a pure function so the window arithmetic
+/// (in particular the `previous_ms != 0` "no prior signal" guard and the
+/// `saturating_sub` protecting against a first signal landing at exactly
+/// `0ms`) is unit-testable without spawning a process or sending real
+/// signals.
+fn is_double_interrupt(previous_ms: u64, now_ms: u64) -> bool {
+    const DOUBLE_INTERRUPT_WINDOW_MS: u64 = 2_000;
+    previous_ms != 0 && now_ms.saturating_sub(previous_ms) < DOUBLE_INTERRUPT_WINDOW_MS
+}
+
+#[cfg(test)]
+mod ctrlc_tests {
+    use super::is_double_interrupt;
+
+    #[test]
+    fn first_signal_never_hard_exits() {
+        // previous_ms == 0 is the sentinel for "no prior signal", including
+        // the edge case of a first signal landing at exactly process-start.
+        assert!(!is_double_interrupt(0, 0));
+        assert!(!is_double_interrupt(0, 5_000));
+    }
+
+    #[test]
+    fn second_signal_within_window_hard_exits() {
+        assert!(is_double_interrupt(1_000, 1_001));
+        assert!(is_double_interrupt(1_000, 2_999));
+    }
+
+    #[test]
+    fn second_signal_outside_window_is_treated_as_independent() {
+        assert!(!is_double_interrupt(1_000, 3_000));
+        assert!(!is_double_interrupt(1_000, 60_000));
+    }
 }
 
 fn main() {
@@ -1490,23 +1589,12 @@ fn open_in_browser(url: &str) {
 
 /// Drain any pending async tasks scheduled by a top-level form.
 ///
-/// Top-level `(async ...)` forms spawn a task but don't implicitly await it,
-/// so their side effects would silently vanish on exit unless we explicitly
-/// run the scheduler. This drains all pending tasks (target = `All`).
-///
-/// The scheduler callback is only registered once an eval has run, so we
-/// silently ignore the "no async scheduler registered" error (nothing async was
-/// scheduled). Other scheduler errors are reported to stderr as warnings but do
-/// not fail the program — the side effects already ran.
-pub(crate) fn drain_async_scheduler(interpreter: &Interpreter) {
-    if let Err(e) = sema_core::call_run_scheduler(&interpreter.ctx, None) {
-        let msg = e.to_string();
-        if msg.contains("no async scheduler registered") {
-            return;
-        }
-        eprintln!("warning: background task error: {msg}");
-    }
-}
+/// Retained as a call-site marker; under the unified cooperative runtime the
+/// evaluator already drives every spawned task to completion during `eval`
+/// (the persistent runtime drains to idle before returning), and any still-
+/// detached task is reaped by the interpreter's bounded shutdown on drop. There
+/// is no separate scheduler to run, so this is a no-op.
+pub(crate) fn drain_async_scheduler(_interpreter: &Interpreter) {}
 
 fn run_notebook_command(command: NotebookCommands) {
     match command {
@@ -3491,14 +3579,15 @@ fn run_bytecode_bytes(
         &[],
         main_cache_slots,
     )?;
-    // Initialize the async scheduler so async/await and channels work in a
-    // `.semac` program (top-level or inside a `(load ...)`). A `.semac` carries
-    // no native table (the format is process-local), and bytecode compiled with
-    // `known_natives=None` uses CallGlobal rather than CallNative, so task VMs
-    // resolve natives via the shared global env — an empty native table is
-    // correct here.
-    sema_vm::init_scheduler(interpreter.global_env.clone(), Vec::new());
-    vm.execute(closure, &interpreter.ctx)
+    // Drive the `.semac` program on the interpreter's unified cooperative
+    // runtime, the sole async engine, so async/await, channels, and timers work
+    // in compiled bytecode (top-level or inside a `(load ...)`). A `.semac`
+    // carries no native table (the format is process-local), and bytecode
+    // compiled with `known_natives=None` uses CallGlobal rather than CallNative,
+    // so task VMs resolve natives via the shared global env — the empty native
+    // table passed to `VM::new` is correct here.
+    vm.seed_main_frame(closure);
+    interpreter.drive_vm_on_runtime(vm)
 }
 
 fn run_fmt(
@@ -3625,7 +3714,9 @@ fn run_fmt(
     };
 
     if files.is_empty() {
-        println!("No .sema files found");
+        if !json {
+            println!("No .sema files found");
+        }
         return;
     }
 
@@ -3674,23 +3765,26 @@ fn run_fmt(
             }
         };
 
+        checked += 1;
+        let file_changed = source != formatted;
+        if file_changed {
+            changed += 1;
+        }
+
         if json {
             println!(
                 "{}",
                 serde_json::json!({
                     "file": file,
                     "formatted": true,
+                    "changed": file_changed,
                     "source": formatted
                 })
             );
             continue;
         }
 
-        checked += 1;
-
-        if source != formatted {
-            changed += 1;
-
+        if file_changed {
             if check {
                 println!("Would reformat: {file}");
             } else if show_diff {
@@ -3709,26 +3803,32 @@ fn run_fmt(
     }
 
     // Print summary
-    if check {
-        if changed > 0 {
-            println!("\n{changed} file(s) would be reformatted, {checked} file(s) checked");
-            std::process::exit(1);
+    if !json {
+        if check {
+            if changed > 0 {
+                println!("\n{changed} file(s) would be reformatted, {checked} file(s) checked");
+                std::process::exit(1);
+            } else {
+                println!("{checked} file(s) already formatted");
+            }
+        } else if show_diff {
+            println!("\n{changed} file(s) would change, {checked} file(s) checked");
+        } else if changed > 0 {
+            println!(
+                "\n{changed} file(s) formatted, {} file(s) unchanged",
+                checked - changed
+            );
         } else {
             println!("{checked} file(s) already formatted");
         }
-    } else if show_diff {
-        println!("\n{changed} file(s) would change, {checked} file(s) checked");
-    } else if changed > 0 {
-        println!(
-            "\n{changed} file(s) formatted, {} file(s) unchanged",
-            checked - changed
-        );
-    } else {
-        println!("{checked} file(s) already formatted");
     }
 
     if errors > 0 {
         eprintln!("{errors} error(s)");
+        std::process::exit(1);
+    }
+
+    if check && changed > 0 {
         std::process::exit(1);
     }
 }

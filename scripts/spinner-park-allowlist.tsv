@@ -1,0 +1,10 @@
+# Spinner lifecycle policy (B6 — R19 spinner render-thread ownership).
+#
+# The spinner render loop MUST park on its condvar (`wait_timeout_while`) between
+# frames, so `term/spinner-stop` and interpreter teardown wake it immediately. A
+# bare `thread::sleep` frame loop is the legacy shape (its sleeping thread could
+# only stop after a full interval, and never on teardown). This allowlist has NO
+# rows: any `thread::sleep` in `crates/sema-stdlib/src/terminal.rs`'s production
+# module is unallowlisted and fails.
+#
+# Format: TOKEN<TAB>COUNT<TAB>reason

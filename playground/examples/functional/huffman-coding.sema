@@ -18,8 +18,8 @@
 (define (make-leaf ch freq) (list :leaf ch freq))
 (define (make-branch left right)
   (list :branch left right (+ (node-freq left) (node-freq right))))
-(define (node-freq node)  (nth node (- (length node) 1)))
-(define (leaf? node)      (eq? (first node) :leaf))
+(define (node-freq node) (nth node (- (length node) 1)))
+(define (leaf? node) (eq? (first node) :leaf))
 
 (define (build-leaves freqs)
   (sort (map (fn (e) (make-leaf (first e) (nth e 1))) (map/entries freqs))
@@ -35,9 +35,9 @@
 (define (build-tree queue)
   (if (<= (length queue) 1)
     (first queue)
-    (let* ((left    (first queue))
-           (right   (nth queue 1))
-           (branch  (make-branch left right)))
+    (let* ((left (first queue))
+           (right (nth queue 1))
+           (branch (make-branch left right)))
       (build-tree (insert-sorted (drop 2 queue) branch)))))
 
 (define tree (build-tree (build-leaves freqs)))
@@ -48,8 +48,8 @@
     (append (generate-codes (nth node 1) (string/append prefix "0"))
       (generate-codes (nth node 2) (string/append prefix "1")))))
 
-(define codes     (generate-codes tree ""))
-(define code-map  (foldl (fn (acc e) (assoc acc (first e) (nth e 1))) {} codes))
+(define codes (generate-codes tree ""))
+(define code-map (foldl (fn (acc e) (assoc acc (first e) (nth e 1))) {} codes))
 
 (println "\nCode table:")
 (for-each

@@ -78,8 +78,8 @@
     988
     1047))
 
-(define num-notes  25)
-(define note-idx   12)  ; start at C5
+(define num-notes 25)
+(define note-idx 12) ; start at C5
 
 ;; Map pitch to RGB color (low=red, mid=green, high=blue)
 (define (pitch-color idx)
@@ -126,9 +126,9 @@
 (println "  Ctrl-C to exit")
 
 ;; Event loop
-(define btn20    #f)
-(define btn21    #f)
-(define playing  #f)
+(define btn20 #f)
+(define btn21 #f)
+(define playing #f)
 
 (define (poll-loop)
   (let ((resp (cmd "POLL")))

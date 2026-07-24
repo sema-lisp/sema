@@ -1,9 +1,9 @@
 ;; AI Chat — Sema Web demo
 ;; Uses llm/chat-stream for progressive token rendering
 
-(def messages        (state (list)))
-(def input-text      (state ""))
-(def current-stream  (state nil))
+(def messages (state (list)))
+(def input-text (state ""))
+(def current-stream (state nil))
 
 (define (update-input ev)
   (put! input-text (dom/event-value ev)))
@@ -20,8 +20,8 @@
 
 (define (format-message msg)
   [:div
-   {:class        (string-append "message " (get msg :role))
-    :data-testid  (string-append "msg-" (get msg :role))}
+   {:class (string-append "message " (get msg :role))
+    :data-testid (string-append "msg-" (get msg :role))}
    [:strong (string-append (get msg :role) ": ")]
    [:span (get msg :content)]])
 
@@ -39,8 +39,8 @@
           (put! current-stream nil)
           [:span])
         [:div
-         {:class        "message assistant streaming"
-          :data-testid  "msg-assistant-streaming"}
+         {:class "message assistant streaming"
+          :data-testid "msg-assistant-streaming"}
          [:strong "assistant: "]
          [:span (get val :text)]]))
     [:span]))
@@ -56,13 +56,13 @@
    [:form
     {:class "input-area" :on-submit "send-message"}
     [:input
-     {:id            "chat-input"
-      :type          "text"
-      :placeholder   "Ask something..."
-      :value         @input-text
-      :on-input      "update-input"
-      :autocomplete  "off"
-      :data-testid   "chat-input"}]
+     {:id "chat-input"
+      :type "text"
+      :placeholder "Ask something..."
+      :value @input-text
+      :on-input "update-input"
+      :autocomplete "off"
+      :data-testid "chat-input"}]
     [:button {:type "submit" :data-testid "send-btn"} "Send"]]])
 
 (mount! "#app" chat-view)

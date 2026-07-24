@@ -6,21 +6,21 @@
 
 ;; ── Pronoun reflection table ──────────────────────────────────────
 (def reflections
-  {"i"         "you"
-   "me"        "you"
-   "my"        "your"
-   "myself"    "yourself"
-   "am"        "are"
-   "was"       "were"
-   "i'd"       "you'd"
-   "i've"      "you've"
-   "i'll"      "you'll"
-   "you"       "i"
-   "your"      "my"
-   "yours"     "mine"
-   "yourself"  "myself"
-   "are"       "am"
-   "were"      "was"})
+  {"i" "you"
+   "me" "you"
+   "my" "your"
+   "myself" "yourself"
+   "am" "are"
+   "was" "were"
+   "i'd" "you'd"
+   "i've" "you've"
+   "i'll" "you'll"
+   "you" "i"
+   "your" "my"
+   "yours" "mine"
+   "yourself" "myself"
+   "are" "am"
+   "were" "was"})
 
 (defn reflect (text)
   "Swap pronouns in captured text so ELIZA's reply reads naturally."
@@ -28,8 +28,8 @@
     (string/join
       (map
         (fn (w)
-          (let* ((low   (string/lower w))
-                 (refl  (or (get reflections low) w)))
+          (let* ((low (string/lower w))
+                 (refl (or (get reflections low) w)))
             ;; Capitalize lone "i" → "I"
             (if (equal? refl "i") "I" refl)))
         words)
@@ -313,8 +313,8 @@
   "Replace (1), (2), ... in TEMPLATE with reflected captures."
   (foldl
     (fn (text i)
-      (let ((placeholder  (string-append "(" (number->string (+ i 1)) ")"))
-            (segment      (reflect (nth captures i))))
+      (let ((placeholder (string-append "(" (number->string (+ i 1)) ")"))
+            (segment (reflect (nth captures i))))
         (string/replace text placeholder segment)))
     template
     (range 0 (length captures))))
@@ -324,8 +324,8 @@
 
 (defn pick-response (key responses)
   "Cycle through responses for a given key to add variety."
-  (let* ((idx       (or (get response-counters key) 0))
-         (response  (nth responses (modulo idx (length responses)))))
+  (let* ((idx (or (get response-counters key) 0))
+         (response (nth responses (modulo idx (length responses)))))
     (set! response-counters (assoc response-counters key (+ idx 1)))
     response))
 
@@ -350,10 +350,10 @@
                                  (match-pattern words
                                    (expand-pattern (:pattern (car rules))))))
                            (if captures
-                             {:rank      (:rank entry)
-                              :keyword   kw
-                              :rule      (car rules)
-                              :captures  captures}
+                             {:rank (:rank entry)
+                              :keyword kw
+                              :rule (car rules)
+                              :captures captures}
                              (try-rules (cdr rules)))))))))
                script)))
          ;; Sort by rank descending, pick best
@@ -364,8 +364,8 @@
 
 (defn respond (input)
   "Generate ELIZA's response to user INPUT."
-  (let* ((words   (words->list input))
-         (result  (find-keyword-match words)))
+  (let* ((words (words->list input))
+         (result (find-keyword-match words)))
     (if (not result)
       "I'm not sure I understand you fully."
       (let* ((rule (:rule result))

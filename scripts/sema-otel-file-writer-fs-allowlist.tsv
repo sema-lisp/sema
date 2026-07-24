@@ -1,0 +1,12 @@
+# OTel file-exporter WRITER filesystem policy (C2 — JSONL span export off the VM thread).
+#
+# Every `write_all` / `fs::write` in the sema-otel crate MUST live on the dedicated file
+# WRITER thread (file_exporter.rs `writer_loop`). The VM thread only renders each span to a
+# `String` and `try_send`s it; the OTLP batch path performs no `fs` writes here. This pins
+# the writes to file_exporter.rs at exact counts; a `write_all`/`fs::write` in ANY other
+# sema-otel file (a regressed synchronous per-span-end write on the VM thread) is
+# unallowlisted and fails. The scan comment-strips and counts the production module only
+# (the #[cfg(test)] block is never shipped).
+#
+# Format: TOKEN<TAB>FILE<TAB>COUNT<TAB>reason
+SEMA_OTEL_WRITE_ALL	crates/sema-otel/src/file_exporter.rs	1	rendered JSONL span line, on the writer thread

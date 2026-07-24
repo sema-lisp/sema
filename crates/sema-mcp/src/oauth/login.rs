@@ -167,6 +167,7 @@ pub async fn login(
     existing_client_info: Option<ClientInfo>,
     redirect: &dyn RedirectDriver,
 ) -> Result<StoredCredentials, String> {
+    redirect.preflight()?;
     let discovered = discover(client, config).await?;
     let redirect_uri = redirect.redirect_uri();
     let client_info = resolve_client(

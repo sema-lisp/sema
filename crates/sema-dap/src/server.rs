@@ -953,24 +953,20 @@ fn backend_thread(
             }
 
             BackendRequest::ConfigurationDone => {
-                if let (
-                    Some(ref mut vm_inst),
-                    Some(ref cl),
-                    Some(ref mut ds),
-                    Some(ref interpreter),
-                ) = (&mut vm, &closure, &mut debug_state, &interp)
+                if let (Some(ref cl), Some(ref mut ds), Some(ref interpreter)) =
+                    (&closure, &mut debug_state, &interp)
                 {
                     // Redirect program stdout/stderr into DAP Output events so they
                     // don't corrupt the JSON-RPC protocol stream on the server's stdout.
                     let event_tx_stdout = event_tx.clone();
-                    sema_core::set_stdout_hook(Some(Box::new(move |s: &str| {
+                    sema_core::set_host_stdout_hook(Some(Box::new(move |s: &str| {
                         let _ = event_tx_stdout.blocking_send(DebugEvent::Output {
                             category: "stdout".to_string(),
                             output: s.to_string(),
                         });
                     })));
                     let event_tx_stderr = event_tx.clone();
-                    sema_core::set_stderr_hook(Some(Box::new(move |s: &str| {
+                    sema_core::set_host_stderr_hook(Some(Box::new(move |s: &str| {
                         let _ = event_tx_stderr.blocking_send(DebugEvent::Output {
                             category: "stderr".to_string(),
                             output: s.to_string(),
@@ -990,20 +986,50 @@ fn backend_thread(
                     // inside loaded files still don't hit — the bypass warning
                     // above remains accurate.
 
-                    // Initialize the async scheduler so async/await and channels
-                    // work in a debugged program. The program was compiled with
-                    // `compile_program_with_spans`, which yields an empty native
-                    // table; task VMs resolve natives via the shared global env,
-                    // so an empty native table is correct here.
-                    sema_vm::init_scheduler(interpreter.global_env.clone(), Vec::new());
-
-                    let result = vm_inst.execute_debug(cl.clone(), &interpreter.ctx, ds);
+                    // Drive the program on the interpreter's unified cooperative
+                    // runtime with this `DebugState` registered as the active
+                    // session for the drive. `run_parked_quantum` observes the
+                    // session (`is_debug_session_active`) and runs the debug-aware
+                    // quantum, so a breakpoint/step stops and serves inspection
+                    // against the stopped task's own VM — RIGHT INSIDE the quantum,
+                    // with no `RuntimeState` borrow held. Async ops (async/await,
+                    // channels, sleep, external I/O) Just Work under the debugger
+                    // because they are ordinary runtime suspensions now.
+                    let result = {
+                        let mut vm_inst = vm.take().expect("debug VM present at configurationDone");
+                        vm_inst.seed_main_frame(cl.clone());
+                        let _active = sema_vm::ActiveDebugGuard::enter(ds);
+                        interpreter.drive_vm_on_runtime(vm_inst)
+                    };
 
                     // Clear the hooks immediately after execution so any server-side
                     // prints (e.g. error logging) go back to the real stdout/stderr.
                     sema_eval::set_debug_session_active(false);
-                    sema_core::set_stdout_hook(None);
-                    sema_core::set_stderr_hook(None);
+                    sema_core::set_host_stdout_hook(None);
+                    sema_core::set_host_stderr_hook(None);
+
+                    // An uncaught top-level error settles the root Failed. With the
+                    // uncaught-exception filter enabled, stop and let the user
+                    // inspect before the session ends: the program cannot resume
+                    // past an uncaught error, so any resume/disconnect just
+                    // propagates it. The root's VM was consumed by the runtime and
+                    // its frames are unwound, so inspection is best-effort (an empty
+                    // stack) — parity with the legacy in-VM exception park, which
+                    // also ran after unwinding. A throwaway VM serves the park loop.
+                    if result.is_err() && ds.break_on_uncaught {
+                        if let Err(ref e) = result {
+                            ds.last_exception = Some(e.to_string());
+                            let _ = ds.event_tx.send(sema_vm::debug::DebugEvent::Stopped {
+                                reason: sema_vm::debug::StopReason::Exception,
+                                description: Some(e.to_string()),
+                            });
+                        }
+                        if let Ok(mut park_vm) =
+                            sema_vm::VM::new(interpreter.global_env.clone(), Vec::new(), &[], 0)
+                        {
+                            park_vm.debug_exception_park(&interpreter.ctx, ds);
+                        }
+                    }
 
                     match result {
                         Ok(val) => {

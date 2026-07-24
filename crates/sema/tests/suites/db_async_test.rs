@@ -130,6 +130,58 @@ fn db_async_query_matches_sync() {
         )
         .expect("async db chain");
     assert_eq!(sync_v, async_v);
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "db/close must return the runtime's gate registry to baseline"
+    );
+}
+
+#[test]
+fn db_gate_created_via_runtime_closes_through_compiled_entrypoint() {
+    let interp = Interpreter::new();
+    interp
+        .eval_str_via_runtime(
+            r#"
+            (db/open-memory "mixed-entry-close")
+            (db/exec "mixed-entry-close" "CREATE TABLE t (v INTEGER)")
+            "#,
+        )
+        .expect("runtime entry creates and uses database");
+    assert_eq!(interp.runtime_resource_gate_count(), 1);
+
+    let result = interp
+        .eval_str_compiled(r#"(db/close "mixed-entry-close")"#)
+        .expect("compiled entry closes the runtime-created gate");
+    assert!(result.is_nil());
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
+}
+
+#[test]
+fn db_close_from_foreign_runtime_closes_the_owner_gate() {
+    let owner = Interpreter::new();
+    let caller = Interpreter::new();
+    owner
+        .eval_str_via_runtime(
+            r#"
+            (db/open-memory "foreign-runtime-close")
+            (db/exec "foreign-runtime-close" "CREATE TABLE t (v INTEGER)")
+            "#,
+        )
+        .expect("owner runtime creates and uses database");
+    assert_eq!(owner.runtime_resource_gate_count(), 1);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+
+    let result = caller
+        .eval_str_via_runtime(r#"(db/close "foreign-runtime-close")"#)
+        .expect("foreign runtime routes close through the gate owner");
+    assert!(result.is_nil());
+    assert_eq!(owner.runtime_resource_gate_count(), 0);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+    let error = owner
+        .eval_str_via_runtime(r#"(db/tables "foreign-runtime-close")"#)
+        .expect_err("accepted foreign close removes the database resource");
+    assert!(error.to_string().contains("no open database"), "{error}");
 }
 
 /// `db/open` (real file, not `:memory:`) offloads through `fs_offload` — a
@@ -243,5 +295,229 @@ fn db_async_concurrent_writers_on_one_handle_all_succeed() {
         count,
         Some(3),
         "all three inserts must land — the checkout must serialize, not drop, queued writers"
+    );
+}
+
+// === Cancellation through the ResourceGate + checkout_external path ===
+//
+// Cancelling a spawned db chain must settle the task Cancelled (never hang or
+// panic) AND leave the thread-local registry + runtime usable: a fresh handle
+// opened afterwards works normally. This exercises the checkout continuations'
+// Cancelled arms (AcquireCont / ReleaseReturnCont / FinalCont) and proves a
+// cancelled op releases its resource gate rather than wedging the handle.
+#[test]
+fn db_cancelled_chain_settles_cancelled_and_registry_stays_usable() {
+    let interp = Interpreter::new();
+    let program = r#"
+        (let ((p (async/spawn (fn ()
+                    (db/open-memory "cancelme")
+                    (db/exec "cancelme" "CREATE TABLE t (v TEXT)")
+                    (db/exec "cancelme" "INSERT INTO t (v) VALUES (?)" "x")
+                    (db/query "cancelme" "SELECT v FROM t")))))
+          (async/cancel p)
+          (let ((caught (try (async/await p) (catch e :caught))))
+            (db/open-memory "after")
+            (db/exec "after" "CREATE TABLE t (v TEXT)")
+            (db/exec "after" "INSERT INTO t (v) VALUES (?)" "ok")
+            (let ((rows (db/query "after" "SELECT v FROM t")))
+              (db/close "after")
+              (list caught (length rows)))))
+    "#;
+    let result = interp
+        .eval_str_compiled(program)
+        .expect("cancelled db chain evaluates without wedging the runtime");
+    let parts: Vec<Value> = result.as_list().expect("result list").to_vec();
+    assert_eq!(
+        parts[0],
+        Value::keyword("caught"),
+        "awaiting the cancelled task must raise the :cancelled condition, got {:?}",
+        parts[0]
+    );
+    assert_eq!(
+        parts[1].as_int(),
+        Some(1),
+        "a fresh handle must work after the cancellation (registry not wedged)"
+    );
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
+}
+
+// A cancelled sibling must not corrupt a shared handle for the others. `mid` is
+// cancelled before it ever runs (settled Cancelled pre-quantum), so it never
+// touches the "contend" connection; `a` and `c` still acquire the gate FIFO and
+// both inserts land. Proves a cancelled acquirer neither strands the gate nor
+// tombstones the shared resource out from under its siblings.
+#[test]
+fn db_cancelled_sibling_does_not_corrupt_shared_handle() {
+    let interp = Interpreter::new();
+    let program = r#"
+        (db/open-memory "contend")
+        (db/exec "contend" "CREATE TABLE t (v TEXT)")
+        (let ((mid (async/spawn (fn ()
+                     (db/exec "contend" "INSERT INTO t (v) VALUES (?)" "mid")))))
+          (async/cancel mid)
+          (let ((pa (async/spawn (fn ()
+                       (db/exec "contend" "INSERT INTO t (v) VALUES (?)" "a"))))
+                (pc (async/spawn (fn ()
+                       (db/exec "contend" "INSERT INTO t (v) VALUES (?)" "c")))))
+            (async/await pa)
+            (async/await pc)
+            (let ((rows (db/query "contend" "SELECT v FROM t ORDER BY v")))
+              (db/close "contend")
+              (map (fn (r) (:v r)) rows))))
+    "#;
+    let result = interp
+        .eval_str_compiled(program)
+        .expect("cancelled sibling evaluates without hanging or corrupting the handle");
+    let got: Vec<String> = result
+        .as_list()
+        .expect("list")
+        .iter()
+        .map(|v| v.as_str().expect("string").to_string())
+        .collect();
+    assert_eq!(
+        got,
+        vec!["a".to_string(), "c".to_string()],
+        "both non-cancelled writers must land and the cancelled one must not, got {got:?}"
+    );
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
+}
+
+// === Interrupt-then-reclaim: a cancelled long query is interrupted, rolled
+// back, and the connection is reinstalled Available (not tombstoned) ===
+//
+// The victim opens a tx (BEGIN + INSERT), signals "ready", then parks in an
+// infinite recursive-CTE `count(*)` — a statement that never returns on its
+// own. Without the interrupt handle this whole program HANGS; with it, cancel
+// fires the interrupt so the query returns `SQLITE_INTERRUPT` promptly, the
+// worker rolls back the open transaction, and the reclaim step reinstalls the
+// SAME connection Available. A retry loop (yielding via `async/sleep` so the
+// runtime drains the reap) then proves the handle is usable afterwards and the
+// INSERT was rolled back (count == 0). A sibling task completing while the CTE
+// is in flight proves the scheduler was never stalled.
+#[test]
+fn db_cancel_interrupts_long_query_and_reclaims_connection() {
+    let interp = Interpreter::new();
+    let program = r#"
+        (let ((out (channel/new 8)))
+          (let ((victim (async/spawn (fn ()
+                          (db/open-memory "cte-cancel")
+                          (db/exec-batch "cte-cancel"
+                            "CREATE TABLE t (v INTEGER); BEGIN; INSERT INTO t (v) VALUES (1);")
+                          (channel/send out "ready")
+                          (db/query "cte-cancel"
+                            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) AS n FROM c")))))
+            (channel/recv out)
+            (async/spawn (fn () (channel/send out "sibling")))
+            (let ((sib (channel/recv out)))
+              (await (async (async/sleep 30)))
+              (async/cancel victim)
+              (let ((caught (try (async/await victim) (catch e :cancelled))))
+                (let ((rolled
+                        (let retry ((n 400))
+                          (if (<= n 0)
+                            :never-usable
+                            (let ((r (try (db/query-one "cte-cancel" "SELECT count(*) AS c FROM t")
+                                          (catch e :retry))))
+                              (if (= r :retry)
+                                (begin (await (async (async/sleep 2))) (retry (- n 1)))
+                                r))))))
+                  (db/close "cte-cancel")
+                  (list sib caught rolled))))))
+    "#;
+    let result = interp
+        .eval_str_compiled(program)
+        .expect("interrupted db chain settles without hanging");
+    let parts: Vec<Value> = result.as_list().expect("result list").to_vec();
+
+    assert_eq!(
+        parts[0],
+        Value::string("sibling"),
+        "a sibling must complete while the long query is in flight (scheduler not stalled)"
+    );
+    assert_eq!(
+        parts[1],
+        Value::keyword("cancelled"),
+        "awaiting the cancelled long query must raise the :cancelled condition, got {:?}",
+        parts[1]
+    );
+    let rolled = parts[2]
+        .as_map_ref()
+        .and_then(|m| m.get(&Value::keyword("c")).and_then(|v| v.as_int()));
+    assert_eq!(
+        rolled,
+        Some(0),
+        "the reclaimed connection must be usable and the interrupted tx rolled back \
+         (count 0), got {:?}",
+        parts[2]
+    );
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "the cancelled op's gate must close so the registry returns to baseline"
+    );
+}
+
+// === Bounded result rows: a query one row past the cap is rejected at the
+// boundary without buffering the whole result ===
+#[test]
+fn db_query_result_row_cap_rejects_at_boundary_plus_one() {
+    let interp = Interpreter::new();
+    // Lower the per-call cap (clamped to the hard ceiling) so the boundary test
+    // stays cheap: three rows allowed, the fourth rejected.
+    sema_stdlib::set_db_result_caps_override(Some((3, u64::MAX)));
+
+    let over = interp.eval_str_compiled(
+        r#"
+        (db/open-memory "cap-db")
+        (db/exec-batch "cap-db"
+          "CREATE TABLE t (v INTEGER);
+           INSERT INTO t (v)
+             WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 4)
+             SELECT x FROM c;")
+        (db/query "cap-db" "SELECT v FROM t ORDER BY v")
+        "#,
+    );
+    let err = over.expect_err("four rows must exceed the three-row cap");
+    assert!(
+        err.to_string().contains("exceeds the maximum of 3 rows"),
+        "unexpected cap error: {err}"
+    );
+
+    // The connection stays usable: a result exactly at the cap succeeds.
+    let ok = interp
+        .eval_str_compiled(
+            r#"
+            (let ((rows (db/query "cap-db" "SELECT v FROM t ORDER BY v LIMIT 3")))
+              (db/close "cap-db")
+              (length rows))
+            "#,
+        )
+        .expect("an at-cap query succeeds");
+    assert_eq!(ok.as_int(), Some(3), "a result at the cap must be returned");
+
+    sema_stdlib::set_db_result_caps_override(None);
+}
+
+// === db/open applies a bounded busy timeout ===
+//
+// A fresh rusqlite connection defaults to a 5000ms busy timeout; db/open sets a
+// distinct 10000ms, observable via `PRAGMA busy_timeout`.
+#[test]
+fn db_open_sets_busy_timeout() {
+    let interp = Interpreter::new();
+    let result = interp
+        .eval_str_compiled(
+            r#"
+            (db/open-memory "busy-db")
+            (let ((row (db/query-one "busy-db" "PRAGMA busy_timeout")))
+              (db/close "busy-db")
+              (:timeout row))
+            "#,
+        )
+        .expect("busy_timeout pragma query");
+    assert_eq!(
+        result.as_int(),
+        Some(10_000),
+        "db/open must apply the bounded busy timeout, got {result:?}"
     );
 }

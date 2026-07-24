@@ -31,8 +31,8 @@
   (format "Vector store has ~a documents" (vector-store/count store-name)))
 
 ;; 2. Ask a question with retrieval
-(define question  "What is this document about?")
-(define hits      (vector-store/search store-name (llm/embed question) 3))
+(define question "What is this document about?")
+(define hits (vector-store/search store-name (llm/embed question) 3))
 
 (println (format "\nTop ~a relevant pages:" (length hits)))
 (for-each

@@ -8,7 +8,19 @@ mod bytevector;
 mod comparison;
 mod context;
 mod crypto;
+/// Lower the per-input byte cap for the hashing/base64 ops under a runtime quantum
+/// (clamped to the hard ceiling), or clear the override with `None`. The B9 seam
+/// for the crypto cap-boundary regression.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use crypto::set_crypto_input_byte_cap_override;
 mod csv_ops;
+/// Lower the per-input byte cap for `csv/parse`(`-maps`) under a runtime quantum
+/// (clamped to the hard ceiling), or clear the override with `None`. The B9 seam
+/// the csv cap-boundary regression drives without a multi-megabyte input.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use csv_ops::set_csv_input_byte_cap_override;
 mod datetime;
 mod diff;
 #[cfg(not(target_arch = "wasm32"))]
@@ -17,17 +29,56 @@ mod event;
 mod fs_watch;
 #[cfg(not(target_arch = "wasm32"))]
 mod git;
+/// Lower the per-pipe output-byte cap for offloaded `git/*` calls (clamped to
+/// the hard ceiling), or clear the override with `None`. The seam the git-async
+/// over-cap regression drives without a multi-megabyte fixture.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use git::set_git_max_output_bytes_override;
 #[cfg(not(target_arch = "wasm32"))]
 mod http;
 #[cfg(not(target_arch = "wasm32"))]
 mod io;
+/// Test/observation hooks for the canonical quarantined-bounded file operations
+/// (Task 05 R08A): the in-flight overlap gauge and the pre-dispatch cap/delay
+/// knobs used by the resource-contract tests.
+#[cfg(not(target_arch = "wasm32"))]
+pub use io::{
+    fs_current_inflight, fs_peak_inflight, reset_fs_inflight, set_fs_byte_cap, set_fs_list_cap,
+    set_fs_test_delay_ms, FS_BYTE_CAP_DEFAULT, FS_LIST_CAP_DEFAULT,
+};
+/// Terminal raw-mode restore observability, used by the R08C stdin/TTY guard
+/// regression tests to assert the cancel/teardown restore path fires exactly
+/// once without a controlling terminal.
+#[cfg(unix)]
+#[doc(hidden)]
+pub use io::{reset_tty_restore_count, set_tty_force_capture_for_test, tty_restore_count};
 pub(crate) mod json;
 #[cfg(not(target_arch = "wasm32"))]
 mod kv;
+/// Lower the per-thread `kv/open`/`kv/set` store bounds (clamped to the hard
+/// ceilings), or clear the override with `None`. The bounded-store seam for
+/// advanced callers and the regression suite.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use kv::set_kv_bounds_override;
 mod list;
 mod map;
+/// Lower the per-input byte cap for `diff/*` under a runtime quantum (clamped to
+/// the hard ceiling), or clear the override with `None`. The B8 seam the diff
+/// cap-boundary regression drives without a multi-megabyte input.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use diff::set_diff_input_byte_cap_override;
 #[cfg(not(target_arch = "wasm32"))]
 mod markup;
+/// Lower the per-input byte cap for the `html/*` and `markdown/*` ops under a
+/// runtime quantum (clamped to the hard ceiling), or clear the override with
+/// `None`. The B9 seam the html cap-boundary regression drives without a
+/// multi-megabyte input.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use markup::set_markup_input_byte_cap_override;
 mod math;
 mod meta;
 mod mutable;
@@ -42,19 +93,61 @@ mod proc;
 mod pty;
 mod reflect;
 mod regex_ops;
+/// Shared reference glue for offloading an I/O op onto the unified-runtime
+/// executor as a structural `NativeOutcome::Suspend` (http, git, sqlite, …).
+#[cfg(not(target_arch = "wasm32"))]
+mod runtime_offload;
 mod secret;
+/// Lower the per-input byte cap for the secret/PII ops under a runtime quantum
+/// (clamped to the hard ceiling), or clear the override with `None`. The B8 seam
+/// the secret/PII cap-boundary regression drives without a multi-megabyte input.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use secret::set_secret_input_byte_cap_override;
 #[cfg(not(target_arch = "wasm32"))]
 mod serial;
 #[cfg(not(target_arch = "wasm32"))]
 mod server;
 #[cfg(not(target_arch = "wasm32"))]
 mod sqlite;
+/// Lower the per-call `db/query`/`db/tables` result caps (clamped to the hard
+/// ceilings) on this thread, or clear the override with `None`. The bounded-
+/// result seam for advanced callers and the regression suite.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use sqlite::set_db_result_caps_override;
 mod stream;
+
+/// Inject a per-op delay into the file-stream checkout worker (milliseconds).
+/// Test hook only, mirroring [`set_fs_test_delay_ms`]; lets a cancellation
+/// regression cancel a regular-file read while its worker is still occupied.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use stream::set_stream_checkout_test_delay_ms;
+
+/// Read one source line through the process-wide stdin coordinator.
+///
+/// This is an internal integration seam for the native headless REPL. Keeping
+/// source acquisition behind the same owner as runtime stdin operations lets a
+/// form such as `(read-line)` consume the bytes immediately following it.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub fn read_coordinated_stdin_source_line() -> Result<Option<String>, sema_core::SemaError> {
+    stream::stdin_source_line_value("headless REPL")
+}
 mod string;
 #[cfg(not(target_arch = "wasm32"))]
 mod system;
+#[cfg(all(not(target_arch = "wasm32"), unix))]
+#[doc(hidden)]
+pub use system::mark_sigwinch_pending_for_test;
 #[cfg(not(target_arch = "wasm32"))]
 mod terminal;
+/// Live spinner render-thread gauge (B6 R19), used by the spinner lifecycle
+/// regression to assert interpreter teardown leaves no live spinner thread.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use terminal::spinner_live_thread_count;
 mod text;
 mod toml_ops;
 mod typed_array;
@@ -205,6 +298,40 @@ fn register_fn_gated(
     }
 }
 
+/// Like [`register_fn_gated`], but the body also receives the evaluator
+/// [`EvalContext`] on both the sync and runtime paths (via
+/// [`NativeFn::with_ctx`](sema_core::NativeFn::with_ctx)). Used by resource
+/// registries (`proc/spawn`, `pty/spawn`) that must register an
+/// interpreter-teardown hook against the owning interpreter's context the first
+/// time they create a live OS resource, so a spawned-but-never-closed child is
+/// reaped on interpreter drop (C6). The body cannot structurally suspend — these
+/// creation ops are synchronous even inside a runtime quantum.
+#[cfg(not(target_arch = "wasm32"))]
+fn register_fn_gated_ctx(
+    env: &Env,
+    sandbox: &Sandbox,
+    cap: Caps,
+    name: &str,
+    f: impl Fn(&sema_core::EvalContext, &[Value]) -> Result<Value, sema_core::SemaError> + 'static,
+) {
+    if sandbox.is_unrestricted() {
+        env.set(
+            sema_core::intern(name),
+            Value::native_fn(sema_core::NativeFn::with_ctx(name, f)),
+        );
+    } else {
+        let sandbox = sandbox.clone();
+        let fn_name = name.to_string();
+        env.set(
+            sema_core::intern(name),
+            Value::native_fn(sema_core::NativeFn::with_ctx(name, move |ctx, args| {
+                sandbox.check(cap, &fn_name)?;
+                f(ctx, args)
+            })),
+        );
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn register_fn_path_gated(
     env: &Env,
@@ -234,6 +361,116 @@ fn register_fn_path_gated(
     }
 }
 
+/// Like [`register_fn_path_gated`], but the op body speaks the runtime native
+/// ABI (`NativeResult`) so its `in_runtime_quantum` branch can return a
+/// `NativeOutcome::Suspend` (an external-wait offload) directly. The sandbox
+/// capability + path checks are applied identically, then the checked body is
+/// exposed under both ABIs: the runtime callback returns the body's structural
+/// `NativeOutcome`, and the synchronous value callback unwraps a plain `Return`
+/// when no runtime quantum is active.
+#[cfg(not(target_arch = "wasm32"))]
+fn register_runtime_fn_path_gated(
+    env: &Env,
+    sandbox: &Sandbox,
+    cap: Caps,
+    name: &str,
+    path_args: &[usize],
+    f: impl Fn(&[Value]) -> sema_core::runtime::NativeResult + 'static,
+) {
+    use sema_core::runtime::NativeOutcome;
+    type RuntimeFnBody = dyn Fn(&[Value]) -> sema_core::runtime::NativeResult;
+    let checked: std::rc::Rc<RuntimeFnBody> = if sandbox.is_unrestricted() {
+        std::rc::Rc::new(f)
+    } else {
+        let sandbox = sandbox.clone();
+        let fn_name = name.to_string();
+        let path_indices: Vec<usize> = path_args.to_vec();
+        std::rc::Rc::new(move |args: &[Value]| {
+            sandbox.check(cap, &fn_name)?;
+            for &idx in &path_indices {
+                if let Some(val) = args.get(idx) {
+                    if let Some(p) = val.as_str() {
+                        sandbox.check_path(p, &fn_name)?;
+                    }
+                }
+            }
+            f(args)
+        })
+    };
+    let for_func = checked.clone();
+    let for_runtime = checked;
+    let func_name = name.to_string();
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
+            name,
+            move |args| match for_func(args)? {
+                NativeOutcome::Return(value) => Ok(value),
+                _ => Err(sema_core::SemaError::eval(format!(
+                    "{func_name}: native suspended outside the cooperative runtime"
+                ))),
+            },
+            move |_ctx, args| for_runtime(args),
+        )),
+    );
+}
+
+/// Like [`register_runtime_fn_path_gated`], but the body also receives the
+/// evaluator [`EvalContext`] on both ABIs (via
+/// [`NativeFn::with_ctx_runtime`](sema_core::NativeFn::with_ctx_runtime)). Used
+/// by resource registries (`kv/open`, `serial/open`, `db/open`,
+/// `db/open-memory`) whose open op still offloads on the runtime path yet must
+/// register an interpreter-teardown hook against the owning interpreter's
+/// context (C6). The sandbox capability + path checks are applied identically to
+/// [`register_runtime_fn_path_gated`].
+#[cfg(not(target_arch = "wasm32"))]
+fn register_runtime_fn_path_gated_ctx(
+    env: &Env,
+    sandbox: &Sandbox,
+    cap: Caps,
+    name: &str,
+    path_args: &[usize],
+    f: impl Fn(&sema_core::EvalContext, &[Value]) -> sema_core::runtime::NativeResult + 'static,
+) {
+    use sema_core::runtime::NativeOutcome;
+    type RuntimeFnBodyCtx =
+        dyn Fn(&sema_core::EvalContext, &[Value]) -> sema_core::runtime::NativeResult;
+    let checked: std::rc::Rc<RuntimeFnBodyCtx> = if sandbox.is_unrestricted() {
+        std::rc::Rc::new(f)
+    } else {
+        let sandbox = sandbox.clone();
+        let fn_name = name.to_string();
+        let path_indices: Vec<usize> = path_args.to_vec();
+        std::rc::Rc::new(move |ctx: &sema_core::EvalContext, args: &[Value]| {
+            sandbox.check(cap, &fn_name)?;
+            for &idx in &path_indices {
+                if let Some(val) = args.get(idx) {
+                    if let Some(p) = val.as_str() {
+                        sandbox.check_path(p, &fn_name)?;
+                    }
+                }
+            }
+            f(ctx, args)
+        })
+    };
+    let for_func = checked.clone();
+    let for_runtime = checked;
+    let func_name = name.to_string();
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(sema_core::NativeFn::with_ctx_runtime(
+            name,
+            move |ctx, args| match for_func(ctx, args)? {
+                NativeOutcome::Return(value) => Ok(value),
+                _ => Err(sema_core::SemaError::eval(format!(
+                    "{func_name}: native suspended outside the cooperative runtime"
+                ))),
+            },
+            move |call, args| for_runtime(call.eval_context, args),
+        )),
+    );
+}
+
 fn register_fn(
     env: &Env,
     name: &str,
@@ -243,4 +480,73 @@ fn register_fn(
         sema_core::intern(name),
         Value::native_fn(sema_core::NativeFn::simple(name, f)),
     );
+}
+
+fn register_fn_with_escaping_args(
+    env: &Env,
+    name: &str,
+    escaping_args: &'static [usize],
+    f: impl Fn(&[Value]) -> Result<Value, sema_core::SemaError> + 'static,
+) {
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(sema_core::NativeFn::simple(name, f).with_escaping_args(escaping_args)),
+    );
+}
+
+/// Like [`register_fn`], but the op body speaks the runtime native ABI
+/// (`NativeResult`) so its `in_runtime_quantum` branch can return a
+/// `NativeOutcome::Suspend` (an external-wait offload) directly. The single body
+/// is exposed under both ABIs: the runtime callback returns its
+/// `NativeOutcome`, while the synchronous value callback unwraps a plain
+/// `Return` when no runtime quantum is active. Mirrors
+/// [`register_runtime_fn_path_gated`] without the sandbox checks.
+#[cfg(not(target_arch = "wasm32"))]
+fn register_runtime_fn(
+    env: &Env,
+    name: &str,
+    f: impl Fn(&[Value]) -> sema_core::runtime::NativeResult + 'static,
+) {
+    use sema_core::runtime::NativeOutcome;
+    let body = std::rc::Rc::new(f);
+    let for_func = body.clone();
+    let for_runtime = body;
+    let func_name = name.to_string();
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
+            name,
+            move |args| match for_func(args)? {
+                NativeOutcome::Return(value) => Ok(value),
+                _ => Err(sema_core::SemaError::eval(format!(
+                    "{func_name}: native suspended outside the cooperative runtime"
+                ))),
+            },
+            move |_ctx, args| for_runtime(args),
+        )),
+    );
+}
+
+/// Like [`register_runtime_fn`], but cap-gated (no path check) — for ops that
+/// need a single capability check ahead of a runtime-ABI body (`zip/*`,
+/// `tar/*`, `patch/apply-file`). The sandbox check is applied identically under
+/// both ABIs before the body runs.
+#[cfg(not(target_arch = "wasm32"))]
+fn register_runtime_fn_gated(
+    env: &Env,
+    sandbox: &Sandbox,
+    cap: Caps,
+    name: &str,
+    f: impl Fn(&[Value]) -> sema_core::runtime::NativeResult + 'static,
+) {
+    if sandbox.is_unrestricted() {
+        register_runtime_fn(env, name, f);
+    } else {
+        let sandbox = sandbox.clone();
+        let fn_name = name.to_string();
+        register_runtime_fn(env, name, move |args| {
+            sandbox.check(cap, &fn_name)?;
+            f(args)
+        });
+    }
 }

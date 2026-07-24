@@ -1,0 +1,6 @@
+# token-id<TAB>exact-repository-path<TAB>exact-count<TAB>reason
+CALL_CALLBACK	scripts/fixtures/unified-runtime-source-policy/permitted-host-adapter.rs	1	fixture for a reviewed host-only callback invocation
+CALL_CALLBACK_OWNED	scripts/fixtures/unified-runtime-source-policy/permitted-host-adapter.rs	1	fixture for a reviewed host-only owned callback invocation
+WITH_STDLIB_CTX	scripts/fixtures/unified-runtime-source-policy/permitted-host-adapter.rs	1	fixture for reviewed host-only stdlib context access
+SET_CALL_CALLBACK	scripts/fixtures/unified-runtime-source-policy/permitted-host-adapter.rs	1	fixture for evaluator initialization
+SET_CALL_OWNED_CALLBACK	scripts/fixtures/unified-runtime-source-policy/permitted-host-adapter.rs	1	fixture for evaluator initialization

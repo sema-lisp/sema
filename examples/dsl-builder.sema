@@ -43,10 +43,10 @@
 (define (span attrs text)       (tag "span" attrs text))
 (define (ul . items)
   (tag "ul" {} (string/join (map (fn (i) (tag "li" {} i)) items) "\n")))
-(define (a attrs text)  (tag "a" attrs text))
-(define (br)            (tag "br" {}))
-(define (hr)            (tag "hr" {}))
-(define (img attrs)     (tag "img" attrs))
+(define (a attrs text) (tag "a" attrs text))
+(define (br) (tag "br" {}))
+(define (hr) (tag "hr" {}))
+(define (img attrs) (tag "img" attrs))
 
 ;; Quick demo
 (define snippet

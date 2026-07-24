@@ -9,21 +9,21 @@
 ;; --- Routing ---------------------------------------------------------------
 
 (router/init!
-  {"/"           "overview-page"
-   "/active"     "active-page"
-   "/completed"  "completed-page"
-   "/about"      "about-page"})
+  {"/" "overview-page"
+   "/active" "active-page"
+   "/completed" "completed-page"
+   "/about" "about-page"})
 
 ;; --- Persistence -----------------------------------------------------------
 
-(def task-storage-key     "sema-web-example/tasks")
-(def next-id-storage-key  "sema-web-example/next-id")
+(def task-storage-key "sema-web-example/tasks")
+(def next-id-storage-key "sema-web-example/next-id")
 
 ;; --- State ----------------------------------------------------------------
 
-(def tasks    (state (or (store/get task-storage-key) '())))
-(def next-id  (state (or (store/get next-id-storage-key) 1)))
-(def draft    (state ""))
+(def tasks (state (or (store/get task-storage-key) '())))
+(def next-id (state (or (store/get next-id-storage-key) 1)))
+(def draft (state ""))
 
 (def route-match (computed (router/current-route)))
 
@@ -44,8 +44,8 @@
 
 (def visible-tasks
   (computed
-    (let ((page   @current-page)
-          (items  @tasks))
+    (let ((page @current-page)
+          (items @tasks))
       (cond
         ((equal? page "active-page")
           (filter (fn (task) (not (:done task))) items))
@@ -56,55 +56,55 @@
 
 (def shell-class
   (css
-    {:display          "grid"
-     :gap              "22px"
-     :padding          "26px"
-     :background       "rgba(255,252,245,0.86)"
-     :border           "1px solid rgba(37,45,61,0.12)"
-     :border-radius    "28px"
-     :box-shadow       "0 20px 70px rgba(38,35,30,0.14)"
-     :backdrop-filter  "blur(12px)"}))
+    {:display "grid"
+     :gap "22px"
+     :padding "26px"
+     :background "rgba(255,252,245,0.86)"
+     :border "1px solid rgba(37,45,61,0.12)"
+     :border-radius "28px"
+     :box-shadow "0 20px 70px rgba(38,35,30,0.14)"
+     :backdrop-filter "blur(12px)"}))
 
 (def hero-class
   (css
-    {:display  "grid"
-     :gap      "10px"}))
+    {:display "grid"
+     :gap "10px"}))
 
 (def badge-class
   (css
-    {:display         "inline-flex"
-     :align-items     "center"
-     :width           "fit-content"
-     :padding         "6px 12px"
-     :border-radius   "999px"
-     :font-size       "12px"
-     :font-weight     "700"
-     :letter-spacing  "0.12em"
-     :text-transform  "uppercase"
-     :background      "#1d2433"
-     :color           "#fff"}))
+    {:display "inline-flex"
+     :align-items "center"
+     :width "fit-content"
+     :padding "6px 12px"
+     :border-radius "999px"
+     :font-size "12px"
+     :font-weight "700"
+     :letter-spacing "0.12em"
+     :text-transform "uppercase"
+     :background "#1d2433"
+     :color "#fff"}))
 
 (def title-class
   (css
-    {:font-size       "clamp(1.6rem, 4vw, 2.8rem)"
-     :line-height     "0.95"
-     :font-weight     "700"
-     :letter-spacing  "-0.03em"
-     :margin          "0"}))
+    {:font-size "clamp(1.6rem, 4vw, 2.8rem)"
+     :line-height "0.95"
+     :font-weight "700"
+     :letter-spacing "-0.03em"
+     :margin "0"}))
 
 (def copy-class
   (css
-    {:margin       "0"
-     :max-width    "700px"
-     :font-size    "1rem"
-     :line-height  "1.65"
-     :color        "#5b6475"}))
+    {:margin "0"
+     :max-width "700px"
+     :font-size "1rem"
+     :line-height "1.65"
+     :color "#5b6475"}))
 
 (def nav-class
   (css
-    {:display    "flex"
-     :flex-wrap  "wrap"
-     :gap        "10px"}))
+    {:display "flex"
+     :flex-wrap "wrap"
+     :gap "10px"}))
 
 (def nav-button-class
   (css
@@ -117,80 +117,80 @@
      :font-weight "600"
      :cursor "pointer"
      :transition "transform 120ms ease, background 120ms ease, border-color 120ms ease"
-     "&:hover" {:transform     "translateY(-1px)"
-      :background    "#ffffff"
-      :border-color  "rgba(37,45,61,0.28)"}}))
+     "&:hover" {:transform "translateY(-1px)"
+      :background "#ffffff"
+      :border-color "rgba(37,45,61,0.28)"}}))
 
 (def nav-button-active-class
   (css
-    {:background    "#c7522a"
-     :border-color  "#c7522a"
-     :color         "#fff"}))
+    {:background "#c7522a"
+     :border-color "#c7522a"
+     :color "#fff"}))
 
 (def grid-class
   (css
-    {:display                "grid"
-     :grid-template-columns  "minmax(0, 1.4fr) minmax(320px, 0.95fr)"
-     :gap                    "20px"}))
+    {:display "grid"
+     :grid-template-columns "minmax(0, 1.4fr) minmax(320px, 0.95fr)"
+     :gap "20px"}))
 
 (def column-class
   (css
-    {:display  "grid"
-     :gap      "18px"}))
+    {:display "grid"
+     :gap "18px"}))
 
 (def card-class
   (css
-    {:padding        "18px"
-     :border-radius  "20px"
-     :background     "rgba(255,255,255,0.72)"
-     :border         "1px solid rgba(37,45,61,0.1)"
-     :box-shadow     "0 12px 30px rgba(38,35,30,0.08)"}))
+    {:padding "18px"
+     :border-radius "20px"
+     :background "rgba(255,255,255,0.72)"
+     :border "1px solid rgba(37,45,61,0.1)"
+     :box-shadow "0 12px 30px rgba(38,35,30,0.08)"}))
 
 (def section-title-class
   (css
-    {:margin       "0 0 8px"
-     :font-size    "18px"
-     :font-weight  "700"}))
+    {:margin "0 0 8px"
+     :font-size "18px"
+     :font-weight "700"}))
 
 (def section-copy-class
   (css
-    {:margin       "0"
-     :font-size    "14px"
-     :line-height  "1.55"
-     :color        "#5b6475"}))
+    {:margin "0"
+     :font-size "14px"
+     :line-height "1.55"
+     :color "#5b6475"}))
 
 (def stats-grid-class
   (css
-    {:display                "grid"
-     :grid-template-columns  "repeat(3, minmax(0, 1fr))"
-     :gap                    "12px"}))
+    {:display "grid"
+     :grid-template-columns "repeat(3, minmax(0, 1fr))"
+     :gap "12px"}))
 
 (def stat-class
   (css
-    {:padding        "16px"
-     :border-radius  "18px"
-     :background     "#fffdf9"
-     :border         "1px solid rgba(37,45,61,0.08)"}))
+    {:padding "16px"
+     :border-radius "18px"
+     :background "#fffdf9"
+     :border "1px solid rgba(37,45,61,0.08)"}))
 
 (def stat-label-class
   (css
-    {:font-size       "12px"
-     :font-weight     "700"
-     :letter-spacing  "0.08em"
-     :text-transform  "uppercase"
-     :color           "#7b5b4a"}))
+    {:font-size "12px"
+     :font-weight "700"
+     :letter-spacing "0.08em"
+     :text-transform "uppercase"
+     :color "#7b5b4a"}))
 
 (def stat-value-class
   (css
-    {:margin-top   "8px"
-     :font-size    "30px"
-     :line-height  "1"
-     :font-weight  "700"}))
+    {:margin-top "8px"
+     :font-size "30px"
+     :line-height "1"
+     :font-weight "700"}))
 
 (def composer-class
   (css
-    {:display  "grid"
-     :gap      "12px"}))
+    {:display "grid"
+     :gap "12px"}))
 
 (def input-class
   (css
@@ -202,63 +202,63 @@
      :font-size "15px"
      :color "#1d2433"
      :outline "none"
-     "&:focus" {:border-color  "#c7522a"
-      :box-shadow    "0 0 0 4px rgba(199,82,42,0.12)"}}))
+     "&:focus" {:border-color "#c7522a"
+      :box-shadow "0 0 0 4px rgba(199,82,42,0.12)"}}))
 
 (def button-row-class
   (css
-    {:display    "flex"
-     :flex-wrap  "wrap"
-     :gap        "10px"}))
+    {:display "flex"
+     :flex-wrap "wrap"
+     :gap "10px"}))
 
 (def primary-button-class
   (css
-    {:padding        "12px 16px"
-     :border         "none"
-     :border-radius  "16px"
-     :background     "linear-gradient(135deg, #c7522a 0%, #df7c32 100%)"
-     :color          "#fff"
-     :font-size      "14px"
-     :font-weight    "700"
-     :cursor         "pointer"
-     :box-shadow     "0 10px 24px rgba(199,82,42,0.24)"
-     "&:hover"       {:filter "brightness(1.03)"}}))
+    {:padding "12px 16px"
+     :border "none"
+     :border-radius "16px"
+     :background "linear-gradient(135deg, #c7522a 0%, #df7c32 100%)"
+     :color "#fff"
+     :font-size "14px"
+     :font-weight "700"
+     :cursor "pointer"
+     :box-shadow "0 10px 24px rgba(199,82,42,0.24)"
+     "&:hover" {:filter "brightness(1.03)"}}))
 
 (def subtle-button-class
   (css
-    {:padding        "12px 16px"
-     :border-radius  "16px"
-     :border         "1px solid rgba(37,45,61,0.12)"
-     :background     "rgba(255,255,255,0.8)"
-     :color          "#1d2433"
-     :font-size      "14px"
-     :font-weight    "600"
-     :cursor         "pointer"
-     "&:hover"       {:background "#fff"}}))
+    {:padding "12px 16px"
+     :border-radius "16px"
+     :border "1px solid rgba(37,45,61,0.12)"
+     :background "rgba(255,255,255,0.8)"
+     :color "#1d2433"
+     :font-size "14px"
+     :font-weight "600"
+     :cursor "pointer"
+     "&:hover" {:background "#fff"}}))
 
 (def list-class
   (css
-    {:display     "grid"
-     :gap         "12px"
-     :padding     "0"
-     :margin      "0"
-     :list-style  "none"}))
+    {:display "grid"
+     :gap "12px"
+     :padding "0"
+     :margin "0"
+     :list-style "none"}))
 
 (def task-class
   (css
-    {:display                "grid"
-     :grid-template-columns  "auto 1fr auto"
-     :align-items            "center"
-     :gap                    "12px"
-     :padding                "14px 16px"
-     :border-radius          "18px"
-     :background             "#fffdf9"
-     :border                 "1px solid rgba(37,45,61,0.08)"}))
+    {:display "grid"
+     :grid-template-columns "auto 1fr auto"
+     :align-items "center"
+     :gap "12px"
+     :padding "14px 16px"
+     :border-radius "18px"
+     :background "#fffdf9"
+     :border "1px solid rgba(37,45,61,0.08)"}))
 
 (def task-done-class
   (css
-    {:background    "rgba(225, 241, 230, 0.88)"
-     :border-color  "rgba(86, 139, 92, 0.24)"}))
+    {:background "rgba(225, 241, 230, 0.88)"
+     :border-color "rgba(86, 139, 92, 0.24)"}))
 
 (def icon-button-class
   (css
@@ -272,42 +272,42 @@
      :background "#fff"
      :cursor "pointer"
      :font-size "14px"
-     "&:hover" {:border-color  "#c7522a"
-      :color         "#c7522a"}}))
+     "&:hover" {:border-color "#c7522a"
+      :color "#c7522a"}}))
 
 (def task-title-class
   (css
-    {:font-size    "15px"
-     :font-weight  "600"
-     :line-height  "1.4"}))
+    {:font-size "15px"
+     :font-weight "600"
+     :line-height "1.4"}))
 
 (def task-title-done-class
   (css
-    {:color            "#5b6475"
-     :text-decoration  "line-through"}))
+    {:color "#5b6475"
+     :text-decoration "line-through"}))
 
 (def task-meta-class
   (css
-    {:font-size       "12px"
-     :font-weight     "700"
-     :letter-spacing  "0.08em"
-     :text-transform  "uppercase"
-     :color           "#7b5b4a"}))
+    {:font-size "12px"
+     :font-weight "700"
+     :letter-spacing "0.08em"
+     :text-transform "uppercase"
+     :color "#7b5b4a"}))
 
 (def empty-state-class
   (css
-    {:padding        "18px"
-     :border-radius  "18px"
-     :background     "rgba(255,255,255,0.72)"
-     :border         "1px dashed rgba(37,45,61,0.16)"
-     :color          "#5b6475"}))
+    {:padding "18px"
+     :border-radius "18px"
+     :background "rgba(255,255,255,0.72)"
+     :border "1px dashed rgba(37,45,61,0.16)"
+     :color "#5b6475"}))
 
 (def about-list-class
   (css
-    {:display       "grid"
-     :gap           "10px"
-     :padding-left  "18px"
-     :margin        "12px 0 0"}))
+    {:display "grid"
+     :gap "10px"
+     :padding-left "18px"
+     :margin "12px 0 0"}))
 
 (def code-pill-class
   (css
@@ -326,10 +326,10 @@
 
 (define (current-page-title)
   (cond
-    ((equal? @current-page "active-page")     "Active tasks")
-    ((equal? @current-page "completed-page")  "Completed tasks")
-    ((equal? @current-page "about-page")      "Build notes")
-    (else                                     "Overview")))
+    ((equal? @current-page "active-page") "Active tasks")
+    ((equal? @current-page "completed-page") "Completed tasks")
+    ((equal? @current-page "about-page") "Build notes")
+    (else "Overview")))
 
 (define (nav-button label handler-name page-name)
   [:button
@@ -351,10 +351,10 @@
       (string-append task-class " " task-done-class)
       task-class)}
    [:button
-    {:class     icon-button-class
-     :data-id   (number->string (:id task))
-     :on-click  "toggle-task"
-     :title     (if (:done task) "Mark as active" "Mark as done")}
+    {:class icon-button-class
+     :data-id (number->string (:id task))
+     :on-click "toggle-task"
+     :title (if (:done task) "Mark as active" "Mark as done")}
     (if (:done task) "✓" "○")]
    [:div
     [:div
@@ -366,10 +366,10 @@
      {:class task-meta-class}
      (if (:done task) "Completed" "Open")]]
    [:button
-    {:class     icon-button-class
-     :data-id   (number->string (:id task))
-     :on-click  "remove-task"
-     :title     "Remove task"}
+    {:class icon-button-class
+     :data-id (number->string (:id task))
+     :on-click "remove-task"
+     :title "Remove task"}
     "×"]])
 
 ;; --- Actions --------------------------------------------------------------
@@ -452,11 +452,11 @@
    [:div
     {:class composer-class}
     [:input
-     {:class        input-class
-      :value        @draft
-      :placeholder  "Add a task for the next release..."
-      :on-input     "set-draft"
-      :on-keydown   "maybe-add-task"}]
+     {:class input-class
+      :value @draft
+      :placeholder "Add a task for the next release..."
+      :on-input "set-draft"
+      :on-keydown "maybe-add-task"}]
     [:div
      {:class button-row-class}
      [:button {:class primary-button-class :on-click "add-task"} "Add task"]

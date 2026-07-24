@@ -7,9 +7,11 @@
 //! harness in `workflow_common`.
 
 use crate::workflow_common;
-use crate::workflow_common::{run_workflow, temp_run_dir, RunOpts};
+use crate::workflow_common::{run_workflow, temp_run_dir, with_workflow_env_lock, RunOpts};
 
+use sema_core::Value;
 use sema_llm::fake::FakeProvider;
+use sema_workflow::{current_for, set_workflow_scope};
 
 const WF: &str = r#"
     (defworkflow resume-demo
@@ -321,4 +323,118 @@ fn missing_memo_reruns_conservatively() {
     );
 
     let _ = std::fs::remove_dir_all(&base);
+}
+
+// ── A2: safe run identity (library-level) ─────────────────────────────────────
+//
+// These drive `set_workflow_scope` directly (task_context = None → host scope) under the
+// shared workflow env lock, exercising the identity/gating logic without a full run.
+
+#[test]
+fn two_generated_runs_in_one_process_land_in_distinct_dirs() {
+    with_workflow_env_lock(|| {
+        let base = temp_run_dir("gen-distinct");
+        std::env::set_var("SEMA_WORKFLOW_RUN_DIR", &base);
+        // No SEMA_WORKFLOW_RUN_ID → each run's id is generated. Two in the same second
+        // (indeed back to back) must still get distinct dirs (nanos + process nonce).
+        let g1 = set_workflow_scope("wf", "", &Value::nil(), None).expect("first run opens");
+        let id1 = current_for(None).expect("scope 1 live").run_id();
+        drop(g1);
+        let g2 = set_workflow_scope("wf", "", &Value::nil(), None).expect("second run opens");
+        let id2 = current_for(None).expect("scope 2 live").run_id();
+        drop(g2);
+
+        assert_ne!(id1, id2, "two generated ids in one process must differ");
+        assert!(base.join(&id1).is_dir(), "first run dir exists: {id1}");
+        assert!(base.join(&id2).is_dir(), "second run dir exists: {id2}");
+        let _ = std::fs::remove_dir_all(&base);
+    });
+}
+
+#[test]
+fn fresh_run_into_a_dir_with_an_existing_journal_fails() {
+    with_workflow_env_lock(|| {
+        let base = temp_run_dir("fresh-existing");
+        // A prior run's journal already occupies this dir: a fresh run must not append to
+        // (and corrupt) it — the create_new claim rejects the reuse.
+        let run = base.join("wf_taken");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("events.jsonl"), "{}\n").unwrap();
+        std::env::set_var("SEMA_WORKFLOW_RUN_DIR", &base);
+        std::env::set_var("SEMA_WORKFLOW_RUN_ID", "wf_taken");
+        let err = match set_workflow_scope("wf", "", &Value::nil(), None) {
+            Ok(_) => panic!("a fresh run into an existing journal must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        let _ = std::fs::remove_dir_all(&base);
+    });
+}
+
+#[test]
+fn library_resume_of_a_nonexistent_run_fails() {
+    with_workflow_env_lock(|| {
+        let base = temp_run_dir("resume-missing");
+        std::env::set_var("SEMA_WORKFLOW_RUN_DIR", &base);
+        std::env::set_var("SEMA_WORKFLOW_RUN_ID", "wf_nope");
+        std::env::set_var("SEMA_WORKFLOW_RESUME", "1");
+        let err = match set_workflow_scope("wf", "", &Value::nil(), None) {
+            Ok(_) => panic!("resume of a run with no journal must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        let _ = std::fs::remove_dir_all(&base);
+    });
+}
+
+#[test]
+fn library_resume_without_a_run_id_fails() {
+    with_workflow_env_lock(|| {
+        let base = temp_run_dir("resume-noid");
+        std::env::set_var("SEMA_WORKFLOW_RUN_DIR", &base);
+        std::env::set_var("SEMA_WORKFLOW_RESUME", "1");
+        // No SEMA_WORKFLOW_RUN_ID: resume has nothing to reopen.
+        let err = match set_workflow_scope("wf", "", &Value::nil(), None) {
+            Ok(_) => panic!("resume without an explicit run id must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_dir_all(&base);
+    });
+}
+
+#[test]
+fn each_resume_claims_a_fresh_distinct_segment() {
+    with_workflow_env_lock(|| {
+        let base = temp_run_dir("resume-segments");
+        let run = base.join("wf_seg");
+        std::fs::create_dir_all(&run).unwrap();
+        // A prior run's journal must exist for resume to be allowed.
+        std::fs::write(run.join("events.jsonl"), "{}\n").unwrap();
+        std::env::set_var("SEMA_WORKFLOW_RUN_DIR", &base);
+        std::env::set_var("SEMA_WORKFLOW_RUN_ID", "wf_seg");
+        std::env::set_var("SEMA_WORKFLOW_RESUME", "1");
+
+        // Two resumes of the same run claim distinct sibling segments (resume-1, resume-2)
+        // via the atomic create_new claim — never the same file.
+        drop(set_workflow_scope("wf", "", &Value::nil(), None).expect("first resume opens"));
+        drop(set_workflow_scope("wf", "", &Value::nil(), None).expect("second resume opens"));
+
+        let mut names: Vec<String> = std::fs::read_dir(&run)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with("events.resume-"))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "events.resume-1.jsonl".to_string(),
+                "events.resume-2.jsonl".to_string()
+            ],
+            "each resume must claim a distinct segment"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    });
 }

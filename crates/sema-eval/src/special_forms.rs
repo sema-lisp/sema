@@ -184,6 +184,191 @@ fn resolve_embedded_file(
     None
 }
 
+pub(crate) struct ResolvedModuleBytes {
+    pub(crate) requested: String,
+    pub(crate) identity: std::path::PathBuf,
+    pub(crate) file_path: std::path::PathBuf,
+    pub(crate) bytes: Vec<u8>,
+}
+
+pub(crate) enum ImportPreparation {
+    Cached {
+        exports: std::collections::BTreeMap<String, Value>,
+        selective: Vec<String>,
+    },
+    Uncached {
+        module: ResolvedModuleBytes,
+        selective: Vec<String>,
+    },
+}
+
+pub(crate) fn prepare_load(
+    args: &[Value],
+    ctx: &EvalContext,
+) -> Result<ResolvedModuleBytes, SemaError> {
+    if args.len() != 1 {
+        return Err(SemaError::arity("load", "1", args.len()));
+    }
+    ctx.sandbox.check(sema_core::Caps::FS_READ, "load")?;
+    let path_val = args[0].clone();
+    let path_str = path_val
+        .as_str()
+        .ok_or_else(|| SemaError::type_error("string", path_val.type_name()))?;
+
+    crate::debug_session::warn_load_bypass_once("load", path_str);
+
+    if let Some((identity, file_path, bytes)) = resolve_embedded_file(ctx, path_str) {
+        return Ok(ResolvedModuleBytes {
+            requested: path_str.to_string(),
+            identity,
+            file_path,
+            bytes,
+        });
+    }
+
+    if sema_core::vfs::is_vfs_active() {
+        let base_dir = ctx
+            .current_file_dir()
+            .map(|dir| dir.to_string_lossy().to_string());
+        if let Some(key) = sema_core::vfs::vfs_resolve_key(path_str, base_dir.as_deref()) {
+            if let Some(bytes) = sema_core::vfs::vfs_read(&key) {
+                let identity = std::path::PathBuf::from(&key);
+                return Ok(ResolvedModuleBytes {
+                    requested: path_str.to_string(),
+                    file_path: identity.clone(),
+                    identity,
+                    bytes,
+                });
+            }
+        }
+    }
+
+    let resolved = if std::path::Path::new(path_str).is_absolute() {
+        std::path::PathBuf::from(path_str)
+    } else if let Some(dir) = ctx.current_file_dir() {
+        dir.join(path_str)
+    } else {
+        std::path::PathBuf::from(path_str)
+    };
+    let canonical = resolved
+        .canonicalize()
+        .map_err(|error| SemaError::Io(format!("load {}: {error}", resolved.display())))?;
+    let bytes = std::fs::read(&canonical)
+        .map_err(|error| SemaError::Io(format!("load {}: {error}", canonical.display())))?;
+    Ok(ResolvedModuleBytes {
+        requested: path_str.to_string(),
+        identity: canonical.clone(),
+        file_path: canonical,
+        bytes,
+    })
+}
+
+fn prepared_import(
+    requested: &str,
+    identity: std::path::PathBuf,
+    file_path: std::path::PathBuf,
+    bytes: Vec<u8>,
+    selective: Vec<String>,
+    ctx: &EvalContext,
+) -> ImportPreparation {
+    match ctx.get_cached_module(&identity) {
+        Some(exports) => ImportPreparation::Cached { exports, selective },
+        None => ImportPreparation::Uncached {
+            module: ResolvedModuleBytes {
+                requested: requested.to_string(),
+                identity,
+                file_path,
+                bytes,
+            },
+            selective,
+        },
+    }
+}
+
+pub(crate) fn prepare_import(
+    args: &[Value],
+    ctx: &EvalContext,
+) -> Result<ImportPreparation, SemaError> {
+    if args.is_empty() {
+        return Err(SemaError::arity("import", "1+", 0));
+    }
+    ctx.sandbox.check(sema_core::Caps::FS_READ, "import")?;
+    let path_val = args[0].clone();
+    let path_str = path_val
+        .as_str()
+        .ok_or_else(|| SemaError::type_error("string", path_val.type_name()))?;
+
+    crate::debug_session::warn_load_bypass_once("import", path_str);
+
+    let selective: Vec<String> = args[1..]
+        .iter()
+        .map(|value| {
+            value
+                .as_symbol()
+                .map(|symbol| symbol.to_string())
+                .ok_or_else(|| SemaError::eval("import: selective names must be symbols"))
+        })
+        .collect::<Result<_, _>>()?;
+
+    if let Some((identity, file_path, bytes)) = resolve_embedded_file(ctx, path_str) {
+        return Ok(prepared_import(
+            path_str, identity, file_path, bytes, selective, ctx,
+        ));
+    }
+
+    if sema_core::vfs::is_vfs_active() {
+        let base_dir = ctx
+            .current_file_dir()
+            .map(|dir| dir.to_string_lossy().to_string());
+        if let Some(key) = sema_core::vfs::vfs_resolve_key(path_str, base_dir.as_deref()) {
+            let identity = std::path::PathBuf::from(&key);
+            let is_package = sema_core::resolve::is_package_import(&key) || !key.ends_with(".sema");
+            let file_path = if is_package {
+                identity.join("__entry__")
+            } else {
+                identity.clone()
+            };
+            if let Some(bytes) = sema_core::vfs::vfs_read(&key) {
+                return Ok(prepared_import(
+                    path_str, identity, file_path, bytes, selective, ctx,
+                ));
+            }
+        }
+    }
+
+    let resolved = if sema_core::resolve::is_package_import(path_str) {
+        sema_core::resolve::resolve_package_import(path_str)?
+    } else if std::path::Path::new(path_str).is_absolute() {
+        std::path::PathBuf::from(path_str)
+    } else if let Some(dir) = ctx.current_file_dir() {
+        dir.join(path_str)
+    } else {
+        std::path::PathBuf::from(path_str)
+    };
+
+    if let Some(exports) = ctx.get_cached_module(&resolved) {
+        return Ok(ImportPreparation::Cached { exports, selective });
+    }
+
+    let canonical = resolved
+        .canonicalize()
+        .map_err(|error| SemaError::Io(format!("import {path_str}: {error}")))?;
+    if let Some(exports) = ctx.get_cached_module(&canonical) {
+        return Ok(ImportPreparation::Cached { exports, selective });
+    }
+    let bytes = std::fs::read(&canonical)
+        .map_err(|error| SemaError::Io(format!("import {path_str}: {error}")))?;
+    Ok(ImportPreparation::Uncached {
+        module: ResolvedModuleBytes {
+            requested: path_str.to_string(),
+            identity: canonical.clone(),
+            file_path: canonical,
+            bytes,
+        },
+        selective,
+    })
+}
+
 fn eval_bytes_in_env(
     op_name: &str,
     path_str: &str,
@@ -264,129 +449,23 @@ fn import_module_from_bytes(
     Ok(Trampoline::Value(Value::nil()))
 }
 
-/// (import "path.sema") or (import "path.sema" sym1 sym2)
-pub(crate) fn eval_import(
-    args: &[Value],
+pub(crate) fn eval_prepared_import(
+    module: ResolvedModuleBytes,
+    selective: &[String],
     env: &Env,
     ctx: &EvalContext,
 ) -> Result<Trampoline, SemaError> {
-    if args.is_empty() {
-        return Err(SemaError::arity("import", "1+", 0));
-    }
-    // Gate filesystem/VFS access behind the sandbox (EVAL-3). Without this, a
-    // restricted sandbox could be bypassed by importing a module.
-    ctx.sandbox.check(sema_core::Caps::FS_READ, "import")?;
-    let path_val = args[0].clone(); // already evaluated by the VM (`__vm-import`/`__vm-load`)
-    let path_str = path_val
-        .as_str()
-        .ok_or_else(|| SemaError::type_error("string", path_val.type_name()))?;
-
-    // Imported modules run on a separate VM (per-form) and bypass the debug
-    // loop, so breakpoints in them never hit. Warn once per debug session
-    // (no-op outside a session). See §7.4 #4.
-    crate::debug_session::warn_load_bypass_once("import", path_str);
-
-    // Selective import names
-    let selective: Vec<String> = args[1..]
-        .iter()
-        .map(|v| {
-            v.as_symbol()
-                .map(|s| s.to_string())
-                .ok_or_else(|| SemaError::eval("import: selective names must be symbols"))
-        })
-        .collect::<Result<_, _>>()?;
-
-    if let Some((resolved_path, file_path, content_bytes)) = resolve_embedded_file(ctx, path_str) {
-        return import_module_from_bytes(
-            path_str,
-            resolved_path,
-            file_path,
-            content_bytes,
-            &selective,
-            env,
-            ctx,
-        );
-    }
-
-    // Check VFS first — bundled executables have packages embedded in the VFS
-    // and won't have them installed on the filesystem.
-    if sema_core::vfs::is_vfs_active() {
-        let base_dir = ctx
-            .current_file_dir()
-            .map(|d| d.to_string_lossy().to_string());
-
-        // The canonical, normalized key that actually matched (resolving
-        // "./"/".."). Using it as the cache identity + current_file means every
-        // spelling of a module (e.g. "shared.sema" vs "sub/../shared.sema")
-        // dedups to one evaluation and roots its own imports correctly.
-        if let Some(key) = sema_core::vfs::vfs_resolve_key(path_str, base_dir.as_deref()) {
-            let resolved_vfs_path = std::path::PathBuf::from(&key);
-
-            // Package/dir entries have no ".sema" filename component; append a
-            // synthetic one so current_file_dir() returns the package directory.
-            let is_package = sema_core::resolve::is_package_import(&key) || !key.ends_with(".sema");
-            let file_path = if is_package {
-                resolved_vfs_path.join("__entry__")
-            } else {
-                resolved_vfs_path.clone()
-            };
-
-            if let Some(content_bytes) = sema_core::vfs::vfs_read(&key) {
-                return import_module_from_bytes(
-                    path_str,
-                    resolved_vfs_path,
-                    file_path,
-                    content_bytes,
-                    &selective,
-                    env,
-                    ctx,
-                );
-            }
-        }
-    }
-
-    // Resolve path: package imports first, then relative/absolute
-    let resolved = if sema_core::resolve::is_package_import(path_str) {
-        sema_core::resolve::resolve_package_import(path_str)?
-    } else if std::path::Path::new(path_str).is_absolute() {
-        std::path::PathBuf::from(path_str)
-    } else if let Some(dir) = ctx.current_file_dir() {
-        dir.join(path_str)
-    } else {
-        std::path::PathBuf::from(path_str)
-    };
-
-    // Check cache for preloaded modules (before canonicalize, which requires a real file).
-    if let Some(cached) = ctx.get_cached_module(&resolved) {
-        copy_exports_to_env(&cached, &selective, env)?;
-        return Ok(Trampoline::Value(Value::nil()));
-    }
-
-    let canonical = resolved
-        .canonicalize()
-        .map_err(|e| SemaError::Io(format!("import {path_str}: {e}")))?;
-
-    // Check cache for on-disk modules
-    if let Some(cached) = ctx.get_cached_module(&canonical) {
-        copy_exports_to_env(&cached, &selective, env)?;
-        return Ok(Trampoline::Value(Value::nil()));
-    }
-
-    let content_bytes =
-        std::fs::read(&canonical).map_err(|e| SemaError::Io(format!("import {path_str}: {e}")))?;
-    import_module_from_bytes(
-        path_str,
-        canonical.clone(),
-        canonical,
-        content_bytes,
-        &selective,
-        env,
-        ctx,
-    )
+    let ResolvedModuleBytes {
+        requested,
+        identity,
+        file_path,
+        bytes,
+    } = module;
+    import_module_from_bytes(&requested, identity, file_path, bytes, selective, env, ctx)
 }
 
 /// Collect exported bindings from a module env
-fn collect_module_exports(
+pub(crate) fn collect_module_exports(
     module_env: &Env,
     declared: Option<&[String]>,
 ) -> std::collections::BTreeMap<String, Value> {
@@ -412,7 +491,7 @@ fn collect_module_exports(
 }
 
 /// Copy exports into the caller environment
-fn copy_exports_to_env(
+pub(crate) fn copy_exports_to_env(
     exports: &std::collections::BTreeMap<String, Value>,
     selective: &[String],
     env: &Env,
@@ -438,62 +517,16 @@ pub(crate) fn eval_load(
     env: &Env,
     ctx: &EvalContext,
 ) -> Result<Trampoline, SemaError> {
-    if args.len() != 1 {
-        return Err(SemaError::arity("load", "1", args.len()));
-    }
-    ctx.sandbox.check(sema_core::Caps::FS_READ, "load")?;
-    let path_val = args[0].clone(); // already evaluated by the VM (`__vm-import`/`__vm-load`)
-    let path_str = path_val
-        .as_str()
-        .ok_or_else(|| SemaError::type_error("string", path_val.type_name()))?;
-
-    // Loaded code runs on a separate VM (per-form) and bypasses the debug loop, so
-    // breakpoints in it never hit. Warn once per debug session (no-op outside a
-    // session). See §7.4 #4.
-    crate::debug_session::warn_load_bypass_once("load", path_str);
-
-    // Resolve path relative to current file
-    let resolved = if std::path::Path::new(path_str).is_absolute() {
-        std::path::PathBuf::from(path_str)
-    } else if let Some(dir) = ctx.current_file_dir() {
-        dir.join(path_str)
-    } else {
-        std::path::PathBuf::from(path_str)
-    };
-
-    // `enter_module_load` guards against cycles (a loads b loads a…), which would
-    // otherwise recurse until the stack overflows. Keyed on the resolved
-    // identity, so a completed load can still be re-loaded — only an in-progress
-    // cycle errors. The guard pops the stack on any exit path.
-    if let Some((resolved_key, file_path, content_bytes)) = resolve_embedded_file(ctx, path_str) {
-        let _guard = ctx.enter_module_load(resolved_key)?;
-        let result = eval_bytes_in_env("load", path_str, &file_path, &content_bytes, env, ctx)?;
-        return Ok(Trampoline::Value(result));
-    }
-
-    // Check VFS before hitting the filesystem
-    if sema_core::vfs::is_vfs_active() {
-        let base_dir = ctx
-            .current_file_dir()
-            .map(|d| d.to_string_lossy().to_string());
-        if let Some(key) = sema_core::vfs::vfs_resolve_key(path_str, base_dir.as_deref()) {
-            if let Some(content_bytes) = sema_core::vfs::vfs_read(&key) {
-                let vfs_path = std::path::PathBuf::from(&key);
-                let _guard = ctx.enter_module_load(vfs_path.clone())?;
-                let result =
-                    eval_bytes_in_env("load", path_str, &vfs_path, &content_bytes, env, ctx)?;
-                return Ok(Trampoline::Value(result));
-            }
-        }
-    }
-
-    let canonical = resolved
-        .canonicalize()
-        .map_err(|e| SemaError::Io(format!("load {}: {e}", resolved.display())))?;
-    let content_bytes = std::fs::read(&canonical)
-        .map_err(|e| SemaError::Io(format!("load {}: {e}", canonical.display())))?;
-    let _guard = ctx.enter_module_load(canonical.clone())?;
-    let result = eval_bytes_in_env("load", path_str, &canonical, &content_bytes, env, ctx)?;
+    let module = prepare_load(args, ctx)?;
+    let _guard = ctx.enter_module_load(module.identity)?;
+    let result = eval_bytes_in_env(
+        "load",
+        &module.requested,
+        &module.file_path,
+        &module.bytes,
+        env,
+        ctx,
+    )?;
     Ok(Trampoline::Value(result))
 }
 

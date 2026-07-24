@@ -5,11 +5,14 @@
 //! in earlier cells are visible to later ones.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use sema_core::runtime::RootId;
 use sema_core::{pretty_print, resolve, Spur, Value};
 use sema_eval::Interpreter;
+use sema_vm::runtime::{OutputEvent, RootOptions, RuntimeCommandHandle};
 
 use crate::format::{CellOutput, CellType, Notebook, OutputType};
 
@@ -61,6 +64,36 @@ pub struct UndoInfo {
     pub cell_id: String,
 }
 
+/// A `Send + Sync` token that lets another thread (a server request handler,
+/// a watchdog) cancel whichever cell an [`Engine`] is *currently* driving,
+/// without needing access to the (`!Send`) `Engine`/`Interpreter` itself.
+///
+/// Obtained once via [`Engine::cancel_token`] and cloned freely — cloning is
+/// cheap (an `Rc`-free channel handle plus a shared `Arc<Mutex<..>>>` root
+/// id). `cancel_running` is a no-op (`false`) when no cell is currently
+/// being driven, or once the running root has already settled.
+#[derive(Clone)]
+pub struct CancelToken {
+    command: RuntimeCommandHandle,
+    running_root: Arc<Mutex<Option<RootId>>>,
+}
+
+impl CancelToken {
+    /// Cancel the cell currently being driven, if any. Returns `false` if no
+    /// cell is running right now, or if the underlying runtime is already
+    /// gone — in neither case is that an error, just nothing to cancel.
+    pub fn cancel_running(&self) -> bool {
+        let root = *self
+            .running_root
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match root {
+            Some(root) => self.command.cancel_root(root),
+            None => false,
+        }
+    }
+}
+
 /// The notebook evaluation engine. Wraps an `Interpreter` and a `Notebook`.
 pub struct Engine {
     /// The Sema interpreter with persistent environment.
@@ -71,6 +104,11 @@ pub struct Engine {
     snapshot: Option<EnvSnapshot>,
     /// Per-cell wall-clock evaluation budget. `None` disables the limit.
     cell_timeout: Option<Duration>,
+    /// The root id of the cell currently being driven, if any. Set just
+    /// before [`Interpreter::drive_until_settled`] and cleared right after,
+    /// so a [`CancelToken`] cloned out via [`Engine::cancel_token`] can
+    /// target the in-flight root from another thread.
+    running_root: Arc<Mutex<Option<RootId>>>,
 }
 
 impl Engine {
@@ -82,6 +120,7 @@ impl Engine {
             notebook,
             snapshot: None,
             cell_timeout: resolve_cell_timeout(),
+            running_root: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -99,6 +138,16 @@ impl Engine {
     /// The currently configured per-cell evaluation budget.
     pub fn cell_timeout(&self) -> Option<Duration> {
         self.cell_timeout
+    }
+
+    /// A cloneable, `Send + Sync` token another thread can use to cancel
+    /// whichever cell this engine is currently driving (`async/sleep 60000`
+    /// stuck in a loop, a runaway agent call). See [`CancelToken`].
+    pub fn cancel_token(&self) -> CancelToken {
+        CancelToken {
+            command: self.interpreter.command_handle(),
+            running_root: self.running_root.clone(),
+        }
     }
 
     /// Evaluate a single cell by ID. Returns the result and updates the notebook.
@@ -142,7 +191,7 @@ impl Engine {
         // LLM/tool spans emitted during the cell nest beneath it via the TL stack.
         let result = {
             let _cell_span = sema_otel::vm_span(&format!("notebook.cell {cell_id}"));
-            self.eval_source(&source)
+            self.eval_source_named(&source, Some(cell_id.to_string()))
         };
 
         // Cell-eval safe point (CORE-2, plan §5.2 point b): the kernel is
@@ -184,6 +233,25 @@ impl Engine {
     /// output is available in the result rather than going to the server's
     /// terminal.
     pub fn eval_source(&mut self, source: &str) -> EvalResult {
+        self.eval_source_named(source, None)
+    }
+
+    /// Same as [`eval_source`](Self::eval_source), tagging the submitted
+    /// root with `name` (the cell id, when called from [`eval_cell`]) for
+    /// host-side observability.
+    ///
+    /// Drives the source through the public host API — `submit_str` +
+    /// `drive_until_settled` + `take_output` — rather than a private
+    /// eval entry point, so cell evaluation is cancellable like any other
+    /// host consumer of `Interpreter`: [`running_root`](Self::running_root)
+    /// (via [`cancel_token`](Self::cancel_token)) is set to the submitted
+    /// root's id for the duration of the drive.
+    ///
+    /// `submit_str` compiles against `self.interpreter.global_env` — the
+    /// same global env every other eval entry point on this interpreter
+    /// uses — so cell-to-cell `define` sharing is unaffected by this
+    /// routing.
+    fn eval_source_named(&mut self, source: &str, name: Option<String>) -> EvalResult {
         let start = Instant::now();
 
         // Apply the wall-clock deadline to the interpreter context so an
@@ -197,21 +265,52 @@ impl Engine {
             self.interpreter.ctx.set_eval_deadline(None);
         }
 
-        // Capture stdout during evaluation via the thread-local output hook
-        // rather than redirecting the process stdout fd. Hooks are per-thread,
-        // so concurrent cell evaluations on different engine threads don't
-        // contend for a single global fd redirect, and program output can never
-        // leak into a server's protocol stream on the real stdout.
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let sink = buf.clone();
-        sema_core::set_stdout_hook(Some(Box::new(move |s: &str| {
-            if let Ok(mut b) = sink.lock() {
-                b.push_str(s);
+        // Submit with `capture_output: true` so the cell's
+        // `println`/`display`/`print` output is routed into root-tagged
+        // `OutputEvent`s (drained below) instead of the real process
+        // stdout — the fd-free capture the old thread-local stdout hook
+        // provided, now attributed per-root by the runtime itself.
+        let opts = RootOptions {
+            name,
+            capture_output: true,
+        };
+        let (eval_result, captured) = match self.interpreter.submit_str(source, opts) {
+            Ok(handle) => {
+                *self
+                    .running_root
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = Some(handle.id());
+                let result = self.interpreter.drive_until_settled(&handle);
+                *self
+                    .running_root
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = None;
+
+                // Only this root's own output belongs to this cell — a
+                // detached task left over from an earlier cell that happens
+                // to print while this root drives is captured too (never
+                // leaked to the real stdout), but attributed to its own
+                // root, not this cell. Stderr (`println-error` etc.) is
+                // folded into the same text stream as stdout, in the order
+                // events were emitted, since the `.sema-nb` format has a
+                // single text output per cell (`OutputType::Stdout`) rather
+                // than a distinct stderr channel — the sink preserves
+                // per-root FIFO/execution order, so simple interleaving here
+                // reproduces the order the cell actually printed in.
+                let captured: String = self
+                    .interpreter
+                    .take_output()
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        OutputEvent::Stdout { root, text } if root == handle.id() => Some(text),
+                        OutputEvent::Stderr { root, text } if root == handle.id() => Some(text),
+                        _ => None,
+                    })
+                    .collect();
+                (result, captured)
             }
-        })));
-        let eval_result = self.interpreter.eval_str_compiled(source);
-        sema_core::set_stdout_hook(None);
-        let captured = buf.lock().map(|b| b.clone()).unwrap_or_default();
+            Err(err) => (Err(err), String::new()),
+        };
 
         // Always clear the deadline so subsequent cells (and unrelated
         // interpreter usage) are not poisoned by it.
@@ -752,6 +851,94 @@ mod tests {
             !engine.notebook.cell(&id_b).unwrap().stale,
             "undo must clear the stale flag it set on downstream cells"
         );
+    }
+
+    // ── Host API migration tests (P6-1 Task 5) ─────────────────────
+
+    /// Multi-line `println` output from a single cell lands in that cell's
+    /// captured `stdout`, in the order it was printed — the root-tagged
+    /// `take_output` draining must preserve per-root FIFO order.
+    #[test]
+    fn multiline_output_lands_in_order() {
+        let mut engine = test_engine();
+        let (_, result) = engine
+            .create_and_eval(r#"(println "one") (println "two") (println "three")"#)
+            .unwrap();
+
+        let lines: Vec<&str> = result.stdout.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["one", "two", "three"],
+            "expected the three prints in order, got: {:?}",
+            result.stdout
+        );
+    }
+
+    /// `println-error` output (stderr) must not be dropped — it belongs in
+    /// the cell's captured output alongside stdout, interleaved in the
+    /// order the events were emitted. The `.sema-nb` format has a single
+    /// text stream per cell (`OutputType::Stdout`), so stderr lines are
+    /// folded into that same stream rather than inventing a new output
+    /// variant.
+    #[test]
+    fn stderr_output_is_not_dropped() {
+        let mut engine = test_engine();
+        let (_, result) = engine
+            .create_and_eval(r#"(println "out1") (println-error "err1") (println "out2")"#)
+            .unwrap();
+
+        let lines: Vec<&str> = result.stdout.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["out1", "err1", "out2"],
+            "expected stdout/stderr interleaved in emission order, got: {:?}",
+            result.stdout
+        );
+    }
+
+    /// Cancelling a running cell from another thread (via `CancelToken`,
+    /// itself backed by `Interpreter::command_handle`) settles the cell
+    /// promptly as an Error output instead of running out the full sleep,
+    /// and the engine is still usable for the next cell afterward.
+    #[test]
+    fn cancel_running_cell_from_another_thread() {
+        let mut engine = test_engine();
+        engine.set_cell_timeout(None); // isolate cancellation from the timeout path
+        let token = engine.cancel_token();
+
+        let canceller = std::thread::spawn(move || {
+            // Poll until the cell's root is actually being driven, then
+            // cancel it. Bounded: the test would fail on timeout below if
+            // this loop never found a running root.
+            for _ in 0..2000 {
+                if token.cancel_running() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("never observed a running root to cancel");
+        });
+
+        let start = Instant::now();
+        let (_, result) = engine.create_and_eval("(async/sleep 60000)").unwrap();
+        let elapsed = start.elapsed();
+        canceller.join().unwrap();
+
+        assert_eq!(
+            result.output.output_type,
+            OutputType::Error,
+            "cancelled cell should settle as an Error output, got {:?}",
+            result.output
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancellation should settle the cell well before the 60s sleep; took {elapsed:?}"
+        );
+
+        // The engine must survive: the next cell evaluates normally.
+        let (_, ok) = engine.create_and_eval("(+ 1 2)").unwrap();
+        assert_eq!(ok.output.output_type, OutputType::Value);
+        assert_eq!(ok.output.display, "3");
     }
 
     #[test]

@@ -50,11 +50,11 @@
                         (scan (+ p 2)
                           (cons
                             (cond
-                              ((char=? esc #\n)  #\newline)
-                              ((char=? esc #\t)  #\tab)
-                              ((char=? esc #\\)  #\\)
-                              ((char=? esc #\")  #\")
-                              (else              esc))
+                              ((char=? esc #\n) #\newline)
+                              ((char=? esc #\t) #\tab)
+                              ((char=? esc #\\) #\\)
+                              ((char=? esc #\") #\")
+                              (else esc))
                             chars)))))
                   ((char=? (string/ref src p) #\")
                     (loop (+ p 1)
@@ -68,8 +68,8 @@
                (and (char=? ch #\-)
                  (< (+ pos 1) len)
                  (char/numeric? (string/ref src (+ pos 1)))))
-              (let scan ((p        (if (char=? ch #\-) (+ pos 1) pos))
-                         (has-dot  #f))
+              (let scan ((p (if (char=? ch #\-) (+ pos 1) pos))
+                         (has-dot #f))
                 (cond
                   ((and (< p len) (char/numeric? (string/ref src p)))
                     (scan (+ p 1) has-dot))
@@ -79,8 +79,8 @@
                     (let ((numstr (string/slice src pos p)))
                       (loop p
                         (cons
-                          {:type   :number
-                           :value  (string/to-number numstr)}
+                          {:type :number
+                           :value (string/to-number numstr)}
                           tokens)))))))
 
             ;; Booleans: #t #f
@@ -112,8 +112,8 @@
                     (loop p
                       (cons
                         (cond
-                          ((equal? sym "nil")  {:type :nil})
-                          (else                {:type :symbol :value sym}))
+                          ((equal? sym "nil") {:type :nil})
+                          (else {:type :symbol :value sym}))
                         tokens))))))))))))
 
 ;; ============================================================
@@ -137,8 +137,8 @@
 (define (parse-expr tokens)
   (when (null? tokens)
     (error "unexpected end of input"))
-  (let ((tok   (car tokens))
-        (rest  (cdr tokens)))
+  (let ((tok (car tokens))
+        (rest (cdr tokens)))
     (cond
       ;; Quote: 'x → (quote x)
       ((equal? (get tok :type) :quote)
@@ -207,14 +207,14 @@
                 (parent :lookup name))))))
 
       ((equal? msg :define)
-        (let ((name   (car args))
-              (value  (nth args 1)))
+        (let ((name (car args))
+              (value (nth args 1)))
           (set! bindings (assoc bindings (string/to-keyword name) value))
           value))
 
       ((equal? msg :set!)
-        (let ((name   (car args))
-              (value  (nth args 1)))
+        (let ((name (car args))
+              (value (nth args 1)))
           (let ((key (string/to-keyword name)))
             (if (contains? bindings key)
               (begin
@@ -258,8 +258,8 @@
       ((and (map? (car items))
          (equal? (get (car items) :ast) :symbol)
          (equal? (get (car items) :name) "."))
-        {:params  (reverse params)
-         :rest    (get (car (cdr items)) :name)})
+        {:params (reverse params)
+         :rest (get (car (cdr items)) :name)})
       (else
         (loop (cdr items)
           (cons (get (car items) :name) params))))))
@@ -324,23 +324,23 @@
                                :items (cons {:ast :symbol :name "begin"}
                                  (cdr args))})))
                       (let ((closure
-                              {:type        :closure
-                               :params      (get parsed :params)
-                               :rest-param  (get parsed :rest)
-                               :body        body
-                               :env         env}))
+                              {:type :closure
+                               :params (get parsed :params)
+                               :rest-param (get parsed :rest)
+                               :body body
+                               :env env}))
                         (env :define fname closure)
                         closure))
                     ;; Simple: (define name expr)
-                    (let ((name  (get target :name))
-                          (val   (meta-eval (nth args 1) env)))
+                    (let ((name (get target :name))
+                          (val (meta-eval (nth args 1) env)))
                       (env :define name val)
                       val))))
 
               ;; (set! <name> <expr>)
               ((sym-named? head "set!")
-                (let ((name  (get (car args) :name))
-                      (val   (meta-eval (nth args 1) env)))
+                (let ((name (get (car args) :name))
+                      (val (meta-eval (nth args 1) env)))
                   (env :set! name val)
                   val))
 
@@ -357,11 +357,11 @@
                             {:ast :list
                              :items (cons {:ast :symbol :name "begin"}
                                body-exprs)})))
-                    {:type        :closure
-                     :params      (get parsed :params)
-                     :rest-param  (get parsed :rest)
-                     :body        body
-                     :env         env})))
+                    {:type :closure
+                     :params (get parsed :params)
+                     :rest-param (get parsed :rest)
+                     :body body
+                     :env env})))
 
               ;; (begin <expr>...)
               ((sym-named? head "begin")
@@ -390,25 +390,25 @@
                 (let ((first-arg (car args)))
                   (if (and (map? first-arg) (equal? (get first-arg :ast) :symbol))
                     ;; Named let: (let loop ((i 0) ...) body)
-                    (let ((loop-name     (get first-arg :name))
-                          (binding-list  (get (nth args 1) :items))
-                          (body          (nth args 2)))
+                    (let ((loop-name (get first-arg :name))
+                          (binding-list (get (nth args 1) :items))
+                          (body (nth args 2)))
                       (let ((let-env (make-env env)))
                         ;; Extract param names and initial values
-                        (let extract ((bs      binding-list)
-                                      (pnames  '())
-                                      (inits   '()))
+                        (let extract ((bs binding-list)
+                                      (pnames '())
+                                      (inits '()))
                           (if (null? bs)
-                            (let ((params     (reverse pnames))
-                                  (init-vals  (reverse inits)))
+                            (let ((params (reverse pnames))
+                                  (init-vals (reverse inits)))
                               ;; Define the loop function
                               (let-env :define
                                 loop-name
-                                {:type        :closure
-                                 :params      params
-                                 :rest-param  nil
-                                 :body        body
-                                 :env         let-env})
+                                {:type :closure
+                                 :params params
+                                 :rest-param nil
+                                 :body body
+                                 :env let-env})
                               ;; Call it with initial values
                               (meta-apply (let-env :lookup loop-name) init-vals))
                             (let ((pair (get (car bs) :items)))
@@ -416,8 +416,8 @@
                                 (cons (get (car pair) :name) pnames)
                                 (cons (meta-eval (nth pair 1) env) inits)))))))
                     ;; Regular let: (let ((x 1) (y 2)) body)
-                    (let ((binding-list  (get first-arg :items))
-                          (body          (nth args 1)))
+                    (let ((binding-list (get first-arg :items))
+                          (body (nth args 1)))
                       (let ((let-env (make-env env)))
                         (let bind-loop ((bs binding-list))
                           (when (not (null? bs))
@@ -452,8 +452,8 @@
 
               ;; Function application
               (else
-                (let ((fn-val    (meta-eval head env))
-                      (arg-vals  (eval-list args env)))
+                (let ((fn-val (meta-eval head env))
+                      (arg-vals (eval-list args env)))
                   (meta-apply fn-val arg-vals))))))))
 
     (else (error (format "cannot evaluate: ~a" expr)))))
@@ -480,10 +480,10 @@
 
     ;; User-defined closure
     ((and (map? fn-val) (equal? (get fn-val :type) :closure))
-      (let ((params       (get fn-val :params))
-            (rest-param   (get fn-val :rest-param))
-            (body         (get fn-val :body))
-            (closure-env  (get fn-val :env)))
+      (let ((params (get fn-val :params))
+            (rest-param (get fn-val :rest-param))
+            (body (get fn-val :body))
+            (closure-env (get fn-val :env)))
         ;; Create a child env and bind parameters
         (let ((call-env (make-env closure-env)))
           ;; Bind regular params
@@ -594,8 +594,8 @@
 ;; ============================================================
 
 (define (run-program src)
-  (let ((exprs  (parse-source src))
-        (env    (setup-builtins)))
+  (let ((exprs (parse-source src))
+        (env (setup-builtins)))
     (let loop ((remaining exprs) (result '()))
       (if (null? remaining)
         result

@@ -1,20 +1,30 @@
 //! Unified-diff generation and patch application builtins.
 //!
-//! `diff/*` functions are read-only (pure string transforms) and registered with
-//! plain `register_fn`. `patch/apply-file` touches the filesystem and is gated
-//! behind `Caps::FS_WRITE`.
-//!
 //! The unified-diff text produced by `diff/unified` (via the `similar` crate) is
 //! the canonical interchange format: `diff/stat`, `diff/hunks`, `diff/parse`, and
 //! `diff/apply` all consume that same textual shape, so a round-trip
 //! (`diff/unified` then `diff/apply`) reconstructs `new` from `old`.
 //!
-//! `patch/apply-file`'s real work (read + apply + write) lives in
-//! `patch_apply_file_work`, called directly at top level or — inside
-//! `async/spawn` (`in_async_context()`) — offloaded through `fs_offload`
-//! (`io.rs`) so applying a patch to a large file doesn't block the VM thread
-//! (and every sibling task). See `archive.rs`'s module doc for the full
-//! offload rationale.
+//! **Bounded / offloaded CPU (B8 R03 split).** `diff/unified` runs a super-linear
+//! LCS (the `similar` diff), so during a runtime quantum (`in_runtime_quantum()`)
+//! it captures a per-input byte cap BEFORE dispatch and offloads the diff onto the
+//! I/O pool through `quarantined_compute` (`io.rs`) — the LCS runs over an owned
+//! `String` snapshot (`Send`) on a worker, and the resulting diff string is
+//! decoded back into a `Value` on the VM thread. `diff/stat`, `diff/hunks`,
+//! `diff/parse`, and `diff/apply` are O(input) line walks, so they stay
+//! SYNCHRONOUS but are still capped by a pre-dispatch input-byte and hunk-count
+//! bound inside a quantum (an explicit synchronous split, not a fake async wrap):
+//! bounded input ⇒ bounded VM-thread CPU. A direct native call outside the
+//! cooperative runtime (e.g. the stdlib's own unit-test harness) keeps the
+//! uncapped synchronous shape.
+//!
+//! `patch/apply-file` is the separate filesystem surface, gated behind
+//! `Caps::FS_WRITE`. Its real work lives in `patch_apply_file_work`. A direct
+//! native call outside the scheduler runs it synchronously; a runtime quantum
+//! offloads it through `quarantined_compute` (`io.rs`). The runtime path captures
+//! patch-byte, target-byte, output-byte, and hunk-count caps before dispatch,
+//! then rechecks the target and output on the worker. Cancellation discards the
+//! eventual result; it does not interrupt an already-running worker.
 
 use std::collections::BTreeMap;
 
@@ -23,7 +33,247 @@ use similar::TextDiff;
 
 use crate::register_fn;
 #[cfg(not(target_arch = "wasm32"))]
-use {crate::register_fn_gated, sema_core::Caps};
+use std::cell::Cell;
+#[cfg(not(target_arch = "wasm32"))]
+use {
+    crate::{register_runtime_fn, register_runtime_fn_gated},
+    sema_core::runtime::NativeOutcome,
+    sema_core::Caps,
+};
+
+/// Per-input byte cap for `diff/*` under a runtime quantum. `diff/unified`'s LCS
+/// is super-linear, so the cap bounds both the offloaded worker's cost and the
+/// synchronous line-walk ops' VM-thread cost. 64 MiB is far above any real diff.
+#[cfg(not(target_arch = "wasm32"))]
+const DIFF_INPUT_BYTE_CAP: u64 = 64 * 1024 * 1024;
+/// Hunk-count cap for the synchronous patch-consuming ops under a quantum.
+/// Shared ceiling with `patch/apply-file`.
+#[cfg(not(target_arch = "wasm32"))]
+const DIFF_HUNK_CAP: usize = PATCH_HUNK_CAP;
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// Optional per-call input-byte cap override (lowered, never raised above the
+    /// hard ceiling). Read on the VM thread pre-dispatch; mirrors
+    /// `git::GIT_MAX_OUTPUT_OVERRIDE`. `None` uses the module ceiling. The seam
+    /// the regression suite drives to exercise the cap boundary without a
+    /// multi-megabyte input string.
+    static DIFF_INPUT_BYTE_CAP_OVERRIDE: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// The effective per-input byte cap for the current call: the module ceiling,
+/// lowered by any per-call override (never raised above it).
+#[cfg(not(target_arch = "wasm32"))]
+fn effective_diff_input_byte_cap() -> u64 {
+    DIFF_INPUT_BYTE_CAP_OVERRIDE
+        .with(Cell::get)
+        .map_or(DIFF_INPUT_BYTE_CAP, |over| over.min(DIFF_INPUT_BYTE_CAP))
+}
+
+/// Lower the per-input byte cap (clamped to the hard ceiling) for subsequent
+/// `diff/*` calls on this thread, or clear the override with `None`. Test seam,
+/// mirroring `set_git_max_output_bytes_override`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_diff_input_byte_cap_override(bytes: Option<u64>) {
+    DIFF_INPUT_BYTE_CAP_OVERRIDE.with(|cell| cell.set(bytes));
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn check_diff_limit(op: &str, dimension: &str, actual: u64, limit: u64) -> Result<(), SemaError> {
+    if actual > limit {
+        return Err(SemaError::eval(format!(
+            "{op}: {dimension} {actual} exceeds the quarantined limit {limit}"
+        ))
+        .with_hint("reduce or split the diff input"));
+    }
+    Ok(())
+}
+
+/// Pre-dispatch caps for a patch-consuming synchronous op (`diff/stat`,
+/// `diff/hunks`, `diff/parse`). Enforced ONLY inside a runtime quantum so the
+/// synchronous line walk that follows is bounded VM-thread CPU; a direct native
+/// call keeps the uncapped shape. The `actual`/`limit` byte check reads
+/// `patch.len()` — no snapshot is taken, so an over-cap input is rejected without
+/// any excess allocation.
+#[cfg(not(target_arch = "wasm32"))]
+fn check_diff_patch_caps(op: &str, patch: &str) -> Result<(), SemaError> {
+    if sema_core::in_runtime_quantum() {
+        let cap = effective_diff_input_byte_cap();
+        check_diff_limit(op, "input bytes", patch.len() as u64, cap)?;
+        check_diff_limit(
+            op,
+            "hunks",
+            patch_hunk_count(patch) as u64,
+            DIFF_HUNK_CAP as u64,
+        )?;
+    }
+    Ok(())
+}
+
+/// Pre-dispatch caps for `diff/apply` (content + patch inputs), enforced only
+/// inside a runtime quantum. See [`check_diff_patch_caps`].
+#[cfg(not(target_arch = "wasm32"))]
+fn check_diff_apply_caps(content: &str, patch: &str) -> Result<(), SemaError> {
+    if sema_core::in_runtime_quantum() {
+        let cap = effective_diff_input_byte_cap();
+        check_diff_limit("diff/apply", "content bytes", content.len() as u64, cap)?;
+        check_diff_limit("diff/apply", "patch bytes", patch.len() as u64, cap)?;
+        check_diff_limit(
+            "diff/apply",
+            "hunks",
+            patch_hunk_count(patch) as u64,
+            DIFF_HUNK_CAP as u64,
+        )?;
+    }
+    Ok(())
+}
+
+/// Decode an offloaded `diff/unified` result (an owned `String`) into a `Value`
+/// on the VM thread. Non-capturing `fn` for `quarantined_compute`'s decoder slot.
+#[cfg(not(target_arch = "wasm32"))]
+fn diff_string_to_value(s: String) -> Value {
+    Value::string(&s)
+}
+
+/// Parse `diff/unified`'s optional context-radius argument (default 3).
+fn diff_context_arg(args: &[Value]) -> Result<usize, SemaError> {
+    if args.len() == 3 {
+        let n = args[2]
+            .as_int()
+            .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?;
+        if n < 0 {
+            return Err(SemaError::eval("diff/unified: context must be >= 0"));
+        }
+        Ok(n as usize)
+    } else {
+        Ok(3)
+    }
+}
+
+/// Produce the unified-diff text for `old` → `new` at the given context radius.
+/// Shared by the offloaded and synchronous `diff/unified` paths.
+fn diff_unified_text(old: &str, new: &str, context: usize) -> String {
+    TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(context)
+        .header("old", "new")
+        .to_string()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const PATCH_INPUT_BYTE_CAP: u64 = 64 * 1024 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const PATCH_TARGET_BYTE_CAP: u64 = 256 * 1024 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const PATCH_OUTPUT_BYTE_CAP: u64 = 256 * 1024 * 1024;
+#[cfg(not(target_arch = "wasm32"))]
+const PATCH_HUNK_CAP: usize = 100_000;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Copy, Debug)]
+struct PatchBounds {
+    patch_bytes: u64,
+    target_bytes: u64,
+    output_bytes: u64,
+    hunks: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const PATCH_RUNTIME_BOUNDS: PatchBounds = PatchBounds {
+    patch_bytes: PATCH_INPUT_BYTE_CAP,
+    target_bytes: PATCH_TARGET_BYTE_CAP,
+    output_bytes: PATCH_OUTPUT_BYTE_CAP,
+    hunks: PATCH_HUNK_CAP,
+};
+
+#[cfg(not(target_arch = "wasm32"))]
+fn check_patch_limit(dimension: &str, actual: u64, limit: u64) -> Result<(), SemaError> {
+    if actual > limit {
+        return Err(SemaError::eval(format!(
+            "patch/apply-file: {dimension} {actual} exceeds the quarantined limit {limit}"
+        ))
+        .with_hint("reduce or split the target and patch"));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn patch_hunk_count(patch: &str) -> usize {
+    patch.lines().filter(|line| line.starts_with("@@")).count()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn patch_added_bytes(patch: &str) -> Result<u64, SemaError> {
+    patch
+        .lines()
+        // Counting file headers too is conservative. Excluding every `+++`
+        // line would undercount a real added line whose content starts `++`.
+        .filter(|line| line.starts_with('+'))
+        .try_fold(0u64, |total, line| {
+            total
+                .checked_add(line.len() as u64)
+                .and_then(|total| total.checked_add(1))
+                .ok_or_else(|| SemaError::eval("patch/apply-file: output byte count overflowed"))
+        })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn check_patch_output_bound(
+    target_bytes: u64,
+    patch: &str,
+    bounds: PatchBounds,
+) -> Result<(), SemaError> {
+    let output_upper_bound = target_bytes
+        .checked_add(patch_added_bytes(patch)?)
+        .ok_or_else(|| SemaError::eval("patch/apply-file: output byte count overflowed"))?;
+    check_patch_limit("output bytes", output_upper_bound, bounds.output_bytes)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+struct PatchRuntimeInput {
+    file: std::fs::File,
+    bounds: PatchBounds,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn prepare_patch_runtime_input(
+    path: &str,
+    patch: &str,
+    bounds: PatchBounds,
+) -> Result<PatchRuntimeInput, SemaError> {
+    check_patch_limit("patch bytes", patch.len() as u64, bounds.patch_bytes)?;
+    check_patch_limit("hunks", patch_hunk_count(patch) as u64, bounds.hunks as u64)?;
+    let metadata = std::fs::metadata(path)
+        .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+    if !metadata.is_file() {
+        return Err(SemaError::eval(format!(
+            "patch/apply-file: target must be a regular file: {path}"
+        )));
+    }
+    check_patch_limit("target bytes", metadata.len(), bounds.target_bytes)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+    let opened = file
+        .metadata()
+        .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+    if !opened.is_file() {
+        return Err(SemaError::eval(format!(
+            "patch/apply-file: target must be a regular file: {path}"
+        )));
+    }
+    check_patch_limit("target bytes", opened.len(), bounds.target_bytes)?;
+    check_patch_output_bound(opened.len(), patch, bounds)?;
+    Ok(PatchRuntimeInput { file, bounds })
+}
 
 /// A single parsed hunk header `@@ -old_start,old_count +new_start,new_count @@`
 /// together with the body lines that follow it.
@@ -267,7 +517,38 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, SemaError> {
 
 #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
-    // (diff/unified old new [context]) -> unified-diff string
+    // (diff/unified old new [context]) -> unified-diff string. The LCS is
+    // super-linear, so in a runtime quantum it is capped (per-input byte cap)
+    // and offloaded onto the I/O pool; outside one it runs synchronously.
+    #[cfg(not(target_arch = "wasm32"))]
+    register_runtime_fn(env, "diff/unified", |args| {
+        check_arity!(args, "diff/unified", 2..=3);
+        let old = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let new = args[1]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let context = diff_context_arg(args)?;
+        if sema_core::in_runtime_quantum() {
+            // Cap each input by byte length BEFORE snapshotting (no excess
+            // allocation on the rejected path), then offload the LCS.
+            let cap = effective_diff_input_byte_cap();
+            check_diff_limit("diff/unified", "old bytes", old.len() as u64, cap)?;
+            check_diff_limit("diff/unified", "new bytes", new.len() as u64, cap)?;
+            let old = old.to_string();
+            let new = new.to_string();
+            return crate::io::quarantined_compute(
+                "diff/unified",
+                diff_string_to_value,
+                move || Ok(diff_unified_text(&old, &new, context)),
+            );
+        }
+        Ok(NativeOutcome::Return(Value::string(&diff_unified_text(
+            old, new, context,
+        ))))
+    });
+    #[cfg(target_arch = "wasm32")]
     register_fn(env, "diff/unified", |args| {
         check_arity!(args, "diff/unified", 2..=3);
         let old = args[0]
@@ -276,24 +557,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let new = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        let context: usize = if args.len() == 3 {
-            let n = args[2]
-                .as_int()
-                .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?;
-            if n < 0 {
-                return Err(SemaError::eval("diff/unified: context must be >= 0"));
-            }
-            n as usize
-        } else {
-            3
-        };
-        let diff = TextDiff::from_lines(old, new);
-        let text = diff
-            .unified_diff()
-            .context_radius(context)
-            .header("old", "new")
-            .to_string();
-        Ok(Value::string(&text))
+        let context = diff_context_arg(args)?;
+        Ok(Value::string(&diff_unified_text(old, new, context)))
     });
 
     // (diff/stat patch) -> {:added <int> :removed <int> :hunks <int>}
@@ -302,6 +567,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let patch = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        check_diff_patch_caps("diff/stat", patch)?;
         let mut added = 0i64;
         let mut removed = 0i64;
         let mut hunks = 0i64;
@@ -342,6 +609,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let patch = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        check_diff_patch_caps("diff/hunks", patch)?;
         let hunks = parse_hunks(patch);
         let values: Vec<Value> = hunks.iter().map(hunk_to_value).collect();
         Ok(Value::list(values))
@@ -353,6 +622,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let patch = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        check_diff_patch_caps("diff/parse", patch)?;
 
         // Walk the patch line-by-line, opening a new file section on each `---`
         // header and attaching subsequent hunks to it. Hunks before any file
@@ -459,6 +730,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let patch = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        #[cfg(not(target_arch = "wasm32"))]
+        check_diff_apply_caps(content, patch)?;
         let hunks = parse_hunks(patch);
         let patched = apply_hunks(content, &hunks)?;
         Ok(Value::string(&patched))
@@ -467,7 +740,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // (patch/apply-file path patch) -> number of hunks applied (int)
     // Touches the real filesystem (not the VFS), so it's native-only.
     #[cfg(not(target_arch = "wasm32"))]
-    register_fn_gated(env, sandbox, Caps::FS_WRITE, "patch/apply-file", |args| {
+    register_runtime_fn_gated(env, sandbox, Caps::FS_WRITE, "patch/apply-file", |args| {
         check_arity!(args, "patch/apply-file", 2);
         let path = args[0]
             .as_str()
@@ -478,29 +751,63 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
             .to_string();
 
-        if sema_core::in_async_context() {
-            return crate::io::fs_offload(
-                move || patch_apply_file_work(&path, &patch).map_err(|e| e.to_string()),
-                Value::int,
-            );
+        if sema_core::in_runtime_quantum() {
+            let bounds = PATCH_RUNTIME_BOUNDS;
+            let input = prepare_patch_runtime_input(&path, &patch, bounds)?;
+            return crate::io::quarantined_compute("patch/apply-file", Value::int, move || {
+                patch_apply_file_work(&path, &patch, Some(input)).map_err(|e| e.to_string())
+            });
         }
-        let count = patch_apply_file_work(&path, &patch)?;
-        Ok(Value::int(count))
+        Ok(NativeOutcome::Return(Value::int(patch_apply_file_work(
+            &path, &patch, None,
+        )?)))
     });
 }
 
 /// `patch/apply-file`'s actual work: read `path`, apply `patch`'s hunks, write
-/// the patched content back, returning the hunk count. Shared verbatim by the
-/// sync and offloaded-async paths (see `archive.rs`'s module doc for the
-/// offload rationale — `SemaError` never crosses the thread boundary, only
-/// its `.to_string()` rendering does).
+/// the patched content back, returning the hunk count. Runtime callers provide
+/// the bounds captured before dispatch; `SemaError` never crosses the thread
+/// boundary, only its `.to_string()` rendering does.
 #[cfg(not(target_arch = "wasm32"))]
-fn patch_apply_file_work(path: &str, patch: &str) -> Result<i64, SemaError> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+fn patch_apply_file_work(
+    path: &str,
+    patch: &str,
+    input: Option<PatchRuntimeInput>,
+) -> Result<i64, SemaError> {
+    let (content, runtime_file) = if let Some(input) = input {
+        use std::io::Read as _;
+
+        let PatchRuntimeInput { file, bounds } = input;
+        let mut content = String::new();
+        (&file)
+            .take(bounds.target_bytes.saturating_add(1))
+            .read_to_string(&mut content)
+            .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+        check_patch_limit("target bytes", content.len() as u64, bounds.target_bytes)?;
+        check_patch_output_bound(content.len() as u64, patch, bounds)?;
+        (content, Some((file, bounds)))
+    } else {
+        (
+            std::fs::read_to_string(path)
+                .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?,
+            None,
+        )
+    };
     let hunks = parse_hunks(patch);
     let count = hunks.len() as i64;
     let patched = apply_hunks(&content, &hunks)?;
+    if let Some((mut file, bounds)) = runtime_file {
+        use std::io::{Seek as _, Write as _};
+
+        check_patch_limit("output bytes", patched.len() as u64, bounds.output_bytes)?;
+        file.set_len(0)
+            .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+        file.seek(std::io::SeekFrom::Start(0))
+            .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+        file.write_all(patched.as_bytes())
+            .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+        return Ok(count);
+    }
     std::fs::write(path, patched)
         .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
     Ok(count)
@@ -510,6 +817,101 @@ fn patch_apply_file_work(path: &str, patch: &str) -> Result<i64, SemaError> {
 mod tests {
     use super::*;
     use sema_core::{Env, Sandbox};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn diff_limit_accepts_boundary_and_rejects_one_over() {
+        assert!(check_diff_limit("diff/unified", "old bytes", 8, 8).is_ok());
+        let error = check_diff_limit("diff/unified", "old bytes", 9, 8)
+            .expect_err("one byte over the captured limit must fail");
+        assert!(error.to_string().contains('9'));
+        assert!(error.to_string().contains('8'));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn diff_input_byte_cap_is_finite_and_clamps_overrides() {
+        assert_eq!(effective_diff_input_byte_cap(), DIFF_INPUT_BYTE_CAP);
+        set_diff_input_byte_cap_override(Some(16));
+        assert_eq!(effective_diff_input_byte_cap(), 16);
+        // An override above the hard ceiling is clamped down, never raised.
+        set_diff_input_byte_cap_override(Some(u64::MAX));
+        assert_eq!(effective_diff_input_byte_cap(), DIFF_INPUT_BYTE_CAP);
+        set_diff_input_byte_cap_override(None);
+        assert_eq!(effective_diff_input_byte_cap(), DIFF_INPUT_BYTE_CAP);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn patch_quarantine_limit_accepts_boundary_and_rejects_one_over() {
+        assert!(check_patch_limit("patch bytes", 8, 8).is_ok());
+        let error = check_patch_limit("patch bytes", 9, 8)
+            .expect_err("one byte over the captured limit must fail");
+        assert!(error.to_string().contains("9"));
+        assert!(error.to_string().contains("8"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn patch_runtime_input_rejects_non_regular_files() {
+        let path = std::env::temp_dir().join(format!("sema-patch-special-{}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("create special-input directory");
+        let error = prepare_patch_runtime_input(
+            path.to_str().expect("utf-8 temp path"),
+            "@@ -1 +1 @@\n-old\n+new\n",
+            PATCH_RUNTIME_BOUNDS,
+        )
+        .expect_err("directory must not enter the worker queue");
+        let _ = std::fs::remove_dir(&path);
+        assert!(error.to_string().contains("regular file"));
+    }
+
+    #[cfg(all(unix, not(target_arch = "wasm32")))]
+    #[test]
+    fn patch_runtime_input_rejects_fifo_without_blocking() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let path = std::env::temp_dir().join(format!("sema-patch-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("FIFO path");
+        assert_eq!(unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) }, 0);
+        let error = prepare_patch_runtime_input(
+            path.to_str().expect("utf-8 temp path"),
+            "@@ -1 +1 @@\n-old\n+new\n",
+            PATCH_RUNTIME_BOUNDS,
+        )
+        .expect_err("FIFO must not enter the worker queue");
+        let _ = std::fs::remove_file(&path);
+        assert!(error.to_string().contains("regular file"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn patch_worker_rechecks_output_bound_after_open() {
+        let path = std::env::temp_dir().join(format!(
+            "sema-patch-grow-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"").expect("create target");
+        let patch = "@@ -1 +1 @@\n-old\n+new\n";
+        let bounds = PatchBounds {
+            patch_bytes: 64,
+            target_bytes: 8,
+            output_bytes: 8,
+            hunks: 1,
+        };
+        let input =
+            prepare_patch_runtime_input(path.to_str().expect("utf-8 temp path"), patch, bounds)
+                .expect("empty target passes preflight");
+        std::fs::write(&path, b"12345678").expect("grow target after descriptor capture");
+
+        let error =
+            patch_apply_file_work(path.to_str().expect("utf-8 temp path"), patch, Some(input))
+                .expect_err("grown target plus additions must fail before patch construction");
+        let _ = std::fs::remove_file(&path);
+        assert!(error.to_string().contains("output bytes"), "{error}");
+    }
 
     fn make_env() -> Env {
         let env = Env::new();

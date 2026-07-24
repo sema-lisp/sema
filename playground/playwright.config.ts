@@ -3,16 +3,21 @@ import { defineConfig } from '@playwright/test';
 // Port is overridable (PW_PORT) so a run can dodge a port already taken by
 // another local dev server; defaults to the conventional 8787.
 const port = Number(process.env.PW_PORT ?? 8787);
+const baseURL = `http://127.0.0.1:${port}`;
 
 export default defineConfig({
   testDir: './tests',
   timeout: 60000,
   use: {
-    baseURL: `http://localhost:${port}`,
+    baseURL,
   },
   webServer: {
-    command: `npx serve -l ${port}`,
-    port,
+    command: `npm run serve -- ${port}`,
+    url: baseURL,
     reuseExistingServer: true,
+    gracefulShutdown: {
+      signal: 'SIGTERM',
+      timeout: 5000,
+    },
   },
 });

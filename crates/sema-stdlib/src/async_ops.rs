@@ -1,14 +1,11 @@
-use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
-use std::rc::Rc;
-
-use sema_core::{
-    call_run_scheduler, call_run_scheduler_all_of, call_run_scheduler_any_of,
-    call_run_scheduler_timeout, call_spawn_callback, check_arity, in_async_context,
-    set_debug_coop_resume, set_yield_signal, take_resume_value, AsyncPromise, Channel,
-    DebugCoopResume, Env, EvalContext, NativeFn, PromiseState, SchedulerRunResult, SchedulerTarget,
-    SemaError, Value, ValueView, YieldReason,
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{
+    ChannelId, ChannelOperation, ChannelQuery, ChannelReceive, ChannelSend, ChannelWait,
+    NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PromiseId,
+    PromiseSetMode, PromiseSetWait, ResumeInput, RuntimeRequest, RuntimeResponse, TaskOutcome,
+    TaskSettlement, Trace, WaitKind,
 };
+use sema_core::{check_arity, in_runtime_quantum, Env, NativeFn, SemaError, Value, ValueView};
 
 use crate::register_fn;
 
@@ -18,11 +15,23 @@ use crate::register_fn;
 /// `(round …)`, `(math/random)` and ordinary arithmetic routinely yield floats.
 fn duration_ms(value: &Value, who: &str) -> Result<i64, SemaError> {
     if let Some(i) = value.as_int() {
+        if i < 0 {
+            return Err(SemaError::eval(format!(
+                "{who}: duration must be non-negative"
+            )));
+        }
         Ok(i)
     } else if let Some(f) = value.as_float() {
         if !f.is_finite() {
             return Err(SemaError::eval(format!(
                 "{who}: duration must be a finite number"
+            )));
+        }
+        // Reject negatives BEFORE rounding: `round(-0.4)` is `-0.0`, so a
+        // rounded-then-checked path would silently accept a negative duration.
+        if f < 0.0 {
+            return Err(SemaError::eval(format!(
+                "{who}: duration must be non-negative"
             )));
         }
         Ok(f.round() as i64)
@@ -31,41 +40,77 @@ fn duration_ms(value: &Value, who: &str) -> Result<i64, SemaError> {
     }
 }
 
-/// Format a normal task rejection as an `async/await` error, stripping
-/// any already-present `async/await: task rejected:` prefix so that
-/// chained awaits don't quadratically nest the prefix.
-fn rejected_error(e: &str) -> SemaError {
-    let core = e
-        .strip_prefix("Eval error: async/await: task rejected: ")
-        .or_else(|| e.strip_prefix("async/await: task rejected: "))
-        .unwrap_or(e);
-    SemaError::eval(format!("async/await: task rejected: {core}"))
+/// Format the `await`-on-cancelled-promise error as a structured, catchable
+/// `:cancelled` condition (not a plain rejection): `(:type e)` on the caught
+/// value is `:cancelled`. The promise carries no `CancelReason`, so a generic
+/// `Explicit` reason is used. Mirrors `runtime::state::await_cancelled_error`.
+fn cancelled_error() -> SemaError {
+    SemaError::cancelled_condition(
+        "async/await: awaited task was cancelled",
+        sema_core::runtime::CancelReason::Explicit,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
-/// Format the `await`-on-cancelled-promise error. Distinct from a
-/// normal rejection so users can branch on `:type :cancelled` once
-/// we expose that.
-fn cancelled_error() -> SemaError {
-    SemaError::eval("async/await: task was cancelled")
-        .with_hint("the task was cancelled via async/cancel before it produced a value")
+/// Validate and cap `async/sleep`'s duration argument, returning the sleep in
+/// whole milliseconds. Shared by the plain value and runtime ABIs.
+fn sleep_duration_ms(args: &[Value]) -> Result<u64, SemaError> {
+    check_arity!(args, "async/sleep", 1);
+    let ms = duration_ms(&args[0], "async/sleep")?;
+    // Cap the duration (mirrors async/timeout). The runtime's virtual
+    // clock jumps straight to a sleeper's wake time and, on native, waits that
+    // whole delta in one `thread::sleep`; without a bound an out-of-range
+    // duration would wedge the thread for years and could overflow the clock.
+    const MAX_SLEEP_MS: i64 = 86_400_000; // 1 day
+    if ms > MAX_SLEEP_MS {
+        return Err(SemaError::eval(format!(
+            "async/sleep: duration {ms} ms exceeds maximum {MAX_SLEEP_MS} ms (1 day)"
+        ))
+        .with_hint("use a shorter sleep, or loop with smaller sleeps"));
+    }
+    Ok(ms as u64)
+}
+
+/// Continuation for `async/sleep` under the unified runtime. A timer wait carries
+/// no value, so a normal fire resumes the parked frame with nil; a cancellation
+/// or failure while sleeping propagates the corresponding error. Holds no state.
+struct SleepCont;
+
+impl Trace for SleepCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for SleepCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(_) => Err(cancelled_error()),
+            ResumeInput::Returned(_) | ResumeInput::Runtime(_) => {
+                Ok(NativeOutcome::Return(Value::nil()))
+            }
+        }
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-fn register_fn_ctx(
-    env: &Env,
-    name: &str,
-    f: impl Fn(&EvalContext, &[Value]) -> Result<Value, SemaError> + 'static,
-) {
-    env.set(
-        sema_core::intern(name),
-        Value::native_fn(NativeFn::with_ctx(name, f)),
-    );
-}
-
-fn expect_promise(args: &[Value], _name: &str, idx: usize) -> Result<Rc<AsyncPromise>, SemaError> {
+/// Extract the runtime `PromiseId` from an `AsyncPromise` handle value. The
+/// registry (not the handle) owns the promise's state; every promise op that
+/// observes or waits on a promise threads this id to the runtime.
+fn expect_promise(args: &[Value], _name: &str, idx: usize) -> Result<PromiseId, SemaError> {
     match args[idx].view() {
-        ValueView::AsyncPromise(p) => Ok(p),
+        ValueView::AsyncPromise(p) => Ok(p.id),
         _ => Err(SemaError::type_error_with_value(
             "async-promise",
             args[idx].type_name(),
@@ -74,9 +119,12 @@ fn expect_promise(args: &[Value], _name: &str, idx: usize) -> Result<Rc<AsyncPro
     }
 }
 
-fn expect_channel(args: &[Value], _name: &str, idx: usize) -> Result<Rc<Channel>, SemaError> {
+/// Extract the runtime `ChannelId` from a `Channel` handle value. The registry
+/// (not the handle) owns the buffer/state; every channel op threads this id to
+/// the runtime.
+fn expect_channel(args: &[Value], _name: &str, idx: usize) -> Result<ChannelId, SemaError> {
     match args[idx].view() {
-        ValueView::Channel(c) => Ok(c),
+        ValueView::Channel(c) => Ok(c.id),
         _ => Err(SemaError::type_error_with_value(
             "channel",
             args[idx].type_name(),
@@ -121,283 +169,413 @@ fn register_predicates(env: &Env) {
 
 // ── Promise operations ───────────────────────────────────────────
 
-fn register_promise_ops(env: &Env) {
-    // async/spawn — spawn a thunk as an async task, returns a promise
-    register_fn_ctx(env, "async/spawn", |ctx, args| {
-        check_arity!(args, "async/spawn", 1);
-        call_spawn_callback(ctx, args[0].clone())
-    });
+/// Register a promise op as a structural runtime native. Plain value-ABI calls
+/// fail because promise operations require an active runtime task context.
+fn register_runtime_fn(env: &Env, name: &str, f: impl Fn(&[Value]) -> NativeResult + 'static) {
+    register_runtime_fn_with_escaping_args(env, name, &[], f);
+}
 
-    // async/await — wait for a promise to resolve
-    register_fn_ctx(env, "async/await", |ctx, args| {
-        check_arity!(args, "async/await", 1);
-        let promise = expect_promise(args, "async/await", 0)?;
+fn register_runtime_fn_with_escaping_args(
+    env: &Env,
+    name: &str,
+    escaping_args: &'static [usize],
+    f: impl Fn(&[Value]) -> NativeResult + 'static,
+) {
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(NativeFn::simple_result(name, f).with_escaping_args(escaping_args)),
+    );
+}
 
-        // Check for resume value first (we're resuming from a yield)
-        if let Some(val) = take_resume_value() {
-            return Ok(val);
-        }
+/// Map a settled promise's outcome to a native result: a returned value resumes
+/// the caller, a failure re-raises the PRESERVED `SemaError` (never re-wrapped),
+/// and a cancellation raises the structured `:cancelled` condition.
+fn settlement_to_result(settlement: &TaskSettlement) -> NativeResult {
+    match &settlement.outcome {
+        TaskOutcome::Returned(value) => Ok(NativeOutcome::Return(value.clone())),
+        TaskOutcome::Failed(error) => Err(error.clone()),
+        TaskOutcome::Cancelled(_) => Err(cancelled_error()),
+    }
+}
 
-        // If already resolved, return immediately
-        {
-            let state = promise.state.borrow();
-            match &*state {
-                PromiseState::Resolved(v) => return Ok(v.clone()),
-                PromiseState::Rejected(e) => return Err(rejected_error(e)),
-                PromiseState::Cancelled => return Err(cancelled_error()),
-                PromiseState::Pending => {}
+/// Collect promise ids from a list/vector of promise handles, in input order.
+fn collect_promise_ids(items: &[Value], name: &str) -> Result<Vec<PromiseId>, SemaError> {
+    items
+        .iter()
+        .map(|item| expect_promise(std::slice::from_ref(item), name, 0))
+        .collect()
+}
+
+/// Continuation that turns a runtime-allocated `PromiseId` (from `Spawn` or
+/// `CreateSettledPromise`) into the language-facing promise handle. Holds no
+/// `Value`, so its trace has no edges.
+struct PromiseHandleCont;
+
+impl Trace for PromiseHandleCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for PromiseHandleCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Promise(id)) => {
+                Ok(NativeOutcome::Return(Value::async_promise_id(id)))
             }
-        }
-
-        // If in async context, yield
-        if in_async_context() {
-            set_yield_signal(YieldReason::AwaitPromise(promise));
-            return Ok(Value::nil()); // placeholder, VM catches the signal
-        }
-
-        // At top level, run the scheduler inline.
-        if call_run_scheduler(ctx, Some(promise.clone()))? == SchedulerRunResult::DebugPaused {
-            // A breakpoint fired inside a task during a cooperative (WASM) debug
-            // session: the target is still pending. Yield the main VM so
-            // `run_cooperative` surfaces the stop to JS, and record how to resume
-            // (re-drive the scheduler, then return this promise's value). The
-            // native re-runs on resume via `take_resume_value` above.
-            set_debug_coop_resume(
-                SchedulerTarget::One(promise.clone()),
-                DebugCoopResume::Await(promise.clone()),
-            );
-            set_yield_signal(YieldReason::AwaitPromise(promise));
-            return Ok(Value::nil());
-        }
-        let state = promise.state.borrow();
-        match &*state {
-            PromiseState::Resolved(v) => Ok(v.clone()),
-            PromiseState::Rejected(e) => Err(rejected_error(e)),
-            PromiseState::Cancelled => Err(cancelled_error()),
-            PromiseState::Pending => Err(SemaError::eval(
-                "async/await: still pending after scheduler run",
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(_) => Err(cancelled_error()),
+            _ => Err(SemaError::eval(
+                "async: promise creation returned an unexpected runtime response",
             )),
         }
-    });
+    }
+}
 
-    // async/run — run all pending tasks to completion
-    register_fn_ctx(env, "async/run", |ctx, args| {
-        check_arity!(args, "async/run", 0);
-        if call_run_scheduler(ctx, None)? == SchedulerRunResult::DebugPaused {
-            set_debug_coop_resume(SchedulerTarget::All, DebugCoopResume::Run);
-            // No specific promise to await: park on the scheduler re-drive via a
-            // dummy never-resolving signal is wrong, so yield with an All target
-            // surrogate. `run_cooperative` re-drives `SchedulerTarget::All`.
-            set_yield_signal(YieldReason::Sleep(0));
-            return Ok(Value::nil());
+/// `async/await` continuation: the awaited promise settled (delivered as a
+/// `Settlement`), or a failure/cancellation reached this frame.
+struct AwaitCont;
+
+impl Trace for AwaitCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for AwaitCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Settlement(Some(settlement))) => {
+                settlement_to_result(&settlement)
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(_) => Err(cancelled_error()),
+            _ => Err(SemaError::eval(
+                "async/await: awaited promise resumed with an unexpected runtime response",
+            )),
         }
-        Ok(Value::nil())
-    });
+    }
+}
 
-    // async/resolved — create an already-resolved promise
-    register_fn(env, "async/resolved", |args| {
-        check_arity!(args, "async/resolved", 1);
-        Ok(Value::async_promise(AsyncPromise {
-            state: RefCell::new(PromiseState::Resolved(args[0].clone())),
-            task_id: Cell::new(0),
+/// `async/all` continuation: on success the runtime delivers every observed
+/// settlement (input order) as `Settlements`; on short-circuit it delivers the
+/// first failed/cancelled settlement as a single `Settlement`.
+struct AllCont;
+
+impl Trace for AllCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for AllCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Settlements(settlements)) => {
+                let mut values = Vec::with_capacity(settlements.len());
+                for settlement in &settlements {
+                    match &settlement.outcome {
+                        TaskOutcome::Returned(value) => values.push(value.clone()),
+                        TaskOutcome::Failed(error) => return Err(error.clone()),
+                        TaskOutcome::Cancelled(_) => return Err(cancelled_error()),
+                    }
+                }
+                Ok(NativeOutcome::Return(Value::list(values)))
+            }
+            ResumeInput::Runtime(RuntimeResponse::Settlement(Some(settlement))) => {
+                settlement_to_result(&settlement)
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(_) => Err(cancelled_error()),
+            _ => Err(SemaError::eval(
+                "async/all: resumed with an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// `async/race` and `async/timeout` continuation: the winning settlement is
+/// delivered as a single `Settlement`; an elapsed `async/timeout` deadline
+/// arrives as `ResumeInput::Failed` (the structured `:timeout` condition).
+struct RaceCont;
+
+impl Trace for RaceCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for RaceCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Settlement(Some(settlement))) => {
+                settlement_to_result(&settlement)
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(_) => Err(cancelled_error()),
+            _ => Err(SemaError::eval(
+                "async: combinator resumed with an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// `async/cancel` continuation: returns the boolean first-request result.
+struct CancelCont;
+
+impl Trace for CancelCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for CancelCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Cancelled(transitioned)) => {
+                Ok(NativeOutcome::Return(Value::bool(transitioned)))
+            }
+            ResumeInput::Failed(error) => Err(error),
+            _ => Err(SemaError::eval(
+                "async/cancel: resumed with an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// Which terminal-state predicate an [`InspectCont`] reports.
+#[derive(Clone, Copy)]
+enum Predicate {
+    Resolved,
+    Rejected,
+    Pending,
+    Cancelled,
+}
+
+/// Continuation for the promise predicates: maps the inspected settlement
+/// (`None` = still pending) to the predicate's boolean.
+struct InspectCont {
+    predicate: Predicate,
+}
+
+impl Trace for InspectCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for InspectCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Settlement(settlement)) => {
+                let outcome = settlement.as_deref().map(|s| &s.outcome);
+                let result = match self.predicate {
+                    Predicate::Pending => outcome.is_none(),
+                    Predicate::Resolved => matches!(outcome, Some(TaskOutcome::Returned(_))),
+                    Predicate::Rejected => matches!(outcome, Some(TaskOutcome::Failed(_))),
+                    Predicate::Cancelled => matches!(outcome, Some(TaskOutcome::Cancelled(_))),
+                };
+                Ok(NativeOutcome::Return(Value::bool(result)))
+            }
+            ResumeInput::Failed(error) => Err(error),
+            _ => Err(SemaError::eval(
+                "async: promise inspection returned an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// `async/run` continuation: the origin-root drain completed; resume with nil.
+struct RunCont;
+
+impl Trace for RunCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for RunCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(_) => Err(cancelled_error()),
+            _ => Ok(NativeOutcome::Return(Value::nil())),
+        }
+    }
+}
+
+/// Build the `InspectPromise` request for a promise predicate.
+fn inspect_op(args: &[Value], name: &str, predicate: Predicate) -> NativeResult {
+    check_arity!(args, name, 1);
+    let id = expect_promise(args, name, 0)?;
+    Ok(NativeOutcome::Runtime(RuntimeRequest::InspectPromise {
+        promise: id,
+        continuation: Box::new(InspectCont { predicate }),
+    }))
+}
+
+fn register_promise_ops(env: &Env) {
+    // async/spawn — spawn a thunk as a detached task; resume with its promise.
+    register_runtime_fn(env, "async/spawn", |args| {
+        check_arity!(args, "async/spawn", 1);
+        Ok(NativeOutcome::Runtime(RuntimeRequest::Spawn {
+            callable: args[0].clone(),
+            continuation: Box::new(PromiseHandleCont),
         }))
     });
 
-    // async/rejected — create an already-rejected promise
-    register_fn(env, "async/rejected", |args| {
+    // async/await — suspend until the promise settles. A rejection re-raises the
+    // PRESERVED error; a cancellation raises the structured `:cancelled`
+    // condition. An already-settled promise resumes immediately (the runtime's
+    // `install_promise_wait` delivers the settlement synchronously). Awaiting a
+    // non-promise value is identity (like `await` of a non-thenable), so results
+    // that are already plain values — e.g. an `async/all` value list — pass
+    // straight through.
+    register_runtime_fn(env, "async/await", |args| {
+        check_arity!(args, "async/await", 1);
+        match args[0].view() {
+            ValueView::AsyncPromise(promise) => Ok(NativeOutcome::Suspend(NativeSuspend {
+                wait: WaitKind::Promise(promise.id),
+                continuation: Box::new(AwaitCont),
+            })),
+            _ => Ok(NativeOutcome::Return(args[0].clone())),
+        }
+    });
+
+    // async/run — suspend on the self-resolving-waits barrier: wait until every
+    // OTHER task in this task's origin-root graph has settled or come to rest on a
+    // cycle-forming wait (see `Runtime::resolve_origin_barriers`), then resume nil.
+    register_runtime_fn(env, "async/run", |args| {
+        check_arity!(args, "async/run", 0);
+        Ok(NativeOutcome::Runtime(RuntimeRequest::OriginBarrier {
+            continuation: Box::new(RunCont),
+        }))
+    });
+
+    // async/resolved — create an already-resolved promise.
+    register_runtime_fn(env, "async/resolved", |args| {
+        check_arity!(args, "async/resolved", 1);
+        Ok(NativeOutcome::Runtime(
+            RuntimeRequest::CreateSettledPromise {
+                outcome: TaskOutcome::Returned(args[0].clone()),
+                continuation: Box::new(PromiseHandleCont),
+            },
+        ))
+    });
+
+    // async/rejected — create an already-rejected promise. The reason string is
+    // preserved as the promise's failure `SemaError`; awaiting it re-raises that
+    // error verbatim (no `task rejected:` wrapping).
+    register_runtime_fn(env, "async/rejected", |args| {
         check_arity!(args, "async/rejected", 1);
         let msg = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
             .to_string();
-        Ok(Value::async_promise(AsyncPromise {
-            state: RefCell::new(PromiseState::Rejected(msg)),
-            task_id: Cell::new(0),
+        Ok(NativeOutcome::Runtime(
+            RuntimeRequest::CreateSettledPromise {
+                outcome: TaskOutcome::Failed(SemaError::eval(msg)),
+                continuation: Box::new(PromiseHandleCont),
+            },
+        ))
+    });
+
+    // Terminal-state predicates — inspect the registry settlement. The states
+    // partition cleanly: a promise is at most one of resolved?/rejected?/
+    // cancelled?, and pending? is exactly the not-yet-settled case.
+    register_runtime_fn(env, "async/resolved?", |args| {
+        inspect_op(args, "async/resolved?", Predicate::Resolved)
+    });
+    register_runtime_fn(env, "async/rejected?", |args| {
+        inspect_op(args, "async/rejected?", Predicate::Rejected)
+    });
+    register_runtime_fn(env, "async/pending?", |args| {
+        inspect_op(args, "async/pending?", Predicate::Pending)
+    });
+    register_runtime_fn(env, "async/cancelled?", |args| {
+        inspect_op(args, "async/cancelled?", Predicate::Cancelled)
+    });
+
+    // async/cancel — request cancellation of the spawned task behind a promise.
+    // Returns #t only when this call records the FIRST cancellation request for a
+    // still-pending spawned task; #f for a synthetic/terminal/reaped promise.
+    register_runtime_fn(env, "async/cancel", |args| {
+        check_arity!(args, "async/cancel", 1);
+        let id = expect_promise(args, "async/cancel", 0)?;
+        Ok(NativeOutcome::Runtime(RuntimeRequest::CancelPromise {
+            promise: id,
+            continuation: Box::new(CancelCont),
         }))
     });
 
-    // async/resolved? — check if promise is resolved
-    register_fn(env, "async/resolved?", |args| {
-        check_arity!(args, "async/resolved?", 1);
-        let promise = expect_promise(args, "async/resolved?", 0)?;
-        let resolved = matches!(&*promise.state.borrow(), PromiseState::Resolved(_));
-        Ok(Value::bool(resolved))
-    });
-
-    // async/rejected? — true exactly when the promise is in the Rejected state.
-    // Excludes Cancelled (which is its own peer variant) so the predicates
-    // partition the terminal states cleanly: a promise is at most one of
-    // resolved? / rejected? / cancelled?.
-    register_fn(env, "async/rejected?", |args| {
-        check_arity!(args, "async/rejected?", 1);
-        let promise = expect_promise(args, "async/rejected?", 0)?;
-        let rejected = matches!(&*promise.state.borrow(), PromiseState::Rejected(_));
-        Ok(Value::bool(rejected))
-    });
-
-    // async/pending? — check if promise is still pending
-    register_fn(env, "async/pending?", |args| {
-        check_arity!(args, "async/pending?", 1);
-        let promise = expect_promise(args, "async/pending?", 0)?;
-        let pending = matches!(&*promise.state.borrow(), PromiseState::Pending);
-        Ok(Value::bool(pending))
-    });
-
-    // async/cancel — request cancellation of a spawned async task.
-    // Returns #t if this call actually transitioned the promise into
-    // Cancelled, #f if the promise was already terminal (resolved,
-    // rejected, or previously cancelled) or was never spawned in the
-    // first place (e.g. created via async/resolved). Never errors on
-    // a non-spawned promise — cancellation is best-effort.
-    register_fn(env, "async/cancel", |args| {
-        check_arity!(args, "async/cancel", 1);
-        let promise = expect_promise(args, "async/cancel", 0)?;
-        let task_id = promise.task_id.get();
-        if task_id == 0 {
-            // Never-spawned promise (async/resolved / async/rejected).
-            // There's nothing to cancel; report no transition.
-            return Ok(Value::bool(false));
-        }
-        let transitioned = sema_core::call_cancel_callback(task_id)?;
-        Ok(Value::bool(transitioned))
-    });
-
-    // async/cancelled? — true exactly when the promise is in the Cancelled state.
-    // Distinct from async/rejected? — a cancelled promise is not a normal
-    // rejection (which a user might catch and recover from). Matches the
-    // PromiseState::Cancelled variant directly so a user manually rejecting
-    // with the string "cancelled" no longer fools this predicate.
-    register_fn(env, "async/cancelled?", |args| {
-        check_arity!(args, "async/cancelled?", 1);
-        let promise = expect_promise(args, "async/cancelled?", 0)?;
-        let is_cancelled = matches!(&*promise.state.borrow(), PromiseState::Cancelled);
-        Ok(Value::bool(is_cancelled))
-    });
-
-    // async/all — run scheduler and collect results from all promises
-    register_fn_ctx(env, "async/all", |ctx, args| {
+    // async/all — OBSERVE every supplied promise; resume with the input-ordered
+    // value list once all resolve, or short-circuit on the first failure/cancel.
+    // The supplied producers are never cancelled. Empty input resolves to `()`.
+    register_runtime_fn(env, "async/all", |args| {
         check_arity!(args, "async/all", 1);
         let items = expect_list_or_vector(&args[0], "async/all")?;
-
-        let promises: Vec<Rc<AsyncPromise>> = items
-            .iter()
-            .map(|item| expect_promise(std::slice::from_ref(item), "async/all", 0))
-            .collect::<Result<_, _>>()?;
-
-        // Run scheduler until the requested promises settle. Unrelated
-        // background tasks must not make this combinator report deadlock.
-        if call_run_scheduler_all_of(ctx, promises.clone())? == SchedulerRunResult::DebugPaused {
-            // Cooperative debug pause inside a task: yield the main VM and re-run
-            // this native on resume (it re-collects the now-settled promises).
-            set_debug_coop_resume(
-                SchedulerTarget::AllOf(promises.clone()),
-                DebugCoopResume::All(promises.clone()),
-            );
-            // Yield against the first still-pending promise so the VM suspends.
-            let pending = promises
-                .iter()
-                .find(|p| matches!(&*p.state.borrow(), PromiseState::Pending))
-                .cloned()
-                .unwrap_or_else(|| promises[0].clone());
-            set_yield_signal(YieldReason::AwaitPromise(pending));
-            return Ok(Value::nil());
-        }
-
-        // Collect results — propagate the first non-resolved settlement.
-        // Report a REJECTION (the cause) in preference to a Cancelled sibling: on a
-        // rejection short-circuit the scheduler transitively cancels the still-pending
-        // siblings (ASYNC-3), so a cancelled task here is usually a *consequence* of
-        // another task's rejection — surfacing it would mask the real failure reason.
-        let mut results = Vec::with_capacity(items.len());
-        for p in &promises {
-            if let PromiseState::Rejected(e) = &*p.state.borrow() {
-                return Err(SemaError::eval(format!("async/all: task rejected: {e}")));
-            }
-        }
-        for p in &promises {
-            if matches!(&*p.state.borrow(), PromiseState::Cancelled) {
-                return Err(SemaError::eval("async/all: task was cancelled"));
-            }
-        }
-        for p in promises {
-            let state = p.state.borrow();
-            match &*state {
-                PromiseState::Resolved(v) => results.push(v.clone()),
-                PromiseState::Rejected(_) | PromiseState::Cancelled => {
-                    unreachable!("non-resolved states handled above")
-                }
-                PromiseState::Pending => {
-                    return Err(SemaError::eval("async/all: task still pending"))
-                }
-            }
-        }
-        Ok(Value::list(results))
+        let promises = collect_promise_ids(items, "async/all")?;
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::PromiseSet(PromiseSetWait {
+                promises,
+                mode: PromiseSetMode::All,
+            }),
+            continuation: Box::new(AllCont),
+        }))
     });
 
-    // async/race — run scheduler and return the first resolved promise's value
-    register_fn_ctx(env, "async/race", |ctx, args| {
+    // async/race — OBSERVE the supplied promises; resume with the first (lowest-
+    // settlement) winner, returned/failed/cancelled alike. Losers CONTINUE.
+    register_runtime_fn(env, "async/race", |args| {
         check_arity!(args, "async/race", 1);
         let items = expect_list_or_vector(&args[0], "async/race")?;
-
         if items.is_empty() {
             return Err(SemaError::eval("async/race: requires at least one promise"));
         }
-
-        // Collect promises
-        let promises: Vec<Rc<AsyncPromise>> = items
-            .iter()
-            .map(|item| expect_promise(std::slice::from_ref(item), "async/race", 0))
-            .collect::<Result<_, _>>()?;
-
-        // Check if any already resolved
-        for p in &promises {
-            if let PromiseState::Resolved(v) = &*p.state.borrow() {
-                return Ok(v.clone());
-            }
-        }
-
-        // Run scheduler until one requested promise settles. Unrelated
-        // background tasks must not make this combinator report deadlock.
-        if call_run_scheduler_any_of(ctx, promises.clone())? == SchedulerRunResult::DebugPaused {
-            set_debug_coop_resume(
-                SchedulerTarget::AnyOf(promises.clone()),
-                DebugCoopResume::Race(promises.clone()),
-            );
-            let pending = promises
-                .iter()
-                .find(|p| matches!(&*p.state.borrow(), PromiseState::Pending))
-                .cloned()
-                .unwrap_or_else(|| promises[0].clone());
-            set_yield_signal(YieldReason::AwaitPromise(pending));
-            return Ok(Value::nil());
-        }
-
-        // Find first resolved
-        for p in &promises {
-            if let PromiseState::Resolved(v) = &*p.state.borrow() {
-                return Ok(v.clone());
-            }
-        }
-
-        // Check for rejections
-        for p in &promises {
-            if let PromiseState::Rejected(e) = &*p.state.borrow() {
-                return Err(SemaError::eval(format!("async/race: task rejected: {e}")));
-            }
-        }
-
-        Err(SemaError::eval("async/race: no promise resolved"))
+        let promises = collect_promise_ids(items, "async/race")?;
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::PromiseSet(PromiseSetWait {
+                promises,
+                mode: PromiseSetMode::Race,
+            }),
+            continuation: Box::new(RaceCont),
+        }))
     });
 
-    // async/timeout — race a promise against a deadline
-    register_fn_ctx(env, "async/timeout", |ctx, args| {
+    // async/timeout — OBSERVE a single promise bounded by a deadline. An
+    // already-settled promise wins (even at ms=0); a promise still pending at the
+    // deadline raises `:timeout` while the supplied producer CONTINUES.
+    register_runtime_fn(env, "async/timeout", |args| {
         check_arity!(args, "async/timeout", 2);
         let ms = duration_ms(&args[0], "async/timeout")?;
-        if ms < 0 {
-            return Err(SemaError::eval(
-                "async/timeout: duration must be non-negative",
-            ));
-        }
         const MAX_TIMEOUT_MS: i64 = 86_400_000; // 1 day
         if ms > MAX_TIMEOUT_MS {
             return Err(SemaError::eval(format!(
@@ -405,105 +583,268 @@ fn register_promise_ops(env: &Env) {
             ))
             .with_hint("split into smaller timeouts or remove the timeout entirely"));
         }
-        let promise = expect_promise(args, "async/timeout", 1)?;
-
-        // If already resolved/rejected, return immediately
-        {
-            let state = promise.state.borrow();
-            match &*state {
-                PromiseState::Resolved(v) => return Ok(v.clone()),
-                PromiseState::Rejected(e) => {
-                    return Err(SemaError::eval(format!(
-                        "async/timeout: task rejected: {e}"
-                    )))
-                }
-                PromiseState::Cancelled => {
-                    return Err(SemaError::eval("async/timeout: task was cancelled"))
-                }
-                PromiseState::Pending => {}
-            }
-        }
-
-        // Run scheduler until the promise resolves or the timeout elapses.
-        match call_run_scheduler_timeout(ctx, promise.clone(), ms as u64)? {
-            SchedulerRunResult::TimedOut => {
-                return Err(SemaError::eval("async/timeout: operation timed out"));
-            }
-            SchedulerRunResult::DebugPaused => {
-                // Cooperative debug pause inside the awaited task: yield + re-run.
-                set_debug_coop_resume(
-                    SchedulerTarget::One(promise.clone()),
-                    DebugCoopResume::Await(promise.clone()),
-                );
-                set_yield_signal(YieldReason::AwaitPromise(promise));
-                return Ok(Value::nil());
-            }
-            SchedulerRunResult::Complete => {}
-        }
-
-        // Check if resolved
-        {
-            let state = promise.state.borrow();
-            match &*state {
-                PromiseState::Resolved(v) => return Ok(v.clone()),
-                PromiseState::Rejected(e) => {
-                    return Err(SemaError::eval(format!(
-                        "async/timeout: task rejected: {e}"
-                    )))
-                }
-                PromiseState::Cancelled => {
-                    return Err(SemaError::eval("async/timeout: task was cancelled"))
-                }
-                PromiseState::Pending => {}
-            }
-        }
-
-        Err(SemaError::eval(
-            "async/timeout: operation is still pending after scheduler run",
-        ))
+        let id = expect_promise(args, "async/timeout", 1)?;
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::PromiseSet(PromiseSetWait {
+                promises: vec![id],
+                mode: PromiseSetMode::Timeout(std::time::Duration::from_millis(ms as u64)),
+            }),
+            continuation: Box::new(RaceCont),
+        }))
     });
 
-    // async/sleep — yield for a duration in milliseconds
-    register_fn(env, "async/sleep", |args| {
-        check_arity!(args, "async/sleep", 1);
-        let ms = duration_ms(&args[0], "async/sleep")?;
-        if ms < 0 {
-            return Err(SemaError::eval(
-                "async/sleep: duration must be non-negative",
-            ));
-        }
-        // Cap the duration (mirrors async/timeout). The scheduler's virtual
-        // clock jumps straight to a sleeper's wake time and, on native, waits
-        // that whole delta in one `thread::sleep`; without a bound an
-        // out-of-range duration would wedge the thread for years and could
-        // overflow the virtual clock.
-        const MAX_SLEEP_MS: i64 = 86_400_000; // 1 day
-        if ms > MAX_SLEEP_MS {
-            return Err(SemaError::eval(format!(
-                "async/sleep: duration {ms} ms exceeds maximum {MAX_SLEEP_MS} ms (1 day)"
-            ))
-            .with_hint("use a shorter sleep, or loop with smaller sleeps"));
-        }
-        if in_async_context() {
-            if let Some(cached) = take_resume_value() {
-                return Ok(cached);
-            }
-            set_yield_signal(YieldReason::Sleep(ms as u64));
-            return Ok(Value::nil());
-        }
-        // Outside async, actually sleep
-        #[cfg(not(target_arch = "wasm32"))]
-        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
-        Ok(Value::nil())
-    });
+    // async/sleep — suspend for a duration in milliseconds.
+    //
+    // Under the unified cooperative runtime (a `TaskContext` is installed) the
+    // native suspends structurally on a timer wait; `SleepCont` resumes the
+    // parked frame with nil when it fires. That runtime ABI is ALWAYS preferred
+    // by `NativeFn::invoke_runtime` when present. The plain value ABI below is
+    // for host-only synchronous callbacks and foreign synchronous VM re-entry.
+    // If a synchronous helper bypasses `invoke_runtime` while a runtime quantum
+    // is active, it cannot carry a suspension and fails explicitly.
+    //
+    // This suspend is unconditional (no promise-driven check): unlike the wasm
+    // http natives, the SAME structural timer wait is correct on every
+    // caller and target. Synchronous and promise-driven wasm entry points differ
+    // only in how their drive loops wait out an `Idle` turn with a timer pending;
+    // `drive_handle_to_settlement` owns that policy.
+    env.set(
+        sema_core::intern("async/sleep"),
+        Value::native_fn(NativeFn::simple_with_runtime(
+            "async/sleep",
+            |args| {
+                let ms = sleep_duration_ms(args)?;
+                if in_runtime_quantum() {
+                    return Err(SemaError::eval(
+                        "async/sleep: entered through a synchronous callback path while the \
+                         cooperative runtime is active — invoke it through a structural \
+                         runtime call so it can suspend cleanly",
+                    ));
+                }
+                // Outside any runtime quantum (a nested/foreign synchronous VM
+                // re-entry), actually sleep. `ms` is unused on wasm32 (the main
+                // thread must never block there).
+                #[cfg(not(target_arch = "wasm32"))]
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                #[cfg(target_arch = "wasm32")]
+                let _ = ms;
+                Ok(Value::nil())
+            },
+            |_ctx, args| {
+                let ms = sleep_duration_ms(args)?;
+                Ok(NativeOutcome::Suspend(NativeSuspend {
+                    wait: WaitKind::Timer(std::time::Duration::from_millis(ms)),
+                    continuation: Box::new(SleepCont),
+                }))
+            },
+        )),
+    );
 }
 
 // ── Channel operations ───────────────────────────────────────────
 
+/// The error raised when `channel/send` finds the channel closed (eagerly or
+/// while a blocked sender is woken by a close). Names the dropped value so a
+/// caller can see which send was lost.
+fn channel_send_closed_error(value: &Value) -> SemaError {
+    SemaError::eval(format!(
+        "channel/send: channel is closed; value {value} was dropped"
+    ))
+}
+
+/// Continuation turning a runtime-allocated `ChannelId` (from `CreateChannel`)
+/// into the language-facing channel handle. Holds no `Value`.
+struct ChannelHandleCont;
+
+impl Trace for ChannelHandleCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for ChannelHandleCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Channel(id)) => {
+                Ok(NativeOutcome::Return(Value::channel_id(id)))
+            }
+            ResumeInput::Failed(error) => Err(error),
+            _ => Err(SemaError::eval("channel/new: unexpected runtime response")),
+        }
+    }
+}
+
+/// `channel/send` continuation: `Sent` → nil; `Closed` → the closed-send error
+/// naming the dropped value (carried here for the message — the runtime consumed
+/// the sent copy).
+struct SendCont {
+    value: Value,
+}
+
+impl Trace for SendCont {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.value));
+        true
+    }
+}
+
+impl NativeContinuation for SendCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Send(ChannelSend::Sent)) => {
+                Ok(NativeOutcome::Return(Value::nil()))
+            }
+            ResumeInput::Runtime(RuntimeResponse::Send(ChannelSend::Closed)) => {
+                Err(channel_send_closed_error(&self.value))
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(_) => Err(cancelled_error()),
+            _ => Err(SemaError::eval("channel/send: unexpected runtime response")),
+        }
+    }
+}
+
+/// `channel/recv` continuation: `Received(v)` → v; `Closed` → nil (the documented
+/// closed-and-empty sentinel).
+struct RecvCont;
+
+impl Trace for RecvCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for RecvCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Receive(ChannelReceive::Received(value))) => {
+                Ok(NativeOutcome::Return(value))
+            }
+            ResumeInput::Runtime(RuntimeResponse::Receive(ChannelReceive::Closed))
+            | ResumeInput::Runtime(RuntimeResponse::Receive(ChannelReceive::Empty)) => {
+                Ok(NativeOutcome::Return(Value::nil()))
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(_) => Err(cancelled_error()),
+            _ => Err(SemaError::eval("channel/recv: unexpected runtime response")),
+        }
+    }
+}
+
+/// `channel/try-recv` continuation: `Received(v)` → v; `Empty`/`Closed` → nil.
+struct TryRecvCont;
+
+impl Trace for TryRecvCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for TryRecvCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Receive(ChannelReceive::Received(value))) => {
+                Ok(NativeOutcome::Return(value))
+            }
+            ResumeInput::Runtime(RuntimeResponse::Receive(_)) => {
+                Ok(NativeOutcome::Return(Value::nil()))
+            }
+            ResumeInput::Failed(error) => Err(error),
+            _ => Err(SemaError::eval(
+                "channel/try-recv: unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// `channel/close` continuation: resume with nil regardless of whether this call
+/// transitioned the channel (the boolean is internal).
+struct CloseCont;
+
+impl Trace for CloseCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for CloseCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Value(_)) => {
+                Ok(NativeOutcome::Return(Value::nil()))
+            }
+            ResumeInput::Failed(error) => Err(error),
+            _ => Err(SemaError::eval(
+                "channel/close: unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// Continuation for the observational channel ops (`count`/`empty?`/`full?`/
+/// `closed?`): the runtime answers synchronously with the int/bool `Value`.
+struct ChannelValueCont;
+
+impl Trace for ChannelValueCont {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for ChannelValueCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Value(value)) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            _ => Err(SemaError::eval("channel: unexpected runtime response")),
+        }
+    }
+}
+
+/// Build the `ChannelOp{Inspect(query)}` request for an observational channel op.
+fn inspect_channel(args: &[Value], name: &str, query: ChannelQuery) -> NativeResult {
+    check_arity!(args, name, 1);
+    let channel = expect_channel(args, name, 0)?;
+    Ok(NativeOutcome::Runtime(RuntimeRequest::ChannelOp {
+        channel,
+        operation: ChannelOperation::Inspect(query),
+        continuation: Box::new(ChannelValueCont),
+    }))
+}
+
 fn register_channel_ops(env: &Env) {
-    // channel/new — create a bounded channel
-    register_fn(env, "channel/new", |args| {
+    // channel/new — create a bounded channel in the registry, resume with its
+    // handle. Capacity validation stays here (the registry only allocates).
+    register_runtime_fn(env, "channel/new", |args| {
         check_arity!(args, "channel/new", 0..=1);
+        // An upper bound keeps an unrepresentable/allocation-impossible request
+        // (e.g. `i64::MAX`) from reaching the registry's buffer, which would panic
+        // on the capacity-overflow rather than returning a Sema condition.
+        const MAX_CHANNEL_CAPACITY: usize = 1 << 24; // ~16M slots
         let capacity = if args.is_empty() {
             1
         } else {
@@ -513,116 +854,83 @@ fn register_channel_ops(env: &Env) {
             if n <= 0 {
                 return Err(SemaError::eval("channel/new: capacity must be at least 1"));
             }
-            n as usize
+            let cap = n as usize;
+            if cap > MAX_CHANNEL_CAPACITY {
+                return Err(SemaError::eval(format!(
+                    "channel/new: capacity {n} exceeds maximum {MAX_CHANNEL_CAPACITY}"
+                ))
+                .with_hint("use a smaller bounded capacity"));
+            }
+            cap
         };
-        Ok(Value::channel(Channel {
-            buffer: RefCell::new(VecDeque::with_capacity(capacity)),
+        Ok(NativeOutcome::Runtime(RuntimeRequest::CreateChannel {
             capacity,
-            closed: Cell::new(false),
+            continuation: Box::new(ChannelHandleCont),
         }))
     });
 
-    // channel/send — send a value to a channel (yields if full in async context)
-    register_fn(env, "channel/send", |args| {
+    // channel/send — send a value; suspend until buffered/handed to a receiver.
+    // A full channel BLOCKS until space (the runtime parks the frame); a
+    // send-to-closed raises the closed error naming the dropped value.
+    register_runtime_fn_with_escaping_args(env, "channel/send", &[1], |args| {
         check_arity!(args, "channel/send", 2);
-        let ch = expect_channel(args, "channel/send", 0)?;
-        if ch.closed.get() {
-            return Err(SemaError::eval(format!(
-                "channel/send: channel is closed; value {} was dropped",
-                args[1]
-            )));
-        }
-        if in_async_context() {
-            if let Some(cached) = take_resume_value() {
-                return Ok(cached);
-            }
-        }
-        let mut buf = ch.buffer.borrow_mut();
-        if buf.len() >= ch.capacity {
-            drop(buf);
-            if in_async_context() {
-                set_yield_signal(YieldReason::ChannelSend(ch, args[1].clone()));
-                return Ok(Value::nil());
-            }
-            return Err(
-                SemaError::eval("channel/send: channel is full").with_hint(
-                    "Use async to run in an async context where send will yield until space is available",
-                ),
-            );
-        }
-        buf.push_back(args[1].clone());
-        Ok(Value::nil())
+        let channel = expect_channel(args, "channel/send", 0)?;
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::Channel(ChannelWait::Send {
+                channel,
+                value: args[1].clone(),
+            }),
+            continuation: Box::new(SendCont {
+                value: args[1].clone(),
+            }),
+        }))
     });
 
-    // channel/recv — receive a value from a channel (yields if empty in async context)
-    register_fn(env, "channel/recv", |args| {
+    // channel/recv — receive a value; suspend until one is available. A closed +
+    // empty channel resumes with nil (the documented closed sentinel).
+    register_runtime_fn(env, "channel/recv", |args| {
         check_arity!(args, "channel/recv", 1);
-        let ch = expect_channel(args, "channel/recv", 0)?;
-        if in_async_context() {
-            if let Some(cached) = take_resume_value() {
-                return Ok(cached);
-            }
-        }
-        let mut buf = ch.buffer.borrow_mut();
-        if let Some(v) = buf.pop_front() {
-            return Ok(v);
-        }
-        drop(buf);
-        if ch.closed.get() {
-            return Ok(Value::nil());
-        }
-        if in_async_context() {
-            set_yield_signal(YieldReason::ChannelRecv(ch));
-            return Ok(Value::nil());
-        }
-        Err(SemaError::eval("channel/recv: channel is empty"))
+        let channel = expect_channel(args, "channel/recv", 0)?;
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::Channel(ChannelWait::Receive { channel }),
+            continuation: Box::new(RecvCont),
+        }))
     });
 
-    // channel/try-recv — non-blocking receive (returns nil if empty)
-    register_fn(env, "channel/try-recv", |args| {
+    // channel/try-recv — non-blocking receive: drain one value or nil sentinel.
+    register_runtime_fn(env, "channel/try-recv", |args| {
         check_arity!(args, "channel/try-recv", 1);
-        let ch = expect_channel(args, "channel/try-recv", 0)?;
-        let val = ch.buffer.borrow_mut().pop_front().unwrap_or(Value::nil());
-        Ok(val)
+        let channel = expect_channel(args, "channel/try-recv", 0)?;
+        Ok(NativeOutcome::Runtime(RuntimeRequest::ChannelOp {
+            channel,
+            operation: ChannelOperation::TryReceive,
+            continuation: Box::new(TryRecvCont),
+        }))
     });
 
-    // channel/close — close a channel
-    register_fn(env, "channel/close", |args| {
+    // channel/close — close the channel, waking parked senders/receivers; nil.
+    register_runtime_fn(env, "channel/close", |args| {
         check_arity!(args, "channel/close", 1);
-        let ch = expect_channel(args, "channel/close", 0)?;
-        ch.closed.set(true);
-        Ok(Value::nil())
+        let channel = expect_channel(args, "channel/close", 0)?;
+        Ok(NativeOutcome::Runtime(RuntimeRequest::ChannelOp {
+            channel,
+            operation: ChannelOperation::Close,
+            continuation: Box::new(CloseCont),
+        }))
     });
 
-    // channel/closed? — check if a channel is closed
-    register_fn(env, "channel/closed?", |args| {
-        check_arity!(args, "channel/closed?", 1);
-        let ch = expect_channel(args, "channel/closed?", 0)?;
-        Ok(Value::bool(ch.closed.get()))
+    // Observational channel ops — answered synchronously by the runtime.
+    register_runtime_fn(env, "channel/closed?", |args| {
+        inspect_channel(args, "channel/closed?", ChannelQuery::Closed)
     });
-
-    // channel/count — number of items currently in the buffer
-    register_fn(env, "channel/count", |args| {
-        check_arity!(args, "channel/count", 1);
-        let ch = expect_channel(args, "channel/count", 0)?;
-        let len = ch.buffer.borrow().len();
-        Ok(Value::int(len as i64))
+    register_runtime_fn(env, "channel/count", |args| {
+        inspect_channel(args, "channel/count", ChannelQuery::Count)
     });
-
-    // channel/empty? — check if the channel buffer is empty
-    register_fn(env, "channel/empty?", |args| {
-        check_arity!(args, "channel/empty?", 1);
-        let ch = expect_channel(args, "channel/empty?", 0)?;
-        let empty = ch.buffer.borrow().is_empty();
-        Ok(Value::bool(empty))
+    register_runtime_fn(env, "channel/empty?", |args| {
+        inspect_channel(args, "channel/empty?", ChannelQuery::Empty)
     });
-
-    // channel/full? — check if the channel buffer is at capacity
-    register_fn(env, "channel/full?", |args| {
-        check_arity!(args, "channel/full?", 1);
-        let ch = expect_channel(args, "channel/full?", 0)?;
-        let buf = ch.buffer.borrow();
-        Ok(Value::bool(buf.len() >= ch.capacity))
+    register_runtime_fn(env, "channel/full?", |args| {
+        inspect_channel(args, "channel/full?", ChannelQuery::Full)
     });
 }
 
@@ -639,5 +947,54 @@ mod duration_tests {
         assert!(duration_ms(&Value::float(f64::INFINITY), "t").is_err()); // non-finite rejected
         assert!(duration_ms(&Value::float(f64::NAN), "t").is_err());
         assert!(duration_ms(&Value::string("nope"), "t").is_err()); // non-number rejected
+    }
+}
+
+#[cfg(test)]
+mod continuation_trace_tests {
+    use super::*;
+
+    fn edge_count(trace: &dyn Trace) -> usize {
+        let mut count = 0;
+        assert!(trace.trace(&mut |_| count += 1));
+        count
+    }
+
+    /// Every promise-op continuation captures only `Copy` state (a `PromiseId`
+    /// lives in the runtime request, never in the continuation; predicates hold a
+    /// `Copy` enum). None holds a `Value`, so their GC trace must emit no edges —
+    /// the CORE-2 invariant that keeps continuation state cycle-free.
+    #[test]
+    fn continuations_hold_no_value_edges() {
+        assert_eq!(edge_count(&PromiseHandleCont), 0);
+        assert_eq!(edge_count(&AwaitCont), 0);
+        assert_eq!(edge_count(&AllCont), 0);
+        assert_eq!(edge_count(&RaceCont), 0);
+        assert_eq!(edge_count(&CancelCont), 0);
+        assert_eq!(edge_count(&RunCont), 0);
+        assert_eq!(
+            edge_count(&InspectCont {
+                predicate: Predicate::Resolved
+            }),
+            0
+        );
+    }
+
+    /// The channel continuations are likewise edge-free EXCEPT `SendCont`, which
+    /// carries the sent `Value` purely to name it in the closed-send error. That
+    /// one `Value` must be a traced edge (CORE-2); the rest emit none.
+    #[test]
+    fn channel_continuations_trace_expected_edges() {
+        assert_eq!(edge_count(&ChannelHandleCont), 0);
+        assert_eq!(edge_count(&RecvCont), 0);
+        assert_eq!(edge_count(&TryRecvCont), 0);
+        assert_eq!(edge_count(&CloseCont), 0);
+        assert_eq!(edge_count(&ChannelValueCont), 0);
+        assert_eq!(
+            edge_count(&SendCont {
+                value: Value::int(7)
+            }),
+            1
+        );
     }
 }

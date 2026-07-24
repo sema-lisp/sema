@@ -1,8 +1,8 @@
 ;; mandelbrot.sema — ASCII Mandelbrot set renderer
 ;; Usage: sema examples/mandelbrot.sema
 
-(define chars      " .:-=+*#%@")
-(define num-chars  (string/length chars))
+(define chars " .:-=+*#%@")
+(define num-chars (string/length chars))
 ;; Escape-time iteration: returns iteration count (max-iter = in set)
 (define (mandelbrot-iter cx cy max-iter)
   (do
@@ -41,8 +41,8 @@
         (do
           ((col 0 (+ col 1)))
           ((= col width))
-          (let* ((cx    (+ x-min (* col dx)))
-                 (iter  (mandelbrot-iter cx cy max-iter)))
+          (let* ((cx (+ x-min (* col dx)))
+                 (iter (mandelbrot-iter cx cy max-iter)))
             (display (iter->char iter max-iter)))))
       (newline))
     (let ((elapsed (- (time-ms) t0)))

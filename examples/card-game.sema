@@ -16,18 +16,18 @@
   (let (([suit rank] card))
     (let ((rank-str
             (match rank
-              (:ace    "A")
-              (:king   "K")
-              (:queen  "Q")
-              (:jack   "J")
-              (n       (str n))))
+              (:ace "A")
+              (:king "K")
+              (:queen "Q")
+              (:jack "J")
+              (n (str n))))
           (suit-str
             (match suit
-              (:spades    "♠")
-              (:hearts    "♥")
-              (:diamonds  "♦")
-              (:clubs     "♣")
-              (_          "?"))))
+              (:spades "♠")
+              (:hearts "♥")
+              (:diamonds "♦")
+              (:clubs "♣")
+              (_ "?"))))
       f"${rank-str}${suit-str}")))
 
 (define (hand-str hand)

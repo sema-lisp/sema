@@ -9,8 +9,8 @@
 
 ;; A stream is a 2-element list: (value thunk)
 ;; where thunk is a fn that returns the next stream (or nil for end)
-(define stream-empty       nil)
-(define (stream-empty? s)  (nil? s))
+(define stream-empty nil)
+(define (stream-empty? s) (nil? s))
 
 (define (stream-cons head tail-thunk)
   (list head tail-thunk))

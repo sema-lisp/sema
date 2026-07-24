@@ -59,9 +59,9 @@
 
 ;; Nested roundtrip
 (define data
-  {:users   [{:name "Ada"} {:name "Bob"}]
-   :count   2
-   :active  #t})
+  {:users [{:name "Ada"} {:name "Bob"}]
+   :count 2
+   :active #t})
 (define roundtripped (json/decode (json/encode data)))
 (assert-eq (:count roundtripped) 2 "nested roundtrip :count")
 (assert-eq (:active roundtripped) #t "nested roundtrip :active")

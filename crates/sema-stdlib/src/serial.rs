@@ -9,23 +9,39 @@
 //! task that would otherwise stall every sibling on the cooperative
 //! scheduler.
 //!
-//! `serial/open` offloads the device `open()` syscall itself via
-//! `fs_offload` (io.rs): there is no existing port to contend over, so the
-//! poller simply inserts the freshly-opened, freshly-`BufReader`-wrapped
-//! port into the registry on completion — mirrors `db/open`'s shape
-//! (`sqlite.rs`).
+//! `serial/open` offloads the device `open()` syscall itself as a plain
+//! External wait (`runtime_offload::external_io_interruptible_try`): there is
+//! no existing port to contend over, so the decoder simply inserts the
+//! freshly-opened, freshly-`BufReader`-wrapped port into the registry on
+//! completion — mirrors `db/open`'s shape (`sqlite.rs`).
 //!
 //! `serial/write`/`serial/read-line`/`serial/send` run against an EXISTING
-//! port, so they use the CHECKOUT pattern (see `sqlite.rs`'s module doc
-//! comment for the canonical writeup this mirrors): the registry slot is
-//! `Available(Port)` / `CheckedOut` / `Tombstone(msg)`. The offload takes the
-//! port out of the slot for its duration; any other `serial/*` op on the
-//! SAME handle sees `CheckedOut` and either errors clearly (the sync path,
-//! and `serial/close`) or queues (an async caller's `IoHandle` re-attempts
-//! the checkout every poll — the `Acquire` phase — until the slot frees up,
-//! then runs its own offload). The offload's poller reinstalls the port as
-//! `Available` and calls `notify_io_complete()` so a sibling queued on the
-//! same handle can't miss the wakeup.
+//! port, so they use the CHECKOUT pattern under the unified runtime via
+//! `runtime_offload::checkout_external` (see `sqlite.rs`'s module doc comment
+//! for the canonical writeup this mirrors): the registry slot is
+//! `Available(Port)` / `CheckedOut` / `Tombstone(msg)`, guarded by a per-handle
+//! `ResourceGate` that serializes concurrent ops FIFO. The offload acquires the
+//! gate, takes the port out of the slot, runs the blocking op on the executor's
+//! blocking tier, then reinstalls the port and releases the gate. Any other
+//! `serial/*` op on the SAME handle either errors clearly (the sync path, and
+//! `serial/close`, on `CheckedOut`) or parks FIFO on the gate. A mid-flight
+//! cancel tombstones the slot (best-effort — the port cannot be reclaimed) and
+//! closes the gate.
+//!
+//! Cancellation model (ledger R14, split R14A/R14B): the structural gate/open/
+//! close waits are INTERRUPTIBLE (R14A — a queued op leaves the FIFO, a cancelled
+//! open rejects, `serial/close` tombstones). The checkout ops themselves are
+//! QUARANTINED-BOUNDED (R14B): serial hardware exposes no portable read-interrupt,
+//! so — unlike proc/pty (SIGKILL) or SQLite (interrupt handle) — cancellation runs
+//! NO abort (`abort: None`); the port cannot be reclaimed and the blocked worker
+//! only frees when the OS read returns. The port's read timeout, validated
+//! `Some(_)`, non-zero, and `<= SERIAL_MAX_OP_TIMEOUT` at `serial/open` and again
+//! before every checkout dispatch, is therefore the sole bound on worker
+//! occupancy: a blocked `serial/read-line` returns a `TimedOut` error within the
+//! validated timeout, so an unbounded blocking read is unrepresentable. (A real
+//! `try_clone`-based abort/wake was considered but not shipped: it cannot be
+//! validated on a tier-1 platform without serial hardware, and the honest
+//! disposition is the bounded-timeout split rather than an unverifiable abort.)
 //!
 //! `serial/write`'s `flush()` is included in its offload — on most serialport
 //! backends flush maps to `tcdrain(3)`, which blocks until every queued byte
@@ -41,12 +57,81 @@
 //! At top level (no scheduler) every builtin keeps today's synchronous shape
 //! byte-for-byte.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::rc::Rc;
 use std::time::Duration;
 
-use sema_core::{check_arity, in_async_context, Caps, IoHandle, IoPoll, SemaError, Value};
+use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateHandle};
+use sema_core::{check_arity, in_runtime_quantum, Caps, SemaError, Value};
+
+use crate::runtime_offload::{
+    checkout_external, finish_terminal_gate, prepare_terminal_gate, CheckoutOp,
+};
+
+/// Completion-kind tag for `serial/*` external waits ("srl\0").
+const SERIAL_COMPLETION_KIND: u64 = 0x7372_6c00;
+
+/// Default per-port read/write timeout when `serial/open` is called without an
+/// explicit `timeout_ms` (the historical value; all `pico-*` examples rely on
+/// it or a small explicit override).
+const DEFAULT_SERIAL_TIMEOUT_MS: u64 = 2000;
+
+/// Upper bound on a serial port's per-operation read/write timeout (R14B).
+///
+/// Serial hardware has no portable way to interrupt a blocked `read(2)`, so —
+/// unlike proc/pty (SIGKILL) or SQLite (interrupt handle) — a cancelled serial
+/// checkout op cannot be woken; the blocked worker only frees when the OS read
+/// returns. The port's configured read timeout is therefore the *only* thing
+/// bounding worker occupancy: a blocked `serial/read-line` returns a `TimedOut`
+/// error after at most this long. Every checkout op validates that its port's
+/// timeout is `Some(_)`, non-zero, and `<= SERIAL_MAX_OP_TIMEOUT` before it
+/// dispatches, so an unbounded blocking read is unrepresentable and a cancelled
+/// op's worker is guaranteed to free within the validated bound. This is R14B's
+/// cancellation backstop in lieu of a (here unverifiable) real abort/wake.
+const SERIAL_MAX_OP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Validate a serial operation timeout as a finite, bounded quantum: `Some(d)`
+/// with `0 < d <= SERIAL_MAX_OP_TIMEOUT`. `None` (no timeout configured) or a
+/// zero timeout is "missing" (no bounded blocking read); a larger value is
+/// "oversized". A checkout op will not dispatch a blocking read/write without a
+/// validated bound, so worker occupancy always stays bounded by `d`.
+fn validate_op_timeout(op: &str, timeout: Option<Duration>) -> Result<Duration, SemaError> {
+    match timeout {
+        Some(d) if d.is_zero() => Err(SemaError::eval(format!(
+            "{op}: a serial read timeout of zero is not a bounded operation timeout"
+        ))
+        .with_hint("open the port with a positive timeout in milliseconds")),
+        Some(d) if d > SERIAL_MAX_OP_TIMEOUT => Err(SemaError::eval(format!(
+            "{op}: read timeout {}ms exceeds the maximum serial op timeout {}ms",
+            d.as_millis(),
+            SERIAL_MAX_OP_TIMEOUT.as_millis()
+        ))
+        .with_hint("open the port with a smaller timeout: (serial/open path baud timeout-ms)")),
+        Some(d) => Ok(d),
+        None => Err(SemaError::eval(format!(
+            "{op}: serial port has no read timeout configured; a bounded timeout is required"
+        ))),
+    }
+}
+
+/// R14B dispatch gate: before a checkout op dispatches a blocking read/write,
+/// confirm the target port's configured timeout is present and bounded. Only an
+/// `Available` port is reachable on the VM thread here — a `CheckedOut` port is
+/// already mid-op on the worker (its timeout was validated when *that* op
+/// dispatched), and a missing/tombstoned slot is surfaced with the exact
+/// invalid-handle / tombstone text by `take` rather than a timeout error. The
+/// port carries its own timeout (`SerialPort::timeout`), so there is no shadow
+/// copy that could drift from the value `serial/open` validated.
+fn validate_available_timeout(op: &'static str, handle: u64) -> Result<(), SemaError> {
+    PORTS.with(|p| match p.borrow().get(&handle) {
+        Some(PortSlot::Available(reader)) => {
+            validate_op_timeout(op, Some(reader.get_ref().timeout())).map(|_| ())
+        }
+        _ => Ok(()),
+    })
+}
 
 /// A registry entry: a buffered handle over a boxed trait object port.
 type Port = BufReader<Box<dyn serialport::SerialPort>>;
@@ -78,6 +163,58 @@ enum PortSlot {
 thread_local! {
     static PORTS: RefCell<HashMap<u64, PortSlot>> = RefCell::new(HashMap::new());
     static NEXT_ID: RefCell<u64> = const { RefCell::new(1) };
+    /// Per-handle owning resource-gate capability, created lazily on the first
+    /// offloaded op and reused for later ops (dropped on `serial/close`). The gate
+    /// provides FIFO mutual exclusion for the checkout slot.
+    static SERIAL_GATES: RefCell<HashMap<u64, ResourceGateHandle>> = RefCell::new(HashMap::new());
+    /// Whether this thread's interpreter has an interpreter-teardown hook wired
+    /// for the serial registry (C6) — see `proc.rs`'s `PROC_TEARDOWN_REGISTERED`.
+    static SERIAL_TEARDOWN_REGISTERED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Register the interpreter-teardown hook for the serial registry against `ctx`
+/// exactly once per interpreter (C6). Called at `serial/open` so a port opened
+/// but never `serial/close`d is still closed on interpreter drop.
+fn ensure_teardown_hook(ctx: &sema_core::EvalContext) {
+    if !SERIAL_TEARDOWN_REGISTERED.with(|c| c.replace(true)) {
+        ctx.register_interpreter_teardown_hook(teardown_ports);
+    }
+}
+
+/// Interpreter-drop teardown for the serial registry (C6). Dropping every slot
+/// closes the underlying device (an `Available` port's OS handle; a `CheckedOut`
+/// port is held by an offloaded worker whose blocked read is bounded by the
+/// port's validated timeout — R14B — and cannot be reclaimed, so the slot is
+/// simply dropped). Gates are closed so any parked waiter fails fast.
+fn teardown_ports() {
+    PORTS.with(|p| p.borrow_mut().clear());
+    SERIAL_GATES.with(|g| {
+        for (_, gate) in g.borrow_mut().drain() {
+            let _ = gate.close();
+        }
+    });
+    SERIAL_TEARDOWN_REGISTERED.with(|c| c.set(false));
+}
+
+/// Take `handle`'s port out of its slot once its gate is owned, marking the slot
+/// `CheckedOut`. A tombstoned/missing/busy slot fails with the same clear text
+/// the sync path raises.
+fn take_port(op: &'static str, handle: u64) -> Result<Port, SemaError> {
+    PORTS.with(|p| {
+        let mut ports = p.borrow_mut();
+        match ports.get_mut(&handle) {
+            Some(slot @ PortSlot::Available(_)) => {
+                let PortSlot::Available(port) = std::mem::replace(slot, PortSlot::CheckedOut)
+                else {
+                    unreachable!("just matched Available")
+                };
+                Ok(port)
+            }
+            Some(PortSlot::CheckedOut) => Err(busy_err(op, handle)),
+            Some(PortSlot::Tombstone(msg)) => Err(tombstone_err(op, handle, msg)),
+            None => Err(missing_err(op, handle)),
+        }
+    })
 }
 
 fn next_handle() -> u64 {
@@ -140,177 +277,71 @@ fn with_port<R>(
     })
 }
 
-/// What crosses the thread boundary from an offloaded port op back to the
-/// poller: the reinstalled `Port` plus the op's owned `Send` result. Mirrors
-/// `sqlite.rs`'s `ConnOpOutcome`.
-struct PortOpOutcome<T> {
-    port: Port,
-    result: Result<T, String>,
-}
-
-/// The two phases a checkout offload's `IoHandle` cycles through — identical
-/// shape to `sqlite.rs`'s `ConnPhase`. A caller that finds the slot
-/// immediately `Available` still starts in `Acquire`; it succeeds on the
-/// very first poll and falls through into `Running` in the same tick, so
-/// there is exactly one code path for both the uncontended and the queued
-/// case.
-enum PortPhase<T> {
-    /// Waiting for the slot to become `Available`. Re-checked every poll;
-    /// never mutates anything beyond that check, so aborting here is a true
-    /// no-op — nothing was ever taken out.
-    Acquire,
-    /// Holding the checkout; `op` is running on the I/O pool. Resolves with
-    /// the reinstalled `Port` plus the op's result.
-    Running(tokio::sync::oneshot::Receiver<PortOpOutcome<T>>),
-}
-
-/// Move `op` on `port` onto the I/O pool's blocking tier. Cancellation past
-/// this point is best-effort by construction (the `Port` is inside a
-/// `spawn_blocking` closure with no abort hook — the same tradeoff every
-/// other `spawn_blocking`-based offload in this codebase accepts, see
-/// `IoHandle::with_abort`'s doc comment): the caller marks the registry slot
-/// `Tombstone` on abort so a later access errors clearly instead of the slot
-/// staying `CheckedOut` forever with no one left to reinstall it, but the
-/// blocking call itself keeps running unattended on the worker.
-fn spawn_port_op<T: Send + 'static>(
-    mut port: Port,
-    op: impl FnOnce(&mut Port) -> Result<T, String> + Send + 'static,
-) -> tokio::sync::oneshot::Receiver<PortOpOutcome<T>> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    sema_io::io_spawn_blocking(move || {
-        let result = op(&mut port);
-        let _ = tx.send(PortOpOutcome { port, result });
-        // Wake the parked VM thread so it re-polls promptly.
-        sema_core::notify_io_complete();
-    });
-    rx
-}
-
-/// Offload one blocking serial operation on the port named `handle` through
-/// the CHECKOUT pattern (see the module doc comment). `op` runs on the I/O
-/// pool; `decode` turns its owned `Send` result into the final `Value` on
-/// the VM thread when the scheduler polls the completed offload — mirrors
-/// `sqlite.rs`'s `checkout_offload`. Returns `Ok(nil)` after arming the
-/// yield signal; the scheduler delivers the real value on resume.
-fn checkout_offload<T: Send + 'static>(
+/// Offload one blocking serial operation on the port `handle` through the
+/// CHECKOUT pattern under the unified runtime (see `sqlite.rs`'s module doc
+/// comment for the canonical writeup this mirrors): acquire the handle's
+/// [`ResourceGate`] (creating it on first use), take the `Port` out of its slot,
+/// run `op` off the VM thread on the executor's blocking tier, then reinstall the
+/// `Port` and decode the result on the VM thread before releasing the gate. A
+/// second `serial/*` op on a busy handle parks FIFO on the gate; a mid-flight
+/// cancel tombstones the slot (best-effort — the blocking call keeps running
+/// unattended, so the port cannot be reclaimed) and closes the gate.
+///
+/// R14B: there is no portable way to interrupt a blocked serial read, so — unlike
+/// proc/pty (SIGKILL) or SQLite (interrupt handle) — cancellation runs no abort
+/// (`abort: None`). Instead, worker occupancy is bounded by the port's validated
+/// read timeout: [`validate_available_timeout`] confirms the port carries a
+/// `Some(_)`, non-zero, `<= SERIAL_MAX_OP_TIMEOUT` timeout before this op
+/// dispatches, so a cancelled op's blocked worker is guaranteed to free within
+/// that bound and an unbounded blocking read is unrepresentable.
+fn checkout_runtime<T: Send + 'static>(
     op_name: &'static str,
     handle: u64,
     op: impl FnOnce(&mut Port) -> Result<T, String> + Send + 'static,
-    decode: impl Fn(T) -> Value + 'static,
-) -> Result<Value, SemaError> {
-    use std::rc::Rc;
-    use tokio::sync::oneshot::error::TryRecvError;
-
-    // Vestigial under CALL_NATIVE (the scheduler delivers the resume value via
-    // `replace_stack_top`, not by re-invoking this native), but kept for
-    // symmetry with the shipped `async/await` yield pattern.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
-    }
-
-    let phase = Rc::new(RefCell::new(PortPhase::<T>::Acquire));
-    let phase_for_poll = phase.clone();
-    let mut op_holder = Some(op);
-
-    let poll = move || -> IoPoll {
-        loop {
-            let is_acquire = matches!(&*phase_for_poll.borrow(), PortPhase::Acquire);
-            if is_acquire {
-                // Owned Result so the PORTS borrow doesn't outlive the match
-                // — the `Running` transition below needs its own
-                // (non-overlapping) borrow of the same thread-local.
-                let mut taken: Option<Result<Port, String>> = None;
-                PORTS.with(|p| {
-                    let mut ports = p.borrow_mut();
-                    match ports.get_mut(&handle) {
-                        Some(slot @ PortSlot::Available(_)) => {
-                            let PortSlot::Available(port) =
-                                std::mem::replace(slot, PortSlot::CheckedOut)
-                            else {
-                                unreachable!("just matched Available")
-                            };
-                            taken = Some(Ok(port));
-                        }
-                        Some(PortSlot::CheckedOut) => {}
-                        Some(PortSlot::Tombstone(msg)) => {
-                            taken = Some(Err(tombstone_err(op_name, handle, msg).to_string()));
-                        }
-                        None => {
-                            taken = Some(Err(missing_err(op_name, handle).to_string()));
-                        }
-                    }
-                });
-                match taken {
-                    None => return IoPoll::Pending,
-                    Some(Err(msg)) => return IoPoll::Ready(Err(msg)),
-                    Some(Ok(port)) => {
-                        let op = op_holder
-                            .take()
-                            .expect("checkout_offload's op is consumed exactly once");
-                        *phase_for_poll.borrow_mut() = PortPhase::Running(spawn_port_op(port, op));
-                        // Fall through: poll the freshly spawned receiver
-                        // immediately instead of wasting a scheduler tick.
-                    }
-                }
-            } else {
-                let mut phase_ref = phase_for_poll.borrow_mut();
-                let PortPhase::Running(rx) = &mut *phase_ref else {
-                    unreachable!("Acquire handled above")
-                };
-                return match rx.try_recv() {
-                    Err(TryRecvError::Empty) => IoPoll::Pending,
-                    Ok(outcome) => {
-                        drop(phase_ref);
-                        PORTS.with(|p| {
-                            p.borrow_mut()
-                                .insert(handle, PortSlot::Available(outcome.port))
-                        });
-                        // MANDATORY lost-wakeup guard: a sibling queued on this
-                        // same handle (still in `Acquire`) may have polled
-                        // Pending earlier in this scheduler sweep — without
-                        // this it would park until an unrelated wakeup.
-                        sema_core::notify_io_complete();
-                        match outcome.result {
-                            Ok(t) => IoPoll::Ready(Ok(decode(t))),
-                            Err(msg) => IoPoll::Ready(Err(msg)),
-                        }
-                    }
-                    Err(TryRecvError::Closed) => {
-                        drop(phase_ref);
-                        PORTS.with(|p| {
-                            p.borrow_mut().insert(
-                                handle,
-                                PortSlot::Tombstone(
-                                    "the I/O worker terminated unexpectedly".to_string(),
-                                ),
-                            )
-                        });
-                        IoPoll::Ready(Err(format!("{op_name}: I/O worker dropped")))
-                    }
-                };
-            }
-        }
-    };
-
-    let phase_for_abort = phase.clone();
-    let io_handle = Rc::new(IoHandle::with_abort(poll, move || {
-        // Acquire-phase abort: no-op — nothing was ever checked out, the
-        // registry slot is exactly as another caller left it. Running-phase
-        // abort: best-effort — see `spawn_port_op`'s doc comment.
-        if matches!(*phase_for_abort.borrow(), PortPhase::Running(_)) {
-            PORTS.with(|p| {
-                p.borrow_mut().insert(
-                    handle,
-                    PortSlot::Tombstone(format!(
-                        "{op_name} was cancelled while in flight; the port cannot be \
-                         reclaimed — serial/close frees the handle"
-                    )),
-                );
+    decode: impl FnOnce(T) -> Value + 'static,
+) -> NativeResult {
+    // R14B dispatch bound: refuse to dispatch a blocking op against a port whose
+    // read timeout is missing/oversized, so worker occupancy stays bounded. A
+    // missing/tombstoned/busy handle short-circuits to `take`'s domain error.
+    validate_available_timeout(op_name, handle)?;
+    let kind = CompletionKind::try_from_raw(SERIAL_COMPLETION_KIND)
+        .expect("serial completion kind is nonzero");
+    let gate = SERIAL_GATES.with(|g| g.borrow().get(&handle).cloned());
+    checkout_external(CheckoutOp {
+        op_name,
+        kind,
+        gate,
+        store_gate: Box::new(move |gid| {
+            SERIAL_GATES.with(|g| {
+                g.borrow_mut().insert(handle, gid);
             });
-        }
-    }));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(io_handle));
-    Ok(Value::nil())
+        }),
+        remove_gate: Rc::new(move |gid| {
+            SERIAL_GATES.with(|g| {
+                let mut gates = g.borrow_mut();
+                if gates.get(&handle).map(ResourceGateHandle::id) == Some(gid) {
+                    gates.remove(&handle);
+                }
+            });
+        }),
+        take: Box::new(move || take_port(op_name, handle)),
+        op: Box::new(op),
+        reinstall: Box::new(move |port| {
+            PORTS.with(|p| {
+                p.borrow_mut().insert(handle, PortSlot::Available(port));
+            });
+        }),
+        decode: Box::new(move |t| Ok(decode(t))),
+        success_value: None,
+        tombstone: Rc::new(move |msg| {
+            PORTS.with(|p| {
+                p.borrow_mut().insert(handle, PortSlot::Tombstone(msg));
+            });
+        }),
+        abort: None,
+        reclaim: None,
+        terminal_on_success: false,
+    })
 }
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
@@ -325,70 +356,100 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     // (serial/open path baud) => handle (int)
     // (serial/open path baud timeout_ms) => handle (int)
-    crate::register_fn_gated(env, sandbox, Caps::SERIAL, "serial/open", |args| {
-        if args.len() < 2 || args.len() > 3 {
-            return Err(SemaError::arity("serial/open", "2-3", args.len()));
-        }
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
-        let baud = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?
-            as u32;
-        let timeout_ms = if args.len() == 3 {
-            args[2]
+    crate::register_runtime_fn_path_gated_ctx(
+        env,
+        sandbox,
+        Caps::SERIAL,
+        "serial/open",
+        &[],
+        |ctx, args| {
+            if args.len() < 2 || args.len() > 3 {
+                return Err(SemaError::arity("serial/open", "2-3", args.len()));
+            }
+            let path = args[0]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+                .to_string();
+            let baud = args[1]
                 .as_int()
-                .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?
-                as u64
-        } else {
-            2000
-        };
+                .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?
+                as u32;
+            let timeout_ms = if args.len() == 3 {
+                args[2]
+                    .as_int()
+                    .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?
+                    as u64
+            } else {
+                DEFAULT_SERIAL_TIMEOUT_MS
+            };
 
-        if in_async_context() {
-            let path_for_open = path.clone();
-            return crate::io::fs_offload(
-                move || {
-                    serialport::new(&path_for_open, baud)
-                        .timeout(Duration::from_millis(timeout_ms))
-                        .open()
-                        .map_err(|e| {
-                            SemaError::eval(format!("serial/open: {e}"))
-                                .with_hint(format!("path={path_for_open}, baud={baud}"))
-                                .to_string()
-                        })
-                },
-                move |port| {
-                    let handle = next_handle();
-                    let reader = BufReader::new(port);
-                    PORTS.with(|ports| {
-                        ports
-                            .borrow_mut()
-                            .insert(handle, PortSlot::Available(reader))
-                    });
-                    Value::int(handle as i64)
-                },
-            );
-        }
+            // R14B admission: validate the requested read timeout as a bounded op
+            // quantum BEFORE any (blocking) device open dispatches, on both the sync
+            // and runtime paths. Every port that lands in the registry therefore
+            // carries a `Some(_)`, non-zero, `<= SERIAL_MAX_OP_TIMEOUT` timeout, so
+            // every later checkout op's worker occupancy is bounded by construction.
+            let timeout =
+                validate_op_timeout("serial/open", Some(Duration::from_millis(timeout_ms)))?;
 
-        let port = serialport::new(&path, baud)
-            .timeout(Duration::from_millis(timeout_ms))
-            .open()
-            .map_err(|e| {
-                SemaError::eval(format!("serial/open: {e}"))
-                    .with_hint(format!("path={path}, baud={baud}"))
-            })?;
+            // Wire the interpreter-teardown hook (idempotent) before the (possibly
+            // offloaded) open dispatches: the async decoder that inserts the port has
+            // no `ctx`, so registration must happen here on the VM thread. A failed
+            // open leaves the hook cleaning an empty registry — harmless.
+            ensure_teardown_hook(ctx);
 
-        let handle = next_handle();
-        let reader = BufReader::new(port);
-        PORTS.with(|ports| {
-            ports
-                .borrow_mut()
-                .insert(handle, PortSlot::Available(reader))
-        });
-        Ok(Value::int(handle as i64))
-    });
+            // There is no existing port to contend over, so `serial/open` offloads
+            // the blocking device `open()` as a plain External wait (mirrors
+            // `db/open`'s shape): the decoder inserts the freshly-`BufReader`-wrapped
+            // port into the registry on completion.
+            if in_runtime_quantum() {
+                let kind = CompletionKind::try_from_raw(SERIAL_COMPLETION_KIND)
+                    .expect("serial completion kind is nonzero");
+                let path_for_open = path;
+                return crate::runtime_offload::external_io_interruptible_try(
+                    "serial/open",
+                    kind,
+                    "serial/open",
+                    move |port: Box<dyn serialport::SerialPort>| {
+                        let handle = next_handle();
+                        let reader = BufReader::new(port);
+                        PORTS.with(|ports| {
+                            ports
+                                .borrow_mut()
+                                .insert(handle, PortSlot::Available(reader))
+                        });
+                        Ok(Value::int(handle as i64))
+                    },
+                    move || async move {
+                        serialport::new(&path_for_open, baud)
+                            .timeout(timeout)
+                            .open()
+                            .map_err(|e| {
+                                SemaError::eval(format!("serial/open: {e}"))
+                                    .with_hint(format!("path={path_for_open}, baud={baud}"))
+                                    .to_string()
+                            })
+                    },
+                );
+            }
+
+            let port = serialport::new(&path, baud)
+                .timeout(timeout)
+                .open()
+                .map_err(|e| {
+                    SemaError::eval(format!("serial/open: {e}"))
+                        .with_hint(format!("path={path}, baud={baud}"))
+                })?;
+
+            let handle = next_handle();
+            let reader = BufReader::new(port);
+            PORTS.with(|ports| {
+                ports
+                    .borrow_mut()
+                    .insert(handle, PortSlot::Available(reader))
+            });
+            Ok(NativeOutcome::Return(Value::int(handle as i64)))
+        },
+    );
 
     // (serial/close handle) => nil
     //
@@ -397,107 +458,137 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // a tombstoned handle is a silent no-op removal — `serial/close` remains
     // the documented way to free either. A missing handle keeps the original
     // synchronous error text verbatim.
-    crate::register_fn_gated(env, sandbox, Caps::SERIAL, "serial/close", |args| {
+    crate::register_runtime_fn_gated(env, sandbox, Caps::SERIAL, "serial/close", |args| {
         check_arity!(args, "serial/close", 1);
         let handle = args[0]
             .as_int()
             .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
             as u64;
+        PORTS.with(|ports| match ports.borrow().get(&handle) {
+            Some(PortSlot::CheckedOut) => Err(busy_err("serial/close", handle)),
+            Some(_) => Ok(()),
+            None => Err(SemaError::eval(format!(
+                "serial/close: invalid handle {handle}"
+            ))),
+        })?;
+        let gate = SERIAL_GATES.with(|g| g.borrow().get(&handle).cloned());
+        prepare_terminal_gate(gate.as_ref(), "serial/close")?;
         PORTS.with(|ports| {
-            let mut ports = ports.borrow_mut();
-            match ports.get(&handle) {
-                Some(PortSlot::CheckedOut) => Err(busy_err("serial/close", handle)),
-                Some(_) => {
-                    ports.remove(&handle);
-                    Ok(Value::nil())
-                }
-                None => Err(SemaError::eval(format!(
-                    "serial/close: invalid handle {handle}"
-                ))),
-            }
-        })
+            ports.borrow_mut().remove(&handle);
+        });
+        // The handle's resource gate is dropped here too; a successful close
+        // implies the gate is idle (a busy gate means CheckedOut, which errors
+        // above), so no waiter is stranded.
+        finish_terminal_gate(
+            gate,
+            Rc::new(move |id| {
+                SERIAL_GATES.with(|g| {
+                    let mut gates = g.borrow_mut();
+                    if gates.get(&handle).map(ResourceGateHandle::id) == Some(id) {
+                        gates.remove(&handle);
+                    }
+                });
+            }),
+            Ok(Value::nil()),
+        )
     });
 
     // (serial/write handle string) => nil
-    crate::register_fn_gated(env, sandbox, Caps::SERIAL, "serial/write", |args| {
-        check_arity!(args, "serial/write", 2);
-        let handle = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
-            as u64;
-        let data = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-            .to_string();
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::SERIAL,
+        "serial/write",
+        &[],
+        |args| {
+            check_arity!(args, "serial/write", 2);
+            let handle = args[0]
+                .as_int()
+                .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
+                as u64;
+            let data = args[1]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
+                .to_string();
 
-        if in_async_context() {
-            return checkout_offload(
-                "serial/write",
-                handle,
-                move |reader| {
-                    let port = reader.get_mut();
-                    port.write_all(data.as_bytes())
-                        .map_err(|e| eval_msg("serial/write", e))?;
-                    port.flush()
-                        .map_err(|e| eval_msg("serial/write flush", e))?;
-                    Ok(())
-                },
-                |()| Value::nil(),
-            );
-        }
+            if in_runtime_quantum() {
+                return checkout_runtime(
+                    "serial/write",
+                    handle,
+                    move |reader| {
+                        let port = reader.get_mut();
+                        port.write_all(data.as_bytes())
+                            .map_err(|e| eval_msg("serial/write", e))?;
+                        port.flush()
+                            .map_err(|e| eval_msg("serial/write flush", e))?;
+                        Ok(())
+                    },
+                    |()| Value::nil(),
+                );
+            }
 
-        with_port("serial/write", handle, |reader| {
-            let port = reader.get_mut();
-            port.write_all(data.as_bytes())
-                .map_err(|e| SemaError::eval(format!("serial/write: {e}")))?;
-            port.flush()
-                .map_err(|e| SemaError::eval(format!("serial/write flush: {e}")))?;
-            Ok(Value::nil())
-        })
-    });
+            with_port("serial/write", handle, |reader| {
+                let port = reader.get_mut();
+                port.write_all(data.as_bytes())
+                    .map_err(|e| SemaError::eval(format!("serial/write: {e}")))?;
+                port.flush()
+                    .map_err(|e| SemaError::eval(format!("serial/write flush: {e}")))?;
+                Ok(Value::nil())
+            })
+            .map(NativeOutcome::Return)
+        },
+    );
 
     // (serial/read-line handle) => string (reads until \n)
-    crate::register_fn_gated(env, sandbox, Caps::SERIAL, "serial/read-line", |args| {
-        check_arity!(args, "serial/read-line", 1);
-        let handle = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
-            as u64;
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::SERIAL,
+        "serial/read-line",
+        &[],
+        |args| {
+            check_arity!(args, "serial/read-line", 1);
+            let handle = args[0]
+                .as_int()
+                .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
+                as u64;
 
-        if in_async_context() {
-            return checkout_offload(
-                "serial/read-line",
-                handle,
-                move |reader| {
-                    let mut line = String::new();
-                    reader
-                        .read_line(&mut line)
-                        .map_err(|e| eval_msg("serial/read-line", e))?;
-                    Ok(line)
-                },
-                |line: String| {
-                    // Trim trailing \r\n
-                    let trimmed = line.trim_end_matches(['\r', '\n']);
-                    Value::string(trimmed)
-                },
-            );
-        }
+            if in_runtime_quantum() {
+                return checkout_runtime(
+                    "serial/read-line",
+                    handle,
+                    move |reader| {
+                        let mut line = String::new();
+                        reader
+                            .read_line(&mut line)
+                            .map_err(|e| eval_msg("serial/read-line", e))?;
+                        Ok(line)
+                    },
+                    |line: String| {
+                        // Trim trailing \r\n
+                        let trimmed = line.trim_end_matches(['\r', '\n']);
+                        Value::string(trimmed)
+                    },
+                );
+            }
 
-        with_port("serial/read-line", handle, |reader| {
-            let mut line = String::new();
-            reader
-                .read_line(&mut line)
-                .map_err(|e| SemaError::eval(format!("serial/read-line: {e}")))?;
-            // Trim trailing \r\n
-            let trimmed = line.trim_end_matches(['\r', '\n']);
-            Ok(Value::string(trimmed))
-        })
-    });
+            with_port("serial/read-line", handle, |reader| {
+                let mut line = String::new();
+                reader
+                    .read_line(&mut line)
+                    .map_err(|e| SemaError::eval(format!("serial/read-line: {e}")))?;
+                // Trim trailing \r\n
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                Ok(Value::string(trimmed))
+            })
+            .map(NativeOutcome::Return)
+        },
+    );
 
     // (serial/send handle command) => parsed JSON response
     // Sends command + \n, reads one line back, parses as JSON.
     // Convenience for the sema-bridge protocol.
-    crate::register_fn_gated(env, sandbox, Caps::SERIAL, "serial/send", |args| {
+    crate::register_runtime_fn_path_gated(env, sandbox, Caps::SERIAL, "serial/send", &[], |args| {
         check_arity!(args, "serial/send", 2);
         let handle = args[0]
             .as_int()
@@ -508,8 +599,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
             .to_string();
 
-        if in_async_context() {
-            return checkout_offload(
+        if in_runtime_quantum() {
+            return checkout_runtime(
                 "serial/send",
                 handle,
                 move |reader| {
@@ -570,6 +661,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .map_err(|e| SemaError::eval(format!("serial/send parse: {e}: {trimmed}")))?;
             Ok(sema_core::json::json_to_value(&json_val))
         })
+        .map(NativeOutcome::Return)
     });
 }
 
@@ -594,63 +686,11 @@ mod tests {
         }
     }
 
-    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
-    /// (even on panic/early return) so a failure can't leak the flag into
-    /// whichever test the harness runs next on the same worker thread —
-    /// mirrors io.rs's `AsyncCtxGuard`.
-    struct AsyncCtxGuard;
-    impl Drop for AsyncCtxGuard {
-        fn drop(&mut self) {
-            sema_core::set_async_context(false);
-        }
-    }
-
-    /// Call a native fn with the async-context gate forced on, then drive the
-    /// `AwaitIo` handle it arms to completion by polling. Panics if the
-    /// native didn't yield at all (e.g. it silently took the sync fallback).
-    /// Returns the raw rejection string on failure — NOT re-wrapped through
-    /// `SemaError::eval` — because the string an `IoPoll::Ready(Err(_))`
-    /// carries is already pre-rendered (via `eval_msg`/`missing_err(...).
-    /// to_string()`) to be substring-identical to the sync path's
-    /// `SemaError::eval(...).to_string()`; wrapping it again would double
-    /// the "Eval error: " prefix.
-    fn drive_async(call: impl FnOnce() -> Result<Value, SemaError>) -> Result<Value, String> {
-        let _guard = AsyncCtxGuard;
-        sema_core::set_async_context(true);
-        let armed = call().map_err(|e| e.to_string())?;
-        assert_eq!(
-            armed,
-            Value::nil(),
-            "an offloading native returns nil immediately after arming its yield signal"
-        );
-        let reason = sema_core::take_yield_signal()
-            .expect("expected a yield signal to be armed — did the native take the sync path?");
-        let handle = match reason {
-            sema_core::YieldReason::AwaitIo(h) => h,
-            other => panic!("expected an AwaitIo yield, got {other:?}"),
-        };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            match handle.poll() {
-                IoPoll::Ready(Ok(v)) => return Ok(v),
-                IoPoll::Ready(Err(e)) => return Err(e),
-                IoPoll::Pending => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "offload never completed within 10s"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-            }
-        }
-    }
-
-    // No real serial hardware is available in this environment, so these
-    // tests exercise the parts of the scheduler-offload gate that don't
-    // require an actually-open port: the sync path stays byte-for-byte
-    // identical, and the async path's checkout correctly reports "missing
-    // handle" (the `Acquire` phase's `None` branch, exercised without ever
-    // spawning a blocking worker) instead of silently doing nothing.
+    // No real serial hardware is available in this environment, so these tests
+    // exercise the sync path: it stays byte-for-byte identical after the
+    // unified-runtime conversion. The async checkout path (missing-handle text +
+    // cancellation) is covered by `crates/sema/tests/serial_async_test.rs`,
+    // which drives the real cooperative runtime.
 
     #[test]
     fn read_line_sync_path_missing_handle_unchanged() {
@@ -660,13 +700,6 @@ mod tests {
             err.to_string(),
             "Eval error: serial/read-line: invalid handle 999"
         );
-    }
-
-    #[test]
-    fn read_line_async_path_missing_handle_matches_sync_text() {
-        let e = env();
-        let err = drive_async(|| native(&e, "serial/read-line")(&[Value::int(999)])).unwrap_err();
-        assert_eq!(err, "Eval error: serial/read-line: invalid handle 999");
     }
 
     #[test]
@@ -680,15 +713,6 @@ mod tests {
     }
 
     #[test]
-    fn write_async_path_missing_handle_matches_sync_text() {
-        let e = env();
-        let err =
-            drive_async(|| native(&e, "serial/write")(&[Value::int(999), Value::string("hi")]))
-                .unwrap_err();
-        assert_eq!(err, "Eval error: serial/write: invalid handle 999");
-    }
-
-    #[test]
     fn send_sync_path_missing_handle_unchanged() {
         let e = env();
         let err = native(&e, "serial/send")(&[Value::int(999), Value::string("ping")]).unwrap_err();
@@ -696,15 +720,6 @@ mod tests {
             err.to_string(),
             "Eval error: serial/send: invalid handle 999"
         );
-    }
-
-    #[test]
-    fn send_async_path_missing_handle_matches_sync_text() {
-        let e = env();
-        let err =
-            drive_async(|| native(&e, "serial/send")(&[Value::int(999), Value::string("ping")]))
-                .unwrap_err();
-        assert_eq!(err, "Eval error: serial/send: invalid handle 999");
     }
 
     #[test]
@@ -717,23 +732,114 @@ mod tests {
         );
     }
 
+    // ---- R14B: bounded-timeout guard (no serial hardware needed) --------------
+
+    /// The bound is finite and comfortably accommodates the historical default
+    /// and every shipped example (2000–5000 ms), so validating against it never
+    /// rejects real usage while still capping the worst case.
     #[test]
-    fn open_async_path_errors_cleanly_on_bad_device() {
-        // No real hardware available; opening a nonexistent device path must
-        // still round-trip cleanly through fs_offload and reject with the
-        // same message shape the sync path would raise.
+    fn serial_max_op_timeout_is_finite_and_covers_default() {
+        assert_eq!(SERIAL_MAX_OP_TIMEOUT, Duration::from_secs(60));
+        assert!(SERIAL_MAX_OP_TIMEOUT >= Duration::from_millis(DEFAULT_SERIAL_TIMEOUT_MS));
+        assert!(SERIAL_MAX_OP_TIMEOUT < Duration::MAX);
+    }
+
+    /// `validate_op_timeout` is the bound every serial checkout op is gated on.
+    /// Since R14B ships `abort: None` (no wake), this validated-bound arm is what
+    /// keeps worker occupancy finite: `None`/zero are rejected as "missing" and a
+    /// value past the ceiling as "oversized"; an in-range timeout passes through.
+    #[test]
+    fn validate_op_timeout_matrix() {
+        // Missing: no configured timeout at all.
+        let none = validate_op_timeout("serial/read-line", None).unwrap_err();
+        assert!(none.to_string().contains("serial/read-line"));
+        assert!(none.to_string().contains("timeout"));
+
+        // Missing: a zero timeout is no bounded operation timeout.
+        let zero = validate_op_timeout("serial/read-line", Some(Duration::ZERO)).unwrap_err();
+        assert!(zero.to_string().contains("timeout"));
+
+        // Oversized: past the ceiling.
+        let over = validate_op_timeout(
+            "serial/read-line",
+            Some(SERIAL_MAX_OP_TIMEOUT + Duration::from_millis(1)),
+        )
+        .unwrap_err();
+        assert!(over.to_string().contains("exceeds the maximum"));
+
+        // In range: accepted, returned verbatim.
+        let ok = validate_op_timeout(
+            "serial/read-line",
+            Some(Duration::from_millis(DEFAULT_SERIAL_TIMEOUT_MS)),
+        )
+        .expect("a default-range timeout must validate");
+        assert_eq!(ok, Duration::from_millis(DEFAULT_SERIAL_TIMEOUT_MS));
+
+        // The ceiling itself is inclusive.
+        assert!(validate_op_timeout("serial/read-line", Some(SERIAL_MAX_OP_TIMEOUT)).is_ok());
+    }
+
+    /// `serial/open` rejects a missing (zero) or oversized timeout up front —
+    /// before the blocking device open — so no port with an unbounded read
+    /// timeout ever reaches the registry. Exercised without hardware because the
+    /// admission short-circuits before the device is touched.
+    #[test]
+    fn open_rejects_zero_and_oversized_timeout_before_device_open() {
         let e = env();
-        let result = drive_async(|| {
-            native(&e, "serial/open")(&[
-                Value::string("/dev/sema-nonexistent-test-device"),
-                Value::int(9600),
-            ])
-        });
-        assert!(result.is_err(), "opening a nonexistent device should fail");
-        let msg = result.unwrap_err();
+        let zero = native(&e, "serial/open")(&[
+            Value::string("/dev/sema-nonexistent-test-device"),
+            Value::int(9600),
+            Value::int(0),
+        ])
+        .unwrap_err();
         assert!(
-            msg.contains("serial/open"),
-            "error should mention serial/open: {msg}"
+            zero.to_string().contains("serial/open") && zero.to_string().contains("timeout"),
+            "zero timeout must be rejected at open: {zero}"
+        );
+
+        let over = native(&e, "serial/open")(&[
+            Value::string("/dev/sema-nonexistent-test-device"),
+            Value::int(9600),
+            Value::int(999_999_999),
+        ])
+        .unwrap_err();
+        assert!(
+            over.to_string().contains("exceeds the maximum"),
+            "oversized timeout must be rejected at open: {over}"
+        );
+    }
+
+    /// C6 guard: `ensure_teardown_hook` wires exactly one hook (idempotent), and
+    /// firing it clears the serial registry and resets the flag. A `Tombstone`
+    /// slot stands in for an open port so the drain is asserted without serial
+    /// hardware.
+    #[test]
+    fn teardown_hook_registered_exactly_once_and_clears_registry() {
+        let ctx = sema_core::EvalContext::new();
+        PORTS.with(|p| p.borrow_mut().clear());
+        SERIAL_TEARDOWN_REGISTERED.with(|c| c.set(false));
+
+        PORTS.with(|p| {
+            p.borrow_mut()
+                .insert(7, PortSlot::Tombstone("guard".to_string()))
+        });
+
+        assert!(!SERIAL_TEARDOWN_REGISTERED.with(Cell::get));
+        ensure_teardown_hook(&ctx);
+        assert!(
+            SERIAL_TEARDOWN_REGISTERED.with(Cell::get),
+            "ensure_teardown_hook must register the interpreter hook"
+        );
+        ensure_teardown_hook(&ctx); // second call is a no-op
+
+        assert!(ctx.try_run_interpreter_teardown_hooks());
+        assert!(
+            PORTS.with(|p| p.borrow().is_empty()),
+            "teardown must clear the serial registry"
+        );
+        assert!(
+            !SERIAL_TEARDOWN_REGISTERED.with(Cell::get),
+            "teardown must reset the hook flag so a fresh interpreter re-registers"
         );
     }
 }

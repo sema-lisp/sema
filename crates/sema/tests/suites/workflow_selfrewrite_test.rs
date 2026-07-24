@@ -103,7 +103,10 @@ fn sema_form_step_check_and_run_form_succeed() {
            :ran (:status run-result)})
     "#;
 
-    let out = wc::run_once(src, fake, "wf_selfrewrite");
+    // Generated ids (not a pinned run id): the emitted sub-workflow auto-runs NESTED
+    // inside the outer run, and under A2 two fresh runs never share a dir — so both need
+    // their own generated id. Read back the OUTER run (workflow name "self-rewriter").
+    let out = wc::run_once_generated(src, fake, "self-rewriter");
 
     // The outer workflow must succeed.
     let run_ended = wc::events_of(&out.events, "run.ended");

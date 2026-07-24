@@ -27,8 +27,8 @@
     (/ (list/sum (get parsed :scores)) (length (get parsed :scores)))))
 
 ;; Roundtrip
-(define original  (map/new "x" 1 "y" (list 2 3) "z" (map/new "nested" #t)))
-(define rt        (json/decode (json/encode original)))
+(define original (map/new "x" 1 "y" (list 2 3) "z" (map/new "nested" #t)))
+(define rt (json/decode (json/encode original)))
 (println
   (format "\nRoundtrip match: ~a"
     (equal? (json/encode original) (json/encode rt))))
@@ -44,8 +44,8 @@
   (format "Tech total: $~a" (list/sum (map (fn (p) (get p :price)) tech))))
 
 ;; API response builder
-(define (api-ok data)         (map/new "status" 200 "ok" #t "data" data))
-(define (api-error code msg)  (map/new "status" code "ok" #f "error" msg))
+(define (api-ok data) (map/new "status" 200 "ok" #t "data" data))
+(define (api-error code msg) (map/new "status" code "ok" #f "error" msg))
 
 (println "\nAPI responses:")
 (println (json/encode-pretty (api-ok (map/new "user" "Alice" "role" "admin"))))

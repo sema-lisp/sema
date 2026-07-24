@@ -27,8 +27,8 @@
 ;;   (react "What's the weather in Oslo?" [get-weather] 4)
 ;; Returns the final answer text.
 (defmacro react (question tools max-rounds)
-  `(let ((rx-tools#  ,tools)
-        (rx-q#      ,question))
+  `(let ((rx-tools# ,tools)
+        (rx-q# ,question))
     (let loop ((round# 1) (scratch# ""))
       (let ((answer#
               (step
@@ -83,8 +83,8 @@
   (prompt
     n
     scorer)
-  `(let ((tot-score#   ,scorer)
-        (tot-prompt#  ,prompt))
+  `(let ((tot-score# ,scorer)
+        (tot-prompt# ,prompt))
     (let ((cands#
             (filter (fn (c#) (not (nil? c#)))
               (parallel

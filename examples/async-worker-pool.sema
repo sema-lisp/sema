@@ -7,11 +7,11 @@
 ;; the buffer is full) and `channel/recv` yields when empty. Everything runs in
 ;; one thread, interleaving at those yield points.
 
-(define n-jobs     12)
-(define n-workers  4)
+(define n-jobs 12)
+(define n-workers 4)
 
-(define jobs     (channel/new 4))       ; bounded work queue (backpressure at 4)
-(define results  (channel/new n-jobs))
+(define jobs (channel/new 4)) ; bounded work queue (backpressure at 4)
+(define results (channel/new n-jobs))
 
 ;; Producer: enqueue n-jobs, then close so workers know when to stop.
 (define producer

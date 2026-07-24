@@ -67,13 +67,18 @@ task install-pgo: [build-pgo]
 task uninstall:
     cargo uninstall sema-lang
 
+@group install
+@desc "Uninstall then reinstall sema to ~/.cargo/bin"
+task reinstall: [uninstall, install]
+
 # ── Test ─────────────────────────────────────────────────────────────
 
 @group test
 @desc "Run all tests (http/llm ignored)"
 task test:
+    @needs cargo-nextest
     @watch crates/**/*.rs Cargo.toml
-    cargo test
+    cargo nextest run
 
 # Test variants (workspace, lsp, http, llm, e2e, providers) live in
 # jake/test.jake, namespaced as `test.*` (jake test.http, jake test.lsp, …).

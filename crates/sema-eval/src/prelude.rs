@@ -129,7 +129,7 @@ pub const PRELUDE: &str = r#"
 
 ;; ws/listen: drive a receive loop on a websocket, dispatching each frame to the
 ;; matching handler. Spawns an async task and returns its promise — await it (or
-;; run the scheduler) to actually drive the loop. All handlers are optional:
+;; otherwise keep driving the runtime) to observe the loop. All handlers are optional:
 ;;   :on-open    (fn (conn) …)      — called once before the loop starts
 ;;   :on-message (fn (conn msg) …)  — msg is the text string or binary bytevector
 ;;   :on-close   (fn (conn info) …) — info is {:code … :reason …}
@@ -289,8 +289,8 @@ pub const PRELUDE: &str = r#"
 ;; The meta map's `:budget` submap caps spend: `:tokens` (deterministic) and/or `:usd`
 ;; (best-effort, pricing-table dependent). Exceeding a cap latches the run and refuses
 ;; to launch further `step` leaves; the run ends {:status :failed :reason "budget
-;; exceeded"}. Under a concurrent fan-out the cap still trips, but per-step token
-;; accounting is best-effort (the LAST_USAGE thread-local is not swapped per task).
+;; exceeded"}. Concurrent fan-out shares the aggregate budget while each task keeps
+;; its own last-usage snapshot and leaf accumulator.
 ;; The cap is PER-INVOCATION: a `--resume` run starts spend at 0 (memoized leaves
 ;; replay for free and don't recharge), so it does not carry the prior run's spend.
 ;; expands to a (workflow/run name doc meta thunk) call. `name` is a bare symbol that
@@ -387,9 +387,8 @@ pub const PRELUDE: &str = r#"
 ;; structurally) or a map with a `:type` field. A bare-keyword field map is
 ;; presence-only (re-ask can't tighten it), so that case surfaces the raw text instead
 ;; of wasting a call.
-;; Per-step budget for a multi-round tool loop is best-effort (the Budget event
-;; reflects the final round's usage; LAST_USAGE is a single slot — same caveat as
-;; fan-out accounting).
+;; Per-step budget accounting sums every model round in the leaf accumulator; the
+;; task-private last-usage snapshot still reports only the most recent completion.
 (defmacro step (prompt . rest)
   (let ((opts-form (if (null? rest) {} (car rest))))
     `(let ((st-opts0# ,opts-form)
@@ -497,10 +496,79 @@ pub const PRELUDE: &str = r#"
        (eval wrf-form#))))
 
 ;; llm/embed is a SINGLE first-class native function (crates/sema-llm/src/
-;; builtins.rs) that branches internally on `in_async_context()`: synchronous
-;; inline outside a scheduler task, offloaded+overlapping inside one. Keeping it a
+;; builtins.rs) that branches internally on the runtime context: synchronous
+;; inline at top level, offloaded+overlapping inside a spawned task. Keeping it a
 ;; native (not a router macro) is what makes `(procedure? llm/embed)` true and lets
 ;; it be used as a value — `(map llm/embed …)`, `(async/pool-map llm/embed …)`.
+
+;; ── Owned-concurrency engine (Task 04) ───────────────────────────────────────
+;; The OWNED combinators (`async/spawn-all`, `async/map`, `async/pool-map`,
+;; `async/race-owned`, `async/with-timeout`) OWN the tasks they create: on a
+;; fail-fast settlement (first failure / race winner / timeout) they CANCEL and
+;; reap every unfinished child before propagating. This is the opposite of the
+;; observational `async/all`/`async/race`/`async/timeout`, which never cancel the
+;; promises a caller supplied — the owned forms are built ON those observational
+;; combinators (which fail-fast on the FIRST child settlement) plus an explicit
+;; cancel sweep.
+;;
+;; A hard constraint drives the helper shape: `async/spawn`/`async/cancel` issue
+;; structural runtime requests at the enclosing task's bytecode boundary. A
+;; synchronous higher-order native (`map`) cannot propagate such a request from
+;; a directly invoked callback. Every spawn/cancel step therefore runs at
+;; bytecode level via explicit recursion, never `(map async/spawn …)`. Pure list
+;; operations (length, etc.) remain safe inside higher-order callbacks.
+
+;; __spawn-thunks: spawn each zero-arg thunk into its own task, returning the
+;; promises in INPUT order. Bytecode-level recursion preserves the runtime request.
+(define (__spawn-thunks thunks)
+  (if (null? thunks)
+      (list)
+      (let ((p (async/spawn (car thunks))))
+        (cons p (__spawn-thunks (cdr thunks))))))
+
+;; __spawn-apply: spawn one task per item that computes `(wf item)`, returning
+;; the promises in INPUT order. Bytecode-level recursion — the per-item worker
+;; closure `(fn () (wf item))` is built HERE (not inside a `map` lambda), since a
+;; closure created during a higher-order native's re-entrant nested call would
+;; index the wrong function table.
+(define (__spawn-apply wf items)
+  (if (null? items)
+      (list)
+      (let ((item (car items)))
+        (let ((p (async/spawn (fn () (wf item)))))
+          (cons p (__spawn-apply wf (cdr items)))))))
+
+;; __cancel-all: request cancellation of every promise in a list (best-effort
+;; reap of owned children on a fail-fast path). Bytecode-level dispatch preserves
+;; the runtime request; cancelling a synthetic or settled promise is a harmless no-op.
+(define (__cancel-all promises)
+  (if (null? promises)
+      nil
+      (begin (async/cancel (car promises))
+             (__cancel-all (cdr promises)))))
+
+;; __owned-all: await every already-spawned child, returning values in INPUT
+;; order. Fail-fast + OWNED: `async/all` raises on the FIRST child failure/
+;; cancellation (while later children may still be pending); we then CANCEL and
+;; reap every child before re-raising, so a still-running sibling is stopped
+;; before its side effects — the ownership property the observational `async/all`
+;; deliberately lacks. Empty input → empty list. The single engine behind
+;; spawn-all / map / pool-map (each differs only in how it produces the children).
+(define (__owned-all children)
+  (if (null? children)
+      (list)
+      (try (async/all children)
+           (catch e
+             (__cancel-all children)
+             (throw e)))))
+
+;; __prefill-sem: seed a semaphore channel with `k` availability tokens
+;; (bytecode-level channel/send — capacity is exactly k so none block).
+(define (__prefill-sem sem k)
+  (if (<= k 0)
+      nil
+      (begin (channel/send sem #t)
+             (__prefill-sem sem (- k 1)))))
 
 ;; async/pool-map: bounded-concurrency fan-out. Applies `f` to each item with at
 ;; most `n` tasks running concurrently, returning results in INPUT order.
@@ -512,31 +580,38 @@ pub const PRELUDE: &str = r#"
 ;; top-level defines. The args are spliced verbatim into a `let` (each is bound
 ;; once, so they evaluate exactly once and in argument order).
 ;;
+;; `n <= 0` is an argument error (a positive concurrency is required).
+;;
 ;; Concurrency is bounded by a semaphore built from a capacity-`n` channel
 ;; pre-filled with `n` tokens: each spawned task first `(channel/recv sem)`
-;; (acquire — yields/parks when the pool is full, which is what caps concurrency),
+;; (acquire — suspends when the pool is full, which is what caps concurrency),
 ;; runs `(pool-f item)`, then releases its token on BOTH the success and error
 ;; paths (via try/catch — a throwing `f` must still release, or the pool
-;; deadlocks). Errors are re-raised so a failing item surfaces. `async/all`
-;; preserves spawn (i.e. input) order, so results line up with `items`.
+;; deadlocks). Owned fan-out: `__owned-all` awaits the workers in INPUT order and,
+;; on the first failure, CANCELS and reaps every unfinished worker (parked on the
+;; semaphore or mid-`f`) before re-raising — unlike the observational `async/all`.
 (defmacro async/pool-map (f items n)
   `(let ((pool-f# ,f)
          (pool-items# ,items)
-         (pool-sem# (channel/new ,n)))
-     ;; Pre-fill the semaphore with n tokens (the available concurrency slots).
-     (for-range (i# 0 ,n) (channel/send pool-sem# #t))
-     (async/all
-       (map (fn (item#)
-              (async/spawn
-                (fn ()
-                  (channel/recv pool-sem#)            ; acquire a slot (parks if full)
-                  (let ((result# (try {:ok (pool-f# item#)}
-                                      (catch e# {:err e#}))))
-                    (channel/send pool-sem# #t)        ; release on BOTH paths
-                    (if (contains? result# :err)
-                      (throw (:err result#))           ; re-raise so failures surface
-                      (:ok result#))))))
-            pool-items#))))
+         (pool-n# ,n))
+     (if (<= pool-n# 0)
+         (error "async/pool-map: concurrency must be a positive integer")
+         (let ((pool-sem# (channel/new pool-n#)))
+           ;; Pre-fill the semaphore with n tokens (the available concurrency slots).
+           (__prefill-sem pool-sem# pool-n#)
+           ;; Per-item worker: acquire a slot (parks if the pool is full — this is
+           ;; what caps concurrency), run `f`, release on BOTH the success and error
+           ;; paths, and re-raise a failure so __owned-all's fail-fast cleanup fires.
+           (let ((pool-worker#
+                   (fn (item#)
+                     (channel/recv pool-sem#)             ; acquire a slot (parks if full)
+                     (let ((result# (try {:ok (pool-f# item#)}
+                                         (catch e# {:err e#}))))
+                       (channel/send pool-sem# #t)         ; release on BOTH paths
+                       (if (contains? result# :err)
+                         (throw (:err result#))            ; re-raise so failures surface
+                         (:ok result#))))))
+             (__owned-all (__spawn-apply pool-worker# pool-items#)))))))
 
 ;; __fanout-tagged: the single bounded-concurrency fan-out engine shared by `parallel`
 ;; and `pipeline`. Applies worker `wf` to each item with at most `n` tasks running at
@@ -545,21 +620,25 @@ pub const PRELUDE: &str = r#"
 ;; policy — a throwing worker never aborts the batch. Internal (the `#`-suffixed
 ;; bindings and the `__` name mark it as not-for-direct-use); `parallel`/`pipeline` are
 ;; the public surface.
+;; Children are spawned at bytecode level via `__spawn-apply` (NOT `(map
+;; async/spawn …)`): `async/spawn` issues a structural runtime request that a
+;; synchronous `map` callback cannot propagate. The per-item worker `fo-worker#`
+;; is built HERE at bytecode level (like `async/pool-map`'s `pool-worker#`) and
+;; handed to `__spawn-apply`, which wraps and spawns each `(fo-worker# item)`
+;; directly.
 (defmacro __fanout-tagged (wf items n)
   `(let ((fo-f# ,wf)
          (fo-items# ,items)
          (fo-sem# (channel/new ,n)))
      (for-range (i# 0 ,n) (channel/send fo-sem# #t))   ; n concurrency tokens
-     (async/all
-       (map (fn (item#)
-              (async/spawn
-                (fn ()
-                  (channel/recv fo-sem#)                 ; acquire (parks when full)
-                  (let ((r# (try {:ok (fo-f# item#)}
-                                 (catch e# {:err e#}))))
-                    (channel/send fo-sem# #t)            ; release on BOTH paths
-                    r#))))                                ; tagged; caller decides policy
-            fo-items#))))
+     (let ((fo-worker#
+             (fn (item#)
+               (channel/recv fo-sem#)                   ; acquire (parks when full)
+               (let ((r# (try {:ok (fo-f# item#)}
+                              (catch e# {:err e#}))))
+                 (channel/send fo-sem# #t)              ; release on BOTH paths
+                 r#))))                                  ; tagged; caller decides policy
+       (async/all (__spawn-apply fo-worker# fo-items#)))))
 
 ;; parallel: run a list of zero-arg thunks concurrently (bounded), awaiting them ALL
 ;; before returning — a BARRIER. Results come back in input order; a thunk that throws
@@ -656,17 +735,12 @@ pub const PRELUDE: &str = r#"
 ;; :base-delay-ms (default 100) * :backoff (default 2.0) ^ attempt between
 ;; failures, re-raising the last error once attempts are exhausted.
 ;;   (retry thunk) or (retry thunk {:max-attempts 3 :base-delay-ms 100 :backoff 2.0})
-;; A native cannot suspend and resume its own Rust loop state across a
-;; scheduler yield (the park delivers the resume value to the CALL SITE, not
-;; back into the middle of a Rust for-loop — see `sema_core::async_signal`),
-;; so in async context the loop lives here, backing off via `async/sleep`
-;; (cooperative: siblings run during the wait) instead of blocking the VM
-;; thread. `__retry-setup` shares its option-parsing/clamping with the
-;; blocking native so both paths default and coerce identically. At top level
-;; the byte-identical blocking native runs (real `thread::sleep`, no
-;; scheduler involved).
+;; A native cannot retain its Rust loop state across a structural suspension,
+;; so in async context the loop lives here and backs off via `async/sleep` while
+;; siblings run. `__retry-setup` shares its option parsing and clamping with the
+;; blocking native. At top level the blocking native uses real `thread::sleep`.
 (define (retry thunk . __retry-rest)
-  (if (__async-context?)
+  (if (or (__async-context?) (__runtime-quantum?))
       (let ((__retry-opts (apply __retry-setup thunk __retry-rest)))
         (letrec ((__retry-go (fn (__retry-n __retry-delay)
                     (try (thunk)
@@ -729,41 +803,85 @@ pub const PRELUDE: &str = r#"
      (fn () ,@body)))
 
 ;; async/spawn-all: spawn a list of zero-arg thunks as concurrent tasks and await
-;; them all, returning results in INPUT order. The ergonomic form of the very common
-;; `(async/all (map (fn (th) (async/spawn th)) thunks))`. Unbounded — every thunk gets
-;; its own task at once; use `async/pool-map` to cap how many run concurrently.
+;; them all, returning results in INPUT order. Unbounded — every thunk gets its own
+;; task at once; use `async/pool-map` to cap how many run concurrently. OWNED: the
+;; first child failure/cancellation CANCELS and reaps the still-running siblings
+;; before propagating (fail-fast), unlike the observational `async/all`. Empty
+;; input → empty list.
 ;;
 ;;   (async/spawn-all (list (fn () (http/get a)) (fn () (http/get b))))  ; both at once
 (defmacro async/spawn-all (thunks)
-  `(async/all (map (fn (thunk#) (async/spawn thunk#)) ,thunks)))
+  `(__owned-all (__spawn-thunks ,thunks)))
 
 ;; async/map: concurrent map — apply `f` to each item in its OWN task, results in
-;; INPUT order. The unbounded sibling of `async/pool-map` (no concurrency cap).
+;; INPUT order. The unbounded sibling of `async/pool-map` (no concurrency cap) and
+;; OWNED: same fail-fast cancel-and-reap of the outstanding children as spawn-all.
 ;;
 ;;   (async/map fetch urls)            ; fetch every url concurrently
 ;;   (async/map (fn (q) (llm/complete q)) prompts)
 (defmacro async/map (f items)
-  `(let ((amap-f# ,f))
-     (async/all
-       (map (fn (item#) (async/spawn (fn () (amap-f# item#)))) ,items))))
+  `(__owned-all (__spawn-apply ,f ,items)))
+
+;; async/race-owned: run a list of zero-arg thunks concurrently and settle on the
+;; FIRST to finish, returning its value (or re-raising its error). OWNED: every
+;; losing child is CANCELLED and reaped before returning — the fail-fast dual of
+;; the observational `async/race` (which leaves losers running). Requires ≥1 thunk.
+;;
+;;   (async/race-owned (list (fn () (http/get mirror-a)) (fn () (http/get mirror-b))))
+(define (async/race-owned thunks)
+  (if (null? thunks)
+      (error "async/race-owned: requires at least one thunk")
+      (let ((children (__spawn-thunks thunks)))
+        ;; `async/race` settles on the FIRST child (value or error); either way we
+        ;; then CANCEL and reap every child, so losers are stopped before their
+        ;; side effects (the winner cancel is a no-op — it already settled).
+        (try (let ((winner (async/race children)))
+               (__cancel-all children)
+               winner)
+             (catch e
+               (__cancel-all children)
+               (throw e))))))
+
+;; async/with-timeout: run one owned child (`thunk`) with a deadline of `ms`
+;; milliseconds. If the child settles first, its outcome is preserved (value
+;; returned, error re-raised). If the deadline wins, the child is CANCELLED and
+;; reaped, then a structured `{:type :timeout}` condition is raised.
+;;
+;;   (async/with-timeout 30000 (fn () (llm/complete prompt)))
+(define (async/with-timeout ms thunk)
+  (let ((child (async/spawn thunk))
+        ;; A deadline task resolving to a distinct sentinel; racing it against the
+        ;; child tells the two apart without relying on `async/timeout` (which
+        ;; can't distinguish a timeout from a child rejection from its catch).
+        (timer (async/spawn (fn () (async/sleep ms) :__with-timeout-elapsed))))
+    (let ((outcome (try {:v (async/race (list child timer))}
+                        (catch e {:e e}))))       ; child errored before the deadline
+      ;; Owned cleanup: cancel BOTH — the child on a timeout, the timer on settle.
+      (async/cancel child)
+      (async/cancel timer)
+      (cond
+        ((contains? outcome :e) (throw (:e outcome)))          ; preserve child error
+        ((eq? (:v outcome) :__with-timeout-elapsed)
+         (throw {:type :timeout :message (str "operation exceeded " ms " ms")}))
+        (else (:v outcome))))))                                 ; child value
 
 ;; ── Non-blocking multi-round agent loop (issue #61 §3a, ADR #68) ──────────────
-;; In an async scheduler task, drive the agent conversation from bytecode: each
-;; provider round is one native (`__agent-step`) that offloads + yields `AwaitIo`,
-;; so sibling tasks overlap during the conversation, and `async/timeout`/`async/cancel`
-;; can cut the loop at an inter-round park. A round that produced tool calls ALWAYS
+;; In a runtime task, drive the agent conversation from bytecode: each provider
+;; round is one native (`__agent-step`) that suspends on an external wait, so
+;; sibling tasks overlap and `async/timeout`/`async/cancel` can cut the loop at
+;; an inter-round park. A round that produced tool calls ALWAYS
 ;; executes them first (so the final round at the turn cap still runs its tools and
 ;; leaves a valid `assistant(tool_calls) → tool_result` history, matching the blocking
 ;; path — never a dangling tool-call turn), then finishes if `:done` or recurses. Loop
 ;; bounds (max-turns, consecutive-error abort) are enforced in the Rust handle. The
-;; synchronous / wasm path stays the byte-identical blocking native `__agent-run-blocking`.
+;; synchronous path uses `__agent-run-blocking`.
 (define (__agent-drive __h)
   (let ((__r0 (__agent-step __h)))
     ;; A streaming (:on-text) round hands back {:stream tok :on-text cb} instead
     ;; of running inline: drive the deltas in TASK context (the callback may
-    ;; itself yield; siblings interleave between delta batches), then apply the
+    ;; itself suspend; siblings interleave between delta batches), then apply the
     ;; assembled response to the loop state (usage was accounted by the stream
-    ;; poller) to get the ordinary {:done :has-tools} map.
+    ;; finalizer) to get the ordinary {:done :has-tools} map.
     (let ((__r (if (nil? (:stream __r0))
                    __r0
                    (begin (__stream-drive (:stream __r0) (:on-text __r0))
@@ -774,18 +892,18 @@ pub const PRELUDE: &str = r#"
           (__agent-finish __h)))))
 
 (define (agent/run __agent __input . __rest)
-  (if (__async-context?)
+  (if (or (__async-context?) (__runtime-quantum?))
       (let ((__h (apply __agent-begin __agent __input __rest)))
+        ;; Pass the unwinding error to finish so the agent span is closed carrying
+        ;; the failure status (notably a cancellation, whose bytecode now runs this
+        ;; catch), not ended "unset".
         (try (__agent-drive __h)
-             (catch __e (begin (__agent-finish __h) (throw __e)))))
+             (catch __e (begin (__agent-finish __h __e) (throw __e)))))
       (apply __agent-run-blocking __agent __input __rest)))
 
-;; llm/chat: a thin dispatcher, exactly like `agent/run` above (closes the drift
-;; documented in docs/plans/archive/2026-07-02-nonblocking-agent-run.md, whose plan
-;; said BOTH agent/run and llm/chat's tool loop would become dispatchers — only
-;; agent/run had shipped). `llm/chat`'s `:tools` loop is `run_tool_loop` under the
-;; hood too, and a native can't loop-yield across multiple provider rounds any more
-;; here than in the agent case, so in async context this reuses the SAME driver:
+;; llm/chat: a thin dispatcher like `agent/run` above. A native cannot retain its
+;; Rust loop across multiple provider-round suspensions, so runtime execution
+;; reuses the same bytecode driver:
 ;; `__chat-begin` builds an ordinary agent-loop handle straight from the raw
 ;; messages + opts (llm/chat has no defagent/:session/:memory to unpack) and
 ;; `__agent-drive` runs it — tool rounds interleave with sibling tasks exactly like
@@ -800,25 +918,23 @@ pub const PRELUDE: &str = r#"
 ;; `llm/chat` is unchanged either way.
 ;;
 ;; `__llm-chat-blocking` is dispatched through `__chat-call-blocking`, NOT `apply`:
-;; `apply` invokes its target via `call_function` (sema-stdlib/list.rs), which
-;; rejects a native that actually sets the yield signal when called that way
-;; (`check_hof_yield` — only a direct bytecode CALL propagates a yield cleanly),
-;; and `__llm-chat-blocking`'s no-`:tools` branch genuinely yields in async
-;; context (`do_complete_async_yield`, WP-LLM-SIMPLE). `__chat-begin` never
-;; yields, so `apply`ing it above is fine regardless of arg count.
+;; `apply` invokes a native through its synchronous value ABI, which cannot
+;; propagate the structural external wait used by the no-`:tools` branch in a
+;; runtime task. A direct bytecode call selects the runtime ABI. `__chat-begin`
+;; never suspends, so applying it above is safe regardless of argument count.
 (define (llm/chat . __chat-args)
-  (if (__async-context?)
+  (if (or (__async-context?) (__runtime-quantum?))
       (let ((__h (apply __chat-begin __chat-args)))
         (if (nil? __h)
             (__chat-call-blocking __chat-args)
             (try (__agent-drive __h)
-                 (catch __e (begin (__agent-finish __h) (throw __e))))))
+                 (catch __e (begin (__agent-finish __h __e) (throw __e))))))
       (__chat-call-blocking __chat-args)))
 
 ;; Direct-call dispatch for `__llm-chat-blocking`'s 1-or-2-arg contract (see the
 ;; `apply` note above). A malformed call (0 or 3+ args) falls through to `apply`
 ;; instead — safe there, since the native's own arity check rejects it before
-;; touching anything that could yield, so `apply`'s HOF-yield guard never fires.
+;; reaching an operation that could suspend.
 (define (__chat-call-blocking __args)
   (cond
     ((null? __args) (apply __llm-chat-blocking __args))
@@ -826,12 +942,45 @@ pub const PRELUDE: &str = r#"
     ((null? (cddr __args)) (__llm-chat-blocking (car __args) (cadr __args)))
     (else (apply __llm-chat-blocking __args))))
 
+;; llm/pmap: runtime tasks map the prompt builder sequentially, stringifying each
+;; returned value before the next mapper call, then submit the complete prompt list
+;; through llm/batch. Both calls use their structural runtime ABI, so a suspending
+;; mapper parks the active task and cancellation stops before batch dispatch. Host
+;; callback entry uses the guarded blocking compatibility native because it must
+;; pass the caller's explicit EvalContext through every mapper call.
+(define (__llm-pmap-map-prompts __mapper __items)
+  (map (fn (__item) (str (__mapper __item))) __items))
+
+(define (llm/pmap . __pmap-args)
+  (if (__runtime-quantum?)
+      (cond
+        ((= (length __pmap-args) 2)
+         (llm/batch
+           (__llm-pmap-map-prompts
+             (car __pmap-args)
+             (__llm-pmap-validate-items (cadr __pmap-args)))))
+        ((= (length __pmap-args) 3)
+         (llm/batch
+           (__llm-pmap-map-prompts
+             (car __pmap-args)
+             (__llm-pmap-validate-items (cadr __pmap-args)))
+           (caddr __pmap-args)))
+        (else (apply __llm-pmap-arity-error __pmap-args)))
+      (cond
+        ((= (length __pmap-args) 2)
+         (__llm-pmap-blocking (car __pmap-args) (cadr __pmap-args)))
+        ((= (length __pmap-args) 3)
+         (__llm-pmap-blocking
+           (car __pmap-args) (cadr __pmap-args) (caddr __pmap-args)))
+        (else (apply __llm-pmap-arity-error __pmap-args)))))
+
 ;; ── Non-blocking streaming (llm/stream + agent :on-text rounds, ADR #68) ──────
-;; Same pivotal constraint as the agent loop: a native cannot loop-yield, so the
-;; per-delta loop lives in bytecode. The wire side streams on the I/O pool into a
-;; channel; `__stream-next` parks on AwaitIo and resolves each batch of deltas as
+;; Same pivotal constraint as the agent loop: a native cannot retain a Rust loop
+;; across suspension, so the per-delta loop lives in bytecode. The wire side
+;; streams on the I/O pool into a channel; `__stream-next` suspends on an external
+;; wait and resolves each batch of deltas as
 ;; {:deltas [...] :done bool}; this driver calls the callback per delta IN TASK
-;; CONTEXT — a callback that itself yields (async/sleep, channel ops, await) is
+;; CONTEXT — a callback that itself suspends (async/sleep, channel ops, await) is
 ;; legal, and sibling tasks run between batches.
 (define (__stream-drive __tok __cb)
   (let ((__r (__stream-next __tok)))
@@ -839,18 +988,80 @@ pub const PRELUDE: &str = r#"
       (for-each __cb (:deltas __r))
       (if (:done __r) nil (__stream-drive __tok __cb)))))
 
-;; llm/stream: inside an async scheduler task, route through the non-blocking
-;; stream machinery (offloaded wire + per-batch parks) so siblings interleave
-;; between deltas; at top level / sync context the byte-identical blocking native
-;; runs. With no callback the deltas print to stdout, trailing newline included —
-;; matching the blocking native's default display.
+;; llm/stream: inside any runtime quantum (the root included), route through the
+;; non-blocking stream machinery so siblings interleave between deltas. Dispatch
+;; valid begin arities directly: generic apply uses the host callback compatibility
+;; context, outside the caller's task-local cassette/context/id scopes. With no
+;; callback the deltas print to stdout, trailing newline included — matching the
+;; blocking native's default display.
 (define (llm/stream . __args)
-  (if (and (__async-context?) (not (null? __args)))
+  (if (and (or (__async-context?) (__runtime-quantum?)) (not (null? __args)))
       (let ((__cbs (filter procedure? (cdr __args)))
-            (__tok (apply __stream-begin __args)))
+            (__tok (cond
+                     ((= (length __args) 1)
+                      (__stream-begin (car __args)))
+                     ((= (length __args) 2)
+                      (__stream-begin (car __args) (cadr __args)))
+                     ((= (length __args) 3)
+                      (__stream-begin (car __args) (cadr __args) (caddr __args)))
+                     (else (apply __stream-begin __args)))))
         (let ((__cb (if (null? __cbs) (fn (__c) (display __c)) (car __cbs))))
           (__stream-drive __tok __cb)
           (let ((__out (__stream-finish __tok)))
             (if (null? __cbs) (begin (newline) __out) __out))))
       (apply __llm-stream-blocking __args)))
+
+;; SRV-1: `http/serve`'s concurrent accept loop (`sema-stdlib/src/server.rs`,
+;; the native registered as `__http-serve-run` below) needs one task per
+;; connection, spawned via `async/spawn`'s runtime ABI, which requires a
+;; compiled VM closure — a hand-built native fn is rejected (see
+;; docs/deferred.md "SRV-1"). It also needs `async/spawn` itself called from
+;; ORDINARY compiled bytecode, not re-issued as a bare `RuntimeRequest::Spawn`
+;; from a Rust continuation: `spawn_via_registry`
+;; (`sema-vm/src/runtime/state.rs`) has a `ReturnOwner::VmResume` fast path
+;; that — correctly, for `async/spawn`'s own trivial default continuation —
+;; injects the settled promise straight onto the parked VM's stack, but that
+;; same fast path SILENTLY DISCARDS any other caller-supplied
+;; `NativeContinuation` without ever invoking it. Every native-outcome hop
+;; chained off a plain top-level call (Suspend/Call/Runtime resumed from a
+;; continuation, never handed back to real bytecode in between) keeps
+;; `owner == VmResume` the whole way, so a Rust continuation built to run
+;; AFTER a raw `RuntimeRequest::Spawn` — e.g. one that re-arms the next accept
+;; wait — is silently dropped, and the spawn's promise value pops out as if it
+;; had settled the ENTIRE top-level call.
+;;
+;; `http/serve` is therefore defined HERE, as a thin Sema wrapper around the
+;; native `__http-serve-run`, so the per-connection dispatch factory — the
+;; closure that does the mint-and-spawn — is built fresh on EVERY call and
+;; passed as a PLAIN ARGUMENT, exactly like `handler` itself. The first
+;; version of this tried to compile the factory once and cache it (an
+;; `EvalContext` seam, later a thread-local): both leak, because either store
+;; outlives the specific `Interpreter`/global-env that compiled it — a
+;; thread-local in particular is process-lifetime, so it pins that env's
+;; `Rc` forever. `gc_stress_test`'s `zero_upvalue_env_cycle_collected_via_env_
+;; candidate` and its cross-env sibling caught this the first time it was
+;; tried: after the offending `Interpreter` dropped, its global env's
+;; `bindings` `Rc` was still reachable through the stale cached closure.
+;; Building the factory fresh per call has no such lifetime mismatch — its
+;; only reference is the call's own argument, dropped normally with everything
+;; else once the connection's task settles.
+;; NOTE: calls `__http-serve-run` DIRECTLY (a fixed-arity call per branch),
+;; deliberately NOT via `apply`. `apply`'s cooperative routing (`list.rs`)
+;; only sends a callee through the `NativeOutcome::Call` path when it is
+;; closure or a known runtime-only native; every OTHER native — including a
+;; plain dual-ABI one like `__http-serve-run` — takes `apply`'s synchronous
+;; `call_function` fallback unconditionally, on the assumption that a
+;; dual-ABI native's plain value callback is a complete, equivalent implementation.
+;; That assumption does not hold here: `__http-serve-run`'s plain value callback
+;; is a serial `blocking_recv` loop for synchronous, non-quantum callers. Routing
+;; through `apply` would select that path instead of the concurrent accept loop,
+;; and any `async/spawn` inside a handler would fail with "requires runtime
+;; invocation". A direct call
+;; goes through the VM's normal native-dispatch (`dispatch_native`), which
+;; correctly honors the runtime ABI.
+(defn http/serve (handler . opts)
+  (let ((factory (fn (h req responder) (async/spawn (fn () (responder (h req)))))))
+    (if (null? opts)
+        (__http-serve-run handler factory)
+        (__http-serve-run handler factory (car opts)))))
 "#;

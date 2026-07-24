@@ -4,9 +4,9 @@
 ;; the picture. (Pairs with l-system.sema, which *generates* turtle commands but
 ;; never draws them.)
 
-(define W   64)   ; canvas width  (chars)
-(define H   30)   ; canvas height (chars)
-(define XS  2.0)  ; x scale — text cells are ~half as wide as tall, so stretch x
+(define W 64) ; canvas width  (chars)
+(define H 30) ; canvas height (chars)
+(define XS 2.0) ; x scale — text cells are ~half as wide as tall, so stretch x
 
 ;; --- canvas: a map of grid-index -> char ---
 (define (plot canvas x y ch)
@@ -17,9 +17,9 @@
 
 ;; sample points along the segment (x0,y0)->(x1,y1) so the line has no gaps
 (define (draw-line canvas x0 y0 x1 y1 ch)
-  (let* ((dx     (- x1 x0))
-         (dy     (- y1 y0))
-         (steps  (max 1 (int (round (* 2.0 (max (abs (* dx XS)) (abs dy))))))))
+  (let* ((dx (- x1 x0))
+         (dy (- y1 y0))
+         (steps (max 1 (int (round (* 2.0 (max (abs (* dx XS)) (abs dy))))))))
     (let loop ((i 0) (c canvas))
       (if (> i steps)
         c
@@ -27,13 +27,13 @@
           (loop (+ i 1) (plot c (+ x0 (* tt dx)) (+ y0 (* tt dy)) ch)))))))
 
 ;; --- the turtle: {:x :y :h :c}  (heading in degrees, 0 = east) ---
-(define PI              3.141592653589793)
-(define (turtle x y h)  {:x x :y y :h h :c {}})
+(define PI 3.141592653589793)
+(define (turtle x y h) {:x x :y y :h h :c {}})
 
 (define (fd t n)
-  (let* ((rad  (/ (* (get t :h) PI) 180.0))
-         (nx   (+ (get t :x) (* n (cos rad))))
-         (ny   (+ (get t :y) (* n (sin rad)))))
+  (let* ((rad (/ (* (get t :h) PI) 180.0))
+         (nx (+ (get t :x) (* n (cos rad))))
+         (ny (+ (get t :y) (* n (sin rad)))))
     (assoc (assoc (assoc t :x nx) :y ny)
       :c (draw-line (get t :c) (get t :x) (get t :y) nx ny "*"))))
 

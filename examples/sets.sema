@@ -188,8 +188,8 @@
 
 ;; Jaccard similarity
 (define (jaccard s1 s2)
-  (let ((inter  (set/size (set/intersection s1 s2)))
-        (uni    (set/size (set/union s1 s2))))
+  (let ((inter (set/size (set/intersection s1 s2)))
+        (uni (set/size (set/union s1 s2))))
     (if (= uni 0) 1.0 (/ (float inter) (float uni)))))
 
 (println "\n  Pairwise Jaccard similarity:")

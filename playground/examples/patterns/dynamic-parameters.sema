@@ -8,8 +8,8 @@
 ;; to thread through every call: here an indentation depth and a log level.
 
 ;; Ambient context — no need to pass these as arguments everywhere.
-(define indent     (make-parameter 0))
-(define log-level  (make-parameter 'info))
+(define indent (make-parameter 0))
+(define log-level (make-parameter 'info))
 
 (define (spaces n) (if (<= n 0) "" (string-append "  " (spaces (- n 1)))))
 

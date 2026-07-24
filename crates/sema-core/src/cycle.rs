@@ -25,8 +25,9 @@ use std::rc::{Rc, Weak};
 use hashbrown::{hash_map, HashMap, HashSet};
 use lasso::Spur;
 
-use crate::value::{AsyncPromise, Channel, MultiMethod, MutableArray, MutableCell, Thunk};
-use crate::value::{Env, NativeFn, PromiseState, Value, ValueViewRef};
+use crate::runtime::{ChannelId, PromiseId};
+use crate::value::{AsyncPromise, Channel, Env, NativeFn, Value, ValueViewRef};
+use crate::value::{MultiMethod, MutableArray, MutableCell, Thunk};
 
 /// The shared bindings allocation of an [`Env`] — the env's *node identity*
 /// for the collector. `Env` is clone-by-value and multiple `Env` handles (and
@@ -137,10 +138,18 @@ pub enum GcNode {
     EnvBindings(Weak<EnvBindings>),
     /// `delay` thunk (data-only cycles via `forced`).
     Thunk(Weak<Thunk>),
-    /// Async promise (data-only cycles via `Resolved`).
-    Promise(Weak<AsyncPromise>),
-    /// Channel (data-only cycles via the buffer).
-    Channel(Weak<Channel>),
+    /// Channel handle (data-only cycles via the runtime's channel BUFFER, which
+    /// lives in the `ChannelRegistry`, reached via the runtime interior hooks).
+    /// The `id` is retained so a prune of a dead handle can also evict the
+    /// registry record — the handle `Weak` alone cannot recover it once dead.
+    Channel { weak: Weak<Channel>, id: ChannelId },
+    /// Promise handle (data-only cycles via the runtime's SETTLED value, which
+    /// lives in the `PromiseRegistry`, reached via the runtime interior hooks).
+    /// The `id` is retained for the same dead-handle eviction reason.
+    Promise {
+        weak: Weak<AsyncPromise>,
+        id: PromiseId,
+    },
     /// Multimethod (data-only cycles via the method table).
     MultiMethod(Weak<MultiMethod>),
     /// Mutable array (data-only cycles via the element vector).
@@ -157,8 +166,8 @@ impl GcNode {
             GcNode::EnvWrapper(w) => w.strong_count(),
             GcNode::EnvBindings(w) => w.strong_count(),
             GcNode::Thunk(w) => w.strong_count(),
-            GcNode::Promise(w) => w.strong_count(),
-            GcNode::Channel(w) => w.strong_count(),
+            GcNode::Channel { weak, .. } => weak.strong_count(),
+            GcNode::Promise { weak, .. } => weak.strong_count(),
             GcNode::MultiMethod(w) => w.strong_count(),
             GcNode::MutableArray(w) => w.strong_count(),
             GcNode::MutableCell(w) => w.strong_count(),
@@ -184,13 +193,13 @@ impl GcNode {
                 let ptr = NodePtr::of_rc(&rc);
                 (ptr, NodeHandle::Value(Value::thunk_from_rc(rc)))
             }),
-            GcNode::Promise(w) => w.upgrade().map(|rc| {
-                let ptr = NodePtr::of_rc(&rc);
-                (ptr, NodeHandle::Value(Value::async_promise_from_rc(rc)))
-            }),
-            GcNode::Channel(w) => w.upgrade().map(|rc| {
+            GcNode::Channel { weak, .. } => weak.upgrade().map(|rc| {
                 let ptr = NodePtr::of_rc(&rc);
                 (ptr, NodeHandle::Value(Value::channel_from_rc(rc)))
+            }),
+            GcNode::Promise { weak, .. } => weak.upgrade().map(|rc| {
+                let ptr = NodePtr::of_rc(&rc);
+                (ptr, NodeHandle::Value(Value::async_promise_from_rc(rc)))
             }),
             GcNode::MultiMethod(w) => w.upgrade().map(|rc| {
                 let ptr = NodePtr::of_rc(&rc);
@@ -206,6 +215,70 @@ impl GcNode {
             }),
         }
     }
+
+    /// When a channel/promise candidate is pruned because its handle `Weak` went
+    /// dead, the runtime's registry still holds the (now unreachable) record —
+    /// evict it so the registry stays O(live handles), not O(total births). No
+    /// other node kind owns runtime-registry state, so this is a no-op for them.
+    fn evict_dead_registry_record(&self, hooks: &RuntimeInteriorHooks) {
+        match self {
+            GcNode::Channel { id, .. } => (hooks.evict_channel)(*id),
+            GcNode::Promise { id, .. } => (hooks.evict_promise)(*id),
+            _ => {}
+        }
+    }
+}
+
+// ── Runtime interior hooks ────────────────────────────────────────
+
+/// Hooks into the async runtime's registries, letting the collector see, sever,
+/// and evict the interior of channel and promise HANDLES. Unlike every other
+/// cycle-capable value, a channel/promise handle's mutable state (buffer /
+/// settled value) does not live inline in the handle `Rc` — it lives in the
+/// runtime's `ChannelRegistry` / `PromiseRegistry`, keyed by id. Without these
+/// hooks a cycle routed through a channel buffer (a closure captured into a
+/// channel that reaches the channel again) is held alive by the registry and is
+/// invisible to trial deletion — a leak.
+///
+/// Registered by sema-vm at runtime construction (same seam as the eval
+/// callbacks, keeping sema-core independent of sema-vm). Every field is a
+/// non-capturing `fn` that reaches the driving runtime through a sema-vm
+/// thread-local, so invariant I2 holds (no captured `Value`/`Env` state). When
+/// no runtime is driving (or none is registered) the trace hooks report no
+/// interior edge — the handle is treated as a leaf, which is always safe.
+/// Enumerate the interior (registry-held) edges of a channel/promise handle id.
+/// Returns `false` if the registry `RefCell` was unavailable (aborts the pass).
+pub type ChannelTraceFn = fn(ChannelId, &mut dyn FnMut(GcEdge)) -> bool;
+pub type PromiseTraceFn = fn(PromiseId, &mut dyn FnMut(GcEdge)) -> bool;
+
+#[derive(Clone, Copy)]
+pub struct RuntimeInteriorHooks {
+    /// Emit one `GcEdge::Value` per value the channel's buffer holds (with exact
+    /// multiplicity — each is one strong `Rc` the registry owns). `false` aborts
+    /// the pass (the registry `RefCell` was unavailable).
+    pub trace_channel: ChannelTraceFn,
+    /// Drain the channel's buffer, returning its contents for deferred drop.
+    pub sever_channel: fn(ChannelId) -> Vec<Value>,
+    /// Remove a channel record whose handle is gone (only if it has no parked
+    /// senders/receivers — a waiter keeps the record until the task is reaped).
+    pub evict_channel: fn(ChannelId),
+    /// Emit the promise's settled value, if any, as a `GcEdge::Value`.
+    pub trace_promise: PromiseTraceFn,
+    /// Clear the promise's settled value, returning it for deferred drop.
+    pub sever_promise: fn(PromiseId) -> Vec<Value>,
+    /// Remove a settled promise record whose handle is gone (only if it has no
+    /// waiters).
+    pub evict_promise: fn(PromiseId),
+}
+
+/// Register (or clear, with `None`) the runtime interior hooks. Idempotent;
+/// sema-vm installs the same hook table on every `Runtime::new`.
+pub fn set_runtime_interior_hooks(hooks: Option<RuntimeInteriorHooks>) {
+    GC.with(|gc| gc.interior.set(hooks));
+}
+
+fn runtime_interior_hooks() -> Option<RuntimeInteriorHooks> {
+    GC.with(|gc| gc.interior.get())
 }
 
 // ── Edges ─────────────────────────────────────────────────────────
@@ -245,7 +318,7 @@ pub enum GcEdge<'a> {
     },
 }
 
-/// Registered by sema-vm at startup (same pattern as `set_eval_callback`,
+/// Registered by sema-vm at startup (the standard function-pointer seam,
 /// keeping sema-core independent of sema-vm). Reports **all** heap edges
 /// owned by the whole `NativeFn` — its payload `Rc`s *including the payload
 /// allocation itself* (as an [`GcEdge::Opaque`], with the exact number of
@@ -399,6 +472,10 @@ struct GcState {
     last_stats: Cell<GcStats>,
     /// Pass observer ([`set_gc_observer`]); `None` = observation disabled.
     observer: Cell<Option<fn(&GcPassEvent)>>,
+    /// Runtime interior hooks ([`set_runtime_interior_hooks`]); `None` when no
+    /// async runtime is wired (e.g. bare sema-core tests) — channel/promise
+    /// handles then trace as leaves.
+    interior: Cell<Option<RuntimeInteriorHooks>>,
     /// Reusable pass buffers (owned by at most one pass at a time — the
     /// `collecting` guard excludes reentry before the scratch is taken).
     scratch: RefCell<Scratch>,
@@ -415,6 +492,7 @@ impl GcState {
             threshold: Cell::new(GC_FLOOR),
             last_stats: Cell::new(GcStats::new()),
             observer: Cell::new(None),
+            interior: Cell::new(None),
             scratch: RefCell::new(Scratch::default()),
         }
     }
@@ -602,23 +680,21 @@ pub fn trace_value(v: &Value, sink: &mut dyn FnMut(GcEdge)) -> bool {
                 Err(_) => false,
             }
         }
-        ValueViewRef::AsyncPromise(p) => match p.state.try_borrow() {
-            Ok(state) => {
-                if let PromiseState::Resolved(rv) = &*state {
-                    sink(GcEdge::Value(rv));
-                }
-                true
-            }
-            Err(_) => false,
+        // A promise handle carries only a runtime `PromiseId`; its settled value
+        // lives in the runtime's `PromiseRegistry`. Reach it through the runtime
+        // interior hook so a cycle through a settled promise is discovered. No
+        // hook (no driving runtime) ⇒ trace as a leaf.
+        ValueViewRef::AsyncPromise(p) => match runtime_interior_hooks() {
+            Some(hooks) => (hooks.trace_promise)(p.id, sink),
+            None => true,
         },
-        ValueViewRef::Channel(c) => match c.buffer.try_borrow() {
-            Ok(buffer) => {
-                for item in buffer.iter() {
-                    sink(GcEdge::Value(item));
-                }
-                true
-            }
-            Err(_) => false,
+        // A channel handle carries only a runtime `ChannelId`; its buffered
+        // values live in the runtime's `ChannelRegistry`. Reach them through the
+        // runtime interior hook so a cycle through the buffer is discovered. No
+        // hook (no driving runtime) ⇒ trace as a leaf.
+        ValueViewRef::Channel(c) => match runtime_interior_hooks() {
+            Some(hooks) => (hooks.trace_channel)(c.id, sink),
+            None => true,
         },
         ValueViewRef::MutableArray(a) => match a.items.try_borrow() {
             Ok(items) => {
@@ -782,6 +858,7 @@ fn run_pass(pins: &[NodePtr], threshold_pass: bool) -> GcStats {
     //    suffices to keep the object a candidate (so duplicates don't
     //    inflate the registry or the survivor-derived threshold).
     let mut pruned = 0usize;
+    let interior = runtime_interior_hooks();
     GC.with(|gc| {
         gc.registry
             .borrow_mut()
@@ -797,6 +874,11 @@ fn run_pass(pins: &[NodePtr], threshold_pass: bool) -> GcStats {
                     }
                 }
                 None => {
+                    // A dead channel/promise handle leaves its registry record
+                    // stranded; evict it so the runtime registry stays bounded.
+                    if let Some(hooks) = &interior {
+                        node.evict_dead_registry_record(hooks);
+                    }
                     pruned += 1;
                     false
                 }
@@ -1364,21 +1446,20 @@ fn sever_node(ptr: NodePtr, handle: &NodeHandle, severed: &mut Vec<Value>) {
                 Ok(mut forced) => severed.extend(forced.take()),
                 Err(_) => debug_assert!(false, "white thunk borrowed during severing"),
             },
-            ValueViewRef::AsyncPromise(p) => match p.state.try_borrow_mut() {
-                Ok(mut state) => {
-                    // An unreachable promise has no observers, so the state
-                    // change is unobservable.
-                    let old = std::mem::replace(&mut *state, PromiseState::Resolved(Value::NIL));
-                    if let PromiseState::Resolved(value) = old {
-                        severed.push(value);
-                    }
+            // Channel/promise interior lives in the runtime registry, not inline
+            // in the handle — sever it through the interior hook (drain the
+            // buffer / clear the settled value). No hook ⇒ nothing to sever
+            // (the handle was a leaf this pass).
+            ValueViewRef::Channel(c) => {
+                if let Some(hooks) = runtime_interior_hooks() {
+                    severed.extend((hooks.sever_channel)(c.id));
                 }
-                Err(_) => debug_assert!(false, "white promise borrowed during severing"),
-            },
-            ValueViewRef::Channel(c) => match c.buffer.try_borrow_mut() {
-                Ok(mut buffer) => severed.extend(buffer.drain(..)),
-                Err(_) => debug_assert!(false, "white channel borrowed during severing"),
-            },
+            }
+            ValueViewRef::AsyncPromise(p) => {
+                if let Some(hooks) = runtime_interior_hooks() {
+                    severed.extend((hooks.sever_promise)(p.id));
+                }
+            }
             ValueViewRef::MutableArray(a) => match a.items.try_borrow_mut() {
                 Ok(mut items) => severed.extend(items.drain(..)),
                 Err(_) => debug_assert!(false, "white mutable array borrowed during severing"),
@@ -1436,9 +1517,9 @@ fn value_node_ptr(v: &Value) -> Option<NodePtr> {
         | ValueViewRef::ToolDef(_)
         | ValueViewRef::Agent(_)
         | ValueViewRef::Thunk(_)
-        | ValueViewRef::MultiMethod(_)
         | ValueViewRef::Channel(_)
         | ValueViewRef::AsyncPromise(_)
+        | ValueViewRef::MultiMethod(_)
         | ValueViewRef::MutableArray(_)
         | ValueViewRef::MutableCell(_)
         | ValueViewRef::Macro(_)
@@ -1454,7 +1535,7 @@ fn value_node_ptr(v: &Value) -> Option<NodePtr> {
 mod tests {
     use super::*;
     use crate::value::intern;
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::BTreeMap;
 
     // -- Test payload types (stand-ins for sema-vm's VmClosurePayload /
     //    UpvalueCell, exercising the payload-tracer and Opaque paths without
@@ -1488,6 +1569,94 @@ mod tests {
 
     fn no_sever(_: NodePtr) -> Option<Value> {
         None
+    }
+
+    #[test]
+    fn registered_payload_emits_opaque_allocation_and_delegates_trace() {
+        struct RegisteredTracePayload {
+            env: Rc<Env>,
+        }
+
+        fn registered_trace_payload_trace(ptr: NodePtr, sink: &mut dyn FnMut(GcEdge)) -> bool {
+            // SAFETY: `ptr` identifies the live `RegisteredTracePayload`
+            // allocation retained by the NativeFn during tracing.
+            let payload = unsafe { &*(ptr.raw() as *const RegisteredTracePayload) };
+            sink(GcEdge::Env(&payload.env));
+            true
+        }
+
+        fn registered_trace_payload_tracer(
+            payload: &Rc<dyn Any>,
+            sink: &mut dyn FnMut(GcEdge),
+        ) -> bool {
+            sink(GcEdge::Opaque {
+                ptr: NodePtr::of_rc(payload),
+                strong_count: Rc::strong_count(payload),
+                trace: registered_trace_payload_trace,
+                sever: no_sever,
+            });
+            true
+        }
+
+        fn invoke_registered_payload(
+            _: &RegisteredTracePayload,
+            _: &mut crate::runtime::NativeCallContext<'_>,
+            _: &[Value],
+        ) -> crate::runtime::NativeResult {
+            Ok(crate::runtime::NativeOutcome::Return(Value::NIL))
+        }
+
+        register_payload_tracer(
+            TypeId::of::<RegisteredTracePayload>(),
+            registered_trace_payload_tracer,
+        );
+        let env = Env::new();
+        let native = Value::native_fn(NativeFn::with_payload_result(
+            "registered-trace",
+            Rc::new(RegisteredTracePayload { env: Rc::new(env) }),
+            invoke_registered_payload,
+        ));
+        let mut opaque_count = 0;
+        let mut opaque = None;
+        let mut payload_strong_count = None;
+        assert!(trace_value(&native, &mut |edge| {
+            opaque_count += 1;
+            if let GcEdge::Opaque {
+                ptr,
+                strong_count,
+                trace,
+                ..
+            } = edge
+            {
+                opaque = Some((ptr, trace));
+                payload_strong_count = Some(strong_count);
+            }
+        }));
+        assert_eq!(opaque_count, 1, "one registered payload allocation");
+        assert_eq!(payload_strong_count, Some(1), "payload field is sole owner");
+        let (ptr, trace) = opaque.expect("registered tracer emitted opaque edge");
+        let mut delegated_count = 0;
+        let mut delegated_env = false;
+        assert!(trace(ptr, &mut |edge| {
+            delegated_count += 1;
+            delegated_env = matches!(edge, GcEdge::Env(_));
+        }));
+        assert_eq!(delegated_count, 1, "one delegated environment edge");
+        assert!(delegated_env);
+    }
+
+    #[test]
+    fn unregistered_payload_is_conservatively_pinned() {
+        struct UnknownPayload;
+        let native = Value::native_fn(NativeFn::with_payload(
+            "unknown",
+            Rc::new(UnknownPayload),
+            |_, _| Ok(Value::NIL),
+        ));
+        let mut edges = 0;
+        assert!(trace_value(&native, &mut |_| edges += 1));
+        assert_eq!(edges, 0);
+        assert!(has_unknown_payload(&native));
     }
 
     /// A mutable cell node (UpvalueCell stand-in), participating via Opaque.
@@ -1726,27 +1895,10 @@ mod tests {
         assert_eq!(t.body, body, "body untouched");
     }
 
-    // 4. channel containing itself (via a Value wrapping it).
-    #[test]
-    fn channel_containing_itself_collected() {
-        let ch = Rc::new(Channel {
-            buffer: RefCell::new(VecDeque::new()),
-            capacity: 4,
-            closed: Cell::new(false),
-        });
-        ch.buffer
-            .borrow_mut()
-            .push_back(Value::channel_from_rc(ch.clone()));
-        let weak = Rc::downgrade(&ch);
-        register_candidate(GcNode::Channel(Rc::downgrade(&ch)));
-        drop(ch);
-
-        let stats = collect(&[], GcTrigger::Explicit);
-
-        assert!(!stats.aborted);
-        assert_eq!(stats.collected, 1);
-        assert_eq!(weak.strong_count(), 0, "channel reclaimed");
-    }
+    // (Retired) A channel containing itself is no longer representable: a
+    // `Channel` carries only a runtime `ChannelId`, never a `Value`, so it
+    // cannot close a data cycle and is not a GC candidate. Its buffered values
+    // live in the runtime's `ChannelRegistry`.
 
     // 5. multimethod whose method value reaches back to it.
     #[test]
@@ -1771,24 +1923,9 @@ mod tests {
         assert_eq!(weak.strong_count(), 0, "multimethod reclaimed");
     }
 
-    // 5b. promise resolved to itself (data-only cycle via Resolved).
-    #[test]
-    fn promise_resolved_to_itself_collected() {
-        let p = Rc::new(AsyncPromise {
-            state: RefCell::new(PromiseState::Pending),
-            task_id: Cell::new(0),
-        });
-        *p.state.borrow_mut() = PromiseState::Resolved(Value::async_promise_from_rc(p.clone()));
-        let weak = Rc::downgrade(&p);
-        register_candidate(GcNode::Promise(Rc::downgrade(&p)));
-        drop(p);
-
-        let stats = collect(&[], GcTrigger::Explicit);
-
-        assert!(!stats.aborted);
-        assert_eq!(stats.collected, 1);
-        assert_eq!(weak.strong_count(), 0, "promise reclaimed");
-    }
+    // (Retired) A promise resolving to itself is no longer representable: an
+    // `AsyncPromise` carries only a runtime `PromiseId`, never a `Value`, so it
+    // cannot close a data cycle and is not a GC candidate.
 
     // 6. shared subgraph reachable from TWO candidates: traced once, counts
     //    exact, collected exactly once.

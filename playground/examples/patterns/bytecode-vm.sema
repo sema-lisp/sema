@@ -9,8 +9,8 @@
 ;; Full walkthrough: https://sema-lang.com/docs/internals/build-a-bytecode-vm.html
 
 ;; --- tiny helpers ---
-(define (second xs)  (nth xs 1))
-(define (third xs)   (nth xs 2))
+(define (second xs) (nth xs 1))
+(define (third xs) (nth xs 2))
 
 ;; ============================================================
 ;; The compiler — one recursive walk, tree -> instructions
@@ -29,12 +29,12 @@
     (else
       (let ((op (first expr)) (args (rest expr)))
         (cond
-          ((= op '+)   (emit-binary :add args))
-          ((= op '-)   (emit-binary :sub args))
-          ((= op '*)   (emit-binary :mul args))
-          ((= op '<)   (emit-binary :lt args))
-          ((= op 'if)  (compile-if args))
-          (else        (error (str "unknown form: " op))))))))
+          ((= op '+) (emit-binary :add args))
+          ((= op '-) (emit-binary :sub args))
+          ((= op '*) (emit-binary :mul args))
+          ((= op '<) (emit-binary :lt args))
+          ((= op 'if) (compile-if args))
+          (else (error (str "unknown form: " op))))))))
 
 ;; if -> test, jump-if-false over THEN, THEN, jump over ELSE, ELSE.
 ;; The jump offsets are computed from the lengths of the branches we just
@@ -81,8 +81,8 @@
 ;; Run it — watch source become bytecode, then a result
 ;; ============================================================
 
-(define program  '(+ 1 (* 2 3)))
-(define bc       (compile-expr program))
+(define program '(+ 1 (* 2 3)))
+(define bc (compile-expr program))
 (println "source:   " program)
 (println "bytecode: " bc)
 (println "result:   " (run bc {}))

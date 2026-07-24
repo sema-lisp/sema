@@ -22,6 +22,12 @@ const FAIL_PAGE: &str =
 /// authorization `code`. The real implementation opens the browser + runs the
 /// loopback listener; tests substitute an opener that simulates the AS.
 pub trait RedirectDriver {
+    /// Reject a full interactive login before discovery or dynamic client
+    /// registration. Drivers that permit interactive consent use the default.
+    fn preflight(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// The redirect URI the authorization request must use.
     fn redirect_uri(&self) -> String;
     /// Send the user to `authorize_url`, capture the redirect, verify `state`,
@@ -73,17 +79,27 @@ impl LoopbackDriver {
         })
     }
 
-    fn wait_for_code(&self, expected_state: &str) -> Result<String, String> {
+    fn wait_for_code(
+        &self,
+        expected_state: &str,
+        opener_errors: &std::sync::mpsc::Receiver<String>,
+    ) -> Result<String, String> {
+        const OPENER_ERROR_POLL: Duration = Duration::from_millis(10);
         let deadline = std::time::Instant::now() + self.timeout;
         loop {
+            if let Ok(error) = opener_errors.try_recv() {
+                return Err(error);
+            }
             let remaining = deadline
                 .checked_duration_since(std::time::Instant::now())
                 .ok_or_else(|| "timed out waiting for the OAuth redirect".to_string())?;
             let request = self
                 .server
-                .recv_timeout(remaining)
-                .map_err(|e| format!("loopback listener error: {e}"))?
-                .ok_or_else(|| "timed out waiting for the OAuth redirect".to_string())?;
+                .recv_timeout(remaining.min(OPENER_ERROR_POLL))
+                .map_err(|e| format!("loopback listener error: {e}"))?;
+            let Some(request) = request else {
+                continue;
+            };
 
             // Browsers hit a loopback listener with stray requests (favicon,
             // preconnect, "/"). Answer those 404 and keep waiting — only the
@@ -115,10 +131,13 @@ impl RedirectDriver for LoopbackDriver {
         std::thread::scope(|scope| {
             let url = authorize_url.to_string();
             let opener = &self.opener;
+            let (send_error, receive_error) = std::sync::mpsc::sync_channel(1);
             scope.spawn(move || {
-                let _ = opener(&url);
+                if let Err(error) = opener(&url) {
+                    let _ = send_error.send(error);
+                }
             });
-            self.wait_for_code(expected_state)
+            self.wait_for_code(expected_state, &receive_error)
         })
     }
 }
@@ -162,6 +181,28 @@ fn parse_callback(request_url: &str, expected_state: &str) -> Result<String, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opener_failure_aborts_without_waiting_for_redirect_timeout() {
+        let timeout = Duration::from_millis(250);
+        let driver = LoopbackDriver::with_opener(
+            timeout,
+            Box::new(|_| Err("sandbox denied browser launch".to_string())),
+        )
+        .expect("bind loopback listener");
+
+        let started = std::time::Instant::now();
+        let error = driver
+            .drive("https://example.com/authorize", "state")
+            .expect_err("a failed opener must abort the redirect flow");
+
+        assert_eq!(error, "sandbox denied browser launch");
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "opener failure waited for the redirect timeout: {:?}",
+            started.elapsed()
+        );
+    }
 
     #[test]
     fn parses_code_when_state_matches() {

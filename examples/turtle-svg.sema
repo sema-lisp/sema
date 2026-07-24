@@ -42,12 +42,12 @@
       (assoc t :x nx :y ny :lines (cons line (get t :lines)))
       (assoc t :x nx :y ny))))
 
-(define (right t degrees)  (assoc t :angle (- (get t :angle) degrees)))
-(define (left t degrees)   (assoc t :angle (+ (get t :angle) degrees)))
-(define (pen-up t)         (assoc t :pen #f))
-(define (pen-down t)       (assoc t :pen #t))
-(define (set-color t c)    (assoc t :color c))
-(define (set-width t w)    (assoc t :width w))
+(define (right t degrees) (assoc t :angle (- (get t :angle) degrees)))
+(define (left t degrees) (assoc t :angle (+ (get t :angle) degrees)))
+(define (pen-up t) (assoc t :pen #f))
+(define (pen-down t) (assoc t :pen #t))
+(define (set-color t c) (assoc t :color c))
+(define (set-width t w) (assoc t :width w))
 
 ;; Execute a list of commands on a turtle
 (define (run-turtle commands)
@@ -212,8 +212,8 @@
 
 ;; Show ASCII preview of the square
 (println "\nASCII preview of square (approximate):")
-(let* ((lines  (reverse (get square-turtle :lines)))
-       (size   20))
+(let* ((lines (reverse (get square-turtle :lines)))
+       (size 20))
   (for-each
     (fn (row)
       (println

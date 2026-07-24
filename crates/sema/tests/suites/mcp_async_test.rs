@@ -14,8 +14,6 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sema::{Interpreter, Value};
-use sema_llm::builtins::{install_cassette, take_cassette};
-use sema_llm::cassette::{Cassette, CassetteMode};
 use sema_mcp::{connect_from_config, ConnectOpts};
 
 /// A unique path under the system temp dir for one test's scratch file(s).
@@ -357,7 +355,7 @@ fn queue_wakeup_five_queued_calls_all_complete() {
 // ── Scenario 5: cancellation tombstones the connection ──────────────────────
 //
 // The mock server sleeps a few real seconds before answering (long enough
-// that a short `async/timeout` always wins the race, short enough the
+// that explicit cancellation always stops the awaiting task first, short enough the
 // orphaned child process exits on its own soon after — no indefinite zombie).
 
 const SLEEPY_SERVER: &str = r#"
@@ -401,17 +399,17 @@ fn cancellation_tombstones_connection_and_interpreter_stays_healthy() {
         .expect("connect");
 
     let program = r#"
-        (try
-          (async/timeout 200 (async/spawn (fn () (mcp/call h "hang" {}))))
-          (catch e :caught))
+        (define p (async/spawn (fn () (mcp/call h "hang" {}))))
+        (async/spawn (fn () (async/sleep 200) (async/cancel p)))
+        (try (async/await p) (catch e :caught))
     "#;
     let result = interp
         .eval_str(program)
-        .expect("timeout-abandoned mcp/call evaluated");
+        .expect("explicitly cancelled mcp/call evaluated");
     assert_eq!(
         result,
         Value::keyword("caught"),
-        "async/timeout must win the race against the slow server"
+        "explicit cancellation must stop the slow call"
     );
 
     // A follow-up call on the now-tombstoned handle must fail fast with the
@@ -432,7 +430,7 @@ fn cancellation_tombstones_connection_and_interpreter_stays_healthy() {
         .expect("interpreter must remain usable after the cancellation");
     assert_eq!(healthy, Value::int(3));
     assert_eq!(
-        sema_vm::scheduler_task_count(),
+        interp.runtime_live_task_count(),
         0,
         "the cancelled task must be reaped, not left orphaned in the scheduler"
     );
@@ -511,32 +509,41 @@ fn cassette_replay_stays_synchronous_inside_async_task() {
         ))
         .expect("connect");
 
-    // --- Record (sync, top level): the real call runs and is taped. ---
-    install_cassette(Cassette::load(tape.clone(), CassetteMode::Record));
+    // --- Record from a task that outlives the `with-cassette` body. The
+    //     completion decoder must retain the dispatch-time recorder capability. ---
     let r1 = interp
-        .eval_str(r#"(mcp/call server "count" {})"#)
-        .expect("record call");
+        .eval_str(&format!(
+            r#"(define pending-record
+                 (llm/with-cassette "{}" {{:mode :record}}
+                   (fn ()
+                     (async/spawn (fn () (mcp/call server "count" {{}}))))))
+               (await pending-record)"#,
+            tape.display()
+        ))
+        .expect("deferred MCP record task should retain its cassette recorder");
     assert_eq!(r1.as_str(), Some("call-1"));
-    take_cassette()
-        .expect("cassette installed")
-        .save()
-        .expect("save tape");
 
-    // --- Replay INSIDE an async task: must resolve without ever offloading
-    //     (no live server touch — the counter must NOT advance). ---
-    install_cassette(Cassette::load(tape, CassetteMode::Replay));
+    // --- Replay from a task spawned inside `llm/with-cassette` but awaited only
+    //     after that dynamic extent has unwound. The MCP hook must resolve the
+    //     cassette selected by the task, never the ambient thread scope. ---
     let r2 = interp
-        .eval_str(r#"(await (async/spawn (fn () (mcp/call server "count" {}))))"#)
-        .expect("replay call inside async task");
+        .eval_str(&format!(
+            r#"(define pending
+                 (llm/with-cassette "{}" {{:mode :replay}}
+                   (fn ()
+                     (async/spawn (fn () (mcp/call server "count" {{}}))))))
+               (await pending)"#,
+            tape.display()
+        ))
+        .expect("deferred MCP replay task should retain its cassette scope");
     assert_eq!(
         r2.as_str(),
         Some("call-1"),
         "replay in async context must return the recorded value, not re-hit the server"
     );
 
-    // --- Proof: drop the cassette and call for real → the server advances to
-    //     call-2, confirming the async replay above did NOT touch it. ---
-    take_cassette();
+    // --- Proof: call for real after the dynamic scope unwound → the server
+    //     advances to call-2, confirming the replay above did NOT touch it. ---
     let r3 = interp
         .eval_str(r#"(mcp/call server "count" {})"#)
         .expect("live call");
@@ -733,8 +740,8 @@ fn async_context_mid_call_401_noninteractive_reauth_fails_cleanly() {
     // `scheduler.rs` — it never resumes the task's own Sema code with a
     // catchable in-task exception). So `try`/`catch` must wrap the COMBINATOR
     // awaiting that task's promise (`async/all`, same idiom as the existing
-    // `cancellation_tombstones_connection...` scenario's `(try (async/timeout
-    // ...) (catch e ...))`), not the `mcp/call` expression itself — a `try`
+    // `cancellation_tombstones_connection...` scenario's `(try (async/await p)
+    // (catch e ...))`), not the `mcp/call` expression itself — a `try`
     // placed directly around `mcp/call` inside the failing task would never
     // run its `catch` arm.
     let interp = Interpreter::new();
@@ -774,17 +781,21 @@ fn async_context_mid_call_401_noninteractive_reauth_fails_cleanly() {
          message; got: {outcome}"
     );
 
-    // Reauth was actually ATTEMPTED (not skipped): discovery and DCR both ran
-    // before `NoInteractiveDriver::drive()` cleanly refused the browser leg.
+    // Reauth is attempted (`call_tool_async` re-enters `login()`), but a
+    // non-interactive driver refuses in `preflight()` BEFORE OAuth discovery or
+    // dynamic client registration: registering a throwaway client on the auth
+    // server (and, for a sandbox-denied browser leg, touching the network) is
+    // wasted work when interactive consent cannot succeed. So the reauth
+    // fast-fails without running discovery/DCR — only the original 401 surfaces.
     assert!(
-        marker_dir.join("discovery-hit").exists(),
-        "the 401 branch must have driven OAuth discovery, proving the \
-         reauth-then-retry path actually ran"
+        !marker_dir.join("discovery-hit").exists(),
+        "a non-interactive reauth must fast-fail in preflight() without driving \
+         OAuth discovery"
     );
     assert!(
-        marker_dir.join("register-hit").exists(),
-        "the 401 branch must have reached dynamic client registration before \
-         the non-interactive driver refuses the browser leg"
+        !marker_dir.join("register-hit").exists(),
+        "a non-interactive reauth must refuse before dynamic client registration \
+         — no throwaway client left on the auth server"
     );
 
     // The interpreter/scheduler remains healthy: no orphaned task, ordinary
@@ -794,7 +805,7 @@ fn async_context_mid_call_401_noninteractive_reauth_fails_cleanly() {
         .expect("interpreter must remain usable after the failed reauth attempt");
     assert_eq!(healthy, Value::int(3));
     assert_eq!(
-        sema_vm::scheduler_task_count(),
+        interp.runtime_live_task_count(),
         0,
         "no task should be left orphaned in the scheduler after the offloaded \
          401-reauth-refuse-retry sequence completes"

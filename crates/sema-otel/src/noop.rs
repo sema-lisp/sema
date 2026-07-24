@@ -90,7 +90,7 @@ pub fn new_conversation_id() -> String {
 }
 
 /// wasm no-op: there is no real otel context to swap, so this is an empty marker.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct OtelTaskCtx;
 
 pub fn take_task_otel() -> OtelTaskCtx {
@@ -147,6 +147,10 @@ impl LlmSpan {
 pub struct ToolSpan;
 
 pub fn tool_span(_name: &str, _call_id: &str, _description: Option<&str>) -> ToolSpan {
+    ToolSpan
+}
+
+pub fn tool_span_detached(_name: &str, _call_id: &str, _description: Option<&str>) -> ToolSpan {
     ToolSpan
 }
 

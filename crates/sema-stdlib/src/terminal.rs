@@ -1,11 +1,20 @@
-use std::cell::Cell;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
-use sema_core::{check_arity, in_async_context, SemaError, Value, ValueView};
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{
+    CancelDisposition, CancelHook, CancelHookError, CompletionDecoder, CompletionKind,
+    DecodedCompletion, ExternalFailure, InterruptibleResource, NativeCallContext,
+    NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation,
+    ResumeInput, SendPayload, Trace, WaitKind,
+};
+use sema_core::{check_arity, NativeFn, SemaError, Value, ValueView};
 
 use crate::register_fn;
 
@@ -27,23 +36,179 @@ fn make_style_fn(env: &sema_core::Env, name: &str, code: &str) {
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS: u64 = 80;
+/// One spinner frame interval. The render thread parks on its condvar for at
+/// most this long between frames, so a `stop` that fires mid-park wakes it now
+/// and a `join` after `stop` is bounded by (at most) one interval.
+const SPINNER_INTERVAL: Duration = Duration::from_millis(SPINNER_INTERVAL_MS);
 
-struct SpinnerHandle {
-    stop_flag: Arc<AtomicBool>,
-    message: Arc<Mutex<String>>,
-    thread: Option<std::thread::JoinHandle<()>>,
+/// Live count of spinner render threads (test observation hook). A thread bumps
+/// this when it starts and drops it just before it exits, letting a test assert
+/// interpreter teardown leaves no live spinner thread. Process-global; nextest's
+/// process-per-test isolation keeps the count local to one test.
+static SPINNER_LIVE_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// Spinner render threads currently alive.
+pub fn spinner_live_thread_count() -> usize {
+    SPINNER_LIVE_THREADS.load(Ordering::SeqCst)
 }
 
-thread_local! {
-    static SPINNERS: RefCell<HashMap<i64, SpinnerHandle>> = RefCell::new(HashMap::new());
-    static SPINNER_COUNTER: Cell<i64> = const { Cell::new(0) };
+/// Cross-thread stop signal for one spinner render thread: a flag plus a condvar
+/// so `stop` wakes a parked thread immediately instead of waiting out its frame
+/// interval. Holds only POD state (no `Value`/`Env`), preserving CORE-2 I2.
+struct SpinnerStop {
+    stopped: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl SpinnerStop {
+    fn new() -> Self {
+        Self {
+            stopped: Mutex::new(false),
+            wake: Condvar::new(),
+        }
+    }
+
+    /// Signal the render thread to stop and wake it out of its frame park now.
+    fn stop(&self) {
+        let mut stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
+        *stopped = true;
+        self.wake.notify_all();
+    }
+
+    fn is_stopped(&self) -> bool {
+        *self.stopped.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Park up to one frame interval, returning the moment `stop` fires. Returns
+    /// `true` once stopped so the render loop exits promptly. This replaces the
+    /// bare `thread::sleep` frame loop, whose sleeping thread could only be
+    /// stopped after its full interval elapsed (and never on teardown).
+    fn park_frame(&self) -> bool {
+        let stopped = self.stopped.lock().unwrap_or_else(|e| e.into_inner());
+        let (stopped, _timed_out) = self
+            .wake
+            .wait_timeout_while(stopped, SPINNER_INTERVAL, |stopped| !*stopped)
+            .unwrap_or_else(|e| e.into_inner());
+        *stopped
+    }
+}
+
+/// A RESOURCE-OWNED spinner: its stop signal, live message cell, and render
+/// thread. Held POD-only (no `Value`/`Env`), so the owning registry stays
+/// `Value`-free (CORE-2 I2).
+struct SpinnerHandle {
+    stop: Arc<SpinnerStop>,
+    message: Arc<Mutex<String>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl SpinnerHandle {
+    /// Signal stop, then join the render thread. The condvar wake makes the
+    /// thread exit within one frame interval, so this join is bounded.
+    fn stop_and_join(mut self) {
+        self.stop.stop();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// INTERPRETER-SHARED registry of live spinners, owned via an `Rc` held by the
+/// `term/spinner-*` natives (the `fs_watch` / B5 `TtyRegistry` model). A weak
+/// interpreter-teardown hook stops and joins every spinner still parked here, so
+/// teardown leaves no live render thread.
+struct SpinnerRegistry {
+    spinners: RefCell<HashMap<i64, SpinnerHandle>>,
+    next_id: Cell<i64>,
+    teardown_hook_registered: Cell<bool>,
+}
+
+impl SpinnerRegistry {
+    fn new() -> Self {
+        Self {
+            spinners: RefCell::new(HashMap::new()),
+            next_id: Cell::new(0),
+            teardown_hook_registered: Cell::new(false),
+        }
+    }
+
+    fn insert(&self, handle: SpinnerHandle) -> i64 {
+        let id = self.next_id.get();
+        self.next_id.set(id.wrapping_add(1));
+        self.spinners.borrow_mut().insert(id, handle);
+        id
+    }
+
+    fn take(&self, id: i64) -> Option<SpinnerHandle> {
+        self.spinners.borrow_mut().remove(&id)
+    }
+
+    fn update(&self, id: i64, msg: String) {
+        if let Some(handle) = self.spinners.borrow().get(&id) {
+            *handle.message.lock().unwrap_or_else(|e| e.into_inner()) = msg;
+        }
+    }
+
+    fn ensure_teardown_hook(self: &Rc<Self>, ctx: &sema_core::EvalContext) {
+        if !self.teardown_hook_registered.replace(true) {
+            let registry = Rc::downgrade(self);
+            ctx.register_interpreter_teardown_hook(move || {
+                if let Some(registry) = registry.upgrade() {
+                    registry.stop_all();
+                }
+            });
+        }
+    }
+
+    fn stop_all(&self) {
+        for (_, handle) in std::mem::take(&mut *self.spinners.borrow_mut()) {
+            handle.stop_and_join();
+        }
+        self.teardown_hook_registered.set(false);
+    }
+}
+
+/// Spawn the render thread: park on the condvar between frames so `stop` wakes it
+/// immediately. Bumps the live-thread gauge for its lifetime.
+fn spawn_spinner(
+    stop: Arc<SpinnerStop>,
+    message: Arc<Mutex<String>>,
+) -> Result<JoinHandle<()>, SemaError> {
+    std::thread::Builder::new()
+        .name("sema-spinner".to_string())
+        .spawn(move || {
+            SPINNER_LIVE_THREADS.fetch_add(1, Ordering::SeqCst);
+            let mut frame_idx = 0usize;
+            loop {
+                if stop.is_stopped() {
+                    break;
+                }
+                let msg = message.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let frame = SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()];
+                {
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = write!(stderr, "\r\x1b[K{frame} {msg}");
+                    let _ = stderr.flush();
+                }
+                frame_idx += 1;
+                if stop.park_frame() {
+                    break;
+                }
+            }
+            SPINNER_LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
+        })
+        .map_err(|e| {
+            SemaError::eval(format!(
+                "term/spinner-start: failed to spawn render thread: {e}"
+            ))
+        })
 }
 
 /// Clear the spinner's line and, if a non-empty symbol/text was given, print
-/// the final status. Shared by `term/spinner-stop`'s sync path and its async
+/// the final status. Shared by `term/spinner-stop`'s sync path and its runtime
 /// offload's `decode` step (both run this on the VM thread — it's the same
-/// stderr write either way, just reached after a blocking join that may have
-/// been offloaded).
+/// stderr write either way, just reached after a join that may have been
+/// offloaded to a blocking-tier worker).
 fn spinner_finish(symbol: &str, text: &str) {
     let mut stderr = std::io::stderr().lock();
     let _ = write!(stderr, "\r\x1b[K");
@@ -51,6 +216,176 @@ fn spinner_finish(symbol: &str, text: &str) {
         let _ = writeln!(stderr, "{symbol} {text}");
     }
     let _ = stderr.flush();
+}
+
+/// Parse `term/spinner-stop`'s id plus the optional `{:symbol … :text …}` final
+/// status. The options map is decoded to plain `String`s here, on the VM thread,
+/// so nothing Sema-valued crosses into an offloaded worker.
+fn parse_spinner_stop_args(args: &[Value]) -> Result<(i64, String, String), SemaError> {
+    check_arity!(args, "term/spinner-stop", 1..=2);
+    let id = args[0]
+        .as_int()
+        .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?;
+    let (symbol, text) = if args.len() == 2 {
+        if let ValueView::Map(opts) = args[1].view() {
+            let symbol = opts
+                .get(&Value::keyword("symbol"))
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_default();
+            let text = opts
+                .get(&Value::keyword("text"))
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or_default();
+            (symbol, text)
+        } else {
+            (String::new(), String::new())
+        }
+    } else {
+        (String::new(), String::new())
+    };
+    Ok((id, symbol, text))
+}
+
+/// Host / non-quantum `term/spinner-stop`: remove the spinner, signal stop, and
+/// join the render thread on the calling thread. The condvar wake bounds this
+/// join by one frame interval. An unknown id is a nil no-op (never a stray line
+/// clear), matching the legacy behavior.
+fn spinner_stop_sync(registry: &SpinnerRegistry, args: &[Value]) -> Result<Value, SemaError> {
+    let (id, symbol, text) = parse_spinner_stop_args(args)?;
+    let Some(handle) = registry.take(id) else {
+        return Ok(Value::nil());
+    };
+    handle.stop_and_join();
+    spinner_finish(&symbol, &text);
+    Ok(Value::nil())
+}
+
+/// Runtime (quantum) `term/spinner-stop`: signal stop + wake on the VM thread
+/// (fast, non-blocking), then offload only the bounded `join` via an External
+/// wait so a sibling task runs while the render thread winds down. The final
+/// status renders on the VM thread in the decoder.
+fn spinner_stop_offload(registry: &SpinnerRegistry, args: &[Value]) -> NativeResult {
+    let (id, symbol, text) = parse_spinner_stop_args(args)?;
+    let Some(mut handle) = registry.take(id) else {
+        return Ok(NativeOutcome::Return(Value::nil()));
+    };
+    handle.stop.stop();
+    let thread = handle.thread.take();
+    Ok(NativeOutcome::Suspend(build_spinner_join_suspend(
+        thread, symbol, text,
+    )))
+}
+
+/// Completion tag for the offloaded spinner join (`"spnj"`).
+const SPINNER_JOIN_COMPLETION_KIND: u64 = 0x7370_6e6a;
+
+/// Build the External spinner-join suspension: a blocking-tier job joins the
+/// (already-stopped) render thread; the decoder then renders the final status on
+/// the VM thread and returns nil. Modeled on `workflow/run`'s flush-ack barrier.
+fn build_spinner_join_suspend(
+    thread: Option<JoinHandle<()>>,
+    symbol: String,
+    text: String,
+) -> NativeSuspend {
+    let kind = CompletionKind::try_from_raw(SPINNER_JOIN_COMPLETION_KIND)
+        .expect("spinner join completion kind is nonzero");
+    let resource = InterruptibleResource::new("term/spinner-join", Box::new(SpinnerJoinCancelHook));
+    let prepared = PreparedExternalOperation::interruptible_blocking(
+        kind,
+        Box::new(SpinnerJoinDecoder { symbol, text }),
+        resource,
+        move || {
+            // Join on a blocking-tier worker (NOT the VM thread). The stop flag +
+            // condvar wake fired before dispatch, so the render thread exits
+            // within one frame interval and this join is bounded.
+            if let Some(thread) = thread {
+                let _ = thread.join();
+            }
+            Ok(Box::new(()) as SendPayload)
+        },
+    );
+    NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(SpinnerJoinContinuation),
+    }
+}
+
+/// Decoder for the offloaded spinner join: ignores the (unit) job payload and
+/// renders the final status on the VM thread. Holds only POD `String`s — no
+/// `Value` edges (CORE-2 I2).
+struct SpinnerJoinDecoder {
+    symbol: String,
+    text: String,
+}
+
+impl Trace for SpinnerJoinDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CompletionDecoder for SpinnerJoinDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        result.map_err(|failure| {
+            SemaError::eval(format!("term/spinner-stop join: {}", failure.message()))
+        })?;
+        spinner_finish(&self.symbol, &self.text);
+        Ok(Value::nil())
+    }
+}
+
+/// Resumes the parked `term/spinner-stop` with nil once the join completes. A
+/// cancellation propagates (the render thread was already signaled and winds
+/// down on its own), settling the task promptly.
+struct SpinnerJoinContinuation;
+
+impl Trace for SpinnerJoinContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for SpinnerJoinContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "term/spinner-stop was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "term/spinner-stop: unexpected runtime response awaiting spinner join",
+            )),
+        }
+    }
+}
+
+/// No-op cancel hook: the stop flag + condvar wake already fired before dispatch,
+/// so a cancelled join has nothing to abort — the render thread winds down on its
+/// own and the worker reaps it.
+struct SpinnerJoinCancelHook;
+
+impl Trace for SpinnerJoinCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CancelHook for SpinnerJoinCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
 }
 
 pub fn register(env: &sema_core::Env) {
@@ -149,124 +484,65 @@ pub fn register(env: &sema_core::Env) {
         )))
     });
 
+    // The spinner registry is INTERPRETER-SHARED: created once here, owned by the
+    // `term/spinner-*` natives via `Rc`, and torn down by a weak interpreter hook
+    // (the `fs_watch` / B5 `TtyRegistry` model).
+    let spinner_registry = Rc::new(SpinnerRegistry::new());
+
     // (term/spinner-start "message") -> spinner-id
-    register_fn(env, "term/spinner-start", |args| {
-        check_arity!(args, "term/spinner-start", 1);
-        let msg = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
+    // Spawns a RESOURCE-OWNED render thread parked in the registry. It is stopped
+    // and joined by an explicit `term/spinner-stop` or, if it outlives the
+    // interpreter, by the registry's teardown hook — never left running.
+    let start_registry = Rc::clone(&spinner_registry);
+    env.set(
+        sema_core::intern("term/spinner-start"),
+        Value::native_fn(NativeFn::with_ctx(
+            "term/spinner-start",
+            move |ctx, args| {
+                check_arity!(args, "term/spinner-start", 1);
+                let msg = args[0]
+                    .as_str()
+                    .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+                    .to_string();
 
-        let id = SPINNER_COUNTER.with(|c| {
-            let id = c.get();
-            c.set(id + 1);
-            id
-        });
-
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let message = Arc::new(Mutex::new(msg));
-
-        let stop_clone = Arc::clone(&stop_flag);
-        let msg_clone = Arc::clone(&message);
-
-        let thread = std::thread::spawn(move || {
-            let mut frame_idx = 0usize;
-            loop {
-                if stop_clone.load(Ordering::Relaxed) {
-                    break;
-                }
-                let msg = msg_clone.lock().unwrap().clone();
-                let frame = SPINNER_FRAMES[frame_idx % SPINNER_FRAMES.len()];
-                // Write spinner frame to stderr
-                let mut stderr = std::io::stderr().lock();
-                let _ = write!(stderr, "\r\x1b[K{frame} {msg}");
-                let _ = stderr.flush();
-                drop(stderr);
-                frame_idx += 1;
-                std::thread::sleep(std::time::Duration::from_millis(SPINNER_INTERVAL_MS));
-            }
-        });
-
-        SPINNERS.with(|spinners| {
-            spinners.borrow_mut().insert(
-                id,
-                SpinnerHandle {
-                    stop_flag,
+                let stop = Arc::new(SpinnerStop::new());
+                let message = Arc::new(Mutex::new(msg));
+                let thread = spawn_spinner(Arc::clone(&stop), Arc::clone(&message))?;
+                let id = start_registry.insert(SpinnerHandle {
+                    stop,
                     message,
                     thread: Some(thread),
-                },
-            );
-        });
-
-        Ok(Value::int(id))
-    });
+                });
+                start_registry.ensure_teardown_hook(ctx);
+                Ok(Value::int(id))
+            },
+        )),
+    );
 
     // (term/spinner-stop id) or (term/spinner-stop id {:symbol "✔" :text "Done" :color :green})
-    register_fn(env, "term/spinner-stop", |args| {
-        check_arity!(args, "term/spinner-stop", 1..=2);
-        let id = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?;
-
-        // Pull the final-status strings out of `args[1]` now, on the VM
-        // thread — a Sema `Value` (the options map) can't cross into the
-        // offloaded worker closure below, so only the plain `String`s it
-        // decodes to are captured.
-        let (symbol, text) = if args.len() == 2 {
-            if let ValueView::Map(opts) = args[1].view() {
-                let symbol = opts
-                    .get(&Value::keyword("symbol"))
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_default();
-                let text = opts
-                    .get(&Value::keyword("text"))
-                    .and_then(|v| v.as_str().map(|s| s.to_string()))
-                    .unwrap_or_default();
-                (symbol, text)
-            } else {
-                (String::new(), String::new())
-            }
-        } else {
-            (String::new(), String::new())
-        };
-
-        let removed = SPINNERS.with(|spinners| spinners.borrow_mut().remove(&id));
-        let Some(mut handle) = removed else {
-            return Ok(Value::nil());
-        };
-        handle.stop_flag.store(true, Ordering::Relaxed);
-        let thread = handle.thread.take();
-
-        if in_async_context() {
-            // `thread.join()` blocks the caller up to ~`SPINNER_INTERVAL_MS`
-            // waiting for the spinner loop to notice the stop flag on its
-            // next wake-up. Offload the join so it doesn't stall the single
-            // cooperative VM thread; the final-line write (which touches no
-            // Sema `Value`s) runs back on the VM thread once the join
-            // completes, via `decode`.
-            crate::io::fs_offload(
-                move || {
-                    if let Some(t) = thread {
-                        let _ = t.join();
-                    }
-                    Ok(())
-                },
-                move |()| {
-                    spinner_finish(&symbol, &text);
-                    Value::nil()
-                },
-            )
-        } else {
-            if let Some(t) = thread {
-                let _ = t.join();
-            }
-            spinner_finish(&symbol, &text);
-            Ok(Value::nil())
-        }
-    });
+    // In a runtime quantum the bounded join is offloaded via an External wait so a
+    // sibling task runs meanwhile; the host (non-quantum) path joins inline,
+    // bounded by one frame interval via the condvar wake.
+    let stop_value_registry = Rc::clone(&spinner_registry);
+    let stop_runtime_registry = Rc::clone(&spinner_registry);
+    env.set(
+        sema_core::intern("term/spinner-stop"),
+        Value::native_fn(NativeFn::simple_with_runtime(
+            "term/spinner-stop",
+            move |args| spinner_stop_sync(&stop_value_registry, args),
+            move |_ctx, args| {
+                if sema_core::in_runtime_quantum() {
+                    spinner_stop_offload(&stop_runtime_registry, args)
+                } else {
+                    spinner_stop_sync(&stop_runtime_registry, args).map(NativeOutcome::Return)
+                }
+            },
+        )),
+    );
 
     // (term/spinner-update id "new message")
-    register_fn(env, "term/spinner-update", |args| {
+    let update_registry = Rc::clone(&spinner_registry);
+    register_fn(env, "term/spinner-update", move |args| {
         check_arity!(args, "term/spinner-update", 2);
         let id = args[0]
             .as_int()
@@ -275,14 +551,7 @@ pub fn register(env: &sema_core::Env) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
             .to_string();
-
-        SPINNERS.with(|spinners| {
-            let map = spinners.borrow();
-            if let Some(handle) = map.get(&id) {
-                *handle.message.lock().unwrap() = new_msg;
-            }
-        });
-
+        update_registry.update(id, new_msg);
         Ok(Value::nil())
     });
 
@@ -437,136 +706,99 @@ fn register_screen_control(env: &sema_core::Env) {
     });
 }
 
-/// `term/spinner-stop`'s async-offload coverage, mirroring the pattern in
-/// `proc.rs`'s `async_offload_tests` / `io.rs`'s `async_offload_tests`:
-/// `sema-stdlib` has no scheduler of its own (that's `sema-vm`/`sema-eval`),
-/// so these tests stand in for it by hand — force
-/// `sema_core::in_async_context()` on, call the native, then poll the
-/// `AwaitIo` handle it arms to completion, exactly what the real scheduler
-/// does in production.
 #[cfg(test)]
-mod async_offload_tests {
+mod tests {
     use super::*;
-    use sema_core::EvalContext;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
-    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
-    /// (even on panic/early return) so a failure can't leak the flag into
-    /// whichever test the harness runs next on the same worker thread.
-    struct AsyncCtxGuard;
-    impl Drop for AsyncCtxGuard {
-        fn drop(&mut self) {
-            sema_core::set_async_context(false);
+    // Both spinner tests move the process-global `SPINNER_LIVE_THREADS` gauge, so
+    // serialize them (nextest already runs each in its own process; this keeps the
+    // absolute 0→1→0 assertions safe under a threaded `cargo test` too).
+    static SPINNER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    // `stop_all` joins each render thread, so the gauge is decremented by the time
+    // teardown returns (no race).
+    #[test]
+    fn teardown_hook_stops_and_joins_live_spinner() {
+        let _serialize = SPINNER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ctx = sema_core::EvalContext::new();
+        let registry = Rc::new(SpinnerRegistry::new());
+
+        // Start one live spinner parked in the registry.
+        let stop = Arc::new(SpinnerStop::new());
+        let message = Arc::new(Mutex::new("teardown probe".to_string()));
+        let thread = spawn_spinner(Arc::clone(&stop), Arc::clone(&message)).expect("spawn spinner");
+        let id = registry.insert(SpinnerHandle {
+            stop,
+            message,
+            thread: Some(thread),
+        });
+
+        // Wait (bounded) for the render thread to actually start.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while spinner_live_thread_count() == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
         }
-    }
-
-    fn env() -> sema_core::Env {
-        let e = sema_core::Env::new();
-        register(&e);
-        e
-    }
-
-    fn call_sync(env: &sema_core::Env, name: &str, args: &[Value]) -> Value {
-        let f = env.get_str(name).expect("fn registered");
-        let nf = f.as_native_fn_ref().expect("native fn");
-        (nf.func)(&EvalContext::default(), args).expect("sync call ok")
-    }
-
-    /// Call a native fn with the async-context gate forced on, then drive
-    /// the `AwaitIo` handle it arms to completion by polling. Panics if the
-    /// native didn't yield at all (e.g. it silently took the sync fallback).
-    fn drive_async(env: &sema_core::Env, name: &str, args: &[Value]) -> Value {
-        let _guard = AsyncCtxGuard;
-        sema_core::set_async_context(true);
-        let f = env.get_str(name).expect("fn registered");
-        let nf = f.as_native_fn_ref().expect("native fn");
-        let armed = (nf.func)(&EvalContext::default(), args)
-            .expect("native call should arm a yield, not error synchronously");
         assert_eq!(
-            armed,
-            Value::nil(),
-            "an offloading native returns nil immediately after arming its yield signal"
+            spinner_live_thread_count(),
+            1,
+            "spinner render thread must be live before teardown"
         );
-        let reason = sema_core::take_yield_signal()
-            .expect("expected a yield signal to be armed — did the native take the sync path?");
-        let handle = match reason {
-            sema_core::YieldReason::AwaitIo(h) => h,
-            other => panic!("expected an AwaitIo yield, got {other:?}"),
-        };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match handle.poll() {
-                sema_core::IoPoll::Ready(Ok(v)) => return v,
-                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
-                sema_core::IoPoll::Pending => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "offload never completed within 10s"
-                    );
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
-        }
-    }
+        assert!(registry.spinners.borrow().contains_key(&id));
 
-    /// Sync path (top level, no scheduler): `term/spinner-stop` blocks and
-    /// returns `nil` directly, unchanged from before the offload was added.
-    #[test]
-    fn spinner_stop_sync_roundtrip() {
-        let e = env();
-        let id = call_sync(&e, "term/spinner-start", &[Value::string("working")]);
-        let result = call_sync(&e, "term/spinner-stop", &[id]);
-        assert_eq!(result, Value::nil());
-    }
-
-    /// In async context, `term/spinner-stop` offloads the spinner thread's
-    /// `join()` instead of blocking the VM thread on it: the native must arm
-    /// an `AwaitIo` yield (not resolve synchronously), and once that offload
-    /// completes the result is the same `nil` the sync path returns.
-    #[test]
-    fn spinner_stop_offloads_join_in_async_context() {
-        let e = env();
-        let id = call_sync(&e, "term/spinner-start", &[Value::string("working")]);
-        let result = drive_async(&e, "term/spinner-stop", &[id]);
-        assert_eq!(result, Value::nil());
-    }
-
-    /// The final-status options map (`{:symbol .. :text ..}`) still works
-    /// once its two strings have to survive the trip through the offloaded
-    /// join's `decode` step.
-    #[test]
-    fn spinner_stop_with_final_status_offloads_async() {
-        let e = env();
-        let id = call_sync(&e, "term/spinner-start", &[Value::string("working")]);
-        let opts = Value::map(
-            [
-                (Value::keyword("symbol"), Value::string("✔")),
-                (Value::keyword("text"), Value::string("Done")),
-            ]
-            .into_iter()
-            .collect::<std::collections::BTreeMap<_, _>>(),
-        );
-        let result = drive_async(&e, "term/spinner-stop", &[id, opts]);
-        assert_eq!(result, Value::nil());
-    }
-
-    /// Stopping an unknown/already-stopped spinner id is a harmless no-op on
-    /// both paths — in particular the async path must NOT arm a yield (there
-    /// is nothing to offload), so it should resolve immediately to `nil`
-    /// rather than parking the caller.
-    #[test]
-    fn spinner_stop_unknown_id_is_noop_in_async_context() {
-        let e = env();
-        let _guard = AsyncCtxGuard;
-        sema_core::set_async_context(true);
-        let f = e.get_str("term/spinner-stop").expect("fn registered");
-        let nf = f.as_native_fn_ref().expect("native fn");
-        let result = (nf.func)(&EvalContext::default(), &[Value::int(999_999)])
-            .expect("unknown id is a no-op, not an error");
-        assert_eq!(result, Value::nil());
+        // Registering the teardown hook is idempotent — the flag flips exactly once.
+        assert!(!registry.teardown_hook_registered.get());
+        registry.ensure_teardown_hook(&ctx);
         assert!(
-            sema_core::take_yield_signal().is_none(),
-            "no spinner to join means no offload should be armed"
+            registry.teardown_hook_registered.get(),
+            "ensure_teardown_hook must register the interpreter hook"
+        );
+        registry.ensure_teardown_hook(&ctx); // second call is a no-op
+
+        // Firing the interpreter teardown hooks stops+joins every live spinner.
+        assert!(ctx.try_run_interpreter_teardown_hooks());
+        assert!(
+            registry.spinners.borrow().is_empty(),
+            "teardown must drain the spinner registry"
+        );
+        assert!(
+            !registry.teardown_hook_registered.get(),
+            "stop_all must reset the teardown-hook flag"
+        );
+        assert_eq!(
+            spinner_live_thread_count(),
+            0,
+            "teardown must leave no live spinner render thread"
+        );
+    }
+
+    // A `stop` that races the thread's frame park wakes it immediately (condvar),
+    // so the join returns well within a couple of frame intervals rather than
+    // hanging or waiting out a bare sleep.
+    #[test]
+    fn stop_wakes_and_joins_render_thread_promptly() {
+        let _serialize = SPINNER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let baseline = spinner_live_thread_count();
+        let stop = Arc::new(SpinnerStop::new());
+        let message = Arc::new(Mutex::new("wake probe".to_string()));
+        let thread = spawn_spinner(Arc::clone(&stop), Arc::clone(&message)).expect("spawn spinner");
+        let handle = SpinnerHandle {
+            stop,
+            message,
+            thread: Some(thread),
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while spinner_live_thread_count() <= baseline && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+
+        let started = Instant::now();
+        handle.stop_and_join();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "condvar wake must join the render thread promptly, took {:?}",
+            started.elapsed()
         );
     }
 }

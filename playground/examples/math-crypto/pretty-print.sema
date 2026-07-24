@@ -1,10 +1,10 @@
 ;;; S-expression pretty printer
 
-(define pp-indent  2)
-(define pp-width   60)
+(define pp-indent 2)
+(define pp-width 60)
 
-(define (flat-length val)  (string/length (str val)))
-(define (flat val)         (str val))
+(define (flat-length val) (string/length (str val)))
+(define (flat val) (str val))
 
 (define (pp val indent)
   (cond
@@ -50,10 +50,10 @@
     (if is-special (pp-special lst indent) (pp-call lst indent))))
 
 (define (pp-special lst indent)
-  (let* ((head          (car lst))
-         (rest-items    (cdr lst))
-         (child-indent  (+ indent pp-indent))
-         (pad           (string/repeat " " child-indent)))
+  (let* ((head (car lst))
+         (rest-items (cdr lst))
+         (child-indent (+ indent pp-indent))
+         (pad (string/repeat " " child-indent)))
     (if (null? rest-items)
       (str "(" head ")")
       (let* ((first-arg (car rest-items))
@@ -72,15 +72,15 @@
             ")"))))))
 
 (define (pp-call lst indent)
-  (let* ((child-indent  (+ indent pp-indent))
-         (pad           (string/repeat " " child-indent))
-         (items         (map (fn (item) (pp item child-indent)) lst)))
+  (let* ((child-indent (+ indent pp-indent))
+         (pad (string/repeat " " child-indent))
+         (items (map (fn (item) (pp item child-indent)) lst)))
     (string/append "(" (string/join items (str "\n" pad)) ")")))
 
 (define (pp-vector vec indent)
-  (let* ((ci     (+ indent 1))
-         (pad    (string/repeat " " ci))
-         (items  (map (fn (item) (pp item ci)) (vector->list vec))))
+  (let* ((ci (+ indent 1))
+         (pad (string/repeat " " ci))
+         (items (map (fn (item) (pp item ci)) (vector->list vec))))
     (string/append "[" (string/join items (str "\n" pad)) "]")))
 
 (define (pp-map m indent)
@@ -110,17 +110,17 @@
 
 (println "\n--- Map ---")
 (pretty-print
-  {:name     "Alice"
-   :age      30
-   :hobbies  (list "reading" "hiking" "coding")
-   :address  {:street "123 Main St" :city "Wonderland"}})
+  {:name "Alice"
+   :age 30
+   :hobbies (list "reading" "hiking" "coding")
+   :address {:street "123 Main St" :city "Wonderland"}})
 
 (println "\n--- Lambda ---")
 (pretty-print
   '(fn (request)
-    (let ((method  (get request :method))
-          (path    (get request :path)))
+    (let ((method (get request :method))
+          (path (get request :path)))
       (cond
-        ((= method "GET")   (handle-get path))
-        ((= method "POST")  (handle-post path (get request :body)))
-        (else               (error "unsupported method"))))))
+        ((= method "GET") (handle-get path))
+        ((= method "POST") (handle-post path (get request :body)))
+        (else (error "unsupported method"))))))

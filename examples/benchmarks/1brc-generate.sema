@@ -49,25 +49,25 @@
 
 ;; Generate a random temperature in tenths for a station
 (define (generate-temp-tenths station)
-  (let ((mean  (get station :mean-tenths))
-        (var   (get station :var-tenths)))
+  (let ((mean (get station :mean-tenths))
+        (var (get station :var-tenths)))
     (math/random-int (- mean var) (+ mean var))))
 
 ;; Format tenths integer as decimal string: 182 -> "18.2", -35 -> "-3.5"
 (define (format-temp tenths)
-  (let ((sign  (if (< tenths 0) "-" ""))
-        (a     (abs tenths)))
-    (let ((whole  (math/quotient a 10))
-          (frac   (math/remainder a 10)))
+  (let ((sign (if (< tenths 0) "-" ""))
+        (a (abs tenths)))
+    (let ((whole (math/quotient a 10))
+          (frac (math/remainder a 10)))
       (string/append sign (str whole) "." (str frac)))))
 
 ;; --- Parse CLI arguments (after "--") ---
 (define (script-args)
   (let loop ((args (sys/args)))
     (cond
-      ((null? args)           '())
-      ((= (first args) "--")  (rest args))
-      (else                   (loop (rest args))))))
+      ((null? args) '())
+      ((= (first args) "--") (rest args))
+      (else (loop (rest args))))))
 
 (define args (script-args))
 (define num-rows

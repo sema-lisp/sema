@@ -1,11 +1,17 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::{Rc, Weak};
 
 use js_sys::Date;
 use sema_core::{pretty_print, Env, NativeFn, SemaError, Value, ValueView};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
+
+// The Promise driver owns browser-turn scheduling, root-tagged output, and the
+// runtime-ABI HTTP adapter used by Promise-based evaluation and debugging.
+mod driver;
+mod output;
 
 thread_local! {
     /// Completed lines of output (flushed by println/newline)
@@ -22,15 +28,8 @@ thread_local! {
         s.insert("/".to_string());
         s
     });
-    /// In-memory HTTP response cache for the replay-with-cache strategy
-    static HTTP_CACHE: RefCell<BTreeMap<String, Value>> = const { RefCell::new(BTreeMap::new()) };
     /// Total bytes currently stored in the VFS
     static VFS_TOTAL_BYTES: Cell<usize> = const { Cell::new(0) };
-    /// Int32Array view over the control SharedArrayBuffer used for real
-    /// `Atomics.wait` sleep when running inside a Web Worker (installed via
-    /// `installAtomicsSleep`). `None` on the main thread (sleep stays an
-    /// instant virtual-clock advance — `Atomics.wait` is illegal there anyway).
-    static SLEEP_I32: RefCell<Option<js_sys::Int32Array>> = const { RefCell::new(None) };
     /// Optional sink called with each completed output line as it is produced
     /// (installed via `setOutputSink`). The Web Worker uses it to stream
     /// `println` output to the main thread live, so a long-running program
@@ -39,41 +38,366 @@ thread_local! {
     static OUTPUT_SINK: RefCell<Option<js_sys::Function>> = const { RefCell::new(None) };
 }
 
-/// Blocking-sleep callback installed in the Web Worker: block this (worker)
-/// thread for `ms` real milliseconds via `Atomics.wait` on the control SAB. The
-/// cell value stays 0, so the wait simply times out after `ms` (a later cancel
-/// can store a non-zero value + `Atomics.notify` to wake it early — see M6).
-/// A plain `fn` (no captures) so it fits `sema_core::BlockingSleepFn`; it reads
-/// the SAB view from the thread-local. Never called on the main thread.
-fn worker_atomics_sleep(ms: u64) {
-    SLEEP_I32.with(|s| {
-        if let Some(arr) = s.borrow().as_ref() {
-            // Slot 0 == 0 → block for `ms`; a cancel stores 1 + notifies, which
-            // wakes this wait immediately so a Stop interrupts a sleep promptly.
-            let _ = js_sys::Atomics::wait_with_timeout(arr, 0, 0, ms as f64);
-        }
-    });
-}
-
-/// Interrupt callback installed in the Web Worker: the main thread requests a
-/// cancel by storing a non-zero value in control slot 0 (+ `Atomics.notify`).
-/// The VM loop guard polls this so a Stop button aborts a running program.
-fn worker_check_interrupt() -> bool {
-    SLEEP_I32.with(|s| {
-        s.borrow()
-            .as_ref()
-            .is_some_and(|arr| js_sys::Atomics::load(arr, 0).unwrap_or(0) != 0)
-    })
-}
-
-/// Active debug session state for cooperative VM execution.
+/// Active debug session state for cooperative execution on the unified runtime.
+/// The program's VM is owned by the runtime (submitted as `handle`'s root); the
+/// session keeps only the headless `DebugState` (registered via an
+/// `ActiveDebugGuard` around each drive so `run_parked_quantum` runs the
+/// debug-aware quantum) and the root handle it polls for settlement.
 struct DebugSession {
-    vm: sema_vm::VM,
+    owner: Weak<sema_eval::Interpreter>,
     debug: sema_vm::DebugState,
+    handle: sema_vm::runtime::RootHandle,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnerRelation {
+    Same,
+    Foreign,
+    Dead,
+}
+
+fn weak_owner_relation<T>(owner: &Weak<T>, current: &Rc<T>) -> OwnerRelation {
+    match owner.upgrade() {
+        Some(owner) if Rc::ptr_eq(&owner, current) => OwnerRelation::Same,
+        Some(_) => OwnerRelation::Foreign,
+        None => OwnerRelation::Dead,
+    }
+}
+
+impl DebugSession {
+    fn is_owned_by(&self, interp: &Rc<sema_eval::Interpreter>) -> bool {
+        weak_owner_relation(&self.owner, interp) == OwnerRelation::Same
+    }
+}
+
+/// Thread-local legacy debugger ownership without a borrow spanning user code.
+/// `Starting` closes admission before macro expansion; `Driving` retains root
+/// identity/cancellation while `DebugSession` lives on `debug_drive`'s stack.
+enum LegacyDebugSlot {
+    Starting {
+        owner: Weak<sema_eval::Interpreter>,
+        stop_requested: bool,
+    },
+    Active(Box<DebugSession>),
+    Driving {
+        owner: Weak<sema_eval::Interpreter>,
+        handle: sema_vm::runtime::RootHandle,
+        stop_requested: bool,
+    },
+}
+
+impl LegacyDebugSlot {
+    fn owner(&self) -> &Weak<sema_eval::Interpreter> {
+        match self {
+            Self::Starting { owner, .. } | Self::Driving { owner, .. } => owner,
+            Self::Active(session) => &session.owner,
+        }
+    }
+
+    fn is_owned_by(&self, interp: &Rc<sema_eval::Interpreter>) -> bool {
+        weak_owner_relation(self.owner(), interp) == OwnerRelation::Same
+    }
+
+    fn cancel_without_drive(self) {
+        match self {
+            Self::Active(session) => {
+                let _ = session
+                    .handle
+                    .cancel(sema_core::runtime::CancelReason::HostStop);
+            }
+            Self::Driving { handle, .. } => {
+                let _ = handle.cancel(sema_core::runtime::CancelReason::HostStop);
+            }
+            Self::Starting { .. } => {}
+        }
+    }
+}
+
+fn cancel_debug_root(runtime: &sema_vm::runtime::Runtime, handle: &sema_vm::runtime::RootHandle) {
+    handle.cancel(sema_core::runtime::CancelReason::HostStop);
+    let budget = sema_vm::runtime::DriveBudget::host_default();
+    for _ in 0..10_000 {
+        if !matches!(handle.poll_result(), sema_vm::runtime::RootPoll::Pending) {
+            break;
+        }
+        if !matches!(
+            runtime.drive(&budget),
+            Ok(sema_vm::runtime::DriveState::Progress { .. })
+        ) {
+            break;
+        }
+    }
 }
 
 thread_local! {
-    static DEBUG_SESSION: RefCell<Option<DebugSession>> = const { RefCell::new(None) };
+    static DEBUG_SESSION: RefCell<Option<LegacyDebugSlot>> = const { RefCell::new(None) };
+}
+
+fn legacy_debug_owner_for(interp: &Rc<sema_eval::Interpreter>) -> Option<OwnerRelation> {
+    DEBUG_SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let relation = weak_owner_relation(slot.as_ref()?.owner(), interp);
+        if relation == OwnerRelation::Dead {
+            let stale = slot.take().expect("legacy debug session disappeared");
+            stale.cancel_without_drive();
+            None
+        } else {
+            Some(relation)
+        }
+    })
+}
+
+fn legacy_debug_active_for(interp: &Rc<sema_eval::Interpreter>) -> bool {
+    legacy_debug_owner_for(interp) == Some(OwnerRelation::Same)
+}
+
+struct LegacyStartReservation {
+    owner: Weak<sema_eval::Interpreter>,
+    armed: bool,
+}
+
+impl LegacyStartReservation {
+    fn ensure_pending(&self) -> Result<(), &'static str> {
+        DEBUG_SESSION.with(|slot| {
+            let slot = slot.borrow();
+            match slot.as_ref() {
+                Some(LegacyDebugSlot::Starting {
+                    owner,
+                    stop_requested: false,
+                }) if Weak::ptr_eq(owner, &self.owner) => Ok(()),
+                Some(LegacyDebugSlot::Starting {
+                    owner,
+                    stop_requested: true,
+                }) if Weak::ptr_eq(owner, &self.owner) => {
+                    Err("synchronous debug start was stopped by a reentrant callback")
+                }
+                _ => Err("synchronous debug start lost its ownership reservation"),
+            }
+        })
+    }
+
+    fn activate(&mut self, session: Box<DebugSession>) -> Result<(), Box<DebugSession>> {
+        let activated = DEBUG_SESSION.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let ready = matches!(
+                slot.as_ref(),
+                Some(LegacyDebugSlot::Starting {
+                    owner,
+                    stop_requested: false,
+                }) if Weak::ptr_eq(owner, &self.owner)
+            );
+            if ready {
+                *slot = Some(LegacyDebugSlot::Active(session));
+                Ok(())
+            } else {
+                Err(session)
+            }
+        });
+        if activated.is_ok() {
+            self.armed = false;
+        }
+        activated
+    }
+}
+
+impl Drop for LegacyStartReservation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        DEBUG_SESSION.with(|slot| {
+            let Ok(mut slot) = slot.try_borrow_mut() else {
+                return;
+            };
+            let owned_start = matches!(
+                slot.as_ref(),
+                Some(LegacyDebugSlot::Starting { owner, .. })
+                    if Weak::ptr_eq(owner, &self.owner)
+            );
+            if owned_start {
+                slot.take();
+            }
+        });
+    }
+}
+
+fn reserve_legacy_debug_start(
+    interp: &Rc<sema_eval::Interpreter>,
+) -> Result<(LegacyStartReservation, Option<Box<DebugSession>>), &'static str> {
+    DEBUG_SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(existing) = slot.as_ref() {
+            match weak_owner_relation(existing.owner(), interp) {
+                OwnerRelation::Foreign => {
+                    return Err("another interpreter has an active synchronous debug session");
+                }
+                OwnerRelation::Same => match existing {
+                    LegacyDebugSlot::Active(_) => {}
+                    LegacyDebugSlot::Starting { .. } | LegacyDebugSlot::Driving { .. } => {
+                        return Err(
+                            "a synchronous debug start or drive is already active on this interpreter",
+                        );
+                    }
+                },
+                OwnerRelation::Dead => {
+                    slot.take()
+                        .expect("legacy debug session disappeared")
+                        .cancel_without_drive();
+                }
+            }
+        }
+
+        let replaced = match slot.take() {
+            Some(LegacyDebugSlot::Active(session)) => Some(session),
+            None => None,
+            Some(other) => {
+                *slot = Some(other);
+                return Err("synchronous debug start could not reserve its session");
+            }
+        };
+        let owner = Rc::downgrade(interp);
+        *slot = Some(LegacyDebugSlot::Starting {
+            owner: owner.clone(),
+            stop_requested: false,
+        });
+        Ok((
+            LegacyStartReservation { owner, armed: true },
+            replaced,
+        ))
+    })
+}
+
+enum LegacyStopAction {
+    Cancel(Box<DebugSession>),
+    Requested,
+    None,
+}
+
+fn request_legacy_debug_stop(interp: &Rc<sema_eval::Interpreter>) -> LegacyStopAction {
+    DEBUG_SESSION.with(|slot| {
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            return LegacyStopAction::None;
+        };
+        let Some(session) = slot.as_mut() else {
+            return LegacyStopAction::None;
+        };
+        if !session.is_owned_by(interp) {
+            return LegacyStopAction::None;
+        }
+        match session {
+            LegacyDebugSlot::Starting { stop_requested, .. }
+            | LegacyDebugSlot::Driving { stop_requested, .. } => {
+                *stop_requested = true;
+                LegacyStopAction::Requested
+            }
+            LegacyDebugSlot::Active(_) => match slot.take() {
+                Some(LegacyDebugSlot::Active(session)) => LegacyStopAction::Cancel(session),
+                _ => unreachable!("active legacy debug session changed under one borrow"),
+            },
+        }
+    })
+}
+
+fn take_legacy_debug_session_for_drive(
+    interp: &Rc<sema_eval::Interpreter>,
+) -> Option<Box<DebugSession>> {
+    DEBUG_SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let active = matches!(
+            slot.as_ref(),
+            Some(LegacyDebugSlot::Active(session)) if session.is_owned_by(interp)
+        );
+        if !active {
+            return None;
+        }
+        let Some(LegacyDebugSlot::Active(session)) = slot.take() else {
+            unreachable!("checked active legacy debug session");
+        };
+        *slot = Some(LegacyDebugSlot::Driving {
+            owner: session.owner.clone(),
+            handle: session.handle.clone(),
+            stop_requested: false,
+        });
+        Some(session)
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LegacyDriveReservation {
+    Continue,
+    Stop,
+    Lost,
+}
+
+fn legacy_drive_reservation(
+    interp: &Rc<sema_eval::Interpreter>,
+    root: sema_core::runtime::RootId,
+) -> LegacyDriveReservation {
+    DEBUG_SESSION.with(|slot| {
+        let slot = slot.borrow();
+        match slot.as_ref() {
+            Some(LegacyDebugSlot::Driving {
+                owner,
+                handle,
+                stop_requested,
+            }) if handle.id() == root
+                && weak_owner_relation(owner, interp) == OwnerRelation::Same =>
+            {
+                if *stop_requested {
+                    LegacyDriveReservation::Stop
+                } else {
+                    LegacyDriveReservation::Continue
+                }
+            }
+            _ => LegacyDriveReservation::Lost,
+        }
+    })
+}
+
+fn restore_legacy_debug_session_after_drive(
+    interp: &Rc<sema_eval::Interpreter>,
+    session: Box<DebugSession>,
+) -> Result<(), Box<DebugSession>> {
+    let root = session.handle.id();
+    DEBUG_SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let restorable = matches!(
+            slot.as_ref(),
+            Some(LegacyDebugSlot::Driving {
+                owner,
+                handle,
+                stop_requested: false,
+            }) if handle.id() == root
+                && weak_owner_relation(owner, interp) == OwnerRelation::Same
+        );
+        if restorable {
+            *slot = Some(LegacyDebugSlot::Active(session));
+            Ok(())
+        } else {
+            Err(session)
+        }
+    })
+}
+
+fn clear_legacy_drive_reservation(
+    interp: &Rc<sema_eval::Interpreter>,
+    root: sema_core::runtime::RootId,
+) {
+    DEBUG_SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let owned = matches!(
+            slot.as_ref(),
+            Some(LegacyDebugSlot::Driving {
+                owner,
+                handle,
+                ..
+            }) if handle.id() == root
+                && weak_owner_relation(owner, interp) == OwnerRelation::Same
+        );
+        if owned {
+            slot.take();
+        }
+    });
 }
 
 const VFS_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024; // 16 MB total
@@ -150,12 +474,45 @@ fn normalize_path(path: &str) -> Result<String, SemaError> {
 }
 
 /// Append text to the current line buffer (no newline).
+///
+/// Also forwards `s` through `sema_core::write_stdout`. The fallback hook is a
+/// no-op; a root submitted with `RootOptions::capture_output` routes it to the
+/// Promise driver's root-tagged sink instead.
+///
+/// A promise-driven root's own output therefore has no business in
+/// `LINE_BUF`/`OUTPUT` at all: nothing ever drains those for it,
+/// so appending there would grow unboundedly for a long-running/looping
+/// promise-driven program. Skip compatibility accumulation while a promise-
+/// driven turn is active; `write_stdout` below is this root's only real sink.
 fn append_output(s: &str) {
-    LINE_BUF.with(|b| b.borrow_mut().push_str(s));
+    if !driver::promise_driven_root_active() {
+        LINE_BUF.with(|b| b.borrow_mut().push_str(s));
+    }
+    sema_core::write_stdout(s);
+}
+
+/// Error-channel counterpart to [`append_output`]. Synchronous entry points
+/// retain their single buffered `output` array, while a capturing runtime root emits
+/// a real stderr-tagged `OutputEvent` for Promise/debugger consumers.
+fn append_error_output(s: &str) {
+    if !driver::promise_driven_root_active() {
+        LINE_BUF.with(|b| b.borrow_mut().push_str(s));
+    }
+    sema_core::write_stderr(s);
 }
 
 /// Flush the current line buffer as a completed line.
+///
+/// A no-op while a promise-driven turn is active — `LINE_BUF` is never
+/// populated for such a root either (see `append_output`), and `OUTPUT`/
+/// `OUTPUT_SINK` are exclusively the synchronous output channel; a
+/// promise-driven root's output goes out through `output.rs`'s own sink.
+/// Without this, every `println` from a long-running/looping promise-driven
+/// program would still push an (empty) line into `OUTPUT` forever.
 fn flush_line() {
+    if driver::promise_driven_root_active() {
+        return;
+    }
     let line = LINE_BUF.with(|b| {
         let line = b.borrow().clone();
         b.borrow_mut().clear();
@@ -185,392 +542,67 @@ fn take_output() -> Vec<String> {
     OUTPUT.with(|o| o.borrow_mut().drain(..).collect())
 }
 
-const HTTP_AWAIT_MARKER: &str = "__SEMA_WASM_HTTP__";
-const MAX_REPLAYS: usize = 50;
-
 /// Instruction budget per cooperative VM yield. The VM will execute up to this
 /// many instructions before yielding back to the browser event loop.
 const WASM_DEBUG_INSTRUCTION_BUDGET: u32 = 500_000;
 
-/// Build a deterministic cache key from HTTP request parameters.
-fn http_cache_key(
-    method: &str,
-    url: &str,
-    body: Option<&str>,
-    headers: &[(String, String)],
-) -> String {
-    use std::fmt::Write;
-    let mut key = format!("{method}\n{url}\n");
-    match body {
-        Some(b) => {
-            write!(key, "{b}").unwrap();
-        }
-        None => {
-            key.push_str("<nil>");
-        }
-    }
-    key.push('\n');
-    for (k, v) in headers {
-        writeln!(key, "{k}:{v}").unwrap();
-    }
-    key
-}
-
-/// Create a marker error whose message encodes an HTTP request as JSON.
-fn http_await_marker(
-    method: &str,
-    url: &str,
-    body: Option<&str>,
-    headers: &[(String, String)],
-    timeout_ms: Option<i64>,
-) -> SemaError {
-    let key = http_cache_key(method, url, body, headers);
-    let body_json = match body {
-        Some(b) => format!("\"{}\"", escape_json(b)),
-        None => "null".to_string(),
-    };
-    let timeout_json = match timeout_ms {
-        Some(t) => format!("{t}"),
-        None => "null".to_string(),
-    };
-    let headers_json = headers
-        .iter()
-        .map(|(k, v)| format!("[\"{}\",\"{}\"]", escape_json(k), escape_json(v)))
-        .collect::<Vec<_>>()
-        .join(",");
-    let payload = format!(
-        "{}{{\"key\":\"{}\",\"method\":\"{}\",\"url\":\"{}\",\"body\":{},\"headers\":[{}],\"timeout\":{}}}",
-        HTTP_AWAIT_MARKER,
-        escape_json(&key),
-        escape_json(method),
-        escape_json(url),
-        body_json,
-        headers_json,
-        timeout_json,
-    );
-    SemaError::eval(payload)
-}
-
-/// Check whether an error is an HTTP await marker.
-fn is_http_await_marker(err: &SemaError) -> bool {
-    match err.inner() {
-        SemaError::Eval(msg) => msg.starts_with(HTTP_AWAIT_MARKER),
-        _ => false,
-    }
-}
-
-/// Extract the JSON payload from an HTTP await marker error.
-fn parse_http_marker(err: &SemaError) -> Option<String> {
-    match err.inner() {
-        SemaError::Eval(msg) if msg.starts_with(HTTP_AWAIT_MARKER) => {
-            Some(msg[HTTP_AWAIT_MARKER.len()..].to_string())
-        }
-        _ => None,
-    }
-}
-
-/// Clear the HTTP response cache.
-fn clear_http_cache() {
-    HTTP_CACHE.with(|c| c.borrow_mut().clear());
-}
-
-/// Perform an HTTP request via the replay-with-cache strategy.
-/// On cache hit, returns the cached response. On cache miss, returns a marker error.
-fn wasm_http_request(
-    method: &str,
-    url: &str,
-    body: Option<&Value>,
-    opts: Option<&Value>,
-) -> Result<Value, SemaError> {
-    let mut headers: Vec<(String, String)> = Vec::new();
-    let mut timeout_ms: Option<i64> = None;
-    let mut has_content_type = false;
-
-    if let Some(opts_val) = opts {
-        if let Some(opts_map) = opts_val.as_map_rc() {
-            if let Some(headers_val) = opts_map.get(&Value::keyword("headers")) {
-                if let Some(hmap) = headers_val.as_map_rc() {
-                    for (k, v) in hmap.iter() {
-                        let key = match k.view() {
-                            ValueView::String(s) => s.to_string(),
-                            ValueView::Keyword(s) => sema_core::resolve(s),
-                            _ => k.to_string(),
-                        };
-                        let val = match v.as_str() {
-                            Some(s) => s.to_string(),
-                            None => v.to_string(),
-                        };
-                        if key.eq_ignore_ascii_case("content-type") {
-                            has_content_type = true;
-                        }
-                        headers.push((key, val));
-                    }
-                }
-            }
-            if let Some(timeout_val) = opts_map.get(&Value::keyword("timeout")) {
-                if let Some(ms) = timeout_val.as_int() {
-                    timeout_ms = Some(ms);
-                }
-            }
-        }
-    }
-
-    let body_str = match body {
-        Some(val) => {
-            if let Some(s) = val.as_str() {
-                Some(s.to_string())
-            } else if val.as_map_rc().is_some() {
-                let json = sema_core::value_to_json_lossy(val);
-                let json_str = serde_json::to_string(&json)
-                    .map_err(|e| SemaError::eval(format!("http: json encode: {e}")))?;
-                if !has_content_type {
-                    headers.push(("Content-Type".to_string(), "application/json".to_string()));
-                }
-                Some(json_str)
-            } else if val.is_nil() {
-                None
-            } else {
-                Some(val.to_string())
-            }
-        }
-        None => None,
-    };
-
-    headers.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-
-    let key = http_cache_key(method, url, body_str.as_deref(), &headers);
-
-    // In a Web Worker there is no `window`. Do a real *synchronous* XHR: it
-    // blocks the worker thread and returns the response directly, so http works
-    // without the main-thread replay-the-whole-program hack — and it composes
-    // correctly with real `Atomics.wait` sleeps (no re-runs). Cross-origin
-    // targets still need CORS/CORP (a same-origin proxy covers the rest).
-    if web_sys::window().is_none() {
-        return perform_fetch_sync(method, url, body_str.as_deref(), &headers);
-    }
-
-    let cached = HTTP_CACHE.with(|c| c.borrow().get(&key).cloned());
-    if let Some(val) = cached {
-        return Ok(val);
-    }
-
-    Err(http_await_marker(
-        method,
-        url,
-        body_str.as_deref(),
-        &headers,
-        timeout_ms,
+fn synchronous_http_error(name: &str) -> SemaError {
+    SemaError::eval(format!(
+        "{name}: synchronous WebAssembly evaluation cannot perform HTTP requests; use evalPromise"
     ))
 }
 
-/// Synchronous HTTP via `XMLHttpRequest` (worker-only — sync XHR is illegal on
-/// the main thread). Blocks the calling (worker) thread until the response,
-/// returning the same `{:status :headers :body}` map shape as `perform_fetch`.
-/// (Per-request timeout is not applied on this path; the worker can be cancelled
-/// via the M6 control buffer instead.)
-fn perform_fetch_sync(
-    method: &str,
-    url: &str,
-    body: Option<&str>,
-    headers: &[(String, String)],
-) -> Result<Value, SemaError> {
-    let xhr = web_sys::XmlHttpRequest::new()
-        .map_err(|_| SemaError::Io("failed to create XMLHttpRequest".to_string()))?;
-    // async = false → synchronous (blocks this worker thread).
-    xhr.open_with_async(method, url, false)
-        .map_err(|e| SemaError::Io(format!("http: open failed: {}", js_err(&e))))?;
-    for (k, v) in headers {
-        let _ = xhr.set_request_header(k, v);
-    }
-    let send = match body {
-        Some(b) => xhr.send_with_opt_str(Some(b)),
-        None => xhr.send(),
-    };
-    send.map_err(|e| SemaError::Io(format!("http: request failed: {}", js_err(&e))))?;
-
-    let status = xhr.status().unwrap_or(0) as i64;
-    let body_text = xhr.response_text().ok().flatten().unwrap_or_default();
-
-    let mut resp_headers = BTreeMap::new();
-    if let Ok(raw) = xhr.get_all_response_headers() {
-        for line in raw.split("\r\n").filter(|l| !l.is_empty()) {
-            if let Some((k, v)) = line.split_once(':') {
-                resp_headers.insert(Value::keyword(k.trim()), Value::string(v.trim()));
-            }
-        }
-    }
-
-    let mut result = BTreeMap::new();
-    result.insert(Value::keyword("status"), Value::int(status));
-    result.insert(Value::keyword("headers"), Value::map(resp_headers));
-    result.insert(Value::keyword("body"), Value::string(&body_text));
-    Ok(Value::map(result))
-}
-
-/// Best-effort string for a JS error value.
-fn js_err(e: &JsValue) -> String {
-    e.as_string()
+fn js_err(error: &JsValue) -> String {
+    error
+        .as_string()
         .or_else(|| {
-            js_sys::Reflect::get(e, &JsValue::from_str("message"))
+            js_sys::Reflect::get(error, &JsValue::from_str("message"))
                 .ok()
-                .and_then(|m| m.as_string())
+                .and_then(|message| message.as_string())
         })
         .unwrap_or_else(|| "error".to_string())
-}
-
-/// Perform an HTTP fetch via the browser's `fetch()` API.
-async fn perform_fetch(
-    method: &str,
-    url: &str,
-    body: Option<&str>,
-    headers: &[(String, String)],
-    timeout_ms: Option<u64>,
-) -> Result<Value, SemaError> {
-    let window = web_sys::window()
-        .ok_or_else(|| SemaError::Io("no global `window` available".to_string()))?;
-
-    let opts = web_sys::RequestInit::new();
-    opts.set_method(method);
-    opts.set_mode(web_sys::RequestMode::Cors);
-
-    if let Some(body_str) = body {
-        opts.set_body(&JsValue::from_str(body_str));
-    }
-
-    let abort_controller = if timeout_ms.is_some() {
-        let controller = web_sys::AbortController::new()
-            .map_err(|_| SemaError::Io("failed to create AbortController".to_string()))?;
-        opts.set_signal(Some(&controller.signal()));
-        Some(controller)
-    } else {
-        None
-    };
-
-    let request = web_sys::Request::new_with_str_and_init(url, &opts).map_err(|e| {
-        SemaError::Io(format!(
-            "failed to create request: {}",
-            e.as_string().unwrap_or_default()
-        ))
-    })?;
-
-    for (k, v) in headers {
-        request.headers().set(k, v).map_err(|e| {
-            SemaError::Io(format!(
-                "failed to set header: {}",
-                e.as_string().unwrap_or_default()
-            ))
-        })?;
-    }
-
-    if let (Some(ms), Some(controller)) = (timeout_ms, &abort_controller) {
-        let c = controller.clone();
-        let closure = wasm_bindgen::closure::Closure::once(move || {
-            c.abort();
-        });
-        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-            closure.as_ref().unchecked_ref(),
-            clamp_timeout_ms(ms),
-        );
-        closure.forget();
-    }
-
-    let resp_jsvalue = JsFuture::from(window.fetch_with_request(&request))
-        .await
-        .map_err(|e| {
-            let msg = e
-                .as_string()
-                .or_else(|| {
-                    js_sys::Reflect::get(&e, &JsValue::from_str("message"))
-                        .ok()
-                        .and_then(|m| m.as_string())
-                })
-                .unwrap_or_else(|| "fetch failed".to_string());
-            SemaError::Io(msg)
-        })?;
-
-    let response: web_sys::Response = resp_jsvalue
-        .dyn_into()
-        .map_err(|_| SemaError::Io("fetch did not return a Response".to_string()))?;
-
-    let status = response.status() as i64;
-
-    let mut resp_headers = BTreeMap::new();
-    if let Ok(Some(iter)) = js_sys::try_iter(&response.headers()) {
-        for entry in iter.flatten() {
-            let arr: js_sys::Array = entry.into();
-            if arr.length() >= 2 {
-                let k = arr.get(0).as_string().unwrap_or_default();
-                let v = arr.get(1).as_string().unwrap_or_default();
-                resp_headers.insert(Value::keyword(&k), Value::string(&v));
-            }
-        }
-    }
-
-    let body_promise = response.text().map_err(|e| {
-        SemaError::Io(format!(
-            "failed to read response body: {}",
-            e.as_string().unwrap_or_default()
-        ))
-    })?;
-    let body_jsvalue = JsFuture::from(body_promise).await.map_err(|e| {
-        SemaError::Io(format!(
-            "failed to read response body: {}",
-            e.as_string().unwrap_or_default()
-        ))
-    })?;
-    let body_text = body_jsvalue.as_string().unwrap_or_default();
-
-    let mut result = BTreeMap::new();
-    result.insert(Value::keyword("status"), Value::int(status));
-    result.insert(Value::keyword("headers"), Value::map(resp_headers));
-    result.insert(Value::keyword("body"), Value::string(&body_text));
-
-    Ok(Value::map(result))
-}
-
-/// Parse an HTTP marker JSON and perform the fetch, returning (cache_key, response).
-async fn perform_fetch_from_marker(json_str: &str) -> Result<(String, Value), SemaError> {
-    let parsed: serde_json::Value = serde_json::from_str(json_str)
-        .map_err(|e| SemaError::eval(format!("failed to parse HTTP marker JSON: {e}")))?;
-
-    let key = parsed["key"]
-        .as_str()
-        .ok_or_else(|| SemaError::eval("HTTP marker missing 'key'"))?
-        .to_string();
-    let method = parsed["method"]
-        .as_str()
-        .ok_or_else(|| SemaError::eval("HTTP marker missing 'method'"))?;
-    let url = parsed["url"]
-        .as_str()
-        .ok_or_else(|| SemaError::eval("HTTP marker missing 'url'"))?;
-    let body = parsed["body"].as_str();
-    let timeout_ms = parsed["timeout"].as_u64();
-
-    let mut headers = Vec::new();
-    if let Some(arr) = parsed["headers"].as_array() {
-        for pair in arr {
-            if let Some(pair_arr) = pair.as_array() {
-                if pair_arr.len() >= 2 {
-                    let k = pair_arr[0].as_str().unwrap_or_default().to_string();
-                    let v = pair_arr[1].as_str().unwrap_or_default().to_string();
-                    headers.push((k, v));
-                }
-            }
-        }
-    }
-
-    let response = perform_fetch(method, url, body, &headers, timeout_ms).await?;
-    Ok((key, response))
 }
 
 /// Register print/println/display/newline that write to the output buffer instead of stdout
 type WasmNativeFn = Box<dyn Fn(&[Value]) -> Result<Value, SemaError>>;
 
+/// Make `sema_core::write_stdout`/`write_stderr`'s NON-capturing fallback
+/// (`HOST_STDOUT_HOOK`/`HOST_STDERR_HOOK`) an inert no-op, so `append_output`'s
+/// new `write_stdout` forward has zero effect outside a capturing runtime root.
+/// Without this, the fallback is `print!`/`eprint!` — real syscalls
+/// that are `unsupported` on wasm32-unknown-unknown and `.expect()`-panic
+/// there (the same class of bug this session already found and fixed for
+/// `Instant::now()`/`std::thread::spawn`). Idempotent; called once per
+/// `WasmInterpreter` construction via `register_wasm_io`. HOST-ADAPTER-ONLY: the
+/// wasm host owns the process, so installing the core fallback hooks is
+/// sanctioned (see `sema_core::set_host_stdout_hook`).
+fn install_noop_core_output_hooks() {
+    sema_core::set_host_stdout_hook(Some(Box::new(|_s: &str| {})));
+    sema_core::set_host_stderr_hook(Some(Box::new(|_s: &str| {})));
+}
+
 fn register_wasm_io(env: &Env) {
+    install_noop_core_output_hooks();
     let register = |name: &str, f: WasmNativeFn| {
         env.set(
             sema_core::intern(name),
             Value::native_fn(NativeFn::simple(name, move |args| f(args))),
+        );
+    };
+
+    // HTTP is structurally suspending in a Promise-driven quantum. The value
+    // ABI remains present for synchronous JS entry points, but it rejects with
+    // an actionable boundary error instead of blocking or replaying the root.
+    let register_http = |name: &str, method: &'static str, f: WasmNativeFn| {
+        let f: driver::SyncHttpFn = Rc::from(f);
+        let synchronous = Rc::clone(&f);
+        env.set(
+            sema_core::intern(name),
+            Value::native_fn(NativeFn::simple_with_runtime(
+                name,
+                move |args| (f)(args),
+                driver::runtime_http_fn(method, synchronous),
+            )),
         );
     };
 
@@ -663,7 +695,7 @@ fn register_wasm_io(env: &Env) {
                 }
                 out.push_str(&format!("{arg}"));
             }
-            append_output(&format!("[error] {out}"));
+            append_error_output(&format!("[error] {out}"));
             flush_line();
             Ok(Value::nil())
         }),
@@ -679,7 +711,7 @@ fn register_wasm_io(env: &Env) {
                 }
                 out.push_str(&format!("{arg}"));
             }
-            append_output(&format!("[error] {out}"));
+            append_error_output(&format!("[error] {out}"));
             flush_line();
             Ok(Value::nil())
         }),
@@ -1028,10 +1060,11 @@ fn register_wasm_io(env: &Env) {
         }),
     );
 
-    // --- HTTP via replay-with-cache (async eval catches markers and performs fetch) ---
+    // --- HTTP via Promise-driven runtime suspension ---
 
-    register(
+    register_http(
         "http/get",
+        "GET",
         Box::new(|args: &[Value]| {
             if args.is_empty() || args.len() > 2 {
                 return Err(SemaError::arity("http/get", "1 or 2", args.len()));
@@ -1039,12 +1072,14 @@ fn register_wasm_io(env: &Env) {
             let url = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            wasm_http_request("GET", url, None, args.get(1))
+            let _ = url;
+            Err(synchronous_http_error("http/get"))
         }),
     );
 
-    register(
+    register_http(
         "http/post",
+        "POST",
         Box::new(|args: &[Value]| {
             if args.len() < 2 || args.len() > 3 {
                 return Err(SemaError::arity("http/post", "2 or 3", args.len()));
@@ -1052,12 +1087,14 @@ fn register_wasm_io(env: &Env) {
             let url = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            wasm_http_request("POST", url, Some(&args[1]), args.get(2))
+            let _ = url;
+            Err(synchronous_http_error("http/post"))
         }),
     );
 
-    register(
+    register_http(
         "http/put",
+        "PUT",
         Box::new(|args: &[Value]| {
             if args.len() < 2 || args.len() > 3 {
                 return Err(SemaError::arity("http/put", "2 or 3", args.len()));
@@ -1065,12 +1102,14 @@ fn register_wasm_io(env: &Env) {
             let url = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            wasm_http_request("PUT", url, Some(&args[1]), args.get(2))
+            let _ = url;
+            Err(synchronous_http_error("http/put"))
         }),
     );
 
-    register(
+    register_http(
         "http/delete",
+        "DELETE",
         Box::new(|args: &[Value]| {
             if args.is_empty() || args.len() > 2 {
                 return Err(SemaError::arity("http/delete", "1 or 2", args.len()));
@@ -1078,12 +1117,14 @@ fn register_wasm_io(env: &Env) {
             let url = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            wasm_http_request("DELETE", url, None, args.get(1))
+            let _ = url;
+            Err(synchronous_http_error("http/delete"))
         }),
     );
 
-    register(
+    register_http(
         "http/request",
+        "REQUEST",
         Box::new(|args: &[Value]| {
             if args.len() < 2 || args.len() > 4 {
                 return Err(SemaError::arity("http/request", "2-4", args.len()));
@@ -1094,9 +1135,8 @@ fn register_wasm_io(env: &Env) {
             let url = args[1]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-            let body = args.get(2);
-            let opts = args.get(3);
-            wasm_http_request(method, url, body, opts)
+            let _ = (method, url);
+            Err(synchronous_http_error("http/request"))
         }),
     );
 
@@ -1662,12 +1702,134 @@ fn register_wasm_io(env: &Env) {
     );
 }
 
+/// Bridges one [`WasmInterpreter::eval_promise`] call into the compatibility
+/// `{"value":...,"output":[...],"error":...}` JSON shape shared by
+/// `evalAsync`, `evalVMAsync`, and `runEntryAsync`.
+///
+/// Installs a private `Closure`-backed `setPromiseOutputSink` for the
+/// duration of one call, collecting only the lines tagged with the root id
+/// this call's `on_root_id` callback reports. The sink belongs to this
+/// interpreter's driver, so a different interpreter may use the same local
+/// root id without cross-talk. Restores whatever sink predates the call.
+struct PromiseCapture {
+    driver: Rc<driver::PromiseDriver>,
+    collected: Rc<RefCell<Vec<String>>>,
+    target_root: Rc<Cell<Option<f64>>>,
+    previous_sink: Option<js_sys::Function>,
+    // Retained only to keep the underlying JS functions alive until this
+    // capture is dropped (after the awaited promise settles) — never called
+    // directly from Rust.
+    _sink_closure: Closure<dyn FnMut(f64, JsValue, JsValue)>,
+    _on_root_closure: Closure<dyn FnMut(f64)>,
+    on_root_js: JsValue,
+}
+
+impl PromiseCapture {
+    fn install(driver: &Rc<driver::PromiseDriver>) -> Self {
+        let collected: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let target_root: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
+        let previous_sink = driver.take_output_sink();
+
+        let sink_collected = Rc::clone(&collected);
+        let sink_root = Rc::clone(&target_root);
+        let sink_closure = Closure::wrap(Box::new(
+            move |root_id: f64, _stream: JsValue, text: JsValue| {
+                if sink_root.get() == Some(root_id) {
+                    if let Some(text) = text.as_string() {
+                        sink_collected.borrow_mut().push(text);
+                    }
+                }
+            },
+        ) as Box<dyn FnMut(f64, JsValue, JsValue)>);
+        driver.set_output_sink(Some(
+            sink_closure
+                .as_ref()
+                .unchecked_ref::<js_sys::Function>()
+                .clone(),
+        ));
+
+        let on_root_root = Rc::clone(&target_root);
+        let on_root_closure = Closure::wrap(Box::new(move |root_id: f64| {
+            on_root_root.set(Some(root_id));
+        }) as Box<dyn FnMut(f64)>);
+        let on_root_js: JsValue = on_root_closure
+            .as_ref()
+            .unchecked_ref::<js_sys::Function>()
+            .clone()
+            .into();
+
+        Self {
+            driver: Rc::clone(driver),
+            collected,
+            target_root,
+            previous_sink,
+            _sink_closure: sink_closure,
+            _on_root_closure: on_root_closure,
+            on_root_js,
+        }
+    }
+
+    /// The `on_root_id` callback argument to pass to `eval_promise`.
+    fn on_root_id(&self) -> JsValue {
+        self.on_root_js.clone()
+    }
+
+    /// Await `promise` to settlement, restore the previous output sink, and
+    /// build the compatibility JSON result from the resolved/rejected value plus
+    /// whatever output was captured for this call's root.
+    async fn await_as_old_json(self, promise: js_sys::Promise) -> JsValue {
+        let _ = &self.target_root; // kept alive for the sink closure's Weak-free capture
+        let settled = JsFuture::from(promise).await;
+        self.driver.set_output_sink(self.previous_sink.clone());
+
+        let output_lines = self.collected.borrow();
+        let output_json = output_lines
+            .iter()
+            .map(|s| format!("\"{}\"", escape_json(s)))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let json_str = match settled {
+            Ok(value) => {
+                let val_str = match value.as_string() {
+                    Some(s) => format!("\"{}\"", escape_json(&s)),
+                    None => "null".to_string(),
+                };
+                format!("{{\"value\":{val_str},\"output\":[{output_json}],\"error\":null}}")
+            }
+            Err(err) => {
+                let message = js_err(&err);
+                format!(
+                    "{{\"value\":null,\"output\":[{output_json}],\"error\":\"{}\"}}",
+                    escape_json(&message)
+                )
+            }
+        };
+        js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
+    }
+}
+
 #[wasm_bindgen(js_name = SemaInterpreter)]
 pub struct WasmInterpreter {
-    inner: sema_eval::Interpreter,
+    // `Rc` (not a bare `Interpreter`) so `evalPromise` (`driver.rs`) can share
+    // it with the macrotask driver's callback, which runs detached from any
+    // JS call stack / `&self` borrow. Every existing method's `self.inner.foo()`
+    // call keeps compiling unchanged (`Rc<T>` derefs transparently to `T`).
+    inner: std::rc::Rc<sema_eval::Interpreter>,
+    promise_driver: std::rc::Rc<driver::PromiseDriver>,
     callback_handles: std::rc::Rc<RefCell<BTreeMap<u32, Value>>>,
     callback_ids_by_value: std::rc::Rc<RefCell<BTreeMap<u64, u32>>>,
     next_callback_id: std::rc::Rc<Cell<u32>>,
+}
+
+impl Drop for WasmInterpreter {
+    fn drop(&mut self) {
+        if let LegacyStopAction::Cancel(session) = request_legacy_debug_stop(&self.inner) {
+            let _ = session
+                .handle
+                .cancel(sema_core::runtime::CancelReason::HostStop);
+        }
+    }
 }
 
 impl Default for WasmInterpreter {
@@ -1690,7 +1852,11 @@ type LoadedArchiveInfo = (
 impl WasmInterpreter {
     #[wasm_bindgen(constructor)]
     pub fn new() -> WasmInterpreter {
-        let interp = sema_eval::Interpreter::new();
+        // Promise-based HTTP parks on an External wait, so the WASM interpreter
+        // needs the browser-backed executor rather than the platform-default
+        // NullExecutor.
+        let interp =
+            sema_eval::Interpreter::new_with_executor(std::sync::Arc::new(driver::WasmExecutor));
 
         // Override print/println/display with our buffer-based versions
         register_wasm_io(&interp.global_env);
@@ -1699,8 +1865,10 @@ impl WasmInterpreter {
         // 10M steps is enough for complex examples but prevents runaway computation.
         interp.ctx.set_eval_step_limit(10_000_000);
 
+        let inner = std::rc::Rc::new(interp);
         WasmInterpreter {
-            inner: interp,
+            promise_driver: driver::PromiseDriver::new(std::rc::Rc::clone(&inner)),
+            inner,
             callback_handles: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
             callback_ids_by_value: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
             next_callback_id: std::rc::Rc::new(Cell::new(1)),
@@ -1755,6 +1923,127 @@ impl WasmInterpreter {
             }
         };
         js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
+    }
+
+    /// Evaluate `code` as ONE root on the unified runtime and return a
+    /// `Promise` that resolves with its printed value (or `null`) and rejects
+    /// with an `Error` on failure. The body runs once; `async/sleep` and
+    /// `http/get` suspend the root in place. Output is
+    /// NOT included in the resolved value: install `setPromiseOutputSink` to
+    /// receive this root's `println`/`print-err` output, tagged with its
+    /// root id, as it happens.
+    ///
+    /// `on_root_id`, if a function, is called SYNCHRONOUSLY (before this
+    /// method returns) with the new root's id as a JS `number` — the only way
+    /// a caller can learn it in time to route a later [`Self::cancel_root`]
+    /// call at the exact root this call submitted. The playground worker
+    /// protocol uses this to implement "Stop". Pass
+    /// `null`/`undefined` to skip.
+    #[wasm_bindgen(js_name = evalPromise)]
+    pub fn eval_promise(&self, code: &str, on_root_id: JsValue) -> js_sys::Promise {
+        let driver = Rc::clone(&self.promise_driver);
+        let code = code.to_string();
+        let on_root_id = on_root_id.dyn_into::<js_sys::Function>().ok();
+        js_sys::Promise::new(&mut |resolve, reject| {
+            driver::submit(&driver, &code, resolve, reject, on_root_id.clone());
+        })
+    }
+
+    /// Request cancellation of the root whose id was reported by
+    /// [`Self::eval_promise`]'s `on_root_id` callback. Returns `false` if no
+    /// pending `evalPromise` root matches `root_id` (already settled, or
+    /// never existed) — a harmless no-op, same liveness contract as the
+    /// underlying `RuntimeCommandHandle::cancel_root`. It only accepts roots
+    /// registered with this Promise driver.
+    #[wasm_bindgen(js_name = cancelRoot)]
+    pub fn cancel_root(&self, root_id: f64) -> bool {
+        driver::cancel_root(&self.promise_driver, root_id)
+    }
+
+    /// Install (or clear, passing `null`/`undefined`) the JS callback that
+    /// receives `evalPromise` roots' output as `(rootId, stream, text)`,
+    /// where `stream` is `"stdout"` or `"stderr"`. Independent of
+    /// `setOutputSink` (the synchronous line-batched sink) — the two never
+    /// observe each other's output.
+    #[wasm_bindgen(js_name = setPromiseOutputSink)]
+    pub fn set_promise_output_sink(&self, sink: JsValue) {
+        self.promise_driver
+            .set_output_sink(sink.dyn_into::<js_sys::Function>().ok());
+    }
+
+    /// Shared body for the compatibility `evalAsync`, `evalVMAsync`, and
+    /// `runEntryAsync` entry points. Submits `src` as one root via
+    /// [`Self::eval_promise`] and awaits it, so
+    /// `http/get`/`async/sleep` inside it get the real, single-execution
+    /// runtime-ABI suspend (no replay or blocking host wait) — but rebuilds
+    /// their `{"value":...,"output":[...],"error":...}` JSON shape these
+    /// callers (the playground's `?no-worker` fallback, `sema-web.js`) still
+    /// expect, so this is a behavior-preserving wrapper, not a signature
+    /// change.
+    ///
+    /// Output capture: `eval_promise` only delivers a root's output through
+    /// the interpreter's `setPromiseOutputSink` channel, tagged by root id — there is
+    /// no way to "read it back" after the fact (a real `setPromiseOutputSink`
+    /// caller, if any, would already have drained it by the next drive turn).
+    /// This installs a private `Closure`-backed sink for the duration of the
+    /// call that only collects lines tagged with THIS call's root id, then
+    /// restores whatever sink was previously installed — so a concurrent real
+    /// `evalPromise`/`setPromiseOutputSink` caller on the same interpreter
+    /// (not a supported combination for the compatibility wrappers, but not
+    /// corrupted either) gets its sink back exactly as it left it.
+    ///
+    /// Error fidelity: `eval_promise` rejects with a plain JS `Error`, but
+    /// `driver::reject_with_error` bakes the full inner message + stack trace
+    /// + hint + note into its `.message`, so extracting that text reproduces
+    /// the compatibility entry points' `"error"` field exactly.
+    async fn eval_once_via_promise_seam(&self, code: &str) -> JsValue {
+        let capture = PromiseCapture::install(&self.promise_driver);
+        let promise = self.eval_promise(code, capture.on_root_id());
+        capture.await_as_old_json(promise).await
+    }
+
+    /// Like [`Self::eval_once_via_promise_seam`], but the submission itself
+    /// (the ONLY synchronous part of an `eval_promise` call — see that
+    /// method's doc) runs with `path` pushed as the current file, so a
+    /// source-text archive entry gets correct relative-import resolution and
+    /// stack-trace file attribution — matching what
+    /// `run_embedded_entry_result`'s direct-eval path did with
+    /// `push_file_path`/`pop_file_path`. Used only by `runEntryAsync`'s
+    /// source-file branch; a precompiled bytecode entry has no
+    /// submit-a-root equivalent and stays on the direct single-execution path.
+    async fn eval_once_via_promise_seam_at_path(
+        &self,
+        code: &str,
+        path: &std::path::Path,
+    ) -> JsValue {
+        let capture = PromiseCapture::install(&self.promise_driver);
+        self.inner.ctx.push_file_path(path.to_path_buf());
+        let promise = self.eval_promise(code, capture.on_root_id());
+        self.inner.ctx.pop_file_path();
+        capture.await_as_old_json(promise).await
+    }
+
+    /// Await an already-submitted root through this interpreter's macrotask
+    /// driver while preserving the compatibility JSON/output shape. Used by
+    /// precompiled archive entries, whose deserialized VM must not be rebuilt
+    /// or executed through the synchronous host boundary.
+    async fn await_submitted_root_via_promise_seam(
+        &self,
+        handle: sema_vm::runtime::RootHandle,
+    ) -> JsValue {
+        let capture = PromiseCapture::install(&self.promise_driver);
+        let driver = Rc::clone(&self.promise_driver);
+        let on_root = capture.on_root_id().dyn_into::<js_sys::Function>().ok();
+        let mut handle = Some(handle);
+        let promise = js_sys::Promise::new(&mut move |resolve, reject| {
+            if let Some(handle) = handle.take() {
+                driver::adopt(&driver, handle, resolve, reject, on_root.clone());
+            } else {
+                let error = js_sys::Error::new("archive root was already adopted");
+                let _ = reject.call1(&JsValue::NULL, &error);
+            }
+        });
+        capture.await_as_old_json(promise).await
     }
 
     /// Evaluate in the global env so defines persist
@@ -1857,193 +2146,184 @@ impl WasmInterpreter {
         js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
     }
 
-    /// Evaluate code with async HTTP support in the persistent global env
-    /// (top-level defines persist across calls). Runs on the bytecode VM.
+    /// Evaluate code with real (single-execution) async HTTP/sleep support in
+    /// the persistent global env (top-level defines persist across calls).
+    ///
+    /// A thin Promise-returning wrapper over [`Self::eval_promise`], kept as
+    /// its own entry point so existing JS callers
+    /// (`sema-web.js`, the playground's `?no-worker` fallback) don't have to
+    /// change; the program body is submitted as ONE root and never replayed.
+    /// See [`Self::eval_once_via_promise_seam`].
     #[wasm_bindgen(js_name = evalAsync)]
     pub async fn eval_async(&self, code: &str) -> JsValue {
-        clear_http_cache();
-
-        for _ in 0..MAX_REPLAYS {
-            OUTPUT.with(|o| o.borrow_mut().clear());
-            LINE_BUF.with(|b| b.borrow_mut().clear());
-
-            match self.inner.eval_str_in_global(code) {
-                Ok(val) => {
-                    let output = take_output();
-                    let val_str = if val.is_nil() {
-                        "null".to_string()
-                    } else {
-                        format!("\"{}\"", escape_json(&pretty_print(&val, 80)))
-                    };
-                    let json_str = format!(
-                        "{{\"value\":{},\"output\":[{}],\"error\":null}}",
-                        val_str,
-                        output
-                            .iter()
-                            .map(|s| format!("\"{}\"", escape_json(s)))
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    );
-                    return js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL);
-                }
-                Err(e) => {
-                    if is_http_await_marker(&e) {
-                        if let Some(json_str) = parse_http_marker(&e) {
-                            match perform_fetch_from_marker(&json_str).await {
-                                Ok((key, response)) => {
-                                    HTTP_CACHE.with(|c| {
-                                        c.borrow_mut().insert(key, response);
-                                    });
-                                    continue;
-                                }
-                                Err(fetch_err) => {
-                                    let output = take_output();
-                                    let err_str = format!("{}", fetch_err.inner());
-                                    let json_str = format!(
-                                        "{{\"value\":null,\"output\":[{}],\"error\":\"{}\"}}",
-                                        output
-                                            .iter()
-                                            .map(|s| format!("\"{}\"", escape_json(s)))
-                                            .collect::<Vec<_>>()
-                                            .join(","),
-                                        escape_json(&err_str)
-                                    );
-                                    return js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL);
-                                }
-                            }
-                        }
-                    }
-                    let output = take_output();
-                    let mut err_str = format!("{}", e.inner());
-                    if let Some(trace) = e.stack_trace() {
-                        err_str.push_str(&format!("\n{trace}"));
-                    }
-                    if let Some(hint) = e.hint() {
-                        err_str.push_str(&format!("\n  hint: {hint}"));
-                    }
-                    if let Some(note) = e.note() {
-                        err_str.push_str(&format!("\n  note: {note}"));
-                    }
-                    let json_str = format!(
-                        "{{\"value\":null,\"output\":[{}],\"error\":\"{}\"}}",
-                        output
-                            .iter()
-                            .map(|s| format!("\"{}\"", escape_json(s)))
-                            .collect::<Vec<_>>()
-                            .join(","),
-                        escape_json(&err_str)
-                    );
-                    return js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL);
-                }
-            }
-        }
-
-        let json_str = format!(
-            "{{\"value\":null,\"output\":[],\"error\":\"{}\"}}",
-            escape_json("exceeded maximum number of HTTP requests (50)")
-        );
-        js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
+        self.eval_once_via_promise_seam(code).await
     }
 
-    /// Evaluate code with async HTTP support (bytecode VM)
+    /// Evaluate code with real (single-execution) async HTTP/sleep support
+    /// (bytecode VM). See [`Self::eval_async`] — identical wrapper; kept as a
+    /// separate name for the same JS-compat reason.
     #[wasm_bindgen(js_name = evalVMAsync)]
     pub async fn eval_vm_async(&self, code: &str) -> JsValue {
-        clear_http_cache();
+        self.eval_once_via_promise_seam(code).await
+    }
 
-        for _ in 0..MAX_REPLAYS {
-            OUTPUT.with(|o| o.borrow_mut().clear());
-            LINE_BUF.with(|b| b.borrow_mut().clear());
-
-            match self.inner.eval_str_compiled(code) {
-                Ok(val) => {
-                    let output = take_output();
-                    let val_str = if val.is_nil() {
-                        "null".to_string()
-                    } else {
-                        format!("\"{}\"", escape_json(&pretty_print(&val, 80)))
-                    };
-                    let json_str = format!(
-                        "{{\"value\":{},\"output\":[{}],\"error\":null}}",
-                        val_str,
-                        output
-                            .iter()
-                            .map(|s| format!("\"{}\"", escape_json(s)))
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    );
-                    return js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL);
-                }
-                Err(e) => {
-                    if is_http_await_marker(&e) {
-                        if let Some(json_str) = parse_http_marker(&e) {
-                            match perform_fetch_from_marker(&json_str).await {
-                                Ok((key, response)) => {
-                                    HTTP_CACHE.with(|c| {
-                                        c.borrow_mut().insert(key, response);
-                                    });
-                                    continue;
-                                }
-                                Err(fetch_err) => {
-                                    let output = take_output();
-                                    let err_str = format!("{}", fetch_err.inner());
-                                    let json_str = format!(
-                                        "{{\"value\":null,\"output\":[{}],\"error\":\"{}\"}}",
-                                        output
-                                            .iter()
-                                            .map(|s| format!("\"{}\"", escape_json(s)))
-                                            .collect::<Vec<_>>()
-                                            .join(","),
-                                        escape_json(&err_str)
-                                    );
-                                    return js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL);
-                                }
-                            }
-                        }
-                    }
-                    let output = take_output();
-                    let mut err_str = format!("{}", e.inner());
-                    if let Some(trace) = e.stack_trace() {
-                        err_str.push_str(&format!("\n{trace}"));
-                    }
-                    if let Some(hint) = e.hint() {
-                        err_str.push_str(&format!("\n  hint: {hint}"));
-                    }
-                    if let Some(note) = e.note() {
-                        err_str.push_str(&format!("\n  note: {note}"));
-                    }
-                    let json_str = format!(
-                        "{{\"value\":null,\"output\":[{}],\"error\":\"{}\"}}",
-                        output
-                            .iter()
-                            .map(|s| format!("\"{}\"", escape_json(s)))
-                            .collect::<Vec<_>>()
-                            .join(","),
-                        escape_json(&err_str)
-                    );
-                    return js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL);
-                }
-            }
+    /// Start a per-interpreter, Promise-driven debug session. The returned
+    /// Promise settles only at a stable stop or terminal outcome; timer/HTTP
+    /// waits yield to the browser and resume the same runtime root.
+    #[wasm_bindgen(js_name = debugStartPromise)]
+    pub fn debug_start_promise(
+        &self,
+        code: &str,
+        breakpoint_lines: &js_sys::Array,
+    ) -> js_sys::Promise {
+        let reservation = match driver::reserve_promise_admission(&self.promise_driver) {
+            Ok(reservation) => reservation,
+            Err(message) => return js_sys::Promise::resolve(&self.debug_error_str(message)),
+        };
+        if driver::debug_action_is_driving(&self.promise_driver) {
+            return js_sys::Promise::resolve(
+                &self.debug_error_str("A Promise debug action is already running"),
+            );
+        }
+        self.inner.ctx.eval_steps.set(0);
+        let bp_lines: Vec<u32> = breakpoint_lines
+            .iter()
+            .filter_map(|value| value.as_f64().map(|line| line as u32))
+            .collect();
+        let (exprs, spans) = match sema_reader::read_many_with_spans(code) {
+            Ok(parsed) => parsed,
+            Err(error) => return js_sys::Promise::resolve(&self.debug_error_result(&error)),
+        };
+        self.inner.ctx.merge_span_table(spans);
+        if exprs.is_empty() {
+            return js_sys::Promise::resolve(&self.debug_finished_result(&sema_core::Value::nil()));
+        }
+        let expanded: Vec<_> = match self.inner.expand_for_vm_batch(&exprs) {
+            Ok(values) => values.into_iter().filter(|value| !value.is_nil()).collect(),
+            Err(error) => return js_sys::Promise::resolve(&self.debug_error_result(&error)),
+        };
+        if expanded.is_empty() {
+            return js_sys::Promise::resolve(&self.debug_finished_result(&sema_core::Value::nil()));
         }
 
-        let json_str = format!(
-            "{{\"value\":null,\"output\":[],\"error\":\"{}\"}}",
-            escape_json("exceeded maximum number of HTTP requests (50)")
-        );
-        js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
+        let source_file = std::path::PathBuf::from("<playground>");
+        let span_map = self.inner.ctx.span_table.borrow().clone();
+        let program = match sema_vm::compile_program_with_spans(
+            &expanded,
+            &span_map,
+            Some(source_file.clone()),
+        ) {
+            Ok(program) => program,
+            Err(error) => return js_sys::Promise::resolve(&self.debug_error_result(&error)),
+        };
+        let valid_lines = sema_vm::valid_breakpoint_lines(&program.closure, &program.functions);
+        let snapped: Vec<u32> = bp_lines
+            .iter()
+            .filter_map(|line| sema_vm::snap_breakpoint_line(*line, &valid_lines))
+            .collect();
+        let mut vm = match sema_vm::VM::new(
+            self.inner.global_env.clone(),
+            program.functions,
+            &[],
+            program.main_cache_slots,
+        ) {
+            Ok(vm) => vm,
+            Err(error) => {
+                return js_sys::Promise::resolve(
+                    &self.debug_error_str(&format!("VM init error: {error}")),
+                );
+            }
+        };
+        vm.seed_main_frame(program.closure);
+
+        let mut debug = sema_vm::DebugState::new_headless();
+        if !snapped.is_empty() {
+            debug.set_breakpoints(&source_file, &snapped);
+        }
+        debug.step_mode = if snapped.is_empty() {
+            sema_vm::StepMode::StepInto
+        } else {
+            sema_vm::StepMode::Continue
+        };
+        debug.instructions_remaining = WASM_DEBUG_INSTRUCTION_BUDGET;
+        if let Err(message) = reservation.ensure_pending() {
+            return js_sys::Promise::resolve(&self.debug_error_str(message));
+        }
+        driver::start_debug(&self.promise_driver, vm, debug, valid_lines, snapped)
+    }
+
+    #[wasm_bindgen(js_name = debugContinuePromise)]
+    pub fn debug_continue_promise(&self) -> js_sys::Promise {
+        driver::resume_debug(&self.promise_driver, sema_vm::StepMode::Continue)
+    }
+
+    #[wasm_bindgen(js_name = debugStepIntoPromise)]
+    pub fn debug_step_into_promise(&self) -> js_sys::Promise {
+        driver::resume_debug(&self.promise_driver, sema_vm::StepMode::StepInto)
+    }
+
+    #[wasm_bindgen(js_name = debugStepOverPromise)]
+    pub fn debug_step_over_promise(&self) -> js_sys::Promise {
+        driver::resume_debug(&self.promise_driver, sema_vm::StepMode::StepOver)
+    }
+
+    #[wasm_bindgen(js_name = debugStepOutPromise)]
+    pub fn debug_step_out_promise(&self) -> js_sys::Promise {
+        driver::resume_debug(&self.promise_driver, sema_vm::StepMode::StepOut)
+    }
+
+    #[wasm_bindgen(js_name = debugStopPromise)]
+    pub fn debug_stop_promise(&self) -> bool {
+        driver::stop_debug(&self.promise_driver)
+    }
+
+    #[wasm_bindgen(js_name = debugGetLocalsPromise)]
+    pub fn debug_get_locals_promise(&self) -> JsValue {
+        driver::debug_locals(&self.promise_driver)
+    }
+
+    #[wasm_bindgen(js_name = debugGetStackTracePromise)]
+    pub fn debug_get_stack_trace_promise(&self) -> JsValue {
+        driver::debug_stack_trace(&self.promise_driver)
+    }
+
+    #[wasm_bindgen(js_name = debugSetBreakpointsPromise)]
+    pub fn debug_set_breakpoints_promise(&self, lines: &js_sys::Array) -> bool {
+        let lines: Vec<u32> = lines
+            .iter()
+            .filter_map(|value| value.as_f64().map(|line| line as u32))
+            .collect();
+        driver::set_debug_breakpoints(&self.promise_driver, &lines)
+    }
+
+    #[wasm_bindgen(js_name = debugIsActivePromise)]
+    pub fn debug_is_active_promise(&self) -> bool {
+        driver::debug_is_active(&self.promise_driver)
     }
 
     /// Start a debug session. Compiles the code, sets breakpoints on given lines,
     /// and runs until the first stop or completion.
-    /// Returns JSON: { status: "stopped"|"finished"|"error"|"http_needed", ... }
+    /// Returns JSON: { status: "stopped"|"finished"|"error", ... }
     #[wasm_bindgen(js_name = debugStart)]
     pub fn debug_start(&self, code: &str, breakpoint_lines: &js_sys::Array) -> JsValue {
+        if self.promise_driver.blocks_legacy_debug_start() {
+            return self.debug_error_str(
+                "the synchronous debugger cannot start while Promise-driven execution is active on this interpreter",
+            );
+        }
+        let (mut start_reservation, replaced_session) =
+            match reserve_legacy_debug_start(&self.inner) {
+                Ok(reservation) => reservation,
+                Err(message) => return self.debug_error_str(message),
+            };
+        if let Some(session) = replaced_session {
+            cancel_debug_root(self.inner.runtime(), &session.handle);
+        }
+        if let Err(message) = start_reservation.ensure_pending() {
+            return self.debug_error_str(message);
+        }
         // The debugger always executes on the VM, so a `(load ...)` runs the
         // loaded body on the VM regardless of which eval the playground ran last.
-        // End any existing session
-        DEBUG_SESSION.with(|s| {
-            *s.borrow_mut() = None;
-        });
-
         OUTPUT.with(|o| o.borrow_mut().clear());
         LINE_BUF.with(|b| b.borrow_mut().clear());
         // Reset the loop-guard step counter so the limit is per debug session.
@@ -2069,6 +2349,9 @@ impl WasmInterpreter {
             Ok(v) => v.into_iter().filter(|e| !e.is_nil()).collect(),
             Err(e) => return self.debug_error_result(&e),
         };
+        if let Err(message) = start_reservation.ensure_pending() {
+            return self.debug_error_str(message);
+        }
         if expanded.is_empty() {
             return self.debug_finished_result(&sema_core::Value::nil());
         }
@@ -2103,12 +2386,15 @@ impl WasmInterpreter {
             Ok(vm) => vm,
             Err(e) => return JsValue::from_str(&format!("VM init error: {e}")),
         };
+        vm.seed_main_frame(prog.closure);
 
-        // Register the async scheduler, exactly like the normal eval path
-        // (run_exprs_on_vm) and the native DAP server do. Without this, debugging
-        // a program that uses async/await/channels fails with "async/spawn: no
-        // async scheduler registered".
-        sema_vm::init_scheduler(self.inner.global_env.clone(), prog.native_table.clone());
+        let runtime = self.inner.runtime();
+        if let Err(message) = start_reservation.ensure_pending() {
+            return self.debug_error_str(message);
+        }
+        if runtime.is_debug_paused() {
+            return self.debug_error_str("Another debug session is already paused");
+        }
 
         let mut debug = sema_vm::DebugState::new_headless();
 
@@ -2142,42 +2428,151 @@ impl WasmInterpreter {
             result
         };
 
-        match vm.start_cooperative(prog.closure, &self.inner.ctx, &mut debug) {
-            Ok(sema_vm::VmExecResult::Stopped(info)) => {
-                let result = attach_bp_info(self.debug_stopped_result(&info));
-                DEBUG_SESSION.with(|s| {
-                    *s.borrow_mut() = Some(DebugSession { vm, debug });
-                });
-                result
-            }
-            Ok(sema_vm::VmExecResult::Yielded) => {
-                let result = attach_bp_info(self.debug_yielded_result());
-                DEBUG_SESSION.with(|s| {
-                    *s.borrow_mut() = Some(DebugSession { vm, debug });
-                });
-                result
-            }
-            Ok(sema_vm::VmExecResult::Finished(v)) => {
-                attach_bp_info(self.debug_finished_result(&v))
-            }
-            Ok(sema_vm::VmExecResult::AsyncYield(_)) => attach_bp_info(self.debug_yielded_result()),
-            Err(e) => self.debug_maybe_http_error(&e),
+        // Submit the seeded VM as a fresh root on the interpreter's persistent
+        // runtime and drive to the first stop/settlement under the debug session.
+        let handle = match runtime.submit_root(vm) {
+            Ok(handle) => handle,
+            Err(e) => return self.debug_error_str(&format!("debug root submission failed: {e:?}")),
+        };
+        let session = Box::new(DebugSession {
+            owner: Rc::downgrade(&self.inner),
+            debug,
+            handle,
+        });
+        if let Err(session) = start_reservation.activate(session) {
+            cancel_debug_root(runtime, &session.handle);
+            return self
+                .debug_error_str("synchronous debug start was stopped before root activation");
         }
+        attach_bp_info(self.debug_drive())
     }
 
-    /// Perform an HTTP fetch from a debug marker and cache the result.
-    /// Called by JS in response to a "http_needed" status.
-    /// Takes the marker JSON from the request field. Returns true on success.
-    #[wasm_bindgen(js_name = debugPerformFetch)]
-    pub async fn debug_perform_fetch(&self, marker_json: &str) -> bool {
-        match perform_fetch_from_marker(marker_json).await {
-            Ok((key, response)) => {
-                HTTP_CACHE.with(|c| {
-                    c.borrow_mut().insert(key, response);
-                });
-                true
+    /// Drive the interpreter's runtime under the active session's `DebugState`
+    /// until it hits a cooperative debug stop or the root settles. Each turn runs
+    /// under an `ActiveDebugGuard` so `run_parked_quantum` runs the debug-aware
+    /// quantum; `DriveState::DebugStopped` becomes a "stopped" response, root
+    /// settlement a "finished"/"error" response. On finish/error the session is
+    /// cleared. Bounded so a pathological program returns "yielded" rather than
+    /// spinning the browser thread.
+    fn debug_drive(&self) -> JsValue {
+        let Some(mut session) = take_legacy_debug_session_for_drive(&self.inner) else {
+            return self.debug_error_str("No active debug session for this interpreter");
+        };
+        let runtime = self.inner.runtime();
+        let root = session.handle.id();
+        let budget = sema_vm::runtime::DriveBudget::host_default();
+        for _ in 0..4_096 {
+            match session.handle.poll_result() {
+                sema_vm::runtime::RootPoll::Ready(settlement) => {
+                    clear_legacy_drive_reservation(&self.inner, root);
+                    return match &settlement.outcome {
+                        sema_core::runtime::TaskOutcome::Returned(value) => {
+                            self.debug_finished_result(value)
+                        }
+                        sema_core::runtime::TaskOutcome::Failed(error) => {
+                            self.debug_error_result(error)
+                        }
+                        sema_core::runtime::TaskOutcome::Cancelled(reason) => {
+                            self.debug_error_str(&format!("debug run cancelled: {reason:?}"))
+                        }
+                    };
+                }
+                sema_vm::runtime::RootPoll::Pending => {}
+                sema_vm::runtime::RootPoll::Aborted(fault) => {
+                    clear_legacy_drive_reservation(&self.inner, root);
+                    return self.debug_error_str(&format!("debug root aborted: {fault:?}"));
+                }
+                sema_vm::runtime::RootPoll::RuntimeDropped
+                | sema_vm::runtime::RootPoll::InvariantViolation => {
+                    clear_legacy_drive_reservation(&self.inner, root);
+                    return self.debug_error_str("debug runtime invariant violation");
+                }
             }
-            Err(_) => false,
+
+            session.debug.instructions_remaining = WASM_DEBUG_INSTRUCTION_BUDGET;
+            let state = {
+                let _guard = sema_vm::ActiveDebugGuard::enter_for_root(&mut session.debug, root);
+                runtime.drive(&budget)
+            };
+            let state = match state {
+                Ok(state) => state,
+                Err(fault) => {
+                    clear_legacy_drive_reservation(&self.inner, root);
+                    return self.debug_error_str(&format!("runtime fault: {fault:?}"));
+                }
+            };
+
+            match legacy_drive_reservation(&self.inner, root) {
+                LegacyDriveReservation::Continue => {}
+                LegacyDriveReservation::Stop => {
+                    cancel_debug_root(runtime, &session.handle);
+                    clear_legacy_drive_reservation(&self.inner, root);
+                    return self.debug_error_str(
+                        "synchronous debug run was stopped by a reentrant callback",
+                    );
+                }
+                LegacyDriveReservation::Lost => {
+                    cancel_debug_root(runtime, &session.handle);
+                    clear_legacy_drive_reservation(&self.inner, root);
+                    return self
+                        .debug_error_str("synchronous debug run lost its ownership reservation");
+                }
+            }
+
+            match state {
+                sema_vm::runtime::DriveState::DebugStopped {
+                    root: stopped_root,
+                    info,
+                    ..
+                } if stopped_root == root => {
+                    let result = self.debug_stopped_result(&info);
+                    return match restore_legacy_debug_session_after_drive(&self.inner, session) {
+                        Ok(()) => result,
+                        Err(session) => {
+                            cancel_debug_root(runtime, &session.handle);
+                            clear_legacy_drive_reservation(&self.inner, root);
+                            self.debug_error_str(
+                                "synchronous debug run could not restore its session",
+                            )
+                        }
+                    };
+                }
+                sema_vm::runtime::DriveState::DebugStopped { .. } => {
+                    cancel_debug_root(runtime, &session.handle);
+                    clear_legacy_drive_reservation(&self.inner, root);
+                    return self.debug_error_str(
+                        "another debug root paused this runtime; use the Promise debugger methods",
+                    );
+                }
+                sema_vm::runtime::DriveState::Progress { .. }
+                | sema_vm::runtime::DriveState::Quiescent
+                | sema_vm::runtime::DriveState::ShutdownComplete => {}
+                sema_vm::runtime::DriveState::Idle { .. } => {
+                    cancel_debug_root(runtime, &session.handle);
+                    clear_legacy_drive_reservation(&self.inner, root);
+                    return self.debug_error_str(
+                        "synchronous debug APIs cannot suspend; use debugStartPromise and the Promise debugger methods",
+                    );
+                }
+            }
+        }
+
+        match legacy_drive_reservation(&self.inner, root) {
+            LegacyDriveReservation::Continue => {
+                match restore_legacy_debug_session_after_drive(&self.inner, session) {
+                    Ok(()) => self.debug_yielded_result(),
+                    Err(session) => {
+                        cancel_debug_root(runtime, &session.handle);
+                        clear_legacy_drive_reservation(&self.inner, root);
+                        self.debug_error_str("synchronous debug run could not restore its session")
+                    }
+                }
+            }
+            LegacyDriveReservation::Stop | LegacyDriveReservation::Lost => {
+                cancel_debug_root(runtime, &session.handle);
+                clear_legacy_drive_reservation(&self.inner, root);
+                self.debug_error_str("synchronous debug run was stopped during execution")
+            }
         }
     }
 
@@ -2203,58 +2598,46 @@ impl WasmInterpreter {
 
     #[wasm_bindgen(js_name = debugPoll)]
     pub fn debug_poll(&self) -> JsValue {
-        DEBUG_SESSION.with(|s| {
-            let mut session = s.borrow_mut();
-            let Some(ref mut sess) = *session else {
-                return self.debug_error_str("No active debug session");
-            };
-
-            sess.debug.instructions_remaining = WASM_DEBUG_INSTRUCTION_BUDGET;
-
-            match sess.vm.run_cooperative(&self.inner.ctx, &mut sess.debug) {
-                Ok(sema_vm::VmExecResult::Stopped(info)) => self.debug_stopped_result(&info),
-                Ok(sema_vm::VmExecResult::Yielded) => self.debug_yielded_result(),
-                Ok(sema_vm::VmExecResult::AsyncYield(_)) => self.debug_yielded_result(),
-                Ok(sema_vm::VmExecResult::Finished(v)) => {
-                    let result = self.debug_finished_result(&v);
-                    *session = None;
-                    result
-                }
-                Err(e) => {
-                    let result = self.debug_maybe_http_error(&e);
-                    *session = None;
-                    result
-                }
-            }
-        })
+        // Keep driving the runtime under the active session (the program yielded
+        // back to JS on a prior turn); returns the same stopped/finished/yielded
+        // mapping as the initial drive.
+        if !legacy_debug_active_for(&self.inner) {
+            return self.debug_error_str("No active debug session");
+        }
+        self.debug_drive()
     }
 
     #[wasm_bindgen(js_name = debugStop)]
     pub fn debug_stop(&self) {
-        DEBUG_SESSION.with(|s| {
-            *s.borrow_mut() = None;
-        });
+        match request_legacy_debug_stop(&self.inner) {
+            LegacyStopAction::Cancel(session) => {
+                cancel_debug_root(self.inner.runtime(), &session.handle);
+            }
+            LegacyStopAction::Requested | LegacyStopAction::None => {}
+        }
     }
 
     #[wasm_bindgen(js_name = debugGetLocals)]
     pub fn debug_get_locals(&self) -> JsValue {
         DEBUG_SESSION.with(|s| {
-            let mut session = s.borrow_mut();
-            let Some(ref mut sess) = *session else {
+            let session = s.borrow();
+            let Some(LegacyDebugSlot::Active(session)) = session.as_ref() else {
                 return JsValue::NULL;
             };
-            // When paused at a breakpoint INSIDE an async task, inspect that
-            // task's per-task VM (its frames hold the task-locals); the main VM
-            // is parked at the `await`. Falls back to the main VM for ordinary
-            // synchronous stops.
-            let locals = sema_vm::with_coop_paused_task_vm(|tvm| {
-                let frame_idx = tvm.frame_count().saturating_sub(1);
-                tvm.debug_locals(frame_idx)
-            })
-            .unwrap_or_else(|| {
-                let frame_idx = sess.vm.frame_count().saturating_sub(1);
-                sess.vm.debug_locals(frame_idx)
-            });
+            if !session.is_owned_by(&self.inner) {
+                return JsValue::NULL;
+            }
+            // Inspect the paused task's own VM (its frames hold the task-locals);
+            // it never leaves the runtime, so `with_paused_task_vm` borrows it in
+            // place. Empty when nothing is paused.
+            let locals = self
+                .inner
+                .runtime()
+                .with_paused_root_vm(session.handle.id(), |tvm| {
+                    let frame_idx = tvm.frame_count().saturating_sub(1);
+                    tvm.debug_locals(frame_idx)
+                })
+                .unwrap_or_default();
             let arr = js_sys::Array::new();
             for var in &locals {
                 let obj = js_sys::Object::new();
@@ -2272,13 +2655,19 @@ impl WasmInterpreter {
     pub fn debug_get_stack_trace(&self) -> JsValue {
         DEBUG_SESSION.with(|s| {
             let session = s.borrow();
-            let Some(ref sess) = *session else {
+            let Some(LegacyDebugSlot::Active(session)) = session.as_ref() else {
                 return js_sys::Array::new().into();
             };
+            if !session.is_owned_by(&self.inner) {
+                return js_sys::Array::new().into();
+            }
             // Mirror debug_get_locals: at an async stop, show the PAUSED TASK's
-            // call stack, not the main VM's (which is parked at the `await`).
-            let frames = sema_vm::with_coop_paused_task_vm(|tvm| tvm.debug_stack_trace())
-                .unwrap_or_else(|| sess.vm.debug_stack_trace());
+            // call stack (its VM is borrowed in place from the runtime).
+            let frames = self
+                .inner
+                .runtime()
+                .with_paused_root_vm(session.handle.id(), |tvm| tvm.debug_stack_trace())
+                .unwrap_or_default();
             let arr = js_sys::Array::new();
             for frame in &frames {
                 let obj = js_sys::Object::new();
@@ -2343,7 +2732,10 @@ impl WasmInterpreter {
             .filter_map(|v| v.as_f64().map(|n| n as u32))
             .collect();
         DEBUG_SESSION.with(|s| {
-            if let Some(ref mut sess) = *s.borrow_mut() {
+            if let Some(LegacyDebugSlot::Active(sess)) = s.borrow_mut().as_mut() {
+                if !sess.is_owned_by(&self.inner) {
+                    return;
+                }
                 let file = std::path::PathBuf::from("<playground>");
                 sess.debug.set_breakpoints(&file, &bp_lines);
             }
@@ -2352,7 +2744,7 @@ impl WasmInterpreter {
 
     #[wasm_bindgen(js_name = debugIsActive)]
     pub fn debug_is_active(&self) -> bool {
-        DEBUG_SESSION.with(|s| s.borrow().is_some())
+        legacy_debug_active_for(&self.inner)
     }
 
     /// Create interpreter with options: {stdlib: false, deny: ["network", "fs-write"]}
@@ -2364,7 +2756,10 @@ impl WasmInterpreter {
             .unwrap_or(true);
 
         let interp = if with_stdlib {
-            sema_eval::Interpreter::new()
+            // See the comment in `WasmInterpreter::new` on why every wasm
+            // interpreter is built with `WasmExecutor`, not the platform
+            // default.
+            sema_eval::Interpreter::new_with_executor(std::sync::Arc::new(driver::WasmExecutor))
         } else {
             use std::rc::Rc;
             let env = sema_core::Env::new();
@@ -2373,7 +2768,12 @@ impl WasmInterpreter {
             sema_core::set_call_callback(&ctx, sema_eval::call_value);
             sema_core::set_call_owned_callback(&ctx, sema_eval::call_value_owned);
             let global_env = Rc::new(env);
-            sema_eval::Interpreter { global_env, ctx }
+            let ctx = Rc::new(ctx);
+            sema_eval::Interpreter::from_parts_with_executor(
+                global_env,
+                ctx,
+                std::sync::Arc::new(driver::WasmExecutor),
+            )
         };
 
         register_wasm_io(&interp.global_env);
@@ -2447,8 +2847,10 @@ impl WasmInterpreter {
             }
         }
 
+        let inner = std::rc::Rc::new(interp);
         WasmInterpreter {
-            inner: interp,
+            promise_driver: driver::PromiseDriver::new(std::rc::Rc::clone(&inner)),
+            inner,
             callback_handles: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
             callback_ids_by_value: std::rc::Rc::new(RefCell::new(BTreeMap::new())),
             next_callback_id: std::rc::Rc::new(Cell::new(1)),
@@ -2742,41 +3144,56 @@ impl WasmInterpreter {
         }
     }
 
-    /// Execute an embedded archive entry path with async HTTP replay support.
+    /// Execute an embedded archive entry path with real (single-execution)
+    /// async HTTP/sleep support.
+    ///
+    /// Source-text and precompiled entries are each submitted as one root and
+    /// adopted by the same macrotask Promise driver. The program body never
+    /// replays, and `http/get`/`async/sleep` resume the original root in place.
     #[wasm_bindgen(js_name = runEntryAsync)]
     pub async fn run_entry_async(&self, path: &str) -> JsValue {
-        clear_http_cache();
-
-        for _ in 0..MAX_REPLAYS {
-            OUTPUT.with(|o| o.borrow_mut().clear());
-            LINE_BUF.with(|b| b.borrow_mut().clear());
-
-            match self.run_embedded_entry_result(path) {
-                Ok(val) => return self.eval_success_result(&val),
-                Err(e) => {
-                    if is_http_await_marker(&e) {
-                        if let Some(json_str) = parse_http_marker(&e) {
-                            match perform_fetch_from_marker(&json_str).await {
-                                Ok((key, response)) => {
-                                    HTTP_CACHE.with(|c| {
-                                        c.borrow_mut().insert(key, response);
-                                    });
-                                    continue;
-                                }
-                                Err(fetch_err) => return self.eval_error_result(&fetch_err),
-                            }
-                        }
-                    }
-                    return self.eval_error_result(&e);
-                }
+        let entry_path = std::path::PathBuf::from(path);
+        let bytes = match self.inner.ctx.get_embedded_file(&entry_path) {
+            Some(bytes) => bytes,
+            None => {
+                return self.eval_error_result(&SemaError::eval(format!(
+                    "embedded entry not found: {path}"
+                )));
             }
+        };
+
+        if sema_vm::is_bytecode_file(&bytes) {
+            if let Err(message) = driver::ensure_promise_admission(&self.promise_driver) {
+                return self.eval_error_result(&SemaError::eval(message));
+            }
+            self.inner.ctx.push_file_path(entry_path.clone());
+            let result = sema_vm::deserialize_from_bytes(&bytes).and_then(|compiled| {
+                self.inner.submit_compile_result(
+                    compiled,
+                    sema_vm::runtime::RootOptions {
+                        name: Some(entry_path.display().to_string()),
+                        capture_output: true,
+                    },
+                )
+            });
+            self.inner.ctx.pop_file_path();
+            return match result {
+                Ok(handle) => self.await_submitted_root_via_promise_seam(handle).await,
+                Err(error) => self.eval_error_result(&error),
+            };
         }
 
-        let json_str = format!(
-            "{{\"value\":null,\"output\":[],\"error\":\"{}\"}}",
-            escape_json("exceeded maximum number of HTTP requests (50)")
-        );
-        js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
+        let source = match String::from_utf8(bytes) {
+            Ok(source) => source,
+            Err(e) => {
+                return self.eval_error_result(&SemaError::eval(format!(
+                    "embedded entry is not valid UTF-8: {e}"
+                )));
+            }
+        };
+
+        self.eval_once_via_promise_seam_at_path(&source, &entry_path)
+            .await
     }
 
     /// Read a file from the virtual filesystem.
@@ -3012,22 +3429,6 @@ impl WasmInterpreter {
         env!("CARGO_PKG_VERSION").to_string()
     }
 
-    /// Enable real wall-clock `async/sleep` via `Atomics.wait` on the given
-    /// control buffer. Call this once from a Web Worker (where blocking is
-    /// allowed), passing an `Int32Array` over a `SharedArrayBuffer` shared with
-    /// the main thread. After this, the scheduler's virtual-clock advances also
-    /// block the worker for the real duration. Do NOT call on the main thread —
-    /// `Atomics.wait` is illegal there; leaving it uninstalled keeps the
-    /// instant virtual-clock behavior.
-    #[wasm_bindgen(js_name = installAtomicsSleep)]
-    pub fn install_atomics_sleep(&self, view: js_sys::Int32Array) {
-        SLEEP_I32.with(|s| *s.borrow_mut() = Some(view));
-        sema_core::set_blocking_sleep_callback(worker_atomics_sleep);
-        // The same control buffer carries the cancel flag (slot 0): the VM loop
-        // guard polls this so a Stop aborts a running program (incl. mid-sleep).
-        sema_core::set_interrupt_callback(worker_check_interrupt);
-    }
-
     /// Install a sink called with each completed output line as it is produced,
     /// so the Web Worker can stream `println` output to the main thread live
     /// (a long-running / sleeping program shows output as it happens). Pass a
@@ -3119,41 +3520,40 @@ impl WasmInterpreter {
     }
 
     fn debug_resume(&self, mode: sema_vm::StepMode) -> JsValue {
-        DEBUG_SESSION.with(|s| {
-            let mut session = s.borrow_mut();
-            let Some(ref mut sess) = *session else {
-                return self.debug_error_str("No active debug session");
+        let runtime = self.inner.runtime();
+        let root = DEBUG_SESSION.with(|slot| {
+            let mut session = slot.borrow_mut();
+            let LegacyDebugSlot::Active(sess) = session.as_mut()? else {
+                return None;
             };
-
+            if !sess.is_owned_by(&self.inner) {
+                return None;
+            }
+            let root = sess.handle.id();
+            if !runtime.is_debug_paused_for(root) {
+                return None;
+            }
             sess.debug.step_mode = mode;
             if mode != sema_vm::StepMode::Continue {
-                // Step depth must be measured against the VM that will actually be
-                // stepped. At a stop INSIDE an async task the resume re-drives that
-                // task's per-task VM (not the main VM, which is parked at the
-                // await), so StepOver/StepOut depth comparisons must use the task's
-                // frame count. Falls back to the main VM for ordinary sync stops.
-                sess.debug.step_frame_depth =
-                    sema_vm::with_coop_paused_task_vm(|tvm| tvm.frame_count())
-                        .unwrap_or_else(|| sess.vm.frame_count());
-            }
-            sess.debug.instructions_remaining = WASM_DEBUG_INSTRUCTION_BUDGET;
-
-            match sess.vm.run_cooperative(&self.inner.ctx, &mut sess.debug) {
-                Ok(sema_vm::VmExecResult::Stopped(info)) => self.debug_stopped_result(&info),
-                Ok(sema_vm::VmExecResult::Yielded) => self.debug_yielded_result(),
-                Ok(sema_vm::VmExecResult::AsyncYield(_)) => self.debug_yielded_result(),
-                Ok(sema_vm::VmExecResult::Finished(v)) => {
-                    let result = self.debug_finished_result(&v);
-                    *session = None;
-                    result
-                }
-                Err(e) => {
-                    let result = self.debug_maybe_http_error(&e);
-                    *session = None;
-                    result
+                // Step depth must be measured against the paused task's own VM
+                // (the one that resumes), not any parent parked at the await —
+                // so StepOver/StepOut depth comparisons are task-correct.
+                if let Some(depth) = runtime.with_paused_root_vm(root, |tvm| tvm.frame_count()) {
+                    sess.debug.step_frame_depth = depth;
                 }
             }
-        })
+            Some(root)
+        });
+        let Some(root) = root else {
+            return self.debug_error_str("No paused synchronous debug session");
+        };
+        // Clear the debug barrier (re-enqueue the paused task) with the step mode
+        // now set, then drive to the next stop/settlement.
+        if !runtime.debug_resume_root(root) {
+            self.debug_stop();
+            return self.debug_error_str("The synchronous debugger lost its paused root");
+        }
+        self.debug_drive()
     }
 
     fn debug_stopped_result(&self, info: &sema_vm::StopInfo) -> JsValue {
@@ -3204,29 +3604,6 @@ impl WasmInterpreter {
             .collect::<Vec<_>>()
             .join(",");
         let json_str = format!("{{\"status\":\"yielded\",\"output\":[{}]}}", output_json,);
-        js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
-    }
-
-    /// Check if an error is an HTTP await marker; if so, return an "http_needed"
-    /// result so JS can perform the fetch and restart the debug session.
-    fn debug_maybe_http_error(&self, e: &sema_core::SemaError) -> JsValue {
-        if let Some(json_payload) = parse_http_marker(e) {
-            return self.debug_http_needed_result(&json_payload);
-        }
-        self.debug_error_result(e)
-    }
-
-    fn debug_http_needed_result(&self, marker_json: &str) -> JsValue {
-        let output = take_output();
-        let output_json = output
-            .iter()
-            .map(|s| format!("\"{}\"", escape_json(s)))
-            .collect::<Vec<_>>()
-            .join(",");
-        let json_str = format!(
-            "{{\"status\":\"http_needed\",\"output\":[{}],\"request\":{}}}",
-            output_json, marker_json,
-        );
         js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
     }
 
@@ -3450,25 +3827,9 @@ fn escape_json(s: &str) -> String {
     out
 }
 
-/// Clamp a user-supplied timeout (milliseconds, u64) to a valid setTimeout
-/// delay. A bare `as i32` wrapped values > ~2.1e9 ms to negative/zero, which
-/// made the abort controller fire immediately and break the request.
-fn clamp_timeout_ms(ms: u64) -> i32 {
-    i32::try_from(ms).unwrap_or(i32::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn clamp_timeout_ms_does_not_wrap_to_negative() {
-        // ~ 3 billion ms is well past i32::MAX; old `as i32` wrapped negative.
-        assert_eq!(clamp_timeout_ms(3_000_000_000), i32::MAX);
-        assert_eq!(clamp_timeout_ms(u64::MAX), i32::MAX);
-        assert_eq!(clamp_timeout_ms(5000), 5000);
-        assert!(clamp_timeout_ms(3_000_000_000) > 0);
-    }
 
     #[test]
     fn escape_json_handles_basic_escapes() {
@@ -3489,6 +3850,26 @@ mod tests {
         );
         // The dedicated escapes are still preferred over the generic form.
         assert_eq!(escape_json("\t"), "\\t");
+    }
+
+    #[test]
+    fn dead_weak_owner_is_distinct_from_a_live_foreign_owner() {
+        let current = Rc::new(());
+        let foreign = Rc::new(());
+        let foreign_owner = Rc::downgrade(&foreign);
+        assert_eq!(
+            weak_owner_relation(&foreign_owner, &current),
+            OwnerRelation::Foreign
+        );
+
+        let dead_owner = {
+            let owner = Rc::new(());
+            Rc::downgrade(&owner)
+        };
+        assert_eq!(
+            weak_owner_relation(&dead_owner, &current),
+            OwnerRelation::Dead
+        );
     }
 
     #[test]

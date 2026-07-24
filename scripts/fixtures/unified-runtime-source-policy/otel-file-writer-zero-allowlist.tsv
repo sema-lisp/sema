@@ -1,0 +1,6 @@
+# A per-token sema-otel file-writer allowlist with NO rows: any `write_all`/`fs::write` in
+# the scanned file is unallowlisted and fails. Used by the fixtures that assert a non-writer
+# sema-otel file stays write-free (a synchronous per-span-end write must move to the
+# file_exporter.rs writer thread).
+#
+# Format: TOKEN<TAB>COUNT<TAB>reason

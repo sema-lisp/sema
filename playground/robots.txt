@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Agentmap: https://sema-lang.com/.well-known/ai-catalog.json

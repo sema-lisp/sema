@@ -17,14 +17,14 @@
 ;; Pretty-print an expression tree
 (define (show-expr expr)
   (match expr
-    ([:add a b]  f"(${(show-expr a)} + ${(show-expr b)})")
-    ([:sub a b]  f"(${(show-expr a)} - ${(show-expr b)})")
-    ([:mul a b]  f"(${(show-expr a)} × ${(show-expr b)})")
-    ([:div a b]  f"(${(show-expr a)} ÷ ${(show-expr b)})")
-    ([:neg x]    f"-(${(show-expr x)})")
-    ([:abs x]    f"|${(show-expr x)}|")
-    ([:pow a b]  f"${(show-expr a)}^${(show-expr b)}")
-    (n           (str n))))
+    ([:add a b] f"(${(show-expr a)} + ${(show-expr b)})")
+    ([:sub a b] f"(${(show-expr a)} - ${(show-expr b)})")
+    ([:mul a b] f"(${(show-expr a)} × ${(show-expr b)})")
+    ([:div a b] f"(${(show-expr a)} ÷ ${(show-expr b)})")
+    ([:neg x] f"-(${(show-expr x)})")
+    ([:abs x] f"|${(show-expr x)}|")
+    ([:pow a b] f"${(show-expr a)}^${(show-expr b)}")
+    (n (str n))))
 
 (define examples
   (list [:add 2 [:mul 3 4]]
@@ -41,16 +41,16 @@
 ;; Symbolic simplifier using match
 (define (simplify expr)
   (match expr
-    ([:add 0 x]       (simplify x))
-    ([:add x 0]       (simplify x))
-    ([:mul 0 _]       0)
-    ([:mul _ 0]       0)
-    ([:mul 1 x]       (simplify x))
-    ([:mul x 1]       (simplify x))
-    ([:neg [:neg x]]  (simplify x))
-    ([:add a b]       [:add (simplify a) (simplify b)])
-    ([:mul a b]       [:mul (simplify a) (simplify b)])
-    (x                x)))
+    ([:add 0 x] (simplify x))
+    ([:add x 0] (simplify x))
+    ([:mul 0 _] 0)
+    ([:mul _ 0] 0)
+    ([:mul 1 x] (simplify x))
+    ([:mul x 1] (simplify x))
+    ([:neg [:neg x]] (simplify x))
+    ([:add a b] [:add (simplify a) (simplify b)])
+    ([:mul a b] [:mul (simplify a) (simplify b)])
+    (x x)))
 
 (println "\nSimplification:")
 (define bloated [:add [:mul 1 [:add 0 5]] [:neg [:neg 3]]])

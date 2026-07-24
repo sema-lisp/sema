@@ -15,6 +15,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Forbidden tokens (post comment-stripping). Path-free so imports can't evade.
 const RUNTIME_TOKENS: &[&str] = &[
@@ -64,6 +65,20 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
         "sema-stdlib/src/server.rs",
         2,
         "in-file #[cfg(test)] fixtures asserting inside-runtime behavior",
+    ),
+    (
+        "sema-eval/src/eval.rs",
+        1,
+        "the interpreter's persistent cooperative unified Runtime \
+         (sema_vm::runtime::Runtime), NOT a tokio runtime — this is the canonical \
+         async engine the unified-runtime migration is built on",
+    ),
+    (
+        "sema-stdlib/src/git.rs",
+        1,
+        "in-file #[cfg(test)] fixture driving the async over-cap drain off a \
+         current-thread runtime (B7); the production git offload routes through \
+         sema-io",
     ),
 ];
 
@@ -139,6 +154,12 @@ fn no_adhoc_tokio_runtimes_outside_allowlist() {
             .unwrap_or(file)
             .to_string_lossy()
             .replace('\\', "/");
+        // Test code is exempt (same as the `crates/*/tests/**` exemption): an
+        // in-src `#[cfg(test)] mod tests` lives in `tests.rs` and legitimately
+        // constructs the cooperative `Runtime` (and tokio fixtures) many times.
+        if rel.ends_with("tests.rs") {
+            continue;
+        }
         let Ok(src) = fs::read_to_string(file) else {
             continue;
         };
@@ -185,4 +206,408 @@ fn no_adhoc_tokio_runtimes_outside_allowlist() {
          — route through sema-io, or add an allowlist entry WITH a reason:\n\n{}",
         violations.join("\n\n")
     );
+}
+
+/// Zero-tolerance removal gate for the legacy async-scheduler purge (P5).
+///
+/// The old change-detector (a committed `legacy-symbols.baseline` the scan was
+/// diffed against) is retired: `scheduler.rs`, the cooperative-debug driver, and
+/// the legacy `async_signal.rs` seams are DELETED, so their identifiers must have
+/// ZERO hits in shipped, comment-stripped code. `--check` fails on any
+/// reintroduction outside the script's exact-file allowlist (currently empty).
+#[test]
+fn unified_runtime_purged_legacy_symbols_absent() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new(root.join("scripts/check-unified-runtime-legacy.sh"))
+        .arg("--check")
+        .current_dir(&root)
+        .output()
+        .expect("run unified runtime legacy scanner");
+
+    assert!(
+        output.status.success(),
+        "purged legacy-scheduler symbols reintroduced\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn signal_callbacks_use_interpreter_owned_structural_dispatch() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = fs::read_to_string(root.join("crates/sema-stdlib/src/system.rs"))
+        .expect("read system stdlib source");
+    let production: String = source
+        .lines()
+        .map(strip_line_comments)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for forbidden in [
+        "SIGNAL_CALLBACKS",
+        "sema_core::call_callback",
+        "SIGWINCH_PENDING.swap",
+        "SIGINT_PENDING.swap",
+        "SIGTERM_PENDING.swap",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "signal dispatch retained forbidden production token {forbidden}"
+        );
+    }
+    for required in [
+        "SignalRegistry",
+        "NativeOutcome::Call",
+        "with_escaping_args(&[1])",
+        "signal_registry_payload_tracer",
+    ] {
+        assert!(
+            production.contains(required),
+            "signal dispatch is missing required production token {required}"
+        );
+    }
+}
+
+#[test]
+fn unified_runtime_scanner_detects_raw_blocking_recv_fixture() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture =
+        root.join("crates/sema/tests/fixtures/unified_runtime_legacy/raw_blocking_recv.rs");
+    let output = Command::new(root.join("scripts/check-unified-runtime-legacy.sh"))
+        .args([
+            "--scan-path",
+            fixture.to_str().expect("fixture path is UTF-8"),
+        ])
+        .current_dir(&root)
+        .output()
+        .expect("scan raw blocking recv fixture");
+
+    assert!(
+        output.status.success(),
+        "fixture scan failed with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("raw_blocking_recv.rs:4:    let _ = receiver.recv();"),
+        "raw blocking recv was not reported; stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn unified_runtime_inventory_mapping_covers_exact_current_matches() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let output = Command::new(root.join("scripts/check-unified-runtime-inventory.sh"))
+        .arg("--check")
+        .current_dir(&root)
+        .output()
+        .expect("run unified runtime inventory checker");
+
+    assert!(
+        output.status.success(),
+        "inventory checker failed with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn unified_runtime_inventory_checker_rejects_invalid_fixture_states() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture_dir = std::env::temp_dir().join(format!(
+        "sema-runtime-inventory-checker-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&fixture_dir);
+    fs::create_dir_all(&fixture_dir).expect("create inventory checker fixture directory");
+    let mapping = fixture_dir.join("mapping.tsv");
+    let current = fixture_dir.join("current.txt");
+    let inventory = fixture_dir.join("inventory.md");
+    fs::write(&current, "crates/example/src/lib.rs:1:match\n").expect("write current fixture");
+    fs::write(
+        &inventory,
+        "| Area | Path | Status |\n| --- | --- | --- |\n| R01A valid row | R99 appears outside the ID column | MIGRATED |\n",
+    )
+    .expect("write inventory fixture");
+
+    let cases = [
+        (
+            "valid",
+            Some("R01A\tcrates/example/src/lib.rs:1:match\n"),
+            true,
+        ),
+        ("missing", None, false),
+        ("empty", Some(""), false),
+        (
+            "stale",
+            Some("R01A\tcrates/example/src/lib.rs:2:stale\n"),
+            false,
+        ),
+        (
+            "duplicate",
+            Some(
+                "R01A\tcrates/example/src/lib.rs:1:match\nR01A\tcrates/example/src/lib.rs:1:match\n",
+            ),
+            false,
+        ),
+        ("malformed", Some("not-a-tsv-row\n"), false),
+        (
+            "unreviewed",
+            Some("UNREVIEWED\tcrates/example/src/lib.rs:1:match\n"),
+            false,
+        ),
+        (
+            "nonexistent-row",
+            Some("R99\tcrates/example/src/lib.rs:1:match\n"),
+            false,
+        ),
+    ];
+
+    for (name, contents, should_pass) in cases {
+        match contents {
+            Some(contents) => fs::write(&mapping, contents).expect("write mapping fixture"),
+            None => {
+                let _ = fs::remove_file(&mapping);
+            }
+        }
+        let output = Command::new(root.join("scripts/check-unified-runtime-inventory.sh"))
+            .args(["--check-files"])
+            .arg(&mapping)
+            .arg(&current)
+            .arg(&inventory)
+            .current_dir(&root)
+            .output()
+            .expect("run inventory checker fixture");
+        assert_eq!(
+            output.status.success(),
+            should_pass,
+            "fixture {name} had unexpected status {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fs::write(&mapping, "R01A\tcrates/example/src/lib.rs:1:match\n")
+        .expect("write mapped nonterminal fixture");
+    for status in ["LEGACY", "ADAPTER"] {
+        fs::write(
+            &inventory,
+            format!(
+                "| Area | Path | Status |\n| --- | --- | --- |\n| R01A valid row | match | {status} |\n"
+            ),
+        )
+        .expect("write nonterminal inventory fixture");
+        let output = Command::new(root.join("scripts/check-unified-runtime-inventory.sh"))
+            .args(["--check-files"])
+            .arg(&mapping)
+            .arg(&current)
+            .arg(&inventory)
+            .current_dir(&root)
+            .output()
+            .expect("run inventory checker nonterminal fixture");
+        assert!(
+            !output.status.success(),
+            "mapped {status} ledger row unexpectedly passed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("nonterminal ledger row R01A"),
+            "mapped {status} ledger row did not report its status\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fs::write(
+        &inventory,
+        "| Area | Path | Status |\n| --- | --- | --- |\n\
+         | R01A first row | match | LEGACY |\n\
+         | R01A conflicting row | match | MIGRATED |\n",
+    )
+    .expect("write conflicting duplicate ledger fixture");
+    let output = Command::new(root.join("scripts/check-unified-runtime-inventory.sh"))
+        .args(["--check-files"])
+        .arg(&mapping)
+        .arg(&current)
+        .arg(&inventory)
+        .current_dir(&root)
+        .output()
+        .expect("run inventory checker duplicate-ledger fixture");
+    assert!(
+        !output.status.success(),
+        "conflicting duplicate ledger row unexpectedly passed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("duplicate ledger row R01A"),
+        "duplicate ledger row did not report its id\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    fs::remove_dir_all(&fixture_dir).expect("remove inventory checker fixture directory");
+}
+
+#[test]
+fn unified_runtime_inventory_writer_preserves_reviews_and_marks_only_new_matches() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture_dir = std::env::temp_dir().join(format!(
+        "sema-runtime-inventory-writer-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&fixture_dir);
+    fs::create_dir_all(&fixture_dir).expect("create inventory writer fixture directory");
+    let mapping = fixture_dir.join("mapping.tsv");
+    let script = root.join("scripts/check-unified-runtime-inventory.sh");
+
+    let first_write = Command::new(&script)
+        .arg("--write-mapping")
+        .env("UNIFIED_RUNTIME_MAPPING_FILE", &mapping)
+        .current_dir(&root)
+        .output()
+        .expect("bootstrap inventory writer fixture");
+    assert!(
+        first_write.status.success(),
+        "inventory writer bootstrap failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&first_write.stdout),
+        String::from_utf8_lossy(&first_write.stderr)
+    );
+
+    let bootstrap = fs::read_to_string(&mapping).expect("read bootstrapped mapping fixture");
+    let first = bootstrap.lines().next().expect("bootstrap has a match");
+    let payload = first
+        .strip_prefix("UNREVIEWED\t")
+        .expect("new matches are explicitly unreviewed");
+    let reviewed = format!("R01A\t{payload}");
+    let mut seeded = bootstrap.replacen(first, &reviewed, 1);
+    seeded.push_str("F01A\tcrates/removed/src/lib.rs:1:stale\n");
+    fs::write(&mapping, seeded).expect("seed reviewed and vanished mapping entries");
+
+    let second_write = Command::new(&script)
+        .arg("--write-mapping")
+        .env("UNIFIED_RUNTIME_MAPPING_FILE", &mapping)
+        .current_dir(&root)
+        .output()
+        .expect("refresh inventory writer fixture");
+    assert!(
+        second_write.status.success(),
+        "inventory writer refresh failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&second_write.stdout),
+        String::from_utf8_lossy(&second_write.stderr)
+    );
+
+    let refreshed = fs::read_to_string(&mapping).expect("read refreshed mapping fixture");
+    assert!(
+        refreshed.lines().any(|line| line == reviewed),
+        "inventory writer did not preserve the reviewed assignment"
+    );
+    assert!(
+        !refreshed.contains("crates/removed/src/lib.rs:1:stale"),
+        "inventory writer retained a vanished payload"
+    );
+    assert!(
+        refreshed
+            .lines()
+            .any(|line| line.starts_with("UNREVIEWED\t")),
+        "inventory writer heuristically assigned every new payload"
+    );
+
+    fs::remove_dir_all(&fixture_dir).expect("remove inventory writer fixture directory");
+}
+
+#[test]
+fn unified_runtime_inventory_checker_rejects_discovery_scan_failure() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture_dir =
+        std::env::temp_dir().join(format!("sema-runtime-missing-rg-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&fixture_dir);
+    fs::create_dir_all(&fixture_dir).expect("create missing rg fixture directory");
+    let mapping = fixture_dir.join("mapping.tsv");
+
+    for mode in ["--check", "--write-mapping"] {
+        let output = Command::new(root.join("scripts/check-unified-runtime-inventory.sh"))
+            .arg(mode)
+            .env("UNIFIED_RUNTIME_RG_BIN", "/definitely/missing/rg")
+            .env("UNIFIED_RUNTIME_MAPPING_FILE", &mapping)
+            .current_dir(&root)
+            .output()
+            .expect("run inventory checker with missing discovery scanner");
+
+        assert!(
+            !output.status.success(),
+            "inventory {mode} swallowed discovery scan failure\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("runtime inventory discovery scan failed"),
+            "inventory {mode} did not report the discovery failure\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !mapping.exists(),
+            "inventory {mode} wrote a mapping after a missing scanner failure"
+        );
+    }
+
+    fs::remove_dir_all(&fixture_dir).expect("remove missing rg fixture directory");
+}
+
+#[cfg(unix)]
+#[test]
+fn unified_runtime_inventory_checker_rejects_partial_discovery_scan_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let fixture_dir = std::env::temp_dir().join(format!(
+        "sema-runtime-partial-rg-failure-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&fixture_dir);
+    fs::create_dir_all(&fixture_dir).expect("create partial rg failure fixture directory");
+    let fixture = fixture_dir.join("rg");
+    let mapping = fixture_dir.join("mapping.tsv");
+    fs::write(
+        &fixture,
+        "#!/bin/sh\ncase \"$*\" in *'IoHandle|IoPoll'*) exit 1;; *) exit 0;; esac\n",
+    )
+    .expect("write partial rg failure fixture");
+    let mut permissions = fs::metadata(&fixture)
+        .expect("read partial rg failure fixture metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&fixture, permissions).expect("make partial rg failure fixture executable");
+
+    for mode in ["--check", "--write-mapping"] {
+        let output = Command::new(root.join("scripts/check-unified-runtime-inventory.sh"))
+            .arg(mode)
+            .env("UNIFIED_RUNTIME_RG_BIN", &fixture)
+            .env("UNIFIED_RUNTIME_MAPPING_FILE", &mapping)
+            .current_dir(&root)
+            .output()
+            .expect("run inventory checker with partial discovery failure");
+
+        assert!(
+            !output.status.success(),
+            "inventory {mode} swallowed the first discovery scan failure\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("runtime inventory discovery scan failed"),
+            "inventory {mode} did not report the discovery failure\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !mapping.exists(),
+            "inventory {mode} wrote a mapping after a partial discovery failure"
+        );
+    }
+    fs::remove_dir_all(&fixture_dir).expect("remove partial rg failure fixture directory");
 }

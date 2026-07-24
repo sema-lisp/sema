@@ -66,10 +66,10 @@
   {:country {:type :string :description "Country name"}}
   (lambda (country)
     (cond
-      ((= country "Norway")  "Oslo")
-      ((= country "France")  "Paris")
-      ((= country "Japan")   "Tokyo")
-      (else                  (format "Unknown capital for ~a" country)))))
+      ((= country "Norway") "Oslo")
+      ((= country "France") "Paris")
+      ((= country "Japan") "Tokyo")
+      (else (format "Unknown capital for ~a" country)))))
 
 (println
   (llm/chat (list (message :user "What is the capital of Norway?"))

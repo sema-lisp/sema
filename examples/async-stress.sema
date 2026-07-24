@@ -5,8 +5,8 @@
 ;; coroutines and gathers them deterministically. A good smoke test that the VM
 ;; scheduler stays correct under load.
 
-(define n-tasks      500)
-(define yields-each  5)
+(define n-tasks 500)
+(define yields-each 5)
 
 ;; Each task yields `yields-each` times, then returns its id doubled.
 (define (spin id)
@@ -24,13 +24,13 @@
   yields-each
   " yields each ===")
 
-(define start    (time-ms))
-(define results  (async/all (map spin (range 1 (+ n-tasks 1)))))
-(define elapsed  (- (time-ms) start))
+(define start (time-ms))
+(define results (async/all (map spin (range 1 (+ n-tasks 1)))))
+(define elapsed (- (time-ms) start))
 
 ;; Verify correctness: results must be exactly 2,4,...,2*n-tasks summed.
-(define got   (foldl + 0 results))
-(define want  (* n-tasks (+ n-tasks 1)))  ; sum(2..2n step 2) = n*(n+1)
+(define got (foldl + 0 results))
+(define want (* n-tasks (+ n-tasks 1))) ; sum(2..2n step 2) = n*(n+1)
 (println "  tasks completed: " (length results))
 (println "  sum of results:  " got " (expected " want ")")
 (println "  correct:         " (= got want))
@@ -39,8 +39,8 @@
 ;; Also exercise channels under fan-in: 200 producers -> 1 channel -> drain.
 (println "")
 (println "=== Channel fan-in: 200 senders -> 1 channel ===")
-(define hub      (channel/new 64))
-(define senders  (map (fn (i) (async (channel/send hub i))) (range 1 201)))
+(define hub (channel/new 64))
+(define senders (map (fn (i) (async (channel/send hub i))) (range 1 201)))
 (define drainer
   (async
     (let loop ((seen 0) (sum 0))

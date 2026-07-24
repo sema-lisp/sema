@@ -1,0 +1,142 @@
+{
+  "specVersion": "1.0",
+  "host": {
+    "displayName": "Sema",
+    "documentationUrl": "https://sema-lang.com/docs/"
+  },
+  "entries": [
+    {
+      "identifier": "urn:air:sema-lang.com:mcp:sema",
+      "displayName": "Sema MCP server",
+      "type": "application/mcp-server-card+json",
+      "data": {
+        "name": "sema",
+        "description": "Native stdio MCP server for evaluating, compiling, formatting, documenting, building, and debugging Sema programs and managing Sema notebooks.",
+        "transport": {
+          "type": "stdio",
+          "command": "sema",
+          "args": ["mcp"]
+        },
+        "repository": "https://github.com/sema-lisp/sema",
+        "documentation": "https://sema-lang.com/docs/mcp",
+        "tools": [
+          {
+            "name": "run_file",
+            "description": "Run a Sema source (.sema) or compiled bytecode (.semac) file."
+          },
+          {
+            "name": "compile",
+            "description": "Compile a .sema file to .semac bytecode."
+          },
+          {
+            "name": "eval",
+            "description": "Evaluate one Sema expression and return its value and captured output."
+          },
+          {
+            "name": "docs",
+            "description": "Get documentation and signatures for a known Sema symbol."
+          },
+          {
+            "name": "fmt",
+            "description": "Format Sema source text or a .sema file in place."
+          },
+          {
+            "name": "disasm",
+            "description": "Disassemble Sema source or .semac bytecode into VM instructions."
+          },
+          {
+            "name": "build",
+            "description": "Build a standalone executable from a .sema file."
+          },
+          {
+            "name": "info",
+            "description": "Get version and environment information from the Sema MCP server."
+          },
+          {
+            "name": "docs_search",
+            "description": "Search Sema documentation by natural-language query."
+          },
+          {
+            "name": "notebook/new",
+            "description": "Create a new empty Sema notebook."
+          },
+          {
+            "name": "notebook/read",
+            "description": "Read a Sema notebook's cells, source, and outputs."
+          },
+          {
+            "name": "notebook/add_cell",
+            "description": "Add a code or Markdown cell to a notebook."
+          },
+          {
+            "name": "notebook/update_cell",
+            "description": "Update an existing notebook cell."
+          },
+          {
+            "name": "notebook/delete_cell",
+            "description": "Delete a cell from a notebook."
+          },
+          {
+            "name": "notebook/eval_cell",
+            "description": "Evaluate one code cell and save its outputs."
+          },
+          {
+            "name": "notebook/eval_all",
+            "description": "Evaluate every code cell in notebook order and save outputs."
+          },
+          {
+            "name": "notebook/export",
+            "description": "Export a notebook to Markdown or clean Sema source."
+          }
+        ],
+        "dynamicTools": "Sema files passed to `sema mcp` can add user-defined MCP tools with `deftool`; private and explicitly unexposed tools are omitted."
+      },
+      "description": "Run `sema mcp` to give coding agents native Sema evaluation, compiler, documentation, build, notebook, and user-defined tool capabilities over stdio.",
+      "tags": ["sema", "lisp", "mcp", "developer-tools", "notebooks"],
+      "capabilities": ["SemaEval", "SemaBuild", "SemaDocs", "SemaNotebook", "SemaDeftool"],
+      "representativeQueries": [
+        "evaluate and format this Sema expression",
+        "find the Sema function for parsing JSON",
+        "create and execute a Sema notebook with an agent"
+      ]
+    },
+    {
+      "identifier": "urn:air:sema-lang.com:skill:sema-agents",
+      "displayName": "Sema for LLM agents",
+      "type": "application/ai-skill+md",
+      "url": "https://sema-lang.com/docs/for-agents.md",
+      "description": "Compact instructions for agents writing Sema, covering syntax, truthiness, naming, collections, state, errors, LLM primitives, and common Lisp-to-Sema mistakes.",
+      "tags": ["sema", "lisp", "coding-agents", "language-guide"],
+      "representativeQueries": [
+        "write correct Sema code without assuming Clojure semantics",
+        "what syntax and standard library conventions should a Sema coding agent know"
+      ]
+    },
+    {
+      "identifier": "urn:air:sema-lang.com:docs:llms-index",
+      "displayName": "Sema LLM documentation index",
+      "type": "text/plain",
+      "url": "https://sema-lang.com/llms.txt",
+      "description": "LLM-friendly index of Sema language, standard-library, LLM, agent, tooling, notebook, web, and internals documentation.",
+      "tags": ["sema", "documentation", "llms.txt", "reference"],
+      "representativeQueries": [
+        "find the relevant Sema documentation page for a coding task",
+        "browse Sema language and standard library documentation without loading the full manual"
+      ]
+    },
+    {
+      "identifier": "urn:air:sema-lang.com:webmcp:playground",
+      "displayName": "Sema Playground WebMCP",
+      "type": "text/html",
+      "url": "https://sema.run",
+      "description": "Experimental browser WebMCP surface for editing, formatting, running, stopping, and debugging Sema code, loading examples, reading output, and managing playground virtual files.",
+      "tags": ["sema", "webmcp", "playground", "wasm", "debugger"],
+      "capabilities": ["Editor", "Evaluator", "Examples", "VirtualFilesystem", "Debugger"],
+      "representativeQueries": [
+        "run this Sema program in the browser playground and inspect its output",
+        "load a Sema example and debug it with breakpoints",
+        "write virtual files and execute Sema code against them in the playground"
+      ]
+    }
+  ]
+}

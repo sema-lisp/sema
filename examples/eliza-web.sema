@@ -8,21 +8,21 @@
 
 ;; ── Pronoun reflection table ──────────────────────────────────────
 (def reflections
-  {"i"         "you"
-   "me"        "you"
-   "my"        "your"
-   "myself"    "yourself"
-   "am"        "are"
-   "was"       "were"
-   "i'd"       "you'd"
-   "i've"      "you've"
-   "i'll"      "you'll"
-   "you"       "i"
-   "your"      "my"
-   "yours"     "mine"
-   "yourself"  "myself"
-   "are"       "am"
-   "were"      "was"})
+  {"i" "you"
+   "me" "you"
+   "my" "your"
+   "myself" "yourself"
+   "am" "are"
+   "was" "were"
+   "i'd" "you'd"
+   "i've" "you've"
+   "i'll" "you'll"
+   "you" "i"
+   "your" "my"
+   "yours" "mine"
+   "yourself" "myself"
+   "are" "am"
+   "were" "was"})
 
 (defn reflect (text)
   "Swap pronouns in captured text so ELIZA's reply reads naturally."
@@ -30,8 +30,8 @@
     (string/join
       (map
         (fn (w)
-          (let* ((low   (string/lower w))
-                 (refl  (or (get reflections low) w)))
+          (let* ((low (string/lower w))
+                 (refl (or (get reflections low) w)))
             (if (equal? refl "i") "I" refl)))
         words)
       " ")))
@@ -167,8 +167,8 @@
     {:keyword "yes"
      :rank 1
      :rules (list
-       {:pattern    (list "*" "yes" "*")
-        :responses  (list "You seem quite sure." "I see." "I understand.")})}
+       {:pattern (list "*" "yes" "*")
+        :responses (list "You seem quite sure." "I see." "I understand.")})}
     {:keyword "no"
      :rank 1
      :rules (list
@@ -266,8 +266,8 @@
 (defn substitute-captures (template captures)
   (foldl
     (fn (text i)
-      (let ((placeholder  (string-append "(" (number->string (+ i 1)) ")"))
-            (segment      (reflect (nth captures i))))
+      (let ((placeholder (string-append "(" (number->string (+ i 1)) ")"))
+            (segment (reflect (nth captures i))))
         (string/replace text placeholder segment)))
     template
     (range 0 (length captures))))
@@ -275,8 +275,8 @@
 (define response-counters {})
 
 (defn pick-response (key responses)
-  (let* ((idx       (or (get response-counters key) 0))
-         (response  (nth responses (modulo idx (length responses)))))
+  (let* ((idx (or (get response-counters key) 0))
+         (response (nth responses (modulo idx (length responses)))))
     (set! response-counters (assoc response-counters key (+ idx 1)))
     response))
 
@@ -298,18 +298,18 @@
                                  (match-pattern words
                                    (expand-pattern (:pattern (car rules))))))
                            (if captures
-                             {:rank      (:rank entry)
-                              :keyword   kw
-                              :rule      (car rules)
-                              :captures  captures}
+                             {:rank (:rank entry)
+                              :keyword kw
+                              :rule (car rules)
+                              :captures captures}
                              (try-rules (cdr rules)))))))))
                script)))
          (sorted (sort-by #(- 0 (:rank %)) matches)))
     (if (null? sorted) nil (car sorted))))
 
 (defn respond (input)
-  (let* ((words   (words->list input))
-         (result  (find-keyword-match words)))
+  (let* ((words (words->list input))
+         (result (find-keyword-match words)))
     (if (not result)
       "I'm not sure I understand you fully."
       (let* ((rule (:rule result))
@@ -468,9 +468,9 @@ input.addEventListener('keydown', async (e) => {
 ;; ── Server ────────────────────────────────────────────────────────
 
 (define (handle-chat req)
-  (let* ((body   (or (:json req) {}))
-         (msg    (or (get body "message") ""))
-         (reply  (respond msg)))
+  (let* ((body (or (:json req) {}))
+         (msg (or (get body "message") ""))
+         (reply (respond msg)))
     (http/ok {:response reply})))
 
 (define routes

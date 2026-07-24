@@ -9,8 +9,8 @@
     (7000 8000 9000)
     (10000)))
 
-(define totals         (map (fn (elf) (foldl + 0 elf)) elf-calories))
-(define sorted-totals  (sort totals (fn (a b) (- b a))))
+(define totals (map (fn (elf) (foldl + 0 elf)) elf-calories))
+(define sorted-totals (sort totals (fn (a b) (- b a))))
 
 (println (format "Elf totals: ~a" totals))
 (println (format "Max single elf: ~a" (first sorted-totals)))
@@ -60,16 +60,16 @@
 (println "\n=== Puzzle 4: Number Word Sum ===\n")
 
 (define number-words
-  {:one    1
-   :two    2
-   :three  3
-   :four   4
-   :five   5
-   :six    6
-   :seven  7
-   :eight  8
-   :nine   9
-   :ten    10})
+  {:one 1
+   :two 2
+   :three 3
+   :four 4
+   :five 5
+   :six 6
+   :seven 7
+   :eight 8
+   :nine 9
+   :ten 10})
 (define words-input
   '("three" "cats" "ate" "five" "fish" "and" "two" "pies" "plus" "one"))
 (define found

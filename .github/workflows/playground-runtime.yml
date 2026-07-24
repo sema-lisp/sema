@@ -1,0 +1,53 @@
+name: Playground Runtime
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  focused-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust and the WASM target
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: playground/package-lock.json
+
+      - name: Install playground dependencies
+        working-directory: playground
+        run: npm ci
+
+      - name: Install Chromium
+        working-directory: playground
+        run: npx playwright install --with-deps chromium
+
+      - name: Install pinned wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.0
+
+      - name: Build the playground runtime
+        working-directory: crates/sema-wasm
+        run: wasm-pack build --target web --out-dir ../../playground/pkg -- --config 'profile.release.package.sema-wasm.opt-level="s"'
+
+      - name: Build the playground
+        working-directory: playground
+        run: node build.mjs
+
+      - name: Run stable runtime browser regressions
+        working-directory: playground
+        run: npx playwright test tests/unified-runtime.spec.ts tests/debug-http-replay.spec.ts --workers=1 --reporter=line

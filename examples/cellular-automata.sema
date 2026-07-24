@@ -3,8 +3,8 @@
 
 (println "=== 1D Cellular Automata ===\n")
 
-(define WIDTH  61)
-(define ROWS   30)
+(define WIDTH 61)
+(define ROWS 30)
 
 ;; --- Rule binary representation ---
 (define (rule-to-bits rule)
@@ -33,9 +33,9 @@
   (let ((len (length row)))
     (map
       (fn (i)
-        (let ((left    (if (= i 0) 0 (nth row (- i 1))))
-              (center  (nth row i))
-              (right   (if (= i (- len 1)) 0 (nth row (+ i 1)))))
+        (let ((left (if (= i 0) 0 (nth row (- i 1))))
+              (center (nth row i))
+              (right (if (= i (- len 1)) 0 (nth row (+ i 1)))))
           (apply-rule rule-bits left center right)))
       (range len))))
 

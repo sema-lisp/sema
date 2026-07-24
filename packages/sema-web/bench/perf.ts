@@ -44,7 +44,7 @@ function installDom(): void {
   });
 }
 
-function createInterp() {
+function createInterpreter() {
   const functions = new Map<string, (...args: any[]) => any>();
 
   return {
@@ -127,7 +127,7 @@ function bench(name: string, iterations: number, fn: () => void): BenchResult {
 }
 
 function renderCase(name: string, iterations: number, sip: Sip): BenchResult {
-  const interp = createInterp();
+  const interp = createInterpreter();
   const ctx = createCtx();
   return bench(name, iterations, () => {
     renderSip(sip, interp, ctx);
@@ -135,7 +135,7 @@ function renderCase(name: string, iterations: number, sip: Sip): BenchResult {
 }
 
 function morphdomCase(): BenchResult {
-  const interp = createInterp();
+  const interp = createInterpreter();
   const ctx = createCtx();
   const variants = Array.from({ length: 20 }, (_, i) => makeList(1_000, i * 7));
   const target = document.createElement("section");
@@ -152,7 +152,7 @@ function morphdomCase(): BenchResult {
 }
 
 function componentUpdateBreakdown(): TimedBreakdown {
-  const interp = createInterp();
+  const interp = createInterpreter();
   const ctx = createCtx();
   const variants = Array.from({ length: 20 }, (_, i) => makeList(1_000, i * 7));
   const target = document.createElement("section");
@@ -191,7 +191,7 @@ function componentUpdateBreakdown(): TimedBreakdown {
 function delegatedEventCase(): BenchResult {
   document.body.innerHTML = '<div id="app"></div>';
 
-  const interp = createInterp();
+  const interp = createInterpreter();
   const ctx = createCtx();
   registerComponentBindings(interp, ctx);
 
@@ -218,7 +218,7 @@ function delegatedEventCase(): BenchResult {
 function eventTargetClosestHandleCase(): BenchResult {
   document.body.innerHTML = '<div id="card"><button id="button">Click</button></div>';
 
-  const interp = createInterp();
+  const interp = createInterpreter();
   const ctx = createCtx();
   registerDomBindings(interp, ctx);
 

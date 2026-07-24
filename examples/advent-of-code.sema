@@ -12,10 +12,10 @@
     (7000 8000 9000)
     (10000)))
 
-(define totals         (map (fn (elf) (foldl + 0 elf)) elf-calories))
-(define sorted-totals  (sort totals (fn (a b) (- b a))))
-(define max-elf        (first sorted-totals))
-(define top3-sum       (foldl + 0 (take 3 sorted-totals)))
+(define totals (map (fn (elf) (foldl + 0 elf)) elf-calories))
+(define sorted-totals (sort totals (fn (a b) (- b a))))
+(define max-elf (first sorted-totals))
+(define top3-sum (foldl + 0 (take 3 sorted-totals)))
 
 (println (format "Elf totals: ~a" totals))
 (println (format "Max single elf: ~a" max-elf))
@@ -48,12 +48,12 @@
 (define (score-round round)
   (let ((opp (first round))
         (you (nth round 1)))
-    (let ((key    (string/to-keyword (string/append opp you)))
-          (shape  (get shape-score (string/to-keyword you))))
+    (let ((key (string/to-keyword (string/append opp you)))
+          (shape (get shape-score (string/to-keyword you))))
       (+ shape (get outcome-map key)))))
 
-(define round-scores  (map score-round rounds))
-(define total-score   (foldl + 0 round-scores))
+(define round-scores (map score-round rounds))
+(define total-score (foldl + 0 round-scores))
 
 (for-each
   (fn (i)
@@ -68,8 +68,8 @@
 (println "\n=== Puzzle 3: Pangram Checker ===\n")
 
 (define (pangram? text)
-  (let ((lower     (string/lower text))
-        (alphabet  "abcdefghijklmnopqrstuvwxyz"))
+  (let ((lower (string/lower text))
+        (alphabet "abcdefghijklmnopqrstuvwxyz"))
     (every (fn (ch) (string/contains? lower (char/to-string ch)))
       (string/chars alphabet))))
 

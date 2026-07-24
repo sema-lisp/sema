@@ -5,27 +5,77 @@
 //! subprocess, so every builtin is gated behind `Caps::PROCESS`.
 //!
 //! Inside an `async/spawn`'d task every builtin offloads the subprocess onto
-//! the process-wide I/O pool and yields `AwaitIo` (the `shell_async` pattern —
-//! see `system.rs`), so a slow `git log`/`git diff` doesn't stall sibling
-//! tasks on the cooperative scheduler. At top level (no scheduler) they stay
-//! exactly as they were: `git()`'s synchronous `.output()`.
+//! the process-wide I/O pool and suspends on a structural `External` wait, so
+//! a slow `git log`/`git diff` does not stall sibling tasks. At top level they
+//! use `git()`'s synchronous `.output()` path.
 //!
-//! The shared sync helper `git()` can't simply grow an async branch: a native
-//! that yields `AwaitIo` is NOT re-invoked on resume (the VM substitutes the
-//! call's return value directly), so any Rust code that would otherwise run
-//! AFTER `git()` returns (parsing `status --porcelain`, deduping `log
-//! --name-only`, …) would never execute for a parked call. Instead the async
-//! branches call [`git_offload`] / [`git_stdout_async`] directly, passing a
-//! `decode`/`finish` closure that does that post-processing — mirroring
-//! `fs_offload` (io.rs): only `Send` facts (raw stdout/stderr/exit code) cross
-//! the thread boundary, and the closure builds the final `Value` on the VM
-//! thread when the scheduler polls the completed offload. The parsing/dedup
-//! logic itself is factored into plain functions (`parse_status_entries`,
-//! `recent_files_value`, …) shared by both paths so sync and async can't drift.
+//! Runtime paths pass a `decode` closure to [`git_stdout_runtime`] so only
+//! `Send` facts (raw stdout/stderr/exit code) cross the thread boundary. The
+//! closure builds the final `Value` on the VM thread after the wait completes.
+//! Parsing and deduplication live in plain functions (`parse_status_entries`,
+//! `recent_files_value`, …) shared by synchronous and runtime paths.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-use sema_core::{check_arity, in_async_context, Caps, SemaError, Value};
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{
+    CancelDisposition, CancelHook, CancelHookError, CompletionKind, InterruptibleResource,
+    NativeOutcome, NativeResult, Trace,
+};
+use sema_core::{check_arity, in_runtime_quantum, Caps, SemaError, Value};
+
+/// Completion tag for an offloaded `git` subprocess. Consistent between the
+/// issued identity and the prepared op (not a uniqueness key), so one shared
+/// value for every `git/*` op is correct.
+const GIT_COMPLETION_KIND: u64 = 0x6769_7400; // "git\0"
+
+/// Cancellation grace for process-group members to close inherited pipes.
+/// A group kill normally closes them immediately; 100 ms absorbs scheduler and
+/// pipe-delivery latency while keeping runtime shutdown cleanup bounded when a
+/// foreign descendant escaped the group but retained an output descriptor.
+const GIT_CANCEL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Hard ceiling on the bytes a single offloaded `git` invocation may buffer from
+/// EACH of stdout/stderr before the process group is killed. The offload's
+/// `decode` closure materializes the whole output into a `Value` on the VM
+/// thread, so an unbounded `git log`/`git diff` (a pathological or hostile repo)
+/// would exhaust memory; a capped incremental drain turns that into a clean,
+/// structured over-cap error instead of an OOM — never a `read_to_end` of a
+/// hostile pipe.
+const GIT_MAX_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Chunk size for the incremental pipe drain. Large enough to keep syscall
+/// overhead low, small enough that the cap is enforced within one chunk of the
+/// boundary.
+const GIT_DRAIN_CHUNK: usize = 64 * 1024;
+
+thread_local! {
+    /// Optional per-call output-byte cap override (lowered, never raised above
+    /// the hard ceiling). Read on the VM thread pre-dispatch and captured by the
+    /// offloaded job — mirrors `sqlite::DB_RESULT_CAPS_OVERRIDE`. `None` uses the
+    /// module ceiling.
+    static GIT_MAX_OUTPUT_OVERRIDE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// The effective per-pipe output cap for the current call: the module ceiling,
+/// lowered by any per-call override (never raised above it). Read on the VM
+/// thread pre-dispatch, then captured by the offloaded job.
+fn effective_git_max_output_bytes() -> usize {
+    GIT_MAX_OUTPUT_OVERRIDE
+        .with(Cell::get)
+        .map_or(GIT_MAX_OUTPUT_BYTES, |over| over.min(GIT_MAX_OUTPUT_BYTES))
+}
+
+/// Lower the per-pipe output cap (clamped to the hard ceiling) for subsequent
+/// offloaded `git/*` calls on this thread, or clear the override with `None`.
+/// The seam the regression suite drives to exercise the over-cap path without a
+/// multi-megabyte fixture; mirrors `set_db_result_caps_override`.
+pub fn set_git_max_output_bytes_override(bytes: Option<usize>) {
+    GIT_MAX_OUTPUT_OVERRIDE.with(|cell| cell.set(bytes));
+}
 
 /// Run `git` with `args`, returning raw (untrimmed) stdout on a zero exit. On a
 /// non-zero exit, surface git's stderr. If the `git` binary can't be launched at
@@ -156,154 +206,441 @@ struct RawGitOutput {
     stderr: Vec<u8>,
 }
 
-/// Render `msg` exactly like `SemaError::eval(msg)` would display, without
-/// constructing (and immediately dropping) the error — used to pre-render an
-/// async rejection so it's byte-identical to the sync path's error text (the
-/// `async/await: task rejected: {e}` envelope embeds this string verbatim).
-fn eval_msg(msg: String) -> String {
-    SemaError::eval(msg).to_string()
-}
+/// Shared proof that the Git child was waited and both pipe-drain tasks were
+/// joined. Cancellation cleanup stays registered until this flips to true.
+#[derive(Clone, Default)]
+struct GitCompletionGuard(Arc<AtomicBool>);
 
-/// Render `msg` exactly like `SemaError::Io(msg)` would display. See
-/// [`eval_msg`].
-fn io_msg(msg: String) -> String {
-    SemaError::Io(msg).to_string()
-}
-
-/// Offload one `git` subprocess invocation onto the process-wide I/O pool and
-/// yield `AwaitIo`, mirroring `shell_async` (system.rs) exactly but scoped to
-/// the fixed `git` binary — so a `git/*` call inside `async/spawn` parks the
-/// task instead of blocking the VM thread (and every sibling task) for the
-/// subprocess's whole duration. `full_args` is the complete argv passed to
-/// `git` (callers decide whether to include the `-c core.quotepath=false`
-/// prefix `git()` forces on the sync path — `git/ignore-matches?` doesn't,
-/// matching its sync bypass of `git()` below). `finish` turns the raw result
-/// into the poller's `IoPoll` on the VM thread — same division of labor as
-/// `fs_offload`'s `decode`: only `Send` facts cross the boundary, the
-/// `Value`/error text is built here, on resume.
-///
-/// No abort-time process-group kill (unlike `shell_async`): `git` runs as a
-/// single direct child, never a `sh -c` pipeline forking grandchildren, so
-/// `kill_on_drop` dropping the child on abort is sufficient — best-effort,
-/// matching every other non-shell offload's cancellation policy.
-///
-/// Returns `Ok(nil)` after arming the yield signal; the scheduler delivers the
-/// real value on resume.
-fn git_offload(
-    full_args: Vec<String>,
-    finish: impl Fn(Result<RawGitOutput, String>) -> sema_core::IoPoll + 'static,
-) -> Result<Value, SemaError> {
-    use std::rc::Rc;
-    use tokio::sync::oneshot::error::TryRecvError;
-
-    // Vestigial under CALL_NATIVE (the scheduler delivers the resume value via
-    // `replace_stack_top`, not by re-invoking this native), but kept for
-    // symmetry with the shipped `async/await` yield pattern.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
+impl GitCompletionGuard {
+    fn mark_reaped(&self) {
+        self.0.store(true, Ordering::Release);
     }
 
-    let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<RawGitOutput, String>>();
-    let abort_task = sema_io::io_spawn(async move {
-        let result = async {
-            let mut cmd = tokio::process::Command::new("git");
-            cmd.args(&full_args)
-                .kill_on_drop(true)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            let output = cmd.output().await.map_err(|e| {
-                io_msg(format!(
-                    "git: failed to run `git` (is it installed and on PATH?): {e}"
-                ))
-            })?;
-            Ok::<RawGitOutput, String>(RawGitOutput {
-                status_code: output.status.code(),
-                stdout: output.stdout,
-                stderr: output.stderr,
-            })
+    fn disposition(&self) -> CancelDisposition {
+        if self.0.load(Ordering::Acquire) {
+            CancelDisposition::Reaped
+        } else {
+            CancelDisposition::PendingReap
         }
-        .await;
-        let _ = tx.send(result);
-        // Wake the parked VM thread so it re-polls promptly.
-        sema_core::notify_io_complete();
-    });
-
-    let handle = Rc::new(sema_core::IoHandle::with_abort(
-        move || match rx.try_recv() {
-            Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-            Ok(r) => finish(r),
-            // No sync equivalent for a dropped worker — plain descriptive
-            // string, matching `fs_offload`'s/`shell_async`'s own novel-case
-            // (non-parity) error text.
-            Err(TryRecvError::Closed) => finish(Err("git: subprocess worker dropped".to_string())),
-        },
-        move || {
-            abort_task();
-        },
-    ));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
+    }
 }
 
-/// Offload a git invocation whose Sema-visible result is `decode(stdout)` on a
-/// zero exit, and an error matching `git()`'s exact rendered text (via
-/// [`eval_msg`]) on a non-zero exit or a spawn failure. `args` are the
-/// CALLER-visible args (no `core.quotepath` prefix — `git_offload` adds it to
-/// the real argv), used verbatim in the error text exactly like `git()`'s
-/// `args.join(" ")`, so async and sync error messages can't drift.
-fn git_stdout_async(
-    args: Vec<String>,
-    decode: impl Fn(String) -> Value + 'static,
-) -> Result<Value, SemaError> {
-    let args_joined = args.join(" ");
-    let mut full_args = vec!["-c".to_string(), "core.quotepath=false".to_string()];
-    full_args.extend(args);
-    git_offload(full_args, move |raw| match raw {
-        Err(msg) => sema_core::IoPoll::Ready(Err(msg)),
-        Ok(raw) if raw.status_code == Some(0) => {
-            let out = String::from_utf8_lossy(&raw.stdout).to_string();
-            sema_core::IoPoll::Ready(Ok(decode(out)))
+/// Proves the queued-before-start case. If the executor discards the job
+/// closure before invoking it, no process or pipe can exist and dropping this
+/// guard publishes `Reaped`. Once started, only [`git_run_future`] may publish
+/// that proof after its wait and pipe joins finish.
+struct GitDispatchGuard {
+    completion: Option<GitCompletionGuard>,
+}
+
+impl GitDispatchGuard {
+    fn new(completion: GitCompletionGuard) -> Self {
+        Self {
+            completion: Some(completion),
         }
-        Ok(raw) => {
-            let stderr = String::from_utf8_lossy(&raw.stderr).trim().to_string();
-            sema_core::IoPoll::Ready(Err(eval_msg(format!("git {args_joined}: {stderr}"))))
+    }
+
+    fn start(mut self) -> GitCompletionGuard {
+        self.completion
+            .take()
+            .expect("dispatch completion is transferred exactly once")
+    }
+}
+
+impl Drop for GitDispatchGuard {
+    fn drop(&mut self) {
+        if let Some(completion) = self.completion.take() {
+            completion.mark_reaped();
         }
+    }
+}
+
+/// Cancel one runtime Git invocation by waking the owned worker. The worker
+/// keeps the child unreaped while pipe drains are live, so it can signal the
+/// original process group without retaining a reusable raw pid in this hook.
+struct GitCancelHook {
+    signal: Option<crate::runtime_offload::CancelSignal>,
+    completion: GitCompletionGuard,
+}
+
+impl GitCancelHook {
+    fn new(signal: crate::runtime_offload::CancelSignal, completion: GitCompletionGuard) -> Self {
+        Self {
+            signal: Some(signal),
+            completion,
+        }
+    }
+}
+
+impl Trace for GitCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CancelHook for GitCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        if let Some(signal) = self.signal.take() {
+            let _ = signal.send(());
+        }
+        Ok(self.completion.disposition())
+    }
+
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(self.completion.disposition())
+    }
+}
+
+#[cfg(unix)]
+fn kill_git_process_group(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    // SAFETY: runtime Git children call `process_group(0)`, so a negative pid
+    // targets only the process group owned by this invocation.
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+    }
+}
+
+fn terminate_git_child(child: &mut tokio::process::Child, pid: u32) {
+    #[cfg(unix)]
+    kill_git_process_group(pid);
+    // This is the non-Unix cancellation mechanism and a direct-child fallback
+    // if a Unix group signal races process-group setup or exit.
+    let _ = child.start_kill();
+}
+
+/// The over-cap signal shared by both pipe drains and the invocation future: the
+/// first drain to exceed the cap sets the flag and wakes the future so it can
+/// kill the process group promptly (which lets the sibling drain read EOF).
+type OverCapSignal = tokio::sync::mpsc::Sender<()>;
+
+/// Drain one pipe incrementally, never buffering more than `cap` bytes. On
+/// exceeding the cap the drain stops reading, publishes the over-cap fact, wakes
+/// the invocation future (which kills the process group), and returns the bytes
+/// read so far (discarded on the over-cap error path). This is a bounded,
+/// pre-dispatch-capped admission — never `read_to_end` of a hostile pipe.
+async fn drain_git_pipe<R>(
+    mut pipe: R,
+    cap: usize,
+    over_cap: Arc<AtomicBool>,
+    signal: OverCapSignal,
+) -> std::io::Result<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut bytes = Vec::new();
+    let mut chunk = vec![0u8; GIT_DRAIN_CHUNK];
+    loop {
+        let read = pipe.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() > cap {
+            // Only the first drain to trip needs to wake the future and kill the
+            // group; the other drain then reads EOF as the child dies.
+            if !over_cap.swap(true, Ordering::AcqRel) {
+                let _ = signal.try_send(());
+            }
+            bytes.truncate(cap);
+            return Ok(bytes);
+        }
+    }
+    Ok(bytes)
+}
+
+/// The `Send` future that runs one `git` invocation off the VM thread on the
+/// executor's blocking worker (via `io_block_on` inside `runtime_offload`).
+/// Stdout and stderr are drained concurrently with the child wait, preventing a
+/// full pipe from deadlocking the process. Each drain is capped at
+/// `max_output_bytes`: exceeding it kills the process group (the same hook
+/// cancellation uses) and resolves the invocation with a structured over-cap
+/// error rather than buffering a hostile pipe to exhaustion. Cancellation kills
+/// the process group on Unix (the direct child elsewhere), then still joins both
+/// drains and awaits the child before publishing the completion proof.
+/// `kill_on_drop` remains a fallback for executor panic/drop paths.
+async fn git_run_future(
+    full_args: Vec<String>,
+    max_output_bytes: usize,
+    mut cancel: crate::runtime_offload::CancelWaiter,
+    completion: GitCompletionGuard,
+) -> Result<RawGitOutput, String> {
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(&full_args)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            completion.mark_reaped();
+            return Err(format!(
+                "git: failed to run `git` (is it installed and on PATH?): {error}"
+            ));
+        }
+    };
+    let pid = child.id().unwrap_or(0);
+
+    let (stdout, stderr) = match (child.stdout.take(), child.stderr.take()) {
+        (Some(stdout), Some(stderr)) => (stdout, stderr),
+        _ => {
+            terminate_git_child(&mut child, pid);
+            let wait = child.wait().await;
+            if wait.is_ok() {
+                completion.mark_reaped();
+            }
+            return Err("git: subprocess pipes were not captured".to_string());
+        }
+    };
+    let over_cap = Arc::new(AtomicBool::new(false));
+    let (over_cap_tx, mut over_cap_rx) = tokio::sync::mpsc::channel::<()>(2);
+    let stdout_drain = tokio::spawn(drain_git_pipe(
+        stdout,
+        max_output_bytes,
+        Arc::clone(&over_cap),
+        over_cap_tx.clone(),
+    ));
+    let stderr_drain = tokio::spawn(drain_git_pipe(
+        stderr,
+        max_output_bytes,
+        Arc::clone(&over_cap),
+        over_cap_tx,
+    ));
+    let stdout_abort = stdout_drain.abort_handle();
+    let stderr_abort = stderr_drain.abort_handle();
+
+    let mut cancelled = false;
+    let mut cancel_resolved = false;
+    let mut over_capped = false;
+    let drains = async { tokio::join!(stdout_drain, stderr_drain) };
+    tokio::pin!(drains);
+    let (stdout, stderr) = tokio::select! {
+        result = &mut drains => result,
+        over = over_cap_rx.recv() => {
+            // An over-cap drain woke us: kill the process group so the sibling
+            // drain reads EOF, then join the drains bounded by the same grace as
+            // cancellation. `None` (both senders dropped without tripping) means
+            // the drains already finished — just await them.
+            if over.is_some() && over_cap.load(Ordering::Acquire) {
+                over_capped = true;
+                terminate_git_child(&mut child, pid);
+                match tokio::time::timeout(GIT_CANCEL_DRAIN_GRACE, &mut drains).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        stdout_abort.abort();
+                        stderr_abort.abort();
+                        drains.await
+                    }
+                }
+            } else {
+                drains.await
+            }
+        }
+        signal = &mut cancel => {
+            cancel_resolved = true;
+            if signal.is_ok() {
+                cancelled = true;
+                terminate_git_child(&mut child, pid);
+                match tokio::time::timeout(GIT_CANCEL_DRAIN_GRACE, &mut drains).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        stdout_abort.abort();
+                        stderr_abort.abort();
+                        drains.await
+                    }
+                }
+            } else {
+                drains.await
+            }
+        }
+    };
+    // The child remains unreaped until both pipes close. While an inherited-pipe
+    // descendant is alive, the pid therefore still names the original group and
+    // cannot be reused by an unrelated process group.
+    let status = if cancel_resolved {
+        child.wait().await
+    } else {
+        tokio::select! {
+            result = child.wait() => result,
+            signal = &mut cancel => {
+                if signal.is_ok() {
+                    cancelled = true;
+                    terminate_git_child(&mut child, pid);
+                }
+                child.wait().await
+            }
+        }
+    };
+    let status = match status {
+        Ok(status) => Ok(status),
+        Err(first_error) => child.wait().await.map_err(|second_error| {
+            std::io::Error::new(
+                second_error.kind(),
+                format!("initial wait failed: {first_error}; reap retry failed: {second_error}"),
+            )
+        }),
+    };
+
+    // These three awaits are the resource proof: the direct child is reaped and
+    // neither pipe-drain task remains live. On cancellation, an escaped process
+    // can force the bounded path to abort the drains, but both JoinHandles are
+    // still awaited before this proof is published.
+    if status.is_ok() {
+        completion.mark_reaped();
+    }
+
+    // An over-cap kill is a hard failure independent of the (now-terminated)
+    // child's exit status and of any drain the grace timeout had to abort, so
+    // surface the structured error before unwrapping the drains. A genuine
+    // cancellation still wins (the runtime settles it via the cancel hook).
+    if over_capped && !cancelled {
+        return Err(format!(
+            "git: output exceeded the {max_output_bytes}-byte limit; the process group was terminated"
+        ));
+    }
+
+    let status = status.map_err(|error| format!("git: failed while waiting for `git`: {error}"))?;
+    let stdout = stdout
+        .map_err(|error| format!("git: stdout drain task failed: {error}"))?
+        .map_err(|error| format!("git: failed to read stdout: {error}"))?;
+    let stderr = stderr
+        .map_err(|error| format!("git: stderr drain task failed: {error}"))?
+        .map_err(|error| format!("git: failed to read stderr: {error}"))?;
+    if cancelled {
+        return Err("git was cancelled".to_string());
+    }
+    Ok(RawGitOutput {
+        status_code: status.code(),
+        stdout,
+        stderr,
     })
 }
 
+fn git_external_runtime(
+    full_args: Vec<String>,
+    decode: impl FnOnce(RawGitOutput) -> Result<Value, SemaError> + 'static,
+) -> NativeResult {
+    let kind =
+        CompletionKind::try_from_raw(GIT_COMPLETION_KIND).expect("git completion kind is nonzero");
+    // Resolve the output cap on the VM thread (pre-dispatch) so the offloaded job
+    // carries a fixed finite admission, never reading a thread-local on a worker.
+    let max_output_bytes = effective_git_max_output_bytes();
+    let (cancel_tx, cancel_rx) = crate::runtime_offload::cancel_channel();
+    let completion = GitCompletionGuard::default();
+    let dispatch = GitDispatchGuard::new(completion.clone());
+    let resource =
+        InterruptibleResource::new("git", Box::new(GitCancelHook::new(cancel_tx, completion)));
+    crate::runtime_offload::suspend_external_interruptible_owned_try(
+        "git",
+        kind,
+        resource,
+        decode,
+        move || git_run_future(full_args, max_output_bytes, cancel_rx, dispatch.start()),
+    )
+}
+
+/// Unified-runtime counterpart to running `git` off the VM thread: SUSPEND on an
+/// interruptible External wait whose job runs `git` off the VM thread and, on a
+/// zero exit, resumes with `decode(stdout)`; a non-zero exit / spawn failure
+/// raises the SAME error text `git()` renders (so runtime and sync can't drift).
+/// Cancellation kills the owned process group on Unix (the direct child on
+/// other platforms), drains both pipes, and reaps the child before the runtime
+/// cleanup registry releases the resource.
+fn git_stdout_runtime(
+    args: Vec<String>,
+    decode: impl FnOnce(String) -> Value + 'static,
+) -> NativeResult {
+    let args_joined = args.join(" ");
+    let mut full_args = vec!["-c".to_string(), "core.quotepath=false".to_string()];
+    full_args.extend(args);
+    git_external_runtime(
+        full_args,
+        move |raw: RawGitOutput| -> Result<Value, SemaError> {
+            if raw.status_code == Some(0) {
+                Ok(decode(String::from_utf8_lossy(&raw.stdout).to_string()))
+            } else {
+                let stderr = String::from_utf8_lossy(&raw.stderr).trim().to_string();
+                Err(SemaError::eval(format!("git {args_joined}: {stderr}")))
+            }
+        },
+    )
+}
+
+/// Unified-runtime counterpart to `git/ignore-matches?`'s `git_offload` use:
+/// needs the RAW exit code (0 = ignored, 1 = not, >1 = error), so it bypasses
+/// `git_stdout_runtime`'s zero-exit-only helper exactly like the synchronous
+/// path bypasses `git()`.
+fn git_ignore_matches_runtime(path: String) -> NativeResult {
+    let path_for_msg = path.clone();
+    let full_args = vec!["check-ignore".to_string(), "-q".to_string(), path];
+    git_external_runtime(
+        full_args,
+        move |raw: RawGitOutput| -> Result<Value, SemaError> {
+            match raw.status_code {
+                Some(0) => Ok(Value::bool(true)),
+                Some(1) => Ok(Value::bool(false)),
+                other => {
+                    let stderr = String::from_utf8_lossy(&raw.stderr).trim().to_string();
+                    Err(SemaError::eval(format!(
+                        "git check-ignore {path_for_msg}: exit {}: {stderr}",
+                        other
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "signal".into())
+                    )))
+                }
+            }
+        },
+    )
+}
+
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/root", |args| {
+    crate::register_runtime_fn_path_gated(env, sandbox, Caps::PROCESS, "git/root", &[], |args| {
         check_arity!(args, "git/root", 0);
-        if in_async_context() {
-            return git_stdout_async(
+        if in_runtime_quantum() {
+            return git_stdout_runtime(
                 vec!["rev-parse".to_string(), "--show-toplevel".to_string()],
                 |out| Value::string(out.trim()),
             );
         }
         let out = git(&["rev-parse", "--show-toplevel"])?;
-        Ok(Value::string(out.trim()))
+        Ok(NativeOutcome::Return(Value::string(out.trim())))
     });
 
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/current-branch", |args| {
-        check_arity!(args, "git/current-branch", 0);
-        if in_async_context() {
-            return git_stdout_async(
-                vec![
-                    "rev-parse".to_string(),
-                    "--abbrev-ref".to_string(),
-                    "HEAD".to_string(),
-                ],
-                |out| Value::string(out.trim()),
-            );
-        }
-        let out = git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
-        Ok(Value::string(out.trim()))
-    });
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::PROCESS,
+        "git/current-branch",
+        &[],
+        |args| {
+            check_arity!(args, "git/current-branch", 0);
+            if in_runtime_quantum() {
+                return git_stdout_runtime(
+                    vec![
+                        "rev-parse".to_string(),
+                        "--abbrev-ref".to_string(),
+                        "HEAD".to_string(),
+                    ],
+                    |out| Value::string(out.trim()),
+                );
+            }
+            let out = git(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+            Ok(NativeOutcome::Return(Value::string(out.trim())))
+        },
+    );
 
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/status", |args| {
+    crate::register_runtime_fn_path_gated(env, sandbox, Caps::PROCESS, "git/status", &[], |args| {
         check_arity!(args, "git/status", 0);
-        if in_async_context() {
-            return git_stdout_async(
+        if in_runtime_quantum() {
+            return git_stdout_runtime(
                 vec![
                     "status".to_string(),
                     "--porcelain=v1".to_string(),
@@ -312,25 +649,36 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 |out| status_entries_value(parse_status_entries(&out)),
             );
         }
-        Ok(status_entries_value(status_entries()?))
+        Ok(NativeOutcome::Return(status_entries_value(
+            status_entries()?
+        )))
     });
 
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/changed-files", |args| {
-        check_arity!(args, "git/changed-files", 0);
-        if in_async_context() {
-            return git_stdout_async(
-                vec![
-                    "status".to_string(),
-                    "--porcelain=v1".to_string(),
-                    "-z".to_string(),
-                ],
-                |out| changed_files_value(parse_status_entries(&out)),
-            );
-        }
-        Ok(changed_files_value(status_entries()?))
-    });
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::PROCESS,
+        "git/changed-files",
+        &[],
+        |args| {
+            check_arity!(args, "git/changed-files", 0);
+            if in_runtime_quantum() {
+                return git_stdout_runtime(
+                    vec![
+                        "status".to_string(),
+                        "--porcelain=v1".to_string(),
+                        "-z".to_string(),
+                    ],
+                    |out| changed_files_value(parse_status_entries(&out)),
+                );
+            }
+            Ok(NativeOutcome::Return(
+                changed_files_value(status_entries()?),
+            ))
+        },
+    );
 
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/diff", |args| {
+    crate::register_runtime_fn_path_gated(env, sandbox, Caps::PROCESS, "git/diff", &[], |args| {
         check_arity!(args, "git/diff", 0..=1);
         let path = if args.is_empty() {
             None
@@ -342,116 +690,120 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     .to_string(),
             )
         };
-        if in_async_context() {
-            let diff_args = match &path {
-                None => vec!["diff".to_string()],
-                Some(p) => vec!["diff".to_string(), "--".to_string(), p.clone()],
-            };
-            return git_stdout_async(diff_args, |out| Value::string(&out));
+        let diff_args = || match &path {
+            None => vec!["diff".to_string()],
+            Some(p) => vec!["diff".to_string(), "--".to_string(), p.clone()],
+        };
+        if in_runtime_quantum() {
+            return git_stdout_runtime(diff_args(), |out| Value::string(&out));
         }
         let out = match &path {
             None => git(&["diff"])?,
             Some(p) => git(&["diff", "--", p])?,
         };
-        Ok(Value::string(&out))
+        Ok(NativeOutcome::Return(Value::string(&out)))
     });
 
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/diff-files", |args| {
-        check_arity!(args, "git/diff-files", 0);
-        if in_async_context() {
-            return git_stdout_async(vec!["diff".to_string(), "--name-only".to_string()], |out| {
-                diff_files_value(&out)
-            });
-        }
-        let out = git(&["diff", "--name-only"])?;
-        Ok(diff_files_value(&out))
-    });
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::PROCESS,
+        "git/diff-files",
+        &[],
+        |args| {
+            check_arity!(args, "git/diff-files", 0);
+            if in_runtime_quantum() {
+                return git_stdout_runtime(
+                    vec!["diff".to_string(), "--name-only".to_string()],
+                    |out| diff_files_value(&out),
+                );
+            }
+            let out = git(&["diff", "--name-only"])?;
+            Ok(NativeOutcome::Return(diff_files_value(&out)))
+        },
+    );
 
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/recent-files", |args| {
-        check_arity!(args, "git/recent-files", 0..=1);
-        let n = if args.is_empty() {
-            20
-        } else {
-            args[0]
-                .as_int()
-                .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
-        };
-        let n_str = n.to_string();
-        if in_async_context() {
-            return git_stdout_async(
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::PROCESS,
+        "git/recent-files",
+        &[],
+        |args| {
+            check_arity!(args, "git/recent-files", 0..=1);
+            let n = if args.is_empty() {
+                20
+            } else {
+                args[0]
+                    .as_int()
+                    .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
+            };
+            let n_str = n.to_string();
+            let log_args = || {
                 vec![
                     "log".to_string(),
                     "--name-only".to_string(),
                     "--pretty=format:".to_string(),
                     "-n".to_string(),
                     n_str.clone(),
-                ],
-                |out| recent_files_value(&out),
-            );
-        }
-        let out = git(&["log", "--name-only", "--pretty=format:", "-n", &n_str])?;
-        Ok(recent_files_value(&out))
-    });
-
-    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "git/ignore-matches?", |args| {
-        check_arity!(args, "git/ignore-matches?", 1);
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
-        // `git check-ignore -q` exits 0 if the path is ignored, 1 if not, and
-        // >1 on a real error. We need the raw exit code, so bypass the
-        // helpers above (`git()`/`git_stdout_async`, which treat any non-zero
-        // exit as failure) on BOTH paths.
-        if in_async_context() {
-            let path_for_msg = path.clone();
-            return git_offload(
-                vec!["check-ignore".to_string(), "-q".to_string(), path],
-                move |raw| match raw {
-                    Err(msg) => sema_core::IoPoll::Ready(Err(msg)),
-                    Ok(raw) => match raw.status_code {
-                        Some(0) => sema_core::IoPoll::Ready(Ok(Value::bool(true))),
-                        Some(1) => sema_core::IoPoll::Ready(Ok(Value::bool(false))),
-                        other => {
-                            let stderr = String::from_utf8_lossy(&raw.stderr).trim().to_string();
-                            sema_core::IoPoll::Ready(Err(eval_msg(format!(
-                                "git check-ignore {path_for_msg}: exit {}: {stderr}",
-                                other
-                                    .map(|c| c.to_string())
-                                    .unwrap_or_else(|| "signal".into())
-                            ))))
-                        }
-                    },
-                },
-            );
-        }
-        let output = std::process::Command::new("git")
-            .args(["check-ignore", "-q", &path])
-            .output()
-            .map_err(|e| {
-                SemaError::Io(format!(
-                    "git: failed to run `git` (is it installed and on PATH?): {e}"
-                ))
-            })?;
-        match output.status.code() {
-            Some(0) => Ok(Value::bool(true)),
-            Some(1) => Ok(Value::bool(false)),
-            other => {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                Err(SemaError::eval(format!(
-                    "git check-ignore {path}: exit {}: {stderr}",
-                    other
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "signal".into())
-                )))
+                ]
+            };
+            if in_runtime_quantum() {
+                return git_stdout_runtime(log_args(), |out| recent_files_value(&out));
             }
-        }
-    });
+            let out = git(&["log", "--name-only", "--pretty=format:", "-n", &n_str])?;
+            Ok(NativeOutcome::Return(recent_files_value(&out)))
+        },
+    );
+
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::PROCESS,
+        "git/ignore-matches?",
+        &[],
+        |args| {
+            check_arity!(args, "git/ignore-matches?", 1);
+            let path = args[0]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+                .to_string();
+            // `git check-ignore -q` exits 0 if the path is ignored, 1 if not, and
+            // >1 on a real error. We need the raw exit code, so bypass the
+            // helpers above (`git()`/`git_stdout_runtime`, which treat any non-zero
+            // exit as failure) on ALL paths.
+            if in_runtime_quantum() {
+                return git_ignore_matches_runtime(path);
+            }
+            let output = std::process::Command::new("git")
+                .args(["check-ignore", "-q", &path])
+                .output()
+                .map_err(|e| {
+                    SemaError::Io(format!(
+                        "git: failed to run `git` (is it installed and on PATH?): {e}"
+                    ))
+                })?;
+            match output.status.code() {
+                Some(0) => Ok(NativeOutcome::Return(Value::bool(true))),
+                Some(1) => Ok(NativeOutcome::Return(Value::bool(false))),
+                other => {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    Err(SemaError::eval(format!(
+                        "git check-ignore {path}: exit {}: {stderr}",
+                        other
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "signal".into())
+                    )))
+                }
+            }
+        },
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sema_core::runtime::{CancelDisposition, CancelHook};
 
     /// True when a `git` binary is available; tests early-return otherwise so a
     /// machine without git doesn't hard-fail the suite.
@@ -545,5 +897,113 @@ mod tests {
         let tracked = call(&env, "git/ignore-matches?", &[Value::string(&cargo)])
             .expect("git/ignore-matches? Cargo.toml");
         assert_eq!(tracked, Value::bool(false), "{cargo} should not be ignored");
+    }
+
+    #[test]
+    fn cancel_hook_stays_pending_until_process_and_pipes_are_reaped() {
+        let completion = GitCompletionGuard::default();
+        let (cancel_tx, mut cancel_rx) = crate::runtime_offload::cancel_channel();
+        let mut hook = GitCancelHook::new(cancel_tx, completion.clone());
+
+        assert_eq!(hook.cancel().unwrap(), CancelDisposition::PendingReap);
+        assert_eq!(cancel_rx.try_recv(), Ok(()), "cancel signal must fire");
+        assert_eq!(hook.reap().unwrap(), CancelDisposition::PendingReap);
+
+        completion.mark_reaped();
+        assert_eq!(hook.reap().unwrap(), CancelDisposition::Reaped);
+    }
+
+    #[test]
+    fn cancel_hook_reports_reaped_when_worker_already_finished() {
+        let completion = GitCompletionGuard::default();
+        completion.mark_reaped();
+        let (cancel_tx, mut cancel_rx) = crate::runtime_offload::cancel_channel();
+        let mut hook = GitCancelHook::new(cancel_tx, completion);
+
+        assert_eq!(hook.cancel().unwrap(), CancelDisposition::Reaped);
+        assert_eq!(cancel_rx.try_recv(), Ok(()), "cancel signal is one-shot");
+        assert_eq!(hook.reap().unwrap(), CancelDisposition::Reaped);
+    }
+
+    #[test]
+    fn dropping_unstarted_dispatch_proves_no_process_exists() {
+        let completion = GitCompletionGuard::default();
+        let dispatch = GitDispatchGuard::new(completion.clone());
+
+        drop(dispatch);
+
+        assert_eq!(completion.disposition(), CancelDisposition::Reaped);
+    }
+
+    #[test]
+    fn starting_dispatch_requires_explicit_reap_proof() {
+        let completion = GitCompletionGuard::default();
+        let dispatch = GitDispatchGuard::new(completion.clone());
+
+        let worker_completion = dispatch.start();
+        drop(worker_completion);
+
+        assert_eq!(
+            completion.disposition(),
+            CancelDisposition::PendingReap,
+            "a started worker cannot be declared reaped merely because its guard dropped"
+        );
+    }
+
+    #[test]
+    fn git_output_cap_is_finite_and_clamps_overrides() {
+        assert_eq!(effective_git_max_output_bytes(), GIT_MAX_OUTPUT_BYTES);
+        set_git_max_output_bytes_override(Some(16));
+        assert_eq!(effective_git_max_output_bytes(), 16);
+        // An override never raises the cap above the hard ceiling.
+        set_git_max_output_bytes_override(Some(usize::MAX));
+        assert_eq!(effective_git_max_output_bytes(), GIT_MAX_OUTPUT_BYTES);
+        set_git_max_output_bytes_override(None);
+        assert_eq!(effective_git_max_output_bytes(), GIT_MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn drain_git_pipe_caps_output_and_signals_over_cap() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+
+        // Over-cap: the drain truncates to the cap, sets the flag, and wakes the
+        // invocation future exactly once.
+        let over_cap = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(2);
+        let flag = Arc::clone(&over_cap);
+        let data = [b'x'; 100];
+        let bytes = runtime
+            .block_on(drain_git_pipe(&data[..], 16, flag, tx))
+            .expect("capped drain reads without error");
+        assert_eq!(bytes.len(), 16, "the drain truncates to the cap");
+        assert!(
+            over_cap.load(Ordering::Acquire),
+            "over-cap flag must be set"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(())),
+            "over-cap must wake the invocation future"
+        );
+
+        // Under-cap: the drain reads to EOF and never signals.
+        let under = Arc::new(AtomicBool::new(false));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(2);
+        let flag = Arc::clone(&under);
+        let data = [b'y'; 8];
+        let bytes = runtime
+            .block_on(drain_git_pipe(&data[..], 16, flag, tx))
+            .expect("under-cap drain reads without error");
+        assert_eq!(bytes, [b'y'; 8], "under-cap output is returned whole");
+        assert!(
+            !under.load(Ordering::Acquire),
+            "under-cap must not set the over-cap flag"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "under-cap must not wake the invocation future"
+        );
     }
 }

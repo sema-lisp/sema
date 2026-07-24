@@ -33,8 +33,8 @@
 
 (define (area shape)
   (cond
-    ((circle? shape)  (* pi (expt (circle-radius shape) 2)))
-    ((rect? shape)    (* (rect-width shape) (rect-height shape)))))
+    ((circle? shape) (* pi (expt (circle-radius shape) 2)))
+    ((rect? shape) (* (rect-width shape) (rect-height shape)))))
 
 (define c1 (make-circle (make-point 0 0) 5))
 (define r1 (make-rect (make-point 1 2) 10 6))

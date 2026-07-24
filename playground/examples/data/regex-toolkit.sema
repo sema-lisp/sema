@@ -40,9 +40,9 @@
                (level (nth groups 1))
                (icon
                  (cond
-                   ((equal? level "ERROR")  "🔴")
-                   ((equal? level "WARN")   "🟡")
-                   (else                    "🟢"))))
+                   ((equal? level "ERROR") "🔴")
+                   ((equal? level "WARN") "🟡")
+                   (else "🟢"))))
           (println
             (format "  ~a ~a | ~a | ~a"
               icon

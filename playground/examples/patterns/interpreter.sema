@@ -3,10 +3,10 @@
 (println "=== Mini-Lisp Interpreter ===\n")
 
 ;; AST constructors
-(define (make-num n)         (map/new :type :number :value n))
-(define (make-var name)      (map/new :type :var :name name))
-(define (make-binop op l r)  (map/new :type :binop :op op :left l :right r))
-(define (make-if c t f)      (map/new :type :if :cond c :then t :else f))
+(define (make-num n) (map/new :type :number :value n))
+(define (make-var name) (map/new :type :var :name name))
+(define (make-binop op l r) (map/new :type :binop :op op :left l :right r))
+(define (make-if c t f) (map/new :type :if :cond c :then t :else f))
 (define (make-let name val body)
   (map/new :type :let :name name :val val :body body))
 (define (make-lam param body)

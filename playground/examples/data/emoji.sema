@@ -79,8 +79,8 @@
           (append acc (list ZWJ) (string/codepoints e))))
       (list)
       emojis)))
-(define man    (cp->str 128104))
-(define woman  (cp->str 128105))
+(define man (cp->str 128104))
+(define woman (cp->str 128105))
 
 ;; Families
 (println "  👪 Families:")
@@ -135,10 +135,10 @@
       "Family")))
 (for-each
   (fn (e)
-    (let* ((g   (first e))
-           (n   (nth e 1))
-           (b   (string/byte-length g))
-           (bl  (min b 20)))
+    (let* ((g (first e))
+           (n (nth e 1))
+           (b (string/byte-length g))
+           (bl (min b 20)))
       (println
         (format "  ~a ~a ~a bytes — ~a"
           (string/pad-right g 4)

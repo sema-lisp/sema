@@ -9,8 +9,8 @@
   (let loop ((i 0) (acc '()))
     (if (> i (length row))
       (reverse acc)
-      (let ((left   (if (= i 0) 0 (nth row (- i 1))))
-            (right  (if (= i (length row)) 0 (nth row i))))
+      (let ((left (if (= i 0) 0 (nth row (- i 1))))
+            (right (if (= i (length row)) 0 (nth row i))))
         (loop (+ i 1) (cons (+ left right) acc))))))
 
 (define (pascal-rows n)
@@ -48,9 +48,9 @@
 ;; === 3. Sine Wave ===
 (println "\n=== Sine Wave ===\n")
 
-(define wave-cols  60)
-(define wave-rows  21)
-(define wave-mid   (/ (- wave-rows 1) 2))
+(define wave-cols 60)
+(define wave-rows 21)
+(define wave-mid (/ (- wave-rows 1) 2))
 
 (let loop-row ((row 0))
   (when (< row wave-rows)
@@ -58,9 +58,9 @@
             (let loop-col ((col 0) (acc ""))
               (if (>= col wave-cols)
                 acc
-                (let* ((x           (* (/ col (- wave-cols 1.0)) (* 4.0 pi)))
-                       (y           (sin x))
-                       (target-row  (round (* (- 1.0 y) 0.5 (- wave-rows 1)))))
+                (let* ((x (* (/ col (- wave-cols 1.0)) (* 4.0 pi)))
+                       (y (sin x))
+                       (target-row (round (* (- 1.0 y) 0.5 (- wave-rows 1)))))
                   (cond
                     ((= row (round target-row))
                       (loop-col (+ col 1) (string/append acc "*")))
@@ -96,9 +96,9 @@
 
 (for-each
   (fn (item)
-    (let* ((label    (nth item 0))
-           (value    (nth item 1))
-           (bar-len  (int (round (* (/ value (+ chart-max 0.0)) 40)))))
+    (let* ((label (nth item 0))
+           (value (nth item 1))
+           (bar-len (int (round (* (/ value (+ chart-max 0.0)) 40)))))
       (println
         (format "  ~a|~a ~a"
           (string/pad-right label (+ max-label-len 1))

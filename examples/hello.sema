@@ -10,9 +10,9 @@
 ;; Fibonacci
 (define (fib n)
   (cond
-    ((= n 0)  0)
-    ((= n 1)  1)
-    (else     (+ (fib (- n 1)) (fib (- n 2))))))
+    ((= n 0) 0)
+    ((= n 1) 1)
+    (else (+ (fib (- n 1)) (fib (- n 2))))))
 
 (display "Fibonacci of 10: ")
 (println (fib 10))
@@ -56,9 +56,9 @@
 (define (compose f g)
   (lambda (x) (f (g x))))
 
-(define inc              (lambda (x) (+ x 1)))
-(define double           (lambda (x) (* x 2)))
-(define inc-then-double  (compose double inc))
+(define inc (lambda (x) (+ x 1)))
+(define double (lambda (x) (* x 2)))
+(define inc-then-double (compose double inc))
 
 (display "inc-then-double 5 = ")
 (println (inc-then-double 5))

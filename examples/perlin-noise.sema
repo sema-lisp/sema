@@ -3,17 +3,17 @@
 ;; Usage: sema examples/perlin-noise.sema              (seed from clock)
 ;;        sema examples/perlin-noise.sema -- 42        (explicit seed)
 
-(define width   70)
-(define height  25)
+(define width 70)
+(define height 25)
 
 ;; Parse optional seed from CLI args (after "--"), otherwise use time-ms
 (define seed
   (let ((args
           (let scan ((a (sys/args)))
             (cond
-              ((null? a)           '())
-              ((= (first a) "--")  (rest a))
-              (else                (scan (rest a)))))))
+              ((null? a) '())
+              ((= (first a) "--") (rest a))
+              (else (scan (rest a)))))))
     (if (null? args)
       (mod (time-ms) 1000000)
       (string/to-number (first args)))))
@@ -38,25 +38,25 @@
 
 ;; --- Single-layer value noise at continuous coordinates (x, y) ---
 (define (value-noise x y)
-  (let* ((ix   (floor x))
-         (iy   (floor y))
-         (fx   (- x ix))
-         (fy   (- y iy))
-         (u    (fade fx))
-         (v    (fade fy))
-         (n00  (hash ix iy))
-         (n10  (hash (+ ix 1) iy))
-         (n01  (hash ix (+ iy 1)))
-         (n11  (hash (+ ix 1) (+ iy 1))))
+  (let* ((ix (floor x))
+         (iy (floor y))
+         (fx (- x ix))
+         (fy (- y iy))
+         (u (fade fx))
+         (v (fade fy))
+         (n00 (hash ix iy))
+         (n10 (hash (+ ix 1) iy))
+         (n01 (hash ix (+ iy 1)))
+         (n11 (hash (+ ix 1) (+ iy 1))))
     (lerp (lerp n00 n10 u)
       (lerp n01 n11 u)
       v)))
 
 ;; --- Octave noise: sum multiple frequencies for detail ---
-(define octaves      3)
-(define lacunarity   2.0)
-(define persistence  0.5)
-(define noise-scale  0.08)
+(define octaves 3)
+(define lacunarity 2.0)
+(define persistence 0.5)
+(define noise-scale 0.08)
 
 (define (octave-noise x y)
   (let loop ((i 0) (freq 1.0) (amp 1.0) (total 0.0) (max-amp 0.0))
@@ -74,13 +74,13 @@
 ;; --- Terrain character mapping ---
 (define (terrain-char val)
   (cond
-    ((< val 0.3)   "~")
-    ((< val 0.38)  ".")
-    ((< val 0.5)   ",")
-    ((< val 0.6)   ";")
-    ((< val 0.72)  ":")
-    ((< val 0.85)  "%")
-    (#t            "#")))
+    ((< val 0.3) "~")
+    ((< val 0.38) ".")
+    ((< val 0.5) ",")
+    ((< val 0.6) ";")
+    ((< val 0.72) ":")
+    ((< val 0.85) "%")
+    (#t "#")))
 
 ;; --- Render ---
 (println

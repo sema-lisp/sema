@@ -16,8 +16,8 @@
   (let loop ((remaining args))
     (if (null? remaining)
       result
-      (let ((arg   (car remaining))
-            (rest  (cdr remaining)))
+      (let ((arg (car remaining))
+            (rest (cdr remaining)))
         (cond
           ((or (equal? arg "--help") (equal? arg "-h"))
             (set! result (assoc result :help #t))
@@ -115,9 +115,9 @@
 
         ;; Slash commands
         ((slash-command? (string/trim input)) (set! eof-count 0)
-          (let* ((trimmed    (string/trim input))
-                 (cmd        (parse-command trimmed))
-                 (new-state  (dispatch-command cmd current-state)))
+          (let* ((trimmed (string/trim input))
+                 (cmd (parse-command trimmed))
+                 (new-state (dispatch-command cmd current-state)))
             (if (equal? new-state 'quit)
               (begin
                 (show-info "Goodbye!")
@@ -126,8 +126,8 @@
 
         ;; Agent turn
         (else (set! eof-count 0)
-          (let ((trimmed  (string/trim input))
-                (mode     (get current-state :mode :normal)))
+          (let ((trimmed (string/trim input))
+                (mode (get current-state :mode :normal)))
 
             ;; In execute mode, nudge user to use /next
             (if (equal? mode :execute)

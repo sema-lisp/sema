@@ -6118,6 +6118,34 @@ fn test_println_error() {
     assert_eq!(eval(r#"(println-error)"#), Value::nil());
 }
 
+// C1: a HOST-ADAPTER-ONLY output hook that itself prints must NOT recurse — the
+// re-entrancy latch in `write_stdout` routes the nested write straight through.
+// Drive a real Sema `print` (which calls `sema_core::write_stdout`) through such
+// a hook and prove it delivers exactly once and returns. Without the latch, the
+// nested write would invoke the hook again, recursing until the stack overflows
+// and aborts the test process.
+#[test]
+fn host_stdout_hook_reentrancy_is_bounded_through_vm_print() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_hook = calls.clone();
+    sema_core::set_host_stdout_hook(Some(Box::new(move |_s: &str| {
+        calls_hook.fetch_add(1, Ordering::SeqCst);
+        // Re-enter from inside the hook; the latch passes this through directly.
+        sema_core::write_stdout("nested-from-hook");
+    })));
+
+    let result = Interpreter::new().eval_str(r#"(print "hi")"#);
+    sema_core::set_host_stdout_hook(None);
+
+    assert!(result.is_ok(), "print through host hook failed: {result:?}");
+    // `print` calls `write_stdout` once; the nested write passed through the
+    // latch rather than invoking the hook again (which would recurse unbounded).
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
 // System: sys/interactive?
 
 #[test]
@@ -6451,6 +6479,219 @@ fn test_term_spinner_update() {
         ),
         Value::nil()
     );
+}
+
+// R19 (B6) spinner lifecycle ownership. In a runtime quantum `term/spinner-stop`
+// offloads its bounded join via an External wait and yields the instant it is
+// called, so a zero-delay sibling task completes first. If the stop blocked the
+// VM thread (the legacy inline join), the spinner task would send before yielding
+// and win the race. Ordering is asserted via channel receive order — never a
+// wall-clock duration — matching the archive/db/kv async-offload suites.
+#[test]
+fn spinner_stop_in_quantum_lets_sibling_run() {
+    let interp = Interpreter::new();
+    let result = interp
+        .eval_str_compiled(
+            r#"
+            (let ((out (channel/new 8)))
+              (async/all
+                (list
+                  (async/spawn (fn ()
+                    (let ((id (term/spinner-start "work")))
+                      (term/spinner-stop id)
+                      (channel/send out "spinner"))))
+                  (async/spawn (fn () (channel/send out "sibling")))))
+              (list (channel/recv out) (channel/recv out)))
+            "#,
+        )
+        .expect("spinner-stop offload lets a sibling run");
+    let received: Vec<String> = result
+        .as_list()
+        .expect("channel receives list")
+        .iter()
+        .map(|v| v.as_str().expect("string value").to_string())
+        .collect();
+    assert_eq!(
+        received,
+        vec!["sibling".to_string(), "spinner".to_string()],
+        "the sibling must complete while spinner-stop is parked on its offloaded join, got {received:?}"
+    );
+}
+
+// A spinner started but never stopped must be stopped+joined by interpreter
+// teardown — no live render thread survives the drop. Probed via the live-thread
+// gauge (not terminal output). nextest's process-per-test isolation keeps the
+// gauge local; the baseline read tolerates a shared-process runner too.
+#[test]
+fn interpreter_drop_stops_live_spinner_threads() {
+    let baseline = sema_stdlib::spinner_live_thread_count();
+    let interp = Interpreter::new();
+    interp
+        .eval_str_compiled(r#"(term/spinner-start "unstopped")"#)
+        .expect("start a spinner and leave it running");
+
+    // Wait (bounded) for the render thread to actually start.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while sema_stdlib::spinner_live_thread_count() <= baseline
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        sema_stdlib::spinner_live_thread_count(),
+        baseline + 1,
+        "the spinner render thread must be live before teardown"
+    );
+
+    drop(interp); // teardown hook stops+joins the live spinner
+    assert_eq!(
+        sema_stdlib::spinner_live_thread_count(),
+        baseline,
+        "interpreter teardown must stop and join every live spinner thread"
+    );
+}
+
+// C6 (closes ledger row C14): the KV/serial/SQLite registries are per-thread TLS
+// maps. Before the interpreter-teardown hooks they survived an interpreter drop,
+// so a store/connection opened but never closed leaked across the drop — a fresh
+// interpreter on the same thread observed the stale resource. With the hooks, the
+// dropped interpreter's teardown closes the Available slots (dropping the store /
+// connection) and closes their gates, so a fresh same-thread interpreter starts
+// clean. (Serial needs real hardware to open, so its teardown is proven by
+// `serial::tests::teardown_hook_registered_exactly_once_and_clears_registry`;
+// KV + SQLite are exercised end-to-end here.)
+#[test]
+fn interpreter_drop_closes_kv_serial_sqlite_slots_and_gates() {
+    let kv_path = std::env::temp_dir().join(format!(
+        "sema-c6-kv-{}-{:?}.json",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&kv_path);
+
+    // Interpreter A opens a kv store and an in-memory SQLite db, then is dropped
+    // without ever calling kv/close or db/close.
+    {
+        let interp = Interpreter::new();
+        let program = format!(
+            r#"(begin
+                 (kv/open "c6store" "{kv}")
+                 (kv/set "c6store" "k" 1)
+                 (db/open-memory "c6db")
+                 (db/exec-batch "c6db" "CREATE TABLE t (v INTEGER)")
+                 (list (kv/get "c6store" "k") (db/tables "c6db")))"#,
+            kv = kv_path.display()
+        );
+        let opened = interp
+            .eval_str_compiled(&program)
+            .expect("A opens a kv store and a sqlite db");
+        let parts = opened.as_list().expect("result list");
+        assert_eq!(
+            parts[0].as_int(),
+            Some(1),
+            "store must be usable before drop"
+        );
+        assert_eq!(
+            parts[1].as_list().map(|l| l.len()),
+            Some(1),
+            "db must be usable before drop"
+        );
+        drop(interp); // teardown closes both registries on this thread
+    }
+
+    // Interpreter B on the SAME thread must not observe A's leaked resources.
+    {
+        let interp = Interpreter::new();
+        let kv_err = interp
+            .eval_str_compiled(r#"(kv/get "c6store" "k")"#)
+            .expect_err("A's kv store must not survive A's interpreter drop");
+        assert!(
+            kv_err.to_string().contains("not open"),
+            "expected a closed-store error, got: {kv_err}"
+        );
+        let db_err = interp
+            .eval_str_compiled(r#"(db/tables "c6db")"#)
+            .expect_err("A's sqlite db must not survive A's interpreter drop");
+        assert!(
+            db_err.to_string().contains("no open database"),
+            "expected a closed-db error, got: {db_err}"
+        );
+    }
+
+    let _ = std::fs::remove_file(&kv_path);
+}
+
+// C6 two-interpreter isolation: interpreter teardown operates on the dropping
+// thread's registry only. Interpreter B runs on its own thread with a kv store
+// keyed by the same name as interpreter A's; dropping A on the main thread must
+// leave B's store intact. Every cross-thread wait is bounded so the test can
+// never hang.
+#[test]
+fn interpreter_drop_does_not_disturb_another_thread_registry() {
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    let pid = std::process::id();
+    let path_b = std::env::temp_dir().join(format!("sema-c6-iso-b-{pid}.json"));
+    let _ = std::fs::remove_file(&path_b);
+
+    let (b_ready_tx, b_ready_rx) = channel::<()>();
+    let (proceed_tx, proceed_rx) = channel::<()>();
+    let (b_result_tx, b_result_rx) = channel::<Option<i64>>();
+
+    let path_b_thread = path_b.clone();
+    let thread_b = std::thread::spawn(move || {
+        let interp = Interpreter::new();
+        let program = format!(
+            r#"(begin (kv/open "shared" "{p}") (kv/set "shared" "k" 42) :ok)"#,
+            p = path_b_thread.display()
+        );
+        interp
+            .eval_str_compiled(&program)
+            .expect("B opens its store");
+        b_ready_tx.send(()).expect("signal B ready");
+        proceed_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("main thread proceeded");
+        // A's drop on the main thread must not have touched B's thread-local store.
+        let value = interp
+            .eval_str_compiled(r#"(kv/get "shared" "k")"#)
+            .expect("B's store is still open");
+        b_result_tx.send(value.as_int()).expect("send B result");
+        drop(interp);
+    });
+
+    b_ready_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("B became ready");
+
+    // Interpreter A opens+drops a store under the SAME name on the main thread.
+    {
+        let path_a = std::env::temp_dir().join(format!("sema-c6-iso-a-{pid}.json"));
+        let _ = std::fs::remove_file(&path_a);
+        let interp = Interpreter::new();
+        let program = format!(
+            r#"(begin (kv/open "shared" "{p}") (kv/set "shared" "k" 7) :ok)"#,
+            p = path_a.display()
+        );
+        interp
+            .eval_str_compiled(&program)
+            .expect("A opens its store");
+        drop(interp); // clears the MAIN thread's registry only
+        let _ = std::fs::remove_file(&path_a);
+    }
+
+    proceed_tx.send(()).expect("release B");
+    let b_value = b_result_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("B reported its store value");
+    thread_b.join().expect("thread B joined");
+    assert_eq!(
+        b_value,
+        Some(42),
+        "interpreter A's drop must not disturb interpreter B's registry on another thread"
+    );
+    let _ = std::fs::remove_file(&path_b);
 }
 
 // Regression tests: deftool params stored as BTreeMap (alphabetical keys).
@@ -7270,6 +7511,41 @@ fn test_sandbox_fs_write_denied() {
     let result = interp.eval_str(r#"(file/write "/tmp/sema-sandbox-test.txt" "hi")"#);
     assert!(result.is_err());
     assert_permission_denied(&result.unwrap_err());
+}
+
+// C5 (closes ledger row C04): the non-MCP `EvalContext.sandbox` is ROOT-SHARED —
+// a task spawned with `async/spawn` runs under the SAME sandbox as its parent and
+// cannot widen it. Registered natives capture their evaluator's sandbox at
+// `register_stdlib` time and every task on the interpreter dispatches through those
+// same closures, so a denied capability stays denied across the spawn boundary
+// (there is no per-task sandbox a child could escalate). This locks the
+// child-same-or-narrower contract for the plain evaluator; MCP's per-evaluator
+// authority isolation is proven separately in `mcp_builtin_test.rs`.
+#[test]
+fn spawned_child_sandbox_is_same_or_narrower() {
+    let sandbox = sema_core::Sandbox::deny(sema_core::Caps::FS_WRITE);
+    let interp = Interpreter::new_with_sandbox(&sandbox);
+
+    // A denied capability stays denied inside a spawned child: the child inherits
+    // the parent's sandbox and cannot escalate to permit the write. The permission
+    // error is raised on the VM thread (pre-dispatch gate) and propagates back
+    // through `async/await`.
+    let denied = interp.eval_str_compiled(
+        r#"(async/await (async/spawn (fn () (file/write "/tmp/sema-c5-sandbox-child.txt" "hi"))))"#,
+    );
+    assert!(
+        denied.is_err(),
+        "a spawned child must not widen a parent's denied FS_WRITE"
+    );
+    assert_permission_denied(&denied.unwrap_err());
+
+    // The same child still runs everything the parent's sandbox permits — the
+    // sandbox is inherited unchanged (same authority, neither widened nor
+    // spuriously narrowed).
+    let allowed = interp
+        .eval_str_compiled(r#"(async/await (async/spawn (fn () (+ 40 2))))"#)
+        .expect("a spawned child keeps every capability the parent's sandbox allows");
+    assert_eq!(allowed, sema_core::Value::int(42));
 }
 
 #[test]
@@ -11811,6 +12087,154 @@ fn test_allowed_paths_none_allows_everything() {
     );
 }
 
+#[test]
+fn fs_watch_interpreters_isolate_handles() {
+    let dir = std::env::temp_dir().join(format!("sema-fs-watch-isolation-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.to_string_lossy().replace('\\', "/");
+
+    let interp_a = Interpreter::new();
+    let interp_b = Interpreter::new();
+    let handle = interp_a
+        .eval_str(&format!(r#"(fs/watch "{path}")"#))
+        .unwrap();
+    assert_eq!(handle, Value::int(1));
+
+    let err = interp_b
+        .eval_str("(fs/watch-events 1)")
+        .expect_err("another interpreter must not see the watcher handle");
+    assert!(
+        err.to_string().contains("no such watcher 1"),
+        "unexpected isolation error: {err}"
+    );
+    assert_eq!(interp_b.eval_str("(fs/unwatch 1)").unwrap(), Value::nil());
+
+    assert!(interp_a.eval_str("(fs/watch-events 1)").is_ok());
+    assert_eq!(interp_a.eval_str("(fs/unwatch 1)").unwrap(), Value::nil());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn fs_watch_respects_allowed_paths() {
+    let root = std::env::temp_dir().join(format!("sema-fs-watch-sandbox-{}", std::process::id()));
+    let allowed = root.join("allowed");
+    let denied = root.join("denied");
+    std::fs::create_dir_all(&allowed).unwrap();
+    std::fs::create_dir_all(&denied).unwrap();
+
+    let sandbox = sema_core::Sandbox::allow_all().with_allowed_paths(vec![allowed]);
+    let interp = Interpreter::new_with_sandbox(&sandbox);
+    let denied = denied.to_string_lossy().replace('\\', "/");
+    let err = interp
+        .eval_str(&format!(r#"(fs/watch "{denied}")"#))
+        .expect_err("watching outside the sandbox must be denied");
+    assert_path_denied(&err);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn fs_watch_teardown_clears_handles_with_retained_environment() {
+    let dir = std::env::temp_dir().join(format!("sema-fs-watch-teardown-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.to_string_lossy().replace('\\', "/");
+
+    let interp = Interpreter::new();
+    let handle = interp.eval_str(&format!(r#"(fs/watch "{path}")"#)).unwrap();
+    assert_eq!(handle, Value::int(1));
+    let retained_env = interp.global_env.clone();
+    drop(interp);
+
+    let watch_events = retained_env
+        .get(sema_core::intern("fs/watch-events"))
+        .expect("retained fs/watch-events native");
+    let native = watch_events
+        .as_native_fn_ref()
+        .expect("fs/watch-events is native");
+    let fresh_ctx = sema_core::EvalContext::new();
+    let err = (native.func)(&fresh_ctx, &[handle])
+        .expect_err("interpreter teardown must clear retained watcher handles");
+    assert!(
+        err.to_string().contains("no such watcher 1"),
+        "unexpected teardown error: {err}"
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn fs_watch_explicit_shutdown_clears_handles_with_retained_environment() {
+    let dir = std::env::temp_dir().join(format!("sema-fs-watch-shutdown-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.to_string_lossy().replace('\\', "/");
+
+    let interp = Interpreter::new();
+    let handle = interp.eval_str(&format!(r#"(fs/watch "{path}")"#)).unwrap();
+    assert_eq!(handle, Value::int(1));
+    let retained_env = interp.global_env.clone();
+    interp
+        .shutdown(sema_vm::runtime::ShutdownOptions {
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+            drive_budget: sema_vm::runtime::DriveBudget::host_default(),
+        })
+        .expect("explicit interpreter shutdown succeeds");
+
+    let watch_events = retained_env
+        .get(sema_core::intern("fs/watch-events"))
+        .expect("retained fs/watch-events native");
+    let native = watch_events
+        .as_native_fn_ref()
+        .expect("fs/watch-events is native");
+    let fresh_ctx = sema_core::EvalContext::new();
+    let err = (native.func)(&fresh_ctx, &[handle])
+        .expect_err("explicit shutdown must clear retained watcher handles");
+    assert!(
+        err.to_string().contains("no such watcher 1"),
+        "unexpected explicit-shutdown error: {err}"
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn fs_watch_delivers_real_events_and_unwatch_removes_handle() {
+    let dir = std::env::temp_dir().join(format!("sema-fs-watch-events-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.to_string_lossy().replace('\\', "/");
+    let changed_file = dir.join("changed.txt");
+    let interp = Interpreter::new();
+
+    assert_eq!(
+        interp.eval_str(&format!(r#"(fs/watch "{path}")"#)).unwrap(),
+        Value::int(1)
+    );
+
+    let mut delivered = false;
+    for revision in 0..400 {
+        std::fs::write(&changed_file, revision.to_string()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let events = interp.eval_str("(fs/watch-events 1)").unwrap();
+        if events.as_list().is_some_and(|events| !events.is_empty()) {
+            delivered = true;
+            break;
+        }
+    }
+    assert!(
+        delivered,
+        "real filesystem changes must reach fs/watch-events"
+    );
+
+    assert_eq!(interp.eval_str("(fs/unwatch 1)").unwrap(), Value::nil());
+    let err = interp
+        .eval_str("(fs/watch-events 1)")
+        .expect_err("unwatch removes the public handle");
+    assert!(
+        err.to_string().contains("no such watcher 1"),
+        "unexpected unwatch error: {err}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 // ── f-string tests ──
 
 #[test]
@@ -12878,6 +13302,158 @@ fn test_http_serve_websocket() {
 }
 
 // ===========================================================================
+// sema fmt --json
+// ===========================================================================
+
+const FMT_JSON_UGLY: &str = "(define   x   1)\n";
+const FMT_JSON_PRETTY: &str = "(define x 1)\n";
+
+fn run_fmt_command(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("fmt")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("failed to run sema fmt")
+}
+
+fn parse_ndjson(output: &[u8]) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("stdout line must be JSON"))
+        .collect()
+}
+
+#[test]
+fn test_fmt_json_changed_input_is_valid_and_read_only() {
+    let dir = unique_temp_dir("fmt-json-changed");
+    std::fs::write(dir.join("changed.sema"), FMT_JSON_UGLY).unwrap();
+
+    let output = run_fmt_command(&dir, &["--json", "changed.sema"]);
+
+    assert!(
+        output.status.success(),
+        "sema fmt failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let results = parse_ndjson(&output.stdout);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["file"], "changed.sema");
+    assert_eq!(results[0]["formatted"], true);
+    assert_eq!(results[0]["changed"], true);
+    assert_eq!(results[0]["source"], FMT_JSON_PRETTY);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("changed.sema")).unwrap(),
+        FMT_JSON_UGLY,
+        "JSON mode must not rewrite the source file"
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_fmt_json_unchanged_input_reports_unchanged() {
+    let dir = unique_temp_dir("fmt-json-unchanged");
+    std::fs::write(dir.join("clean.sema"), FMT_JSON_PRETTY).unwrap();
+
+    let output = run_fmt_command(&dir, &["--json", "clean.sema"]);
+
+    assert!(output.status.success());
+    let results = parse_ndjson(&output.stdout);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["formatted"], true);
+    assert_eq!(results[0]["changed"], false);
+    assert_eq!(results[0]["source"], FMT_JSON_PRETTY);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_fmt_json_multiple_files_emit_only_ndjson_records() {
+    let dir = unique_temp_dir("fmt-json-multiple");
+    std::fs::write(dir.join("changed.sema"), FMT_JSON_UGLY).unwrap();
+    std::fs::write(dir.join("clean.sema"), FMT_JSON_PRETTY).unwrap();
+
+    let output = run_fmt_command(&dir, &["--json", "changed.sema", "clean.sema"]);
+
+    assert!(output.status.success());
+    let results = parse_ndjson(&output.stdout);
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["file"], "changed.sema");
+    assert_eq!(results[0]["changed"], true);
+    assert_eq!(results[1]["file"], "clean.sema");
+    assert_eq!(results[1]["changed"], false);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_fmt_json_check_exits_one_when_input_would_change() {
+    let dir = unique_temp_dir("fmt-json-check");
+    std::fs::write(dir.join("changed.sema"), FMT_JSON_UGLY).unwrap();
+
+    let output = run_fmt_command(&dir, &["--check", "--json", "changed.sema"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let results = parse_ndjson(&output.stdout);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["changed"], true);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("changed.sema")).unwrap(),
+        FMT_JSON_UGLY
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_fmt_json_rejects_diff() {
+    let dir = unique_temp_dir("fmt-json-diff");
+    std::fs::write(dir.join("changed.sema"), FMT_JSON_UGLY).unwrap();
+
+    let output = run_fmt_command(&dir, &["--diff", "--json", "changed.sema"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--diff"), "unexpected stderr: {stderr}");
+    assert!(stderr.contains("--json"), "unexpected stderr: {stderr}");
+    assert!(
+        stderr.contains("cannot be used with"),
+        "unexpected stderr: {stderr}"
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_fmt_json_no_matches_is_silent() {
+    let dir = unique_temp_dir("fmt-json-empty");
+
+    let output = run_fmt_command(&dir, &["--json", "*.sema"]);
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_fmt_json_missing_file_emits_one_error_record() {
+    let dir = unique_temp_dir("fmt-json-missing");
+
+    let output = run_fmt_command(&dir, &["--json", "missing.sema"]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let results = parse_ndjson(&output.stdout);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["file"], "missing.sema");
+    assert_eq!(results[0]["formatted"], false);
+    assert!(results[0]["error"].is_string());
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+// ===========================================================================
 // sema build — standalone executable tests
 // ===========================================================================
 
@@ -13667,6 +14243,10 @@ fn test_vfs_in_process() {
         "github.com/x/lib/src/common.sema".to_string(),
         b"(define common-val 5)".to_vec(),
     );
+    files.insert(
+        "runtime-vfs.sema".to_string(),
+        b"(module runtime-vfs (export answer) (async/sleep 2) (define answer 42))".to_vec(),
+    );
 
     sema_core::vfs::init_vfs(files);
 
@@ -13735,6 +14315,16 @@ fn test_vfs_in_process() {
             .eval_str(r#"(begin (import "counter.sema") (import "counter.sema") n)"#)
             .unwrap();
         assert_eq!(result, Value::int(42));
+    }
+
+    // --- cooperative runtime import from VFS ---
+    {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(r#"(begin (import "runtime-vfs.sema" answer) answer)"#)
+            .unwrap();
+        assert_eq!(result, Value::int(42));
+        assert_eq!(interp.ctx.current_file_path(), None);
     }
 
     // --- load ---
@@ -14808,10 +15398,12 @@ fn test_stream_copy() {
 
     eval(&format!(
         r#"(let ((in (stream/open-input "{src_str}"))
-                 (out (stream/open-output "{dst_str}")))
-             (stream/copy in out)
+                 (buffer (stream/byte-buffer)))
+             (stream/copy in buffer 1024)
              (stream/close in)
-             (stream/close out))"#
+             (let ((out (stream/open-output "{dst_str}")))
+               (stream/write out (stream/to-bytes buffer))
+               (stream/close out)))"#
     ));
 
     assert_eq!(std::fs::read_to_string(&dst).unwrap(), "copy me");
@@ -15539,6 +16131,45 @@ fn test_u4_repl_eof_unterminated() {
         stderr.contains("unterminated input at EOF"),
         "expected unterminated-input error, got: {stderr}"
     );
+}
+
+#[test]
+fn test_headless_repl_runtime_stdin_does_not_lose_prefetched_input() {
+    let output = run_repl_with_input("(read-line)\nhello\n");
+    assert!(
+        output.status.success(),
+        "sema exited non-zero: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "\"hello\"\nGoodbye!\n"
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
+fn test_headless_repl_preserves_multiline_forms() {
+    let output = run_repl_with_input("(let ((x 20)\n      (y 22))\n  (+ x y))\n");
+    assert!(
+        output.status.success(),
+        "sema exited non-zero: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\nGoodbye!\n");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+}
+
+#[test]
+fn test_headless_repl_preserves_multiple_source_lines() {
+    let output = run_repl_with_input("(+ 1 2)\n(+ 20 22)\n");
+    assert!(
+        output.status.success(),
+        "sema exited non-zero: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "3\n42\nGoodbye!\n");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
 }
 
 #[test]

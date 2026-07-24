@@ -147,15 +147,16 @@ impl InterpreterBuilder {
         }
 
         let global_env = Rc::new(env);
+        let ctx = Rc::new(ctx);
         // The VM is the sole evaluator: register the __vm-* delegates (eval/load/
         // import/macroexpand/...) and load the prelude macros, exactly as
         // sema_eval::Interpreter::new does. Without this, an embedder built via
         // this builder would lose import/load and all prelude macros on the VM.
-        sema_eval::register_vm_delegates(&global_env);
+        sema_eval::register_vm_delegates(&global_env, &ctx);
         sema_eval::load_prelude(&ctx, &global_env);
 
         Interpreter {
-            inner: sema_eval::Interpreter { global_env, ctx },
+            inner: sema_eval::Interpreter::from_parts(global_env, ctx),
             _otel_guard: guard,
         }
     }
@@ -201,6 +202,28 @@ impl Interpreter {
     /// function in one call and use it in the next.
     pub fn eval_str(&self, input: &str) -> EvalResult {
         self.inner.eval_str_in_global(input)
+    }
+
+    /// Parse and evaluate a string through the unified async runtime (rather
+    /// than the legacy cooperative scheduler). Definitions and connections
+    /// persist across calls on the interpreter, exactly like [`eval_str`]. Used
+    /// by the runtime-path integration tests.
+    ///
+    /// [`eval_str`]: Self::eval_str
+    pub fn eval_str_via_runtime(&self, input: &str) -> EvalResult {
+        self.inner.eval_str_via_runtime(input)
+    }
+
+    /// The number of tasks the persistent cooperative runtime is currently
+    /// holding (live + settled-not-yet-reaped). A test/observability oracle:
+    /// `0` after a run proves every task settled and was reaped, not orphaned.
+    pub fn runtime_live_task_count(&self) -> usize {
+        self.inner.runtime_live_task_count()
+    }
+
+    /// Number of live per-resource gates on the persistent runtime.
+    pub fn runtime_resource_gate_count(&self) -> usize {
+        self.inner.runtime_resource_gate_count()
     }
 
     /// Register a native function that can be called from Sema code.

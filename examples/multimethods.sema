@@ -33,10 +33,10 @@
   (assoc multi :default impl))
 
 (define (invoke multi . args)
-  (let* ((dispatch-fn   (get multi :dispatch-fn))
-         (dispatch-val  (apply dispatch-fn args))
-         (methods       (get multi :methods))
-         (method        (get methods dispatch-val)))
+  (let* ((dispatch-fn (get multi :dispatch-fn))
+         (dispatch-val (apply dispatch-fn args))
+         (methods (get multi :methods))
+         (method (get methods dispatch-val)))
     (if (nil? method)
       (if (nil? (get multi :default))
         (error (format "No method for dispatch value: ~a" dispatch-val))
@@ -49,9 +49,9 @@
 (println "--- Shape area (dispatch on :type) ---")
 
 ;; Constructors
-(define (make-circle r)      {:type :circle :radius r})
-(define (make-rect w h)      {:type :rect :width w :height h})
-(define (make-triangle b h)  {:type :triangle :base b :height h})
+(define (make-circle r) {:type :circle :radius r})
+(define (make-rect w h) {:type :rect :width w :height h})
+(define (make-triangle b h) {:type :triangle :base b :height h})
 
 ;; Create the multimethod — dispatches on :type keyword
 (define area
@@ -194,9 +194,9 @@
   (-> (make-multi (fn (a b) (list (get a :type) (get b :type))))
     (add-method (list :circle :circle)
       (fn (a b)
-        (let* ((dx    (- (get a :x) (get b :x)))
-               (dy    (- (get a :y) (get b :y)))
-               (dist  (sqrt (+ (* dx dx) (* dy dy)))))
+        (let* ((dx (- (get a :x) (get b :x)))
+               (dy (- (get a :y) (get b :y)))
+               (dist (sqrt (+ (* dx dx) (* dy dy)))))
           (<= dist (+ (get a :r) (get b :r))))))
     (add-method (list :rect :rect)
       (fn (a b)

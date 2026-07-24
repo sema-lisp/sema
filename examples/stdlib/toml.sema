@@ -51,8 +51,8 @@
   (toml/encode
     {:database {:host "localhost"
       :port 5432
-      :credentials {:user      "admin"
-       :password  "secret"}}}))
+      :credentials {:user "admin"
+       :password "secret"}}}))
 (assert-eq (string? nested-encoded) #t "encode nested returns string")
 
 ;; Error: non-map top-level
@@ -73,9 +73,9 @@
 ;; Round-trip
 (define config-str
   "[server]\nhost = \"0.0.0.0\"\nport = 3000\n\n[server.cors]\norigins = [\"https://example.com\"]\n")
-(define config      (toml/decode config-str))
-(define new-config  (map/assoc-in config [:server :port] 8080))
-(define rt-encoded  (toml/encode new-config))
+(define config (toml/decode config-str))
+(define new-config (map/assoc-in config [:server :port] 8080))
+(define rt-encoded (toml/encode new-config))
 (assert-eq (string? rt-encoded) #t "roundtrip encode returns string")
 ;; Verify the updated value survives roundtrip
 (define rt-decoded (toml/decode rt-encoded))

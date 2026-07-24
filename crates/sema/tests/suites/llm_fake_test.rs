@@ -383,6 +383,79 @@ fn cache_hit_does_not_recharge_usage() {
     );
 }
 
+/// A cache hit served from DISK (not the in-memory cache) must charge ZERO usage —
+/// identical to the in-memory hit. C3 moved the disk read off the runtime quantum
+/// (an offloaded blocking-tier peek); the accounting invariant is unchanged. Run 1
+/// populates the on-disk cache with a real call; run 2 starts with an EMPTY in-memory
+/// cache (fresh interpreter + `reset_runtime_state`), so the same prompt can only be
+/// served from disk.
+#[test]
+fn disk_cache_hit_charges_zero_usage() {
+    // Unique prompt so the on-disk cache key never collides with another test/run.
+    let prompt = format!("disk-cache-probe-{}-{}", std::process::id(), line!());
+
+    // Run 1: a real completion (150 tokens) populates the on-disk cache.
+    let rec_fake = FakeProvider::builder("fake")
+        .model("m")
+        .reply_with_usage("cached-on-disk", 100, 50)
+        .build();
+    {
+        let interp = Interpreter::new();
+        reset_runtime_state();
+        register_test_provider(Box::new(rec_fake));
+        let total = interp
+            .eval_str_compiled(&format!(
+                r#"(llm/with-cache {{:ttl 3600}} (fn () (llm/complete "{prompt}" {{:model "m"}})))
+                   (:total-tokens (llm/session-usage))"#
+            ))
+            .expect("run 1 populates the disk cache");
+        assert_eq!(
+            total.as_int(),
+            Some(150),
+            "run 1 charges the real provider call"
+        );
+    }
+
+    // Run 2: fresh interpreter (empty in-memory cache) + a fake that ERRORS if called.
+    // The same prompt must be served from the ON-DISK cache via the offloaded peek,
+    // charging ZERO usage and never touching the provider.
+    let must_not_call = FakeProvider::builder("fake")
+        .model("m")
+        .error(sema_llm::types::LlmError::Api {
+            status: 500,
+            message: "disk cache hit must not call the provider".into(),
+        })
+        .build();
+    let recorder = must_not_call.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(must_not_call));
+    let result = interp
+        .eval_str_compiled(&format!(
+            r#"(llm/with-cache {{:ttl 3600}}
+                 (fn ()
+                   (let ((answer (llm/complete "{prompt}" {{:model "m"}})))
+                     (list answer (:total-tokens (llm/session-usage))))))"#
+        ))
+        .expect("run 2 serves from the on-disk cache");
+    let items = result.as_list().expect("list result");
+    assert_eq!(
+        items[0].as_str(),
+        Some("cached-on-disk"),
+        "disk cache hit serves the recorded content"
+    );
+    assert_eq!(
+        items[1].as_int(),
+        Some(0),
+        "disk cache hit charges ZERO usage (no provider call)"
+    );
+    assert_eq!(
+        recorder.call_count(),
+        0,
+        "disk cache hit must not call the provider"
+    );
+}
+
 /// Prompt-cache token counts flow through to session/last usage. Providers that
 /// surface `cache_read_input_tokens` / `cache_creation_input_tokens` (Anthropic
 /// distinctly, OpenAI/Gemini as a subset of prompt tokens) must be visible to
@@ -478,11 +551,11 @@ fn tool_handler_runs_full_evaluator_with_side_effects() {
 
 /// CORE-2 mid-agent-loop reclamation (`docs/plans/2026-07-02-core2-gc.md`
 /// §5.2): a long agent run must reclaim BETWEEN tool turns, not only when
-/// the whole eval returns. Turn 1's handler builds 700 garbage
-/// recursive-closure cycles and then churns 3000 dead channels; the channel
-/// births cross the registry-growth threshold inside the handler, so the
-/// data-birth trigger (`register_candidate`) severs the cycles and prunes
-/// the dead entries mid-turn. The turn-boundary `maybe_collect` stays a
+/// the whole eval returns. Turn 1's handler builds 3700 garbage
+/// recursive-closure cycles; the closure births cross the registry-growth
+/// threshold inside the handler, so the data-birth trigger
+/// (`register_candidate`) severs the cycles and prunes the dead entries
+/// mid-turn. The turn-boundary `maybe_collect` stays a
 /// threshold-gated backstop that the growth policy keeps quiescent here
 /// (registry-at-rest never exceeds the threshold once births self-collect).
 /// Turn 2's handler observes the outcome as its FIRST action: bounded
@@ -508,13 +581,11 @@ fn agent_turn_boundary_collects_between_tool_turns() {
           r)
         (define (spin i)
           (if (<= i 0) nil (begin (mk-cycle i) (spin (- i 1)))))
-        (define (spam-channels i)
-          (if (<= i 0) nil (begin (channel/new 1) (spam-channels (- i 1)))))
         (deftool churn "Churn the heap" {:x {:type :string}}
           (lambda (x)
             (set! turn (+ turn 1))
             (if (= turn 1)
-                (begin (spin 700) (spam-channels 3000) "turn-1 done")
+                (begin (spin 3700) "turn-1 done")
                 (begin (set! probe (gc/stats))
                        (set! leftover (gc/collect))
                        "turn-2 done"))))
@@ -532,8 +603,8 @@ fn agent_turn_boundary_collects_between_tool_turns() {
     // The loop completed correctly across the collections...
     assert_eq!(items[0].as_str(), Some("all done"));
     // ...and turn 2 observed the mid-turn passes: registry bounded well
-    // under the spam count, the last pass really pruned a dead batch, and
-    // the 700 garbage cycles were already severed before turn 2 started
+    // under the churn count, the last pass really pruned a dead batch, and
+    // the 3700 garbage cycles were already severed before turn 2 started
     // (the explicit collect has nothing left to reclaim).
     assert_eq!(
         items[1],
@@ -995,5 +1066,104 @@ fn agent_run_preserves_tool_correlation_across_turns() {
         tool_msg.tool_name.as_deref(),
         Some("calc"),
         "the re-sent tool result must keep its tool name"
+    );
+}
+
+/// Accounting invariant (AGENTS.md, C4): a cancelled/discarded completion charges
+/// NOTHING. A native sync-only completion is IN FLIGHT on the blocking tier (`chat_delay`
+/// keeps the worker busy); a sibling cancels the parked task before the worker returns.
+/// `track_usage` runs only in the VM-thread finalizer on resume, and a cancelled task
+/// never resumes — so session usage stays zero even after the orphaned worker finishes.
+#[test]
+fn cancelled_inflight_completion_charges_nothing() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .chat_delay(200)
+        .reply_with_usage("late", 1000, 500)
+        .build();
+    let recorder = fake.recorder();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (define pending (async/spawn (fn () (llm/complete "in-flight"))))
+            (async/spawn (fn () (sleep 20) (async/cancel pending)))
+            (define outcome (try (async/await pending) (catch e :cancelled)))
+            ;; Wait past the provider's in-flight delay so the orphaned worker has
+            ;; certainly finished — its discarded result must STILL not be charged.
+            (sleep 300)
+            (list outcome
+                  (:total-tokens (llm/session-usage))
+                  (:cost-usd (llm/session-usage)))
+            "#,
+        )
+        .expect("in-flight completion is cancellable");
+
+    let items = value.as_list().expect("cancel outcome + usage");
+    assert_eq!(items[0], Value::keyword("cancelled"));
+    assert_eq!(
+        items[1].as_int(),
+        Some(0),
+        "a cancelled in-flight completion must charge no tokens"
+    );
+    assert_eq!(
+        items[2].as_float(),
+        Some(0.0),
+        "a cancelled in-flight completion must charge no cost"
+    );
+    assert_eq!(
+        recorder.call_count(),
+        1,
+        "the provider was dispatched exactly once (its result discarded)"
+    );
+}
+
+/// A sync-only provider (no `complete_future` — only a blocking `complete()`) is offloaded
+/// under a bounded per-job deadline resolved pre-dispatch from `:timeout` (C4). A blocking
+/// call that outlives the deadline is abandoned promptly with an error rather than parking
+/// the task for the whole call: the deadline is a real bound, and the orphaned worker is a
+/// best-effort quarantine (its result is discarded, never charged). Without the deadline
+/// the call would return the provider's late reply after the full 2s `chat_delay`.
+#[test]
+fn sync_only_provider_offload_enforces_a_deadline() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .chat_delay(2000)
+        .reply_with_usage("too-late", 1000, 500)
+        .build();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let started = std::time::Instant::now();
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (try (llm/complete "slow" {:timeout 60}) (catch e :deadline))
+            "#,
+        )
+        .expect("a sync-only completion is bounded by its deadline");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        value,
+        Value::keyword("deadline"),
+        "the bounded deadline must fire instead of returning the late reply"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_millis(1500),
+        "the deadline (60ms) must settle the call well before the 2s chat delay; got {elapsed:?}"
+    );
+    // The abandoned completion never reaches the finalizer, so nothing is charged.
+    let usage = interp
+        .eval_str_compiled(r#"(:total-tokens (llm/session-usage))"#)
+        .expect("session usage is readable");
+    assert_eq!(
+        usage.as_int(),
+        Some(0),
+        "a deadline-abandoned completion must charge nothing"
     );
 }

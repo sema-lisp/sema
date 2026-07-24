@@ -52,9 +52,9 @@
                (message (nth groups 2))
                (icon
                  (cond
-                   ((equal? level "ERROR")  "🔴")
-                   ((equal? level "WARN")   "🟡")
-                   (else                    "🟢"))))
+                   ((equal? level "ERROR") "🔴")
+                   ((equal? level "WARN") "🟡")
+                   (else "🟢"))))
           (println (format "  ~a ~a | ~a | ~a" icon timestamp level message)))
         (println (format "  ?? Unparseable: ~a" line)))))
   log-lines)
@@ -109,12 +109,12 @@ Some ***bold italic*** and ~~strikethrough~~ content.
 
 (println "\n=== Pattern Splitting ===\n")
 
-(define csv-line  "Alice, 30, Engineer, \"New York, NY\", active")
-(define parts     (regex/split ",\\s*" csv-line))
+(define csv-line "Alice, 30, Engineer, \"New York, NY\", active")
+(define parts (regex/split ",\\s*" csv-line))
 (println (format "CSV fields: ~a" parts))
 
-(define camel        "parseHTMLResponseCode")
-(define split-camel  (regex/find-all "[A-Z]?[a-z]+|[A-Z]+" camel))
+(define camel "parseHTMLResponseCode")
+(define split-camel (regex/find-all "[A-Z]?[a-z]+|[A-Z]+" camel))
 (println (format "CamelCase split of '~a': ~a" camel split-camel))
 
 (println "\nDone!")

@@ -57,16 +57,17 @@ jake lint               # fmt-check + clippy -D warnings
 jake fmt                # cargo fmt
 jake install            # install to ~/.cargo/bin (LTO, no PGO)
 jake install-pgo        # PGO build + install (slower build, faster runtime)
+jake reinstall          # uninstall then install
 jake all                # lint + test + build
 jake run                # start REPL
 jake example-notebook   # run demo notebook headlessly
 jake test.notebook-e2e  # Playwright E2E tests for notebook
 ```
 
-- Single crate: `cargo test -p sema-reader` | Single test: `cargo test -p sema-lang --test integration_test -- test_name`
-- Single eval test: `cargo test -p sema-lang --test eval_suite -- test_name` | Ignored tests: `cargo test -p sema-lang -- --ignored`
+- Single crate: `cargo nextest run -p sema-reader` | Single test: `cargo nextest run -p sema-lang --test integration_test test_name` (positional arg is a substring filter)
+- Single eval test: `cargo nextest run -p sema-lang --test eval_test test_name` | Ignored tests: `cargo nextest run -p sema-lang --run-ignored ignored-only`
 - Run file: `cargo run -- examples/hello.sema` | REPL: `cargo run` | Eval: `cargo run -- -e "(+ 1 2)"`
-- Integration tests: `crates/sema/tests/integration_test.rs`. Eval tests: `crates/sema/tests/suites/eval_*.rs` (linked into the `eval_suite` binary). Reader unit tests: `crates/sema-reader/src/reader.rs`.
+- Integration tests: `crates/sema/tests/integration_test.rs`. Eval tests: `crates/sema/tests/eval_test.rs`. Reader unit tests: `crates/sema-reader/src/reader.rs`.
 - Editor plugins live in their own repos under the `sema-lisp` org (`vscode-sema`, `zed-sema`, `intellij-sema`, `emacs-sema`, `helix-sema`, `sema.nvim`, `sema.vim`, `sublime-sema`) and the grammar in `sema-lisp/tree-sitter-sema` — they are no longer in this repo. Each carries its own CI/publishing.
 
 ## Architecture (Cargo workspace)
@@ -105,7 +106,6 @@ Dependency flow (arrows = "depends on"): `sema-core ← sema-reader ← sema-vm 
 - Native fns: `NativeFn` takes `(&EvalContext, &[Value])` → `Result<Value, SemaError>`. Use `NativeFn::simple()` (no context) or `NativeFn::with_ctx()`. Special forms return `Trampoline`.
 - Comments describe the code as it stands, not what changed. Drop change-narration ("now uses X instead of Y", "switched from", "previously", "fixed to"); keep the *why* (rationale, invariants, gotchas). Git tracks the story; the source shouldn't. Contrasting with a sibling (`unlike string/lower`) is fine; contrasting with a past version is not.
 - **Sema naming (Decision #24)**: slash-namespaced for all new functions (`file/read`, `path/join`, `regex/match?`, `http/get`, `json/encode`, `string/split`); legacy Scheme names kept (`string-append`, `string-length`, `string-ref`, `substring`); arrow conversions (`string->symbol`, `keyword->string`); predicates end in `?` (`null?`, `list?`, `file/exists?`).
-- **Shell scripts (`scripts/*.sh`)**: follow `docs/shell-style.md` (header block, `set -euo pipefail` with documented exceptions, `#!/usr/bin/env bash`). Run `jake scripts.check` (shellcheck + shfmt) before committing shell; `scripts/pack-mcpb.sh` is the exemplar.
 
 ## Bytecode File Format (.semac)
 
@@ -120,12 +120,11 @@ Dependency flow (arrows = "depends on"): `sema-core ← sema-reader ← sema-vm 
 
 The bytecode VM (`sema-vm`) is the **sole evaluator**. All tests run on the VM. The `eval_tests!` / `eval_error_tests!` macros emit one test per case and pin each case to a literal expected value (`$input => $expected`) — that literal is the correctness oracle (there's no second backend to differentially compare against). The `common::eval_tw`/`eval_vm` helpers are equivalent and kept only because many tests call them to turn an expected Sema literal into a `Value` (`=> common::eval_tw("'(2 4 6)")`).
 
-- **Test binaries are GROUPED** (build-time: 86 single-file binaries at ~100MB each once caused ENOSPC; see `docs/build-time-report.md`): most files live in `crates/sema/tests/suites/` as modules of eight `*_suite.rs` harness binaries (`eval`, `vm`, `async`, `llm`, `mcp`, `server`, `workflow`, `misc`). **A new test file goes into a suite** (add the file under `tests/suites/`, then a `#[path] mod` entry in the suite root) **unless it needs process-global isolation** — `sema_otel::testing::install()`, env-var toggles, cwd changes — in which case it stays a top-level `tests/*.rs` file like the `otel_*` files.
-- **Eval test files**: `crates/sema/tests/suites/eval_*.rs` — use `eval_tests!` and `eval_error_tests!` (literal `=> expected` is the oracle)
-- **Async tests**: `crates/sema/tests/suites/vm_async_test.rs` (vm_suite) and `crates/sema/tests/suites/*_async_test.rs` (async_suite) — async/channel tests
+- **Eval test file**: `crates/sema/tests/eval_test.rs` — use `eval_tests!` and `eval_error_tests!` (literal `=> expected` is the oracle)
+- **Async tests**: `crates/sema/tests/vm_async_test.rs` — async/channel tests
 - **Integration / equivalence**: `integration_test.rs`, `vm_integration_test.rs`
 - I/O, LLM, sandbox, CLI, module/import, server tests → `integration_test.rs`
-- **LLM / agent paths (keyless, deterministic)**: `crates/sema/tests/suites/llm_fake_test.rs` (llm_suite) uses `sema_llm::fake::FakeProvider` — a scripted provider (canned replies, tool calls, errors, streamed chunks) installed as the default via `sema_llm::builtins::register_test_provider`. It records every request (`FakeRecorder`) so tests can assert on the exact messages the runtime built (e.g. round-2 tool-result correlation). Test hooks: `set_retry_base_ms(0)` (no real sleeps) and `set_network_max_retries`. **Always add a FakeProvider test when changing the agent loop, retry, cache, budget, or provider serializers** — this is the CI regression oracle that runs without API keys.
+- **LLM / agent paths (keyless, deterministic)**: `crates/sema/tests/llm_fake_test.rs` uses `sema_llm::fake::FakeProvider` — a scripted provider (canned replies, tool calls, errors, streamed chunks) installed as the default via `sema_llm::builtins::register_test_provider`. It records every request (`FakeRecorder`) so tests can assert on the exact messages the runtime built (e.g. round-2 tool-result correlation). Test hooks: `set_retry_base_ms(0)` (no real sleeps) and `set_network_max_retries`. **Always add a FakeProvider test when changing the agent loop, retry, cache, budget, or provider serializers** — this is the CI regression oracle that runs without API keys.
 - Notebook E2E tests: `crates/sema-notebook/tests/e2e/` (Playwright, run via `jake test.notebook-e2e`)
 - A few `#[ignore]`d tests in `integration_test.rs` are a ready acceptance suite for the deferred VM stack-trace parity work (see `docs/deferred.md`).
 
@@ -139,7 +138,7 @@ The bytecode VM (`sema-vm`) is the **sole evaluator**. All tests run on the VM. 
 - **Builtin fn**: add to `crates/sema-stdlib/src/*.rs`, register in that module's `register()` fn, add an eval test.
 - **Special form**: add lowering in the `lower_list()` dispatch in `crates/sema-vm/src/lower.rs` (+ compiler if needed), add an eval test. If it desugars into existing CoreExpr nodes (If/Let/LetStar/Call), do that in lower.rs; if it needs runtime helpers, add `__vm-<name>` native functions in `register_vm_delegates()` in `eval.rs`.
 - **Prelude macro**: add to `crates/sema-eval/src/prelude.rs` (Sema code evaluated at startup, expanded VM-natively).
-- **Async feature**: implement in stdlib (`async_ops.rs`) using the yield signal mechanism, add an async test in `tests/suites/vm_async_test.rs`.
+- **Async feature**: implement in stdlib (`async_ops.rs`) using the yield signal mechanism, add an async test in `vm_async_test.rs`.
 
 ## LLM & Agentic Features (sema-llm)
 
@@ -148,7 +147,6 @@ Hard-won conventions — follow these or you will reintroduce shipped bugs (see 
 - **One canonical request, per-provider translation.** `ChatRequest` (in `sema-llm/src/types.rs`) is the single source of truth that Sema code produces; each provider's `build_request_body` (anthropic/openai/gemini/ollama) translates it to that provider's wire format. **Never branch on provider in Sema code or in builtins** — add the field to `ChatRequest` and map it in each serializer. Example: `:reasoning-effort` → OpenAI `reasoning_effort`, Anthropic extended thinking (`budget_tokens` + max-tokens/temperature adjustments), Gemini `thinkingConfig`.
 - **Tool-result correlation is mandatory.** The agent loop (`run_tool_loop`) must echo the assistant `tool_calls` turn and send results as correlated `ChatMessage::tool_result(id, name, content)`; each serializer maps that to its native shape (OpenAI `role:"tool"`+`tool_call_id`, Anthropic `tool_use`/`tool_result` blocks, Gemini `functionCall`/`functionResponse`). Plain user-text results silently break OpenAI-family providers.
 - **Compat is self-healing + no-op, never user-facing.** Unsupported params degrade gracefully. OpenAI is **proactive where the family rule is stable, reactive elsewhere** (there is no capabilities endpoint — `GET /v1/models` exposes nothing): reasoning models (gpt-5 series / o-series, via `is_reasoning_model`) drop a custom `temperature` proactively, and `DROP_TEMPERATURE` learns any other model from its 400. The reactive net is chained through one bounded retry loop (`correct_for_400` → retry): (a) function tools + a non-`none` `reasoning_effort` on `/chat/completions` are learned per-model (`FORCE_EFFORT_NONE`) and pinned to `none` **only when tools are present** — a tool-free call keeps the caller's effort, since some reasoning models (gpt-5.1) accept tools+effort; (b) an unsupported effort **value** (e.g. `minimal`/`max` on gpt-5.6) is clamped to the nearest accepted tier by **reading the "Supported values are: …" set out of the 400** (`EFFORT_SUPPORTED`), not blind retry. `max_completion_tokens` is used on official OpenAI/Azure (`is_official_openai_url`). Tolerate unknown response blocks (e.g. Anthropic `thinking`) rather than failing to decode.
-- **reqwest has NO compiled-in TLS provider** (workspace `rustls-no-provider`, avoiding the aws-lc-sys ~43s build): any new `reqwest::Client` (or tokio-tungstenite connect) construction site MUST first call its crate's `ensure_crypto_provider()` guard (`sema_llm::http::`, `sema_stdlib`'s `http` module, `sema_mcp::`, sema-otel's `imp`) or construction panics at runtime.
 - **Accounting invariant:** a cache hit makes no provider call → it MUST report zero usage so `track_usage` doesn't recharge cost or burn budget. Network retry covers 429/5xx/network with backoff+jitter (`complete_with_retry`); 4xx-non-429 fail fast.
 - **Verification flow for any LLM change:** (1) deterministic FakeProvider test (required, CI), then (2) live integration test against real providers when feasible — keys are in the env (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `MISTRAL_API_KEY`). Use cheap models: `gpt-5.4-mini`, `claude-haiku-4-5-20251001`, `gemini-2.5-flash`, `mistral-small-latest`; **don't hammer `gpt-5.5`** (priciest). OpenAI model ids use dots (`gpt-5.4-mini`), not the dashed form in the pricing snapshot. Ollama-down is a handy hard-fail for testing `llm/with-fallback`.
 
@@ -160,7 +158,7 @@ Hard-won conventions — follow these or you will reintroduce shipped bugs (see 
 
 ## Release Procedure
 
-1. **Run the full CI-equivalent suite locally** (plain `cargo test` is NOT enough — it skips the example/bytecode smoke tests that run in CI): `cargo test --workspace && jake examples && jake smoke-bytecode && jake lint && jake docs-check` — all must pass. Skipping `jake examples`/`jake smoke-bytecode` locally is how a regression once shipped past four releases. The crates.io and npm publish workflows `needs:` a `verify` gate (`.github/workflows/verify.yml`) — a red suite blocks publishing. After pushing the tag, confirm `gh run list` shows CI **and** the publish gate green; never assume "started" == "passed". (The cargo-dist `Release`/binaries workflow is autogenerated and not gated — treat its result as advisory.)
+1. **Run the full CI-equivalent suite locally** (plain `cargo nextest run` is NOT enough — it skips the example/bytecode smoke tests that run in CI): `cargo nextest run --workspace && jake examples && jake smoke-bytecode && jake lint && jake docs-check` — all must pass. Skipping `jake examples`/`jake smoke-bytecode` locally is how a regression once shipped past four releases. The crates.io and npm publish workflows `needs:` a `verify` gate (`.github/workflows/verify.yml`) — a red suite blocks publishing. After pushing the tag, confirm `gh run list` shows CI **and** the publish gate green; never assume "started" == "passed". (The cargo-dist `Release`/binaries workflow is autogenerated and not gated — treat its result as advisory.)
 2. **Bump versions** in `Cargo.toml`: the workspace version *and* every inter-crate `=X.Y.Z` pin. One-shot: `sed -i '' -e 's/^version = "OLD"/version = "NEW"/' -e 's/version = "=OLD"/version = "=NEW"/g' Cargo.toml`, then confirm `grep -c 'OLD' Cargo.toml` is `0` (no stale version string remains).
 3. **Update CHANGELOG.md** — add a new `## X.Y.Z` section at the top.
 4. **Build release**: `cargo build --release` (also refreshes `Cargo.lock`); verify `./target/release/sema --version`.

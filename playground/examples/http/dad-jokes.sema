@@ -13,9 +13,8 @@
       (get (json/decode (:body resp)) :joke)
       "(couldn't fetch a joke)")))
 
-;; Due to the replay-cache strategy, each http/get with the
-;; same URL+headers returns the same cached response within
-;; one evaluation. So we get one joke per run.
+;; The Promise runtime executes this request once without replaying the
+;; surrounding program. Press Run again to make a fresh request.
 (define joke (get-joke))
 (println (format "  ~a" joke))
 (println "\n  (Press Run again for a new joke!)")

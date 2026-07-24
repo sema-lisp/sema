@@ -407,6 +407,75 @@ fn channel_ping_pong_with_collects_mid_exchange() {
     );
 }
 
+#[test]
+fn multimethod_structural_stages_survive_collections_while_parked() {
+    let v = eval_ok(
+        "(let ((seen 0))
+           (defmulti collected-multimethod
+             (fn (key)
+               (set! seen (+ seen 1))
+               (async/sleep 50)
+               key))
+           (defmethod collected-multimethod :go
+             (fn (key)
+               (set! seen (+ seen 10))
+               (async/sleep 50)
+               seen))
+           (let ((collector
+                   (async
+                     (async/sleep 10)
+                     (gc/collect)
+                     (async/sleep 50)
+                     (gc/collect))))
+             (let ((result (collected-multimethod :go)))
+               (await collector)
+               (list result seen))))",
+    );
+    assert_eq!(v, Value::list(vec![Value::int(11), Value::int(11)]));
+}
+
+#[test]
+fn async_multimethod_capture_survives_collections_while_parked() {
+    let v = eval_ok(
+        "(let ((seen 0))
+           (defmulti collected-async-multimethod
+             (fn (key)
+               (set! seen (+ seen 1))
+               (async/sleep 50)
+               key))
+           (defmethod collected-async-multimethod :go
+             (fn (key)
+               (set! seen (+ seen 10))
+               (async/sleep 50)
+               seen))
+           (let ((pending (async (collected-async-multimethod :go))))
+             (async/sleep 10)
+             (gc/collect)
+             (async/sleep 50)
+             (gc/collect)
+             (list (await pending) seen)))",
+    );
+    assert_eq!(v, Value::list(vec![Value::int(11), Value::int(11)]));
+}
+
+#[test]
+fn late_mutable_cell_closure_survives_collections_while_parked() {
+    let v = eval_ok(
+        "(let ((x 41)
+               (callback (mutable-cell/new nil)))
+           (let ((pending
+                   (async
+                     (async/sleep 50)
+                     ((mutable-cell/get callback)))))
+             (mutable-cell/set! callback (fn () (+ x 1)))
+             (gc/collect)
+             (let ((result (await pending)))
+               (gc/collect)
+               result)))",
+    );
+    assert_eq!(v, Value::int(42));
+}
+
 // ── Collections from inside foreign frames ─────────────────────────
 
 #[test]
@@ -922,6 +991,47 @@ fn data_only_promise_channel_cycle_live_round_trips() {
 }
 
 #[test]
+fn promise_settled_value_cell_cycle_collected() {
+    // Promise-only cycle (no channel): a promise resolves to a mutable cell that
+    // is then set back to the promise. The cycle passes through the promise's
+    // SETTLED value, which lives in the runtime's `PromiseRegistry` — the exact
+    // registry-invisible shape the channel-buffer fix also covers. Once `mk`
+    // returns nothing outside the cycle references either handle; the settled
+    // value (and the cell) must be reclaimed via the promise interior hook.
+    let v = eval_ok(
+        "(begin
+           (gc/collect)
+           (define (mk)
+             (define box (mutable-cell/new nil))
+             (define p (async/resolved box))
+             (mutable-cell/set! box p)
+             nil)
+           (mk)
+           (> (:collected (gc/collect)) 0))",
+    );
+    assert_eq!(v, Value::bool(true));
+}
+
+#[test]
+fn promise_settled_value_cell_cycle_live_round_trips() {
+    // Same promise↔cell cycle, still reachable (global bindings): the collection
+    // must keep the whole cycle. Awaiting the promise yields the cell back, and
+    // the cell still holds the promise that awaits back to the cell — proving
+    // neither the settled value nor the cell slot was severed. Walked twice
+    // around the cycle via identity to pin every edge.
+    let v = eval_ok(
+        "(begin
+           (define box (mutable-cell/new nil))
+           (define p (async/resolved box))
+           (mutable-cell/set! box p)
+           (gc/collect)
+           (list (eq? box (await p))
+                 (eq? box (await (mutable-cell/get (await p))))))",
+    );
+    assert_eq!(v, Value::list(vec![Value::bool(true), Value::bool(true)]));
+}
+
+#[test]
 fn data_only_multimethod_self_cycle_collected() {
     // mm.methods[:self] = mm with a builtin dispatch fn: no closure anywhere
     // on the cycle. After the global rebind the MultiMethod candidate is the
@@ -1071,6 +1181,30 @@ fn zero_upvalue_env_cycle_collected_via_env_candidate() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn signal_registry_callback_cycle_collected_at_interpreter_teardown() {
+    // EvalContext roots the callback interpreter-wide, and the callback points
+    // back to its home env. Teardown must clear that root before collecting the
+    // env and its signal-registry payload.
+    let weak_bindings = {
+        let interp = Interpreter::new();
+        interp
+            .eval_str_compiled(
+                "(begin
+                   (define signal-root :kept-until-drop)
+                   (sys/on-signal :winch (fn () signal-root)))",
+            )
+            .expect("register signal callback");
+        std::rc::Rc::downgrade(&interp.global_env.bindings)
+    };
+    assert_eq!(
+        weak_bindings.strong_count(),
+        0,
+        "signal registry callback cycle reclaimed with its interpreter"
+    );
+}
+
 #[test]
 fn zero_upvalue_module_closure_bound_in_importer_env_collected_at_teardown() {
     // Cross-env variant: a zero-upvalue closure homed in a MODULE env is
@@ -1141,4 +1275,56 @@ fn self_tail_named_let_with_capture_still_collects_no_cycle() {
            (list result (:collected (gc/collect))))",
     );
     assert_eq!(v, Value::list(vec![Value::keyword("done"), Value::int(0)]));
+}
+
+// ── Workflow checkpoint state bag traced through the task-local scope ──
+
+#[test]
+fn workflow_checkpoint_self_cycle_survives_a_live_collection() {
+    // A self-cyclic mutable array is checkpointed and its binding discarded, so the ONLY
+    // strong reference is the run's state bag. A collection WHILE the run is live must not
+    // free it: the run's `WorkflowCtx` is a TRACED task-local scope (Invariant I2), so the
+    // collector reaches the array and reading `:cyc` back returns the intact structure.
+    // Without the trace the collector would sever the cycle as garbage and the read-back
+    // would corrupt.
+    let dir = temp_dir("wf-gc-cycle");
+    std::env::set_var("SEMA_WORKFLOW_FIXED_TS", "0");
+    std::env::set_var("SEMA_WORKFLOW_RUN_ID", "wf_gc_cycle");
+    std::env::set_var("SEMA_WORKFLOW_RUN_DIR", &dir);
+
+    let v = Interpreter::new().eval_str_compiled(
+        r#"
+        (workflow/run "gc-cycle" "doc" {}
+          (fn ()
+            (gc/collect)
+            ;; store a self-cycle reachable ONLY through the run state bag
+            (workflow/checkpoint :cyc
+              (fn ()
+                (let ((a (mutable-array/new)))
+                  (mutable-array/push! a a)
+                  (mutable-array/push! a 42)
+                  a)))
+            (gc/collect)
+            (let ((back (workflow/checkpoint :cyc)))
+              {:status :success
+               :len (mutable-array/length back)
+               :second (mutable-array/get back 1)})))
+        "#,
+    );
+
+    for k in [
+        "SEMA_WORKFLOW_FIXED_TS",
+        "SEMA_WORKFLOW_RUN_ID",
+        "SEMA_WORKFLOW_RUN_DIR",
+    ] {
+        std::env::remove_var(k);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let result = v.expect("workflow evaluated");
+    assert_eq!(
+        result,
+        eval_ok("{:status :success :len 2 :second 42}"),
+        "the live checkpoint cycle must survive a collection intact"
+    );
 }

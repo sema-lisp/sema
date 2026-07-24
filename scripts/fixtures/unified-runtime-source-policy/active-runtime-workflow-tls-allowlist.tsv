@@ -1,0 +1,2 @@
+# token-id<TAB>exact-repository-path<TAB>exact-count<TAB>reason
+WORKFLOW_TLS	scripts/fixtures/unified-runtime-source-policy/active-runtime-workflow-tls.rs	1	mutation fixture is allowlisted so the active-runtime rule supplies the failure tooth

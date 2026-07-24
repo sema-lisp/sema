@@ -1,7 +1,13 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult};
 use sema_core::{check_arity, Caps, SemaError, Value, ValueView};
+
+/// Completion tag for an offloaded HTTP request. It only needs to be consistent
+/// between the issued identity and the prepared op (it is not a uniqueness key),
+/// so one shared value for every HTTP method is correct.
+const HTTP_COMPLETION_KIND: u64 = 0x6874_7470; // "http"
 
 /// A process-wide `reqwest::Client` (`Send + Sync + Clone`) reused for every
 /// request — sync and offloaded alike — so connections pool across threads and
@@ -22,12 +28,18 @@ pub(crate) fn ensure_crypto_provider() {
 }
 
 /// Get (initializing on first use) the process-wide shared client.
+///
+/// Built through [`sema_llm::http::proxy_env_client_builder`] so the first build
+/// in a process does not perform reqwest's slow synchronous system-proxy lookup
+/// on the VM thread (see that function's docs); env-var proxies are still
+/// honored. Falls back to the plain client only if the configured build fails.
 #[cfg(not(target_arch = "wasm32"))]
 fn http_shared_client() -> reqwest::Client {
     HTTP_SHARED_CLIENT
         .get_or_init(|| {
-            ensure_crypto_provider();
-            reqwest::Client::new()
+            sema_llm::http::proxy_env_client_builder()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
         })
         .clone()
 }
@@ -240,22 +252,25 @@ fn http_request(
     url: &str,
     body: Option<&Value>,
     opts: Option<&Value>,
-) -> Result<Value, SemaError> {
-    // Inside an `async/spawn`'d task: offload the round-trip onto the process-wide
-    // I/O pool and yield `AwaitIo` so the scheduler can run sibling tasks while
-    // this request is in flight. The request is built and the response decoded on
-    // the VM thread; only `Send` facts cross the boundary.
+) -> NativeResult {
+    // Inside a unified-runtime VM quantum (an `async/spawn`'d task): offload the
+    // round-trip onto the executor's I/O pool and SUSPEND on a structural External
+    // wait, so sibling tasks run while this request is in flight. The request is
+    // built and the response decoded on the VM thread; only `Send` facts cross
+    // the boundary, and an `async/cancel`/`async/timeout` aborts it by dropping
+    // the in-flight future.
     #[cfg(not(target_arch = "wasm32"))]
-    if sema_core::in_async_context() {
-        return http_request_async(method, url, body, opts);
+    if sema_core::in_runtime_quantum() {
+        return http_request_runtime(method, url, body, opts);
     }
 
-    // Top-level (not in a scheduler task): the synchronous path. `io_block_on`
-    // drives the round-trip ON THIS (VM) thread using THE pool's reactor —
-    // observable behavior identical to a dedicated blocking runtime.
+    #[cfg(not(target_arch = "wasm32"))]
+    // Top-level (not in any task): the synchronous path. `io_block_on` drives the
+    // round-trip ON THIS (VM) thread using the pool's reactor — observable
+    // behavior identical to a dedicated blocking runtime.
     let want_bytes = opts_want_bytes(opts);
     let client = http_shared_client();
-    sema_io::io_block_on(async {
+    let value = sema_io::io_block_on(async {
         let builder = build_request(&client, method, url, body, opts)?;
 
         let response = builder
@@ -275,33 +290,38 @@ fn http_request(
             .map_err(SemaError::Io)?;
 
         Ok(build_response_value(status, &headers, body))
-    })
+    })?;
+    Ok(NativeOutcome::Return(value))
 }
 
-/// The offloaded (async-context) path: build the request on the VM thread,
-/// `io_spawn` the send+read on the process-wide I/O pool, and yield an `AwaitIo`
-/// handle whose poll closure decodes the `Send` response facts into the identical
-/// `Value` shape the sync path returns. Returns `Ok(nil)` after arming the
-/// yield signal; the scheduler delivers the real value on resume.
+/// Decode the raw (send-safe) HTTP response facts into the Sema response `Value`
+/// on the VM thread. `fn`-pointer shaped so it can be handed to the shared
+/// [`crate::runtime_offload::external_io_async`] decoder.
 #[cfg(not(target_arch = "wasm32"))]
-fn http_request_async(
+fn raw_http_to_value(raw: RawHttpResponse) -> Value {
+    build_response_value(raw.status, &raw.headers, raw.body)
+}
+
+/// The unified-runtime path: build the request on the VM thread, then SUSPEND on
+/// an interruptible External wait whose `reqwest` future runs off the VM thread
+/// on the executor's ASYNC tier (a real tokio reactor, no per-op blocking
+/// worker), so N concurrent `http/get`s overlap without a worker ceiling. The
+/// shared `external_io_async` decoder rebuilds the identical response `Value` on
+/// resume; cancellation (`async/cancel`/`async/timeout`) fires the wait's cancel
+/// signal, the job's `select!` drops the in-flight request future, and the
+/// connection is torn down so a cancelled request does not consume a full
+/// round-trip.
+#[cfg(not(target_arch = "wasm32"))]
+fn http_request_runtime(
     method: &str,
     url: &str,
     body: Option<&Value>,
     opts: Option<&Value>,
-) -> Result<Value, SemaError> {
-    use std::rc::Rc;
-    use tokio::sync::oneshot::error::TryRecvError;
-
-    // Vestigial under CALL_NATIVE (the scheduler delivers the resume value via
-    // `replace_stack_top`, not by re-invoking this native), but kept for
-    // symmetry with the shipped `async/await` yield pattern.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
-    }
-
+) -> NativeResult {
     let want_bytes = opts_want_bytes(opts);
     let client = http_shared_client();
+    // Build on the VM thread so a bad method / multipart / json body surfaces the
+    // exact same synchronous error the sync path raises, before any offload.
     let builder = build_request(&client, method, url, body, opts)?;
 
     // Owned strings for the error-message format, which must match the sync
@@ -309,10 +329,14 @@ fn http_request_async(
     let method_owned = method.to_string();
     let url_owned = url.to_string();
 
-    let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<RawHttpResponse, String>>();
-
-    let abort = sema_io::io_spawn(async move {
-        let result = async {
+    let kind = CompletionKind::try_from_raw(HTTP_COMPLETION_KIND)
+        .expect("http completion kind is nonzero");
+    crate::runtime_offload::external_io_async(
+        "http",
+        kind,
+        "http",
+        raw_http_to_value,
+        move || async move {
             let response = builder
                 .send()
                 .await
@@ -335,38 +359,12 @@ fn http_request_async(
                 headers,
                 body,
             })
-        }
-        .await;
-        let _ = tx.send(result);
-        // Wake the parked VM thread so it re-polls promptly.
-        sema_core::notify_io_complete();
-    });
-
-    // True cancellation: on cancel/timeout the scheduler calls the abort hook (the
-    // seam's one-shot AbortHook), which aborts the spawned task → drops the in-flight
-    // reqwest future → the connection is torn down (no wasted round-trip). Never
-    // called on normal completion.
-    let handle = Rc::new(sema_core::IoHandle::with_abort(
-        move || match rx.try_recv() {
-            Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-            Ok(Ok(raw)) => sema_core::IoPoll::Ready(Ok(build_response_value(
-                raw.status,
-                &raw.headers,
-                raw.body,
-            ))),
-            Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
-            Err(TryRecvError::Closed) => {
-                sema_core::IoPoll::Ready(Err("http: request worker dropped".to_string()))
-            }
         },
-        abort,
-    ));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
+    )
 }
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
-    crate::register_fn_gated(env, sandbox, Caps::NETWORK, "http/get", |args| {
+    crate::register_runtime_fn_path_gated(env, sandbox, Caps::NETWORK, "http/get", &[], |args| {
         check_arity!(args, "http/get", 1..=2);
         let url = args[0]
             .as_str()
@@ -375,7 +373,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         http_request("GET", url, None, opts)
     });
 
-    crate::register_fn_gated(env, sandbox, Caps::NETWORK, "http/post", |args| {
+    crate::register_runtime_fn_path_gated(env, sandbox, Caps::NETWORK, "http/post", &[], |args| {
         check_arity!(args, "http/post", 2..=3);
         let url = args[0]
             .as_str()
@@ -385,7 +383,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         http_request("POST", url, Some(body), opts)
     });
 
-    crate::register_fn_gated(env, sandbox, Caps::NETWORK, "http/put", |args| {
+    crate::register_runtime_fn_path_gated(env, sandbox, Caps::NETWORK, "http/put", &[], |args| {
         check_arity!(args, "http/put", 2..=3);
         let url = args[0]
             .as_str()
@@ -397,7 +395,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     // QUERY (RFC 10008): safe + idempotent like GET, but carries a request body
     // like POST — for queries too large or structured for the URL.
-    crate::register_fn_gated(env, sandbox, Caps::NETWORK, "http/query", |args| {
+    crate::register_runtime_fn_path_gated(env, sandbox, Caps::NETWORK, "http/query", &[], |args| {
         check_arity!(args, "http/query", 2..=3);
         let url = args[0]
             .as_str()
@@ -407,26 +405,40 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         http_request("QUERY", url, Some(body), opts)
     });
 
-    crate::register_fn_gated(env, sandbox, Caps::NETWORK, "http/delete", |args| {
-        check_arity!(args, "http/delete", 1..=2);
-        let url = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let opts = args.get(1);
-        http_request("DELETE", url, None, opts)
-    });
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::NETWORK,
+        "http/delete",
+        &[],
+        |args| {
+            check_arity!(args, "http/delete", 1..=2);
+            let url = args[0]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            let opts = args.get(1);
+            http_request("DELETE", url, None, opts)
+        },
+    );
 
-    crate::register_fn_gated(env, sandbox, Caps::NETWORK, "http/request", |args| {
-        check_arity!(args, "http/request", 2..=4);
-        let method = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_uppercase();
-        let url = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        let opts = args.get(2);
-        let body = args.get(3);
-        http_request(&method, url, body, opts)
-    });
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::NETWORK,
+        "http/request",
+        &[],
+        |args| {
+            check_arity!(args, "http/request", 2..=4);
+            let method = args[0]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+                .to_uppercase();
+            let url = args[1]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+            let opts = args.get(2);
+            let body = args.get(3);
+            http_request(&method, url, body, opts)
+        },
+    );
 }

@@ -14,6 +14,7 @@ use num_traits::ToPrimitive;
 use crate::error::SemaError;
 use crate::number::Complex as SemaComplex;
 use crate::number::SemaNumber;
+use crate::runtime::{NativeCallContext, NativeOutcome, NativeResult};
 use crate::EvalContext;
 
 // Compile-time check: NaN-boxing requires 64-bit pointers that fit in 48-bit VA space.
@@ -120,9 +121,15 @@ pub fn compare_spurs(a: Spur, b: Spur) -> std::cmp::Ordering {
 
 /// A native function callable from Sema.
 pub type NativeFnInner = dyn Fn(&EvalContext, &[Value]) -> Result<Value, SemaError>;
+type RuntimeNativeFnInner = dyn for<'a> Fn(&mut NativeCallContext<'a>, &[Value]) -> NativeResult;
 
 pub struct NativeFn {
     pub name: String,
+    /// Legacy callback ABI.
+    ///
+    /// Invariant I2: this boxed callback must not strongly capture a `Value`,
+    /// `Env`, or anything that transitively owns either. Traceable state belongs
+    /// in a registered `payload`; host infrastructure may capture `Weak` handles.
     pub func: Box<NativeFnInner>,
     pub payload: Option<Rc<dyn Any>>,
     /// Fixed parameter names, in declaration order, for VM-compiled closures
@@ -136,9 +143,32 @@ pub struct NativeFn {
     /// flag lets `type`/`type_name` report `:lambda` instead of `:native-fn`
     /// without sema-core/sema-stdlib needing to know the VM's payload type.
     pub is_closure: bool,
+    /// Runtime-aware callback ABI.
+    ///
+    /// Invariant I2: this boxed callback must not strongly capture a `Value`,
+    /// `Env`, or anything that transitively owns either. Traceable state belongs
+    /// in a registered `payload`; host infrastructure may capture `Weak` handles.
+    runtime_func: Option<Box<RuntimeNativeFnInner>>,
+    /// True when this native has ONLY a runtime ABI — its legacy `func` is the
+    /// "requires runtime invocation" hard-error stub (async/spawn, channel/*,
+    /// async/resolved, …). A dual-ABI native (`simple_with_runtime` /
+    /// `with_ctx_runtime`, e.g. `async/sleep`, `__llm-chat-blocking`) has a real
+    /// `func` and is NOT runtime-only. Synchronous compatibility entry points
+    /// use this to reject only shapes whose value ABI is an error stub; runtime
+    /// callback drivers route all callables through `NativeOutcome::Call`.
+    runtime_only: bool,
+    /// Argument positions whose values the native retains beyond this call.
+    /// The VM snapshots closures reachable from only these arguments while the
+    /// owning frame is known, avoiding an all-native graph walk.
+    escaping_args: &'static [usize],
 }
 
 impl NativeFn {
+    /// Constructs a context-free legacy native callback.
+    ///
+    /// Invariant I2 applies to `f`: do not strongly capture a `Value`, `Env`, or
+    /// a transitive owner. Put traceable state in a registered payload; host
+    /// infrastructure may capture `Weak` handles.
     pub fn simple(
         name: impl Into<String>,
         f: impl Fn(&[Value]) -> Result<Value, SemaError> + 'static,
@@ -149,9 +179,17 @@ impl NativeFn {
             payload: None,
             param_names: None,
             is_closure: false,
+            runtime_func: None,
+            runtime_only: false,
+            escaping_args: &[],
         }
     }
 
+    /// Constructs a legacy native callback receiving the evaluator context.
+    ///
+    /// Invariant I2 applies to `f`: do not strongly capture a `Value`, `Env`, or
+    /// a transitive owner. Put traceable state in a registered payload; host
+    /// infrastructure may capture `Weak` handles.
     pub fn with_ctx(
         name: impl Into<String>,
         f: impl Fn(&EvalContext, &[Value]) -> Result<Value, SemaError> + 'static,
@@ -162,9 +200,17 @@ impl NativeFn {
             payload: None,
             param_names: None,
             is_closure: false,
+            runtime_func: None,
+            runtime_only: false,
+            escaping_args: &[],
         }
     }
 
+    /// Constructs a legacy native callback with collector-traceable payload.
+    ///
+    /// Invariant I2 applies to `f`: do not strongly capture a `Value`, `Env`, or
+    /// a transitive owner. Traceable state belongs in `payload`, whose type must
+    /// have a registered tracer; host infrastructure may capture `Weak` handles.
     pub fn with_payload(
         name: impl Into<String>,
         payload: Rc<dyn Any>,
@@ -176,7 +222,227 @@ impl NativeFn {
             payload: Some(payload),
             param_names: None,
             is_closure: false,
+            runtime_func: None,
+            runtime_only: false,
+            escaping_args: &[],
         }
+    }
+
+    /// Constructs a context-free runtime-aware native callback.
+    ///
+    /// Invariant I2 applies to `f`: do not strongly capture a `Value`, `Env`, or
+    /// a transitive owner. Put traceable state in a registered payload; host
+    /// infrastructure may capture `Weak` handles.
+    pub fn simple_result(
+        name: impl Into<String>,
+        f: impl Fn(&[Value]) -> NativeResult + 'static,
+    ) -> Self {
+        let name = name.into();
+        let error_name = name.clone();
+        Self {
+            name,
+            func: Box::new(move |_, _| {
+                Err(SemaError::eval(format!(
+                    "internal error: runtime native function '{error_name}' requires runtime invocation"
+                )))
+            }),
+            runtime_func: Some(Box::new(move |_, args| f(args))),
+            payload: None,
+            param_names: None,
+            is_closure: false,
+            runtime_only: true,
+            escaping_args: &[],
+        }
+    }
+
+    /// Constructs a runtime-aware callback receiving only its native call
+    /// context and arguments. The evaluator context is not passed to `f`.
+    ///
+    /// Invariant I2 applies to `f`: do not strongly capture a `Value`, `Env`, or
+    /// a transitive owner. Put traceable state in a registered payload; host
+    /// infrastructure may capture `Weak` handles.
+    pub fn with_context_result(
+        name: impl Into<String>,
+        f: impl for<'a> Fn(&mut NativeCallContext<'a>, &[Value]) -> NativeResult + 'static,
+    ) -> Self {
+        let name = name.into();
+        let error_name = name.clone();
+        Self {
+            name,
+            func: Box::new(move |_, _| {
+                Err(SemaError::eval(format!(
+                    "internal error: runtime native function '{error_name}' requires runtime invocation"
+                )))
+            }),
+            runtime_func: Some(Box::new(f)),
+            payload: None,
+            param_names: None,
+            is_closure: false,
+            runtime_only: true,
+            escaping_args: &[],
+        }
+    }
+
+    /// Constructs a runtime-aware callback with typed, collector-traceable state.
+    ///
+    /// The payload type must have a tracer registered with
+    /// [`crate::register_payload_tracer`] when it can reach a [`Value`] or
+    /// [`crate::Env`]. The payload field owns the sole strong callback-state
+    /// edge; the runtime callback captures only a `Weak<T>` and the function
+    /// pointer, then temporarily upgrades the weak handle for each invocation.
+    pub fn with_payload_result<T: Any + 'static>(
+        name: impl Into<String>,
+        payload: Rc<T>,
+        f: for<'a> fn(&T, &mut NativeCallContext<'a>, &[Value]) -> NativeResult,
+    ) -> Self {
+        let name = name.into();
+        let error_name = name.clone();
+        let weak_payload = Rc::downgrade(&payload);
+        let payload: Rc<dyn Any> = payload;
+        Self {
+            name,
+            func: Box::new(move |_, _| {
+                Err(SemaError::eval(format!(
+                    "internal error: runtime native function '{error_name}' requires runtime invocation"
+                )))
+            }),
+            payload: Some(payload),
+            param_names: None,
+            is_closure: false,
+            runtime_func: Some(Box::new(move |context, args| {
+                let payload = weak_payload.upgrade().ok_or_else(|| {
+                    SemaError::eval("internal error: runtime native payload is unavailable")
+                })?;
+                f(&payload, context, args)
+            })),
+            runtime_only: true,
+            escaping_args: &[],
+        }
+    }
+
+    /// Constructs a dual-ABI native with typed, collector-traceable state.
+    ///
+    /// The payload type must have a tracer registered with
+    /// [`crate::register_payload_tracer`] when it can reach a [`Value`] or
+    /// [`crate::Env`]. The payload field owns the sole strong callback-state
+    /// edge; both callbacks capture only a `Weak<T>` and their function
+    /// pointers, then temporarily upgrade the weak handle for each invocation.
+    pub fn with_payload_ctx_runtime<T: Any + 'static>(
+        name: impl Into<String>,
+        payload: Rc<T>,
+        func: fn(&T, &EvalContext, &[Value]) -> Result<Value, SemaError>,
+        runtime: for<'a> fn(&T, &mut NativeCallContext<'a>, &[Value]) -> NativeResult,
+    ) -> Self {
+        let legacy_payload = Rc::downgrade(&payload);
+        let runtime_payload = Rc::downgrade(&payload);
+        let payload: Rc<dyn Any> = payload;
+        Self {
+            name: name.into(),
+            func: Box::new(move |context, args| {
+                let payload = legacy_payload.upgrade().ok_or_else(|| {
+                    SemaError::eval("internal error: native payload is unavailable")
+                })?;
+                func(&payload, context, args)
+            }),
+            payload: Some(payload),
+            param_names: None,
+            is_closure: false,
+            runtime_func: Some(Box::new(move |context, args| {
+                let payload = runtime_payload.upgrade().ok_or_else(|| {
+                    SemaError::eval("internal error: runtime native payload is unavailable")
+                })?;
+                runtime(&payload, context, args)
+            })),
+            runtime_only: false,
+            escaping_args: &[],
+        }
+    }
+
+    /// Constructs a native carrying both the synchronous value ABI and the
+    /// runtime ABI. The runtime callback runs with an installed
+    /// [`TaskContext`](crate::runtime::TaskContext); `func` handles callers that
+    /// invoke the native outside a runtime quantum.
+    ///
+    /// Invariant I2 applies to both callbacks: do not strongly capture a
+    /// `Value`, `Env`, or a transitive owner. Put traceable state in a registered
+    /// payload; host infrastructure may capture `Weak` handles.
+    pub fn simple_with_runtime(
+        name: impl Into<String>,
+        func: impl Fn(&[Value]) -> Result<Value, SemaError> + 'static,
+        runtime: impl for<'a> Fn(&mut NativeCallContext<'a>, &[Value]) -> NativeResult + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            func: Box::new(move |_ctx, args| func(args)),
+            runtime_func: Some(Box::new(runtime)),
+            payload: None,
+            param_names: None,
+            is_closure: false,
+            runtime_only: false,
+            escaping_args: &[],
+        }
+    }
+
+    /// Like [`simple_with_runtime`](Self::simple_with_runtime), but the legacy
+    /// callback receives the evaluator context (parity with
+    /// [`with_ctx`](Self::with_ctx)). The runtime callback drives the native
+    /// under the unified cooperative runtime; `func` handles synchronous callers
+    /// outside a runtime quantum and therefore only produces plain values.
+    ///
+    /// Invariant I2 applies to both callbacks: do not strongly capture a
+    /// `Value`, `Env`, or a transitive owner. Put traceable state in a registered
+    /// payload; host infrastructure may capture `Weak` handles.
+    pub fn with_ctx_runtime(
+        name: impl Into<String>,
+        func: impl Fn(&EvalContext, &[Value]) -> Result<Value, SemaError> + 'static,
+        runtime: impl for<'a> Fn(&mut NativeCallContext<'a>, &[Value]) -> NativeResult + 'static,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            func: Box::new(func),
+            runtime_func: Some(Box::new(runtime)),
+            payload: None,
+            param_names: None,
+            is_closure: false,
+            runtime_only: false,
+            escaping_args: &[],
+        }
+    }
+
+    /// Mark the argument positions whose values this native stores into a
+    /// longer-lived object or runtime wait. The metadata is static and carries
+    /// no traceable state, preserving invariant I2.
+    pub fn with_escaping_args(mut self, indices: &'static [usize]) -> Self {
+        self.escaping_args = indices;
+        self
+    }
+
+    /// Argument positions that must be snapshotted before this native runs.
+    pub fn escaping_args(&self) -> &'static [usize] {
+        self.escaping_args
+    }
+
+    #[doc(hidden)]
+    /// Invokes the runtime ABI. A legacy callback fallback observes the same
+    /// evaluator context carried by the runtime invocation.
+    pub fn invoke_runtime(
+        &self,
+        runtime_context: &mut NativeCallContext<'_>,
+        args: &[Value],
+    ) -> NativeResult {
+        match &self.runtime_func {
+            Some(f) => f(runtime_context, args),
+            None => (self.func)(runtime_context.eval_context, args).map(NativeOutcome::Return),
+        }
+    }
+
+    /// True when this native can ONLY run through the runtime ABI — its legacy
+    /// value `func` is the "requires runtime invocation" hard-error stub
+    /// (`async/spawn`, `channel/*`, `async/resolved`, …). Callback-driving
+    /// builtins consult this when they must diagnose an attempted synchronous
+    /// invocation. Runtime callback drivers structurally invoke every callable.
+    pub fn is_runtime_only(&self) -> bool {
+        self.runtime_only
     }
 }
 
@@ -265,53 +531,36 @@ pub enum PromiseState {
     Cancelled,
 }
 
-/// An async promise: represents a value that will be available in the future.
+/// An async promise: a thin handle to a promise in the unified runtime's
+/// `PromiseRegistry`, which is the single source of truth for its state and its
+/// settled value. The handle carries only the checked `PromiseId` (Copy,
+/// runtime-scoped), so it holds no GC edges — the resolved value lives in the
+/// registry (retained there via `Rc`), not on this handle.
+#[derive(Clone, Copy)]
 pub struct AsyncPromise {
-    pub state: RefCell<PromiseState>,
-    pub task_id: Cell<u64>,
+    pub id: crate::runtime::PromiseId,
 }
 
 impl fmt::Debug for AsyncPromise {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &*self.state.borrow() {
-            PromiseState::Pending => write!(f, "<async-promise pending>"),
-            PromiseState::Resolved(_) => write!(f, "<async-promise resolved>"),
-            PromiseState::Rejected(e) => write!(f, "<async-promise rejected: {e}>"),
-            PromiseState::Cancelled => write!(f, "<async-promise cancelled>"),
-        }
-    }
-}
-
-impl Clone for AsyncPromise {
-    fn clone(&self) -> Self {
-        AsyncPromise {
-            state: RefCell::new(self.state.borrow().clone()),
-            task_id: Cell::new(self.task_id.get()),
-        }
+        write!(f, "<async-promise>")
     }
 }
 
 /// A bounded async channel for communication between coroutines.
+/// A bounded async channel: a thin handle to a channel in the unified runtime's
+/// `ChannelRegistry`, which owns the buffer, capacity, closed flag, and the
+/// parked sender/receiver queues. The handle carries only the checked
+/// `ChannelId` (Copy, runtime-scoped), so it holds no GC edges — the buffered
+/// values live in the registry, not on this handle.
+#[derive(Clone, Copy)]
 pub struct Channel {
-    pub buffer: RefCell<std::collections::VecDeque<Value>>,
-    pub capacity: usize,
-    pub closed: Cell<bool>,
+    pub id: crate::runtime::ChannelId,
 }
 
 impl fmt::Debug for Channel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let len = self.buffer.borrow().len();
-        write!(f, "<channel {len}/{}>", self.capacity)
-    }
-}
-
-impl Clone for Channel {
-    fn clone(&self) -> Self {
-        Channel {
-            buffer: RefCell::new(self.buffer.borrow().clone()),
-            capacity: self.capacity,
-            closed: Cell::new(self.closed.get()),
-        }
+        f.write_str("<channel>")
     }
 }
 
@@ -452,6 +701,43 @@ pub struct MultiMethod {
 impl fmt::Debug for MultiMethod {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "<multimethod {}>", resolve(self.name))
+    }
+}
+
+/// Invoke a multimethod's dispatch function synchronously and select its
+/// handler. This is the host-only value-ABI path used outside an active runtime
+/// quantum. Runtime callers structurally invoke the dispatch function and then
+/// use [`select_multimethod_handler`] with its returned dispatch value.
+pub fn resolve_multimethod_handler(
+    ctx: &EvalContext,
+    mm: &MultiMethod,
+    args: &[Value],
+) -> Result<Value, SemaError> {
+    let dispatch_val = crate::call_callback(ctx, &mm.dispatch_fn, args)?;
+    select_multimethod_handler(mm, &dispatch_val)
+}
+
+/// Select the handler for an already-computed multimethod dispatch value.
+/// Performs no evaluator callback and is therefore safe inside runtime
+/// continuations.
+pub fn select_multimethod_handler(
+    mm: &MultiMethod,
+    dispatch_val: &Value,
+) -> Result<Value, SemaError> {
+    let methods = mm.methods.borrow();
+    if let Some(handler) = methods.get(dispatch_val) {
+        Ok(handler.clone())
+    } else {
+        drop(methods);
+        let default = mm.default.borrow().clone();
+        default.ok_or_else(|| {
+            SemaError::eval(format!(
+                "no method in multimethod '{}' for dispatch value: {}",
+                resolve(mm.name),
+                dispatch_val
+            ))
+            .with_hint("add a (defmethod name :default handler) to handle unmatched values")
+        })
     }
 }
 
@@ -1094,25 +1380,56 @@ impl Value {
     }
 
     pub fn async_promise(promise: AsyncPromise) -> Value {
+        // Cold data-cycle constructor (CORE-2): the handle carries only a
+        // `PromiseId`, but the promise's SETTLED value lives in the runtime's
+        // `PromiseRegistry` and can reach back to this handle (a promise that
+        // resolves to a structure holding the promise). Register the handle as a
+        // candidate — carrying the id so a dead-handle prune can also evict the
+        // registry record — so the collector traces that interior (via the
+        // runtime interior hooks) and severs the cycle. No hook = no interior
+        // edge (leaf), which is safe.
         let rc = Rc::new(promise);
-        // Cold data-cycle constructor (CORE-2): a resolved promise can close a
-        // closure-free cycle through its state cell (e.g. resolved to a channel
-        // that buffers the promise). The scheduler's raw `Rc::new(AsyncPromise…)`
-        // spawn sites register their own candidates before wrapping via
-        // `async_promise_from_rc`.
-        crate::cycle::register_candidate(crate::cycle::GcNode::Promise(Rc::downgrade(&rc)));
+        crate::cycle::register_candidate(crate::cycle::GcNode::Promise {
+            weak: Rc::downgrade(&rc),
+            id: rc.id,
+        });
         Value::from_rc_ptr(TAG_ASYNC_PROMISE, rc)
     }
+    /// Build a promise `Value` from a runtime `PromiseId`. The registry owns the
+    /// promise's state; this is just the language-facing handle to it.
+    pub fn async_promise_id(id: crate::runtime::PromiseId) -> Value {
+        Value::async_promise(AsyncPromise { id })
+    }
+    /// Rebuild a promise handle `Value` from an existing `Rc` WITHOUT re-registering
+    /// a GC candidate — used by the collector to upgrade a candidate `Weak` into a
+    /// snapshot handle for the duration of a pass.
     pub fn async_promise_from_rc(rc: Rc<AsyncPromise>) -> Value {
         Value::from_rc_ptr(TAG_ASYNC_PROMISE, rc)
     }
     pub fn channel(ch: Channel) -> Value {
+        // Cold data-cycle constructor (CORE-2): the handle carries only a
+        // `ChannelId`, but the channel's BUFFER lives in the runtime's
+        // `ChannelRegistry` and can hold values that reach back to this handle
+        // (a channel that buffers itself, or a closure captured into its
+        // buffer). Register the handle as a candidate — carrying the id so a
+        // dead-handle prune can also evict the registry record — so the
+        // collector traces the buffer (via the runtime interior hooks) and
+        // severs the cycle. No hook = no interior edge (leaf), which is safe.
         let rc = Rc::new(ch);
-        // Cold data-cycle constructor (CORE-2): the buffer can hold values
-        // that reach back to the channel with no closure on the cycle.
-        crate::cycle::register_candidate(crate::cycle::GcNode::Channel(Rc::downgrade(&rc)));
+        crate::cycle::register_candidate(crate::cycle::GcNode::Channel {
+            weak: Rc::downgrade(&rc),
+            id: rc.id,
+        });
         Value::from_rc_ptr(TAG_CHANNEL, rc)
     }
+    /// Build a channel `Value` from a runtime `ChannelId`. The registry owns the
+    /// channel's buffer/state; this is just the language-facing handle to it.
+    pub fn channel_id(id: crate::runtime::ChannelId) -> Value {
+        Value::channel(Channel { id })
+    }
+    /// Rebuild a channel handle `Value` from an existing `Rc` WITHOUT re-registering
+    /// a GC candidate — used by the collector to upgrade a candidate `Weak` into a
+    /// snapshot handle for the duration of a pass.
     pub fn channel_from_rc(rc: Rc<Channel>) -> Value {
         Value::from_rc_ptr(TAG_CHANNEL, rc)
     }
@@ -1381,11 +1698,10 @@ impl Value {
         if !is_boxed(self.0) {
             return None;
         }
-        match get_tag(self.0) {
-            TAG_NIL | TAG_FALSE | TAG_TRUE | TAG_INT_SMALL | TAG_CHAR | TAG_SYMBOL
-            | TAG_KEYWORD => None,
-            _ => Some(payload_to_ptr(get_payload(self.0))),
+        if is_immediate_tag(get_tag(self.0)) {
+            return None;
         }
+        Some(payload_to_ptr(get_payload(self.0)))
     }
 
     /// `Rc::strong_count` of the heap allocation behind this value, read
@@ -2185,6 +2501,34 @@ unsafe fn rc_strong_cell<'a>(ptr: *const u8) -> &'a Cell<usize> {
     &*(ptr.sub(RC_HEADER) as *const Cell<usize>)
 }
 
+/// Recursion budget for `free_heap_value`'s direct (non-worklist) path: at
+/// depths at or below this bound, freeing a nested collection recurses
+/// straight through Rust's native call stack instead of allocating and
+/// draining a worklist `Vec`. The overwhelming majority of real Sema
+/// structures (a handful of list/map levels) never approach this depth, so
+/// the direct path is what almost every last-ref drop actually takes —
+/// no `Vec::new`/push/pop indirection, just ordinary recursive calls the
+/// compiler can inline and branch-predict well. 64 native frames (a few
+/// hundred bytes each at most) is far below any realistic stack-overflow
+/// threshold while comfortably exceeding realistic nesting depth; beyond it,
+/// `free_heap_value` falls back to the worklist spill (see
+/// `drop_last_heap_ref`'s original SIGABRT-prevention rationale, preserved
+/// below), so teardown of one contiguous run of nested `TAG_LIST`/`TAG_VECTOR`/
+/// `TAG_MAP`/`TAG_HASHMAP` (the types this module unrolls onto the worklist)
+/// costs only O(1) native frames regardless of how deep that run goes.
+///
+/// That bound does NOT extend across a non-unrolled heap type (`Record`,
+/// `Thunk`, `MutableArray`, `Lambda`, ...) reached mid-teardown: those drop
+/// via ordinary Rust drop glue (`drop_leaf_heap_ref`), which recurses into
+/// each `Value` field through `Value::drop` — a fresh call with no memory of
+/// the depth this module was tracking, i.e. a fresh depth-0 budget. A
+/// structure that interleaves such types with runs of nested collections
+/// each ≤64 deep therefore costs O(reset-count × 64) native frames in the
+/// worst case, not O(1) — accepted as a ~64x narrowing of the overflow
+/// margin versus always spilling, since that interleaved shape is contrived
+/// and the common case (long pure collection chains) is unaffected.
+const DROP_DIRECT_RECURSION_BUDGET: u32 = 64;
+
 /// Typed free for a heap value whose last strong reference is going away:
 /// reconstruct the `Rc` (strong count 1) and drop it, running the payload's
 /// destructor and releasing the box exactly as a plain `Rc` drop would
@@ -2202,6 +2546,172 @@ unsafe fn rc_strong_cell<'a>(ptr: *const u8) -> &'a Cell<usize> {
 /// better judgment about its layout.
 #[inline(never)]
 unsafe fn drop_last_heap_ref(tag: u64, ptr: *const u8) {
+    free_heap_value(tag, ptr, 0);
+}
+
+/// Free one heap value's last strong reference at nesting `depth` (0 at the
+/// drop root, +1 per nested immutable-collection level a recursive free
+/// descends into). Depths within [`DROP_DIRECT_RECURSION_BUDGET`] free their
+/// children via direct recursive calls; past the budget, this falls back to
+/// the iterative worklist spill that the original (always-iterative)
+/// implementation used unconditionally.
+///
+/// # Safety
+/// Same contract as [`drop_last_heap_ref`]: `ptr` came from `Rc::into_raw`
+/// for the payload type `tag` denotes, with strong count exactly 1.
+unsafe fn free_heap_value(tag: u64, ptr: *const u8, depth: u32) {
+    if depth > DROP_DIRECT_RECURSION_BUDGET {
+        // Deeply nested immutable collections (a 5000-deep nested list, a
+        // tree of maps) would otherwise free recursively: dropping the outer
+        // `Vec<Value>` drops each child `Value`, whose last-ref free drops
+        // *its* `Vec<Value>`, one native frame per level. On the
+        // unified-runtime drive path that recursion starts from a deep
+        // native baseline and overflows the OS stack (an uncatchable
+        // SIGABRT) well before any Sema guard can fire. Flatten it: move
+        // each collection's children onto an explicit heap worklist and free
+        // them iteratively, so teardown depth from here is O(1) native
+        // frames per contiguous run of the unrolled collection types
+        // (`TAG_LIST`/`TAG_VECTOR`/`TAG_MAP`/`TAG_HASHMAP`), regardless of how
+        // deep that run goes. Only those cycle-free immutable collections are
+        // unrolled here; every other payload drops through
+        // `drop_leaf_heap_ref` via ordinary Rust drop glue, which re-enters
+        // `Value::drop` (and so `free_heap_value`) at a fresh depth 0 for
+        // each `Value` field it holds — a structure that interleaves such
+        // types with ≤64-deep collection runs costs O(reset-count × 64)
+        // frames rather than O(1) (see `DROP_DIRECT_RECURSION_BUDGET` for the
+        // accepted margin trade-off this implies).
+        let mut worklist: Vec<Value> = Vec::new();
+        free_heap_payload(tag, ptr, &mut worklist);
+        drain_drop_worklist(worklist);
+        return;
+    }
+    if !take_owned_children(tag, ptr, |child| drop_child_value(child, depth + 1)) {
+        drop_leaf_heap_ref(tag, ptr);
+    }
+}
+
+/// For the three child-bearing immutable collection tags
+/// (`TAG_LIST`/`TAG_VECTOR` → `Vec<Value>`, `TAG_MAP` → `BTreeMap`,
+/// `TAG_HASHMAP` → `hashbrown::HashMap`), reconstruct the container's `Rc`
+/// (strong count 1) and drop it — freeing the container's own allocation
+/// exactly once via `Rc::into_inner` — then feed every owned child `Value` to
+/// `sink` (for maps, key then value, preserving iteration order), and return
+/// `true`. For any other tag, return `false` WITHOUT touching `ptr`, leaving
+/// the caller to free that leaf allocation itself.
+///
+/// This is the single source of truth for which tags own child `Value`s and
+/// how they are extracted; the direct-recursion (`free_heap_value`) and
+/// worklist-spill (`free_heap_payload`) paths differ only in the `sink` they
+/// pass (recurse vs push), so they share this enumeration.
+///
+/// # Safety
+/// `ptr` came from `Rc::into_raw` for the payload type `tag` denotes, and the
+/// strong count is exactly 1 — a `true` return consumes that last reference.
+unsafe fn take_owned_children(tag: u64, ptr: *const u8, mut sink: impl FnMut(Value)) -> bool {
+    match tag {
+        TAG_LIST | TAG_VECTOR => {
+            let items = Rc::into_inner(Rc::from_raw(ptr as *const Vec<Value>))
+                .expect("caller guarantees the last strong reference");
+            for value in items {
+                sink(value);
+            }
+        }
+        TAG_MAP => {
+            let map = Rc::into_inner(Rc::from_raw(ptr as *const BTreeMap<Value, Value>))
+                .expect("caller guarantees the last strong reference");
+            for (k, v) in map {
+                sink(k);
+                sink(v);
+            }
+        }
+        TAG_HASHMAP => {
+            let map = Rc::into_inner(Rc::from_raw(ptr as *const hashbrown::HashMap<Value, Value>))
+                .expect("caller guarantees the last strong reference");
+            for (k, v) in map {
+                sink(k);
+                sink(v);
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Drop one child `Value` reached while freeing a collection's contents at
+/// `depth`: decrement its refcount, recursing into `free_heap_value` (direct
+/// or worklist-spilled, per `depth`) only when this was the last reference.
+/// `mem::forget` keeps `Value`'s own `Drop` from re-entering the recursive
+/// path this replaces.
+#[inline]
+unsafe fn drop_child_value(value: Value, depth: u32) {
+    drop_value_ref(value, |tag, ptr| free_heap_value(tag, ptr, depth));
+}
+
+/// True for the seven immediate (non-heap) tags — values that carry no
+/// refcounted allocation and so need no clone/drop bookkeeping. `TAG_NIL..=
+/// TAG_KEYWORD` are the contiguous range `0..=6` and `TAG_INT_BIG` (the first
+/// heap tag) is `7`, so this single comparison is exactly the set
+/// `{TAG_NIL, TAG_FALSE, TAG_TRUE, TAG_INT_SMALL, TAG_CHAR, TAG_SYMBOL,
+/// TAG_KEYWORD}`.
+#[inline]
+fn is_immediate_tag(tag: u64) -> bool {
+    tag < TAG_INT_BIG
+}
+
+/// Shared refcount-decrement tail for a `Value` being released off a teardown
+/// path (a collection child or a worklist entry): skip immediates, otherwise
+/// decrement the strong count and, on the last reference, run `on_last(tag,
+/// ptr)` — the caller-supplied free (direct-recursive `free_heap_value` for the
+/// child path, worklist-spilling `free_heap_payload` for the drain path).
+/// `mem::forget` keeps `Value`'s own `Drop` from re-entering the recursive path
+/// this replaces.
+///
+/// # Safety
+/// A boxed non-immediate `value` carries a live `Rc::into_raw` pointer (the
+/// `rc_strong_cell` contract); on a strong count of 1 `on_last` receives the
+/// last reference and must consume it.
+#[inline]
+unsafe fn drop_value_ref(value: Value, on_last: impl FnOnce(u64, *const u8)) {
+    if is_boxed(value.0) {
+        let tag = get_tag(value.0);
+        if !is_immediate_tag(tag) {
+            let ptr = payload_to_ptr(get_payload(value.0));
+            let strong = rc_strong_cell(ptr);
+            match strong.get() {
+                1 => on_last(tag, ptr),
+                n => strong.set(n - 1),
+            }
+        }
+    }
+    std::mem::forget(value);
+}
+
+/// Drain a worklist of children spilled by the depth-budget fallback,
+/// freeing each iteratively. Deliberately does NOT call back into
+/// `free_heap_value`'s direct path — once a structure's teardown has
+/// spilled, it stays on the O(1)-native-frames worklist path for the rest of
+/// its depth, which is what makes the budget cutoff safe against arbitrarily
+/// deep structures.
+unsafe fn drain_drop_worklist(mut worklist: Vec<Value>) {
+    while let Some(value) = worklist.pop() {
+        drop_value_ref(value, |tag, ptr| free_heap_payload(tag, ptr, &mut worklist));
+    }
+}
+
+/// Free ONE heap allocation whose last strong reference is going away. For the
+/// immutable collection types, move the owned child `Value`s onto `worklist`
+/// (so they are freed iteratively by [`drop_last_heap_ref`]) and free only the
+/// container's own allocation here; every other payload is dropped normally.
+unsafe fn free_heap_payload(tag: u64, ptr: *const u8, worklist: &mut Vec<Value>) {
+    if !take_owned_children(tag, ptr, |child| worklist.push(child)) {
+        drop_leaf_heap_ref(tag, ptr);
+    }
+}
+
+/// Drop a single heap payload's last reference via Rust's normal drop glue.
+/// The immutable collection tags are intercepted before this by
+/// [`free_heap_payload`]; they remain here only as a total fallback.
+unsafe fn drop_leaf_heap_ref(tag: u64, ptr: *const u8) {
     match tag {
         TAG_INT_BIG => drop(Rc::from_raw(ptr as *const i64)),
         TAG_BIGINT => drop(Rc::from_raw(ptr as *const BigInt)),
@@ -2242,33 +2752,30 @@ impl Clone for Value {
             return Value(self.0);
         }
         let tag = get_tag(self.0);
-        match tag {
-            // Immediates: trivial copy
-            TAG_NIL | TAG_FALSE | TAG_TRUE | TAG_INT_SMALL | TAG_CHAR | TAG_SYMBOL
-            | TAG_KEYWORD => Value(self.0),
-            // Heap pointers: one uniform strong-count bump — the RcBox header
-            // sits at the same offset for every heap payload (see RC_HEADER),
-            // so no per-tag dispatch is needed.
-            _ => {
-                debug_assert!(
-                    (TAG_INT_BIG..=TAG_MUTABLE_CELL).contains(&tag),
-                    "invalid heap tag in clone: {tag}"
-                );
-                let ptr = payload_to_ptr(get_payload(self.0));
-                // SAFETY: every boxed non-immediate tag carries a live
-                // `Rc::into_raw` pointer (the `rc_strong_cell` contract).
-                unsafe {
-                    let strong = rc_strong_cell(ptr);
-                    let n = strong.get().wrapping_add(1);
-                    if n == 0 {
-                        // Refcount overflow — abort, as `Rc::clone` would.
-                        std::process::abort();
-                    }
-                    strong.set(n);
-                }
-                Value(self.0)
-            }
+        // Immediates: trivial copy
+        if is_immediate_tag(tag) {
+            return Value(self.0);
         }
+        // Heap pointers: one uniform strong-count bump — the RcBox header
+        // sits at the same offset for every heap payload (see RC_HEADER),
+        // so no per-tag dispatch is needed.
+        debug_assert!(
+            (TAG_INT_BIG..=TAG_MUTABLE_CELL).contains(&tag),
+            "invalid heap tag in clone: {tag}"
+        );
+        let ptr = payload_to_ptr(get_payload(self.0));
+        // SAFETY: every boxed non-immediate tag carries a live
+        // `Rc::into_raw` pointer (the `rc_strong_cell` contract).
+        unsafe {
+            let strong = rc_strong_cell(ptr);
+            let n = strong.get().wrapping_add(1);
+            if n == 0 {
+                // Refcount overflow — abort, as `Rc::clone` would.
+                std::process::abort();
+            }
+            strong.set(n);
+        }
+        Value(self.0)
     }
 }
 
@@ -2281,28 +2788,25 @@ impl Drop for Value {
             return; // Float
         }
         let tag = get_tag(self.0);
-        match tag {
-            // Immediates: nothing to free
-            TAG_NIL | TAG_FALSE | TAG_TRUE | TAG_INT_SMALL | TAG_CHAR | TAG_SYMBOL
-            | TAG_KEYWORD => {}
-            // Heap pointers: uniform decrement; the per-tag typed free runs
-            // only when the last reference goes away (cold, out of line).
-            _ => {
-                debug_assert!(
-                    (TAG_INT_BIG..=TAG_MUTABLE_CELL).contains(&tag),
-                    "invalid heap tag in drop: {tag}"
-                );
-                let ptr = payload_to_ptr(get_payload(self.0));
-                // SAFETY: same RcBox-header contract as `Clone`; at count 1
-                // this value owns the final reference, which the typed free
-                // consumes.
-                unsafe {
-                    let strong = rc_strong_cell(ptr);
-                    match strong.get() {
-                        1 => drop_last_heap_ref(tag, ptr),
-                        n => strong.set(n - 1),
-                    }
-                }
+        // Immediates: nothing to free
+        if is_immediate_tag(tag) {
+            return;
+        }
+        // Heap pointers: uniform decrement; the per-tag typed free runs
+        // only when the last reference goes away (cold, out of line).
+        debug_assert!(
+            (TAG_INT_BIG..=TAG_MUTABLE_CELL).contains(&tag),
+            "invalid heap tag in drop: {tag}"
+        );
+        let ptr = payload_to_ptr(get_payload(self.0));
+        // SAFETY: same RcBox-header contract as `Clone`; at count 1
+        // this value owns the final reference, which the typed free
+        // consumes.
+        unsafe {
+            let strong = rc_strong_cell(ptr);
+            match strong.get() {
+                1 => drop_last_heap_ref(tag, ptr),
+                n => strong.set(n - 1),
             }
         }
     }
@@ -2803,20 +3307,8 @@ impl fmt::Display for Value {
                 with_resolved(m.name, |n| write!(f, "<multimethod {n}>"))
             }
             ValueViewRef::Stream(s) => write!(f, "<stream:{}>", s.stream_type()),
-            ValueViewRef::AsyncPromise(p) => match &*p.state.borrow() {
-                PromiseState::Pending => write!(f, "<async-promise pending>"),
-                PromiseState::Resolved(v) => write!(f, "<async-promise resolved: {v}>"),
-                PromiseState::Rejected(e) => write!(f, "<async-promise rejected: {e}>"),
-                PromiseState::Cancelled => write!(f, "<async-promise cancelled>"),
-            },
-            ValueViewRef::Channel(c) => {
-                let len = c.buffer.borrow().len();
-                if c.closed.get() {
-                    write!(f, "<channel {len}/{} closed>", c.capacity)
-                } else {
-                    write!(f, "<channel {len}/{}>", c.capacity)
-                }
-            }
+            ValueViewRef::AsyncPromise(_) => write!(f, "<async-promise>"),
+            ValueViewRef::Channel(_) => write!(f, "<channel>"),
             // Length/opaque only: a mutable array or cell can contain itself,
             // so printing contents could recurse forever. Freeze with
             // `mutable-array/->vector` (or `mutable-cell/get`) to inspect.
@@ -3184,6 +3676,59 @@ mod tests {
             drop(Rc::from_raw(raw));
         }
         drop(extra);
+    }
+
+    #[test]
+    fn drop_mixed_shallow_and_deep_nesting_does_not_double_free_or_leak() {
+        // A shape that crosses `DROP_DIRECT_RECURSION_BUDGET` (64) well
+        // before reaching a splice: a 5000-deep nested-list spine (far past
+        // the budget, forcing the worklist-spill fallback) with a map
+        // spliced into its middle that itself holds a 100-deep nested list.
+        // By the depth the map is reached, the outer spine has already
+        // spilled to the worklist, so the map and its inner list are freed
+        // by `free_heap_payload` draining the worklist — pushing children
+        // directly rather than recursing — never re-entering the direct
+        // recursive path (`free_heap_value`'s depth-tracked branch). Two leaf
+        // strings are wrapped in `Rc` so their weak counts pin "freed exactly
+        // once" — a double-free would abort or corrupt the allocator before
+        // this assertion runs, and a leak would leave the strong count above
+        // zero.
+        fn deep_list(depth: usize, leaf: Value) -> Value {
+            let mut v = leaf;
+            for _ in 0..depth {
+                v = Value::list(vec![v]);
+            }
+            v
+        }
+
+        let shallow_leaf = Rc::new(String::from("shallow leaf"));
+        let deep_leaf = Rc::new(String::from("deep leaf"));
+        let shallow_weak = Rc::downgrade(&shallow_leaf);
+        let deep_weak = Rc::downgrade(&deep_leaf);
+
+        let shallow_value = Value::string_from_rc(shallow_leaf);
+        let deep_value = Value::string_from_rc(deep_leaf);
+
+        // 100-deep list (past the budget on its own) nested inside a map.
+        let inner_deep_list = deep_list(100, deep_value);
+        let mut inner_map = BTreeMap::new();
+        inner_map.insert(Value::keyword("payload"), inner_deep_list);
+        let map_value = Value::map(inner_map);
+
+        // Splice the map into the middle of a 5000-deep spine (2500 levels
+        // on either side, each well past the budget).
+        let below = deep_list(2500, map_value);
+        let spine_bottom = Value::list(vec![shallow_value, below]);
+        let full = deep_list(2500, spine_bottom);
+
+        drop(full);
+
+        assert_eq!(
+            shallow_weak.strong_count(),
+            0,
+            "shallow leaf freed exactly once"
+        );
+        assert_eq!(deep_weak.strong_count(), 0, "deep leaf freed exactly once");
     }
 
     #[test]

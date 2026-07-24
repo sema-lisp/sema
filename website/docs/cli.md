@@ -57,7 +57,7 @@ sema eval [OPTIONS]
 | `--path <FILE>`       | Set file context for imports and error spans                     |
 | `--sandbox <MODE>`    | Sandbox mode (`strict`, `all`, or comma-separated capabilities)  |
 | `--no-llm`            | Disable LLM features                                             |
-| `--timeout <MS>`      | Kill evaluation after N ms; 0 disables (default: 5000)           |
+| `--timeout <MS>`      | Kill evaluation after N ms (default: 5000)                       |
 
 **Examples:**
 
@@ -153,14 +153,12 @@ sema build [OPTIONS] [FILE]
 
 | Flag                     | Description                                               |
 | ------------------------ | --------------------------------------------------------- |
-| `-o, --output <PATH>`   | Output path. A file path is used as-is; a directory (existing, or ending in `/`) means "default filename inside it". Missing parent directories are created; a leading `~` is expanded. |
+| `-o, --output <PATH>`   | Output executable path (default: filename without extension) |
 | `--include <PATH>...`   | Additional files or directories to bundle (repeatable)    |
-| `--runtime <PATH>`      | Path to a sema executable to embed the program into, instead of the current executable or the release binary `--target` downloads. The output inherits its platform and version. Conflicts with `--target`. |
-| `--target <TARGET>`     | Target platform triple or alias (e.g. `linux`, `macos`, `windows`, `web`, or a full triple like `x86_64-unknown-linux-gnu`). Use `all` to build every supported native target. |
+| `--runtime <PATH>`      | Sema binary to use as runtime base (default: current exe) |
+| `--target <TARGET>`     | Target platform triple or alias (e.g. `linux`, `macos`, `windows`, or a full triple like `x86_64-unknown-linux-gnu`). Use `all` to build for all supported targets. |
 | `--list-targets`        | Show all supported target platforms and aliases            |
 | `--no-cache`            | Force re-download of cached runtime binaries              |
-| `-v, --verbose`         | Show per-step build detail and runtime cache/checksum info |
-| `--json`                | Print a machine-readable build manifest to stdout          |
 
 ```bash
 # Build a standalone executable
@@ -180,35 +178,6 @@ sema build script.sema --target linux --no-cache  # force re-download runtime
 # Run the standalone executable
 ./myapp --arg1 --arg2
 ```
-
-With `--target all` the program is compiled once and each per-target executable
-gets a distinct suffixed filename (`<name>-<triple>`, `.exe` for Windows) —
-combined with `-o` a directory means "put them all in here", a file path is used
-as the base name. A summary table with sizes and full paths is printed on
-stdout when done:
-
-```
-Built 5/5 targets in 14.4s:
-
-  macos    arm64    27.9 MB   /home/me/dist/game-aarch64-apple-darwin
-  linux    arm64    28.0 MB   /home/me/dist/game-aarch64-unknown-linux-gnu
-  macos    x86_64   28.5 MB   /home/me/dist/game-x86_64-apple-darwin
-  linux    x86_64   31.0 MB   /home/me/dist/game-x86_64-unknown-linux-gnu
-  windows  x86_64   23.9 MB   /home/me/dist/game-x86_64-pc-windows-msvc.exe
-```
-
-Progress goes to stderr and the final summary to stdout, so the output is
-pipeable. `--json` replaces the summary with a manifest — per target: `path`,
-`bytes`, `sha256`, the runtime source (`host` / `cached` / `downloaded` /
-`custom`), and `ok`/`error` status — handy for release scripts:
-
-```bash
-sema build app.sema --target all --json | jq -r '.targets[].path'
-```
-
-Windows executables are built with an embedded Sema icon and a `VERSIONINFO`
-resource (name + version in Explorer's Details tab), also when cross-building
-from macOS or Linux.
 
 Cross-compilation downloads pre-built runtime binaries from GitHub Releases and caches them at `~/.sema/cache/runtimes/`. Use `--no-cache` to force a fresh download, or `--runtime` to provide your own binary.
 
@@ -331,9 +300,8 @@ sema fmt [OPTIONS] [FILES...]
 | `--diff` | Print diff of changes |
 | `--width <N>` | Max line width (default: `80`) |
 | `--indent <N>` | Indentation width (default: `2`) |
-| `--align` | Column-align consecutive similar forms |
-| `--max-blank-lines <N>` | Max consecutive blank lines to keep (default: `1`) |
-| `--json` | Output result as JSON (useful for editor integrations) |
+| `--align` | Align consecutive similar forms |
+| `--json` | Emit read-only NDJSON results for editor integrations |
 
 ```bash
 # Format all .sema files recursively
@@ -344,6 +312,9 @@ sema fmt --check
 
 # Preview changes
 sema fmt --diff
+
+# Machine-readable check (exit 1 when changes are needed)
+sema fmt --check --json
 ```
 
 ### `sema notebook`

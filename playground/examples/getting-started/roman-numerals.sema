@@ -21,8 +21,8 @@
   (let loop ((n n) (table roman-table) (acc ""))
     (if (or (null? table) (= n 0))
       acc
-      (let ((value   (first (first table)))
-            (symbol  (nth (first table) 1)))
+      (let ((value (first (first table)))
+            (symbol (nth (first table) 1)))
         (if (>= n value)
           (loop (- n value) table (string/append acc symbol))
           (loop n (rest table) acc))))))

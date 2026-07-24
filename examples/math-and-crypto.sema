@@ -111,9 +111,9 @@
     (string/slice chain-result 0 16)))
 
 ;; --- Timing ---
-(define start    (time-ms))
-(define _result  (sieve-primes 10000))
-(define elapsed  (- (time-ms) start))
+(define start (time-ms))
+(define _result (sieve-primes 10000))
+(define elapsed (- (time-ms) start))
 (println
   (format "\nPrimes under 10000: ~a primes found in ~ams"
     (length _result)

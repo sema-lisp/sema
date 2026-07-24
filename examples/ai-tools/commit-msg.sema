@@ -9,8 +9,8 @@
   (exit 1))
 
 ;; Get the staged diff
-(define result  (shell "git" "diff" "--staged"))
-(define diff    (:stdout result))
+(define result (shell "git" "diff" "--staged"))
+(define diff (:stdout result))
 
 (when (= (string/trim diff) "")
   (io/println-error "No staged changes. Stage changes with 'git add' first.")

@@ -2,45 +2,145 @@
 
 ## Unreleased
 
-### Fixed
-
-- **`sema mcp` no longer dies on `llm/*` calls.** The stdio server ran inside a
-  tokio `block_on`, so LLM builtins' `io_block_on` hit tokio's
-  runtime-in-runtime panic — with release `panic = "abort"` the whole server
-  aborted on the first `llm/complete`/`llm/extract` a client invoked. The loop
-  is now plain synchronous std::io (`run_mcp_server_sync`); LLM tool calls
-  return normal tool results/errors.
-- **MCP error results keep hints.** Unbound-variable "Did you mean 'X'?"
-  suggestions (and error notes) now survive the MCP boundary instead of being
-  dropped by `Display`; a `docs` miss also points at `docs_search`.
-- **`llm/extract` bare keyword field specs are real shorthand.**
-  `{:total :number}` now renders the type in the extraction prompt (was
-  `<any>`) and is type-checked in validation (was key-presence only, so
-  `"$10.00"` passed as `:number`).
+- **Unified async runtime — terminal-inventory ledger signed off; conformance
+  gate green.** The async-runtime migration inventory
+  (`docs/internals/async-runtime-inventory.md`) is now terminal for every
+  production-matched row. The 68 already-proven core/eval/VM/executor/stdlib/host
+  rows were stamped `MIGRATED` after per-row verification against current code —
+  the legacy-symbol purge gate (`check-unified-runtime-legacy.sh --check`), the
+  exact off-quantum host-adapter allowlist, and the adversarial verification are
+  the evidence — joining the A1–C6 resource/context rows.
+  `docs/plans/evidence/unified-cooperative-runtime/runtime-match-map.tsv` was
+  regenerated to the 931 current discovery matches (line-shift inherits, the
+  B8/B9/B3 split-row remaps `R03→R03A` / `R13→R13A` / `R14→R14B` /
+  `R21→R21A`/`R21B`, and hand-classified new payloads), and
+  `check-unified-runtime-inventory.sh` now accepts commit-annotated terminal
+  statuses (`MIGRATED (B7)`, …) via a terminal-prefix match. All nine
+  `runtime_conformance_test` cases pass, including
+  `unified_runtime_inventory_mapping_covers_exact_current_matches`.
+- **WebSocket waits and event selection use source-driven runtime wakes.**
+  Client handshakes and client/server message and close waits are event-driven;
+  cancelling a pending receive preserves the installed receiver and connection.
+  Timer-only `event/select` parks once until the exact earliest deadline. Stdin
+  and process readiness cannot notify the runtime, so their VM-thread checks
+  retain structural 5 ms timer probes.
+- **Unified runtime — `YieldReason::Sleep` (the last TLS yield-signal bridge)
+  retired.** `async/sleep`'s structural Timer ABI (`invoke_runtime`) is
+  always preferred when a `TaskContext` is installed, so the legacy
+  ctx-less value-ABI closure was reached only when a caller bypassed
+  `invoke_runtime` entirely: a raw native passed directly to a single-ABI
+  (`register_fn`-only) higher-order function like `any`/`every` (not the
+  cooperative `register_hof` natives — `map`/`filter`/`sort-by`/… already
+  suspend it structurally), or to `apply`, where there is no way to suspend
+  anyway. That closure now raises a clear "wrap it in a lambda" error itself
+  instead of setting a TLS signal for the VM to relay into
+  `VmExecResult::AsyncYield`; outside any runtime quantum (a nested/foreign
+  synchronous VM re-entry) it still actually sleeps, unchanged. `YieldReason`,
+  `set_yield_signal`/`take_yield_signal`, `VmExecResult::AsyncYield` (and its
+  `NativeDispatchResult`/`VmNativeSignal` carriers), and `TaskAction::VmSleep`
+  are deleted; `list.rs`'s `check_hof_yield` guard — now redundant, since the
+  error surfaces directly from `async/sleep` itself — is deleted too.
+  `scripts/check-unified-runtime-legacy.sh`'s zero-tolerance gate is extended
+  to guard against reintroducing any of these symbols. See
+  `docs/deferred.md`'s LEGACY-SCHEDULER note.
+- **Runtime correctness: `cancel_root` now reaps fire-and-forget descendants
+  of an already-settled task (CANCEL-ROOT-CASCADE-1).** `Runtime::cancel_root`
+  used to cancel only the root's main task and rely on the live
+  `cancellation_parent` chain to reach descendants — a detached child spawned
+  by a task that had already returned (its spawner removed from
+  `state.tasks`) fell off that chain and leaked, running to completion or
+  staying parked forever in a persistent host (notebook, embedded
+  `Interpreter`, a server cancelling one root while others run). `cancel_root`
+  now sweeps every live task by `origin_root` (a field that survives an
+  intermediate spawner's removal, unlike `cancellation_parent`), reaping the
+  whole subtree regardless of how deep or how settled its spawners are, with
+  the same C2 eager wait teardown and exactly-once composition the
+  `async/cancel` path already relied on. See `docs/deferred.md`
+  §CANCEL-ROOT-CASCADE-1.
+- **SRV-1 (concurrent `http/serve`) — RESOLVED, fail-fast guard deleted.**
+  `http/serve`'s accept loop no longer blocks the VM thread: it parks
+  cooperatively on a re-arming `WaitKind::External` fed by the request
+  channel (proven deadlock-free by four focused runtime tests,
+  `crates/sema-vm/src/runtime/tests.rs`'s `srv1_spike_*`, at the real
+  `Runtime` API level — an idle External keeps the runtime `Idle`, never a
+  false `Quiescent`/deadlock; independent parked tasks settle independently;
+  a re-arming continuation loops indefinitely with no leak; shutdown while
+  parked tears down cleanly), each connection runs as its own spawned task,
+  and a server-side WebSocket handler's `(:recv conn)` suspends cooperatively
+  too instead of pinning the VM thread with `blocking_recv` — so a slow,
+  async-parked, or WebSocket-idling handler no longer blocks its siblings.
+  The `in_runtime_quantum() && current_task_id().is_some()` fail-fast guard
+  that used to reject `http/serve` inside `async/spawn` is deleted:
+  `http/serve` now genuinely composes there. All four acceptance scenarios in
+  `crates/sema/tests/http_serve_concurrent_test.rs` are un-ignored and green,
+  plus a new synthetic-level cancellation gate
+  (`crates/sema/tests/http_serve_cancel_test.rs`) proves an idle WebSocket
+  handler's task is reaped (no leak) on cancellation. An uncaught handler
+  error now produces a bounded 500 ("Handler did not respond") rather than
+  the old serial loop's `{"error": "..."}` JSON body — undocumented either
+  way, and now pinned by a dedicated test. See `docs/deferred.md` §SRV-1 for
+  the two runtime-adjacent traps this work routed around without a
+  `sema-vm` change (`spawn_via_registry`'s `VmResume` fast path silently
+  dropping a non-default `Spawn` continuation; a synchronous `call_callback`
+  re-entry suspending `in_runtime_quantum()` for its duration), both flagged
+  as open follow-ups for the next caller in this area.
+- **Unified runtime — Step G callback re-entry (nested `eval` and multimethod
+  dispatch):** the last two gaps where a synchronous evaluator re-entry could
+  not host a suspension are fixed. `(eval '(async/await (async ...)))` now
+  runs the eval'd form under the SAME runtime quantum instead of a fresh,
+  scheduler-less VM — `__vm-eval` gained a runtime-ABI path that wraps the
+  compiled chunk as a callable (`sema_vm::program_as_callable`) and hands it to
+  the runtime as a cooperative `NativeOutcome::Call`, exactly like a
+  higher-order-function callback. A direct multimethod call `(mm x)` whose
+  SELECTED method suspends (`async/await`, `channel/*`, …) now suspends
+  cleanly too, instead of leaking "internal error: runtime native function 'X'
+  requires runtime invocation" — the VM's direct-call sites route a
+  runtime-quantum multimethod dispatch through the same cooperative Call path.
+  Synchronous value-ABI evaluation and multimethod calls outside a runtime
+  quantum are unchanged. `apply` now uses the same runtime dispatcher, so a
+  selected multimethod method can suspend there as well. See
+  `docs/deferred.md`'s Step G entry.
+- **WASM Promise-driven roots — the deletion (P6-3 step 5):** the shipped
+  HTTP-replay loops (`evalAsync`/`evalVMAsync`/`runEntryAsync` re-running the
+  whole program on every host I/O, up to `MAX_REPLAYS=50`) and the playground
+  worker's `SharedArrayBuffer`/`Atomics.wait` sleep fallback are deleted. The
+  three async entry points are now thin Promise-returning wrappers over the
+  `evalPromise` seam — submitted as ONE root, never replayed, with real
+  single-execution `http/get`/`async/sleep` support — while keeping their
+  existing JS method names and JSON result shape. Playground programs execute
+  exactly once — an `http/get` no longer re-runs the program up to 50× — and
+  `async/sleep` now drives through `setTimeout` with the page responsive
+  instead of a blocking `Atomics.wait`. Evaluations submitted concurrently are
+  individually cancellable: Stop routes through
+  `RuntimeCommandHandle::cancel_root` and cancels the exact in-flight root, not
+  every root in the worker. The playground worker's SharedArrayBuffer/Atomics
+  control protocol is removed entirely, and the real-browser acceptance gate
+  (`playground/tests/unified-runtime.spec.ts`) is committed as evidence, with
+  its transcript at
+  `docs/plans/evidence/unified-cooperative-runtime/p63-browser-gate-transcript.txt`.
+  The debugger's own HTTP marker flow and the synchronous entry points'
+  (`eval`/`evalGlobal`/`evalVM`) interruptible-sleep support are intentionally
+  kept (verified live consumers beyond this step's scope) — the two documented
+  survivors are the sync-entry-point sleep busy-poll and the
+  debugger-narrowed HTTP marker; see `docs/deferred.md`'s P6-3 entry.
+- **Public host API (P6-1):** `Interpreter` gains `submit_str`/`submit_value`/
+  `drive_until_settled`/`drive_turn`/`take_output`/`command_handle`/`shutdown`,
+  with `RootOptions{capture_output}`, root-tagged `OutputEvent`, and
+  `RuntimeCommandHandle` — a `Send + Sync` handle for cross-thread cancellation.
+  The CLI now cancels gracefully on Ctrl-C (double-press hard-exits, 130); the
+  notebook engine drives cells through the API with per-cell output capture,
+  in-order stderr, and cross-thread cell cancellation.
+- **Runtime fast-path recovery (0b/0c):** HOF-heavy compute and task fan-out now
+  beat the pre-unification engine (primes/spawn-storm 0.7×); channel rendezvous
+  7.4×→~1.4× via inline completion + direct task-to-task handoff; O(1)
+  cancel-waiting and ready-remaining; depth-bounded value drop; divan scheduler
+  micro-benchmarks (`jake bench.micro`).
+- **Advisory Windows CI leg:** `ci.yml` gains a `test-windows` job
+  (`windows-latest`, `cargo nextest run --workspace`) with
+  `continue-on-error: true` — advisory until first green, then promoted to
+  required.
 
 ### Added
-
-- **`sema mcp --sandbox <mode>`** — sandbox the MCP server with the standard
-  grammar (`strict` or `no-shell,no-fs-write`); falls back to the top-level
-  `--sandbox`, default remains allow-everything.
-- **`docs_search` hits include a `signature` field** with argument order
-  (e.g. `(regex/replace-all pattern replacement text) -> string`) — summaries
-  alone led agents to swap argument order.
-
-- **`sema build --json`** — a machine-readable build manifest on stdout: source,
-  archive size, and per-target `path` / `bytes` / `sha256` / runtime source
-  (`host`·`cached`·`downloaded`·`custom`) / `ok` / `error`. Works for single
-  targets, `--target all`, and `--target web` (same envelope, `runtime: null`).
-  Failed targets appear as `ok: false` entries and the exit code stays non-zero.
-- **`sema build -v/--verbose`** — restores the per-step build detail
-  (`[1/4]`…`[4/4]`) and runtime cache/checksum/paths info that the new compact
-  output omits by default.
-- **Windows executables from `sema build` are branded**: the Sema mark is
-  embedded as a proper multi-resolution icon (256→16 px) and a `VERSIONINFO`
-  resource (ProductName / FileDescription / FileVersion) fills Explorer's
-  Details tab. Pure-Rust, works when cross-building from macOS/Linux.
-- **Runtime downloads show a progress bar** when stderr is a TTY (plain
-  deterministic lines when piped or in CI).
 
 - **Authenticated MCP servers in workflow runs — headless precursor** (per
   `docs/plans/2026-06-24-workflow-mcp-auth.md`, §9 items a–c). A `defworkflow`
@@ -129,29 +229,6 @@
 
 ### Changed
 
-- **`sema build` output redesigned.** Default output is compact: one
-  `Compiled <src> → archive` note, a live per-target status line under
-  `--target all`, and an aligned summary table (os / arch / human-readable
-  size / full path) at the end. Progress goes to stderr, the final summary to
-  stdout (pipeable). The `Note: this binary … won't run on your current
-  machine` line is gone; `Checksum verified` / `Cached at` / `Using cached
-  runtime` moved behind `--verbose`.
-- **`sema build --target all` compiles once.** The archive (compile → trace
-  imports → collect assets → serialize) is target-independent and is now built
-  a single time; only the runtime fetch + injection runs per target.
-- **OTLP-over-gRPC is now a cargo feature (`otel-grpc`).** Release artifacts
-  (installer, Homebrew, GitHub archives) still include it; a plain
-  `cargo install sema-lang` or source build omits the tonic/h2 stack
-  (~30s of compile) and `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` warns once and
-  falls back to `http/protobuf`. Opt back in with `--features otel-grpc`.
-- **TLS now uses rustls with the pure-Rust `ring` provider** instead of
-  aws-lc. No behavioral change for HTTP/LLM/WebSocket features; it removes the
-  slowest C build step from source builds.
-- **`--runtime` help text clarified**: it is a path to a sema executable used
-  as the embed base; the output inherits its platform and version, so passing
-  e.g. a Windows `sema.exe` cross-builds without a download. Conflicts with
-  `--target`.
-
 - **`async/sleep` and `async/timeout` accept a float duration**, not just an
   int — a duration is naturally a number, and `(round …)` / `(math/random)` /
   ordinary arithmetic routinely yield floats. A float is rounded to the nearest
@@ -167,6 +244,22 @@
   the in-repo copy is removed.
 - **The game-of-life example is a full TUI** — altscreen rendering with mouse
   support, built on the raw-mode/altscreen/mouse guard macros.
+- **Unified cooperative runtime.** All async — language promises/channels,
+  external I/O, timers, resource acquisition, and the debugger — now runs on a
+  single interpreter-owned cooperative scheduler through one structural native
+  ABI; the previous split scheduler and its thread-local suspension bridges are
+  gone. User-visible effects:
+  - **`(async/run)` is a transitive settle-barrier**, not a ready-drain: it now
+    waits for every transitively-spawned descendant that is parked on a
+    self-resolving wait (a real `async/sleep` timer or an in-flight external I/O
+    job) to finish before returning, instead of returning as soon as the ready
+    queue drains. It still does not deadlock on cycle-forming waits (a promise,
+    channel, or resource slot another task holds), so a rendezvous-blocked or
+    self-awaiting child releases the barrier rather than hanging it.
+  - **`apply`, `call-with-values`, and multi-list `map`** now compose with
+    async/channel operations — e.g. `(apply async/spawn …)`,
+    `(call-with-values … async/resolved)`, `(map channel/send …)` — instead of
+    raising an internal "requires runtime invocation" error.
 
 ### Performance
 
@@ -183,17 +276,6 @@
     async yields, and debug hooks still take the re-entry path.
 
 ### Fixed
-
-- **`sema build --output` is honored with `--target all`.** Previously the
-  flag was silently ignored and per-target files landed in the current
-  directory. A directory output now yields `<dir>/<stem>-<target>[.exe]`, a
-  file-ish output becomes the base name (`<base>-<target>[.exe]`), and every
-  target gets a distinct suffixed filename instead of overwriting one file.
-- **`sema build -o` creates missing parent directories** (`mkdir -p`
-  semantics) instead of erroring, treats an existing directory (or trailing
-  `/`) as "default filename inside this directory", expands a literal leading
-  `~` (shells don't tilde-expand after `--output=`), and refuses an output
-  path that resolves to the source file itself.
 
 - **Many more blocking natives are now scheduler-compatible under `async`.** A
   native that ran a blocking syscall on the cooperative VM thread would freeze
@@ -233,11 +315,12 @@
   values are: …" list out of the 400, and the temperature / effort-tools /
   effort-value backstops now **chain** through one bounded retry loop so a
   request tripping several at once recovers in a single turn.
-- **`stream/copy`, `stream/read`, and `stream/read-line` on `*stdin*` no longer
-  block the async scheduler.** Inside `async`, a blocking stdin read is now
-  offloaded to a worker (matching the file-backed path) instead of running
-  synchronously on the VM thread, so a `(stream/copy *stdin* out)` can't stall
-  cooperative scheduling while it waits on input.
+- **All `*stdin*` stream operations share one interruptible owner.** Finite
+  reads, line reads, `stream/read-all`, and `stream/copy` acquire FIFO ownership
+  and consume one bounded buffer on every native platform, so mixing them
+  cannot lose bytes already buffered by an earlier read. Runtime calls poll the
+  owner structurally, so waiting on an open stdin never blocks the VM or pins a
+  runtime worker; cancellation releases queued ownership promptly.
 - **Installed `sema web` builds now contain their browser runtime.** The
   crates.io package, GitHub release archives, shell installer, and Homebrew
   formula embed the WASM VM and JavaScript runtime and work offline. Version
@@ -319,11 +402,11 @@
     a concurrent op on the same handle.
   - File-backed `stream/*` offloads via a per-stream checkout; in-memory
     streams (`stream/from-string`, `stream/byte-buffer`, …) stay synchronous
-    everywhere — nothing to offload. A `stream/copy` between two file-backed
-    streams keeps its synchronous loop even in async context (avoiding a
-    two-resource checkout that could deadlock against a reverse copy) — a
-    narrow, documented exception; a copy with only one file-backed side
-    offloads normally.
+    everywhere — nothing to offload. A runtime `stream/copy` between two
+    file-backed streams fails promptly with guidance to copy in bounded chunks,
+    because safely offloading both ends requires ordered dual-resource
+    acquisition; a copy with only one file-backed side offloads normally. The
+    direct host ABI retains its bounded synchronous file-to-file loop.
   - `kv/*`'s disk flush (the whole-store rewrite behind `kv/set`/`kv/delete`)
     offloads too, but the call still doesn't resolve until the flush
     completes — the write-through durability contract (a crash right after

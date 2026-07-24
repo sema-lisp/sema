@@ -38,16 +38,28 @@ fn configure_installs_provider_and_writes_spans() {
     {
         let s = sema_otel::user_span("programmatic", sema_otel::SemaSpanKind::Internal, vec![]);
         s.set_str("sema.test", "configured");
-        // The JSONL sink is a *simple* exporter: it writes + flushes on span-end (drop),
-        // so the line is on disk immediately — no provider flush needed.
+        // Span-end enqueues to the off-thread JSONL writer, which write+flushes each line;
+        // the line therefore lands on disk asynchronously. Poll for it rather than racing
+        // the writer thread (the `configure` install returns no guard to shut down here).
         drop(s);
     }
 
     let mut contents = String::new();
-    std::fs::File::open(&path)
-        .expect("jsonl file should exist")
-        .read_to_string(&mut contents)
-        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        contents.clear();
+        if let Ok(mut f) = std::fs::File::open(&path) {
+            f.read_to_string(&mut contents).unwrap();
+            if contents.lines().any(|l| !l.trim().is_empty()) {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "span line never reached disk via the off-thread writer; got:\n{contents}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let _ = std::fs::remove_file(&path);
 
     let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();

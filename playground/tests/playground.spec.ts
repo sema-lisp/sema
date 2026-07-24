@@ -15,8 +15,8 @@ const EXAMPLE_NAMES = [
   'perlin-noise.sema',
   'game-of-life.sema',
   'ascii-art.sema',
-  // Concurrency examples — exercise the async scheduler + channels in WASM
-  // (where async/sleep is a no-op yield), stressing fan-out/pipeline/fan-in.
+  // Concurrency examples exercise the Promise-driven async scheduler and
+  // channels in WASM, stressing fan-out, pipelines, and fan-in.
   'channels.sema',
   'parallel-tasks.sema',
   'timeout.sema',
@@ -196,10 +196,9 @@ test('runs code with the bytecode VM', async ({ page }) => {
   expect(timing).toContain('bytecode VM');
 });
 
-test('async/sleep ordering works in WASM (virtual clock)', async ({ page }) => {
-  // Regression guard for the virtual clock: in WASM async/sleep has no real
-  // delay, but shorter sleeps must still wake before longer ones. Tasks are
-  // spawned c/a/b but sleep 30/10/20 — output must be a, b, c.
+test('async/sleep ordering works in the WASM promise runtime', async ({ page }) => {
+  // Tasks are spawned c/a/b but sleep 30/10/20ms, so the Promise scheduler
+  // must resume them in a, b, c order.
   const code = `(async/all
   (list (async (async/sleep 30) (println "c"))
         (async (async/sleep 10) (println "a"))
@@ -212,28 +211,126 @@ test('async/sleep ordering works in WASM (virtual clock)', async ({ page }) => {
   expect(lines).toEqual(['a', 'b', 'c']);
 });
 
-test('?no-worker forces the main-thread fallback (instant virtual-clock sleep)', async ({ page }) => {
-  // The worker path is the default under cross-origin isolation; ?no-worker
-  // opts out to the main-thread interpreter, where async/sleep is an instant
-  // no-op. A 2s sleep must therefore complete near-instantly (proving fallback).
+test('?no-worker forces the main-thread promise-runtime fallback', async ({ page }) => {
+  // The worker path is the default under cross-origin isolation. ?no-worker
+  // keeps evaluation on the main thread while retaining the Promise driver's
+  // real timer semantics.
   await page.goto('/?no-worker');
   await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
 
-  await setEditorCode(page, '(await (async (async/sleep 2000) 42))');
+  await setEditorCode(page, '(await (async (async/sleep 200) 42))');
   const t0 = Date.now();
   await page.getByTestId('run-btn').click();
   await page.waitForSelector('#output .output-timing', { timeout: 20000 });
   const elapsed = Date.now() - t0;
 
-  expect(elapsed).toBeLessThan(1000); // instant on the main-thread path (not real-slept)
+  expect(elapsed).toBeGreaterThanOrEqual(170);
   const value = await page.$eval('#output .output-value', (el) => el.textContent || '');
   expect(value).toContain('42');
 });
 
+test('default evaluation constructs the Sema Web Worker and sends init and eval messages', async ({ page }) => {
+  await page.addInitScript(() => {
+    const NativeWorker = globalThis.Worker;
+    const audit = { urls: [] as string[], messages: [] as string[] };
+    class AuditedWorker extends NativeWorker {
+      constructor(url: string | URL, options?: WorkerOptions) {
+        super(url, options);
+        audit.urls.push(String(url));
+      }
+
+      postMessage(message: unknown, transferOrOptions?: Transferable[] | StructuredSerializeOptions) {
+        const type = (message as { type?: unknown } | null)?.type;
+        audit.messages.push(String(type));
+        if (transferOrOptions === undefined) return super.postMessage(message);
+        return super.postMessage(message, transferOrOptions as Transferable[]);
+      }
+    }
+    Object.defineProperty(globalThis, 'Worker', { configurable: true, value: AuditedWorker });
+    Object.defineProperty(globalThis, '__workerAudit', { configurable: true, value: audit });
+  });
+
+  await page.goto('/');
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
+  await setEditorCode(page, '(+ 20 22)');
+  await clickRunAndWait(page);
+
+  const audit = await page.evaluate(() =>
+    (globalThis as unknown as { __workerAudit: { urls: string[]; messages: string[] } }).__workerAudit
+  );
+  expect(audit.urls.some((url) => url.endsWith('/dist/sema-worker.js'))).toBe(true);
+  expect(audit.messages).toEqual(expect.arrayContaining(['init', 'eval']));
+  await expect(page.getByTestId('output')).toContainText('=> 42');
+});
+
+test('worker initialization failure falls back to a usable main-thread runtime', async ({ page }) => {
+  const warnings: string[] = [];
+  page.on('console', (message) => {
+    if (message.type() === 'warning') warnings.push(message.text());
+  });
+  await page.addInitScript(() => {
+    class InitFailureWorker extends EventTarget {
+      postMessage(message: { type?: string }) {
+        if (message.type === 'init') {
+          queueMicrotask(() => this.dispatchEvent(new MessageEvent('message', {
+            data: { type: 'init_error', error: 'synthetic worker init failure' },
+          })));
+        }
+      }
+
+      terminate() {}
+    }
+    Object.defineProperty(globalThis, 'Worker', { configurable: true, value: InitFailureWorker });
+  });
+
+  await page.goto('/?worker-init-failure');
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 5000 });
+  expect(warnings.some((warning) => warning.includes('synthetic worker init failure'))).toBe(true);
+
+  await setEditorCode(page, '(+ 40 2)');
+  await clickRunAndWait(page);
+  await expect(page.getByTestId('output')).toContainText('=> 42');
+});
+
+test('worker crash rejects the run, restores the controls, and uses the fallback next time', async ({ page }) => {
+  await page.addInitScript(() => {
+    class EvalCrashWorker extends EventTarget {
+      postMessage(message: { type?: string }) {
+        if (message.type === 'init') {
+          queueMicrotask(() => this.dispatchEvent(new MessageEvent('message', {
+            data: { type: 'ready' },
+          })));
+        } else if (message.type === 'eval') {
+          queueMicrotask(() => this.dispatchEvent(new ErrorEvent('error', {
+            message: 'synthetic worker eval crash',
+          })));
+        }
+      }
+
+      terminate() {}
+    }
+    Object.defineProperty(globalThis, 'Worker', { configurable: true, value: EvalCrashWorker });
+  });
+
+  await page.goto('/?worker-eval-crash');
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 5000 });
+  await setEditorCode(page, '(+ 1 2)');
+  await page.getByTestId('run-btn').click();
+
+  await expect(page.getByTestId('status')).toHaveText('Error', { timeout: 5000 });
+  await expect(page.getByTestId('run-btn')).toContainText('Run');
+  await expect(page.getByTestId('output')).toContainText('synthetic worker eval crash');
+
+  await setEditorCode(page, '(+ 20 22)');
+  await clickRunAndWait(page);
+  await expect(page.getByTestId('output')).toContainText('=> 42');
+  await expect(page.getByTestId('status')).toHaveText('Ready');
+});
+
 test('worker path: async/sleep paces in real wall-clock while the UI stays responsive', async ({ page }) => {
-  // Opt into the worker eval path (?worker). Requires cross-origin isolation,
-  // which the dev server provides via serve.json (COOP/COEP).
-  await page.goto('/?worker');
+  // The worker eval path is the default under cross-origin isolation, which
+  // the dev server provides via COOP/COEP headers.
+  await page.goto('/');
   await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
 
   // The worker path must actually be active (cross-origin isolated + SAB),
@@ -243,9 +340,8 @@ test('worker path: async/sleep paces in real wall-clock while the UI stays respo
   );
   expect(isolated).toBe(true);
 
-  // Three concurrent sleeps (100/200/300ms) then a final print. On the worker
-  // these are REAL waits, so the run takes ~300ms wall-clock (vs instant on the
-  // main-thread virtual clock). Output is ordered by sleep duration.
+  // Three concurrent real sleeps (100/200/300ms) then a final print. Output is
+  // ordered by sleep duration.
   const code = `(async/all
   (list (async (async/sleep 300) (println "c"))
         (async (async/sleep 100) (println "a"))
@@ -326,10 +422,9 @@ test('worker path: a file written during eval shows up in the file tree (VFS mir
   expect(files.some((f) => f.includes('from-worker.txt'))).toBe(true);
 });
 
-test('worker path: http/get works via synchronous XHR (no replay)', async ({ page }) => {
-  // On the worker, http uses a blocking synchronous XHR instead of the
-  // main-thread replay-the-whole-program hack. Hit a same-origin file so the
-  // test is reliable (no network, no cross-origin CORP/COEP concerns).
+test('worker path: http/get uses the Promise driver without replay', async ({ page }) => {
+  // The worker Promise driver suspends the root around fetch and resumes it
+  // without replaying earlier effects. A same-origin file keeps this reliable.
   await page.goto('/?worker');
   await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
 
@@ -380,8 +475,8 @@ test('worker path: Stop cancels a running program and the worker survives', asyn
   await page.goto('/?worker');
   await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
 
-  // A long real sleep (5s) via the scheduler (async/await), so on the worker it
-  // actually blocks ~5s on Atomics.wait — giving us a window to cancel it.
+  // A long real sleep (5s) via the Promise scheduler gives us a window to
+  // cancel the root while the worker remains responsive to messages.
   await setEditorCode(page, '(await (async (async/sleep 5000) (println "should not print")))');
   await page.getByTestId('run-btn').click();
 

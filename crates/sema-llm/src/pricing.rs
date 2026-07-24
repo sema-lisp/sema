@@ -191,6 +191,26 @@ pub fn clear_custom_pricing() {
     CUSTOM_PRICING.with(|p| p.borrow_mut().clear());
 }
 
+/// Snapshot (clone) the current thread's custom-pricing overrides. Custom pricing is
+/// TASK-SNAPSHOT config: the LLM dynamic scope parks this map onto a suspended task so a
+/// sibling's `(llm/set-pricing ...)` cannot reprice work already in flight (see
+/// `builtins::LlmDynScope`). The map is small (per-call overrides), so a clone is cheap.
+pub(crate) fn snapshot_custom_pricing() -> HashMap<String, (f64, f64)> {
+    CUSTOM_PRICING.with(|p| p.borrow().clone())
+}
+
+/// Overwrite the current thread's custom-pricing overrides with `map`. The dynamic-scope
+/// swap uses this to reinstall a task's own pricing snapshot when it is scheduled back in.
+pub(crate) fn restore_custom_pricing(map: HashMap<String, (f64, f64)>) {
+    CUSTOM_PRICING.with(|p| *p.borrow_mut() = map);
+}
+
+/// True when no custom-pricing overrides are active on this thread (fast-path predicate
+/// for the LLM dynamic-scope empty check — no clone).
+pub(crate) fn custom_pricing_is_empty() -> bool {
+    CUSTOM_PRICING.with(|p| p.borrow().is_empty())
+}
+
 /// Returns the pricing source name and the snapshot's `updated_at` date.
 pub fn pricing_status() -> (&'static str, Option<String>) {
     ("embedded", Some(embedded().updated_at.clone()))

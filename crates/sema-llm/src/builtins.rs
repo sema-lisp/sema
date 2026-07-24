@@ -1,8 +1,9 @@
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 
+use sema_core::runtime::RuntimeTaskId;
 use sema_core::{
     resolve, Agent, Conversation, Env, EvalContext, ImageAttachment, Message, NativeFn, Prompt,
     Role, SemaError, Value, ValueView,
@@ -34,19 +35,19 @@ thread_local! {
     /// per-TASK slot (captured at task spawn, swapped in/out at each task step via the
     /// `sema_core` usage-scope seam — mirroring the otel context), so a sibling leaf
     /// running concurrently can't clobber an in-flight leaf's tally. A multi-round tool
-    /// loop SUMS every round's usage instead of seeing only the last. The async
-    /// completion path additionally captures this frame's `Rc` into its poller closure
-    /// so the fold lands even though the poller runs outside the task-step boundary.
+    /// loop sums every round's usage instead of seeing only the last. Runtime
+    /// completion paths capture this frame's `Rc` into their decoder so the fold
+    /// lands outside the task-step boundary.
     static ACTIVE_LEAF_SCOPE: RefCell<Option<Rc<RefCell<LeafUsage>>>> = const { RefCell::new(None) };
-    /// Set while an async completion's poller folds usage into a CAPTURED frame Rc.
-    /// Suppresses `track_usage`'s own active-frame fold so the async path counts each
+    /// Set while a runtime completion decoder folds usage into a captured frame `Rc`.
+    /// Suppresses `track_usage`'s own active-frame fold so the runtime path counts each
     /// completion exactly once.
     static USAGE_ACCUM_SUPPRESS: Cell<bool> = const { Cell::new(false) };
     static SESSION_COST: RefCell<f64> = const { RefCell::new(0.0) };
     /// The budget frame in force for the CURRENT TASK, held behind a shared `Rc` so
     /// that all concurrent tasks spawned inside one `llm/with-budget` charge ONE
     /// aggregate frame (captured by-`Rc` onto each task at spawn via the per-task LLM
-    /// dynamic-scope seam, and re-installed around the async completion poller's
+    /// dynamic-scope seam, and re-installed around the runtime completion decoder's
     /// `track_usage`). `None` when no budget is active.
     static ACTIVE_BUDGET: RefCell<Option<Rc<RefCell<BudgetFrame>>>> = const { RefCell::new(None) };
     /// When set (via `llm/with-budget {:on-stream :pre-gate}`), `llm/stream` checks the
@@ -181,8 +182,8 @@ impl Drop for UsageScope {
 }
 
 /// Open a per-leaf usage accumulation scope. `track_usage` folds each completion made
-/// while the returned guard is alive into this scope's frame; the async completion path
-/// captures the frame's `Rc` into its poller so an in-flight leaf is tallied even after
+/// while the returned guard is alive into this scope's frame; the runtime completion path
+/// captures the frame's `Rc` into its decoder so an in-flight leaf is tallied even after
 /// a sibling task runs. The guard restores the prior active scope on drop.
 pub fn open_usage_scope() -> UsageScope {
     let slot = Rc::new(RefCell::new(LeafUsage::default()));
@@ -190,8 +191,8 @@ pub fn open_usage_scope() -> UsageScope {
     UsageScope { slot, prev }
 }
 
-/// Clone the active (per-task) usage-accumulator frame's `Rc`, if any. The async
-/// completion path captures this at yield time so the poller folds usage into the
+/// Clone the active (per-task) usage-accumulator frame's `Rc`, if any. The runtime
+/// completion path captures this at dispatch so the decoder folds usage into the
 /// LEAF'S OWN frame — correct even across a concurrent sibling task.
 fn current_usage_accum() -> Option<Rc<RefCell<LeafUsage>>> {
     ACTIVE_LEAF_SCOPE.with(|s| s.borrow().clone())
@@ -224,6 +225,19 @@ fn install_usage_scope(ctx: Box<dyn std::any::Any>) -> Box<dyn std::any::Any> {
     Box::new(ACTIVE_LEAF_SCOPE.with(|s| std::mem::replace(&mut *s.borrow_mut(), incoming)))
 }
 
+/// Fast-path predicate (`TaskScopeSwap`, sema-vm `state.rs`): a captured usage
+/// scope is empty when no leaf-usage accumulator is active. No allocation.
+fn usage_scope_captured_is_empty(ctx: &Box<dyn std::any::Any>) -> bool {
+    ctx.downcast_ref::<Option<Rc<RefCell<LeafUsage>>>>()
+        .is_none_or(Option::is_none)
+}
+
+/// Peek (no mutation, no allocation) whether the thread-local active leaf-usage
+/// scope is currently empty.
+fn usage_scope_ambient_is_empty() -> bool {
+    ACTIVE_LEAF_SCOPE.with(|s| s.borrow().is_none())
+}
+
 /// Register the per-task usage-scope callbacks with sema-core. Called once at startup.
 pub fn register_usage_scope_task_callbacks() {
     sema_core::set_usage_scope_task_callbacks(
@@ -231,28 +245,97 @@ pub fn register_usage_scope_task_callbacks() {
         take_usage_scope,
         install_usage_scope,
     );
+    sema_core::set_usage_scope_empty_callbacks(
+        usage_scope_captured_is_empty,
+        usage_scope_ambient_is_empty,
+    );
 }
 
-// ── Per-task LLM dynamic scope (cache / budget / tags) — ASYNC-1 ─────
+// ── Per-task LLM dynamic scope (cache / budget / cassette / tags) ────
 //
-// `llm/with-cache`, `llm/with-budget`, and per-call `:tags`/`:metadata` set
-// dynamically-scoped thread-locals for the extent of a thunk, then reset them. A task
-// spawned inside that thunk reads them WHEN IT RUNS — which the cooperative scheduler
-// can defer past the reset. The scheduler captures this scope at `async/spawn` and
-// swaps it in/out at each task step (like the otel context and leaf-usage scope), so
-// concurrent siblings stay isolated. Read-only flags ride as a value snapshot; the
-// budget frame rides as a shared `Rc` so all siblings in one `with-budget` charge one
-// aggregate. Reached from `sema-core` through the type-erased fn-pointer seam.
+// Dynamic LLM builtins install thread-local state for the extent of a thunk. A spawned
+// task may run after that extent has unwound, so the scheduler captures the scope at
+// `async/spawn` and swaps it around every task step. Read-only flags ride as value
+// snapshots; budget and cassette state use shared `Rc`s so siblings in one scope charge
+// one aggregate or record into one tape. Reached from `sema-core` through the
+// type-erased fn-pointer seam.
+
+struct CassetteState {
+    cassette: RefCell<Option<crate::cassette::Cassette>>,
+}
+
+impl CassetteState {
+    fn new(cassette: crate::cassette::Cassette) -> Self {
+        Self {
+            cassette: RefCell::new(Some(cassette)),
+        }
+    }
+
+    fn borrow(&self) -> std::cell::Ref<'_, crate::cassette::Cassette> {
+        std::cell::Ref::map(self.cassette.borrow(), |cassette| {
+            cassette
+                .as_ref()
+                .expect("live cassette scope always owns its tape")
+        })
+    }
+
+    fn borrow_mut(&self) -> std::cell::RefMut<'_, crate::cassette::Cassette> {
+        std::cell::RefMut::map(self.cassette.borrow_mut(), |cassette| {
+            cassette
+                .as_mut()
+                .expect("live cassette scope always owns its tape")
+        })
+    }
+}
+
+impl Drop for CassetteState {
+    fn drop(&mut self) {
+        if let Some(cassette) = self.cassette.get_mut().as_mut() {
+            persist_cassette_off_quantum(cassette);
+        }
+    }
+}
+
+impl sema_core::McpCassetteRecordTarget for CassetteState {
+    fn record(&self, key: &str, value: &serde_json::Value) {
+        self.borrow_mut()
+            .record_entry(crate::cassette::TapeEntry::from_mcp_call(key, value));
+    }
+}
+
+type CassetteScope = Rc<CassetteState>;
 
 /// The dynamically-scoped LLM state captured onto a task and swapped in/out per step.
+#[derive(Clone)]
 struct LlmDynScope {
     cache_enabled: bool,
     cache_ttl_secs: i64,
     stream_budget_pregate: bool,
     call_tags: Vec<String>,
     call_meta: Vec<(String, String)>,
+    last_usage: Option<Usage>,
+    fallback_chain: Option<Vec<FallbackEntry>>,
+    rate_limit_rps: Option<f64>,
+    /// Siblings spawned inside one rate-limit scope reserve against one cursor.
+    rate_limit_last: Option<Rc<Cell<u64>>>,
+    retry_base_ms: u64,
+    network_max_retries: u32,
     /// The active budget frame, shared by `Rc` so concurrent siblings charge one aggregate.
     budget: Option<Rc<RefCell<BudgetFrame>>>,
+    /// Saved outer budget frames for nested `llm/with-budget` scopes (TASK-PRIVATE
+    /// bookkeeping). A push saves the frame in force; the matching pop restores it.
+    /// Parking this stack onto the task is what lets interleaved nested budget scopes
+    /// each restore their OWN outer frame — an ambient stack shared across suspensions
+    /// would pop a sibling's frame out of LIFO order. The saved frames are shared by
+    /// `Rc` (a restored outer frame is the same aggregate), but the stack structure is
+    /// per-task.
+    budget_stack: Vec<Option<Rc<RefCell<BudgetFrame>>>>,
+    /// Custom per-model pricing overrides (TASK-SNAPSHOT config). Parked onto the task so
+    /// a sibling's `(llm/set-pricing ...)` never reprices a suspended task's usage.
+    custom_pricing: std::collections::HashMap<String, (f64, f64)>,
+    /// The cassette selected by this scope. Spawned siblings share one tape so
+    /// replay and recording remain coherent across quantum boundaries.
+    cassette: Option<CassetteScope>,
 }
 
 impl Default for LlmDynScope {
@@ -263,7 +346,16 @@ impl Default for LlmDynScope {
             stream_budget_pregate: false,
             call_tags: Vec::new(),
             call_meta: Vec::new(),
+            last_usage: None,
+            fallback_chain: None,
+            rate_limit_rps: None,
+            rate_limit_last: None,
+            retry_base_ms: 500,
+            network_max_retries: 3,
             budget: None,
+            budget_stack: Vec::new(),
+            custom_pricing: std::collections::HashMap::new(),
+            cassette: None,
         }
     }
 }
@@ -276,7 +368,16 @@ fn read_llm_scope() -> LlmDynScope {
         stream_budget_pregate: STREAM_BUDGET_PREGATE.with(|c| c.get()),
         call_tags: CALL_TAGS.with(|t| t.borrow().clone()),
         call_meta: CALL_META.with(|m| m.borrow().clone()),
+        last_usage: LAST_USAGE.with(|u| u.borrow().clone()),
+        fallback_chain: FALLBACK_CHAIN.with(|c| c.borrow().clone()),
+        rate_limit_rps: RATE_LIMIT_RPS.with(|r| r.get()),
+        rate_limit_last: RATE_LIMIT_LAST.with(|last| last.borrow().clone()),
+        retry_base_ms: RETRY_BASE_MS.with(|base| base.get()),
+        network_max_retries: NETWORK_MAX_RETRIES.with(|retries| retries.get()),
         budget: ACTIVE_BUDGET.with(|b| b.borrow().clone()),
+        budget_stack: BUDGET_STACK.with(|s| s.borrow().clone()),
+        custom_pricing: pricing::snapshot_custom_pricing(),
+        cassette: CASSETTE.with(|c| c.borrow().clone()),
     }
 }
 
@@ -288,13 +389,31 @@ fn write_llm_scope(s: LlmDynScope) -> LlmDynScope {
     STREAM_BUDGET_PREGATE.with(|c| c.set(s.stream_budget_pregate));
     CALL_TAGS.with(|t| *t.borrow_mut() = s.call_tags);
     CALL_META.with(|m| *m.borrow_mut() = s.call_meta);
+    LAST_USAGE.with(|u| *u.borrow_mut() = s.last_usage);
+    FALLBACK_CHAIN.with(|c| *c.borrow_mut() = s.fallback_chain);
+    RATE_LIMIT_RPS.with(|r| r.set(s.rate_limit_rps));
+    RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = s.rate_limit_last);
+    RETRY_BASE_MS.with(|base| base.set(s.retry_base_ms));
+    NETWORK_MAX_RETRIES.with(|retries| retries.set(s.network_max_retries));
     ACTIVE_BUDGET.with(|b| *b.borrow_mut() = s.budget);
+    BUDGET_STACK.with(|stack| *stack.borrow_mut() = s.budget_stack);
+    pricing::restore_custom_pricing(s.custom_pricing);
+    CASSETTE.with(|c| *c.borrow_mut() = s.cassette);
     prev
 }
 
 /// Capture (clone) the LLM dynamic scope to seed onto a freshly-spawned task.
 fn capture_llm_scope() -> Box<dyn std::any::Any> {
-    Box::new(read_llm_scope())
+    let mut scope = read_llm_scope();
+    // `last-usage` describes the most recent request made by this task. A new
+    // task inherits dynamic configuration, but starts without request history.
+    scope.last_usage = None;
+    // The budget save-stack is TASK-PRIVATE lexical bookkeeping: a child inherits the
+    // ACTIVE budget frame (`budget`, shared by `Rc`, so a fan-out charges one aggregate)
+    // but starts its own nesting fresh — like `last_usage`, its own `with-budget` scopes
+    // push/pop against an empty stack.
+    scope.budget_stack = Vec::new();
+    Box::new(scope)
 }
 
 /// Take the LLM dynamic scope out of the thread-locals, leaving defaults.
@@ -311,9 +430,62 @@ fn install_llm_scope(ctx: Box<dyn std::any::Any>) -> Box<dyn std::any::Any> {
     Box::new(write_llm_scope(incoming))
 }
 
+/// Fast-path predicate (`TaskScopeSwap`, sema-vm `state.rs`): a captured LLM
+/// dynamic scope is empty when it carries no cache/budget/cassette/tag overrides — i.e.
+/// it is bytewise the same as [`LlmDynScope::default`]. No allocation (field
+/// reads only, no clone).
+fn llm_scope_captured_is_empty(ctx: &Box<dyn std::any::Any>) -> bool {
+    match ctx.downcast_ref::<LlmDynScope>() {
+        Some(s) => llm_dyn_scope_is_default(s),
+        None => true,
+    }
+}
+
+/// Peek (no mutation, no allocation) whether the thread-local LLM dynamic scope
+/// is currently at its default (no cache/budget/cassette/tag overrides active).
+fn llm_scope_ambient_is_empty() -> bool {
+    !CACHE_ENABLED.with(Cell::get)
+        && !ACTIVE_BUDGET.with(|b| b.borrow().is_some())
+        && BUDGET_STACK.with(|s| s.borrow().is_empty())
+        && pricing::custom_pricing_is_empty()
+        && CALL_TAGS.with(|t| t.borrow().is_empty())
+        && CALL_META.with(|m| m.borrow().is_empty())
+        && LAST_USAGE.with(|u| u.borrow().is_none())
+        && FALLBACK_CHAIN.with(|c| c.borrow().is_none())
+        && RATE_LIMIT_RPS.with(|r| r.get().is_none())
+        && RETRY_BASE_MS.with(|base| base.get() == 500)
+        && NETWORK_MAX_RETRIES.with(|retries| retries.get() == 3)
+        && CASSETTE.with(|c| c.borrow().is_none())
+}
+
+/// Shared field-by-field default check for [`LlmDynScope`] (avoids requiring
+/// `PartialEq`/cloning just to compare against `Default::default()`). Ignores
+/// `cache_ttl_secs`/`stream_budget_pregate` when the flags they gate are off —
+/// a stray `llm/set-cache-ttl` with caching disabled still counts as empty
+/// (correctness-safe: it means the fast path is skipped slightly less often,
+/// never more).
+fn llm_dyn_scope_is_default(s: &LlmDynScope) -> bool {
+    !s.cache_enabled
+        && s.budget.is_none()
+        && s.budget_stack.is_empty()
+        && s.custom_pricing.is_empty()
+        && s.cassette.is_none()
+        && s.call_tags.is_empty()
+        && s.call_meta.is_empty()
+        && s.last_usage.is_none()
+        && s.fallback_chain.is_none()
+        && s.rate_limit_rps.is_none()
+        && s.retry_base_ms == 500
+        && s.network_max_retries == 3
+}
+
 /// Register the per-task LLM dynamic-scope callbacks with sema-core. Called once at startup.
 pub fn register_llm_scope_task_callbacks() {
     sema_core::set_llm_scope_task_callbacks(capture_llm_scope, take_llm_scope, install_llm_scope);
+    sema_core::set_llm_scope_empty_callbacks(
+        llm_scope_captured_is_empty,
+        llm_scope_ambient_is_empty,
+    );
 }
 
 #[derive(Clone, Default)]
@@ -354,14 +526,14 @@ thread_local! {
     static CACHE_TTL_SECS: Cell<i64> = const { Cell::new(3600) };
     static CACHE_HITS: Cell<u64> = const { Cell::new(0) };
     static CACHE_MISSES: Cell<u64> = const { Cell::new(0) };
-    // Active LLM cassette (record/replay). Sits below the otel span + response
-    // cache, above the real provider — see crate::cassette.
-    static CASSETTE: RefCell<Option<crate::cassette::Cassette>> = const { RefCell::new(None) };
+    // Active LLM cassette (record/replay). The shared scope is captured onto
+    // spawned tasks with the rest of `LlmDynScope`.
+    static CASSETTE: RefCell<Option<CassetteScope>> = const { RefCell::new(None) };
     static FALLBACK_CHAIN: RefCell<Option<Vec<FallbackEntry>>> = const { RefCell::new(None) };
     static VECTOR_STORES: RefCell<std::collections::HashMap<String, VectorStore>> =
         RefCell::new(std::collections::HashMap::new());
     static RATE_LIMIT_RPS: Cell<Option<f64>> = const { Cell::new(None) };
-    static RATE_LIMIT_LAST: Cell<u64> = const { Cell::new(0) };
+    static RATE_LIMIT_LAST: RefCell<Option<Rc<Cell<u64>>>> = const { RefCell::new(None) };
     // Name of the provider that served the most recent `do_complete` response, so cost
     // tracking can price the model as served by that provider (resellers/gateways can list
     // the same model id at a different rate). Set at the dispatch choke points, consumed +
@@ -369,7 +541,184 @@ thread_local! {
     static LAST_SERVING_PROVIDER: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-// ── AwaitIo spike instrumentation ───────────────────────────────
+fn rate_limit_last_value() -> u64 {
+    RATE_LIMIT_LAST.with(|last| last.borrow().as_ref().map_or(0, |slot| slot.get()))
+}
+
+fn set_rate_limit_last_value(value: u64) {
+    RATE_LIMIT_LAST.with(|last| {
+        let mut last = last.borrow_mut();
+        if let Some(slot) = last.as_ref() {
+            slot.set(value);
+        } else {
+            *last = Some(Rc::new(Cell::new(value)));
+        }
+    });
+}
+
+fn current_cassette_scope() -> Option<CassetteScope> {
+    CASSETTE.with(|c| c.borrow().clone())
+}
+
+fn install_cassette_scope(scope: Option<CassetteScope>) -> Option<CassetteScope> {
+    CASSETTE.with(|c| std::mem::replace(&mut *c.borrow_mut(), scope))
+}
+
+fn cassette_scope(cassette: crate::cassette::Cassette) -> CassetteScope {
+    Rc::new(CassetteState::new(cassette))
+}
+
+/// Persist a cassette's pending entries OFF the runtime quantum. Renders the pending
+/// NDJSON on the VM thread (bounded), then appends on a blocking-tier worker when a
+/// quantum is active (best-effort, matching the tape's existing trust model — the
+/// durable record→replay path tears down after a suspended provider call, so it
+/// appends synchronously here off the quantum), or synchronously on the host thread
+/// otherwise.
+fn persist_cassette_off_quantum(cassette: &mut crate::cassette::Cassette) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if sema_core::in_runtime_quantum() {
+            if let Some((path, encoded)) = cassette.take_pending_append() {
+                sema_io::io_spawn_blocking(move || {
+                    let _ = crate::cassette::append_ndjson(&path, &encoded);
+                });
+            }
+            return;
+        }
+    }
+    let _ = cassette.save();
+}
+
+/// Install an already-loaded cassette into a fresh scope, disabling the response
+/// cache for its dynamic extent (a cache hit would short-circuit before the tape —
+/// see [`crate::cassette`]), and return the teardown that flushes the tape (off the
+/// quantum) and restores the prior cassette + cache state. Shared by both ABIs of
+/// `llm/with-cassette`.
+fn install_loaded_cassette(cassette: crate::cassette::Cassette) -> Box<dyn FnOnce()> {
+    let active = cassette_scope(cassette);
+    let prev_cassette = install_cassette_scope(Some(Rc::clone(&active)));
+    let prev_cache = CACHE_ENABLED.with(|c| c.replace(false));
+    Box::new(move || {
+        {
+            let mut guard = active.borrow_mut();
+            persist_cassette_off_quantum(&mut guard);
+        }
+        install_cassette_scope(prev_cassette);
+        CACHE_ENABLED.with(|c| c.set(prev_cache));
+    })
+}
+
+/// Parse `(llm/with-cassette "path" [{:mode :auto}] thunk)` → (path, mode, body thunk).
+fn parse_with_cassette_args(
+    args: &[Value],
+) -> Result<(std::path::PathBuf, crate::cassette::CassetteMode, Value), SemaError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(SemaError::arity("llm/with-cassette", "2 or 3", args.len()));
+    }
+    let path = args[0]
+        .as_str()
+        .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+    let (mode, body_fn) = if args.len() == 3 {
+        let opts = args[1]
+            .as_map_ref()
+            .ok_or_else(|| SemaError::type_error("map", args[1].type_name()))?;
+        let mode = get_opt_effort(opts, "mode")
+            .map(|s| crate::cassette::CassetteMode::parse(&s))
+            .unwrap_or(crate::cassette::CassetteMode::Auto);
+        (mode, args[2].clone())
+    } else {
+        (crate::cassette::CassetteMode::Auto, args[1].clone())
+    };
+    if body_fn.as_lambda_rc().is_none() && body_fn.as_native_fn_rc().is_none() {
+        return Err(SemaError::type_error("function", body_fn.type_name()));
+    }
+    Ok((std::path::PathBuf::from(path), mode, body_fn))
+}
+
+/// Parse `(llm/cassette-load "path" [{:mode :replay}])` → (path, mode).
+fn parse_cassette_load_args(
+    args: &[Value],
+) -> Result<(std::path::PathBuf, crate::cassette::CassetteMode), SemaError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(SemaError::arity("llm/cassette-load", "1 or 2", args.len()));
+    }
+    let path = args[0]
+        .as_str()
+        .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+    let mode = if args.len() == 2 {
+        let opts = args[1]
+            .as_map_ref()
+            .ok_or_else(|| SemaError::type_error("map", args[1].type_name()))?;
+        get_opt_effort(opts, "mode")
+            .map(|s| crate::cassette::CassetteMode::parse(&s))
+            .unwrap_or(crate::cassette::CassetteMode::Auto)
+    } else {
+        crate::cassette::CassetteMode::Auto
+    };
+    Ok((std::path::PathBuf::from(path), mode))
+}
+
+/// Runtime-ABI arm of `llm/with-cassette`: OFFLOAD the tape load off the quantum, then
+/// resume by installing the scope and calling the body under a scope-teardown guard.
+#[cfg(not(target_arch = "wasm32"))]
+fn with_cassette_runtime(args: &[Value]) -> sema_core::runtime::NativeResult {
+    let (path, mode, body_fn) = parse_with_cassette_args(args)?;
+    suspend_cassette_load(path, mode, CassetteLoadThen::WithBody(body_fn))
+}
+
+/// wasm has no cooperative-runtime External wait: load synchronously and call the body.
+#[cfg(target_arch = "wasm32")]
+fn with_cassette_runtime(args: &[Value]) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::{NativeCall, NativeOutcome};
+    let (path, mode, body_fn) = parse_with_cassette_args(args)?;
+    let cassette = crate::cassette::Cassette::load(path, mode);
+    let teardown = install_loaded_cassette(cassette);
+    Ok(NativeOutcome::Call(NativeCall {
+        callable: body_fn,
+        args: Vec::new(),
+        continuation: Box::new(ScopeGuardContinuation {
+            teardown: Some(teardown),
+        }),
+    }))
+}
+
+/// Runtime-ABI arm of `llm/cassette-load`: OFFLOAD the tape load off the quantum, then
+/// install it in the ambient scope.
+#[cfg(not(target_arch = "wasm32"))]
+fn cassette_load_runtime(args: &[Value]) -> sema_core::runtime::NativeResult {
+    let (path, mode) = parse_cassette_load_args(args)?;
+    suspend_cassette_load(path, mode, CassetteLoadThen::Install)
+}
+
+/// wasm has no cooperative-runtime External wait: load synchronously and install.
+#[cfg(target_arch = "wasm32")]
+fn cassette_load_runtime(args: &[Value]) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::NativeOutcome;
+    let (path, mode) = parse_cassette_load_args(args)?;
+    let cassette = crate::cassette::Cassette::load(path, mode);
+    install_cassette(cassette);
+    Ok(NativeOutcome::Return(Value::nil()))
+}
+
+fn cassette_decide(key: &str) -> Option<crate::cassette::Decision> {
+    let scope = current_cassette_scope()?;
+    let decision = scope.borrow().decide(key);
+    Some(decision)
+}
+
+fn cassette_record(entry: crate::cassette::TapeEntry) {
+    if let Some(scope) = current_cassette_scope() {
+        scope.borrow_mut().record_entry(entry);
+    }
+}
+
+fn cassette_scope_record(scope: &Option<CassetteScope>, entry: crate::cassette::TapeEntry) {
+    if let Some(scope) = scope {
+        scope.borrow_mut().record_entry(entry);
+    }
+}
+
+// ── I/O-overlap instrumentation ─────────────────────────────────
 //
 // Used only by the `llm/io-sleep-once` spike leaf (and its acceptance test) to
 // prove that N offloaded futures are in flight *simultaneously* on SHARED_RT,
@@ -400,6 +749,68 @@ pub fn reset_io_inflight() {
     IO_PEAK.store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// How many raw cache/cassette filesystem sites executed while a runtime quantum was
+/// active on the calling thread. Under the cooperative runtime this MUST stay 0 — the
+/// disk legs are offloaded onto the blocking tier (cache read/write, cassette
+/// load/save). The `debug_assert` in [`note_off_quantum_fs`] catches a regression in
+/// debug builds; this counter is the release-safe seam the tests read.
+static QUANTUM_FS_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Guard for every raw cache/cassette filesystem site: they MUST run OFF the
+/// cooperative runtime quantum (on a blocking-tier worker or the host thread). Fires
+/// a `debug_assert` and bumps [`QUANTUM_FS_CALLS`] if invoked while a quantum is
+/// active on this thread.
+pub(crate) fn note_off_quantum_fs(site: &str) {
+    let on_quantum = sema_core::in_runtime_quantum();
+    if on_quantum {
+        QUANTUM_FS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    debug_assert!(
+        !on_quantum,
+        "{site}: cache/cassette filesystem I/O ran on the runtime quantum"
+    );
+}
+
+/// Test seam: number of cache/cassette fs sites that ran on a quantum thread (must be
+/// 0). See [`note_off_quantum_fs`].
+#[doc(hidden)]
+pub fn quantum_fs_calls() -> u64 {
+    QUANTUM_FS_CALLS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reset the quantum-fs seam counter (test helper).
+#[doc(hidden)]
+pub fn reset_quantum_fs_calls() {
+    QUANTUM_FS_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// RAII gauge for one offloaded completion future: bumps `IO_INFLIGHT` + `IO_PEAK`
+/// on construction and decrements (clamped at 0) on drop, so an abort that drops
+/// the future before or during its first poll cannot strand the gauge at +1.
+/// External-wait paths use this to prove simultaneity
+/// (`io_peak_inflight() >= 2`).
+#[cfg(not(target_arch = "wasm32"))]
+struct InflightGuard;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl InflightGuard {
+    fn new() -> Self {
+        use std::sync::atomic::Ordering;
+        let prev = IO_INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+        IO_PEAK.fetch_max(prev, Ordering::SeqCst);
+        InflightGuard
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let _ =
+            IO_INFLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
+    }
+}
+
 fn set_serving_provider(name: &str) {
     LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = Some(name.to_string()));
 }
@@ -426,8 +837,8 @@ pub fn reset_runtime_state() {
     // Idempotently register the per-task usage-scope seam (fn-pointer thread-locals)
     // so the scheduler can swap the active leaf scope in/out per task step.
     register_usage_scope_task_callbacks();
-    // Idempotently register the per-task LLM dynamic-scope seam (cache/budget/tags) so
-    // the scheduler can swap it in/out per task step (ASYNC-1).
+    // Register the per-task LLM dynamic-scope seam so the scheduler can swap
+    // cache, budget, cassette, and call metadata in/out per task step.
     register_llm_scope_task_callbacks();
     SESSION_COST.with(|c| *c.borrow_mut() = 0.0);
     ACTIVE_BUDGET.with(|b| *b.borrow_mut() = None);
@@ -443,8 +854,8 @@ pub fn reset_runtime_state() {
     FALLBACK_CHAIN.with(|c| *c.borrow_mut() = None);
     VECTOR_STORES.with(|s| s.borrow_mut().clear());
     RATE_LIMIT_RPS.with(|r| r.set(None));
-    RATE_LIMIT_LAST.with(|r| r.set(0));
-    CASSETTE.with(|c| *c.borrow_mut() = None);
+    RATE_LIMIT_LAST.with(|r| *r.borrow_mut() = None);
+    install_cassette_scope(None);
     LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = None);
     RETRY_BASE_MS.with(|c| c.set(500));
     NETWORK_MAX_RETRIES.with(|c| c.set(3));
@@ -454,46 +865,47 @@ pub fn reset_runtime_state() {
 }
 
 // ── MCP-call cassette bridge ─────────────────────────────────
-// The LLM cassette (thread-local `CASSETTE`) also serves MCP `tools/call`
-// interactions so agent-over-MCP flows replay deterministically. These fns are
-// registered into `sema-core` (fn pointers) so `sema-mcp` can consult the tape
-// without depending on `sema-llm`.
+// The task-scoped LLM cassette also serves MCP `tools/call` interactions. The
+// hook returns a recorder capability that retains the selected tape across an
+// asynchronous call, without introducing a sema-mcp → sema-llm dependency.
 
-fn mcp_cassette_decide(key: &str) -> sema_core::McpCassetteDecision {
+fn mcp_cassette_decide(key: &str) -> Option<sema_core::McpCassetteDecision> {
     use crate::cassette::Decision;
-    CASSETTE.with(|c| match c.borrow().as_ref() {
-        // No active cassette → behave as passthrough (real call, no recording).
-        None => sema_core::McpCassetteDecision::Record,
-        Some(cass) => match cass.decide(key) {
-            Decision::Replay(entry) => match entry.mcp_result {
-                Some(value) => sema_core::McpCassetteDecision::Replay(value),
-                // Present under this key but not an mcp-call entry — treat as drift.
-                None => sema_core::McpCassetteDecision::Miss,
-            },
-            Decision::Miss(_) => sema_core::McpCassetteDecision::Miss,
-            Decision::Record => sema_core::McpCassetteDecision::Record,
+    let scope = current_cassette_scope()?;
+    let decision = scope.borrow().decide(key);
+    Some(match decision {
+        Decision::Replay(entry) => match entry.mcp_result {
+            Some(value) => sema_core::McpCassetteDecision::Replay(value),
+            // Present under this key but not an mcp-call entry — treat as drift.
+            None => sema_core::McpCassetteDecision::Miss,
         },
+        Decision::Miss(_) => sema_core::McpCassetteDecision::Miss,
+        Decision::Record => sema_core::McpCassetteDecision::Record(
+            sema_core::McpCassetteRecorder::new(scope, key.to_string()),
+        ),
     })
 }
 
-fn mcp_cassette_record(key: &str, value: &serde_json::Value) {
-    CASSETTE.with(|c| {
-        if let Some(cass) = c.borrow_mut().as_mut() {
-            cass.record_entry(crate::cassette::TapeEntry::from_mcp_call(key, value));
-        }
-    });
-}
-
-/// Install a cassette on the current thread (programmatic/test entry point;
-/// the env path `SEMA_LLM_CASSETTE` uses the same thread-local).
+/// Install a cassette in the current ambient LLM scope. Tasks spawned afterward
+/// inherit it; the `SEMA_LLM_CASSETTE` path uses the same baseline.
 pub fn install_cassette(cassette: crate::cassette::Cassette) {
-    CASSETTE.with(|c| *c.borrow_mut() = Some(cassette));
+    install_cassette_scope(Some(cassette_scope(cassette)));
 }
 
-/// Remove and return the active cassette (e.g. to flush it to disk after
-/// recording).
+/// Remove the cassette from the current ambient scope and return an owned
+/// snapshot. Already-spawned tasks retain their shared scope and flush any later
+/// recordings when its final owner is dropped.
 pub fn take_cassette() -> Option<crate::cassette::Cassette> {
-    CASSETTE.with(|c| c.borrow_mut().take())
+    let scope = install_cassette_scope(None)?;
+    match Rc::try_unwrap(scope) {
+        Ok(mut state) => state.cassette.get_mut().take(),
+        Err(scope) => {
+            let mut active = scope.borrow_mut();
+            persist_cassette_off_quantum(&mut active);
+            let cassette = active.clone();
+            Some(cassette)
+        }
+    }
 }
 
 /// Test-only: register `provider` as the default LLM provider, bypassing
@@ -524,6 +936,479 @@ fn register_fn_ctx(
     env.set(
         sema_core::intern(name),
         Value::native_fn(NativeFn::with_ctx(name, f)),
+    );
+}
+
+/// Register a dual-ABI native whose body speaks the runtime native ABI
+/// (`NativeResult`) so its `in_runtime_quantum` branch can return a
+/// `NativeOutcome::Suspend`/`Call` directly (an external-wait offload or a
+/// cooperative tool round). The runtime callback uses the exact evaluator
+/// context carried by its [`sema_core::runtime::NativeCallContext`]. The plain
+/// value callback runs the same body with its evaluator context and unwraps the
+/// `Return` produced outside a runtime quantum.
+///
+/// True when a provider call must offload so the interpreter thread never
+/// blocks. Root-main and addressable spawned tasks are both suspendable runtime
+/// work; `current_task_id()` distinguishes cancellation handles, not whether a
+/// quantum may park.
+#[cfg(not(target_arch = "wasm32"))]
+fn in_runtime_offload_context() -> bool {
+    sema_core::in_runtime_quantum()
+}
+
+fn register_runtime_fn_ctx(
+    env: &Env,
+    name: &str,
+    f: impl Fn(&EvalContext, &[Value]) -> sema_core::runtime::NativeResult + 'static,
+) {
+    use sema_core::runtime::NativeOutcome;
+    let f = std::rc::Rc::new(f);
+    let for_func = f.clone();
+    let for_runtime = f;
+    let err_name = name.to_string();
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(NativeFn::with_ctx_runtime(
+            name,
+            move |ctx, args| match for_func(ctx, args)? {
+                NativeOutcome::Return(value) => Ok(value),
+                _ => Err(SemaError::eval(format!(
+                    "{err_name}: native suspended outside the cooperative runtime"
+                ))),
+            },
+            move |native_ctx, args| for_runtime(native_ctx.eval_context, args),
+        )),
+    );
+}
+
+/// Like [`register_runtime_fn_ctx`], but capability-gated and value-args (no
+/// `EvalContext` in the body). The gate runs on BOTH ABI callbacks so a sandboxed
+/// caller sees the same `PermissionDenied` whether the native is reached through
+/// its plain value callback or its runtime callback.
+fn register_runtime_fn_gated(
+    env: &Env,
+    sandbox: &sema_core::Sandbox,
+    cap: sema_core::Caps,
+    name: &str,
+    f: impl Fn(&[Value]) -> sema_core::runtime::NativeResult + 'static,
+) {
+    use sema_core::runtime::NativeOutcome;
+    type RuntimeFnBody = dyn Fn(&[Value]) -> sema_core::runtime::NativeResult;
+    let body: std::rc::Rc<RuntimeFnBody> = if sandbox.is_unrestricted() {
+        std::rc::Rc::new(f)
+    } else {
+        let sandbox = sandbox.clone();
+        let fn_name = name.to_string();
+        std::rc::Rc::new(move |args: &[Value]| {
+            sandbox.check(cap, &fn_name)?;
+            f(args)
+        })
+    };
+    let for_func = body.clone();
+    let for_runtime = body;
+    let err_name = name.to_string();
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(NativeFn::simple_with_runtime(
+            name,
+            move |args| match for_func(args)? {
+                NativeOutcome::Return(value) => Ok(value),
+                _ => Err(SemaError::eval(format!(
+                    "{err_name}: native suspended outside the cooperative runtime"
+                ))),
+            },
+            move |_native_ctx, args| for_runtime(args),
+        )),
+    );
+}
+
+#[derive(Clone, Copy)]
+enum ConversationCallbackKind {
+    Filter,
+    Map,
+    MapRole,
+    Find,
+}
+
+impl ConversationCallbackKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Filter => "conversation/filter",
+            Self::Map => "conversation/map",
+            Self::MapRole => "conversation/map-role",
+            Self::Find => "conversation/find",
+        }
+    }
+
+    fn arity(self) -> usize {
+        match self {
+            Self::MapRole => 3,
+            Self::Filter | Self::Map | Self::Find => 2,
+        }
+    }
+}
+
+enum ConversationCallbackOperation {
+    Filter,
+    Map,
+    MapRole(Role),
+    Find,
+}
+
+struct ConversationCallbackPlan {
+    conversation: Rc<Conversation>,
+    callback: Value,
+    operation: ConversationCallbackOperation,
+}
+
+fn prepare_conversation_callback(
+    kind: ConversationCallbackKind,
+    args: &[Value],
+) -> Result<ConversationCallbackPlan, SemaError> {
+    let expected = kind.arity();
+    if args.len() != expected {
+        return Err(SemaError::arity(
+            kind.name(),
+            expected.to_string(),
+            args.len(),
+        ));
+    }
+    let conversation = args[0]
+        .as_conversation_rc()
+        .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
+    let (callback, operation) = match kind {
+        ConversationCallbackKind::Filter => {
+            (args[1].clone(), ConversationCallbackOperation::Filter)
+        }
+        ConversationCallbackKind::Map => (args[1].clone(), ConversationCallbackOperation::Map),
+        ConversationCallbackKind::MapRole => (
+            args[2].clone(),
+            ConversationCallbackOperation::MapRole(parse_role(&args[1], kind.name())?),
+        ),
+        ConversationCallbackKind::Find => (args[1].clone(), ConversationCallbackOperation::Find),
+    };
+    Ok(ConversationCallbackPlan {
+        conversation,
+        callback,
+        operation,
+    })
+}
+
+fn run_conversation_callback_sync(
+    ctx: &EvalContext,
+    plan: ConversationCallbackPlan,
+) -> Result<Value, SemaError> {
+    match plan.operation {
+        ConversationCallbackOperation::Filter => {
+            let mut messages = Vec::new();
+            for message in &plan.conversation.messages {
+                let result = sema_core::call_callback(
+                    ctx,
+                    &plan.callback,
+                    &[Value::message(message.clone())],
+                )?;
+                if result.is_truthy() {
+                    messages.push(message.clone());
+                }
+            }
+            Ok(conversation_with_messages(&plan.conversation, messages))
+        }
+        ConversationCallbackOperation::Map => {
+            let mut results = Vec::with_capacity(plan.conversation.messages.len());
+            for message in &plan.conversation.messages {
+                results.push(sema_core::call_callback(
+                    ctx,
+                    &plan.callback,
+                    &[Value::message(message.clone())],
+                )?);
+            }
+            Ok(Value::list(results))
+        }
+        ConversationCallbackOperation::MapRole(role) => {
+            let mut messages = Vec::with_capacity(plan.conversation.messages.len());
+            for message in &plan.conversation.messages {
+                if message.role == role {
+                    let result = sema_core::call_callback(
+                        ctx,
+                        &plan.callback,
+                        &[Value::message(message.clone())],
+                    )?;
+                    let transformed = result
+                        .as_message_rc()
+                        .ok_or_else(|| SemaError::type_error("message", result.type_name()))?;
+                    messages.push((*transformed).clone());
+                } else {
+                    messages.push(message.clone());
+                }
+            }
+            Ok(conversation_with_messages(&plan.conversation, messages))
+        }
+        ConversationCallbackOperation::Find => {
+            for message in &plan.conversation.messages {
+                let argument = Value::message(message.clone());
+                if sema_core::call_callback(ctx, &plan.callback, std::slice::from_ref(&argument))?
+                    .is_truthy()
+                {
+                    return Ok(argument);
+                }
+            }
+            Ok(Value::nil())
+        }
+    }
+}
+
+fn conversation_with_messages(conversation: &Conversation, messages: Vec<Message>) -> Value {
+    Value::conversation(Conversation {
+        messages,
+        model: conversation.model.clone(),
+        metadata: conversation.metadata.clone(),
+    })
+}
+
+fn register_conversation_callback_fn(env: &Env, kind: ConversationCallbackKind) {
+    let name = kind.name();
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(NativeFn::with_ctx_runtime(
+            name,
+            move |ctx, args| {
+                run_conversation_callback_sync(ctx, prepare_conversation_callback(kind, args)?)
+            },
+            move |_native_ctx, args| {
+                ConversationCallbackDriver::start(prepare_conversation_callback(kind, args)?)
+            },
+        )),
+    );
+}
+
+struct ConversationCallbackDriver {
+    plan: ConversationCallbackPlan,
+    next_message: usize,
+    active_message: Option<usize>,
+    active_argument: Option<Value>,
+    values: Vec<Value>,
+    messages: Vec<Message>,
+}
+
+impl sema_core::runtime::Trace for ConversationCallbackDriver {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        sink(sema_core::cycle::GcEdge::Value(&self.plan.callback));
+        if let Some(argument) = &self.active_argument {
+            sink(sema_core::cycle::GcEdge::Value(argument));
+        }
+        for value in &self.values {
+            sink(sema_core::cycle::GcEdge::Value(value));
+        }
+        true
+    }
+}
+
+impl ConversationCallbackDriver {
+    fn start(plan: ConversationCallbackPlan) -> sema_core::runtime::NativeResult {
+        Box::new(Self {
+            plan,
+            next_message: 0,
+            active_message: None,
+            active_argument: None,
+            values: Vec::new(),
+            messages: Vec::new(),
+        })
+        .advance()
+    }
+
+    fn advance(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome};
+
+        while let Some(message) = self.plan.conversation.messages.get(self.next_message) {
+            let index = self.next_message;
+            self.next_message += 1;
+            if let ConversationCallbackOperation::MapRole(role) = &self.plan.operation {
+                if message.role != *role {
+                    self.messages.push(message.clone());
+                    continue;
+                }
+            }
+            self.active_message = Some(index);
+            let argument = Value::message(message.clone());
+            self.active_argument = Some(argument.clone());
+            return Ok(NativeOutcome::Call(NativeCall {
+                callable: self.plan.callback.clone(),
+                args: vec![argument],
+                continuation: self,
+            }));
+        }
+
+        let Self {
+            plan,
+            values,
+            messages,
+            ..
+        } = *self;
+        let value = match plan.operation {
+            ConversationCallbackOperation::Filter | ConversationCallbackOperation::MapRole(_) => {
+                conversation_with_messages(&plan.conversation, messages)
+            }
+            ConversationCallbackOperation::Map => Value::list(values),
+            ConversationCallbackOperation::Find => Value::nil(),
+        };
+        Ok(NativeOutcome::Return(value))
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for ConversationCallbackDriver {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeOutcome, ResumeInput};
+
+        let Some((index, argument)) = self.active_message.take().zip(self.active_argument.take())
+        else {
+            return Err(SemaError::eval(format!(
+                "{} callback resumed without an active message",
+                self.plan.operation.name()
+            )));
+        };
+        match input {
+            ResumeInput::Returned(value) => match &self.plan.operation {
+                ConversationCallbackOperation::Filter => {
+                    if value.is_truthy() {
+                        self.messages
+                            .push(self.plan.conversation.messages[index].clone());
+                    }
+                    self.advance()
+                }
+                ConversationCallbackOperation::Map => {
+                    self.values.push(value);
+                    self.advance()
+                }
+                ConversationCallbackOperation::MapRole(_) => {
+                    let transformed = value
+                        .as_message_rc()
+                        .ok_or_else(|| SemaError::type_error("message", value.type_name()))?;
+                    self.messages.push((*transformed).clone());
+                    self.advance()
+                }
+                ConversationCallbackOperation::Find => {
+                    if value.is_truthy() {
+                        Ok(NativeOutcome::Return(argument))
+                    } else {
+                        self.advance()
+                    }
+                }
+            },
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "{} callback was cancelled ({reason:?})",
+                self.plan.operation.name()
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(format!(
+                "{} callback received an unexpected runtime response",
+                self.plan.operation.name()
+            ))),
+        }
+    }
+}
+
+impl ConversationCallbackOperation {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Filter => ConversationCallbackKind::Filter.name(),
+            Self::Map => ConversationCallbackKind::Map.name(),
+            Self::MapRole(_) => ConversationCallbackKind::MapRole.name(),
+            Self::Find => ConversationCallbackKind::Find.name(),
+        }
+    }
+}
+
+/// Cooperative teardown for an `llm/with-*` dynamic-scope wrapper. The wrapper's
+/// setup installs the scope's thread-local state and hands this continuation a
+/// `teardown` closure that restores the prior state; the runtime drives the
+/// wrapped thunk as a `NativeOutcome::Call` (so an async op inside it parks on the
+/// active task instead of hitting the runtime-only error stub) and resumes this
+/// continuation with the thunk's result. Teardown runs on return, failure, AND
+/// cancellation, then the original outcome is propagated so an enclosing
+/// try/catch sees the same value/error as the synchronous path. The teardown
+/// closure captures only non-`Value` scope state (bools/ints/`Rc<BudgetFrame>`/
+/// provider names), so there are no GC edges to trace.
+struct ScopeGuardContinuation {
+    teardown: Option<Box<dyn FnOnce()>>,
+}
+
+impl sema_core::runtime::Trace for ScopeGuardContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for ScopeGuardContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeOutcome, ResumeInput};
+        if let Some(teardown) = self.teardown.take() {
+            teardown();
+        }
+        match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "llm/with-* thunk was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "llm/with-* teardown received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// Register an `llm/with-*` dynamic-scope wrapper as a dual-ABI native. `setup`
+/// validates the args, installs the scope's thread-local state, and returns the
+/// body thunk plus a teardown closure that restores the prior state.
+///
+/// Under the unified runtime the body runs as a cooperative
+/// `NativeOutcome::Call`, so an async op inside the thunk (`async/spawn`,
+/// `channel/*`, …) parks on the active task and works — where a synchronous
+/// `call_callback` re-entry would suspend the runtime quantum and hit the
+/// runtime-only error stub. Teardown runs when the thunk RETURNS (matching the
+/// synchronous `call_callback` extent): a thunk that only builds a promise tears down
+/// immediately; a thunk that itself awaits keeps the scope installed across the
+/// await (the thread-local is not per-task-swapped mid-quantum). Outside a runtime
+/// quantum the plain value callback runs the thunk synchronously and tears down
+/// inline.
+fn register_scope_fn_ctx(
+    env: &Env,
+    name: &'static str,
+    setup: impl Fn(&[Value]) -> Result<(Value, Box<dyn FnOnce()>), SemaError> + 'static,
+) {
+    use sema_core::runtime::{NativeCall, NativeOutcome};
+    let setup = std::rc::Rc::new(setup);
+    let for_func = setup.clone();
+    let for_runtime = setup;
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(NativeFn::with_ctx_runtime(
+            name,
+            move |ctx, args| {
+                let (body_fn, teardown) = for_func(args)?;
+                let result = sema_core::call_callback(ctx, &body_fn, &[]);
+                teardown();
+                result
+            },
+            move |_native_ctx, args| {
+                let (body_fn, teardown) = for_runtime(args)?;
+                Ok(NativeOutcome::Call(NativeCall {
+                    callable: body_fn,
+                    args: Vec::new(),
+                    continuation: Box::new(ScopeGuardContinuation {
+                        teardown: Some(teardown),
+                    }),
+                }))
+            },
+        )),
     );
 }
 
@@ -611,7 +1496,7 @@ fn track_usage(usage: &Usage) -> Result<(), SemaError> {
     LAST_USAGE.with(|u| *u.borrow_mut() = Some(usage.clone()));
     // Fold into the active per-task leaf accumulator for the workflow runtime. SUMS
     // every round of a multi-round tool loop; cache hits (all-zero) don't bump `calls`.
-    // The async poller captures the leaf's own frame Rc and folds there instead, so it
+    // The runtime decoder captures the leaf's own frame Rc and folds there instead, so it
     // sets USAGE_ACCUM_SUPPRESS to keep this fold from double-counting.
     if !USAGE_ACCUM_SUPPRESS.with(|s| s.get()) {
         if let Some(slot) = current_usage_accum() {
@@ -654,7 +1539,7 @@ fn track_usage(usage: &Usage) -> Result<(), SemaError> {
 }
 
 /// Clone the active (per-task) budget frame's `Rc`, if any. The sync path charges
-/// this via `track_usage`; the async completion poller captures it at yield time and
+/// this via `track_usage`; the runtime completion decoder captures it at dispatch and
 /// re-installs it around its own `track_usage` so the charge lands on the frame that
 /// was active when the completion was DISPATCHED, not whatever is active when the
 /// future resolves.
@@ -674,7 +1559,7 @@ fn ensure_active_budget() -> Rc<RefCell<BudgetFrame>> {
 
 /// Charge `total_tokens` / `cost` into `frame` and return `Err` if either limit is now
 /// exceeded. Cost is charged only when known (`Some`); the token charge always applies.
-/// Shared by the sync path and the async poller so both gate identically.
+/// Shared by synchronous and runtime completion paths so both gate identically.
 fn charge_budget_frame(
     frame: &Rc<RefCell<BudgetFrame>>,
     total_tokens: u64,
@@ -987,6 +1872,16 @@ struct LispProvider {
     default_model: String,
 }
 
+fn lisp_provider_complete_callback(name: &str) -> Result<Value, LlmError> {
+    LISP_PROVIDERS.with(|providers| {
+        providers
+            .borrow()
+            .get(name)
+            .map(|callbacks| callbacks.complete_fn.clone())
+            .ok_or_else(|| LlmError::Config(format!("lisp provider '{name}' callbacks not found")))
+    })
+}
+
 impl LlmProvider for LispProvider {
     fn name(&self) -> &str {
         &self.name
@@ -996,32 +1891,30 @@ impl LlmProvider for LispProvider {
         &self.default_model
     }
 
+    // A Lisp provider's `:complete` closure runs on the VM thread via the
+    // callback context, so it must never be offloaded to a pool worker.
+    fn runs_on_vm_thread(&self) -> bool {
+        true
+    }
+
     fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
-        let name = self.name.clone();
-        LISP_PROVIDERS.with(|providers| {
-            let providers = providers.borrow();
-            let callbacks = providers.get(&name).ok_or_else(|| {
-                LlmError::Config(format!("lisp provider '{}' callbacks not found", name))
-            })?;
-            let complete_fn = callbacks.complete_fn.clone();
+        let complete_fn = lisp_provider_complete_callback(&self.name)?;
+        let request_map = chat_request_to_value(&request);
 
-            let request_map = chat_request_to_value(&request);
+        // The LlmProvider trait gives us no caller ctx, so invoke the user's
+        // `:complete` function on the shared stdlib context, which carries the
+        // registered evaluator callback (same path stdlib HOFs use).
+        let result = sema_core::with_stdlib_ctx(|ctx| {
+            sema_core::call_callback(ctx, &complete_fn, &[request_map])
+        });
 
-            // The LlmProvider trait gives us no caller ctx, so invoke the user's
-            // `:complete` function on the shared stdlib context, which carries the
-            // registered evaluator callback (same path stdlib HOFs use).
-            let result = sema_core::with_stdlib_ctx(|ctx| {
-                sema_core::call_callback(ctx, &complete_fn, &[request_map])
-            });
-
-            match result {
-                Ok(response_val) => parse_lisp_provider_response(&response_val, &request.model),
-                Err(e) => Err(LlmError::Api {
-                    status: 0,
-                    message: e.to_string(),
-                }),
-            }
-        })
+        match result {
+            Ok(response_val) => parse_lisp_provider_response(&response_val, &request.model),
+            Err(e) => Err(LlmError::Api {
+                status: 0,
+                message: e.to_string(),
+            }),
+        }
     }
 }
 
@@ -1093,7 +1986,10 @@ fn parse_lisp_provider_response(val: &Value, model: &str) -> Result<ChatResponse
             role: "assistant".to_string(),
             model: model.to_string(),
             tool_calls: vec![],
-            usage: Usage::default(),
+            usage: Usage {
+                model: model.to_string(),
+                ..Usage::default()
+            },
             stop_reason: Some("end_turn".to_string()),
         }),
         ValueView::Map(map) => {
@@ -1207,45 +2103,7 @@ fn parse_lisp_provider_response(val: &Value, model: &str) -> Result<ChatResponse
     }
 }
 
-fn register_fn_gated(
-    env: &Env,
-    sandbox: &sema_core::Sandbox,
-    cap: sema_core::Caps,
-    name: &str,
-    f: impl Fn(&[Value]) -> Result<Value, SemaError> + 'static,
-) {
-    if sandbox.is_unrestricted() {
-        register_fn(env, name, f);
-    } else {
-        let sandbox = sandbox.clone();
-        let fn_name = name.to_string();
-        register_fn(env, name, move |args| {
-            sandbox.check(cap, &fn_name)?;
-            f(args)
-        });
-    }
-}
-
-fn register_fn_ctx_gated(
-    env: &Env,
-    sandbox: &sema_core::Sandbox,
-    cap: sema_core::Caps,
-    name: &str,
-    f: impl Fn(&sema_core::EvalContext, &[Value]) -> Result<Value, SemaError> + 'static,
-) {
-    if sandbox.is_unrestricted() {
-        register_fn_ctx(env, name, f);
-    } else {
-        let sandbox = sandbox.clone();
-        let fn_name = name.to_string();
-        register_fn_ctx(env, name, move |ctx, args| {
-            sandbox.check(cap, &fn_name)?;
-            f(ctx, args)
-        });
-    }
-}
-
-/// Like [`register_fn_ctx_gated`], but binds the native under a different ENV SYMBOL
+/// Bind a capability-gated context native under a different ENV SYMBOL
 /// (`reg_name`) than the name used for the capability-check error / `NativeFn`
 /// display (`display_name`). Used to split a Sema-visible entry point (e.g.
 /// `llm/chat`) into several internal native entry points (a blocking twin, an
@@ -1277,6 +2135,56 @@ fn register_fn_ctx_gated_as(
             })),
         );
     }
+}
+
+/// Runtime-ABI sibling of [`register_fn_ctx_gated_as`]: registers under
+/// `reg_name` a dual-ABI native whose body speaks `NativeResult` (so its
+/// `in_runtime_quantum` branch can `NativeOutcome::Suspend`), gated as
+/// `display_name`. The runtime callback receives the invoking runtime's exact
+/// evaluator context (as [`register_runtime_fn_ctx`] does); the plain value
+/// callback runs the same body with its evaluator context and unwraps the
+/// `Return`.
+fn register_runtime_fn_ctx_gated_as(
+    env: &Env,
+    sandbox: &sema_core::Sandbox,
+    cap: sema_core::Caps,
+    reg_name: &str,
+    display_name: &str,
+    f: impl Fn(&EvalContext, &[Value]) -> sema_core::runtime::NativeResult + 'static,
+) {
+    use sema_core::runtime::NativeOutcome;
+    let f = std::rc::Rc::new(f);
+    let for_func = f.clone();
+    let for_runtime = f;
+    let err_name = display_name.to_string();
+    let unrestricted = sandbox.is_unrestricted();
+    let sandbox_func = sandbox.clone();
+    let sandbox_runtime = sandbox.clone();
+    let gate_name_func = display_name.to_string();
+    let gate_name_runtime = display_name.to_string();
+    env.set(
+        sema_core::intern(reg_name),
+        Value::native_fn(NativeFn::with_ctx_runtime(
+            display_name,
+            move |ctx, args| {
+                if !unrestricted {
+                    sandbox_func.check(cap, &gate_name_func)?;
+                }
+                match for_func(ctx, args)? {
+                    NativeOutcome::Return(value) => Ok(value),
+                    _ => Err(SemaError::eval(format!(
+                        "{err_name}: native suspended outside the cooperative runtime"
+                    ))),
+                }
+            },
+            move |native_ctx, args| {
+                if !unrestricted {
+                    sandbox_runtime.check(cap, &gate_name_runtime)?;
+                }
+                for_runtime(native_ctx.eval_context, args)
+            },
+        )),
+    );
 }
 
 /// Extract the host from a provider `base-url`/`host` string without pulling in
@@ -1424,9 +2332,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // a plain `fn` (captures nothing; invariant I2). Idempotent.
     sema_core::set_gc_observer(Some(gc_otel_observer));
 
-    // Bridge the LLM cassette to MCP tool calls (sema-mcp consults this via
-    // sema-core). Idempotent — just sets two thread-local fn pointers.
-    sema_core::set_mcp_cassette_hook(mcp_cassette_decide, mcp_cassette_record);
+    // Bridge the task-scoped LLM cassette to MCP tool calls through sema-core.
+    // Idempotent: interpreter setup replaces one thread-local function pointer.
+    sema_core::set_mcp_cassette_hook(mcp_cassette_decide);
 
     // Reclaim non-blocking agent-run slab entries owned by a CANCELLED task
     // (whose `__agent-finish` can never run) the moment the scheduler reaps it —
@@ -1436,10 +2344,11 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // a plain `fn`, captures nothing.
     sema_core::set_task_reaped_callback(reap_cancelled_agent_runs);
 
-    // CI/global cassette: SEMA_LLM_CASSETTE=path [+ SEMA_LLM_CASSETTE_MODE=replay|
-    // record|auto] installs a cassette for the whole process, so a suite can be
-    // forced into deterministic replay without touching test source. Only honored
-    // outside the sandbox (it reads/writes a file path from the environment).
+    // CI cassette baseline: SEMA_LLM_CASSETTE=path
+    // [+ SEMA_LLM_CASSETTE_MODE=replay|record|auto] installs a cassette in the
+    // current ambient LLM scope, so tasks spawned afterward inherit deterministic
+    // replay without touching test source. Only honored outside the sandbox (it
+    // reads/writes a file path from the environment).
     if unrestricted {
         if let Ok(path) = std::env::var("SEMA_LLM_CASSETTE") {
             if !path.is_empty() {
@@ -1448,7 +2357,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     .unwrap_or(crate::cassette::CassetteMode::Auto);
                 let cassette =
                     crate::cassette::Cassette::load(std::path::PathBuf::from(path), mode);
-                CASSETTE.with(|c| *c.borrow_mut() = Some(cassette));
+                install_cassette(cassette);
             }
         }
     }
@@ -1995,7 +2904,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (llm/complete "prompt text" {:model "..." :max-tokens 200 :temperature 0.5})
-    register_fn_gated(env, sandbox, sema_core::Caps::LLM, "llm/complete", |args| {
+    register_runtime_fn_gated(env, sandbox, sema_core::Caps::LLM, "llm/complete", |args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/complete", "1-2", args.len()));
         }
@@ -2043,40 +2954,43 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.reasoning_effort = reasoning_effort;
         request.timeout_ms = opt_timeout_ms(args.get(1));
 
-        // Inside a scheduler task: offload + yield so siblings overlap. The poller
-        // accounts (no post-call `track_usage` here) and shapes the value. The sync
-        // branch below is byte-identical to before.
+        // In any runtime quantum, including root-main, the completion driver calls
+        // Sema-defined providers structurally on the VM and suspends each native
+        // provider attempt on an External wait. Finalization accounts usage and
+        // shapes the value after either kind of provider succeeds.
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
-            return do_complete_async_yield(
+        {
+            dispatch_complete_offload(
                 request,
-                Box::new(|resp| Ok(Value::string(&resp.content))),
-            );
+                CompleteFinalize::new(|resp| Ok(Value::string(&resp.content))),
+            )
         }
-
-        let response = do_complete(request)?;
-        track_usage(&response.usage)?;
-        Ok(Value::string(&response.content))
+        #[cfg(target_arch = "wasm32")]
+        {
+            let response = do_complete(request)?;
+            track_usage(&response.usage)?;
+            Ok(NativeOutcome::Return(Value::string(&response.content)))
+        }
     });
 
     // (llm/chat messages {:model "..." :tools [...] :tool-mode :auto ...})
     // Synchronous / no-tools-needed twin. The Sema-visible `llm/chat` is a prelude
-    // dispatcher (mirrors `agent/run`): in async context WITH a configured tool
+    // dispatcher (mirrors `agent/run`): in a runtime quantum with a configured tool
     // loop it drives `__chat-begin` + the shared `__agent-*` step natives instead
-    // (a native can't loop-yield across multiple provider rounds); every other
-    // case — top level, or async with no `:tools`/`:tool-mode :none` — reaches
-    // this native, which is otherwise byte-identical to the pre-split `llm/chat`
-    // (its own `in_async_context()` branch below already offloads the no-tools
-    // completion — WP-LLM-SIMPLE). Gated as "llm/chat" (not this native's own
+    // (a native cannot retain a Rust loop across multiple suspensions); every
+    // other case—top level, or no `:tools`/`:tool-mode :none`—reaches this native.
+    // Its runtime branch offloads the no-tools completion. Gated as "llm/chat" (not this native's own
     // registration name) so a sandboxed caller sees the same `PermissionDenied`
     // regardless of which internal entry point actually runs.
-    register_fn_ctx_gated_as(
+    register_runtime_fn_ctx_gated_as(
         env,
         sandbox,
         sema_core::Caps::LLM,
         "__llm-chat-blocking",
         "llm/chat",
         |ctx, args| {
+            #[allow(unused_imports)]
+            use sema_core::runtime::NativeOutcome;
             if args.is_empty() || args.len() > 2 {
                 return Err(SemaError::arity("llm/chat", "1-2", args.len()));
             }
@@ -2136,21 +3050,28 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 request.timeout_ms = opt_timeout_ms(args.get(1));
                 let _conv = conv_scope.open();
 
-                // Inside a scheduler task: offload + yield so siblings overlap; the
-                // poller accounts and shapes the value. Sync branch below is
-                // byte-identical to before. Mirrors `llm/complete`.
+                // Native provider work in root-main and spawned tasks suspends on
+                // an External wait; only a host call uses the synchronous adapter.
                 #[cfg(not(target_arch = "wasm32"))]
-                if sema_core::in_async_context() {
-                    return do_complete_async_yield(
+                {
+                    dispatch_complete_offload(
                         request,
-                        Box::new(|resp| Ok(Value::string(&resp.content))),
-                    );
+                        CompleteFinalize::new(|resp| Ok(Value::string(&resp.content))),
+                    )
                 }
-
-                let response = do_complete(request)?;
-                track_usage(&response.usage)?;
-                Ok(Value::string(&response.content))
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let response = do_complete(request)?;
+                    track_usage(&response.usage)?;
+                    Ok(NativeOutcome::Return(Value::string(&response.content)))
+                }
             } else {
+                if sema_core::in_runtime_quantum() {
+                    return Err(SemaError::eval(
+                        "__llm-chat-blocking cannot run a tool loop inside the cooperative runtime",
+                    )
+                    .with_hint("call llm/chat so provider, observer, and tool callbacks can suspend cooperatively"));
+                }
                 // Chat with tool execution loop, synchronously — `run_tool_loop` is a
                 // Rust `for` over rounds that blocks the VM thread per round. Reached
                 // from top level (this IS "the" tool loop there) and, in principle,
@@ -2176,13 +3097,13 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     None, // agent_name
                     conv_scope,
                 )?;
-                Ok(Value::string(&result))
+                Ok(NativeOutcome::Return(Value::string(&result)))
             }
         },
     );
 
     // (llm/send prompt {:model "..." ...})
-    register_fn_gated(env, sandbox, sema_core::Caps::LLM, "llm/send", |args| {
+    register_runtime_fn_gated(env, sandbox, sema_core::Caps::LLM, "llm/send", |args| {
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/send", "1-2", args.len()));
         }
@@ -2201,6 +3122,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // between delta batches there).
     register_fn_ctx(env, "__llm-stream-blocking", |ctx, args| {
         let (request, callback, opts_map) = parse_stream_args(args)?;
+        if sema_core::in_runtime_quantum() {
+            return Err(SemaError::eval(
+                "__llm-stream-blocking cannot run inside the cooperative runtime",
+            )
+            .with_hint("call llm/stream so its provider and callback can suspend cooperatively"));
+        }
         let conv_scope = ConvScope::from_opts(opts_map.as_ref());
 
         // Streaming bypasses do_complete/track_usage, so it gets its own CLIENT span +
@@ -2257,7 +3184,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (llm/extract schema text {:model "..." :validate true :retries 2 :reask? true})
-    register_fn(env, "llm/extract", |args| {
+    register_runtime_fn_ctx(env, "llm/extract", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/extract", "2-3", args.len()));
         }
@@ -2297,33 +3226,6 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.json_mode = true;
         request.system = Some(system.clone());
 
-        // Inside a scheduler task: ONLY attempt 0 is offloaded so siblings overlap;
-        // the poller accounts attempt 0, then `finalize` validates and — only if a
-        // re-ask is needed — runs the remaining attempts on the SYNCHRONOUS
-        // `do_complete` path (VM thread). A re-asking extract therefore briefly
-        // blocks siblings; the common single-attempt extract is fully concurrent.
-        #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
-            let cfg = ExtractConfig {
-                schema,
-                schema_desc,
-                system,
-                model,
-                messages,
-                validate,
-                max_retries,
-                reask,
-            };
-            return do_complete_async_yield(
-                request,
-                Box::new(move |first| extract_validate_and_reask(first, &cfg)),
-            );
-        }
-
-        // Sync path (byte-identical to before): attempt 0 through `do_complete` +
-        // `track_usage`, then the shared validate/re-ask loop.
-        let first = do_complete(request)?;
-        track_usage(&first.usage)?;
         let cfg = ExtractConfig {
             schema,
             schema_desc,
@@ -2334,17 +3236,37 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             max_retries,
             reask,
         };
-        extract_validate_and_reask(first, &cfg)
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if in_runtime_offload_task() {
+                return do_complete_runtime_suspend(
+                    request,
+                    CompleteFinalize::runtime(Box::new(RuntimeExtractDriver::new(cfg))),
+                );
+            }
+            let first = do_complete(request)?;
+            track_usage(&first.usage)?;
+            extract_validate_and_reask(first, &cfg).map(NativeOutcome::Return)
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let first = do_complete(request)?;
+            track_usage(&first.usage)?;
+            extract_validate_and_reask(first, &cfg).map(NativeOutcome::Return)
+        }
     });
 
     // (llm/extract-from-image schema source {:model "..."})
     // source: string path or bytevector
-    register_fn_ctx_gated(
+    register_runtime_fn_ctx_gated_as(
         env,
         sandbox,
         sema_core::Caps::LLM,
         "llm/extract-from-image",
+        "llm/extract-from-image",
         |_ctx, args| {
+            #[allow(unused_imports)]
+            use sema_core::runtime::NativeOutcome;
             if args.len() < 2 || args.len() > 3 {
                 return Err(SemaError::arity(
                     "llm/extract-from-image",
@@ -2402,31 +3324,26 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             request.system = Some(system);
             request.json_mode = true;
 
-            let response = do_complete(request)?;
-            track_usage(&response.usage)?;
-
-            // Parse JSON response back to Sema value
-            let content = response.content.trim();
-            let json_str = if content.starts_with("```") {
-                content
-                    .trim_start_matches("```json")
-                    .trim_start_matches("```")
-                    .trim_end_matches("```")
-                    .trim()
-            } else {
-                content
-            };
-            let json: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
-                SemaError::Llm(format!(
-                    "failed to parse LLM JSON response: {e}\nResponse was: {content}"
-                ))
-            })?;
-            Ok(sema_core::json_to_value(&json))
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                dispatch_complete_offload(
+                    request,
+                    CompleteFinalize::new(|response| extract_parse_response(&response)),
+                )
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let response = do_complete(request)?;
+                track_usage(&response.usage)?;
+                extract_parse_response(&response).map(NativeOutcome::Return)
+            }
         },
     );
 
     // (llm/classify categories text {:model "..."})
-    register_fn(env, "llm/classify", |args| {
+    register_runtime_fn_ctx(env, "llm/classify", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/classify", "2-3", args.len()));
         }
@@ -2469,6 +3386,8 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
         // Shape the response into a category keyword (if it matched a keyword in the
         // original list) or string. Shared by the sync and async paths.
+        #[cfg(not(target_arch = "wasm32"))]
+        let finalize_values = categories.clone();
         let parse_category = move |response: ChatResponse| -> Result<Value, SemaError> {
             let category = response.content.trim().to_string();
             if categories
@@ -2481,16 +3400,21 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }
         };
 
-        // Inside a scheduler task: offload + yield so siblings overlap; the poller
-        // accounts and runs `parse_category`. Sync branch is byte-identical.
+        // Runtime roots and spawned tasks suspend on an External wait. The
+        // completion decoder accounts usage and runs `parse_category`.
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
-            return do_complete_async_yield(request, Box::new(parse_category));
+        {
+            dispatch_complete_offload(
+                request,
+                CompleteFinalize::with_values(parse_category, finalize_values),
+            )
         }
-
-        let response = do_complete(request)?;
-        track_usage(&response.usage)?;
-        parse_category(response)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let response = do_complete(request)?;
+            track_usage(&response.usage)?;
+            parse_category(response).map(NativeOutcome::Return)
+        }
     });
 
     // Conversation functions
@@ -2524,7 +3448,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (conversation/say conv "message" {:temperature 0.5 :max-tokens 2048 :system "..."})
-    register_fn(env, "conversation/say", |args| {
+    register_runtime_fn_ctx(env, "conversation/say", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("conversation/say", "2-3", args.len()));
         }
@@ -2587,16 +3513,18 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }))
         };
 
-        // Inside a scheduler task: offload + yield so siblings overlap. Sync
-        // branch below is byte-identical to before. Mirrors `llm/complete`.
+        // Runtime roots and spawned tasks suspend on an External wait; only a
+        // host call uses the synchronous adapter.
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
-            return do_complete_async_yield(request, Box::new(finalize));
+        {
+            dispatch_complete_offload(request, CompleteFinalize::new(finalize))
         }
-
-        let response = do_complete(request)?;
-        track_usage(&response.usage)?;
-        finalize(response)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let response = do_complete(request)?;
+            track_usage(&response.usage)?;
+            finalize(response).map(NativeOutcome::Return)
+        }
     });
 
     // (conversation/messages conv)
@@ -2811,12 +3739,19 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
     // (agent/run agent "msg") returns string
     // (agent/run agent "msg" {:on-tool-call cb :messages history}) returns {:response "..." :messages [...]}
-    // Synchronous / wasm agent loop (byte-identical to the historical `agent/run`).
-    // The `agent/run` name is bound in the prelude to a dispatcher that reaches this
-    // native in non-async context and the yield-per-round driver in async context.
+    // Synchronous agent loop. The prelude dispatcher reaches this native outside a
+    // runtime quantum and uses the suspend-per-round bytecode driver inside one.
     register_fn_ctx(env, "__agent-run-blocking", |ctx, args| {
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("agent/run", "2-3", args.len()));
+        }
+        if sema_core::in_runtime_quantum() {
+            return Err(SemaError::eval(
+                "__agent-run-blocking cannot run inside the cooperative runtime",
+            )
+            .with_hint(
+                "call agent/run so provider, observer, and tool callbacks can suspend cooperatively",
+            ));
         }
         let agent = args[0]
             .as_agent_rc()
@@ -3008,26 +3943,54 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         }
     });
 
-    // ── Non-blocking multi-round agent loop (async-context path) ──────────────
+    // ── Non-blocking multi-round agent loop (runtime-task path) ───────────────
     // The prelude `agent/run` dispatches here (four internal natives + a Sema
-    // driver loop) when `(__async-context?)`, so each provider round offloads +
-    // yields `AwaitIo` and sibling scheduler tasks overlap during the conversation.
+    // driver loop) when `(__async-context?)`, so each provider round suspends on
+    // an External wait and sibling tasks overlap during the conversation.
     // See docs/plans/2026-07-02-nonblocking-agent-run.md (ADR #68).
     register_fn_ctx(env, "__async-context?", |_ctx, _args| {
-        Ok(Value::bool(sema_core::in_async_context()))
+        Ok(Value::bool(in_runtime_offload_context()))
+    });
+    // True while a unified-runtime VM quantum is executing — at ANY level, the
+    // root/top-level main task INCLUDED (it too is a genuine runtime task that can
+    // park and resume; it merely publishes `current_task_id() == None` because it
+    // is not `async/cancel`-addressable). The prelude `agent/run` / `llm/chat`
+    // dispatchers select the Sema-driven `__agent-drive` loop whenever this is true,
+    // so each provider round offloads + suspends and the tool round
+    // (`__agent-exec-tools`) runs every handler COOPERATIVELY via `NativeOutcome::Call`
+    // — a handler that suspends (e.g. `mcp/call`'s runtime external wait, or an
+    // `async/await` inside it) parks on the active task and resumes through the
+    // scheduler, at the root exactly as in a spawned child. The cooperative tool
+    // round journals the same per-tool OTel span + `:on-tool-call` start/end events
+    // the synchronous `run_tool_loop` does (see `ExecToolsContinuation`), so the flip
+    // is span/journaling-transparent. The synchronous `run_tool_loop` remains only
+    // for execution outside a runtime quantum, where no handler can suspend. See Task 04/06
+    // (`docs/plans/archive/2026-07-13-unified-cooperative-runtime.md`).
+    register_fn_ctx(env, "__runtime-quantum?", |_ctx, _args| {
+        Ok(Value::bool(sema_core::in_runtime_quantum()))
     });
     register_fn_ctx(env, "__agent-begin", |_ctx, args| agent_begin(args));
-    register_fn_ctx(env, "__agent-step", |ctx, args| {
+    register_runtime_fn_ctx(env, "__agent-step", |ctx, args| {
         let token = agent_token_arg(args, "__agent-step")?;
         agent_step(ctx, token)
     });
-    register_fn_ctx(env, "__agent-exec-tools", |ctx, args| {
+    register_runtime_fn_ctx(env, "__agent-exec-tools", |ctx, args| {
         let token = agent_token_arg(args, "__agent-exec-tools")?;
         agent_exec_tools(ctx, token)
     });
     register_fn_ctx(env, "__agent-finish", |_ctx, args| {
-        let token = agent_token_arg(args, "__agent-finish")?;
-        agent_finish(token)
+        // `(__agent-finish token)` on the normal-done path; `(__agent-finish token
+        // err)` from the driver's `catch` when the loop unwound on an error —
+        // notably a cancellation, whose bytecode NOW runs the catch (the unified
+        // runtime resumes a cancelled parked task to unwind cleanly), so the
+        // `invoke_agent` span must be closed carrying the failure status rather
+        // than a bare (unset) end.
+        if args.is_empty() || args.len() > 2 {
+            return Err(SemaError::arity("__agent-finish", "1-2", args.len()));
+        }
+        let token = agent_token_arg(&args[..1], "__agent-finish")?;
+        let finish_error = args.get(1).map(|e| e.to_string());
+        agent_finish(token, finish_error)
     });
 
     // `llm/chat`'s `:tools` twin of `__agent-begin`: builds an ordinary agent-loop
@@ -3081,7 +4044,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         }
         stream_run_begin(request, span)
     });
-    register_fn(env, "__stream-next", |args| {
+    register_runtime_fn_ctx(env, "__stream-next", |_ctx, args| {
         if args.len() != 1 {
             return Err(SemaError::arity("__stream-next", "1", args.len()));
         }
@@ -3101,89 +4064,106 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         agent_stream_apply(agent_token, stream_token_arg(&args[1])?)
     });
 
-    // (llm/pmap fn collection {:max-tokens N ...})
-    // Maps fn over collection to produce prompts, then sends all prompts in parallel via batch_complete
-    register_fn_ctx(env, "llm/pmap", |ctx, args| {
+    // The public `llm/pmap` is a prelude dispatcher. Runtime tasks compose
+    // structural `map` + `llm/batch`; host callback entry routes here so the
+    // mapper receives the caller's explicit EvalContext rather than STDLIB_CTX.
+    // The guard makes this compatibility path impossible to use as a blocking
+    // escape hatch from an active runtime quantum.
+    register_fn_ctx(env, "__llm-pmap-blocking", |ctx, args| {
+        if sema_core::in_runtime_quantum() {
+            return Err(SemaError::eval(
+                "__llm-pmap-blocking cannot run inside the cooperative runtime",
+            )
+            .with_hint("call llm/pmap so its mapper can suspend cooperatively"));
+        }
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/pmap", "2-3", args.len()));
         }
         let func = &args[0];
         let items = args[1]
             .as_seq()
-            .map(|l| l.to_vec())
+            .map(|items| items.to_vec())
             .ok_or_else(|| SemaError::type_error("list or vector", args[1].type_name()))?;
 
         let mut model = String::new();
         let mut max_tokens = None;
         let mut temperature = None;
         let mut system = None;
-
-        if let Some(opts_val) = args.get(2) {
-            if let Some(opts) = opts_val.as_map_rc() {
-                model = get_opt_string(&opts, "model").unwrap_or_default();
-                max_tokens = get_opt_u32(&opts, "max-tokens");
-                temperature = get_opt_f64(&opts, "temperature");
-                system = get_opt_string(&opts, "system");
-            }
+        if let Some(opts) = args.get(2).and_then(Value::as_map_rc) {
+            model = get_opt_string(&opts, "model").unwrap_or_default();
+            max_tokens = get_opt_u32(&opts, "max-tokens");
+            temperature = get_opt_f64(&opts, "temperature");
+            system = get_opt_string(&opts, "system");
         }
 
-        // Step 1: Map fn over items to produce prompt strings (sequentially, since Rc)
-        let mut prompts = Vec::with_capacity(items.len());
-        for item in &items {
-            #[allow(clippy::cloned_ref_to_slice_refs)] // clone needed: &Value -> [Value]
-            let result = sema_core::call_callback(ctx, func, &[item.clone()])?;
-            let prompt_str = result
-                .as_str()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| result.to_string());
-            prompts.push(prompt_str);
-        }
-
-        // Step 2: Build ChatRequests
-        let requests: Vec<ChatRequest> = prompts
+        let prompts = items
+            .iter()
+            .map(|item| {
+                let result = sema_core::call_callback(ctx, func, std::slice::from_ref(item))?;
+                Ok(result
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| result.to_string()))
+            })
+            .collect::<Result<Vec<_>, SemaError>>()?;
+        let requests = prompts
             .into_iter()
             .map(|prompt_text| {
-                let messages = vec![ChatMessage::new("user", prompt_text)];
-                let mut req = ChatRequest::new(model.clone(), messages);
-                req.max_tokens = max_tokens.or(Some(4096));
-                req.temperature = temperature;
-                req.system = system.clone();
-                req
+                let mut request =
+                    ChatRequest::new(model.clone(), vec![ChatMessage::new("user", prompt_text)]);
+                request.max_tokens = max_tokens.or(Some(4096));
+                request.temperature = temperature;
+                request.system = system.clone();
+                request
             })
-            .collect();
+            .collect::<Vec<_>>();
 
-        // Step 3: batch_complete (runs concurrently at provider level)
-        let responses = with_provider(|p| {
-            let reqs: Vec<ChatRequest> = requests
+        let responses = with_provider(|provider| {
+            let requests = requests
                 .into_iter()
-                .map(|mut r| {
-                    if r.model.is_empty() {
-                        r.model = p.default_model().to_string();
+                .map(|mut request| {
+                    if request.model.is_empty() {
+                        request.model = provider.default_model().to_string();
                     }
-                    r
+                    request
                 })
                 .collect();
-            Ok(p.batch_complete(reqs))
+            Ok(provider.batch_complete(requests))
         })?;
+        responses
+            .into_iter()
+            .map(|response| {
+                let response = response.map_err(|error| SemaError::Llm(error.to_string()))?;
+                track_usage(&response.usage)?;
+                Ok(Value::string(&response.content))
+            })
+            .collect::<Result<Vec<_>, SemaError>>()
+            .map(Value::list)
+    });
 
-        // Step 4: Collect results
-        let mut results = Vec::with_capacity(responses.len());
-        for resp_result in responses {
-            let resp = resp_result.map_err(|e| SemaError::Llm(e.to_string()))?;
-            track_usage(&resp.usage)?;
-            results.push(Value::string(&resp.content));
+    // These non-blocking helpers preserve the public native's exact validation
+    // diagnostics while the prelude owns cooperative control flow.
+    register_fn(env, "__llm-pmap-arity-error", |args| {
+        Err(SemaError::arity("llm/pmap", "2-3", args.len()))
+    });
+    register_fn(env, "__llm-pmap-validate-items", |args| {
+        if args.len() != 1 {
+            return Err(SemaError::arity(
+                "__llm-pmap-validate-items",
+                "1",
+                args.len(),
+            ));
         }
-        Ok(Value::list(results))
+        args[0]
+            .as_seq()
+            .ok_or_else(|| SemaError::type_error("list or vector", args[0].type_name()))?;
+        Ok(args[0].clone())
     });
 
     // (llm/batch ["prompt1" "prompt2" "prompt3"] {:max-tokens 100})
-    register_fn(env, "llm/batch", |args| {
-        // On resume from the async yield the scheduler re-runs the bytecode AFTER
-        // this CALL via `replace_stack_top`, so this native is not re-invoked.
-        // Drain any stray resume value defensively (mirrors llm/embed).
-        if let Some(v) = sema_core::take_resume_value() {
-            return Ok(v);
-        }
+    register_runtime_fn_ctx(env, "llm/batch", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/batch", "1-2", args.len()));
         }
@@ -3222,18 +4202,13 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             })
             .collect();
 
-        // ── ASYNC path: offload the whole batch + yield (native targets only) ──
+        // ── Runtime path ────────────────────────────────────────────────────
         //
-        // `batch_complete`'s provider impls (anthropic/openai/gemini/ollama) drive
-        // their own concurrency internally via `sema_io::io_block_on(join_all(..))`
-        // — legal from a `spawn_blocking` closure, illegal from an async worker (see
-        // the sema-io threading contract) — so the WHOLE call is offloaded to the
-        // blocking tier as ONE unit rather than re-driven as a `spawn`ed future; the
-        // provider's own internal join_all runs unchanged inside it, occupying one
-        // admission-control permit for its entire duration (by design, same as a
-        // long retry backoff — see the sema-io module docs).
+        // Sema-defined providers run one structural callback per request, in order.
+        // Native providers retain their own `batch_complete` concurrency and run the
+        // whole batch as one admission-controlled blocking-tier unit.
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
+        if in_runtime_offload_context() {
             let provider = PROVIDER_REGISTRY.with(|reg| reg.borrow().default_provider());
             let Some(provider) = provider else {
                 return Err(SemaError::Llm(
@@ -3242,8 +4217,24 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                         .to_string(),
                 ));
             };
+
+            if provider.runs_on_vm_thread() {
+                return Box::new(SemaBatchDriver {
+                    provider: provider.name().to_string(),
+                    default_model: provider.default_model().to_string(),
+                    requests,
+                    next_request: 0,
+                    active_model: None,
+                    responses: Vec::new(),
+                    usage_accum_slot: current_usage_accum(),
+                    budget_slot: active_budget(),
+                })
+                .advance();
+            }
+
             let reqs: Vec<ChatRequest> = requests
-                .into_iter()
+                .iter()
+                .cloned()
                 .map(|mut r| {
                     if r.model.is_empty() {
                         r.model = provider.default_model().to_string();
@@ -3253,72 +4244,40 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 .collect();
 
             // Capture the dispatch-time budget + leaf-usage frames (ASYNC-1), so the
-            // poller charges the frames active NOW — not whatever scope is installed
-            // when the future lands. Mirrors do_complete_async_yield/llm/embed.
+            // decoder charges the frames active now, not whatever scope is installed
+            // when the future lands. Mirrors the completion and embedding paths.
             let usage_accum_slot = current_usage_accum();
             let budget_slot = active_budget();
 
-            let (tx, mut rx) =
-                tokio::sync::oneshot::channel::<Vec<Result<ChatResponse, LlmError>>>();
-            let p2 = provider.clone();
-            // Blocking-tier offload (no native `spawn`-based future here — see the
-            // comment above): abort is best-effort, the batch call runs to
-            // completion on the worker and its result is simply discarded.
-            sema_io::io_spawn_blocking(move || {
-                let responses = p2.batch_complete(reqs);
-                let _ = tx.send(responses);
-                sema_core::notify_io_complete();
-            });
-
-            let handle = Rc::new(sema_core::IoHandle::new(move || {
-                use tokio::sync::oneshot::error::TryRecvError;
-                match rx.try_recv() {
-                    Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-                    Ok(responses) => {
-                        let mut results = Vec::with_capacity(responses.len());
-                        for resp_result in responses {
-                            let resp = match resp_result {
-                                Ok(r) => r,
-                                Err(e) => return sema_core::IoPoll::Ready(Err(e.to_string())),
-                            };
-                            // Fold into THIS call's captured accumulator frame, then
-                            // suppress `track_usage`'s own fold and re-install the
-                            // captured budget frame around it — the poller runs
-                            // outside the per-task install boundary, so the live
-                            // thread-locals may belong to a sibling task. Priced
-                            // with an empty provider, matching the sync path (which
-                            // never stamps a serving provider for `llm/batch`).
-                            if let Some(slot) = &usage_accum_slot {
-                                let cost = pricing::calculate_cost_for("", &resp.usage);
-                                accumulate_into(slot, &resp.usage, cost);
-                            }
-                            let track_result = {
-                                let prev_budget = ACTIVE_BUDGET.with(|b| {
-                                    std::mem::replace(&mut *b.borrow_mut(), budget_slot.clone())
-                                });
-                                let r = USAGE_ACCUM_SUPPRESS.with(|s| {
-                                    s.set(true);
-                                    let r = track_usage(&resp.usage);
-                                    s.set(false);
-                                    r
-                                });
-                                ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
-                                r
-                            };
-                            if let Err(e) = track_result {
-                                return sema_core::IoPoll::Ready(Err(e.to_string()));
-                            }
-                            results.push(Value::string(&resp.content));
-                        }
-                        sema_core::IoPoll::Ready(Ok(Value::list(results)))
-                    }
-                    Err(TryRecvError::Closed) => {
-                        sema_core::IoPoll::Ready(Err("batch: worker dropped".to_string()))
-                    }
-                }
-            }));
-            sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-            return Ok(Value::nil());
+            // A unified-runtime spawned task SUSPENDS on an External wait (the whole
+            // batch runs as ONE unit on the executor's blocking tier, since
+            // `batch_complete` drives its own internal `join_all`); the decoder folds
+            // usage and shapes the list on the VM thread.
+            if in_runtime_offload_task() {
+                use sema_core::runtime::{
+                    CompletionKind, InterruptibleResource, NativeSuspend,
+                    PreparedExternalOperation, SendPayload, WaitKind,
+                };
+                let p_job = provider.clone();
+                let decoder = Box::new(BatchDecoder {
+                    usage_accum_slot: usage_accum_slot.clone(),
+                    budget_slot: budget_slot.clone(),
+                });
+                let kind = CompletionKind::try_from_raw(BATCH_COMPLETION_KIND)
+                    .expect("batch completion kind is nonzero");
+                let resource =
+                    InterruptibleResource::new("llm/batch", Box::new(CompleteNoopCancelHook));
+                let prepared = PreparedExternalOperation::interruptible_blocking(
+                    kind,
+                    decoder,
+                    resource,
+                    move || Ok(Box::new(p_job.batch_complete(reqs)) as SendPayload),
+                );
+                return Ok(NativeOutcome::Suspend(NativeSuspend {
+                    wait: WaitKind::External(Box::new(prepared)),
+                    continuation: Box::new(OffloadValueContinuation { op: "llm/batch" }),
+                }));
+            }
         }
 
         // ── SYNC path: inline provider call (byte-identical to before) ─────
@@ -3341,7 +4300,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             track_usage(&resp.usage)?;
             results.push(Value::string(&resp.content));
         }
-        Ok(Value::list(results))
+        Ok(NativeOutcome::Return(Value::list(results)))
     });
 
     // (llm/set-pricing "model-pattern" input-per-million output-per-million)
@@ -3448,33 +4407,24 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         })
     });
 
-    // `llm/embed` — a SINGLE first-class native function that branches internally
-    // on `sema_core::in_async_context()`:
+    // `llm/embed` — a single first-class native function that branches internally
+    // on whether it runs in a runtime quantum:
     //
     //   (llm/embed "text" {:model "..."})        ; → bytevector
     //   (llm/embed ["text1" "text2"] {:model …}) ; → list of bytevectors
     //
-    // Outside an async scheduler task it runs the SYNCHRONOUS embed path inline
+    // Outside the runtime it runs the synchronous embed path inline
     // (open span, cassette, provider.embed, set_response, track_usage, decode).
-    // Inside a task it offloads `provider.embed` onto the shared runtime and
-    // yields `AwaitIo` so sibling tasks overlap; the IoHandle poller (which runs
-    // on the VM thread inside the scheduler) finalizes the DETACHED span, records
-    // the cassette, runs `track_usage`, and decodes the embeddings into the SAME
-    // Value the sync path returns — so the concurrent and sync paths are
-    // byte-identical. Folding `track_usage` into the poller is what lets a single
-    // native (which is NOT re-invoked on resume — the scheduler resumes the
-    // bytecode after the CALL via `replace_stack_top`) account correctly without
-    // a separate Sema-sequenced accounting step.
+    // Root-main and spawned tasks offload `provider.embed` and suspend on an
+    // External wait so siblings overlap. The VM-thread decoder finalizes the
+    // detached span, records the cassette, runs `track_usage`, and builds the same
+    // `Value` as the synchronous path.
     //
     // Keeping it a native (not a macro) means `(procedure? llm/embed)` is #t and
     // it is usable as a value: `(map llm/embed …)`, `(async/pool-map llm/embed …)`.
-    register_fn(env, "llm/embed", |args| {
-        // On resume from the async yield the scheduler re-runs the bytecode AFTER
-        // this CALL via `replace_stack_top`, so this native is not re-invoked.
-        // Drain any stray resume value defensively (mirrors io-sleep-once).
-        if let Some(v) = sema_core::take_resume_value() {
-            return Ok(v);
-        }
+    register_runtime_fn_ctx(env, "llm/embed", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/embed", "1-2", args.len()));
         }
@@ -3509,25 +4459,27 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         let req_model = request.model.clone().unwrap_or_default();
         let cassette_key = compute_embed_key(&request);
 
-        // ── ASYNC path: offload + yield (native targets only) ──────────────
+        // ── Runtime path: offload and suspend (native targets only) ─────────
         //
         // The concurrent embed path is native-only (no shared tokio runtime on
         // wasm), so wasm always falls through to the synchronous path below.
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
-            // DETACHED embeddings span: parent captured now, finalized in the
-            // poller after the yield (where the active-span stack may hold a
+        if in_runtime_offload_context() {
+            // DETACHED embeddings span: parent captured now, finalized by the
+            // decoder after the wait (where the active-span stack may hold a
             // sibling task's span, so the span must not pop the stack on drop).
             let span = sema_otel::llm_span_detached("embeddings");
             span.set_embedding_input(&request.texts);
 
             // Cassette decision — SYNCHRONOUSLY, pre-spawn, on the VM thread.
-            let decision =
-                CASSETTE.with(|c| c.borrow().as_ref().map(|cass| cass.decide(&cassette_key)));
+            let cassette_scope = current_cassette_scope();
+            let decision = cassette_scope
+                .as_ref()
+                .map(|scope| scope.borrow().decide(&cassette_key));
             match decision {
                 Some(crate::cassette::Decision::Replay(entry)) => {
-                    // Replay made no provider call → finalize the span inline,
-                    // account, and return WITHOUT yielding (nothing to overlap).
+                    // Replay made no provider call: finalize the span inline,
+                    // account, and return without suspending.
                     let resp = EmbedResponse {
                         embeddings: entry.embeddings,
                         model: entry.model.clone(),
@@ -3546,7 +4498,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     });
                     drop(span);
                     track_usage(&resp.usage)?;
-                    return Ok(embed_value_from_response(&resp, single));
+                    return Ok(NativeOutcome::Return(embed_value_from_response(
+                        &resp, single,
+                    )));
                 }
                 Some(crate::cassette::Decision::Miss(k)) => return Err(cassette_miss_error(&k)),
                 _ => {}
@@ -3567,122 +4521,72 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             };
 
             // The provider name + canonical price are needed on the VM thread in
-            // the poller; capture them before the Arc is moved into the worker.
+            // the decoder; capture them before the Arc is moved into the worker.
             let provider_name = provider.name().to_string();
             // Capture the dispatch-time budget + leaf-usage frames (ASYNC-1), so the
-            // poller charges the frames active NOW — not whatever scope is installed
-            // when the future lands. Mirrors do_complete_async_yield.
+            // decoder charges the frames active now, not whatever scope is installed
+            // when the future lands. Mirrors the completion path.
             let usage_accum_slot = current_usage_accum();
             let budget_slot = active_budget();
-            let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<EmbedResponse, LlmError>>();
-            let req2 = request.clone();
-            // Spawned pool future (the http/shell abort tier): providers with a
-            // native async embed path (`embed_future`) are dropped mid-flight on
-            // abort — true cancellation; sync-only providers fall back to the
-            // admission-controlled blocking tier, where cancel stays best-effort
-            // (result discarded, call runs to completion).
-            let abort = sema_io::io_spawn(async move {
-                let r = match provider.embed_future(req2.clone()) {
-                    Some(fut) => fut.await,
-                    None => {
-                        let p = provider.clone();
-                        sema_io::io_offload_blocking(move || p.embed(req2)).await
-                    }
-                };
-                let _ = tx.send(r);
-                sema_core::notify_io_complete();
-            });
 
-            // Move the LlmSpan + cassette context INTO the poller closure so the
-            // span is finalized (and the cassette recorded + usage accounted) on
-            // the VM thread when the future lands — never as a native-frame local
-            // (those drop at the yield).
-            let key = cassette_key;
-            let mut span_slot = Some(span);
-            // On cancel/timeout the scheduler runs the abort hook, aborting the
-            // spawned wire future. Never called on normal completion.
-            let handle = Rc::new(sema_core::IoHandle::with_abort(
-                move || {
-                    use tokio::sync::oneshot::error::TryRecvError;
-                    match rx.try_recv() {
-                        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-                        Ok(Ok(resp)) => {
-                            if let Some(span) = span_slot.take() {
-                                span.set_dispatch(&provider_name, &req_model);
-                                span.set_response(&sema_otel::ResponseFacts {
-                                    input_tokens: resp.usage.prompt_tokens,
-                                    output_tokens: 0,
-                                    response_model: resp.model.clone(),
-                                    cost_usd: pricing::calculate_cost_for(
-                                        &provider_name,
-                                        &resp.usage,
-                                    ),
-                                    ..Default::default()
-                                });
-                                // span drops here → ends the span.
+            // A unified-runtime spawned task SUSPENDS on an External wait (the wire
+            // call runs off the VM thread on the executor's async tier); the decoder
+            // finalizes the span, cassette, and usage on the VM thread when it lands.
+            if in_runtime_offload_task() {
+                use sema_core::runtime::{
+                    CompletionKind, InterruptibleResource, NativeSuspend,
+                    PreparedExternalOperation, SendPayload, WaitKind,
+                };
+                let provider_for_job = provider.clone();
+                let req_for_job = request.clone();
+                let decoder = Box::new(EmbedDecoder {
+                    span: Some(span),
+                    provider_name: provider_name.clone(),
+                    req_model: req_model.clone(),
+                    recording,
+                    key: cassette_key.clone(),
+                    cassette_scope,
+                    single,
+                    usage_accum_slot: usage_accum_slot.clone(),
+                    budget_slot: budget_slot.clone(),
+                });
+                let kind = CompletionKind::try_from_raw(EMBED_COMPLETION_KIND)
+                    .expect("embed completion kind is nonzero");
+                let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                let resource = InterruptibleResource::new(
+                    "llm/embed",
+                    Box::new(LlmSelectCancelHook {
+                        signal: Some(cancel_tx),
+                    }),
+                );
+                let prepared = PreparedExternalOperation::interruptible_async(
+                    kind,
+                    decoder,
+                    resource,
+                    move || async move {
+                        let work = async move {
+                            match provider_for_job.embed_future(req_for_job.clone()) {
+                                Some(fut) => fut.await,
+                                None => {
+                                    let p = provider_for_job.clone();
+                                    sema_io::io_offload_blocking(move || p.embed(req_for_job)).await
+                                }
                             }
-                            if recording {
-                                CASSETTE.with(|c| {
-                                    if let Some(cass) = c.borrow_mut().as_mut() {
-                                        cass.record_entry(crate::cassette::TapeEntry::from_embed(
-                                            &key,
-                                            &resp.model,
-                                            &resp.embeddings,
-                                            resp.usage.prompt_tokens,
-                                        ));
-                                    }
-                                });
-                            }
-                            // Decode the embedding (byte-identical to the sync path)
-                            // and account on the VM thread. `track_usage` only mutates
-                            // session-usage / budget thread-locals and reads static
-                            // pricing — it never spawns, yields, or touches the
-                            // scheduler — so it is safe to call here inside
-                            // `wake_blocked_tasks`'s `&mut self.tasks` borrow. Fold into
-                            // the CAPTURED leaf-usage frame and charge the CAPTURED
-                            // budget frame (ASYNC-1, mirroring the completion poller):
-                            // the poller runs outside the per-task install boundary, so
-                            // the live thread-locals may belong to a sibling. A budget
-                            // overrun fails the task, exactly as the sync path's `?`.
-                            if let Some(slot) = &usage_accum_slot {
-                                let cost = pricing::calculate_cost_for(&provider_name, &resp.usage);
-                                accumulate_into(slot, &resp.usage, cost);
-                            }
-                            let value = embed_value_from_response(&resp, single);
-                            let track_result = {
-                                let prev_budget = ACTIVE_BUDGET.with(|b| {
-                                    std::mem::replace(&mut *b.borrow_mut(), budget_slot.clone())
-                                });
-                                let r = USAGE_ACCUM_SUPPRESS.with(|s| {
-                                    s.set(true);
-                                    let r = track_usage(&resp.usage);
-                                    s.set(false);
-                                    r
-                                });
-                                ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
-                                r
-                            };
-                            match track_result {
-                                Ok(()) => sema_core::IoPoll::Ready(Ok(value)),
-                                Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            if let Some(span) = span_slot.take() {
-                                span.record_error(llm_error_kind(&e), &e.to_string());
-                            }
-                            sema_core::IoPoll::Ready(Err(e.to_string()))
-                        }
-                        Err(TryRecvError::Closed) => {
-                            span_slot.take();
-                            sema_core::IoPoll::Ready(Err("embed: io worker dropped".to_string()))
-                        }
-                    }
-                },
-                abort,
-            ));
-            sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-            return Ok(Value::nil());
+                        };
+                        // A mid-flight cancel drops the in-flight request future.
+                        let r = tokio::select! {
+                            biased;
+                            _ = cancel_rx => Err(LlmError::Config("cancelled".to_string())),
+                            r = work => r,
+                        };
+                        Ok(Box::new(r) as SendPayload)
+                    },
+                );
+                return Ok(NativeOutcome::Suspend(NativeSuspend {
+                    wait: WaitKind::External(Box::new(prepared)),
+                    continuation: Box::new(OffloadValueContinuation { op: "llm/embed" }),
+                }));
+            }
         }
 
         // ── SYNC path: inline provider call (byte-identical to before) ─────
@@ -3691,8 +4595,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         // Advertise the input texts (content-gated; OpenInference embedding.* keys).
         span.set_embedding_input(&request.texts);
         // Cassette interception (mirrors run_completion, for the embeddings seam).
-        let decision =
-            CASSETTE.with(|c| c.borrow().as_ref().map(|cass| cass.decide(&cassette_key)));
+        let decision = cassette_decide(&cassette_key);
         let response = match decision {
             Some(crate::cassette::Decision::Replay(entry)) => {
                 let resp = EmbedResponse {
@@ -3735,35 +4638,29 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     Ok(resp)
                 })?;
                 if recording {
-                    CASSETTE.with(|c| {
-                        if let Some(cass) = c.borrow_mut().as_mut() {
-                            cass.record_entry(crate::cassette::TapeEntry::from_embed(
-                                &cassette_key,
-                                &resp.model,
-                                &resp.embeddings,
-                                resp.usage.prompt_tokens,
-                            ));
-                        }
-                    });
+                    cassette_record(crate::cassette::TapeEntry::from_embed(
+                        &cassette_key,
+                        &resp.model,
+                        &resp.embeddings,
+                        resp.usage.prompt_tokens,
+                    ));
                 }
                 resp
             }
         };
 
         track_usage(&response.usage)?;
-        Ok(embed_value_from_response(&response, single))
+        Ok(NativeOutcome::Return(embed_value_from_response(
+            &response, single,
+        )))
     });
 
     // (llm/rerank query documents {:top-k 5 :model "..." :provider :cohere})
     // Cross-encoder reranking. Returns a list of {:index :score :document}, highest
     // relevance first. `documents` is a list of strings.
-    register_fn(env, "llm/rerank", |args| {
-        // On resume from the async yield the scheduler re-runs the bytecode AFTER
-        // this CALL via `replace_stack_top`, so this native is not re-invoked.
-        // Drain any stray resume value defensively (mirrors llm/embed).
-        if let Some(v) = sema_core::take_resume_value() {
-            return Ok(v);
-        }
+    register_runtime_fn_ctx(env, "llm/rerank", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/rerank", "2-3", args.len()));
         }
@@ -3782,7 +4679,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             })
             .collect::<Result<_, _>>()?;
         if documents.is_empty() {
-            return Ok(Value::list(vec![]));
+            return Ok(NativeOutcome::Return(Value::list(vec![])));
         }
 
         let mut top_k = None;
@@ -3803,14 +4700,14 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             model: model.clone(),
         };
 
-        // ── ASYNC path: offload + yield (native targets only) ──────────────
+        // ── Runtime path: offload and suspend (native targets only) ─────────
         //
         // The concurrent rerank path is native-only (no shared tokio runtime on
         // wasm), so wasm always falls through to the synchronous path below.
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
-            // DETACHED reranker span: parent captured now, finalized in the
-            // poller after the yield (where the active-span stack may hold a
+        if in_runtime_offload_context() {
+            // DETACHED reranker span: parent captured now, finalized by the
+            // decoder after the wait (where the active-span stack may hold a
             // sibling task's span, so the span must not pop the stack on drop).
             let span =
                 sema_otel::reranker_span_detached(&query, model.as_deref().unwrap_or(""), top_k);
@@ -3837,70 +4734,57 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 }
             })?;
 
-            let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<RerankResponse, LlmError>>();
-            let req2 = request.clone();
-            // Spawned pool future (the http/shell abort tier): providers with a
-            // native async rerank path (`rerank_future`) are dropped mid-flight on
-            // abort — true cancellation; sync-only providers fall back to the
-            // admission-controlled blocking tier, where cancel stays best-effort
-            // (result discarded, call runs to completion).
-            let abort = sema_io::io_spawn(async move {
-                let r = match resolved_provider.rerank_future(req2.clone()) {
-                    Some(fut) => fut.await,
-                    None => {
-                        let p = resolved_provider.clone();
-                        sema_io::io_offload_blocking(move || p.rerank(req2)).await
-                    }
+            // Root-main and spawned tasks suspend on an External wait; the decoder
+            // builds the reordered output on the VM thread when it lands.
+            if in_runtime_offload_task() {
+                use sema_core::runtime::{
+                    CompletionKind, InterruptibleResource, NativeSuspend,
+                    PreparedExternalOperation, SendPayload, WaitKind,
                 };
-                let _ = tx.send(r);
-                sema_core::notify_io_complete();
-            });
-
-            // Move the span + documents INTO the poller closure so the reordered
-            // output and the final Value are built on the VM thread when the
-            // future lands — never as a native-frame local (those drop at yield).
-            let mut span_slot = Some(span);
-            let documents_for_poller = documents;
-            // On cancel/timeout the scheduler runs the abort hook, aborting the
-            // spawned wire future. Never called on normal completion.
-            let handle = Rc::new(sema_core::IoHandle::with_abort(
-                move || {
-                    use tokio::sync::oneshot::error::TryRecvError;
-                    match rx.try_recv() {
-                        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-                        Ok(Ok(resp)) => {
-                            if let Some(span) = span_slot.take() {
-                                let out_docs: Vec<(String, f64)> = resp
-                                    .results
-                                    .iter()
-                                    .filter_map(|r| {
-                                        documents_for_poller
-                                            .get(r.index)
-                                            .map(|d| (d.clone(), r.score))
-                                    })
-                                    .collect();
-                                span.set_output(&out_docs);
-                                // span drops here → ends the span.
+                let provider_for_job = resolved_provider.clone();
+                let req_for_job = request.clone();
+                let decoder = Box::new(RerankDecoder {
+                    span: Some(span),
+                    documents: documents.clone(),
+                });
+                let kind = CompletionKind::try_from_raw(RERANK_COMPLETION_KIND)
+                    .expect("rerank completion kind is nonzero");
+                let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                let resource = InterruptibleResource::new(
+                    "llm/rerank",
+                    Box::new(LlmSelectCancelHook {
+                        signal: Some(cancel_tx),
+                    }),
+                );
+                let prepared = PreparedExternalOperation::interruptible_async(
+                    kind,
+                    decoder,
+                    resource,
+                    move || async move {
+                        let work = async move {
+                            match provider_for_job.rerank_future(req_for_job.clone()) {
+                                Some(fut) => fut.await,
+                                None => {
+                                    let p = provider_for_job.clone();
+                                    sema_io::io_offload_blocking(move || p.rerank(req_for_job))
+                                        .await
+                                }
                             }
-                            let value = rerank_value_from_response(&resp, &documents_for_poller);
-                            sema_core::IoPoll::Ready(Ok(value))
-                        }
-                        Ok(Err(e)) => {
-                            if let Some(span) = span_slot.take() {
-                                span.record_error(llm_error_kind(&e), &e.to_string());
-                            }
-                            sema_core::IoPoll::Ready(Err(e.to_string()))
-                        }
-                        Err(TryRecvError::Closed) => {
-                            span_slot.take();
-                            sema_core::IoPoll::Ready(Err("rerank: io worker dropped".to_string()))
-                        }
-                    }
-                },
-                abort,
-            ));
-            sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-            return Ok(Value::nil());
+                        };
+                        // A mid-flight cancel drops the in-flight request future.
+                        let r = tokio::select! {
+                            biased;
+                            _ = cancel_rx => Err(LlmError::Config("cancelled".to_string())),
+                            r = work => r,
+                        };
+                        Ok(Box::new(r) as SendPayload)
+                    },
+                );
+                return Ok(NativeOutcome::Suspend(NativeSuspend {
+                    wait: WaitKind::External(Box::new(prepared)),
+                    continuation: Box::new(OffloadValueContinuation { op: "llm/rerank" }),
+                }));
+            }
         }
 
         // ── SYNC path: inline provider call (byte-identical to before) ─────
@@ -3923,7 +4807,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             .collect();
         span.set_output(&out_docs);
 
-        Ok(rerank_value_from_response(&resp, &documents))
+        Ok(NativeOutcome::Return(rerank_value_from_response(
+            &resp, &documents,
+        )))
     });
 
     // (llm/similarity vec1 vec2) — cosine similarity
@@ -4425,49 +5311,15 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (conversation/filter conv pred) — keep only messages where (pred msg) is truthy
-    register_fn_ctx(env, "conversation/filter", |ctx, args| {
-        if args.len() != 2 {
-            return Err(SemaError::arity("conversation/filter", "2", args.len()));
-        }
-        let conv = args[0]
-            .as_conversation_rc()
-            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
-        let pred = &args[1];
-        let mut filtered = Vec::new();
-        for msg in &conv.messages {
-            let msg_val = Value::message(msg.clone());
-            let result = sema_core::call_callback(ctx, pred, &[msg_val])?;
-            if result.is_truthy() {
-                filtered.push(msg.clone());
-            }
-        }
-        Ok(Value::conversation(Conversation {
-            messages: filtered,
-            model: conv.model.clone(),
-            metadata: conv.metadata.clone(),
-        }))
-    });
+    register_conversation_callback_fn(env, ConversationCallbackKind::Filter);
 
     // (conversation/map conv f) — transform each message with (f msg), returns list of results
-    register_fn_ctx(env, "conversation/map", |ctx, args| {
-        if args.len() != 2 {
-            return Err(SemaError::arity("conversation/map", "2", args.len()));
-        }
-        let conv = args[0]
-            .as_conversation_rc()
-            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
-        let func = &args[1];
-        let mut results = Vec::new();
-        for msg in &conv.messages {
-            let msg_val = Value::message(msg.clone());
-            let result = sema_core::call_callback(ctx, func, &[msg_val])?;
-            results.push(result);
-        }
-        Ok(Value::list(results))
-    });
+    register_conversation_callback_fn(env, ConversationCallbackKind::Map);
 
     // (conversation/say-as conv system-prompt "message" opts?) — say with a different system prompt for one turn
-    register_fn(env, "conversation/say-as", |args| {
+    register_runtime_fn_ctx(env, "conversation/say-as", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         if args.len() < 3 || args.len() > 4 {
             return Err(SemaError::arity("conversation/say-as", "3-4", args.len()));
         }
@@ -4547,16 +5399,18 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }))
         };
 
-        // Inside a scheduler task: offload + yield so siblings overlap. Sync
-        // branch below is byte-identical to before. Mirrors `llm/complete`.
+        // Runtime roots and spawned tasks suspend on an External wait; only a
+        // host call uses the synchronous adapter.
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
-            return do_complete_async_yield(request, Box::new(finalize));
+        {
+            dispatch_complete_offload(request, CompleteFinalize::new(finalize))
         }
-
-        let response = do_complete(request)?;
-        track_usage(&response.usage)?;
-        finalize(response)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let response = do_complete(request)?;
+            track_usage(&response.usage)?;
+            finalize(response).map(NativeOutcome::Return)
+        }
     });
 
     // (conversation/token-count conv) — count total tokens in conversation messages
@@ -4849,33 +5703,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
     // (conversation/map-role conv :role f) — transform only messages of `role` with (f msg),
     // which must return a message; other messages pass through unchanged.
-    register_fn_ctx(env, "conversation/map-role", |ctx, args| {
-        if args.len() != 3 {
-            return Err(SemaError::arity("conversation/map-role", "3", args.len()));
-        }
-        let conv = args[0]
-            .as_conversation_rc()
-            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
-        let role = parse_role(&args[1], "conversation/map-role")?;
-        let func = &args[2];
-        let mut messages = Vec::with_capacity(conv.messages.len());
-        for msg in &conv.messages {
-            if msg.role == role {
-                let result = sema_core::call_callback(ctx, func, &[Value::message(msg.clone())])?;
-                let new_msg = result
-                    .as_message_rc()
-                    .ok_or_else(|| SemaError::type_error("message", result.type_name()))?;
-                messages.push((*new_msg).clone());
-            } else {
-                messages.push(msg.clone());
-            }
-        }
-        Ok(Value::conversation(Conversation {
-            messages,
-            model: conv.model.clone(),
-            metadata: conv.metadata.clone(),
-        }))
-    });
+    register_conversation_callback_fn(env, ConversationCallbackKind::MapRole);
 
     // ---- Conversation search (issue #12, Part 3) ----
 
@@ -4906,22 +5734,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (conversation/find conv pred) — first message where (pred msg) is truthy, else nil
-    register_fn_ctx(env, "conversation/find", |ctx, args| {
-        if args.len() != 2 {
-            return Err(SemaError::arity("conversation/find", "2", args.len()));
-        }
-        let conv = args[0]
-            .as_conversation_rc()
-            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
-        let pred = &args[1];
-        for m in &conv.messages {
-            let msg_val = Value::message(m.clone());
-            if sema_core::call_callback(ctx, pred, std::slice::from_ref(&msg_val))?.is_truthy() {
-                return Ok(msg_val);
-            }
-        }
-        Ok(Value::nil())
-    });
+    register_conversation_callback_fn(env, ConversationCallbackKind::Find);
 
     // ---- Prompt algebra (issue #12, Part 7) — exact (role, content) matching ----
 
@@ -5137,7 +5950,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (llm/with-budget {:max-cost-usd 0.50 :max-tokens 10000} thunk)
-    register_fn_ctx(env, "llm/with-budget", |ctx, args| {
+    register_scope_fn_ctx(env, "llm/with-budget", |args| {
         if args.len() != 2 {
             return Err(SemaError::arity("llm/with-budget", "2", args.len()));
         }
@@ -5171,12 +5984,19 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             .map(|s| s == "pre-gate")
             .unwrap_or(false);
 
+        // A fresh budget frame rides as a shared `Rc` (see `push_budget_scope`): a
+        // concurrent fan-out spawned inside this scope captures the frame at spawn
+        // and charges it as one aggregate. The frame is popped when the thunk
+        // returns (its extent), restoring any outer `with-budget` frame.
         push_budget_scope(max_cost, max_tokens);
         let prev_pregate = STREAM_BUDGET_PREGATE.with(|c| c.replace(pregate));
-        let result = sema_core::call_callback(ctx, body_fn, &[]);
-        STREAM_BUDGET_PREGATE.with(|c| c.set(prev_pregate));
-        pop_budget_scope();
-        result
+        Ok((
+            body_fn.clone(),
+            Box::new(move || {
+                STREAM_BUDGET_PREGATE.with(|c| c.set(prev_pregate));
+                pop_budget_scope();
+            }),
+        ))
     });
 
     // --- Cache builtins ---
@@ -5241,7 +6061,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         Ok(Value::map(map))
     });
 
-    register_fn_ctx(env, "llm/with-cache", |ctx, args| {
+    register_scope_fn_ctx(env, "llm/with-cache", |args| {
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/with-cache", "1-2", args.len()));
         }
@@ -5261,89 +6081,71 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         let prev_ttl = CACHE_TTL_SECS.with(|c| c.get());
         CACHE_ENABLED.with(|c| c.set(true));
         CACHE_TTL_SECS.with(|c| c.set(ttl));
-        let result = sema_core::call_callback(ctx, body_fn, &[]);
-        CACHE_ENABLED.with(|c| c.set(prev_enabled));
-        CACHE_TTL_SECS.with(|c| c.set(prev_ttl));
-        result
+        Ok((
+            body_fn.clone(),
+            Box::new(move || {
+                CACHE_ENABLED.with(|c| c.set(prev_enabled));
+                CACHE_TTL_SECS.with(|c| c.set(prev_ttl));
+            }),
+        ))
     });
 
     // --- Cassette (record/replay) builtins ---
 
-    register_fn_ctx(env, "llm/with-cassette", |ctx, args| {
-        // (llm/with-cassette "path.jsonl" [{:mode :auto}] thunk)
-        if args.len() < 2 || args.len() > 3 {
-            return Err(SemaError::arity("llm/with-cassette", "2 or 3", args.len()));
-        }
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let (mode, body_fn) = if args.len() == 3 {
-            let opts = args[1]
-                .as_map_ref()
-                .ok_or_else(|| SemaError::type_error("map", args[1].type_name()))?;
-            let mode = get_opt_effort(opts, "mode")
-                .map(|s| crate::cassette::CassetteMode::parse(&s))
-                .unwrap_or(crate::cassette::CassetteMode::Auto);
-            (mode, &args[2])
-        } else {
-            (crate::cassette::CassetteMode::Auto, &args[1])
-        };
-        if body_fn.as_lambda_rc().is_none() && body_fn.as_native_fn_rc().is_none() {
-            return Err(SemaError::type_error("function", body_fn.type_name()));
-        }
-        let cassette = crate::cassette::Cassette::load(std::path::PathBuf::from(path), mode);
-        // Swap in the cassette and disable the response cache for the dynamic extent
-        // (a cache hit would short-circuit before the tape — see crate::cassette).
-        let prev_cassette = CASSETTE.with(|c| c.borrow_mut().replace(cassette));
-        let prev_cache = CACHE_ENABLED.with(|c| c.replace(false));
-        let result = sema_core::call_callback(ctx, body_fn, &[]);
-        // Flush the tape, then restore the prior cassette + cache state.
-        CASSETTE.with(|c| {
-            if let Some(cass) = c.borrow().as_ref() {
-                let _ = cass.save();
-            }
-        });
-        CASSETTE.with(|c| *c.borrow_mut() = prev_cassette);
-        CACHE_ENABLED.with(|c| c.set(prev_cache));
-        result
-    });
+    // (llm/with-cassette "path.jsonl" [{:mode :auto}] thunk). The tape LOAD is a disk
+    // read; under the cooperative runtime it OFFLOADS to the blocking tier so the
+    // quantum never touches the filesystem, then installs the scope and calls the body.
+    env.set(
+        sema_core::intern("llm/with-cassette"),
+        Value::native_fn(NativeFn::with_ctx_runtime(
+            "llm/with-cassette",
+            |ctx, args| {
+                // Host (non-quantum) path: synchronous load, body call, then flush.
+                let (path, mode, body_fn) = parse_with_cassette_args(args)?;
+                let cassette = crate::cassette::Cassette::load(path, mode);
+                let teardown = install_loaded_cassette(cassette);
+                let result = sema_core::call_callback(ctx, &body_fn, &[]);
+                teardown();
+                result
+            },
+            |_native_ctx, args| with_cassette_runtime(args),
+        )),
+    );
 
-    register_fn(env, "llm/cassette-load", |args| {
-        // (llm/cassette-load "path" [{:mode :replay}]) — install globally.
-        if args.is_empty() || args.len() > 2 {
-            return Err(SemaError::arity("llm/cassette-load", "1 or 2", args.len()));
-        }
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let mode = if args.len() == 2 {
-            let opts = args[1]
-                .as_map_ref()
-                .ok_or_else(|| SemaError::type_error("map", args[1].type_name()))?;
-            get_opt_effort(opts, "mode")
-                .map(|s| crate::cassette::CassetteMode::parse(&s))
-                .unwrap_or(crate::cassette::CassetteMode::Auto)
-        } else {
-            crate::cassette::CassetteMode::Auto
-        };
-        let cassette = crate::cassette::Cassette::load(std::path::PathBuf::from(path), mode);
-        CASSETTE.with(|c| *c.borrow_mut() = Some(cassette));
-        Ok(Value::nil())
-    });
+    // (llm/cassette-load "path" [{:mode :replay}]) — install in the current ambient
+    // scope. Tasks spawned afterward inherit this cassette; tasks that already exist
+    // retain the scope they captured at spawn time. The tape load offloads off the
+    // quantum under the runtime.
+    env.set(
+        sema_core::intern("llm/cassette-load"),
+        Value::native_fn(NativeFn::with_ctx_runtime(
+            "llm/cassette-load",
+            |_ctx, args| {
+                let (path, mode) = parse_cassette_load_args(args)?;
+                let cassette = crate::cassette::Cassette::load(path, mode);
+                install_cassette(cassette);
+                Ok(Value::nil())
+            },
+            |_native_ctx, args| cassette_load_runtime(args),
+        )),
+    );
 
     register_fn(env, "llm/cassette-save", |_args| {
-        let saved = CASSETTE.with(|c| c.borrow().as_ref().map(|cass| cass.save()));
-        match saved {
-            Some(Ok(())) => Ok(Value::bool(true)),
-            Some(Err(e)) => Err(SemaError::eval(format!("cassette save failed: {e}"))),
+        // Flush the active tape OFF the quantum (best-effort under the runtime; the
+        // in-memory tape is authoritative, disk persistence is best-effort).
+        match current_cassette_scope() {
+            Some(scope) => {
+                let mut guard = scope.borrow_mut();
+                persist_cassette_off_quantum(&mut guard);
+                Ok(Value::bool(true))
+            }
             None => Ok(Value::bool(false)),
         }
     });
 
     register_fn(env, "llm/cassette-eject", |_args| {
-        let cass = CASSETTE.with(|c| c.borrow_mut().take());
-        if let Some(cass) = cass {
-            let _ = cass.save();
+        if let Some(mut cass) = take_cassette() {
+            persist_cassette_off_quantum(&mut cass);
             Ok(Value::bool(true))
         } else {
             Ok(Value::bool(false))
@@ -5352,7 +6154,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
     // --- Fallback provider builtins ---
 
-    register_fn_ctx(env, "llm/with-fallback", |ctx, args| {
+    register_scope_fn_ctx(env, "llm/with-fallback", |args| {
         if args.len() != 2 {
             return Err(SemaError::arity("llm/with-fallback", "2", args.len()));
         }
@@ -5369,9 +6171,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             .collect::<Result<_, _>>()?;
         let prev = FALLBACK_CHAIN.with(|c| c.borrow().clone());
         FALLBACK_CHAIN.with(|c| *c.borrow_mut() = Some(chain));
-        let result = sema_core::call_callback(ctx, body_fn, &[]);
-        FALLBACK_CHAIN.with(|c| *c.borrow_mut() = prev);
-        result
+        Ok((
+            body_fn.clone(),
+            Box::new(move || {
+                FALLBACK_CHAIN.with(|c| *c.borrow_mut() = prev);
+            }),
+        ))
     });
 
     register_fn(env, "llm/providers", |_args| {
@@ -5674,7 +6479,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
     // --- Rate limiting ---
 
-    register_fn_ctx(env, "llm/with-rate-limit", |ctx, args| {
+    register_scope_fn_ctx(env, "llm/with-rate-limit", |args| {
         if args.len() != 2 {
             return Err(SemaError::arity("llm/with-rate-limit", "2", args.len()));
         }
@@ -5687,15 +6492,23 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             return Err(SemaError::type_error("function", body_fn.type_name()));
         }
         let prev = RATE_LIMIT_RPS.with(|r| r.get());
+        let prev_last = RATE_LIMIT_LAST.with(|last| last.borrow().clone());
         RATE_LIMIT_RPS.with(|r| r.set(Some(rps)));
-        let result = sema_core::call_callback(ctx, body_fn, &[]);
-        RATE_LIMIT_RPS.with(|r| r.set(prev));
-        result
+        RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = Some(Rc::new(Cell::new(0))));
+        Ok((
+            body_fn.clone(),
+            Box::new(move || {
+                RATE_LIMIT_RPS.with(|r| r.set(prev));
+                RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = prev_last);
+            }),
+        ))
     });
 
     // --- Convenience wrappers ---
 
-    register_fn(env, "llm/summarize", |args| {
+    register_runtime_fn_ctx(env, "llm/summarize", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/summarize", "1-2", args.len()));
         }
@@ -5732,22 +6545,26 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.system = Some(system);
         request.max_tokens = Some(4096);
 
-        // Inside a scheduler task: offload + yield so siblings overlap. Sync
-        // branch below is byte-identical to before. Mirrors `llm/complete`.
+        // Runtime roots and spawned tasks suspend on an External wait; only a
+        // host call uses the synchronous adapter.
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
-            return do_complete_async_yield(
+        {
+            dispatch_complete_offload(
                 request,
-                Box::new(|resp| Ok(Value::string(&resp.content))),
-            );
+                CompleteFinalize::new(|resp| Ok(Value::string(&resp.content))),
+            )
         }
-
-        let response = do_complete(request)?;
-        track_usage(&response.usage)?;
-        Ok(Value::string(&response.content))
+        #[cfg(target_arch = "wasm32")]
+        {
+            let response = do_complete(request)?;
+            track_usage(&response.usage)?;
+            Ok(NativeOutcome::Return(Value::string(&response.content)))
+        }
     });
 
-    register_fn(env, "llm/compare", |args| {
+    register_runtime_fn_ctx(env, "llm/compare", |_ctx, args| {
+        #[allow(unused_imports)]
+        use sema_core::runtime::NativeOutcome;
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/compare", "2-3", args.len()));
         }
@@ -5797,69 +6614,81 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             Ok(sema_core::json_to_value(&json))
         };
 
-        // Inside a scheduler task: offload + yield so siblings overlap. Sync
-        // branch below is byte-identical to before. Mirrors `llm/complete`.
+        // Runtime roots and spawned tasks suspend on an External wait; only a
+        // host call uses the synchronous adapter.
         #[cfg(not(target_arch = "wasm32"))]
-        if sema_core::in_async_context() {
-            return do_complete_async_yield(request, Box::new(parse_comparison));
+        {
+            dispatch_complete_offload(request, CompleteFinalize::new(parse_comparison))
         }
-
-        let response = do_complete(request)?;
-        track_usage(&response.usage)?;
-        parse_comparison(response)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let response = do_complete(request)?;
+            track_usage(&response.usage)?;
+            parse_comparison(response).map(NativeOutcome::Return)
+        }
     });
 
-    // (llm/io-sleep-once id [ms]) — AwaitIo spike leaf (NOT for production use).
+    // (llm/io-sleep-once id [ms]) — external-wait test leaf (NOT for production use).
     //
     // Mimics `llm/chat-once` but does a timer instead of an HTTP call: spawns a
-    // `tokio::time::sleep` on the I/O pool and yields `AwaitIo`, so the
-    // scheduler parks the task and runs siblings. Proves real overlap across the
-    // per-task-VM scheduler before any agent-loop work. Resolves to `id`.
+    // `tokio::time::sleep` on the I/O pool and suspends on an External wait, so
+    // the runtime can drive sibling tasks. This proves real overlap before any
+    // agent-loop work. Resolves to `id`.
     #[cfg(not(target_arch = "wasm32"))]
-    register_fn_ctx(env, "llm/io-sleep-once", |_ctx, args| {
+    register_runtime_fn_ctx(env, "llm/io-sleep-once", |_ctx, args| {
+        use sema_core::runtime::NativeOutcome;
         use std::sync::atomic::Ordering;
 
-        // Vestigial under CALL_NATIVE: the response arrives via the scheduler's
-        // `replace_stack_top`, not by re-invoking this native. Kept for symmetry
-        // with the shipped `async/await` pattern.
-        if let Some(v) = sema_core::take_resume_value() {
-            return Ok(v);
-        }
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/io-sleep-once", "1-2", args.len()));
         }
         let id = args[0].as_int().unwrap_or(0);
         let ms = args.get(1).and_then(|v| v.as_int()).unwrap_or(1000).max(0) as u64;
 
-        let (tx, mut rx) = tokio::sync::oneshot::channel::<i64>();
+        // A runtime root or spawned task suspends on an External wait backed by an
+        // async-tier timer. The in-flight gauge is bumped on the VM thread so a
+        // test can prove simultaneity before the future's first poll; the future
+        // decrements it.
+        if in_runtime_offload_task() {
+            use sema_core::runtime::{
+                CompletionKind, InterruptibleResource, NativeSuspend, PreparedExternalOperation,
+                SendPayload, WaitKind,
+            };
+            let prev = IO_INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+            IO_PEAK.fetch_max(prev, Ordering::SeqCst);
+            let kind = CompletionKind::try_from_raw(IO_SLEEP_COMPLETION_KIND)
+                .expect("io-sleep completion kind is nonzero");
+            let resource =
+                InterruptibleResource::new("llm/io-sleep-once", Box::new(CompleteNoopCancelHook));
+            let prepared = PreparedExternalOperation::interruptible_async(
+                kind,
+                Box::new(IoSleepDecoder),
+                resource,
+                move || async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                    let _ = IO_INFLIGHT
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
+                    Ok(Box::new(id) as SendPayload)
+                },
+            );
+            return Ok(NativeOutcome::Suspend(NativeSuspend {
+                wait: WaitKind::External(Box::new(prepared)),
+                continuation: Box::new(OffloadValueContinuation {
+                    op: "llm/io-sleep-once",
+                }),
+            }));
+        }
 
-        // Bump in-flight + peak on spawn so the test can prove simultaneity.
+        // Host/plain-callback fallback: sleep synchronously and return the id.
+        // The in-flight gauge is bumped/decremented
+        // around the blocking sleep so the concurrency test invariants still hold.
         let prev = IO_INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
         IO_PEAK.fetch_max(prev, Ordering::SeqCst);
-
-        let _abort = sema_io::io_spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-            // Clamp at 0: a stray decrement from an abandoned future (timeout/pool
-            // error-path) must not push a later test's live count negative.
-            let _ = IO_INFLIGHT
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
-            let _ = tx.send(id);
-            // Wake the parked VM thread so it re-polls promptly.
-            sema_core::notify_io_complete();
-        });
-
-        let handle = Rc::new(sema_core::IoHandle::new(move || {
-            use tokio::sync::oneshot::error::TryRecvError;
-            match rx.try_recv() {
-                Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-                Ok(v) => sema_core::IoPoll::Ready(Ok(Value::int(v))),
-                Err(TryRecvError::Closed) => {
-                    sema_core::IoPoll::Ready(Err("io-sleep-once: worker dropped".to_string()))
-                }
-            }
-        }));
-        sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-        Ok(Value::nil())
+        #[cfg(not(target_arch = "wasm32"))]
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        let _ =
+            IO_INFLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
+        Ok(NativeOutcome::Return(Value::int(id)))
     });
 }
 
@@ -5905,7 +6734,9 @@ fn extract_float_vec(val: &Value) -> Result<Vec<f64>, SemaError> {
         .collect()
 }
 
-fn complete_with_prompt(prompt: &Prompt, opts: Option<&Value>) -> Result<Value, SemaError> {
+fn complete_with_prompt(prompt: &Prompt, opts: Option<&Value>) -> sema_core::runtime::NativeResult {
+    #[allow(unused_imports)]
+    use sema_core::runtime::NativeOutcome;
     let messages: Vec<ChatMessage> = prompt
         .messages
         .iter()
@@ -5930,17 +6761,21 @@ fn complete_with_prompt(prompt: &Prompt, opts: Option<&Value>) -> Result<Value, 
     // Per-call observability tags/metadata (read inside do_complete's span).
     let _tele = install_call_telemetry(opts.and_then(|v| v.as_map_rc()).as_ref());
 
-    // Inside a scheduler task: offload + yield so siblings overlap (shared by
-    // `llm/send` and the Prompt-arg branch of `llm/complete`). Sync branch below
-    // is byte-identical to before. Mirrors `llm/complete`.
+    // Shared by `llm/send` and the Prompt-arg branch of `llm/complete`: runtime
+    // roots and spawned tasks suspend on an External wait; host calls are synchronous.
     #[cfg(not(target_arch = "wasm32"))]
-    if sema_core::in_async_context() {
-        return do_complete_async_yield(request, Box::new(|resp| Ok(Value::string(&resp.content))));
+    {
+        dispatch_complete_offload(
+            request,
+            CompleteFinalize::new(|resp| Ok(Value::string(&resp.content))),
+        )
     }
-
-    let response = do_complete(request)?;
-    track_usage(&response.usage)?;
-    Ok(Value::string(&response.content))
+    #[cfg(target_arch = "wasm32")]
+    {
+        let response = do_complete(request)?;
+        track_usage(&response.usage)?;
+        Ok(NativeOutcome::Return(Value::string(&response.content)))
+    }
 }
 
 fn message_to_chat_message(m: &Message) -> ChatMessage {
@@ -6026,16 +6861,65 @@ fn format_schema(val: &Value) -> String {
 /// The schema is a map of keyword keys to field descriptors (maps with `:type`).
 /// Returns Ok(()) if valid, or Err with a description of mismatches.
 fn validate_extraction(result: &Value, schema: &Value) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for step in prepare_extraction_validation(result, schema) {
+        match step {
+            ExtractionValidationStep::Error(error) => errors.push(error),
+            ExtractionValidationStep::Predicate {
+                callable,
+                argument,
+                key_name,
+                failure_message,
+            } => match sema_core::with_stdlib_ctx(|ctx| {
+                sema_core::call_callback(ctx, &callable, std::slice::from_ref(&argument))
+            }) {
+                Ok(value) if value.is_truthy() => {}
+                Ok(_) => errors.push(format!("key {key_name}: {failure_message}")),
+                Err(error) => {
+                    errors.push(format!("key {key_name}: validation error: {error}"));
+                }
+            },
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+enum ExtractionValidationStep {
+    Error(String),
+    Predicate {
+        callable: Value,
+        argument: Value,
+        key_name: String,
+        failure_message: String,
+    },
+}
+
+/// Produce validation work in schema order. Runtime callers drive predicates as
+/// structural calls; synchronous callers consume the same sequence inline.
+fn prepare_extraction_validation(
+    result: &Value,
+    schema: &Value,
+) -> VecDeque<ExtractionValidationStep> {
     let schema_map = match schema.as_map_rc() {
         Some(m) => m,
-        None => return Ok(()),
+        None => return VecDeque::new(),
     };
     let result_map = match result.as_map_rc() {
         Some(m) => m,
-        None => return Err(format!("expected map result, got {}", result.type_name())),
+        None => {
+            return VecDeque::from([ExtractionValidationStep::Error(format!(
+                "expected map result, got {}",
+                result.type_name()
+            ))]);
+        }
     };
 
-    let mut errors = Vec::new();
+    let mut steps = VecDeque::new();
 
     for (key, field_spec) in schema_map.iter() {
         let key_name = key
@@ -6056,7 +6940,9 @@ fn validate_extraction(result: &Value, schema: &Value) -> Result<(), String> {
         match result_val {
             None => {
                 if !is_optional {
-                    errors.push(format!("missing key: {key_name}"));
+                    steps.push_back(ExtractionValidationStep::Error(format!(
+                        "missing key: {key_name}"
+                    )));
                 }
             }
             Some(val) => {
@@ -6071,10 +6957,10 @@ fn validate_extraction(result: &Value, schema: &Value) -> Result<(), String> {
                         _ => true,
                     };
                     if !ok {
-                        errors.push(format!(
+                        steps.push_back(ExtractionValidationStep::Error(format!(
                             "key {key_name}: expected {type_name}, got {}",
                             val.type_name()
-                        ));
+                        )));
                     }
                 } else if let Some(spec) = field_spec.as_map_rc() {
                     // Type checking
@@ -6091,45 +6977,33 @@ fn validate_extraction(result: &Value, schema: &Value) -> Result<(), String> {
                             _ => true,
                         };
                         if !ok {
-                            errors.push(format!(
+                            steps.push_back(ExtractionValidationStep::Error(format!(
                                 "key {key_name}: expected {type_name}, got {}",
                                 val.type_name()
-                            ));
+                            )));
                             continue; // skip :validate if type check failed
                         }
                     }
 
                     // Custom predicate validation via :validate
                     if let Some(validate_fn) = spec.get(&Value::keyword("validate")) {
-                        let custom_msg = spec
+                        let failure_message = spec
                             .get(&Value::keyword("message"))
-                            .and_then(|v| v.as_str().map(|s| s.to_string()));
-
-                        match sema_core::with_stdlib_ctx(|ctx| {
-                            sema_core::call_callback(ctx, validate_fn, std::slice::from_ref(val))
-                        }) {
-                            Ok(v) if v.is_truthy() => {} // validation passed
-                            Ok(_) => {
-                                let msg = custom_msg.unwrap_or_else(|| {
-                                    format!("custom validation failed for value {}", val)
-                                });
-                                errors.push(format!("key {key_name}: {msg}"));
-                            }
-                            Err(e) => {
-                                errors.push(format!("key {key_name}: validation error: {e}"));
-                            }
-                        }
+                            .and_then(|v| v.as_str().map(|s| s.to_string()))
+                            .unwrap_or_else(|| format!("custom validation failed for value {val}"));
+                        steps.push_back(ExtractionValidationStep::Predicate {
+                            callable: validate_fn.clone(),
+                            argument: val.clone(),
+                            key_name,
+                            failure_message,
+                        });
                     }
                 }
             }
         }
     }
 
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors.join("; "))
-    }
+    steps
 }
 
 fn compute_cache_key(request: &ChatRequest) -> String {
@@ -6170,15 +7044,28 @@ fn cache_file_path(key: &str) -> std::path::PathBuf {
 }
 
 fn load_cached(key: &str) -> Option<CachedResponse> {
-    let mem_hit = CACHE_MEM.with(|c| c.borrow().get(key).cloned());
-    if let Some(cached) = mem_hit {
+    if let Some(cached) = load_cached_mem(key) {
         return Some(cached);
     }
-    let path = cache_file_path(key);
-    let data = std::fs::read_to_string(&path).ok()?;
-    let cached: CachedResponse = serde_json::from_str(&data).ok()?;
+    let cached = read_cached_from_disk(&cache_file_path(key))?;
     CACHE_MEM.with(|c| c.borrow_mut().insert(key.to_string(), cached.clone()));
     Some(cached)
+}
+
+/// In-memory (per-task-scope) cache probe only — never touches disk. The VM-thread
+/// preparation stage uses this so a mem hit short-circuits while the disk read is
+/// offloaded onto the runtime's blocking tier (the cache-peek phase below).
+fn load_cached_mem(key: &str) -> Option<CachedResponse> {
+    CACHE_MEM.with(|c| c.borrow().get(key).cloned())
+}
+
+/// Read one cache entry off DISK. The single cache-read filesystem site; MUST run OFF
+/// the runtime quantum — on the blocking tier (the driver's cache-peek phase) or the
+/// host thread. A missing/corrupt file is a miss (`None`), never an error.
+fn read_cached_from_disk(path: &std::path::Path) -> Option<CachedResponse> {
+    note_off_quantum_fs("llm cache read");
+    let data = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
 }
 
 fn store_cached(key: &str, response: &ChatResponse) {
@@ -6189,11 +7076,53 @@ fn store_cached(key: &str, response: &ChatResponse) {
         completion_tokens: response.usage.completion_tokens,
         cached_at: unix_timestamp(),
     };
+    // In-memory cache is authoritative for in-process reuse; update it on the VM
+    // thread. Render the JSON here (bounded — a single response) and push the DISK
+    // write off the quantum.
     CACHE_MEM.with(|c| c.borrow_mut().insert(key.to_string(), cached.clone()));
-    let dir = cache_dir();
-    let _ = std::fs::create_dir_all(&dir);
     if let Ok(json) = serde_json::to_string(&cached) {
-        let _ = std::fs::write(cache_file_path(key), json);
+        persist_cache_file_off_quantum(cache_file_path(key), json);
+    }
+}
+
+/// Persist a cache entry OFF the runtime quantum: on a blocking-tier worker when a
+/// quantum is active, or synchronously on the host thread otherwise. Best-effort —
+/// the in-memory cache already covers in-process reuse, so a dropped disk write only
+/// forgoes cross-process persistence (the entry's existing trust model).
+fn persist_cache_file_off_quantum(path: std::path::PathBuf, json: String) {
+    let write = move || {
+        note_off_quantum_fs("llm cache write");
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&path, json);
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if sema_core::in_runtime_quantum() {
+            sema_io::io_spawn_blocking(write);
+            return;
+        }
+    }
+    write();
+}
+
+/// Build the ZERO-usage `ChatResponse` served by a cache hit. A hit made NO provider
+/// call, so it reports zero tokens: `track_usage` must not recharge session cost or
+/// burn the budget for a cached response (the disk hit is identical to the mem hit).
+fn cache_hit_response(cached: CachedResponse, usage_model: String) -> ChatResponse {
+    ChatResponse {
+        content: cached.content,
+        role: "assistant".to_string(),
+        model: cached.model,
+        tool_calls: vec![],
+        usage: Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            model: usage_model,
+            ..Default::default()
+        },
+        stop_reason: Some("cache_hit".to_string()),
     }
 }
 
@@ -6450,25 +7379,10 @@ fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
     if let Some(cached) = load_cached(&cache_key) {
         if is_cache_valid(&cached) {
             CACHE_HITS.with(|c| c.set(c.get() + 1));
-            // A cache hit makes no provider call: no tokens are consumed and no
-            // money is spent. Report ZERO usage so the caller's `track_usage` does
-            // not re-charge session cost or burn the budget for a cached response
-            // (the provider never saw this request). The cached token counts live
-            // in the on-disk/in-memory entry if ever needed; the live accounting
-            // must reflect actual spend.
-            let resp = ChatResponse {
-                content: cached.content,
-                role: "assistant".to_string(),
-                model: cached.model,
-                tool_calls: vec![],
-                usage: Usage {
-                    prompt_tokens: 0,
-                    completion_tokens: 0,
-                    model: key_request.model.clone(),
-                    ..Default::default()
-                },
-                stop_reason: Some("cache_hit".to_string()),
-            };
+            // A cache hit makes no provider call: no tokens are consumed and no money
+            // is spent. Report ZERO usage so the caller's `track_usage` does not
+            // re-charge session cost or burn the budget for a cached response.
+            let resp = cache_hit_response(cached, key_request.model.clone());
             // Cache-hit span: no provider served it; tag gen_ai.cache.hit=true with
             // zero usage (matches the zero-usage accounting invariant).
             span.set_dispatch("", &resp.model);
@@ -6518,40 +7432,110 @@ fn do_complete_streaming(
     stream_with_dispatch(request, &mut chunk_cb, &span)
 }
 
-/// Concurrent counterpart to [`do_complete`] + the native's post-call accounting,
-/// for the async-scheduler-task path. Mirrors the concurrent `llm/embed` flow,
-/// scaled to a completion: it runs the on-VM-thread stage (conv scope, detached
-/// `chat` span, request attrs, cache lookup, cassette decision, fallback-chain
-/// resolution into `Arc` clones) SYNCHRONOUSLY, then SPAWNS the wire unit
-/// (`run_fallback_retry_async`) as an abortable pool future and YIELDS `AwaitIo`
-/// so sibling tasks overlap — cancel/timeout runs the handle's abort hook, which
-/// drops the in-flight request. All post-call work (span finalize, retry spans,
-/// cache store, cassette record, `track_usage`, content→Value) runs in the
-/// poller, on the VM thread, when the future lands — because the native is NOT
-/// re-invoked on resume.
-///
-/// `finalize` shapes the per-native return value from the `ChatResponse` (e.g.
-/// `Value::string(&resp.content)` for `llm/complete`). It runs in the poller on the
-/// VM thread, AFTER `track_usage`, so it may itself do further VM-thread work
-/// (e.g. `llm/extract`'s re-ask loop).
-///
-/// On a cache hit or cassette replay (no provider call) it finalizes the span,
-/// accounts ZERO usage, calls `finalize`, and returns WITHOUT yielding (nothing to
-/// overlap) — preserving the zero-usage cache-hit accounting invariant.
+/// Shapes a completed `ChatResponse` into the next native-runtime outcome on the
+/// VM thread, after `track_usage`.
 #[cfg(not(target_arch = "wasm32"))]
-fn do_complete_async_yield(
-    request: ChatRequest,
-    finalize: Box<dyn FnOnce(ChatResponse) -> Result<Value, SemaError>>,
-) -> Result<Value, SemaError> {
-    use std::sync::atomic::Ordering;
+type CompleteFinalizeCallback = Box<dyn FnOnce(ChatResponse) -> Result<Value, SemaError>>;
 
-    // Defensive resume-value drain: the scheduler resumes the bytecode after the
-    // CALL via `replace_stack_top`, so this native is not re-invoked — but mirror
-    // `llm/embed`/`io-sleep-once` and drain any stray resume value.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
+#[cfg(not(target_arch = "wasm32"))]
+trait CompleteResponseContinuation: sema_core::runtime::Trace {
+    fn finish(self: Box<Self>, response: ChatResponse) -> sema_core::runtime::NativeResult;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+enum CompleteFinalize {
+    /// A value-producing finalizer. Closures are opaque to the cycle collector,
+    /// so every captured `Value` must also appear in `retained_values`.
+    Value {
+        callback: CompleteFinalizeCallback,
+        retained_values: Vec<Value>,
+    },
+    /// A structural continuation that can return another call or suspension.
+    /// Its implementation owns and traces all retained runtime state.
+    Runtime(Box<dyn CompleteResponseContinuation>),
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl CompleteFinalize {
+    fn new(callback: impl FnOnce(ChatResponse) -> Result<Value, SemaError> + 'static) -> Self {
+        Self::with_values(callback, Vec::new())
     }
 
+    fn with_values(
+        callback: impl FnOnce(ChatResponse) -> Result<Value, SemaError> + 'static,
+        retained_values: Vec<Value>,
+    ) -> Self {
+        Self::Value {
+            callback: Box::new(callback),
+            retained_values,
+        }
+    }
+
+    fn runtime(continuation: Box<dyn CompleteResponseContinuation>) -> Self {
+        Self::Runtime(continuation)
+    }
+
+    fn finish(self, response: ChatResponse) -> sema_core::runtime::NativeResult {
+        match self {
+            Self::Value { callback, .. } => {
+                callback(response).map(sema_core::runtime::NativeOutcome::Return)
+            }
+            Self::Runtime(continuation) => continuation.finish(response),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for CompleteFinalize {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        match self {
+            Self::Value {
+                retained_values, ..
+            } => {
+                for value in retained_values {
+                    sink(sema_core::cycle::GcEdge::Value(value));
+                }
+                true
+            }
+            Self::Runtime(continuation) => continuation.trace(sink),
+        }
+    }
+}
+
+/// On-VM-thread preparation result for a runtime completion. `Inline` is a cache
+/// hit or cassette replay that made no provider call; the caller accounts zero
+/// usage and finalizes without suspending. `Offload` carries the provider plan.
+#[cfg(not(target_arch = "wasm32"))]
+enum CompletePrep {
+    Inline(ChatResponse),
+    Offload(Box<CompleteOffloadPlan>),
+}
+
+/// Everything the provider-at-a-time runtime driver and its VM-thread finalizer
+/// need. The chain is resolved on the VM thread so native workers touch no
+/// thread-locals; `request_for_messages` is retained for the span's I/O attributes.
+#[cfg(not(target_arch = "wasm32"))]
+struct CompleteOffloadPlan {
+    chain: Vec<ResolvedProvider>,
+    request: ChatRequest,
+    max_retries: u32,
+    retry_base_ms: u64,
+    rate_limit_wait_ms: u64,
+    span: sema_otel::LlmSpan,
+    cache_key: Option<String>,
+    cassette_record_key: Option<String>,
+    cassette_scope: Option<CassetteScope>,
+    request_for_messages: ChatRequest,
+}
+
+/// The on-VM-thread prep stage of a runtime completion: open the conversation
+/// scope, start the DETACHED `chat` span, consult the response cache and cassette
+/// (either can short-circuit to `Inline`), then resolve the fallback chain +
+/// rate-limit/retry parameters into `Arc` clones each native attempt can own. All
+/// runtime completion paths use this stage to keep cache, cassette, and retry
+/// behavior aligned.
+#[cfg(not(target_arch = "wasm32"))]
+fn complete_offload_prep(request: ChatRequest) -> Result<CompletePrep, SemaError> {
     // Standalone completions get their own conversation scope (so the chat span
     // carries gen_ai.conversation.id); agent-nested ones inherit. The detached span
     // captures the conversation id at creation, so the guard need only live across
@@ -6566,9 +7550,9 @@ fn do_complete_async_yield(
         None
     };
 
-    // DETACHED chat span: parent captured now, finalized in the poller after the
-    // yield (when the active-span stack may hold a sibling task's span, so the span
-    // must not pop the stack on drop).
+    // DETACHED chat span: parent captured now, finalized when the offload lands
+    // (when the active-span stack may hold a sibling task's span, so the span must
+    // not pop the stack on drop).
     let span = sema_otel::llm_span_detached("chat");
     span.set_request(
         request.temperature,
@@ -6591,7 +7575,7 @@ fn do_complete_async_yield(
     }
     apply_call_telemetry_llm(&span);
 
-    // ── Cache lookup (hit → finalize inline, zero usage, NO yield) ────────
+    // ── Cache lookup (hit → Inline, zero usage) ──────────────────────────
     let cache_enabled = CACHE_ENABLED.with(|c| c.get());
     let cache_key = if cache_enabled {
         let key_model = if request.model.is_empty() {
@@ -6602,47 +7586,32 @@ fn do_complete_async_yield(
         let mut key_request = request.clone();
         key_request.model = key_model;
         let key = compute_cache_key(&key_request);
-        if let Some(cached) = load_cached(&key) {
+        // MEM-only probe on the VM thread — a mem hit short-circuits with ZERO usage
+        // exactly like `do_complete`. The DISK read is offloaded by the driver's
+        // cache-peek phase (so no fs touches the quantum), where the hit/miss counters
+        // are bumped once the disk result lands.
+        if let Some(cached) = load_cached_mem(&key) {
             if is_cache_valid(&cached) {
                 CACHE_HITS.with(|c| c.set(c.get() + 1));
-                // A cache hit made no provider call → ZERO usage (mirrors
-                // `do_complete`), so `track_usage` does not recharge or burn budget.
-                let resp = ChatResponse {
-                    content: cached.content,
-                    role: "assistant".to_string(),
-                    model: cached.model,
-                    tool_calls: vec![],
-                    usage: Usage {
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        model: key_request.model.clone(),
-                        ..Default::default()
-                    },
-                    stop_reason: Some("cache_hit".to_string()),
-                };
+                let resp = cache_hit_response(cached, key_request.model.clone());
                 span.set_dispatch("", &resp.model);
                 span.set_response(&response_facts("", &resp));
                 drop(span);
-                track_usage(&resp.usage)?;
-                return finalize(resp);
+                return Ok(CompletePrep::Inline(resp));
             }
         }
-        // Cache miss (no entry, or entry present but invalid) — mirror the sync
-        // `do_complete` so `(llm/cache-stats)` :misses is accurate for async traffic.
-        CACHE_MISSES.with(|c| c.set(c.get() + 1));
         Some(key)
     } else {
         None
     };
 
-    // ── Cassette decision (replay → inline, no yield; miss → Err) ─────────
+    // ── Cassette decision (replay → Inline; miss → Err) ──────────────────
     // Keyed by the request as-is (no default-model resolution), matching
     // `run_completion`'s key so record/replay agree with the sync path.
-    let cassette_decision = CASSETTE.with(|c| {
-        c.borrow().as_ref().map(|cass| {
-            let key = compute_cache_key(&request);
-            (key.clone(), cass.decide(&key))
-        })
+    let cassette_scope = current_cassette_scope();
+    let cassette_decision = cassette_scope.as_ref().map(|scope| {
+        let key = compute_cache_key(&request);
+        (key.clone(), scope.borrow().decide(&key))
     });
     match cassette_decision {
         Some((_, crate::cassette::Decision::Replay(entry))) => {
@@ -6650,8 +7619,7 @@ fn do_complete_async_yield(
             span.set_dispatch("cassette", &resp.model);
             span.set_response(&response_facts("cassette", &resp));
             drop(span);
-            track_usage(&resp.usage)?;
-            return finalize(resp);
+            return Ok(CompletePrep::Inline(resp));
         }
         Some((k, crate::cassette::Decision::Miss(_))) => return Err(cassette_miss_error(&k)),
         _ => {}
@@ -6663,14 +7631,13 @@ fn do_complete_async_yield(
 
     // ── Resolve the fallback chain (or default provider) into Arc clones ──
     // Done on the VM thread so the offloaded worker touches no thread-locals.
-    // Reserve this call's rate-limit slot HERE, synchronously, before the
-    // offload starts (see `reserve_rate_limit_wait_ms`); the wait itself (if
-    // any) is spent inside the spawned future below, never on the VM thread.
+    // Reserve this call's rate-limit slot HERE, synchronously. Runtime calls
+    // spend the wait as a structural timer before the provider driver starts;
+    // host calls use the synchronous path's existing pacing behavior.
     let rate_limit_wait_ms = reserve_rate_limit_wait_ms();
     let max_retries = NETWORK_MAX_RETRIES.with(|c| c.get());
-    // Capture the retry-backoff base on the VM thread so the offloaded wire
-    // stage honors it (pool workers have their own RETRY_BASE_MS TLS copies) —
-    // see `retry_backoff_ms`. Threaded through `run_fallback_retry_async`.
+    // Capture the retry-backoff base on the VM thread so each native provider
+    // attempt honors it (pool workers have their own RETRY_BASE_MS TLS copies).
     let retry_base_ms = RETRY_BASE_MS.with(|c| c.get());
     let chain: Vec<ResolvedProvider> = PROVIDER_REGISTRY.with(|reg| {
         let reg = reg.borrow();
@@ -6708,174 +7675,1251 @@ fn do_complete_async_yield(
         }
     })?;
 
-    // ── Offload the wire unit + yield ────────────────────────────────────
-    let (tx, mut rx) =
-        tokio::sync::oneshot::channel::<Result<CompleteOutcome, crate::types::LlmError>>();
-    let req2 = request.clone();
-    // NOTE (async-path compat nuance): the wire stage runs on pool workers, so
-    // OpenAI's `DROP_TEMPERATURE` self-heal LEARNS into a worker's TLS, not the
-    // VM thread's. The WITHIN-call self-heal (400 → drop temperature → retry
-    // once) is fully preserved (openai's `complete_future` strips temperature
-    // from the retried request explicitly), so every async completion still
-    // succeeds; only the cross-call optimization (skip the doomed first request
-    // on later calls) is not shared across the VM thread — each async call may
-    // pay one extra 400+retry on temperature-rejecting models. Correctness
-    // holds; documented as a minor async-path divergence.
-    // Bump in-flight + peak on spawn so a test can prove simultaneity (mirrors the
-    // io-sleep-once spike instrumentation). The balancing guard is constructed
-    // HERE and moved into the future: an abort that lands before the future's
-    // first poll still drops the future — and the captured guard with it — so
-    // the gauge cannot strand at +1.
-    struct InflightGuard;
-    impl Drop for InflightGuard {
-        fn drop(&mut self) {
-            let _ = IO_INFLIGHT
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
+    let request_for_messages = request.clone();
+    Ok(CompletePrep::Offload(Box::new(CompleteOffloadPlan {
+        chain,
+        request,
+        max_retries,
+        retry_base_ms,
+        rate_limit_wait_ms,
+        span,
+        cache_key,
+        cassette_record_key,
+        cassette_scope,
+        request_for_messages,
+    })))
+}
+
+/// VM-thread finalizer for a successful offloaded completion: finalize the span (retry spans,
+/// dispatch/response/messages facts), store the cache entry, record the cassette,
+/// fold the leaf usage accumulator, then `track_usage` under the captured budget
+/// frame (a budget overrun fails the task, exactly as the sync path's `?`) and
+/// finally `finalize` the response into the per-native return value. `span`,
+/// `finalize`, and the captured `Rc` slots are all consumed exactly once here.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+fn finalize_complete_success(
+    outcome: CompleteOutcome,
+    span: sema_otel::LlmSpan,
+    cache_key: Option<String>,
+    cassette_record_key: Option<String>,
+    cassette_scope: Option<CassetteScope>,
+    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
+    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
+    request_for_messages: &ChatRequest,
+    finalize: CompleteFinalize,
+) -> sema_core::runtime::NativeResult {
+    let CompleteOutcome {
+        resp,
+        serving_provider,
+        serving_model,
+        retry_events,
+    } = outcome;
+    // Emit retry spans + set the response facts UNDER this span so children parent
+    // correctly (the detached span is not on the stack). `entered` installs it as
+    // the active parent for the closure, then restores.
+    span.entered(|| {
+        emit_retry_spans(&retry_events);
+    });
+    span.set_dispatch(&serving_provider, &serving_model);
+    span.set_response(&response_facts(&serving_provider, &resp));
+    span.set_messages(
+        &messages_json(&request_for_messages.messages),
+        &content_json("assistant", &resp.content),
+        request_for_messages
+            .system
+            .as_deref()
+            .map(|s| content_json("system", s))
+            .as_deref(),
+    );
+    drop(span); // ends the span
+    set_serving_provider(&serving_provider);
+    if let Some(key) = &cache_key {
+        store_cached(key, &resp);
+    }
+    if let Some(key) = &cassette_record_key {
+        cassette_scope_record(
+            &cassette_scope,
+            crate::cassette::TapeEntry::from_response(key, &resp),
+        );
+    }
+    // Fold this completion into the LEAF'S OWN captured accumulator frame — the
+    // `Rc` snapshotted at dispatch, not whatever scope is active when the offload
+    // lands (the finalize runs outside the per-task install boundary). Price it the
+    // same way `track_usage` does, then suppress `track_usage`'s own active-frame
+    // fold so this completion is counted exactly once.
+    if let Some(slot) = &usage_accum_slot {
+        let cost = pricing::calculate_cost_for(&serving_provider, &resp.usage);
+        accumulate_into(slot, &resp.usage, cost);
+    }
+    // Account on the VM thread, then shape the value. Install THIS completion's
+    // captured budget frame as active around `track_usage` so the charge + limit
+    // check land on the dispatch-time frame (shared by `Rc` across the fan-out),
+    // then restore whatever was active.
+    let track_result = {
+        let prev_budget =
+            ACTIVE_BUDGET.with(|b| std::mem::replace(&mut *b.borrow_mut(), budget_slot.clone()));
+        let r = USAGE_ACCUM_SUPPRESS.with(|s| {
+            s.set(true);
+            let r = track_usage(&resp.usage);
+            s.set(false);
+            r
+        });
+        ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
+        r
+    };
+    track_result?;
+    finalize.finish(resp)
+}
+
+/// Completion-kind tag for an agent/chat provider round offloaded through the
+/// unified runtime's External-wait machinery (distinct from mcp's kinds).
+#[cfg(not(target_arch = "wasm32"))]
+const AGENT_COMPLETE_COMPLETION_KIND: u64 = 0x6c6c_6d63; // "llmc"
+
+/// Completion-kind tag for the offloaded cache disk-read peek.
+#[cfg(not(target_arch = "wasm32"))]
+const CACHE_PEEK_COMPLETION_KIND: u64 = 0x6361_6368; // "cach"
+
+/// Completion-kind tag for an offloaded cassette tape LOAD (disk read).
+#[cfg(not(target_arch = "wasm32"))]
+const CASSETTE_LOAD_COMPLETION_KIND: u64 = 0x6373_6c64; // "csld"
+
+/// True when a provider call must offload and suspend on the unified runtime's
+/// External wait. Root-main and spawned tasks obey the same boundary.
+#[cfg(not(target_arch = "wasm32"))]
+fn in_runtime_offload_task() -> bool {
+    in_runtime_offload_context()
+}
+
+/// Route a prepared completion through the offload appropriate to the current
+/// execution context, returning a `NativeResult`. This is the shared split every
+/// simple completion entry point (`llm/complete`, `llm/send`, `llm/chat` no-tools,
+/// `llm/compare`) uses so runtime and synchronous paths stay aligned:
+///
+/// * any unified-runtime quantum → [`do_complete_runtime_suspend`]; Sema callbacks
+///   run as structural calls and native attempts park on External;
+/// * a host call → the synchronous provider call.
+///
+/// `finalize` shapes the return value from the `ChatResponse` and runs on the VM
+/// thread after `track_usage`, so it MUST be equivalent across both paths.
+#[cfg(not(target_arch = "wasm32"))]
+fn dispatch_complete_offload(
+    request: ChatRequest,
+    finalize: CompleteFinalize,
+) -> sema_core::runtime::NativeResult {
+    if in_runtime_offload_task() {
+        return do_complete_runtime_suspend(request, finalize);
+    }
+    let response = do_complete(request)?;
+    track_usage(&response.usage)?;
+    finalize.finish(response)
+}
+
+/// Cooperative provider-complete round under the unified runtime. It uses the
+/// shared on-VM-thread preparation and finalization stages, then drives providers
+/// in fallback order. Sema callbacks are structural VM calls; each native attempt
+/// runs on the executor's IO pool behind a cancellable External wait. A cache hit
+/// or cassette replay finalizes inline. Returns the `NativeOutcome` directly on the
+/// runtime native ABI (`__agent-step` drives it through its runtime callback).
+#[cfg(not(target_arch = "wasm32"))]
+fn do_complete_runtime_suspend(
+    request: ChatRequest,
+    finalize: CompleteFinalize,
+) -> sema_core::runtime::NativeResult {
+    let plan = match complete_offload_prep(request)? {
+        CompletePrep::Inline(resp) => {
+            track_usage(&resp.usage)?;
+            return finalize.finish(resp);
+        }
+        CompletePrep::Offload(plan) => *plan,
+    };
+    dispatch_complete_runtime_plan(plan, finalize)
+}
+
+/// Drive a runtime completion one provider at a time. Sema-defined providers run
+/// as structural VM calls, while native providers suspend on one external attempt
+/// (including that provider's retry loop). Owning the whole chain in one
+/// continuation preserves arbitrary fallback order without blocking a quantum.
+#[cfg(not(target_arch = "wasm32"))]
+fn dispatch_complete_runtime_plan(
+    plan: CompleteOffloadPlan,
+    finalize: CompleteFinalize,
+) -> sema_core::runtime::NativeResult {
+    Box::new(RuntimeCompleteDriver {
+        plan,
+        finalize,
+        next_provider: 0,
+        last_error: None,
+        phase: RuntimeCompletePhase::Ready,
+        cache_peeked: false,
+        usage_accum_slot: current_usage_accum(),
+        budget_slot: active_budget(),
+    })
+    .advance()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+type CompleteAttemptSlot = Rc<RefCell<Option<Result<CompleteOutcome, crate::types::LlmError>>>>;
+
+/// Delivery slot for the offloaded cache-peek disk read. Outer `Option` = "the
+/// decoder ran"; inner `Option<CachedResponse>` = "a well-formed on-disk entry" (or a
+/// miss). Validity/TTL is checked on the VM thread when the read lands.
+#[cfg(not(target_arch = "wasm32"))]
+type CachePeekSlot = Rc<RefCell<Option<Option<CachedResponse>>>>;
+
+#[cfg(not(target_arch = "wasm32"))]
+enum RuntimeCompletePhase {
+    Ready,
+    /// Parked on the offloaded cache disk read (blocking tier); a hit finalizes inline
+    /// with zero usage, a miss proceeds to the provider chain.
+    CachePeek {
+        slot: CachePeekSlot,
+    },
+    Pacing,
+    Sema {
+        provider: String,
+        model: String,
+    },
+    Native {
+        provider: String,
+        slot: CompleteAttemptSlot,
+    },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct RuntimeCompleteDriver {
+    plan: CompleteOffloadPlan,
+    finalize: CompleteFinalize,
+    next_provider: usize,
+    last_error: Option<crate::types::LlmError>,
+    phase: RuntimeCompletePhase,
+    /// Whether the offloaded cache disk peek has already run (it runs at most once,
+    /// before pacing and the provider chain).
+    cache_peeked: bool,
+    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
+    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for RuntimeCompleteDriver {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        sema_core::runtime::Trace::trace(&self.finalize, sink)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RuntimeCompleteDriver {
+    fn advance(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome, NativeSuspend, WaitKind};
+
+        // ── Cache disk peek (once, before pacing/providers) ──────────────────
+        // The on-disk read is offloaded to the blocking tier so the quantum never
+        // touches the filesystem; a hit finalizes inline with ZERO usage and leaves
+        // any sibling task runnable while parked.
+        if !self.cache_peeked {
+            self.cache_peeked = true;
+            if let Some(key) = self.plan.cache_key.clone() {
+                return self.suspend_cache_peek(key);
+            }
+        }
+
+        if self.plan.rate_limit_wait_ms > 0 {
+            let delay = std::time::Duration::from_millis(self.plan.rate_limit_wait_ms);
+            self.plan.rate_limit_wait_ms = 0;
+            self.phase = RuntimeCompletePhase::Pacing;
+            return Ok(NativeOutcome::Suspend(NativeSuspend {
+                wait: WaitKind::Timer(delay),
+                continuation: self,
+            }));
+        }
+
+        loop {
+            let Some(entry) = self.plan.chain.get(self.next_provider) else {
+                let error = self.last_error.take().unwrap_or_else(|| {
+                    crate::types::LlmError::Config("all providers failed".to_string())
+                });
+                self.plan
+                    .span
+                    .record_error("provider_error", &error.to_string());
+                return Err(SemaError::Llm(error.to_string()));
+            };
+            self.next_provider += 1;
+
+            let provider = entry.provider.clone();
+            let provider_name = entry.name.clone();
+            let mut request = self.plan.request.clone();
+            if let Some(model) = &entry.model {
+                request.model = model.clone();
+            } else if request.model.is_empty() {
+                request.model = provider.default_model().to_string();
+            }
+
+            if provider.runs_on_vm_thread() {
+                let callback = match lisp_provider_complete_callback(&provider_name) {
+                    Ok(callback) => callback,
+                    Err(error) => {
+                        eprintln!(
+                            "Provider '{}' failed: {error}, trying next...",
+                            provider_name
+                        );
+                        self.last_error = Some(error);
+                        continue;
+                    }
+                };
+                let model = request.model.clone();
+                self.phase = RuntimeCompletePhase::Sema {
+                    provider: provider_name,
+                    model,
+                };
+                return Ok(NativeOutcome::Call(NativeCall {
+                    callable: callback,
+                    args: vec![chat_request_to_value(&request)],
+                    continuation: self,
+                }));
+            }
+
+            return self.suspend_native_attempt(provider, provider_name, request);
         }
     }
-    let prev = IO_INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
-    IO_PEAK.fetch_max(prev, Ordering::SeqCst);
-    let inflight = InflightGuard;
-    // Offloaded as a SPAWNED POOL FUTURE (the http/shell abort tier), not
-    // spawn_blocking: native-async providers are dropped mid-flight on abort —
-    // the in-flight request's connection is torn down, no wasted round-trip.
-    // Sync-only providers fall back to the admission-controlled blocking tier
-    // inside `complete_once_async`, where cancel stays best-effort.
-    let abort = sema_io::io_spawn(async move {
-        // Balance in-flight on EVERY exit — normal completion or abort-drop.
-        let _inflight = inflight;
-        // Spend the reserved rate-limit pacing gap HERE, on the pool worker —
-        // never on the VM thread — so sibling tasks keep running while it
-        // elapses. An abort during this wait drops the whole future (dropping
-        // the sleep with it), same as an abort mid-request.
-        if rate_limit_wait_ms > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(rate_limit_wait_ms)).await;
-        }
-        let r = run_fallback_retry_async(chain, req2, max_retries, retry_base_ms).await;
-        let _ = tx.send(r);
-        sema_core::notify_io_complete();
-    });
 
-    // Move the span + cassette/cache context INTO the poller closure so all
-    // post-call work runs on the VM thread when the future lands.
-    let mut span_slot = Some(span);
-    let mut finalize_slot = Some(finalize);
-    // Capture THIS leaf's per-leaf usage accumulator frame (if a workflow scope is
-    // open) the same way the otel span crosses the yield via `span_slot`. Folding into
-    // this captured Rc — not whatever frame is on top when the future lands — is what
-    // makes async fan-out correct: a sibling leaf opening its own scope can't clobber
-    // this in-flight leaf's tally.
-    let usage_accum_slot = current_usage_accum();
-    // Capture the active BUDGET frame `Rc` the same way (ASYNC-1). The poller runs
-    // OUTSIDE the per-task install boundary (during `wake_blocked_tasks`), so the
-    // thread-local budget is whatever is active when the future lands — not the frame
-    // that was in force when this completion was dispatched. Re-installing THIS captured
-    // frame around `track_usage` below is what lets a concurrent `with-budget` fan-out
-    // charge one shared aggregate and gate correctly.
-    let budget_slot = active_budget();
-    let request_for_messages = request;
-    // True cancellation: on cancel/timeout the scheduler runs the abort hook,
-    // which aborts the spawned wire future → the in-flight provider request is
-    // dropped (connection torn down). Never called on normal completion.
-    let handle = Rc::new(sema_core::IoHandle::with_abort(
-        move || {
-            use tokio::sync::oneshot::error::TryRecvError;
-            match rx.try_recv() {
-                Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-                Ok(Ok(outcome)) => {
-                    let CompleteOutcome {
+    /// Suspend on the offloaded cache disk read for `key`. The read runs on the
+    /// blocking tier (`interruptible_blocking`), never the VM quantum.
+    fn suspend_cache_peek(mut self: Box<Self>, key: String) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{
+            CompletionKind, InterruptibleResource, NativeOutcome, NativeSuspend,
+            PreparedExternalOperation, SendPayload, WaitKind,
+        };
+        let slot: CachePeekSlot = Rc::new(RefCell::new(None));
+        let decoder = Box::new(CachePeekDecoder {
+            slot: Rc::clone(&slot),
+        });
+        self.phase = RuntimeCompletePhase::CachePeek { slot };
+        let kind = CompletionKind::try_from_raw(CACHE_PEEK_COMPLETION_KIND)
+            .expect("cache-peek completion kind is nonzero");
+        let resource =
+            InterruptibleResource::new("llm/cache-peek", Box::new(CompleteNoopCancelHook));
+        let path = cache_file_path(&key);
+        let prepared =
+            PreparedExternalOperation::interruptible_blocking(kind, decoder, resource, move || {
+                Ok(Box::new(read_cached_from_disk(&path)) as SendPayload)
+            });
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::External(Box::new(prepared)),
+            continuation: self,
+        }))
+    }
+
+    /// Resume after the offloaded cache disk read. A valid on-disk entry is a HIT:
+    /// populate the in-memory cache, count the hit, and finalize inline with ZERO
+    /// usage — identical to the mem hit, so `track_usage` never recharges. Otherwise
+    /// count the miss and proceed to the provider chain.
+    fn finish_cache_peek(
+        mut self: Box<Self>,
+        disk: Option<CachedResponse>,
+    ) -> sema_core::runtime::NativeResult {
+        if let Some(cached) = disk {
+            if is_cache_valid(&cached) {
+                CACHE_HITS.with(|c| c.set(c.get() + 1));
+                let Self { plan, finalize, .. } = *self;
+                if let Some(key) = &plan.cache_key {
+                    CACHE_MEM.with(|c| c.borrow_mut().insert(key.clone(), cached.clone()));
+                }
+                let usage_model = cached.model.clone();
+                let resp = cache_hit_response(cached, usage_model);
+                plan.span.set_dispatch("", &resp.model);
+                plan.span.set_response(&response_facts("", &resp));
+                drop(plan.span);
+                track_usage(&resp.usage)?;
+                return finalize.finish(resp);
+            }
+        }
+        // Miss (no entry, or entry present but invalid) — count it once here (deferred
+        // from prep) so `(llm/cache-stats)` :misses is accurate, then run providers.
+        CACHE_MISSES.with(|c| c.set(c.get() + 1));
+        self.phase = RuntimeCompletePhase::Ready;
+        self.advance()
+    }
+
+    fn suspend_native_attempt(
+        mut self: Box<Self>,
+        provider: std::sync::Arc<dyn LlmProvider>,
+        provider_name: String,
+        request: ChatRequest,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{
+            CompletionKind, InterruptibleResource, NativeOutcome, NativeSuspend,
+            PreparedExternalOperation, SendPayload, WaitKind,
+        };
+
+        let max_retries = self.plan.max_retries;
+        let retry_base_ms = self.plan.retry_base_ms;
+        let serving_model = request.model.clone();
+        let slot = Rc::new(RefCell::new(None));
+        let decoder = Box::new(CompleteAttemptDecoder {
+            slot: Rc::clone(&slot),
+        });
+        self.phase = RuntimeCompletePhase::Native {
+            provider: provider_name.clone(),
+            slot,
+        };
+
+        let kind = CompletionKind::try_from_raw(AGENT_COMPLETE_COMPLETION_KIND)
+            .expect("agent completion kind is nonzero");
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let resource = InterruptibleResource::new(
+            "agent/complete",
+            Box::new(LlmSelectCancelHook {
+                signal: Some(cancel_tx),
+            }),
+        );
+        let prepared = PreparedExternalOperation::interruptible_async(
+            kind,
+            decoder,
+            resource,
+            move || async move {
+                let work = async move {
+                    let _inflight = InflightGuard::new();
+                    complete_with_retry_collecting_async(
+                        &provider,
+                        &request,
+                        max_retries,
+                        retry_base_ms,
+                    )
+                    .await
+                    .map(|(resp, retry_events)| CompleteOutcome {
                         resp,
-                        serving_provider,
+                        serving_provider: provider_name,
                         serving_model,
                         retry_events,
-                    } = outcome;
-                    if let Some(span) = span_slot.take() {
-                        // Emit retry spans + set the response facts UNDER this span so
-                        // children parent correctly (the detached span is not on the
-                        // stack). `entered` installs it as the active parent for the
-                        // closure, then restores.
-                        span.entered(|| {
-                            emit_retry_spans(&retry_events);
-                        });
-                        span.set_dispatch(&serving_provider, &serving_model);
-                        span.set_response(&response_facts(&serving_provider, &resp));
-                        span.set_messages(
-                            &messages_json(&request_for_messages.messages),
-                            &content_json("assistant", &resp.content),
-                            request_for_messages
-                                .system
-                                .as_deref()
-                                .map(|s| content_json("system", s))
-                                .as_deref(),
-                        );
-                        // span drops here → ends the span.
+                    })
+                };
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel_rx => {
+                        Err(crate::types::LlmError::Config("cancelled".to_string()))
                     }
-                    set_serving_provider(&serving_provider);
-                    if let Some(key) = &cache_key {
-                        store_cached(key, &resp);
-                    }
-                    if let Some(key) = &cassette_record_key {
-                        CASSETTE.with(|c| {
-                            if let Some(cass) = c.borrow_mut().as_mut() {
-                                cass.record_entry(crate::cassette::TapeEntry::from_response(
-                                    key, &resp,
-                                ));
-                            }
-                        });
-                    }
-                    // Fold this completion into the LEAF'S OWN captured accumulator frame —
-                    // the `Rc` snapshotted at yield time, not whatever scope is active when
-                    // the future lands (the poller runs outside the per-task install
-                    // boundary, so the thread-local may now hold a sibling's scope). Price
-                    // it the same way `track_usage` does — by the serving provider — then
-                    // suppress `track_usage`'s own active-frame fold so this completion is
-                    // counted exactly once.
-                    if let Some(slot) = &usage_accum_slot {
-                        let cost = pricing::calculate_cost_for(&serving_provider, &resp.usage);
-                        accumulate_into(slot, &resp.usage, cost);
-                    }
-                    // Account on the VM thread, then shape the value. A budget overrun
-                    // fails the task, exactly as the sync path's `?`. Install THIS
-                    // completion's captured budget frame as active around `track_usage` so
-                    // the charge + limit check land on the dispatch-time frame (shared by
-                    // `Rc` across the fan-out), then restore whatever was active.
-                    let track_result = {
-                        let prev_budget = ACTIVE_BUDGET
-                            .with(|b| std::mem::replace(&mut *b.borrow_mut(), budget_slot.clone()));
-                        let r = USAGE_ACCUM_SUPPRESS.with(|s| {
-                            s.set(true);
-                            let r = track_usage(&resp.usage);
-                            s.set(false);
-                            r
-                        });
-                        ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
-                        r
-                    };
-                    if let Err(e) = track_result {
-                        return sema_core::IoPoll::Ready(Err(e.to_string()));
-                    }
-                    let finalize = finalize_slot.take().expect("finalize used once");
-                    match finalize(resp) {
-                        Ok(value) => sema_core::IoPoll::Ready(Ok(value)),
-                        Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
-                    }
-                }
-                Ok(Err(e)) => {
-                    if let Some(span) = span_slot.take() {
-                        span.record_error(llm_error_kind(&e), &e.to_string());
-                    }
-                    sema_core::IoPoll::Ready(Err(e.to_string()))
-                }
-                Err(TryRecvError::Closed) => {
-                    span_slot.take();
-                    sema_core::IoPoll::Ready(Err("complete: io worker dropped".to_string()))
+                    result = work => result,
+                };
+                Ok(Box::new(result) as SendPayload)
+            },
+        );
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::External(Box::new(prepared)),
+            continuation: self,
+        }))
+    }
+
+    fn provider_failed(
+        mut self: Box<Self>,
+        provider: String,
+        error: crate::types::LlmError,
+    ) -> sema_core::runtime::NativeResult {
+        eprintln!("Provider '{provider}' failed: {error}, trying next...");
+        self.last_error = Some(error);
+        self.phase = RuntimeCompletePhase::Ready;
+        self.advance()
+    }
+
+    fn finish(self: Box<Self>, outcome: CompleteOutcome) -> sema_core::runtime::NativeResult {
+        let Self {
+            plan,
+            finalize,
+            usage_accum_slot,
+            budget_slot,
+            ..
+        } = *self;
+        finalize_complete_success(
+            outcome,
+            plan.span,
+            plan.cache_key,
+            plan.cassette_record_key,
+            plan.cassette_scope,
+            usage_accum_slot,
+            budget_slot,
+            &plan.request_for_messages,
+            finalize,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::NativeContinuation for RuntimeCompleteDriver {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+
+        match (&self.phase, input) {
+            (RuntimeCompletePhase::CachePeek { slot }, ResumeInput::Returned(_)) => {
+                let disk = slot.borrow_mut().take().flatten();
+                self.finish_cache_peek(disk)
+            }
+            (RuntimeCompletePhase::CachePeek { .. }, ResumeInput::Failed(_)) => {
+                // A failed disk read is a cache miss, not a fatal error — run providers.
+                self.finish_cache_peek(None)
+            }
+            (RuntimeCompletePhase::Pacing, ResumeInput::Returned(_)) => {
+                let mut this = self;
+                this.phase = RuntimeCompletePhase::Ready;
+                this.advance()
+            }
+            (RuntimeCompletePhase::Sema { provider, model }, ResumeInput::Returned(value)) => {
+                let provider = provider.clone();
+                let model = model.clone();
+                match parse_lisp_provider_response(&value, &model) {
+                    Ok(resp) => self.finish(CompleteOutcome {
+                        resp,
+                        serving_provider: provider,
+                        serving_model: model,
+                        retry_events: Vec::new(),
+                    }),
+                    Err(error) => self.provider_failed(provider, error),
                 }
             }
-        },
-        abort,
-    ));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
+            (RuntimeCompletePhase::Sema { provider, .. }, ResumeInput::Failed(error)) => {
+                let provider = provider.clone();
+                self.provider_failed(
+                    provider,
+                    crate::types::LlmError::Api {
+                        status: 0,
+                        message: error.to_string(),
+                    },
+                )
+            }
+            (RuntimeCompletePhase::Native { provider, slot }, ResumeInput::Returned(_)) => {
+                let provider = provider.clone();
+                let result = slot
+                    .borrow_mut()
+                    .take()
+                    .ok_or_else(|| SemaError::eval("agent completion result was not delivered"))?;
+                match result {
+                    Ok(outcome) => self.finish(outcome),
+                    Err(error) => self.provider_failed(provider, error),
+                }
+            }
+            (_, ResumeInput::Failed(error)) => {
+                self.plan.span.record_error("io", &error.to_string());
+                Err(error)
+            }
+            (_, ResumeInput::Cancelled(reason)) => Err(SemaError::eval(format!(
+                "agent completion was cancelled ({reason:?})"
+            ))),
+            (_, ResumeInput::Runtime(_)) => Err(SemaError::eval(
+                "agent completion driver received an unexpected runtime response",
+            )),
+            (RuntimeCompletePhase::Ready, ResumeInput::Returned(_)) => Err(SemaError::eval(
+                "agent completion driver resumed without an active attempt",
+            )),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct CompleteAttemptDecoder {
+    slot: CompleteAttemptSlot,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for CompleteAttemptDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CompletionDecoder for CompleteAttemptDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        let payload = result.map_err(|failure| {
+            SemaError::eval(format!("agent completion: {}", failure.message()))
+        })?;
+        let result = sema_core::runtime::downcast_send_payload::<
+            Result<CompleteOutcome, crate::types::LlmError>,
+        >(payload, "agent-complete")
+        .map_err(|failure| SemaError::eval(format!("agent completion: {}", failure.message())))?;
+        let mut slot = self.slot.borrow_mut();
+        if slot.is_some() {
+            return Err(SemaError::eval(
+                "agent completion result was delivered more than once",
+            ));
+        }
+        *slot = Some(result);
+        Ok(Value::nil())
+    }
+}
+
+/// Decoder for the offloaded cache disk peek: hands the on-disk `Option<CachedResponse>`
+/// back to the driver. Holds no `Value`, so it emits no GC edges.
+#[cfg(not(target_arch = "wasm32"))]
+struct CachePeekDecoder {
+    slot: CachePeekSlot,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for CachePeekDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CompletionDecoder for CachePeekDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        let payload = result
+            .map_err(|failure| SemaError::eval(format!("cache peek: {}", failure.message())))?;
+        let cached = sema_core::runtime::downcast_send_payload::<Option<CachedResponse>>(
+            payload,
+            "cache-peek",
+        )
+        .map_err(|failure| SemaError::eval(format!("cache peek: {}", failure.message())))?;
+        *self.slot.borrow_mut() = Some(cached);
+        Ok(Value::nil())
+    }
+}
+
+/// What to do once an offloaded cassette tape LOAD lands.
+#[cfg(not(target_arch = "wasm32"))]
+enum CassetteLoadThen {
+    /// `llm/with-cassette`: install the loaded cassette scope, then CALL the body
+    /// thunk under a scope-teardown continuation.
+    WithBody(Value),
+    /// `llm/cassette-load`: install the cassette in the ambient scope, then return nil.
+    Install,
+}
+
+/// Continuation that reconstructs a cassette from an offloaded tape read and either
+/// runs the `with-cassette` body or installs the ambient scope. Traces the body thunk
+/// (a `Value` that may capture live state).
+#[cfg(not(target_arch = "wasm32"))]
+struct CassetteLoadContinuation {
+    slot: Rc<RefCell<Option<crate::cassette::Tape>>>,
+    path: std::path::PathBuf,
+    mode: crate::cassette::CassetteMode,
+    then: CassetteLoadThen,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for CassetteLoadContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        if let CassetteLoadThen::WithBody(body) = &self.then {
+            sink(sema_core::cycle::GcEdge::Value(body));
+        }
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::NativeContinuation for CassetteLoadContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome, ResumeInput};
+        match input {
+            ResumeInput::Returned(_) => {
+                let Self {
+                    slot,
+                    path,
+                    mode,
+                    then,
+                } = *self;
+                let tape = slot
+                    .borrow_mut()
+                    .take()
+                    .ok_or_else(|| SemaError::eval("cassette load result was not delivered"))?;
+                let cassette = crate::cassette::Cassette::from_tape(path, mode, tape);
+                match then {
+                    CassetteLoadThen::Install => {
+                        install_cassette(cassette);
+                        Ok(NativeOutcome::Return(Value::nil()))
+                    }
+                    CassetteLoadThen::WithBody(body_fn) => {
+                        let teardown = install_loaded_cassette(cassette);
+                        Ok(NativeOutcome::Call(NativeCall {
+                            callable: body_fn,
+                            args: Vec::new(),
+                            continuation: Box::new(ScopeGuardContinuation {
+                                teardown: Some(teardown),
+                            }),
+                        }))
+                    }
+                }
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "llm/with-cassette load was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "cassette load received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// Decoder for an offloaded cassette tape LOAD: hands the loaded `Tape` to the
+/// continuation. Holds no `Value`, so it emits no GC edges.
+#[cfg(not(target_arch = "wasm32"))]
+struct CassetteLoadDecoder {
+    slot: Rc<RefCell<Option<crate::cassette::Tape>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for CassetteLoadDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CompletionDecoder for CassetteLoadDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        let payload = result
+            .map_err(|failure| SemaError::eval(format!("cassette load: {}", failure.message())))?;
+        let tape = sema_core::runtime::downcast_send_payload::<crate::cassette::Tape>(
+            payload,
+            "cassette-load",
+        )
+        .map_err(|failure| SemaError::eval(format!("cassette load: {}", failure.message())))?;
+        *self.slot.borrow_mut() = Some(tape);
+        Ok(Value::nil())
+    }
+}
+
+/// Suspend on an offloaded cassette tape LOAD (disk read) so the quantum never touches
+/// the filesystem, resuming into `then`.
+#[cfg(not(target_arch = "wasm32"))]
+fn suspend_cassette_load(
+    path: std::path::PathBuf,
+    mode: crate::cassette::CassetteMode,
+    then: CassetteLoadThen,
+) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::{
+        CompletionKind, InterruptibleResource, NativeOutcome, NativeSuspend,
+        PreparedExternalOperation, SendPayload, WaitKind,
+    };
+    let slot: Rc<RefCell<Option<crate::cassette::Tape>>> = Rc::new(RefCell::new(None));
+    let decoder = Box::new(CassetteLoadDecoder {
+        slot: Rc::clone(&slot),
+    });
+    let kind = CompletionKind::try_from_raw(CASSETTE_LOAD_COMPLETION_KIND)
+        .expect("cassette load kind is nonzero");
+    let resource =
+        InterruptibleResource::new("llm/with-cassette", Box::new(CompleteNoopCancelHook));
+    let load_path = path.clone();
+    let prepared =
+        PreparedExternalOperation::interruptible_blocking(kind, decoder, resource, move || {
+            Ok(Box::new(crate::cassette::Tape::load(&load_path)) as SendPayload)
+        });
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(CassetteLoadContinuation {
+            slot,
+            path,
+            mode,
+            then,
+        }),
+    }))
+}
+
+/// No-op cancel hook for the completion External wait: the executor aborts the
+/// offloaded future itself (dropping the in-flight request); there is no external
+/// resource to tear down here.
+#[cfg(not(target_arch = "wasm32"))]
+struct CompleteNoopCancelHook;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for CompleteNoopCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CancelHook for CompleteNoopCancelHook {
+    fn cancel(
+        &mut self,
+    ) -> Result<sema_core::runtime::CancelDisposition, sema_core::runtime::CancelHookError> {
+        Ok(sema_core::runtime::CancelDisposition::Reaped)
+    }
+    fn reap(
+        &mut self,
+    ) -> Result<sema_core::runtime::CancelDisposition, sema_core::runtime::CancelHookError> {
+        Ok(sema_core::runtime::CancelDisposition::Reaped)
+    }
+}
+
+/// Cancel hook for an interruptible async LLM offload whose in-flight request is
+/// torn down by firing a one-shot signal that the job's `tokio::select!` awaits.
+/// Firing it drops the in-flight provider future (closing the connection) — the
+/// same drop-on-cancel the http path gives, and robust under an executor whose
+/// async tier drives futures with `block_on` (no task-abort). Lives on the runtime
+/// thread, so it need not be `Send`.
+#[cfg(not(target_arch = "wasm32"))]
+struct LlmSelectCancelHook {
+    signal: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for LlmSelectCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CancelHook for LlmSelectCancelHook {
+    fn cancel(
+        &mut self,
+    ) -> Result<sema_core::runtime::CancelDisposition, sema_core::runtime::CancelHookError> {
+        if let Some(signal) = self.signal.take() {
+            // Err (receiver already gone) means the job finished first; nothing to
+            // tear down. Either way the resource is reaped.
+            let _ = signal.send(());
+        }
+        Ok(sema_core::runtime::CancelDisposition::Reaped)
+    }
+    fn reap(
+        &mut self,
+    ) -> Result<sema_core::runtime::CancelDisposition, sema_core::runtime::CancelHookError> {
+        Ok(sema_core::runtime::CancelDisposition::Reaped)
+    }
+}
+
+/// Generic pass-through continuation for a value-producing offload whose decoder
+/// already built the final `Value`/error (`llm/embed`, `llm/rerank`, `llm/batch`,
+/// `llm/io-sleep-once`). Holds no `Value`, so it emits no GC edges.
+#[cfg(not(target_arch = "wasm32"))]
+struct OffloadValueContinuation {
+    op: &'static str,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for OffloadValueContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::NativeContinuation for OffloadValueContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeOutcome, ResumeInput};
+        match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "{} was cancelled ({reason:?})",
+                self.op
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(format!(
+                "{} continuation received an unexpected runtime response",
+                self.op
+            ))),
+        }
+    }
+}
+
+/// Completion-kind tag for an `llm/embed` round offloaded through the unified
+/// runtime's External-wait machinery.
+#[cfg(not(target_arch = "wasm32"))]
+const EMBED_COMPLETION_KIND: u64 = 0x656d_6264; // "embd"
+
+/// Decoder for an offloaded `llm/embed`: finalizes the detached span, records the
+/// cassette, decodes the embedding, and accounts usage against the DISPATCH-TIME
+/// leaf/budget frames on the VM thread when the wire future lands. Holds no live
+/// `Value` (the span, model
+/// strings, and captured slots are not `Value`s), so it emits no GC edges.
+#[cfg(not(target_arch = "wasm32"))]
+struct EmbedDecoder {
+    span: Option<sema_otel::LlmSpan>,
+    provider_name: String,
+    req_model: String,
+    recording: bool,
+    key: String,
+    cassette_scope: Option<CassetteScope>,
+    single: bool,
+    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
+    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for EmbedDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CompletionDecoder for EmbedDecoder {
+    fn decode(
+        mut self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        let payload = match result {
+            Ok(payload) => payload,
+            Err(failure) => {
+                if let Some(span) = self.span.take() {
+                    span.record_error("io", failure.message());
+                }
+                return Err(SemaError::eval(format!("embed: {}", failure.message())));
+            }
+        };
+        let wire = match sema_core::runtime::downcast_send_payload::<Result<EmbedResponse, LlmError>>(
+            payload, "embed",
+        ) {
+            Ok(wire) => wire,
+            Err(failure) => {
+                if let Some(span) = self.span.take() {
+                    span.record_error("io", failure.message());
+                }
+                return Err(SemaError::eval(format!("embed: {}", failure.message())));
+            }
+        };
+        match wire {
+            Ok(resp) => {
+                if let Some(span) = self.span.take() {
+                    span.set_dispatch(&self.provider_name, &self.req_model);
+                    span.set_response(&sema_otel::ResponseFacts {
+                        input_tokens: resp.usage.prompt_tokens,
+                        output_tokens: 0,
+                        response_model: resp.model.clone(),
+                        cost_usd: pricing::calculate_cost_for(&self.provider_name, &resp.usage),
+                        ..Default::default()
+                    });
+                }
+                if self.recording {
+                    cassette_scope_record(
+                        &self.cassette_scope,
+                        crate::cassette::TapeEntry::from_embed(
+                            &self.key,
+                            &resp.model,
+                            &resp.embeddings,
+                            resp.usage.prompt_tokens,
+                        ),
+                    );
+                }
+                if let Some(slot) = &self.usage_accum_slot {
+                    let cost = pricing::calculate_cost_for(&self.provider_name, &resp.usage);
+                    accumulate_into(slot, &resp.usage, cost);
+                }
+                let value = embed_value_from_response(&resp, self.single);
+                let prev_budget = ACTIVE_BUDGET
+                    .with(|b| std::mem::replace(&mut *b.borrow_mut(), self.budget_slot.clone()));
+                let track_result = USAGE_ACCUM_SUPPRESS.with(|s| {
+                    s.set(true);
+                    let r = track_usage(&resp.usage);
+                    s.set(false);
+                    r
+                });
+                ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
+                track_result?;
+                Ok(value)
+            }
+            Err(e) => {
+                if let Some(span) = self.span.take() {
+                    span.record_error(llm_error_kind(&e), &e.to_string());
+                }
+                Err(SemaError::Llm(e.to_string()))
+            }
+        }
+    }
+}
+
+/// Completion-kind tag for an `llm/rerank` round offloaded through the unified
+/// runtime's External-wait machinery.
+#[cfg(not(target_arch = "wasm32"))]
+const RERANK_COMPLETION_KIND: u64 = 0x7272_6e6b; // "rrnk"
+
+/// Decoder for an offloaded `llm/rerank`: finalizes the detached reranker span and
+/// builds the reordered result list on the VM thread when the wire future lands.
+/// `documents` is plain `String` data (not `Value`s), so it emits no GC edges.
+#[cfg(not(target_arch = "wasm32"))]
+struct RerankDecoder {
+    span: Option<sema_otel::RerankerSpan>,
+    documents: Vec<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for RerankDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CompletionDecoder for RerankDecoder {
+    fn decode(
+        mut self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        let payload = match result {
+            Ok(payload) => payload,
+            Err(failure) => {
+                if let Some(span) = self.span.take() {
+                    span.record_error("io", failure.message());
+                }
+                return Err(SemaError::eval(format!("rerank: {}", failure.message())));
+            }
+        };
+        let wire = match sema_core::runtime::downcast_send_payload::<Result<RerankResponse, LlmError>>(
+            payload, "rerank",
+        ) {
+            Ok(wire) => wire,
+            Err(failure) => {
+                if let Some(span) = self.span.take() {
+                    span.record_error("io", failure.message());
+                }
+                return Err(SemaError::eval(format!("rerank: {}", failure.message())));
+            }
+        };
+        match wire {
+            Ok(resp) => {
+                if let Some(span) = self.span.take() {
+                    let out_docs: Vec<(String, f64)> = resp
+                        .results
+                        .iter()
+                        .filter_map(|r| self.documents.get(r.index).map(|d| (d.clone(), r.score)))
+                        .collect();
+                    span.set_output(&out_docs);
+                }
+                Ok(rerank_value_from_response(&resp, &self.documents))
+            }
+            Err(e) => {
+                if let Some(span) = self.span.take() {
+                    span.record_error(llm_error_kind(&e), &e.to_string());
+                }
+                Err(SemaError::Llm(e.to_string()))
+            }
+        }
+    }
+}
+
+/// Completion-kind tag for an `llm/batch` round offloaded through the unified
+/// runtime's External-wait machinery.
+#[cfg(not(target_arch = "wasm32"))]
+const BATCH_COMPLETION_KIND: u64 = 0x6261_7463; // "batc"
+
+/// Cooperative sequencer for a Sema-defined provider's default `batch_complete`
+/// behavior. Every request callback runs in input order, including callbacks after
+/// an earlier failure; only after the sequence settles are results folded in order.
+#[cfg(not(target_arch = "wasm32"))]
+struct SemaBatchDriver {
+    provider: String,
+    default_model: String,
+    requests: Vec<ChatRequest>,
+    next_request: usize,
+    active_model: Option<String>,
+    responses: Vec<Result<ChatResponse, LlmError>>,
+    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
+    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for SemaBatchDriver {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl SemaBatchDriver {
+    fn advance(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome};
+
+        while let Some(request) = self.requests.get(self.next_request) {
+            let mut request = request.clone();
+            self.next_request += 1;
+            if request.model.is_empty() {
+                request.model = self.default_model.clone();
+            }
+            let callback = match lisp_provider_complete_callback(&self.provider) {
+                Ok(callback) => callback,
+                Err(error) => {
+                    self.responses.push(Err(error));
+                    continue;
+                }
+            };
+            self.active_model = Some(request.model.clone());
+            return Ok(NativeOutcome::Call(NativeCall {
+                callable: callback,
+                args: vec![chat_request_to_value(&request)],
+                continuation: self,
+            }));
+        }
+
+        let Self {
+            responses,
+            usage_accum_slot,
+            budget_slot,
+            ..
+        } = *self;
+        finalize_batch_responses(responses, usage_accum_slot, budget_slot)
+            .map(NativeOutcome::Return)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::NativeContinuation for SemaBatchDriver {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+
+        match input {
+            ResumeInput::Returned(value) => {
+                let model = self
+                    .active_model
+                    .take()
+                    .expect("Sema batch callback has an active model");
+                self.responses
+                    .push(parse_lisp_provider_response(&value, &model));
+                self.advance()
+            }
+            ResumeInput::Failed(error) => {
+                self.active_model.take();
+                self.responses.push(Err(LlmError::Api {
+                    status: 0,
+                    message: error.to_string(),
+                }));
+                self.advance()
+            }
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "llm/batch callback was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "llm/batch callback received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn finalize_batch_responses(
+    responses: Vec<Result<ChatResponse, LlmError>>,
+    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
+    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
+) -> Result<Value, SemaError> {
+    let mut results = Vec::with_capacity(responses.len());
+    for resp_result in responses {
+        let resp = resp_result.map_err(|error| SemaError::Llm(error.to_string()))?;
+        // Priced with an empty provider, matching the sync path (which never
+        // stamps a serving provider for `llm/batch`).
+        if let Some(slot) = &usage_accum_slot {
+            let cost = pricing::calculate_cost_for("", &resp.usage);
+            accumulate_into(slot, &resp.usage, cost);
+        }
+        let prev_budget = ACTIVE_BUDGET
+            .with(|active| std::mem::replace(&mut *active.borrow_mut(), budget_slot.clone()));
+        let track_result = USAGE_ACCUM_SUPPRESS.with(|suppress| {
+            suppress.set(true);
+            let result = track_usage(&resp.usage);
+            suppress.set(false);
+            result
+        });
+        ACTIVE_BUDGET.with(|active| *active.borrow_mut() = prev_budget);
+        track_result?;
+        results.push(Value::string(&resp.content));
+    }
+    Ok(Value::list(results))
+}
+
+/// Decoder for an offloaded `llm/batch`: folds each response into the
+/// dispatch-time leaf/budget frames and shapes the result list on the VM thread.
+/// Holds no live `Value`.
+#[cfg(not(target_arch = "wasm32"))]
+struct BatchDecoder {
+    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
+    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for BatchDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CompletionDecoder for BatchDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        let payload = match result {
+            Ok(payload) => payload,
+            Err(failure) => return Err(SemaError::eval(format!("batch: {}", failure.message()))),
+        };
+        let responses = match sema_core::runtime::downcast_send_payload::<
+            Vec<Result<ChatResponse, LlmError>>,
+        >(payload, "batch")
+        {
+            Ok(responses) => responses,
+            Err(failure) => return Err(SemaError::eval(format!("batch: {}", failure.message()))),
+        };
+        finalize_batch_responses(responses, self.usage_accum_slot, self.budget_slot)
+    }
+}
+
+/// Completion-kind tag for the `llm/io-sleep-once` spike leaf's External wait.
+#[cfg(not(target_arch = "wasm32"))]
+const IO_SLEEP_COMPLETION_KIND: u64 = 0x736c_7031; // "slp1"
+
+/// Decoder for the `llm/io-sleep-once` spike leaf: the offloaded timer resolves to
+/// the `id` (`i64`). Holds no state, emits no GC edges.
+#[cfg(not(target_arch = "wasm32"))]
+struct IoSleepDecoder;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for IoSleepDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CompletionDecoder for IoSleepDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        match result {
+            Ok(payload) => {
+                match sema_core::runtime::downcast_send_payload::<i64>(payload, "io-sleep-once") {
+                    Ok(id) => Ok(Value::int(id)),
+                    Err(failure) => Err(SemaError::eval(failure.message().to_string())),
+                }
+            }
+            Err(failure) => Err(SemaError::eval(format!(
+                "io-sleep-once: {}",
+                failure.message()
+            ))),
+        }
+    }
 }
 
 /// Cassette interception seam: below the otel span + response cache (set up in
@@ -6887,14 +8931,14 @@ fn run_completion(
     request: ChatRequest,
     span: &sema_otel::LlmSpan,
 ) -> Result<ChatResponse, SemaError> {
-    if CASSETTE.with(|c| c.borrow().is_none()) {
+    if current_cassette_scope().is_none() {
         return do_complete_inner(request, span);
     }
     // Key by the request as-is (no default-model resolution) so record and replay
     // produce the same key for an identical call, even with no provider configured
     // (keyless replay). Shares the hashing with the response cache.
     let key = compute_cache_key(&request);
-    let decision = CASSETTE.with(|c| c.borrow().as_ref().unwrap().decide(&key));
+    let decision = cassette_decide(&key).expect("cassette scope checked above");
     match decision {
         crate::cassette::Decision::Replay(entry) => {
             // A replayed call is a stand-in for a real one: emit the span with the
@@ -6908,11 +8952,7 @@ fn run_completion(
         crate::cassette::Decision::Miss(k) => Err(cassette_miss_error(&k)),
         crate::cassette::Decision::Record => {
             let resp = do_complete_inner(request, span)?;
-            CASSETTE.with(|c| {
-                if let Some(cass) = c.borrow_mut().as_mut() {
-                    cass.record_entry(crate::cassette::TapeEntry::from_response(&key, &resp));
-                }
-            });
+            cassette_record(crate::cassette::TapeEntry::from_response(&key, &resp));
             Ok(resp)
         }
     }
@@ -6956,7 +8996,7 @@ fn stream_with_cassette(
         })
     };
 
-    if CASSETTE.with(|c| c.borrow().is_none()) {
+    if current_cassette_scope().is_none() {
         let resp = stream_real(request.clone(), chunk_cb)?;
         span.set_dispatch(p.name(), &request.model);
         span.set_response(&response_facts(p.name(), &resp));
@@ -6964,7 +9004,7 @@ fn stream_with_cassette(
     }
 
     let key = compute_cache_key(&request);
-    let decision = CASSETTE.with(|c| c.borrow().as_ref().unwrap().decide(&key));
+    let decision = cassette_decide(&key).expect("cassette scope checked above");
     match decision {
         crate::cassette::Decision::Replay(entry) => {
             for ch in &entry.chunks {
@@ -6983,13 +9023,9 @@ fn stream_with_cassette(
                 chunk_cb(chunk)
             };
             let resp = stream_real(request.clone(), &mut wrap)?;
-            CASSETTE.with(|c| {
-                if let Some(cass) = c.borrow_mut().as_mut() {
-                    cass.record_entry(crate::cassette::TapeEntry::from_stream(
-                        &key, &collected, &resp,
-                    ));
-                }
-            });
+            cassette_record(crate::cassette::TapeEntry::from_stream(
+                &key, &collected, &resp,
+            ));
             span.set_dispatch(p.name(), &request.model);
             span.set_response(&response_facts(p.name(), &resp));
             Ok(resp)
@@ -7077,8 +9113,7 @@ fn primary_model_for_cache() -> Result<String, SemaError> {
     with_provider(|p| Ok(p.default_model().to_string()))
 }
 
-/// Parameters for `llm/extract`'s validate-and-re-ask stage, captured so the
-/// (possibly offloaded) finalize closure can run the synchronous re-ask attempts.
+/// Parameters shared by every `llm/extract` validation and re-ask attempt.
 struct ExtractConfig {
     schema: Value,
     schema_desc: String,
@@ -7088,6 +9123,28 @@ struct ExtractConfig {
     validate: bool,
     max_retries: u32,
     reask: bool,
+}
+
+fn extract_reask_request(
+    cfg: &ExtractConfig,
+    last_response_content: &str,
+    last_validation_error: &str,
+) -> ChatRequest {
+    let mut request = ChatRequest::new(cfg.model.clone(), cfg.messages.clone());
+    request.json_mode = true;
+    request.system = Some(if cfg.reask {
+        format_reask_prompt(
+            last_response_content,
+            last_validation_error,
+            &cfg.schema_desc,
+        )
+    } else {
+        format!(
+            "{}\n\nYour previous response had validation errors: {}. Please fix.",
+            cfg.system, last_validation_error
+        )
+    });
+    request
 }
 
 /// Parse an LLM extraction response body into a Sema `Value` (strips a ```json
@@ -7111,11 +9168,245 @@ fn extract_parse_response(response: &ChatResponse) -> Result<Value, SemaError> {
     Ok(sema_core::json_to_value(&json))
 }
 
-/// Validate `llm/extract`'s attempt-0 response and, on validation failure with
-/// retries remaining, run the re-ask attempts via the SYNCHRONOUS `do_complete`
-/// path (+ `track_usage` per attempt) — preserving the exact loop semantics and
-/// error messages of the original native. `first` is the attempt-0 response, which
-/// the caller has ALREADY accounted (sync path: inline; async path: in the poller).
+#[cfg(not(target_arch = "wasm32"))]
+enum RuntimeExtractPhase {
+    Ready,
+    Predicate {
+        key_name: String,
+        failure_message: String,
+    },
+}
+
+/// Reinstall the extraction task's dispatch-time dynamic scopes while preparing
+/// a later completion round. Native continuations resume outside the runtime's
+/// per-quantum scope swap, so recursive provider preparation must supply the
+/// captured LLM, telemetry, and leaf-accounting contexts explicitly.
+#[cfg(not(target_arch = "wasm32"))]
+struct RuntimeCompletionPrepScope {
+    previous_llm: Option<LlmDynScope>,
+    previous_otel: Option<sema_otel::OtelTaskCtx>,
+    previous_usage: Option<Option<Rc<RefCell<LeafUsage>>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RuntimeCompletionPrepScope {
+    fn install(
+        llm: LlmDynScope,
+        otel: sema_otel::OtelTaskCtx,
+        usage: Option<Rc<RefCell<LeafUsage>>>,
+    ) -> Self {
+        let previous_llm = write_llm_scope(llm);
+        let previous_otel = sema_otel::install_task_otel(otel);
+        let previous_usage =
+            ACTIVE_LEAF_SCOPE.with(|active| std::mem::replace(&mut *active.borrow_mut(), usage));
+        Self {
+            previous_llm: Some(previous_llm),
+            previous_otel: Some(previous_otel),
+            previous_usage: Some(previous_usage),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for RuntimeCompletionPrepScope {
+    fn drop(&mut self) {
+        if let Some(previous_usage) = self.previous_usage.take() {
+            ACTIVE_LEAF_SCOPE.with(|active| *active.borrow_mut() = previous_usage);
+        }
+        if let Some(previous_otel) = self.previous_otel.take() {
+            let _ = sema_otel::install_task_otel(previous_otel);
+        }
+        if let Some(previous_llm) = self.previous_llm.take() {
+            let _ = write_llm_scope(previous_llm);
+        }
+    }
+}
+
+/// Cooperative validation and re-ask state for `llm/extract`. Provider rounds
+/// reuse the canonical completion driver, and custom validators are structural
+/// VM calls so either side may suspend without occupying the VM thread.
+#[cfg(not(target_arch = "wasm32"))]
+struct RuntimeExtractDriver {
+    cfg: ExtractConfig,
+    attempt: u32,
+    last_validation_error: String,
+    last_response_content: String,
+    result: Option<Value>,
+    steps: VecDeque<ExtractionValidationStep>,
+    errors: Vec<String>,
+    phase: RuntimeExtractPhase,
+    llm_scope: LlmDynScope,
+    otel_scope: sema_otel::OtelTaskCtx,
+    usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RuntimeExtractDriver {
+    fn new(cfg: ExtractConfig) -> Self {
+        Self {
+            cfg,
+            attempt: 0,
+            last_validation_error: String::new(),
+            last_response_content: String::new(),
+            result: None,
+            steps: VecDeque::new(),
+            errors: Vec::new(),
+            phase: RuntimeExtractPhase::Ready,
+            llm_scope: read_llm_scope(),
+            otel_scope: sema_otel::current_conversation_scope(),
+            usage_accum_slot: current_usage_accum(),
+        }
+    }
+
+    fn accept_response(
+        mut self: Box<Self>,
+        response: ChatResponse,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::NativeOutcome;
+
+        self.last_response_content = response.content.trim().to_string();
+        let result = extract_parse_response(&response)?;
+        if !self.cfg.validate {
+            return Ok(NativeOutcome::Return(result));
+        }
+
+        self.steps = prepare_extraction_validation(&result, &self.cfg.schema);
+        self.result = Some(result);
+        self.errors.clear();
+        self.phase = RuntimeExtractPhase::Ready;
+        self.advance_validation()
+    }
+
+    fn advance_validation(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome};
+
+        while let Some(step) = self.steps.pop_front() {
+            match step {
+                ExtractionValidationStep::Error(error) => self.errors.push(error),
+                ExtractionValidationStep::Predicate {
+                    callable,
+                    argument,
+                    key_name,
+                    failure_message,
+                } => {
+                    self.phase = RuntimeExtractPhase::Predicate {
+                        key_name,
+                        failure_message,
+                    };
+                    return Ok(NativeOutcome::Call(NativeCall {
+                        callable,
+                        args: vec![argument],
+                        continuation: self,
+                    }));
+                }
+            }
+        }
+
+        if self.errors.is_empty() {
+            let result = self
+                .result
+                .take()
+                .ok_or_else(|| SemaError::eval("llm/extract validation lost its parsed result"))?;
+            return Ok(NativeOutcome::Return(result));
+        }
+
+        self.last_validation_error = std::mem::take(&mut self.errors).join("; ");
+        if self.attempt == self.cfg.max_retries {
+            return Err(SemaError::Llm(format!(
+                "extraction validation failed after {} attempt(s): {}",
+                self.cfg.max_retries + 1,
+                self.last_validation_error
+            )));
+        }
+
+        self.attempt += 1;
+        self.result = None;
+        self.phase = RuntimeExtractPhase::Ready;
+        let request = extract_reask_request(
+            &self.cfg,
+            &self.last_response_content,
+            &self.last_validation_error,
+        );
+        let _scope = RuntimeCompletionPrepScope::install(
+            self.llm_scope.clone(),
+            self.otel_scope.clone(),
+            self.usage_accum_slot.clone(),
+        );
+        do_complete_runtime_suspend(request, CompleteFinalize::runtime(self))
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for RuntimeExtractDriver {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        sink(sema_core::cycle::GcEdge::Value(&self.cfg.schema));
+        if let Some(result) = &self.result {
+            sink(sema_core::cycle::GcEdge::Value(result));
+        }
+        for step in &self.steps {
+            if let ExtractionValidationStep::Predicate {
+                callable, argument, ..
+            } = step
+            {
+                sink(sema_core::cycle::GcEdge::Value(callable));
+                sink(sema_core::cycle::GcEdge::Value(argument));
+            }
+        }
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl CompleteResponseContinuation for RuntimeExtractDriver {
+    fn finish(self: Box<Self>, response: ChatResponse) -> sema_core::runtime::NativeResult {
+        self.accept_response(response)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::NativeContinuation for RuntimeExtractDriver {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+
+        let phase = std::mem::replace(&mut self.phase, RuntimeExtractPhase::Ready);
+        match (phase, input) {
+            (
+                RuntimeExtractPhase::Predicate {
+                    key_name,
+                    failure_message,
+                },
+                ResumeInput::Returned(value),
+            ) => {
+                if !value.is_truthy() {
+                    self.errors
+                        .push(format!("key {key_name}: {failure_message}"));
+                }
+                self.advance_validation()
+            }
+            (RuntimeExtractPhase::Predicate { key_name, .. }, ResumeInput::Failed(error)) => {
+                self.errors
+                    .push(format!("key {key_name}: validation error: {error}"));
+                self.advance_validation()
+            }
+            (_, ResumeInput::Cancelled(reason)) => Err(SemaError::eval(format!(
+                "llm/extract validator was cancelled ({reason:?})"
+            ))),
+            (_, ResumeInput::Runtime(_)) => Err(SemaError::eval(
+                "llm/extract validator received an unexpected runtime response",
+            )),
+            (RuntimeExtractPhase::Ready, _) => Err(SemaError::eval(
+                "llm/extract validator resumed without an active predicate",
+            )),
+        }
+    }
+}
+
+/// Validate `llm/extract` synchronously for host calls and wasm builds. `first` is
+/// the attempt-0 response and has already been accounted by the caller.
 fn extract_validate_and_reask(
     first: ChatResponse,
     cfg: &ExtractConfig,
@@ -7129,20 +9420,8 @@ fn extract_validate_and_reask(
         let response = if attempt == 0 {
             first.clone()
         } else {
-            let mut request = ChatRequest::new(cfg.model.clone(), cfg.messages.clone());
-            request.json_mode = true;
-            request.system = Some(if cfg.reask {
-                format_reask_prompt(
-                    &last_response_content,
-                    &last_validation_error,
-                    &cfg.schema_desc,
-                )
-            } else {
-                format!(
-                    "{}\n\nYour previous response had validation errors: {}. Please fix.",
-                    cfg.system, last_validation_error
-                )
-            });
+            let request =
+                extract_reask_request(cfg, &last_response_content, &last_validation_error);
             let resp = do_complete(request)?;
             track_usage(&resp.usage)?;
             resp
@@ -7269,8 +9548,8 @@ fn retry_backoff_ms(attempt: u32, server_hint: u64, base_ms: u64) -> u64 {
 
 /// A single network-retry event, captured as DATA (not emitted as an otel span at
 /// the point it happens). The synchronous completion path emits `retry_span`s
-/// inline from these; the async path collects them on a worker thread (no otel TLS
-/// there) and replays them as spans in the VM-thread poller. Capturing-as-data is
+/// inline from these; the runtime path collects them on a worker thread (no otel TLS
+/// there) and replays them as spans in the VM-thread finalizer. Capturing-as-data is
 /// what lets both paths share one retry loop with zero telemetry drift.
 #[derive(Debug, Clone)]
 struct RetryEvent {
@@ -7322,7 +9601,7 @@ fn complete_with_retry_collecting(
 }
 
 /// Emit one `retry_span` child per collected [`RetryEvent`] under the active LLM
-/// span. Called on the VM thread (sync path: inline; async path: in the poller)
+/// span. Called on the VM thread (synchronous path inline; runtime path in the finalizer)
 /// where the otel context is live.
 fn emit_retry_spans(events: &[RetryEvent]) {
     for ev in events {
@@ -7334,7 +9613,7 @@ fn emit_retry_spans(events: &[RetryEvent]) {
 
 /// Run `provider.complete` with retry on transient errors (429 / 5xx / network),
 /// using capped exponential backoff with jitter (429 honors `retry-after`).
-/// Re-expressed on top of [`complete_with_retry_collecting`] so the sync and async
+/// Re-expressed on top of [`complete_with_retry_collecting`] so synchronous and runtime
 /// paths share one retry loop: this variant emits the collected retries as otel
 /// `retry_span` children inline (the sync path's behavior, unchanged).
 fn complete_with_retry(
@@ -7353,6 +9632,7 @@ fn complete_with_retry(
 /// clone (off the thread-local registry, cloned on the VM thread before offload),
 /// the provider's registry name, and an optional per-entry model override.
 #[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
 struct ResolvedProvider {
     provider: std::sync::Arc<dyn LlmProvider>,
     name: String,
@@ -7361,7 +9641,7 @@ struct ResolvedProvider {
 
 /// Result of the offloadable completion wire stage: the response, the name of the
 /// provider that served it (for `set_serving_provider` + pricing on the VM thread),
-/// and the collected retry events (replayed as spans in the poller).
+/// and the collected retry events (replayed as spans in the VM-thread finalizer).
 #[cfg(not(target_arch = "wasm32"))]
 struct CompleteOutcome {
     resp: ChatResponse,
@@ -7370,13 +9650,40 @@ struct CompleteOutcome {
     retry_events: Vec<RetryEvent>,
 }
 
+/// Default per-job deadline (ms) for the sync-only provider blocking offload when the
+/// request carries no explicit `:timeout`.
+#[cfg(not(target_arch = "wasm32"))]
+const SYNC_ONLY_DEFAULT_TIMEOUT_MS: u64 = 300_000; // 5 minutes
+/// Hard ceiling (ms) clamped over any caller-supplied `:timeout` for the sync-only
+/// blocking offload, so a blocking `complete()` with no interrupt handle can never
+/// occupy a worker unbounded.
+#[cfg(not(target_arch = "wasm32"))]
+const SYNC_ONLY_MAX_TIMEOUT_MS: u64 = 600_000; // 10 minutes
+
+/// Resolve the sync-only blocking offload's per-job deadline BEFORE dispatch: a positive
+/// caller `:timeout` (`request.timeout_ms`) is honored up to the hard ceiling; anything
+/// missing or zero falls back to the default. The result is always finite, so an
+/// unbounded blocking `complete()` is unrepresentable.
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_only_offload_deadline_ms(timeout_ms: Option<u64>) -> u64 {
+    timeout_ms
+        .filter(|&ms| ms > 0)
+        .unwrap_or(SYNC_ONLY_DEFAULT_TIMEOUT_MS)
+        .min(SYNC_ONLY_MAX_TIMEOUT_MS)
+}
+
 /// One completion attempt for the async wire stage. Providers with a native
 /// async path (`complete_future`) are awaited in-place inside the spawned pool
 /// future — aborting the task drops the in-flight request (TRUE cancellation,
 /// connection torn down). Sync-only providers (the `complete_future` default —
 /// e.g. the FakeProvider test double) fall back to an admission-controlled
-/// blocking offload, where cancellation stays best-effort (result discarded,
-/// call runs to completion on the worker).
+/// blocking offload under a bounded per-job deadline
+/// ([`sync_only_offload_deadline_ms`], resolved pre-dispatch). Cancellation on this
+/// arm is explicitly a BEST-EFFORT QUARANTINE: a provider that exposes only a blocking
+/// API has no interrupt handle, so on cancel or deadline the awaiting future is dropped
+/// and the result discarded (never charged — `track_usage` runs only in the VM-thread
+/// finalizer on resume) while the orphaned worker runs to completion on its own. There
+/// is no fake abort.
 #[cfg(not(target_arch = "wasm32"))]
 async fn complete_once_async(
     provider: &std::sync::Arc<dyn LlmProvider>,
@@ -7385,9 +9692,26 @@ async fn complete_once_async(
     match provider.complete_future(request.clone()) {
         Some(fut) => fut.await,
         None => {
+            let deadline =
+                std::time::Duration::from_millis(sync_only_offload_deadline_ms(request.timeout_ms));
             let p = provider.clone();
             let req = request.clone();
-            sema_io::io_offload_blocking(move || p.complete(req)).await
+            match tokio::time::timeout(
+                deadline,
+                sema_io::io_offload_blocking(move || p.complete(req)),
+            )
+            .await
+            {
+                Ok(result) => result,
+                // Fail fast on the deadline (a non-retryable Config error): retrying a
+                // purely-blocking API we cannot interrupt would only strand more workers.
+                Err(_elapsed) => Err(crate::types::LlmError::Config(format!(
+                    "sync-only provider blocking call exceeded its {} ms deadline \
+                     (best-effort quarantine: the result is discarded and never charged; \
+                     the orphaned worker runs to completion on its own)",
+                    deadline.as_millis()
+                ))),
+            }
         }
     }
 }
@@ -7429,50 +9753,6 @@ async fn complete_with_retry_collecting_async(
             },
         }
     }
-}
-
-/// The OFFLOADED wire unit for an async completion: walk the resolved fallback
-/// chain (via [`complete_with_retry_collecting_async`], preserving
-/// DROP_TEMPERATURE self-heal + network retry), failing over on error. Does NO
-/// thread-local access — no cassette, cache, spans, `track_usage`, or
-/// `set_serving_provider` (those all stay on the VM thread, in the poller).
-/// Runs inside an `io_spawn`ed pool future, so the scheduler's abort hook
-/// cancels it mid-flight.
-#[cfg(not(target_arch = "wasm32"))]
-async fn run_fallback_retry_async(
-    chain: Vec<ResolvedProvider>,
-    request: ChatRequest,
-    max_retries: u32,
-    base_ms: u64,
-) -> Result<CompleteOutcome, crate::types::LlmError> {
-    let mut last_error = None;
-    for entry in &chain {
-        let mut req = request.clone();
-        // Per-provider override wins; else fill the provider default when unpinned
-        // (mirrors `do_complete_with_provider` / `do_complete_uncached`).
-        if let Some(model) = &entry.model {
-            req.model = model.clone();
-        } else if req.model.is_empty() {
-            req.model = entry.provider.default_model().to_string();
-        }
-        match complete_with_retry_collecting_async(&entry.provider, &req, max_retries, base_ms)
-            .await
-        {
-            Ok((resp, retry_events)) => {
-                return Ok(CompleteOutcome {
-                    resp,
-                    serving_provider: entry.name.clone(),
-                    serving_model: req.model,
-                    retry_events,
-                });
-            }
-            Err(e) => {
-                eprintln!("Provider '{}' failed: {e}, trying next...", entry.name);
-                last_error = Some(e);
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| crate::types::LlmError::Config("all providers failed".into())))
 }
 
 fn do_complete_with_provider(
@@ -7727,7 +10007,7 @@ fn enforce_rate_limit() {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let last = RATE_LIMIT_LAST.with(|l| l.get());
+        let last = rate_limit_last_value();
         // saturating_sub: a backward wall-clock adjustment makes `now < last`,
         // which would panic (debug) or wrap to a huge value (release) on plain
         // subtraction. Treat that as "no wait needed". This sleep runs on the
@@ -7742,13 +10022,13 @@ fn enforce_rate_limit() {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        RATE_LIMIT_LAST.with(|l| l.set(actual_now));
+        set_rate_limit_last_value(actual_now);
     }
 }
 
-/// Non-blocking counterpart to `enforce_rate_limit`, for the two async-path
-/// callers (`do_complete_async_yield`, `stream_run_begin`). Runs on the VM
-/// thread, synchronously, BEFORE the offload is dispatched — it never sleeps
+/// Non-blocking counterpart to `enforce_rate_limit`, used by completion and
+/// streaming offloads. Runs synchronously on the VM thread before dispatch and
+/// never sleeps
 /// itself. It returns how many milliseconds THIS call's send must be delayed
 /// (0 if the gate is clear), and the caller is responsible for spending that
 /// delay somewhere that isn't the VM thread (a `tokio::time::sleep` inside the
@@ -7776,7 +10056,7 @@ fn reserve_rate_limit_wait_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let last = RATE_LIMIT_LAST.with(|l| l.get());
+    let last = rate_limit_last_value();
     // A `last` slot more than this far ahead of `now` cannot be a legitimate
     // reservation queue — the wall clock jumped backward since it was
     // stamped. Discard it, exactly like `enforce_rate_limit`'s
@@ -7804,7 +10084,7 @@ fn reserve_rate_limit_wait_ms() -> u64 {
     } else {
         now.max(last.saturating_add(min_interval_ms))
     };
-    RATE_LIMIT_LAST.with(|l| l.set(slot));
+    set_rate_limit_last_value(slot);
     slot.saturating_sub(now)
 }
 
@@ -8019,12 +10299,12 @@ fn chat_messages_to_sema_list(messages: &[ChatMessage]) -> Value {
 /// Bound runaway error loops across the agent conversation (mirrors `run_tool_loop`).
 const MAX_CONSECUTIVE_TOOL_ERRORS: usize = 5;
 
-/// Per-run state for the non-blocking (async-context) agent loop. Lives in the
-/// thread-local `AGENT_RUNS` slab keyed by an integer token handed to Sema, so it
-/// survives every inter-round / inter-tool `AwaitIo` park (the slab is on the VM
-/// thread; nothing here is `Send` and nothing crosses threads). No `__agent-*`
+/// Per-run state for the non-blocking runtime agent loop. Lives in the thread-local
+/// `AGENT_RUNS` slab keyed by an integer token handed to Sema, so it survives every
+/// inter-round and inter-tool suspension (the slab is on the VM thread; nothing
+/// here is `Send` and nothing crosses threads). No `__agent-*`
 /// native holds a `RefCell` borrow of the slab across a callback / tool execution /
-/// completion yield — each short-borrows to copy inputs out, drops, does the work,
+/// completion suspension — each short-borrows to copy inputs out, drops, does the work,
 /// then short-borrows again to write back.
 struct AgentLoopState {
     messages: Vec<ChatMessage>,
@@ -8066,7 +10346,7 @@ struct AgentLoopState {
     /// the task-reaped sweep (`reap_cancelled_agent_runs`) matches on this id to
     /// reclaim the entry (and end its span) instead of leaking it until
     /// `reset_runtime_state`.
-    owning_task_id: Option<u64>,
+    owning_task_id: Option<RuntimeTaskId>,
 }
 
 impl Drop for AgentLoopState {
@@ -8130,7 +10410,7 @@ pub fn stream_runs_len() -> usize {
 /// Idempotent by absence in both directions: after `__agent-finish` removed the
 /// entry this sweep finds nothing, and a late finish after this sweep is the
 /// existing idempotent no-op. Entries with `owning_task_id: None` are untouched.
-fn reap_cancelled_agent_runs(task_id: u64) {
+fn reap_cancelled_agent_runs(task_id: RuntimeTaskId) {
     let reaped: Vec<AgentLoopState> = AGENT_RUNS.with(|r| {
         let mut slab = r.borrow_mut();
         let tokens: Vec<u64> = slab
@@ -8310,7 +10590,7 @@ fn agent_begin(args: &[Value]) -> Result<Value, SemaError> {
     ));
     let agent_span = sema_otel::agent_span(Some(&agent.name));
     // User :tags / :metadata attached directly to the agent span (a `CallTelemetry`
-    // guard cannot be held across the loop's yields; the async path attaches to the
+    // guard cannot be held across the loop's suspensions; the runtime path attaches to the
     // agent root rather than threading CALL_TAGS through every round).
     if let Some(o) = opts.as_ref() {
         let tags = get_opt_string_list(o, "tags");
@@ -8497,8 +10777,8 @@ fn chat_begin(args: &[Value]) -> Result<Value, SemaError> {
 }
 
 /// Apply one provider round's response to the loop state and return the driver's
-/// `{:done bool :has-tools bool}` map. Runs on the VM thread (either the poller after
-/// an async round, or inline for the synchronous fallback). Short-borrows the slab.
+/// `{:done bool :has-tools bool}` map. Runs on the VM thread, either from the
+/// runtime decoder or inline for the synchronous fallback. Short-borrows the slab.
 fn agent_apply_step_response(token: u64, resp: ChatResponse) -> Result<Value, SemaError> {
     AGENT_RUNS.with(|r| {
         let mut slab = r.borrow_mut();
@@ -8535,18 +10815,13 @@ fn agent_apply_step_response(token: u64, resp: ChatResponse) -> Result<Value, Se
     })
 }
 
-/// `__agent-step(token) → {:done bool :has-tools bool}`. One provider round: in async
-/// context it offloads + yields `AwaitIo` (the map is produced by the poller via the
-/// finalize closure and becomes the resolved value of the yield); otherwise it runs
-/// `do_complete` synchronously. If the loop is already done (round cap or consec-error
+/// `__agent-step(token) → {:done bool :has-tools bool}`. One provider round: in a
+/// runtime task it offloads and suspends on an External wait; the decoder uses the
+/// finalize closure to build the result map. Otherwise it runs `do_complete`
+/// synchronously. If the loop is already done (round cap or consecutive-error
 /// abort set by `__agent-exec-tools`), returns immediately without a provider call.
-fn agent_step(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
-    // A resumed AwaitIo yield lands here NOT re-invoked (the scheduler resumes the
-    // bytecode after the CALL); but drain any stray resume value defensively, as the
-    // other yielding natives do.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
-    }
+fn agent_step(ctx: &EvalContext, token: u64) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::NativeOutcome;
 
     // Short-borrow: bail out if the loop is already done (round cap / consec-error
     // abort), else build the request + snapshot on_text; then drop the borrow.
@@ -8576,22 +10851,25 @@ fn agent_step(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
             let mut map = BTreeMap::new();
             map.insert(Value::keyword("done"), Value::bool(true));
             map.insert(Value::keyword("has-tools"), Value::bool(false));
-            return Ok(Value::map(map));
+            return Ok(NativeOutcome::Return(Value::map(map)));
         }
         StepPrep::Run(req, on_text) => (*req, on_text),
     };
 
-    // Async context: a plain round offloads + yields; a streaming (`:on-text`)
+    // In a runtime quantum, a streaming (`:on-text`)
     // round opens a non-blocking stream run and hands the driver
     // `{:stream tok :on-text cb}` — the prelude drives `__stream-drive` in TASK
-    // context (so the callback may itself yield, and siblings interleave between
+    // context (so the callback may itself suspend, and siblings interleave between
     // delta batches), then applies the assembled response via
-    // `__agent-stream-apply`, feeding `agent_apply_step_response` unchanged.
+    // `__agent-stream-apply`, feeding `agent_apply_step_response` unchanged. A plain
+    // round offloads the provider call and suspends the active task on an External
+    // wait, so two spawned `agent/run`s overlap across rounds and
+    // `async/cancel` cuts the loop at an inter-round park.
     #[cfg(not(target_arch = "wasm32"))]
-    if sema_core::in_async_context() {
+    if sema_core::in_runtime_quantum() {
         if let Some(cb) = on_text {
             // Mirror `do_complete_streaming`'s scope/span setup, detached (the
-            // span is finalized by the stream poller after the last park).
+            // span is finalized by the stream decoder after the last park).
             let _conv = (sema_otel::current_conversation_id().is_none()).then(|| {
                 sema_otel::set_conversation_scope(&sema_otel::new_conversation_id(), None, None)
             });
@@ -8607,11 +10885,11 @@ fn agent_step(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
             let mut map = BTreeMap::new();
             map.insert(Value::keyword("stream"), stream_token);
             map.insert(Value::keyword("on-text"), cb);
-            return Ok(Value::map(map));
+            return Ok(NativeOutcome::Return(Value::map(map)));
         }
-        return do_complete_async_yield(
+        return do_complete_runtime_suspend(
             request,
-            Box::new(move |resp| agent_apply_step_response(token, resp)),
+            CompleteFinalize::new(move |resp| agent_apply_step_response(token, resp)),
         );
     }
 
@@ -8623,13 +10901,14 @@ fn agent_step(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
         None => do_complete(request)?,
     };
     track_usage(&response.usage)?;
-    agent_apply_step_response(token, response)
+    agent_apply_step_response(token, response).map(NativeOutcome::Return)
 }
 
-/// `__agent-exec-tools(token) → nil`. Runs the pending tool calls in ordinary async
-/// task context (so yielding/async tools suspend correctly), pushing correlated
+/// `__agent-exec-tools(token) → nil`. Runs the pending tool calls in ordinary runtime
+/// task context (so async tools suspend correctly), pushing correlated
 /// tool-result messages. Never holds the slab borrow across a callback / tool call.
-fn agent_exec_tools(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
+fn agent_exec_tools(ctx: &EvalContext, token: u64) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::NativeOutcome;
     // Short-borrow: copy out the pending calls + tool set + callback, then drop.
     let (pending, tools, on_tool_call): (Vec<ToolCall>, Vec<Value>, Option<Value>) = AGENT_RUNS
         .with(|r| {
@@ -8640,6 +10919,20 @@ fn agent_exec_tools(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
             let pending = std::mem::take(&mut st.pending_tool_calls);
             Ok::<_, SemaError>((pending, st.tools.clone(), st.on_tool_call.clone()))
         })?;
+
+    // Cooperative runtime path (Task 04/06): a tool handler may SUSPEND (e.g.
+    // `mcp/call`'s runtime external wait, or an `async/await` inside the handler),
+    // and the `:on-tool-call` callback may itself run a runtime op (the ticker test
+    // sends on a channel from it). Drive each handler and callback as a
+    // `NativeOutcome::Call` so they run as real cooperative work on the active task
+    // and park/resume through the scheduler. The multi-round loop above
+    // (`__agent-drive`) already runs turn-by-turn in bytecode; this makes the
+    // per-turn tool round cooperative too. `ExecToolsContinuation` journals the same
+    // per-tool OTel span + `:on-tool-call` start/end events + correlated tool
+    // results (with the same error-recovery) the synchronous `run_tool_loop` does.
+    if sema_core::in_runtime_quantum() {
+        return exec_tools_cooperative_start(token, tools, on_tool_call, pending);
+    }
 
     for tc in &pending {
         let args_value = sema_core::json_to_value(&tc.arguments);
@@ -8689,41 +10982,450 @@ fn agent_exec_tools(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
         }
 
         // Re-borrow to push the correlated result + update the error counter.
-        AGENT_RUNS.with(|r| {
-            let mut slab = r.borrow_mut();
-            let st = match slab.get_mut(&token) {
-                Some(st) => st,
-                None => return,
-            };
-            st.messages.push(ChatMessage::tool_result(
-                tc.id.clone(),
-                tc.name.clone(),
-                result,
-            ));
-            if is_error {
-                st.consecutive_errors += 1;
-                if st.consecutive_errors >= MAX_CONSECUTIVE_TOOL_ERRORS {
-                    // Stop the loop; `__agent-finish` raises the abort so the caller
-                    // sees the same failure the blocking path returns via `?`.
-                    st.done = true;
-                    st.abort_error = Some(format!(
-                        "aborting agent run after {} consecutive tool errors",
-                        st.consecutive_errors
-                    ));
-                }
-            } else {
-                st.consecutive_errors = 0;
-            }
-        });
+        record_tool_result(token, tc, result, is_error);
     }
 
-    Ok(Value::nil())
+    Ok(NativeOutcome::Return(Value::nil()))
+}
+
+/// Push a correlated `tool_result` message for `tc` into the agent slab and
+/// update the consecutive-error counter (aborting the loop past the cap, so
+/// `__agent-finish` raises the same failure the blocking path returns). Shared by
+/// the synchronous tool loop and the cooperative runtime continuation so both keep
+/// identical loop-state semantics.
+fn record_tool_result(token: u64, tc: &ToolCall, result: String, is_error: bool) {
+    AGENT_RUNS.with(|r| {
+        let mut slab = r.borrow_mut();
+        let st = match slab.get_mut(&token) {
+            Some(st) => st,
+            None => return,
+        };
+        st.messages.push(ChatMessage::tool_result(
+            tc.id.clone(),
+            tc.name.clone(),
+            result,
+        ));
+        if is_error {
+            st.consecutive_errors += 1;
+            if st.consecutive_errors >= MAX_CONSECUTIVE_TOOL_ERRORS {
+                st.done = true;
+                st.abort_error = Some(format!(
+                    "aborting agent run after {} consecutive tool errors",
+                    st.consecutive_errors
+                ));
+            }
+        } else {
+            st.consecutive_errors = 0;
+        }
+    });
+}
+
+/// Which cooperative `Call` the next [`ExecToolsContinuation::resume`] is settling.
+enum ToolPhase {
+    /// Resuming from a custom tool-schema predicate. Validation failures are
+    /// accumulated after the start observer and before handler dispatch.
+    Validation {
+        key_name: String,
+        failure_message: String,
+    },
+    /// Resuming from the `:on-tool-call` "start" event callback: its return value is
+    /// ignored; next, open the tool span and validate the call.
+    StartEvent,
+    /// Resuming from the tool handler itself: its `Returned`/`Failed` becomes the
+    /// tool result fed back to the model.
+    Handler,
+    /// Resuming from the `:on-tool-call` "end" event callback: its return is ignored;
+    /// record the (already-computed) result and advance to the next tool.
+    EndEvent { result: String, is_error: bool },
+}
+
+/// Per-call working state carried across the start-event, validation, handler, and
+/// end-event calls while one tool call is in flight. The OTel span covers validation
+/// and handler execution, matching the synchronous tool-call boundary.
+struct ActiveCall {
+    tc: ToolCall,
+    /// `(handler, args)` resolved before validation, taken when the handler call
+    /// is dispatched.
+    pending_handler: Option<(Value, Vec<Value>)>,
+    pending_error: Option<String>,
+    validation_steps: VecDeque<ExtractionValidationStep>,
+    validation_errors: Vec<String>,
+    /// The call arguments as a Sema value (passed to both `:on-tool-call` events).
+    args_value: Value,
+    /// The call arguments as JSON (for the tool span's content-gated I/O).
+    args_json: String,
+    span: Option<sema_otel::ToolSpan>,
+    started: Option<std::time::Instant>,
+}
+
+/// Cooperative tool-round state machine (Task 04/06). Drives each pending tool call's
+/// `:on-tool-call` "start" event, its handler, and its "end" event as
+/// `NativeOutcome::Call`s so a handler OR a callback that suspends parks/resumes on
+/// the active runtime task; opens the same per-tool OTel span and records each
+/// correlated result via [`record_tool_result`]. Resolution/validation failures and
+/// handler errors are fed back as tool-error results (never escaping the loop),
+/// mirroring `run_tool_loop`. `Return(nil)` once every pending call is recorded.
+struct ExecToolsContinuation {
+    token: u64,
+    tools: Vec<Value>,
+    /// The `:on-tool-call` callback (workflow journaling / user observer), or `None`.
+    on_tool_call: Option<Value>,
+    /// Tool calls not yet dispatched (front = next).
+    remaining: std::collections::VecDeque<ToolCall>,
+    /// The call currently in flight, plus which `Call` the next `resume` settles.
+    active: Option<ActiveCall>,
+    phase: ToolPhase,
+}
+
+impl sema_core::runtime::Trace for ExecToolsContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        use sema_core::cycle::GcEdge;
+        for tool in &self.tools {
+            sink(GcEdge::Value(tool));
+        }
+        if let Some(cb) = &self.on_tool_call {
+            sink(GcEdge::Value(cb));
+        }
+        if let Some(active) = &self.active {
+            sink(GcEdge::Value(&active.args_value));
+            if let Some((handler, args)) = &active.pending_handler {
+                sink(GcEdge::Value(handler));
+                for arg in args {
+                    sink(GcEdge::Value(arg));
+                }
+            }
+            for step in &active.validation_steps {
+                if let ExtractionValidationStep::Predicate {
+                    callable, argument, ..
+                } = step
+                {
+                    sink(GcEdge::Value(callable));
+                    sink(GcEdge::Value(argument));
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Build one `:on-tool-call` event map. `result` (present for the "end" event)
+/// carries the truncated result preview, the error flag, and the handler duration.
+fn tool_event_map(
+    event: &str,
+    tc: &ToolCall,
+    args_value: &Value,
+    result: Option<(&str, bool, i64)>,
+) -> Value {
+    let mut m = BTreeMap::new();
+    m.insert(Value::keyword("event"), Value::string(event));
+    m.insert(Value::keyword("tool"), Value::string(&tc.name));
+    m.insert(Value::keyword("args"), args_value.clone());
+    if let Some((result_str, is_error, duration_ms)) = result {
+        let preview = if result_str.len() > 200 {
+            format!("{}...", sema_core::truncate_chars(result_str, 200))
+        } else {
+            result_str.to_string()
+        };
+        m.insert(Value::keyword("result"), Value::string(&preview));
+        m.insert(Value::keyword("error"), Value::bool(is_error));
+        m.insert(Value::keyword("duration-ms"), Value::int(duration_ms));
+    }
+    Value::map(m)
+}
+
+impl ExecToolsContinuation {
+    fn start_tool_call(self: Box<Self>) -> sema_core::runtime::NativeResult {
+        let start_event = self.on_tool_call.as_ref().map(|_| {
+            let active = self.active.as_ref().expect("active tool call");
+            tool_event_map("start", &active.tc, &active.args_value, None)
+        });
+        match self.on_tool_call.clone() {
+            Some(callback) => {
+                self.call_event(callback, start_event.unwrap(), ToolPhase::StartEvent)
+            }
+            None => self.begin_tool_work(),
+        }
+    }
+
+    fn begin_tool_work(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        let active = self.active.as_mut().expect("active tool call");
+        let tool_desc = self.tools.iter().find_map(|tool| {
+            let definition = tool.as_tool_def_rc()?;
+            (definition.name == active.tc.name).then(|| definition.description.clone())
+        });
+        active.span = Some(sema_otel::tool_span_detached(
+            &active.tc.name,
+            &active.tc.id,
+            tool_desc.as_deref(),
+        ));
+        active.started = Some(std::time::Instant::now());
+
+        if let Some(error) = active.pending_error.take() {
+            return self.complete_tool_call(error, true);
+        }
+        self.advance_validation()
+    }
+
+    fn advance_validation(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome};
+
+        loop {
+            let step = self
+                .active
+                .as_mut()
+                .expect("active call while validating")
+                .validation_steps
+                .pop_front();
+            match step {
+                Some(ExtractionValidationStep::Error(error)) => self
+                    .active
+                    .as_mut()
+                    .expect("active call while validating")
+                    .validation_errors
+                    .push(error),
+                Some(ExtractionValidationStep::Predicate {
+                    callable,
+                    argument,
+                    key_name,
+                    failure_message,
+                }) => {
+                    self.phase = ToolPhase::Validation {
+                        key_name,
+                        failure_message,
+                    };
+                    return Ok(NativeOutcome::Call(NativeCall {
+                        callable,
+                        args: vec![argument],
+                        continuation: self,
+                    }));
+                }
+                None => break,
+            }
+        }
+
+        let errors = &self
+            .active
+            .as_ref()
+            .expect("active call after validation")
+            .validation_errors;
+        if errors.is_empty() {
+            return self.dispatch_handler();
+        }
+
+        let active = self.active.as_ref().expect("invalid active call");
+        let error = SemaError::Llm(format!(
+            "invalid arguments for tool '{}': {}",
+            active.tc.name,
+            active.validation_errors.join("; ")
+        ));
+        self.complete_tool_call(format!("Error: {error}"), true)
+    }
+
+    /// A cooperative `Call` on `callback` with one event map, resuming into `phase`.
+    fn call_event(
+        mut self: Box<Self>,
+        callback: Value,
+        event: Value,
+        phase: ToolPhase,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome};
+        self.phase = phase;
+        Ok(NativeOutcome::Call(NativeCall {
+            callable: callback,
+            args: vec![event],
+            continuation: self,
+        }))
+    }
+
+    /// Dispatch the validated handler as a `NativeOutcome::Call`, resuming into
+    /// `Handler`. The tool span was opened before validation.
+    fn dispatch_handler(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome};
+        let active = self.active.as_mut().expect("active call while dispatching");
+        let (handler, args) = active
+            .pending_handler
+            .take()
+            .expect("handler resolved before dispatch");
+        self.phase = ToolPhase::Handler;
+        Ok(NativeOutcome::Call(NativeCall {
+            callable: handler,
+            args,
+            continuation: self,
+        }))
+    }
+
+    /// Pop the next pending call and fire its start event. The no-observer path opens
+    /// the span and begins validation directly. Returns `Return(nil)` once every
+    /// pending call is recorded.
+    fn advance(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::NativeOutcome;
+        let Some(tc) = self.remaining.pop_front() else {
+            return Ok(NativeOutcome::Return(Value::nil()));
+        };
+        let args_value = sema_core::json_to_value(&tc.arguments);
+        let prepared = prepare_tool_call_cooperative(&self.tools, &tc.name, &tc.arguments);
+        let (pending_handler, pending_error, validation_steps) = match prepared {
+            Ok(prepared) => (
+                Some((prepared.handler, prepared.args)),
+                None,
+                prepared.validation_steps,
+            ),
+            Err(error) => (None, Some(format!("Error: {error}")), VecDeque::new()),
+        };
+        let args_json = serde_json::to_string(&tc.arguments).unwrap_or_default();
+        self.active = Some(ActiveCall {
+            tc,
+            pending_handler,
+            pending_error,
+            validation_steps,
+            validation_errors: Vec::new(),
+            args_value,
+            args_json,
+            span: None,
+            started: None,
+        });
+        self.start_tool_call()
+    }
+
+    /// Finalize the tool span for the settled handler (record error / content I/O,
+    /// then drop it) and return `(result, is_error, duration_ms)`.
+    fn finish_span(&mut self, result: &str, is_error: bool) -> i64 {
+        let active = self.active.as_mut().expect("active call at handler settle");
+        if let Some(span) = active.span.take() {
+            if is_error {
+                span.record_error("tool_error", result);
+            }
+            if sema_otel::content_capture_enabled() {
+                span.set_tool_io(&active.args_json, result);
+            }
+            // `span` drops here → the tool span ends and pops the task's otel stack.
+        }
+        active
+            .started
+            .map(|t| t.elapsed().as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    fn complete_tool_call(
+        mut self: Box<Self>,
+        result: String,
+        is_error: bool,
+    ) -> sema_core::runtime::NativeResult {
+        let duration_ms = self.finish_span(&result, is_error);
+        match self.on_tool_call.clone() {
+            Some(callback) => {
+                let active = self.active.as_ref().expect("active call at completion");
+                let event = tool_event_map(
+                    "end",
+                    &active.tc,
+                    &active.args_value,
+                    Some((&result, is_error, duration_ms)),
+                );
+                self.call_event(callback, event, ToolPhase::EndEvent { result, is_error })
+            }
+            None => {
+                let tc = self.active.take().expect("active call at completion").tc;
+                record_tool_result(self.token, &tc, result, is_error);
+                self.advance()
+            }
+        }
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for ExecToolsContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+        // A task cancellation lands on whichever `Call` was in flight; abort the whole
+        // run so the runtime settles the parked parent task Cancelled.
+        if let ResumeInput::Cancelled(reason) = &input {
+            let message = format!("agent tool round was cancelled ({reason:?})");
+            if let Some(span) = self.active.as_ref().and_then(|active| active.span.as_ref()) {
+                span.record_error("cancelled", &message);
+            }
+            return Err(SemaError::eval(message));
+        }
+        match std::mem::replace(&mut self.phase, ToolPhase::Handler) {
+            ToolPhase::Validation {
+                key_name,
+                failure_message,
+            } => {
+                let active = self.active.as_mut().expect("active call after validation");
+                match input {
+                    ResumeInput::Returned(value) if value.is_truthy() => {}
+                    ResumeInput::Returned(_) => active
+                        .validation_errors
+                        .push(format!("key {key_name}: {failure_message}")),
+                    ResumeInput::Failed(error) => active
+                        .validation_errors
+                        .push(format!("key {key_name}: validation error: {error}")),
+                    ResumeInput::Cancelled(_) => unreachable!("handled above"),
+                    ResumeInput::Runtime(_) => {
+                        return Err(SemaError::eval(
+                            "agent tool validation received an unexpected runtime response",
+                        ))
+                    }
+                }
+                self.advance_validation()
+            }
+            // The "start" event settled (return value ignored, and a callback failure
+            // must not abort the tool round) — now open the span and validate.
+            ToolPhase::StartEvent => self.begin_tool_work(),
+            // The handler settled: its value/error is the tool result.
+            ToolPhase::Handler => {
+                let (result, is_error) = match input {
+                    ResumeInput::Returned(value) => (stringify_tool_result(value), false),
+                    // A handler error is fed BACK to the model as a tool result (the
+                    // loop recovers), never propagated — matching `run_tool_loop`.
+                    ResumeInput::Failed(error) => (format!("Error: {error}"), true),
+                    ResumeInput::Cancelled(_) => unreachable!("handled above"),
+                    ResumeInput::Runtime(_) => {
+                        return Err(SemaError::eval(
+                            "agent tool continuation received an unexpected runtime response",
+                        ))
+                    }
+                };
+                self.complete_tool_call(result, is_error)
+            }
+            // The "end" event settled — record the tool result and move on.
+            ToolPhase::EndEvent { result, is_error } => {
+                let tc = self.active.take().expect("active call at end").tc;
+                record_tool_result(self.token, &tc, result, is_error);
+                self.advance()
+            }
+        }
+    }
+}
+
+/// Begin the cooperative tool round: build the [`ExecToolsContinuation`] and
+/// RETURN its first `NativeOutcome` on the runtime native ABI (mirrors `map`'s
+/// cooperative entry — the runtime drives the resulting `Call`). When no handler
+/// call is needed (e.g. every pending call fails to resolve), the results are
+/// recorded synchronously and a nil value is returned directly.
+fn exec_tools_cooperative_start(
+    token: u64,
+    tools: Vec<Value>,
+    on_tool_call: Option<Value>,
+    pending: Vec<ToolCall>,
+) -> sema_core::runtime::NativeResult {
+    let continuation = Box::new(ExecToolsContinuation {
+        token,
+        tools,
+        on_tool_call,
+        remaining: pending.into(),
+        active: None,
+        phase: ToolPhase::Handler,
+    });
+    continuation.advance()
 }
 
 /// `__agent-finish(token) → result`. Idempotent: appends the final assistant turn,
 /// records trace I/O, ends the agent span, writes back to memory, and builds the
 /// return value (`{:response :messages :session}` map with opts, else the string).
-fn agent_finish(token: u64) -> Result<Value, SemaError> {
+fn agent_finish(token: u64, finish_error: Option<String>) -> Result<Value, SemaError> {
     // Take the state OUT of the slab so the span/scope guards drop (balanced pop+end,
     // agent-task otel installed) once we're done building the result.
     let mut st = match AGENT_RUNS.with(|r| r.borrow_mut().remove(&token)) {
@@ -8732,6 +11434,23 @@ fn agent_finish(token: u64) -> Result<Value, SemaError> {
         // may both call finish.
         None => return Ok(Value::nil()),
     };
+
+    // The driver's `catch` passed the unwinding error: close the `invoke_agent`
+    // span with the failure status before it ends (on `st` drop below). This is
+    // the cancellation path — the unified runtime resumes a cancelled parked task
+    // so the driver's `catch → __agent-finish → throw` runs, ending the span here
+    // (balanced pop) rather than leaving it for the task-reaped sweep. Without
+    // this the span would end "unset", losing the cancellation telemetry.
+    if let Some(err) = &finish_error {
+        if let Some(span) = st.agent_span.as_ref() {
+            let kind = if err.to_ascii_lowercase().contains("cancel") {
+                "cancelled"
+            } else {
+                "agent_error"
+            };
+            span.record_error(kind, err);
+        }
+    }
 
     // Append the final assistant message (mirrors run_tool_loop's terminal push).
     if !st.final_pushed && !st.last_content.is_empty() {
@@ -8803,8 +11522,8 @@ fn agent_finish(token: u64) -> Result<Value, SemaError> {
 // ── Non-blocking streaming (`llm/stream` + agent `:on-text` rounds) ──────────
 //
 // The streaming sibling of the `__agent-*` loop above, same ADR #68 shape: a
-// native cannot loop-yield (a yielded `AwaitIo` is not re-invoked, and a Sema
-// callback cannot run inside a poller), so the per-delta loop lives in bytecode
+// native cannot retain a Rust loop across suspension, and a Sema callback cannot
+// run inside a completion decoder, so the per-delta loop lives in bytecode
 // (`__stream-drive` in the prelude) over three natives — `__stream-begin` /
 // `__stream-next` / `__stream-finish` — coordinated by a slab entry that owns
 // the wire channel and the finalize context. The wire side (the provider's
@@ -8826,6 +11545,18 @@ struct StreamDone {
     provider: String,
 }
 
+/// Provider-at-a-time dispatch state retained between `__stream-next` calls.
+/// It contains host data only; Sema callbacks are looked up immediately before
+/// a structural `NativeOutcome::Call` and are traced by that call itself.
+#[cfg(not(target_arch = "wasm32"))]
+struct StreamDispatchState {
+    chain: Vec<ResolvedProvider>,
+    request: ChatRequest,
+    next_provider: usize,
+    last_error: Option<(LlmError, String)>,
+    rate_limit_wait_ms: u64,
+}
+
 /// Per-run state for a non-blocking stream, keyed by an integer token in the
 /// thread-local `STREAM_RUNS` slab (its own slab — agent-loop state is not
 /// touched). Owns the wire receiver and everything the finalize needs on the VM
@@ -8835,10 +11566,15 @@ struct StreamRunState {
     rx: Option<std::sync::mpsc::Receiver<StreamEvent>>,
     /// Pre-filled events, drained before `rx`.
     buffered: std::collections::VecDeque<StreamEvent>,
+    /// Real provider dispatch. `Some` + no receiver means the next provider is
+    /// ready to start; `Some` + a receiver means one native stream is active.
+    /// `None` means cassette replay or a terminal event is already buffered.
+    #[cfg(not(target_arch = "wasm32"))]
+    dispatch: Option<StreamDispatchState>,
     /// Detached chat span (parent captured at begin), finalized when `Done` lands.
     span: Option<sema_otel::LlmSpan>,
-    /// This leaf's usage-accumulator frame, captured at begin (same reasoning as
-    /// `do_complete_async_yield`'s `usage_accum_slot`).
+    /// This leaf's usage-accumulator frame, captured at begin so accounting uses
+    /// the dispatch-time scope.
     usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
     /// The dispatch-time budget frame `Rc` (ASYNC-1), re-installed around the
     /// finalize's `track_usage`.
@@ -8846,6 +11582,9 @@ struct StreamRunState {
     /// Set when a cassette is recording; the entry is written at finalize with
     /// the collected chunk boundaries.
     cassette_record_key: Option<String>,
+    /// The exact cassette selected at dispatch, retained because finalization can
+    /// run after the task's dynamic scope has been swapped out.
+    cassette_scope: Option<CassetteScope>,
     /// Every delta drained so far (cassette recording preserves boundaries).
     collected: Vec<String>,
     first_token_seen: bool,
@@ -8855,7 +11594,7 @@ struct StreamRunState {
     /// The scheduler task that opened this run (None outside a task). The
     /// task-reaped sweep reclaims entries by this id when their task is
     /// cancelled — `__stream-finish` cannot run for a cancelled task.
-    owning_task_id: Option<u64>,
+    owning_task_id: Option<RuntimeTaskId>,
     /// A failure that arrived in a batch that still carried deltas: stored so the
     /// driver delivers those deltas to the callback first, then raised (and the
     /// entry dropped) on the next `__stream-next`/`__stream-finish`.
@@ -8944,10 +11683,6 @@ fn stream_wire_walk(
                 return;
             }
             Err(e) => {
-                eprintln!(
-                    "Provider '{}' failed to open stream: {e}, trying next...",
-                    entry.name
-                );
                 last = Some((e, entry.name.clone()));
             }
         }
@@ -8964,9 +11699,20 @@ fn stream_wire_walk(
     })));
 }
 
+/// Drive one native provider attempt on the I/O pool. Fallback selection stays
+/// on the VM thread, so this helper reports exactly one terminal event and does
+/// not inspect or log the remainder of the chain.
+#[cfg(not(target_arch = "wasm32"))]
+fn stream_wire_attempt(
+    entry: &ResolvedProvider,
+    request: &ChatRequest,
+    emit: &mut dyn FnMut(StreamEvent),
+) {
+    stream_wire_walk(std::slice::from_ref(entry), request, emit);
+}
+
 /// Resolve the active fallback chain (or the default provider) into owned `Arc`
-/// clones on the VM thread, so the offloaded wire walk touches no thread-locals
-/// (mirrors the resolution inside `do_complete_async_yield`).
+/// clones on the VM thread, so the offloaded wire walk touches no thread-locals.
 fn resolve_stream_chain() -> Result<Vec<ResolvedProvider>, SemaError> {
     PROVIDER_REGISTRY.with(|reg| {
         let reg = reg.borrow();
@@ -9005,30 +11751,23 @@ fn resolve_stream_chain() -> Result<Vec<ResolvedProvider>, SemaError> {
     })
 }
 
-/// Start a non-blocking stream run: budget pre-gate, cassette decision on the
-/// VM thread (replay pre-fills the run — drained without parking; recording
-/// captures the key for finalize), then — for a real dispatch only — the
-/// rate-limit gate, chain resolution into `Arc` clones, and the wire walk
-/// offloaded onto the I/O pool with `notify_io_complete` after every send so
-/// the parked scheduler wakes per delta. `span` is the caller's DETACHED chat
-/// span (attributes already set); it is finalized when `Done` lands. Returns
-/// the slab token.
+/// Start a non-blocking stream run: budget pre-gate and cassette decision happen
+/// on the VM thread. Replay pre-fills the run; a real dispatch stores an owned
+/// provider plan for `__stream-next` to drive one provider at a time. `span` is
+/// the caller's detached chat span and is finalized when `Done` lands.
 ///
 /// The rate-limit gate sits AFTER the cassette decision (unlike the sync
 /// `stream_with_dispatch`, which always calls `enforce_rate_limit` up front):
-/// a replay makes no provider call, so — mirroring `do_complete_async_yield`'s
-/// cache/cassette-hit paths, which skip the gate entirely — it doesn't
-/// consume a pacing slot either.
+/// a replay makes no provider call, so it does not consume a pacing slot.
 fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Value, SemaError> {
     stream_budget_pregate()?;
 
     // Keyed by the request as-is (no default-model resolution), matching the
     // synchronous `stream_with_cassette` so record/replay agree across paths.
-    let cassette_decision = CASSETTE.with(|c| {
-        c.borrow().as_ref().map(|cass| {
-            let key = compute_cache_key(&request);
-            (key.clone(), cass.decide(&key))
-        })
+    let cassette_scope = current_cassette_scope();
+    let cassette_decision = cassette_scope.as_ref().map(|scope| {
+        let key = compute_cache_key(&request);
+        (key.clone(), scope.borrow().decide(&key))
     });
     let mut buffered = std::collections::VecDeque::new();
     let mut cassette_record_key = None;
@@ -9049,52 +11788,49 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
         _ => {}
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    let dispatch = if prefilled {
+        None
+    } else {
+        Some(StreamDispatchState {
+            chain: resolve_stream_chain()?,
+            request,
+            next_provider: 0,
+            last_error: None,
+            rate_limit_wait_ms: reserve_rate_limit_wait_ms(),
+        })
+    };
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let rx = None;
+
+    #[cfg(target_arch = "wasm32")]
     let rx = if prefilled {
         None
     } else {
-        // Reserve this dispatch's rate-limit slot HERE, synchronously, before
-        // the offload starts (see `reserve_rate_limit_wait_ms`). The wait
-        // itself is spent on the I/O pool worker below, never the VM thread.
         let rate_limit_wait_ms = reserve_rate_limit_wait_ms();
         let chain = resolve_stream_chain()?;
         let (tx, rx) = std::sync::mpsc::channel::<StreamEvent>();
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            sema_io::io_spawn_blocking(move || {
-                if rate_limit_wait_ms > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(rate_limit_wait_ms));
-                }
-                let mut emit = |ev: StreamEvent| {
-                    let _ = tx.send(ev);
-                    sema_core::notify_io_complete();
-                };
-                stream_wire_walk(&chain, &request, &mut emit);
-            });
+        if rate_limit_wait_ms > 0 {
+            sema_core::blocking_sleep_ms(rate_limit_wait_ms);
         }
-        #[cfg(target_arch = "wasm32")]
-        {
-            // No I/O pool on wasm: run the walk inline (blocking) — deltas are
-            // delivered after the stream completes, in order, exactly once.
-            // Single-threaded (no siblings to stall), so the reserved wait is
-            // spent inline too, unlike the pool-offloaded path above.
-            if rate_limit_wait_ms > 0 {
-                sema_core::blocking_sleep_ms(rate_limit_wait_ms);
-            }
-            let mut emit = |ev: StreamEvent| {
-                let _ = tx.send(ev);
-            };
-            stream_wire_walk(&chain, &request, &mut emit);
-        }
+        let mut emit = |ev: StreamEvent| {
+            let _ = tx.send(ev);
+        };
+        stream_wire_walk(&chain, &request, &mut emit);
         Some(rx)
     };
 
     let state = StreamRunState {
         rx,
         buffered,
+        #[cfg(not(target_arch = "wasm32"))]
+        dispatch,
         span: Some(span),
         usage_accum_slot: current_usage_accum(),
         budget_slot: active_budget(),
         cassette_record_key,
+        cassette_scope,
         collected: Vec::new(),
         first_token_seen: false,
         response: None,
@@ -9111,9 +11847,261 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
     Ok(Value::int(token as i64))
 }
 
-/// Post-stream work on the VM thread when `Done` lands — the streaming analogue
-/// of `do_complete_async_yield`'s poller finalize: span finalize,
-/// serving-provider stamp, cassette record, per-leaf usage fold +
+#[cfg(not(target_arch = "wasm32"))]
+enum RuntimeStreamPhase {
+    Ready,
+    Pacing,
+    Sema { provider: String, model: String },
+}
+
+/// Token-only continuation that advances one stream provider at a time. The run
+/// slab owns all host state; `NativeCall` owns and traces each Sema callback and
+/// request value while that call is active.
+#[cfg(not(target_arch = "wasm32"))]
+struct RuntimeStreamDriver {
+    token: u64,
+    phase: RuntimeStreamPhase,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for RuntimeStreamDriver {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RuntimeStreamDriver {
+    fn advance(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome, NativeSuspend, WaitKind};
+
+        enum Action {
+            Pace(u64),
+            Sema {
+                provider: String,
+                model: String,
+                request: ChatRequest,
+            },
+            Native {
+                entry: ResolvedProvider,
+                request: ChatRequest,
+            },
+            Terminal,
+        }
+
+        loop {
+            let action = STREAM_RUNS.with(|runs| -> Result<Action, SemaError> {
+                let mut runs = runs.borrow_mut();
+                let state = runs
+                    .get_mut(&self.token)
+                    .ok_or_else(|| SemaError::Llm("stream-run handle not found".to_string()))?;
+                let dispatch = state.dispatch.as_mut().ok_or_else(|| {
+                    SemaError::eval("stream dispatch resumed after reaching a terminal state")
+                })?;
+
+                if dispatch.rate_limit_wait_ms > 0 {
+                    let wait_ms = std::mem::take(&mut dispatch.rate_limit_wait_ms);
+                    return Ok(Action::Pace(wait_ms));
+                }
+
+                let Some(entry) = dispatch.chain.get(dispatch.next_provider).cloned() else {
+                    let (error, provider) = dispatch.last_error.take().unwrap_or_else(|| {
+                        (
+                            LlmError::Config("all providers failed".to_string()),
+                            String::new(),
+                        )
+                    });
+                    state.dispatch = None;
+                    state
+                        .buffered
+                        .push_back(StreamEvent::Done(Box::new(StreamDone {
+                            result: Err(error),
+                            provider,
+                        })));
+                    return Ok(Action::Terminal);
+                };
+                dispatch.next_provider += 1;
+
+                let mut request = dispatch.request.clone();
+                if let Some(model) = &entry.model {
+                    request.model = model.clone();
+                } else if request.model.is_empty() {
+                    request.model = entry.provider.default_model().to_string();
+                }
+
+                if entry.provider.runs_on_vm_thread() {
+                    Ok(Action::Sema {
+                        provider: entry.name,
+                        model: request.model.clone(),
+                        request,
+                    })
+                } else {
+                    Ok(Action::Native { entry, request })
+                }
+            })?;
+
+            match action {
+                Action::Pace(wait_ms) => {
+                    self.phase = RuntimeStreamPhase::Pacing;
+                    return Ok(NativeOutcome::Suspend(NativeSuspend {
+                        wait: WaitKind::Timer(std::time::Duration::from_millis(wait_ms)),
+                        continuation: self,
+                    }));
+                }
+                Action::Sema {
+                    provider,
+                    model,
+                    request,
+                } => {
+                    let callback = match lisp_provider_complete_callback(&provider) {
+                        Ok(callback) => callback,
+                        Err(error) => {
+                            stream_note_open_failure(self.token, provider, error)?;
+                            continue;
+                        }
+                    };
+                    self.phase = RuntimeStreamPhase::Sema { provider, model };
+                    return Ok(NativeOutcome::Call(NativeCall {
+                        callable: callback,
+                        args: vec![chat_request_to_value(&request)],
+                        continuation: self,
+                    }));
+                }
+                Action::Native { entry, request } => {
+                    let (tx, rx) = std::sync::mpsc::channel::<StreamEvent>();
+                    STREAM_RUNS.with(|runs| -> Result<(), SemaError> {
+                        let mut runs = runs.borrow_mut();
+                        let state = runs.get_mut(&self.token).ok_or_else(|| {
+                            SemaError::Llm("stream-run handle not found".to_string())
+                        })?;
+                        state.rx = Some(rx);
+                        Ok(())
+                    })?;
+                    sema_io::io_spawn_blocking(move || {
+                        let mut emit = |event| {
+                            let _ = tx.send(event);
+                        };
+                        stream_wire_attempt(&entry, &request, &mut emit);
+                    });
+                    return stream_next_runtime_step(self.token);
+                }
+                Action::Terminal => return stream_next_runtime_step(self.token),
+            }
+        }
+    }
+
+    fn sema_succeeded(
+        &self,
+        provider: String,
+        response: ChatResponse,
+    ) -> sema_core::runtime::NativeResult {
+        STREAM_RUNS.with(|runs| -> Result<(), SemaError> {
+            let mut runs = runs.borrow_mut();
+            let state = runs
+                .get_mut(&self.token)
+                .ok_or_else(|| SemaError::Llm("stream-run handle not found".to_string()))?;
+            state.dispatch = None;
+            state
+                .buffered
+                .push_back(StreamEvent::Delta(response.content.clone()));
+            state
+                .buffered
+                .push_back(StreamEvent::Done(Box::new(StreamDone {
+                    result: Ok(response),
+                    provider,
+                })));
+            Ok(())
+        })?;
+        stream_next_runtime_step(self.token)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::NativeContinuation for RuntimeStreamDriver {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+
+        match (&self.phase, input) {
+            (RuntimeStreamPhase::Pacing, ResumeInput::Returned(_)) => {
+                let mut this = self;
+                this.phase = RuntimeStreamPhase::Ready;
+                this.advance()
+            }
+            (RuntimeStreamPhase::Sema { provider, model }, ResumeInput::Returned(value)) => {
+                let provider = provider.clone();
+                let model = model.clone();
+                match parse_lisp_provider_response(&value, &model) {
+                    Ok(response) => self.sema_succeeded(provider, response),
+                    Err(error) => {
+                        stream_note_open_failure(self.token, provider, error)?;
+                        self.advance()
+                    }
+                }
+            }
+            (RuntimeStreamPhase::Sema { provider, .. }, ResumeInput::Failed(error)) => {
+                let provider = provider.clone();
+                stream_note_open_failure(
+                    self.token,
+                    provider,
+                    LlmError::Api {
+                        status: 0,
+                        message: error.to_string(),
+                    },
+                )?;
+                self.advance()
+            }
+            (_, ResumeInput::Failed(error)) => Err(error),
+            (_, ResumeInput::Cancelled(reason)) => Err(SemaError::eval(format!(
+                "stream provider dispatch was cancelled ({reason:?})"
+            ))),
+            (_, ResumeInput::Runtime(_)) => Err(SemaError::eval(
+                "stream provider driver received an unexpected runtime response",
+            )),
+            (RuntimeStreamPhase::Ready, ResumeInput::Returned(_)) => Err(SemaError::eval(
+                "stream provider driver resumed without an active attempt",
+            )),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stream_note_open_failure(
+    token: u64,
+    provider: String,
+    error: LlmError,
+) -> Result<(), SemaError> {
+    eprintln!("Provider '{provider}' failed to open stream: {error}, trying next...");
+    STREAM_RUNS.with(|runs| {
+        let mut runs = runs.borrow_mut();
+        let state = runs
+            .get_mut(&token)
+            .ok_or_else(|| SemaError::Llm("stream-run handle not found".to_string()))?;
+        let dispatch = state.dispatch.as_mut().ok_or_else(|| {
+            SemaError::eval("stream provider failed after reaching a terminal state")
+        })?;
+        dispatch.last_error = Some((error, provider));
+        state.rx = None;
+        Ok(())
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn stream_dispatch_ready(token: u64) -> Result<bool, SemaError> {
+    STREAM_RUNS.with(|runs| {
+        let runs = runs.borrow();
+        let state = runs
+            .get(&token)
+            .ok_or_else(|| SemaError::Llm("stream-run handle not found".to_string()))?;
+        Ok(state.dispatch.is_some() && state.rx.is_none())
+    })
+}
+
+/// Post-stream work on the VM thread when `Done` lands: span finalization,
+/// serving-provider stamp, cassette record, per-leaf usage fold, and
 /// budget-installed `track_usage` (exactly once per streamed completion).
 /// Returns the response, or the error message to surface.
 fn stream_finalize(
@@ -9122,6 +12110,7 @@ fn stream_finalize(
     usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
     budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
     cassette_record_key: Option<String>,
+    cassette_scope: Option<CassetteScope>,
     collected: &[String],
 ) -> Result<ChatResponse, String> {
     match done.result {
@@ -9137,16 +12126,13 @@ fn stream_finalize(
                 set_serving_provider(&done.provider);
             }
             if let Some(key) = &cassette_record_key {
-                CASSETTE.with(|c| {
-                    if let Some(cass) = c.borrow_mut().as_mut() {
-                        cass.record_entry(crate::cassette::TapeEntry::from_stream(
-                            key, collected, &resp,
-                        ));
-                    }
-                });
+                cassette_scope_record(
+                    &cassette_scope,
+                    crate::cassette::TapeEntry::from_stream(key, collected, &resp),
+                );
             }
             // Fold into THIS run's captured accumulator frame, then suppress
-            // `track_usage`'s own fold — the poller runs outside the per-task
+            // `track_usage`'s own fold — the finalizer runs outside the per-task
             // install boundary, so the thread-local may hold a sibling's scope.
             if let Some(slot) = &usage_accum_slot {
                 let cost = pricing::calculate_cost_for(&done.provider, &resp.usage);
@@ -9189,15 +12175,12 @@ fn stream_batch_map(deltas: Vec<Value>, done: bool) -> Value {
 /// Drain every currently-available wire event for `token` into one batch
 /// (batching amortizes park/resume over fast token streams), finalizing the run
 /// when `Done` arrives. `blocking` waits for the first event (the sync-context
-/// fallback and pre-filled runs); the poller path never blocks. `Ok(None)` =
+/// fallback and pre-filled runs); the nonblocking scan never blocks. `Ok(None)` =
 /// nothing available yet (stay parked).
 ///
-/// A failure is NEVER surfaced through the poller (an `IoPoll::Ready(Err)`
-/// rejects the whole task — an in-task `try` could not catch it, and which path
-/// fired would depend on batch timing): it is always stored as `pending_error`
-/// and raised by the NEXT `__stream-next` as an ordinary native error —
-/// deterministic, catchable in task context (matching the sync path), and the
-/// callback still sees every delta delivered before the failure.
+/// A failure is stored as `pending_error` and raised by the next `__stream-next`
+/// as an ordinary native error. This keeps it catchable in task context and lets
+/// the callback observe every delta delivered before the failure.
 fn stream_poll_batch(token: u64, blocking: bool) -> Result<Option<Value>, SemaError> {
     use std::sync::mpsc::TryRecvError;
 
@@ -9273,24 +12256,53 @@ fn stream_poll_batch(token: u64, blocking: bool) -> Result<Option<Value>, SemaEr
         };
     };
 
+    #[cfg(not(target_arch = "wasm32"))]
+    let should_fallback = STREAM_RUNS.with(|runs| {
+        let runs = runs.borrow();
+        runs.get(&token)
+            .is_some_and(|state| !state.first_token_seen && state.dispatch.is_some())
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    if should_fallback && done.result.is_err() {
+        let StreamDone { result, provider } = *done;
+        let error = result.expect_err("stream fallback branch requires an error");
+        stream_note_open_failure(token, provider, error)?;
+        debug_assert!(batch.is_empty());
+        return Ok(None);
+    }
+
     // Done landed: take the finalize context out (short-borrow), run the
     // finalize outside the slab borrow, then write the outcome back.
     let ctx = STREAM_RUNS.with(|r| {
         let mut slab = r.borrow_mut();
         slab.get_mut(&token).map(|st| {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                st.dispatch = None;
+            }
+            st.rx = None;
             (
                 st.span.take(),
                 st.usage_accum_slot.take(),
                 st.budget_slot.take(),
                 st.cassette_record_key.take(),
+                st.cassette_scope.take(),
                 std::mem::take(&mut st.collected),
             )
         })
     });
-    let Some((span, usage_slot, budget_slot, record_key, collected)) = ctx else {
+    let Some((span, usage_slot, budget_slot, record_key, cassette_scope, collected)) = ctx else {
         return Err(SemaError::Llm("stream-run handle not found".to_string()));
     };
-    match stream_finalize(*done, span, usage_slot, budget_slot, record_key, &collected) {
+    match stream_finalize(
+        *done,
+        span,
+        usage_slot,
+        budget_slot,
+        record_key,
+        cassette_scope,
+        &collected,
+    ) {
         Ok(resp) => {
             STREAM_RUNS.with(|r| {
                 if let Some(st) = r.borrow_mut().get_mut(&token) {
@@ -9311,16 +12323,125 @@ fn stream_poll_batch(token: u64, blocking: bool) -> Result<Option<Value>, SemaEr
     }
 }
 
-/// `__stream-next(token) → {:deltas [str…] :done bool}`. In a scheduler task it
-/// parks on `AwaitIo`; the poller drains all currently-available deltas per wake
-/// (see `stream_poll_batch`). Pre-filled runs and non-async context drain
-/// blockingly without parking.
-fn stream_next(token: u64) -> Result<Value, SemaError> {
-    // The scheduler resumes the bytecode after the CALL via `replace_stack_top`
-    // (this native is not re-invoked); drain a stray resume value defensively.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
+/// `__stream-next(token) → {:deltas [str…] :done bool}`. In a runtime task it
+/// suspends on an External wait; the decoder drains all currently available
+/// deltas per wake (see `stream_poll_batch`). Pre-filled runs and synchronous
+/// contexts drain blockingly.
+/// Completion-kind tag for the `__stream-next` cooperative inter-scan sleep.
+#[cfg(not(target_arch = "wasm32"))]
+const STREAM_POLL_COMPLETION_KIND: u64 = 0x7374_726d; // "strm"
+/// Milliseconds slept off the VM thread between stream-batch scans.
+#[cfg(not(target_arch = "wasm32"))]
+const STREAM_POLL_INTERVAL_MS: u64 = 5;
+/// Bounded cleanup deadline for the inter-scan sleep job.
+#[cfg(not(target_arch = "wasm32"))]
+const STREAM_POLL_CLEANUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Nil decoder for the `__stream-next` inter-scan sleep — the batch re-check lives
+/// in [`StreamPollContinuation`]; the sleep itself carries no result.
+#[cfg(not(target_arch = "wasm32"))]
+struct StreamPollDecoder;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for StreamPollDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::CompletionDecoder for StreamPollDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        result: Result<sema_core::runtime::SendPayload, sema_core::runtime::ExternalFailure>,
+    ) -> sema_core::runtime::DecodedCompletion {
+        match result {
+            Ok(_) => Ok(Value::nil()),
+            Err(failure) => Err(SemaError::eval(failure.message().to_string())),
+        }
+    }
+}
+
+/// Resumes a parked `__stream-next` after its inter-scan sleep: re-scan the run's
+/// delta batch (start the next scan, or resolve). Holds only the run `token`
+/// (`u64`), so it emits no GC edges.
+#[cfg(not(target_arch = "wasm32"))]
+struct StreamPollContinuation {
+    token: u64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::Trace for StreamPollContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl sema_core::runtime::NativeContinuation for StreamPollContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+        match input {
+            ResumeInput::Returned(_) => stream_next_runtime_step(self.token),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "__stream-next was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "__stream-next continuation received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// One cooperative scan of a stream run under the unified runtime: re-check the
+/// delta batch on the VM thread; resolve if a batch is ready, else re-arm the
+/// short inter-scan sleep so sibling tasks overlap while the provider streams.
+#[cfg(not(target_arch = "wasm32"))]
+fn stream_next_runtime_step(token: u64) -> sema_core::runtime::NativeResult {
+    use sema_core::runtime::{
+        CompletionKind, NativeOutcome, NativeSuspend, PreparedExternalOperation, QuarantineBound,
+        SendPayload, WaitKind,
+    };
+    match stream_poll_batch(token, false) {
+        Ok(Some(v)) => return Ok(NativeOutcome::Return(v)),
+        Ok(None) => {}
+        Err(e) => return Err(e),
+    }
+    if stream_dispatch_ready(token)? {
+        return Box::new(RuntimeStreamDriver {
+            token,
+            phase: RuntimeStreamPhase::Ready,
+        })
+        .advance();
+    }
+    let kind = CompletionKind::try_from_raw(STREAM_POLL_COMPLETION_KIND)
+        .expect("stream poll completion kind is nonzero");
+    let bound = QuarantineBound::hard_deadline(STREAM_POLL_CLEANUP_DEADLINE)
+        .expect("stream poll cleanup deadline is nonzero");
+    let prepared = PreparedExternalOperation::quarantined_blocking(
+        kind,
+        Box::new(StreamPollDecoder),
+        bound,
+        move || {
+            std::thread::sleep(std::time::Duration::from_millis(STREAM_POLL_INTERVAL_MS));
+            Ok(Box::new(()) as SendPayload)
+        },
+    );
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(StreamPollContinuation { token }),
+    }))
+}
+
+fn stream_next(token: u64) -> sema_core::runtime::NativeResult {
+    #[allow(unused_imports)]
+    use sema_core::runtime::NativeOutcome;
 
     enum Pre {
         Err(String),
@@ -9341,42 +12462,55 @@ fn stream_next(token: u64) -> Result<Value, SemaError> {
         if st.done {
             return Ok(Pre::Done);
         }
-        Ok::<_, SemaError>(Pre::Run {
-            prefilled: st.rx.is_none(),
-        })
+        #[cfg(not(target_arch = "wasm32"))]
+        let prefilled = st.dispatch.is_none() && st.rx.is_none();
+        #[cfg(target_arch = "wasm32")]
+        let prefilled = st.rx.is_none();
+        Ok::<_, SemaError>(Pre::Run { prefilled })
     })?;
 
     let prefilled = match pre {
         Pre::Err(msg) => return Err(SemaError::Llm(msg)),
-        Pre::Done => return Ok(stream_batch_map(Vec::new(), true)),
+        Pre::Done => return Ok(NativeOutcome::Return(stream_batch_map(Vec::new(), true))),
         Pre::Run { prefilled } => prefilled,
     };
 
-    // Pre-filled runs resolve without parking (nothing to overlap — mirrors the
-    // cassette-replay no-yield path of `do_complete_async_yield`); outside a
-    // scheduler task fall back to a blocking drain.
-    if prefilled || !sema_core::in_async_context() {
+    #[cfg(not(target_arch = "wasm32"))]
+    if stream_dispatch_ready(token)? {
+        return stream_next_runtime_step(token);
+    }
+
+    // Pre-filled runs resolve without parking because there is nothing to overlap;
+    // outside a runtime quantum, fall back to a blocking drain.
+    if prefilled || !sema_core::in_runtime_quantum() {
         loop {
             if let Some(v) = stream_poll_batch(token, true)? {
-                return Ok(v);
+                return Ok(NativeOutcome::Return(v));
             }
         }
     }
 
-    let handle = Rc::new(sema_core::IoHandle::new(move || {
-        match stream_poll_batch(token, false) {
-            Ok(Some(v)) => sema_core::IoPoll::Ready(Ok(v)),
-            Ok(None) => sema_core::IoPoll::Pending,
-            Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
+    // A unified-runtime quantum re-scans cooperatively via a short off-VM-thread
+    // sleep (a bounded External wait), so sibling tasks overlap between delta
+    // batches. (Wasm has no off-thread executor; the non-runtime blocking drain
+    // above already handled `!in_runtime_quantum`, so drain synchronously here.)
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        stream_next_runtime_step(token)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        loop {
+            if let Some(v) = stream_poll_batch(token, true)? {
+                return Ok(NativeOutcome::Return(v));
+            }
         }
-    }));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
+    }
 }
 
 /// `__stream-finish(token) → content-string`. Cleans the slab entry and returns
-/// the assembled content (usage was already accounted, exactly once, when the
-/// poller finalized the `Done`).
+/// the assembled content (usage was already accounted exactly once when the
+/// VM-thread finalizer handled `Done`).
 fn stream_finish(token: u64) -> Result<Value, SemaError> {
     let mut st = STREAM_RUNS
         .with(|r| r.borrow_mut().remove(&token))
@@ -9395,7 +12529,7 @@ fn stream_finish(token: u64) -> Result<Value, SemaError> {
 /// agent-path terminal for a driven streaming round: pops the stream slab entry
 /// and feeds the assembled `ChatResponse` to `agent_apply_step_response`
 /// unchanged (tool-call handling identical to a non-streaming round; usage was
-/// accounted by the stream poller).
+/// accounted by the stream finalizer).
 fn agent_stream_apply(agent_token: u64, stream_token: u64) -> Result<Value, SemaError> {
     let mut st = STREAM_RUNS
         .with(|r| r.borrow_mut().remove(&stream_token))
@@ -9641,17 +12775,55 @@ fn execute_tool_call(
     let sema_args = json_args_to_sema(&tool_def.parameters, arguments, &tool_def.handler);
     let result = sema_core::call_callback(ctx, &tool_def.handler, &sema_args)?;
 
-    // Convert result to string for sending back to LLM
+    Ok(stringify_tool_result(result))
+}
+
+/// Convert a tool handler's return value to the string sent back to the model.
+/// Strings pass through; maps/sequences are JSON-encoded; everything else uses
+/// its display form. Shared by the synchronous `execute_tool_call` and the
+/// cooperative runtime tool loop so both stringify identically.
+fn stringify_tool_result(result: Value) -> String {
     if let Some(s) = result.as_str() {
-        return Ok(s.to_string());
+        return s.to_string();
     }
     if result.as_map_rc().is_some() || result.as_seq().is_some() {
-        // JSON-encode complex results
         let json = sema_core::value_to_json_lossy(&result);
-        Ok(serde_json::to_string(&json).unwrap_or_else(|_| result.to_string()))
+        serde_json::to_string(&json).unwrap_or_else(|_| result.to_string())
     } else {
-        Ok(result.to_string())
+        result.to_string()
     }
+}
+
+struct CooperativeToolCall {
+    handler: Value,
+    args: Vec<Value>,
+    validation_steps: VecDeque<ExtractionValidationStep>,
+}
+
+/// Resolve a runtime tool call without invoking custom schema predicates. The
+/// caller drives each predicate through `NativeOutcome::Call` before dispatching
+/// the handler.
+fn prepare_tool_call_cooperative(
+    tools: &[Value],
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Result<CooperativeToolCall, SemaError> {
+    let tool_def = tools
+        .iter()
+        .find_map(|tool| {
+            tool.as_tool_def_rc()
+                .filter(|definition| definition.name == name)
+        })
+        .ok_or_else(|| SemaError::Llm(format!("tool not found: {name}")))?;
+
+    let args_map = sema_core::json_to_value(arguments);
+    let validation_steps = prepare_extraction_validation(&args_map, &tool_def.parameters);
+    let args = json_args_to_sema(&tool_def.parameters, arguments, &tool_def.handler);
+    Ok(CooperativeToolCall {
+        handler: tool_def.handler.clone(),
+        args,
+        validation_steps,
+    })
 }
 
 /// Convert JSON arguments into a list of Sema values based on handler declaration order.
@@ -9722,6 +12894,211 @@ mod tests {
     use super::*;
     use sema_core::{intern, Lambda};
     use serde_json::json;
+
+    fn runtime_quantum_probe(
+        ctx: &EvalContext,
+        _args: &[Value],
+    ) -> sema_core::runtime::NativeResult {
+        Ok(sema_core::runtime::NativeOutcome::Return(Value::bool(
+            ctx.runtime_quantum_active(),
+        )))
+    }
+
+    fn invoke_context_probe(env: &Env, name: &str, eval_context: &EvalContext) -> Value {
+        use sema_core::runtime::{
+            CancellationView, NativeCallContext, NativeOutcome, TaskContextHandle,
+        };
+
+        let callable = env.get(intern(name)).expect("registered context probe");
+        let native = callable.as_native_fn_rc().expect("probe is a native");
+        let task_context = TaskContextHandle::default();
+        let mut call_context = NativeCallContext {
+            eval_context,
+            task_context,
+            call_env: None,
+            cancellation: CancellationView::default(),
+        };
+        match native
+            .invoke_runtime(&mut call_context, &[])
+            .expect("probe invocation succeeds")
+        {
+            NativeOutcome::Return(value) => value,
+            _ => panic!("context probe must return directly"),
+        }
+    }
+
+    #[test]
+    fn runtime_context_helpers_use_the_invocation_context() {
+        let eval_context = EvalContext::new();
+        let env = Env::new();
+        register_runtime_fn_ctx(&env, "runtime-context-probe", runtime_quantum_probe);
+        register_runtime_fn_ctx_gated_as(
+            &env,
+            &sema_core::Sandbox::allow_all(),
+            sema_core::Caps::NETWORK,
+            "gated-runtime-context-probe",
+            "gated-runtime-context-probe",
+            runtime_quantum_probe,
+        );
+
+        let _quantum = eval_context
+            .enter_runtime_quantum()
+            .expect("probe owns the runtime quantum");
+        assert_eq!(
+            invoke_context_probe(&env, "runtime-context-probe", &eval_context),
+            Value::bool(true)
+        );
+        assert_eq!(
+            invoke_context_probe(&env, "gated-runtime-context-probe", &eval_context),
+            Value::bool(true)
+        );
+    }
+
+    #[test]
+    fn conversation_callback_driver_traces_retained_values() {
+        use sema_core::runtime::Trace;
+
+        let active_argument = Value::int(40);
+        let callback = Value::int(41);
+        let accumulated = Value::int(42);
+        let driver = ConversationCallbackDriver {
+            plan: ConversationCallbackPlan {
+                conversation: Rc::new(Conversation {
+                    messages: Vec::new(),
+                    model: String::new(),
+                    metadata: BTreeMap::new(),
+                }),
+                callback: callback.clone(),
+                operation: ConversationCallbackOperation::Map,
+            },
+            next_message: 0,
+            active_message: Some(0),
+            active_argument: Some(active_argument.clone()),
+            values: vec![accumulated.clone()],
+            messages: Vec::new(),
+        };
+        let mut traced = Vec::new();
+        assert!(driver.trace(&mut |edge| {
+            if let sema_core::cycle::GcEdge::Value(value) = edge {
+                traced.push(value.clone());
+            }
+        }));
+        assert_eq!(traced, vec![callback, active_argument, accumulated]);
+    }
+
+    /// The `llm/with-*` teardown continuation captures only non-`Value` scope
+    /// state (a `FnOnce` over bools/ints/`Rc<BudgetFrame>`/provider names), so it
+    /// exposes ZERO GC edges — the runtime traces it without visiting any `Value`.
+    #[test]
+    fn scope_guard_continuation_holds_no_gc_edges() {
+        use sema_core::runtime::Trace;
+        let fired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let fired2 = fired.clone();
+        let cont = ScopeGuardContinuation {
+            teardown: Some(Box::new(move || fired2.set(true))),
+        };
+        let mut edges = 0usize;
+        assert!(cont.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 0, "teardown continuation must expose no Value edges");
+        // Sanity: the captured teardown is a real closure that runs once.
+        (cont.teardown.unwrap())();
+        assert!(fired.get());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn runtime_extract_finalizer_traces_pending_validation_values() {
+        use sema_core::runtime::Trace;
+
+        let driver = RuntimeExtractDriver {
+            cfg: ExtractConfig {
+                schema: Value::int(1),
+                schema_desc: String::new(),
+                system: String::new(),
+                model: String::new(),
+                messages: Vec::new(),
+                validate: true,
+                max_retries: 1,
+                reask: true,
+            },
+            attempt: 0,
+            last_validation_error: String::new(),
+            last_response_content: String::new(),
+            result: Some(Value::int(2)),
+            steps: VecDeque::from([ExtractionValidationStep::Predicate {
+                callable: Value::int(3),
+                argument: Value::int(4),
+                key_name: "field".to_string(),
+                failure_message: "invalid".to_string(),
+            }]),
+            errors: Vec::new(),
+            phase: RuntimeExtractPhase::Ready,
+            llm_scope: LlmDynScope::default(),
+            otel_scope: sema_otel::OtelTaskCtx::default(),
+            usage_accum_slot: None,
+        };
+        let finalize = CompleteFinalize::runtime(Box::new(driver));
+        let mut edges = 0;
+        assert!(finalize.trace(&mut |_| edges += 1));
+        assert_eq!(edges, 4, "schema, result, predicate, and argument are live");
+    }
+
+    /// The cooperative tool-round continuation exposes exactly its live `Value`
+    /// edges: each tool, the `:on-tool-call` callback, and — while a call is in
+    /// flight — its args value plus the pending `(handler, args)`. `ToolCall` and the
+    /// (detached) `ToolSpan` hold no `Value`, so they contribute no edges.
+    #[test]
+    fn exec_tools_continuation_traces_its_value_edges() {
+        use sema_core::runtime::Trace;
+        fn edges(c: &ExecToolsContinuation) -> usize {
+            let mut n = 0usize;
+            assert!(c.trace(&mut |_| n += 1));
+            n
+        }
+        let tc = ToolCall {
+            id: "call_1".into(),
+            name: "t".into(),
+            arguments: json!({"a": 1}),
+            thought_signature: None,
+        };
+        // Idle (no active call): 2 tools + 1 callback = 3 edges.
+        let mut cont = ExecToolsContinuation {
+            token: 1,
+            tools: vec![Value::int(1), Value::int(2)],
+            on_tool_call: Some(Value::int(3)),
+            remaining: std::collections::VecDeque::new(),
+            active: None,
+            phase: ToolPhase::Handler,
+        };
+        assert_eq!(edges(&cont), 3);
+        // With a call in flight: + args_value + handler + 2 handler args = 4 more.
+        cont.active = Some(ActiveCall {
+            tc,
+            pending_handler: Some((Value::int(4), vec![Value::int(5), Value::int(6)])),
+            pending_error: None,
+            validation_steps: VecDeque::new(),
+            validation_errors: Vec::new(),
+            args_value: Value::int(7),
+            args_json: "{}".into(),
+            span: None,
+            started: None,
+        });
+        assert_eq!(edges(&cont), 7);
+        cont.active
+            .as_mut()
+            .expect("active call")
+            .validation_steps
+            .push_back(ExtractionValidationStep::Predicate {
+                callable: Value::int(8),
+                argument: Value::int(9),
+                key_name: "field".into(),
+                failure_message: "invalid".into(),
+            });
+        assert_eq!(edges(&cont), 9);
+        // No callback → one fewer edge.
+        cont.on_tool_call = None;
+        assert_eq!(edges(&cont), 8);
+    }
 
     fn usage(prompt: u32, completion: u32) -> Usage {
         Usage {
@@ -9812,6 +13189,91 @@ mod tests {
     }
 
     #[test]
+    fn llm_dynamic_scope_capture_copies_configuration_but_not_last_usage() {
+        let fallback = vec![FallbackEntry {
+            provider: "scoped-provider".to_string(),
+            model: Some("scoped-model".to_string()),
+        }];
+        let last_usage = usage(17, 9);
+        FALLBACK_CHAIN.with(|chain| *chain.borrow_mut() = Some(fallback));
+        RATE_LIMIT_RPS.with(|rate| rate.set(Some(7.0)));
+        set_rate_limit_last_value(41);
+        RETRY_BASE_MS.with(|base| base.set(23));
+        NETWORK_MAX_RETRIES.with(|retries| retries.set(5));
+        LAST_USAGE.with(|usage| *usage.borrow_mut() = Some(last_usage.clone()));
+        let captured = capture_llm_scope();
+
+        FALLBACK_CHAIN.with(|chain| *chain.borrow_mut() = None);
+        RATE_LIMIT_RPS.with(|rate| rate.set(None));
+        RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = None);
+        RETRY_BASE_MS.with(|base| base.set(500));
+        NETWORK_MAX_RETRIES.with(|retries| retries.set(3));
+        LAST_USAGE.with(|usage| *usage.borrow_mut() = None);
+
+        let displaced = install_llm_scope(captured);
+        assert_eq!(
+            FALLBACK_CHAIN.with(|chain| chain.borrow().as_ref().unwrap()[0].provider.clone()),
+            "scoped-provider"
+        );
+        assert_eq!(RATE_LIMIT_RPS.with(Cell::get), Some(7.0));
+        assert_eq!(rate_limit_last_value(), 41);
+        assert_eq!(RETRY_BASE_MS.with(Cell::get), 23);
+        assert_eq!(NETWORK_MAX_RETRIES.with(Cell::get), 5);
+        assert!(LAST_USAGE.with(|usage| usage.borrow().is_none()));
+
+        let _ = install_llm_scope(displaced);
+    }
+
+    #[test]
+    fn llm_dynamic_scope_take_install_preserves_own_last_usage() {
+        let last_usage = usage(17, 9);
+        LAST_USAGE.with(|usage| *usage.borrow_mut() = Some(last_usage.clone()));
+
+        let taken = take_llm_scope();
+        assert!(LAST_USAGE.with(|usage| usage.borrow().is_none()));
+
+        let displaced = install_llm_scope(taken);
+        LAST_USAGE.with(|usage| {
+            let usage = usage.borrow();
+            let restored = usage.as_ref().expect("task usage restored");
+            assert_eq!(restored.prompt_tokens, last_usage.prompt_tokens);
+            assert_eq!(restored.completion_tokens, last_usage.completion_tokens);
+            assert_eq!(restored.model, last_usage.model);
+        });
+
+        let _ = install_llm_scope(displaced);
+    }
+
+    #[test]
+    fn captured_rate_limit_siblings_share_one_reservation_cursor() {
+        RATE_LIMIT_RPS.with(|rate| rate.set(Some(10.0)));
+        set_rate_limit_last_value(0);
+        let first_child = capture_llm_scope();
+        let second_child = capture_llm_scope();
+        let parent = take_llm_scope();
+        RATE_LIMIT_RPS.with(|rate| rate.set(None));
+        RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = None);
+
+        let displaced = install_llm_scope(first_child);
+        assert_eq!(reserve_rate_limit_wait_ms(), 0);
+        let _first_child = take_llm_scope();
+        let _ = install_llm_scope(displaced);
+
+        let displaced = install_llm_scope(second_child);
+        let second_wait = reserve_rate_limit_wait_ms();
+        assert!(
+            (90..=110).contains(&second_wait),
+            "sibling must reserve after the first shared slot, got {second_wait}ms"
+        );
+        let _second_child = take_llm_scope();
+        let _ = install_llm_scope(displaced);
+
+        let _ = install_llm_scope(parent);
+        RATE_LIMIT_RPS.with(|rate| rate.set(None));
+        RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = None);
+    }
+
+    #[test]
     fn enforce_rate_limit_survives_backward_clock() {
         // A last-request timestamp in the future (wall clock jumped backward)
         // must not panic on the `now - last` subtraction (debug overflow check)
@@ -9821,7 +13283,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        RATE_LIMIT_LAST.with(|l| l.set(now + 1_000_000));
+        set_rate_limit_last_value(now + 1_000_000);
         let start = std::time::Instant::now();
         enforce_rate_limit();
         assert!(
@@ -9829,13 +13291,13 @@ mod tests {
             "backward clock should not cause a long sleep"
         );
         RATE_LIMIT_RPS.with(|r| r.set(None));
-        RATE_LIMIT_LAST.with(|l| l.set(0));
+        RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = None);
     }
 
     #[test]
     fn reserve_rate_limit_wait_ms_stays_zero_with_no_gate() {
         RATE_LIMIT_RPS.with(|r| r.set(None));
-        RATE_LIMIT_LAST.with(|l| l.set(0));
+        RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = None);
         assert_eq!(reserve_rate_limit_wait_ms(), 0);
     }
 
@@ -9847,7 +13309,7 @@ mod tests {
         // proving concurrent async dispatches get staggered instead of all
         // computing the same wait against a stale `RATE_LIMIT_LAST`.
         RATE_LIMIT_RPS.with(|r| r.set(Some(10.0)));
-        RATE_LIMIT_LAST.with(|l| l.set(0));
+        set_rate_limit_last_value(0);
         let first = reserve_rate_limit_wait_ms();
         let second = reserve_rate_limit_wait_ms();
         let third = reserve_rate_limit_wait_ms();
@@ -9861,7 +13323,7 @@ mod tests {
             "third reservation should land ~200ms out, got {third}"
         );
         RATE_LIMIT_RPS.with(|r| r.set(None));
-        RATE_LIMIT_LAST.with(|l| l.set(0));
+        RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = None);
     }
 
     #[test]
@@ -9874,14 +13336,14 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        RATE_LIMIT_LAST.with(|l| l.set(now + 1_000_000));
+        set_rate_limit_last_value(now + 1_000_000);
         let wait = reserve_rate_limit_wait_ms();
         assert!(
             wait < 1_000,
             "backward clock should not produce a huge reserved wait, got {wait}ms"
         );
         RATE_LIMIT_RPS.with(|r| r.set(None));
-        RATE_LIMIT_LAST.with(|l| l.set(0));
+        RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = None);
     }
 
     #[test]
@@ -9999,6 +13461,109 @@ mod tests {
             map.insert(Value::keyword(k), Value::map(BTreeMap::new()));
         }
         Value::map(map)
+    }
+
+    #[test]
+    fn complete_finalize_traces_values_retained_by_its_closure() {
+        let retained = make_lambda(&["value"]);
+        let finalize =
+            CompleteFinalize::with_values(|_response| Ok(Value::nil()), vec![retained.clone()]);
+        let mut saw_retained = false;
+
+        sema_core::runtime::Trace::trace(&finalize, &mut |edge| {
+            if let sema_core::cycle::GcEdge::Value(value) = edge {
+                saw_retained |= value == &retained;
+            }
+        });
+
+        assert!(saw_retained, "the retained Value must be visible to CORE-2");
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn runtime_complete_driver_traces_its_finalizer_values() {
+        let retained = make_lambda(&["value"]);
+        let driver = RuntimeCompleteDriver {
+            plan: CompleteOffloadPlan {
+                chain: Vec::new(),
+                request: ChatRequest::new(String::new(), Vec::new()),
+                max_retries: 0,
+                retry_base_ms: 0,
+                rate_limit_wait_ms: 0,
+                span: sema_otel::llm_span_detached("chat"),
+                cache_key: None,
+                cassette_record_key: None,
+                cassette_scope: None,
+                request_for_messages: ChatRequest::new(String::new(), Vec::new()),
+            },
+            finalize: CompleteFinalize::with_values(
+                |_response| Ok(Value::nil()),
+                vec![retained.clone()],
+            ),
+            next_provider: 0,
+            last_error: None,
+            phase: RuntimeCompletePhase::Ready,
+            cache_peeked: false,
+            usage_accum_slot: None,
+            budget_slot: None,
+        };
+        let mut saw_retained = false;
+
+        sema_core::runtime::Trace::trace(&driver, &mut |edge| {
+            if let sema_core::cycle::GcEdge::Value(value) = edge {
+                saw_retained |= value == &retained;
+            }
+        });
+
+        assert!(
+            saw_retained,
+            "the runtime driver must retain the finalizer's CORE-2 edge"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn complete_attempt_decoder_delivers_one_owned_result() {
+        use sema_core::runtime::{
+            CancellationView, CompletionDecoder, NativeCallContext, SendPayload, TaskContextHandle,
+        };
+
+        let slot = Rc::new(RefCell::new(None));
+        let decoder = Box::new(CompleteAttemptDecoder {
+            slot: Rc::clone(&slot),
+        });
+        let outcome = CompleteOutcome {
+            resp: ChatResponse {
+                content: "done".to_string(),
+                role: "assistant".to_string(),
+                model: "fake-model".to_string(),
+                tool_calls: Vec::new(),
+                usage: Usage::default(),
+                stop_reason: Some("end_turn".to_string()),
+            },
+            serving_provider: "fake".to_string(),
+            serving_model: "fake-model".to_string(),
+            retry_events: Vec::new(),
+        };
+        let eval_context = EvalContext::new();
+        let task_context = TaskContextHandle::default();
+        let mut call_context = NativeCallContext {
+            eval_context: &eval_context,
+            task_context,
+            call_env: None,
+            cancellation: CancellationView::default(),
+        };
+
+        let decoded = CompletionDecoder::decode(
+            decoder,
+            &mut call_context,
+            Ok(Box::new(Ok::<CompleteOutcome, LlmError>(outcome)) as SendPayload),
+        )
+        .expect("matching completion payload decodes");
+
+        assert_eq!(decoded, Value::nil());
+        assert!(matches!(slot.borrow_mut().take(), Some(Ok(_))));
+        assert!(slot.borrow_mut().take().is_none(), "slot is consumed once");
     }
 
     // -- json_args_to_sema tests --

@@ -165,11 +165,11 @@ Execute the next unfinished steps now."
 
 (define (create-agent cwd model)
   (set-workspace-root! cwd)
-  (let* ((platform    (format "~a (~a)" (sys/os) (sys/arch)))
-         (context     (load-context-files cwd))
-         (skills      (discover-skills cwd))
-         (skills-xml  (format-skills-xml skills))
-         (prompt      (build-system-prompt cwd platform context skills-xml)))
+  (let* ((platform (format "~a (~a)" (sys/os) (sys/arch)))
+         (context (load-context-files cwd))
+         (skills (discover-skills cwd))
+         (skills-xml (format-skills-xml skills))
+         (prompt (build-system-prompt cwd platform context skills-xml)))
     (defagent pi-sema-agent
       {:system     prompt
        :tools      (all-tools)

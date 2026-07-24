@@ -1,14 +1,132 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use sema_core::{
-    check_arity, in_async_context, set_yield_signal, take_resume_value, Caps, SemaError, Value,
-    YieldReason,
+#[cfg(unix)]
+use std::cell::{Cell, RefCell};
+#[cfg(unix)]
+use std::collections::VecDeque;
+#[cfg(unix)]
+use std::rc::Rc;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(unix)]
+use std::sync::{Mutex, OnceLock};
+
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{
+    CancelDisposition, CancelHook, CancelHookError, CompletionDecoder, CompletionKind,
+    DecodedCompletion, ExternalFailure, InterruptibleResource, NativeCallContext,
+    NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation,
+    ResumeInput, SendPayload, Trace, WaitKind,
 };
+use sema_core::{check_arity, in_runtime_quantum, Caps, SemaError, Value};
 
 use crate::register_fn;
+
+/// Completion tag for the blocking `sleep` external operation. A tag only needs
+/// to be consistent between the issued identity and the prepared op; collisions
+/// with other external ops are harmless (it is not a uniqueness key).
+const SLEEP_COMPLETION_KIND: u64 = 1;
+/// Clamp for a blocking sleep routed to a worker thread (mirrors `async/sleep`):
+/// keeps an out-of-range duration from wedging a worker for years.
+const MAX_SLEEP_MS: u64 = 86_400_000; // 1 day
+
+/// Cancel hook for the blocking `sleep` worker. A `thread::sleep` cannot be
+/// interrupted mid-flight, so cancellation reports the resource reaped: the
+/// runtime drops it immediately and the worker's eventual (now unowned)
+/// completion is discarded as a late completion.
+struct SleepCancelHook;
+
+impl Trace for SleepCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CancelHook for SleepCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+}
+
+/// Decodes the worker's completion for a blocking `sleep`: success yields nil; a
+/// worker failure (e.g. panic) surfaces as an evaluation error.
+struct SleepDecoder;
+
+impl Trace for SleepDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CompletionDecoder for SleepDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        result
+            .map(|_| Value::nil())
+            .map_err(|failure| SemaError::eval(format!("sleep failed: {}", failure.message())))
+    }
+}
+
+/// Resumes the parked `sleep` frame once the worker completes: the decoded nil is
+/// injected onto its stack top; a failure or cancellation is raised at the call
+/// site (catchable by an enclosing try/catch).
+struct SleepContinuation;
+
+impl Trace for SleepContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for SleepContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => {
+                Err(SemaError::eval(format!("sleep was cancelled ({reason:?})")))
+            }
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "sleep continuation received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// Build the external-wait `NativeOutcome::Suspend` for a blocking `sleep` under
+/// the unified runtime and RETURN it on the runtime native ABI. The runtime
+/// submits the job to the thread-pool executor (so it runs off the VM thread and
+/// overlaps sibling work) and, when the worker completes, resumes this frame with
+/// nil.
+fn sleep_via_executor(ms: u64) -> NativeResult {
+    let ms = ms.min(MAX_SLEEP_MS);
+    let kind = CompletionKind::try_from_raw(SLEEP_COMPLETION_KIND)
+        .expect("sleep completion kind is nonzero");
+    let prepared = PreparedExternalOperation::interruptible_blocking(
+        kind,
+        Box::new(SleepDecoder),
+        InterruptibleResource::new("sleep", Box::new(SleepCancelHook)),
+        move || {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            Ok(Box::new(()) as SendPayload)
+        },
+    );
+    let suspend = NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(SleepContinuation),
+    };
+    Ok(NativeOutcome::Suspend(suspend))
+}
 
 /// Monotonic clock captured the first time it is needed — forced during
 /// `register()` so it reflects interpreter/process startup, not the first call
@@ -38,31 +156,388 @@ fn is_executable(path: &std::path::Path) -> bool {
     }
 }
 
-// ─── Signal pending flags (set by async signal handlers) ────────────────────
-static SIGWINCH_PENDING: AtomicBool = AtomicBool::new(false);
-static SIGINT_PENDING: AtomicBool = AtomicBool::new(false);
-static SIGTERM_PENDING: AtomicBool = AtomicBool::new(false);
+// ─── Deferred Unix signal delivery ─────────────────────────────────────────
 
-// ─── Signal callbacks (thread-local, keyed by signal number) ────────────────
-// Values are Sema callables stored per-signal.
-thread_local! {
-    static SIGNAL_CALLBACKS: RefCell<HashMap<i32, Vec<Value>>> = RefCell::new(HashMap::new());
+/// Process-wide event generations. A generation is a broadcast token: each
+/// interpreter-owned registry remembers the last generation it observed, so
+/// one interpreter checking signals cannot consume another's event. Multiple
+/// arrivals before one interpreter checks remain coalesced into one dispatch.
+#[cfg(unix)]
+static SIGWINCH_EPOCH: AtomicUsize = AtomicUsize::new(0);
+#[cfg(unix)]
+static SIGINT_EPOCH: AtomicUsize = AtomicUsize::new(0);
+#[cfg(unix)]
+static SIGTERM_EPOCH: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SignalKind {
+    Winch,
+    Int,
+    Term,
+}
+
+#[cfg(unix)]
+impl SignalKind {
+    const ALL: [Self; 3] = [Self::Winch, Self::Int, Self::Term];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Winch => 0,
+            Self::Int => 1,
+            Self::Term => 2,
+        }
+    }
+
+    fn epoch(self) -> &'static AtomicUsize {
+        match self {
+            Self::Winch => &SIGWINCH_EPOCH,
+            Self::Int => &SIGINT_EPOCH,
+            Self::Term => &SIGTERM_EPOCH,
+        }
+    }
+
+    fn from_value(value: &Value) -> Result<Self, SemaError> {
+        let keyword = value
+            .as_keyword()
+            .ok_or_else(|| SemaError::type_error("keyword", value.type_name()))?;
+        match keyword.as_str() {
+            "winch" => Ok(Self::Winch),
+            "int" => Ok(Self::Int),
+            "term" => Ok(Self::Term),
+            other => Err(SemaError::eval(format!(
+                "sys/on-signal: unknown signal :{other}; use :winch, :int, or :term"
+            ))),
+        }
+    }
+
+    fn signal_number(self) -> libc::c_int {
+        match self {
+            Self::Winch => libc::SIGWINCH,
+            Self::Int => libc::SIGINT,
+            Self::Term => libc::SIGTERM,
+        }
+    }
+
+    fn handler(self) -> libc::sighandler_t {
+        // Cast through a pointer to avoid the fn_to_numeric_cast lint. The
+        // installed handler touches only one lock-free atomic generation.
+        match self {
+            Self::Winch => handle_sigwinch as *const () as usize,
+            Self::Int => handle_sigint as *const () as usize,
+            Self::Term => handle_sigterm as *const () as usize,
+        }
+    }
+
+    fn install_handler(self) -> Result<libc::sigaction, SemaError> {
+        // SAFETY: zero-initialization is valid for `sigaction`; the mask is
+        // initialized before installation, and `handler` is an extern-C
+        // function with the exact platform signal-handler signature and
+        // process lifetime.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = self.handler();
+            action.sa_flags = libc::SA_RESTART;
+            if libc::sigemptyset(&mut action.sa_mask) != 0 {
+                return Err(signal_install_error());
+            }
+            let mut previous: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(self.signal_number(), &action, &mut previous) != 0 {
+                return Err(signal_install_error());
+            }
+            Ok(previous)
+        }
+    }
+
+    fn acquire(self) -> Result<(), SemaError> {
+        let mut ownership = process_signal_ownership().lock().map_err(|_| {
+            SemaError::eval("sys/on-signal: process signal ownership lock is poisoned")
+        })?;
+        let slot = &mut ownership[self.index()];
+        let next = slot.subscribers.checked_add(1).ok_or_else(|| {
+            SemaError::eval("sys/on-signal: process signal subscriber count overflow")
+        })?;
+        if slot.subscribers == 0 {
+            slot.previous = Some(self.install_handler()?);
+        }
+        slot.subscribers = next;
+        Ok(())
+    }
+
+    /// Release one registry's process-handler lease without panicking. A failed
+    /// final `sigaction` restore leaves the subscriber and prior action intact
+    /// so Drop, GC severing, or a later interpreter hook can retry it.
+    fn release(self) -> bool {
+        let mut ownership = process_signal_ownership()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let slot = &mut ownership[self.index()];
+        if slot.subscribers == 0 {
+            return true;
+        }
+        if slot.subscribers > 1 {
+            slot.subscribers -= 1;
+            return true;
+        }
+
+        let Some(previous) = slot.previous.as_ref() else {
+            return false;
+        };
+        // SAFETY: `previous` was returned by `sigaction` for this exact signal
+        // when the first subscriber installed the process handler. The global
+        // ownership mutex keeps a new first subscriber from racing this restore.
+        let restored =
+            unsafe { libc::sigaction(self.signal_number(), previous, std::ptr::null_mut()) };
+        if restored != 0 {
+            return false;
+        }
+        slot.subscribers = 0;
+        slot.previous = None;
+        true
+    }
+}
+
+#[cfg(unix)]
+fn signal_install_error() -> SemaError {
+    SemaError::eval(format!(
+        "sys/on-signal: failed to install signal handler: {}",
+        std::io::Error::last_os_error()
+    ))
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct ProcessSignalOwnership {
+    subscribers: usize,
+    previous: Option<libc::sigaction>,
+}
+
+#[cfg(unix)]
+fn process_signal_ownership() -> &'static Mutex<[ProcessSignalOwnership; 3]> {
+    static OWNERSHIP: OnceLock<Mutex<[ProcessSignalOwnership; 3]>> = OnceLock::new();
+    OWNERSHIP.get_or_init(|| Mutex::new(std::array::from_fn(|_| ProcessSignalOwnership::default())))
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct SignalSlot {
+    seen_epoch: usize,
+}
+
+/// One interpreter's signal subscriptions. The two signal builtins in that
+/// interpreter's environment share this as a traced native payload. Callback
+/// `Value`s live in the interpreter-wide `EvalContext` signal store, which
+/// teardown clears before collecting its global environment; this host-only
+/// registry owns only process-handler leases and event cursors.
+#[cfg(unix)]
+#[derive(Default)]
+struct SignalRegistry {
+    slots: RefCell<[SignalSlot; 3]>,
+    /// Installed kinds outlive callback roots so teardown can release every
+    /// process-handler lease even after the callback store is cleared.
+    installed: Cell<[bool; 3]>,
+    /// Exactly one weak teardown hook covers each live lease epoch. Releasing
+    /// the epoch resets this so a retained builtin can reacquire under a new
+    /// interpreter context.
+    teardown_hook_registered: Cell<bool>,
+}
+
+#[cfg(unix)]
+impl SignalRegistry {
+    fn register(
+        self: &Rc<Self>,
+        ctx: &sema_core::EvalContext,
+        kind: SignalKind,
+        callback: Value,
+    ) -> Result<(), SemaError> {
+        let index = kind.index();
+        let mut installed = self.installed.get();
+        if !installed[index] {
+            kind.acquire()?;
+            installed[index] = true;
+            self.installed.set(installed);
+            // Registration linearizes at this load. Signals observed before it
+            // are historical; a signal racing after it advances the generation
+            // and is delivered on the next check.
+            self.slots.borrow_mut()[index].seen_epoch = kind.epoch().load(Ordering::Relaxed);
+        }
+        if !self.teardown_hook_registered.replace(true) {
+            let registry = Rc::downgrade(self);
+            ctx.register_interpreter_teardown_hook(move || {
+                if let Some(registry) = registry.upgrade() {
+                    registry.release_installed_handlers();
+                }
+            });
+        }
+        ctx.register_signal_callback(index, callback);
+        Ok(())
+    }
+
+    /// Consume this interpreter's current generation snapshot and clone its
+    /// callback batch in stable signal/registration order. The borrow ends
+    /// before any callback runs, so callbacks may register more callbacks.
+    fn take_pending_callbacks(
+        &self,
+        ctx: &sema_core::EvalContext,
+    ) -> Result<VecDeque<Value>, SemaError> {
+        let observed = SignalKind::ALL.map(|kind| kind.epoch().load(Ordering::Relaxed));
+        let mut slots = self.slots.try_borrow_mut().map_err(|_| {
+            SemaError::eval("sys/check-signals: signal registry is already borrowed")
+        })?;
+        let mut callbacks = VecDeque::new();
+        for kind in SignalKind::ALL {
+            let index = kind.index();
+            let slot = &mut slots[index];
+            if self.installed.get()[index] && slot.seen_epoch != observed[index] {
+                slot.seen_epoch = observed[index];
+                callbacks.extend(ctx.signal_callbacks(index));
+            }
+        }
+        Ok(callbacks)
+    }
+
+    fn release_installed_handlers(&self) {
+        self.teardown_hook_registered.set(false);
+        let mut installed = self.installed.get();
+        for kind in SignalKind::ALL {
+            let index = kind.index();
+            if installed[index] && kind.release() {
+                installed[index] = false;
+            }
+        }
+        self.installed.set(installed);
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SignalRegistry {
+    fn drop(&mut self) {
+        self.release_installed_handlers();
+    }
+}
+
+#[cfg(unix)]
+struct SignalDispatchContinuation {
+    remaining: VecDeque<Value>,
+}
+
+#[cfg(unix)]
+impl Trace for SignalDispatchContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        for callback in &self.remaining {
+            sink(GcEdge::Value(callback));
+        }
+        true
+    }
+}
+
+#[cfg(unix)]
+impl NativeContinuation for SignalDispatchContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(_) => dispatch_signal_callbacks(self.remaining),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "sys/check-signals callback was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "sys/check-signals callback received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn dispatch_signal_callbacks(mut callbacks: VecDeque<Value>) -> NativeResult {
+    let Some(callable) = callbacks.pop_front() else {
+        return Ok(NativeOutcome::Return(Value::nil()));
+    };
+    Ok(NativeOutcome::Call(sema_core::runtime::NativeCall {
+        callable,
+        args: Vec::new(),
+        continuation: Box::new(SignalDispatchContinuation {
+            remaining: callbacks,
+        }),
+    }))
+}
+
+#[cfg(unix)]
+fn check_signals(
+    registry: &SignalRegistry,
+    context: &mut NativeCallContext<'_>,
+    args: &[Value],
+) -> NativeResult {
+    check_arity!(args, "sys/check-signals", 0);
+    dispatch_signal_callbacks(registry.take_pending_callbacks(context.eval_context)?)
+}
+
+/// Reports the one strong payload edge owned by the NativeFn currently being
+/// traced. Both signal builtins point at the same allocation, so two NativeFns
+/// report two edges and the opaque node's `strong_count` is two.
+#[cfg(unix)]
+fn signal_registry_payload_tracer(
+    payload: &Rc<dyn std::any::Any>,
+    sink: &mut dyn FnMut(GcEdge<'_>),
+) -> bool {
+    sink(GcEdge::Opaque {
+        ptr: sema_core::NodePtr::of_rc(payload),
+        strong_count: Rc::strong_count(payload),
+        trace: trace_signal_registry,
+        sever: sever_signal_registry,
+    });
+    true
+}
+
+#[cfg(unix)]
+fn trace_signal_registry(ptr: sema_core::NodePtr, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+    // SAFETY: payload tracing supplied the data pointer of a live
+    // `Rc<SignalRegistry>`; the collector retains traced allocations through
+    // the complete pass.
+    let registry = unsafe { &*(ptr.raw() as *const SignalRegistry) };
+    let Ok(slots) = registry.slots.try_borrow() else {
+        return false;
+    };
+    drop(slots);
+    true
+}
+
+#[cfg(unix)]
+fn sever_signal_registry(ptr: sema_core::NodePtr) -> Option<Value> {
+    // SAFETY: see `trace_signal_registry`; severing runs while the same opaque
+    // allocation remains retained by the collector.
+    let registry = unsafe { &*(ptr.raw() as *const SignalRegistry) };
+    let _slots = registry.slots.try_borrow_mut().ok()?;
+    registry.release_installed_handlers();
+    Some(Value::nil())
 }
 
 // ─── Signal handlers: only allowed to use async-signal-safe operations ───────
 #[cfg(unix)]
 extern "C" fn handle_sigwinch(_: libc::c_int) {
-    SIGWINCH_PENDING.store(true, Ordering::Relaxed);
+    SIGWINCH_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(unix)]
 extern "C" fn handle_sigint(_: libc::c_int) {
-    SIGINT_PENDING.store(true, Ordering::Relaxed);
+    SIGINT_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(unix)]
 extern "C" fn handle_sigterm(_: libc::c_int) {
-    SIGTERM_PENDING.store(true, Ordering::Relaxed);
+    SIGTERM_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Deterministic delivery hook for runtime integration tests. It exercises the
+/// same epoch transition as the async OS handler without sending a process
+/// signal that could interfere with a parallel test.
+#[cfg(unix)]
+#[doc(hidden)]
+pub fn mark_sigwinch_pending_for_test() {
+    SIGWINCH_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Resolve the (program, argv) for a `shell` invocation. A lone command string
@@ -159,136 +634,138 @@ struct RawShellOutput {
     stderr: Vec<u8>,
 }
 
-/// The offloaded (async-context) path: `io_spawn` the subprocess on the process-
-/// wide I/O pool and yield an `AwaitIo` handle whose poll closure decodes the `Send`
-/// output facts into the identical `Value` shape the sync path returns. Returns
-/// `Ok(nil)` after arming the yield signal; the scheduler delivers the real
-/// value on resume.
-fn shell_async(
+/// Completion tag for an offloaded `shell` subprocess. Consistent between the
+/// issued identity and the prepared op (not a uniqueness key).
+const SHELL_COMPLETION_KIND: u64 = 0x7368_656c; // "shel"
+
+/// The `Send` future that runs the shell subprocess off the VM thread on the
+/// executor's blocking worker (via `io_block_on` inside `runtime_offload`). It
+/// publishes the child's OS pid into `pid_slot` (its own process group, so the
+/// abort hook can `SIGKILL` the whole group), then clears it once the child is
+/// reaped so a late cancel never signals a reused pid. `kill_on_drop` kills the
+/// direct child if the future is dropped on cancel.
+#[cfg(not(target_arch = "wasm32"))]
+async fn shell_run_future(
     program: String,
     child_args: Vec<String>,
     cwd: Option<String>,
     env_vars: Vec<(String, String)>,
-) -> Result<Value, SemaError> {
-    use std::rc::Rc;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::Arc;
-    use tokio::sync::oneshot::error::TryRecvError;
-
-    // Vestigial under CALL_NATIVE (the scheduler delivers the resume value via
-    // `replace_stack_top`, not by re-invoking this native), but kept for
-    // symmetry with the shipped `async/await` yield pattern.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
+    pid_slot: std::sync::Arc<std::sync::atomic::AtomicU32>,
+) -> Result<RawShellOutput, String> {
+    use std::sync::atomic::Ordering;
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&child_args)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(dir) = &cwd {
+        cmd.current_dir(dir);
     }
-
-    let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<RawShellOutput, String>>();
-    // The child's OS pid, published by the worker once spawned (0 = not yet). On Unix
-    // the child is its OWN process-group leader (process_group(0) → pgid == pid), so
-    // the abort hook can SIGKILL the whole group. The poll closure resets this to 0 on
-    // completion so a later abort never signals a reaped (possibly reused) pid.
-    let pid_slot = Arc::new(AtomicU32::new(0));
-    let pid_for_worker = pid_slot.clone();
-    let pid_for_poll = pid_slot.clone();
-
-    let abort_task = sema_io::io_spawn(async move {
-        let result = async {
-            // Spawn (not `.output()`) so we can publish the pid before awaiting, then
-            // gather output. `kill_on_drop` kills the direct child if this future is
-            // dropped while the runtime is alive. stdout/stderr piped to match `.output()`.
-            let mut cmd = tokio::process::Command::new(&program);
-            cmd.args(&child_args)
-                .kill_on_drop(true)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            // Honor the options map's :cwd / :env, matching the sync path.
-            if let Some(dir) = &cwd {
-                cmd.current_dir(dir);
-            }
-            for (k, v) in &env_vars {
-                cmd.env(k, v);
-            }
-            // Put the child in its own process group so a compound/pipelined command
-            // (`sh -c "a; b"`) — where `sh` forks the real workers as grandchildren —
-            // can be torn down as a GROUP on abort, not just the `sh` leader.
-            #[cfg(unix)]
-            cmd.process_group(0);
-            let child = cmd
-                .spawn()
-                // Match the sync path's spawn-error message format exactly.
-                .map_err(|e| format!("shell: {e}"))?;
-            if let Some(id) = child.id() {
-                pid_for_worker.store(id, Ordering::SeqCst);
-            }
-            let output = child
-                .wait_with_output()
-                .await
-                .map_err(|e| format!("shell: {e}"))?;
-            Ok::<RawShellOutput, String>(RawShellOutput {
-                status_code: output.status.code(),
-                stdout: output.stdout,
-                stderr: output.stderr,
-            })
-        }
-        .await;
-        let _ = tx.send(result);
-        // Wake the parked VM thread so it re-polls promptly.
-        sema_core::notify_io_complete();
-    });
-
-    // True cancellation: on cancel/timeout the scheduler runs this hook. It (a) runs
-    // the seam's one-shot AbortHook, aborting the spawned task (→ drops the
-    // kill_on_drop `Child` once the pool processes it) AND (b) issues a SYNCHRONOUS
-    // `SIGKILL` to the child's whole PROCESS GROUP. (b) is what makes the kill
-    // reliable even when the program exits IMMEDIATELY after the timeout (e.g. a
-    // one-shot `sema -e`), where the pool is torn down before it can process the
-    // async abort — and killing the GROUP (not just the `sh` pid) reaps the
-    // grandchildren a compound command forks. Fires only on cancellation; the killpg
-    // layer composes AROUND the seam's hook.
+    for (k, v) in &env_vars {
+        cmd.env(k, v);
+    }
+    // Own process group so a compound/pipelined command (`sh -c "a; b"`) can be
+    // torn down as a GROUP on abort, not just the `sh` leader.
     #[cfg(unix)]
-    let pid_for_abort = pid_slot;
-    #[cfg(not(unix))]
-    let _ = pid_slot;
-    let handle = Rc::new(sema_core::IoHandle::with_abort(
-        move || match rx.try_recv() {
-            Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-            Ok(Ok(raw)) => {
-                pid_for_poll.store(0, Ordering::SeqCst);
-                sema_core::IoPoll::Ready(Ok(shell_output_value(
-                    raw.status_code,
-                    &raw.stdout,
-                    &raw.stderr,
-                )))
-            }
-            Ok(Err(msg)) => {
-                pid_for_poll.store(0, Ordering::SeqCst);
-                sema_core::IoPoll::Ready(Err(msg))
-            }
-            Err(TryRecvError::Closed) => {
-                pid_for_poll.store(0, Ordering::SeqCst);
-                sema_core::IoPoll::Ready(Err("shell: subprocess worker dropped".to_string()))
-            }
-        },
-        move || {
-            abort_task();
-            #[cfg(unix)]
-            {
-                let pid = pid_for_abort.load(Ordering::SeqCst);
-                if pid != 0 {
-                    // SAFETY: killpg of the child's own process group (process_group(0)
-                    // set pgid == pid). The negative pid targets the GROUP, killing the
-                    // `sh` leader AND any grandchildren it forked. The pid is reset to 0
-                    // by the poll closure once the worker observed completion, so a
-                    // reaped/reused pid is never targeted (only a constant signal is sent).
-                    unsafe {
-                        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                    }
+    cmd.process_group(0);
+    let child = cmd.spawn().map_err(|e| format!("shell: {e}"))?;
+    if let Some(id) = child.id() {
+        pid_slot.store(id, Ordering::SeqCst);
+    }
+    let output = child.wait_with_output().await;
+    // Child reaped (or the wait errored): clear the pid so a cancel that races
+    // completion never `SIGKILL`s a reaped (possibly reused) pid.
+    pid_slot.store(0, Ordering::SeqCst);
+    let output = output.map_err(|e| format!("shell: {e}"))?;
+    Ok(RawShellOutput {
+        status_code: output.status.code(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
+/// Cancel hook for the runtime `shell` op. On `async/cancel`/`async/timeout` it
+/// (a) issues a SYNCHRONOUS `SIGKILL` to the child's PROCESS GROUP — reliable
+/// even when the program exits immediately after the timeout (a one-shot
+/// `sema -e`), where the worker may be gone before it can drop the future, and
+/// killing the GROUP reaps a compound command's grandchildren — and (b) fires the
+/// select signal so the job drops the future (`kill_on_drop` the direct child).
+/// Mirrors `shell_async`'s abort hook exactly.
+#[cfg(not(target_arch = "wasm32"))]
+struct ShellCancelHook {
+    signal: Option<crate::runtime_offload::CancelSignal>,
+    pid_slot: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Trace for ShellCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl CancelHook for ShellCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        #[cfg(unix)]
+        {
+            let pid = self.pid_slot.load(std::sync::atomic::Ordering::SeqCst);
+            if pid != 0 {
+                // SAFETY: killpg of the child's own process group (process_group(0)
+                // set pgid == pid). The negative pid targets the GROUP. The pid is
+                // reset to 0 by the worker once the child is reaped, so a
+                // reaped/reused pid is never targeted.
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
                 }
             }
+        }
+        if let Some(signal) = self.signal.take() {
+            let _ = signal.send(());
+        }
+        Ok(CancelDisposition::Reaped)
+    }
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+}
+
+/// The unified-runtime `shell` path: SUSPEND on an interruptible External wait
+/// whose job runs the subprocess off the VM thread; on resume the decoder builds
+/// the identical `shell_output_value`. Cancellation class: interruptible with a
+/// synchronous process-group `SIGKILL` (see [`ShellCancelHook`]).
+#[cfg(not(target_arch = "wasm32"))]
+fn shell_runtime(
+    program: String,
+    child_args: Vec<String>,
+    cwd: Option<String>,
+    env_vars: Vec<(String, String)>,
+) -> NativeResult {
+    let (cancel_tx, cancel_rx) = crate::runtime_offload::cancel_channel();
+    let pid_slot = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let resource = InterruptibleResource::new(
+        "shell",
+        Box::new(ShellCancelHook {
+            signal: Some(cancel_tx),
+            pid_slot: pid_slot.clone(),
+        }),
+    );
+    let kind = CompletionKind::try_from_raw(SHELL_COMPLETION_KIND)
+        .expect("shell completion kind is nonzero");
+    crate::runtime_offload::suspend_external_interruptible_try(
+        "shell",
+        kind,
+        resource,
+        cancel_rx,
+        move |raw: RawShellOutput| -> Result<Value, SemaError> {
+            Ok(shell_output_value(
+                raw.status_code,
+                &raw.stdout,
+                &raw.stderr,
+            ))
         },
-    ));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
+        move || shell_run_future(program, child_args, cwd, env_vars, pid_slot),
+    )
 }
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
@@ -310,7 +787,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // process). Gate on SHELL via the helper, and check PROCESS inline so either
     // denial blocks the call.
     let shell_sandbox = sandbox.clone();
-    crate::register_fn_gated(env, sandbox, Caps::SHELL, "shell", move |args| {
+    crate::register_runtime_fn_path_gated(env, sandbox, Caps::SHELL, "shell", &[], move |args| {
         shell_sandbox.check(Caps::PROCESS, "shell")?;
         check_arity!(args, "shell", 1..);
         let cmd = args[0]
@@ -338,16 +815,13 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         // launch byte-identical commands.
         let (program, child_args) = shell_program_args(cmd, &cmd_args);
 
-        // Inside an `async/spawn`'d task: offload the subprocess onto the
-        // process-wide I/O pool and yield `AwaitIo` so the scheduler can run
-        // sibling tasks while the child runs. Args are resolved and the result
-        // `Value` decoded on the VM thread; only `Send` facts cross the boundary.
-        if sema_core::in_async_context() {
-            return shell_async(program, child_args, cwd, env_vars);
+        // Inside a unified-runtime VM quantum: SUSPEND on a structural External
+        // wait so the subprocess runs off the VM thread while sibling tasks run.
+        if in_runtime_quantum() {
+            return shell_runtime(program, child_args, cwd, env_vars);
         }
 
-        // Top-level (not in a scheduler task): the original synchronous path,
-        // byte-identical in observable behavior to the pre-async implementation.
+        // Top-level (not in any task): run the subprocess synchronously.
         let mut command = std::process::Command::new(&program);
         command.args(&child_args);
         if let Some(dir) = &cwd {
@@ -360,11 +834,11 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .output()
             .map_err(|e| SemaError::Io(format!("shell: {e}")))?;
 
-        Ok(shell_output_value(
+        Ok(NativeOutcome::Return(shell_output_value(
             output.status.code(),
             &output.stdout,
             &output.stderr,
-        ))
+        )))
     });
 
     // shell/quote — POSIX-quote a string for safe interpolation into a POSIX `sh -c`
@@ -407,26 +881,35 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // Canonical slash-namespaced alias (Decision #24)
     register_fn(env, "time/now-ms", time_ms_impl);
 
-    register_fn(env, "sleep", |args| {
-        check_arity!(args, "sleep", 1);
-        let ms = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
-        // In an async scheduler task, blocking the VM thread would freeze
-        // every sibling task. Yield exactly like `async/sleep` (async_ops.rs)
-        // so the scheduler parks this task and drives siblings while the
-        // sleep elapses.
-        if in_async_context() {
-            if let Some(cached) = take_resume_value() {
-                return Ok(cached);
-            }
-            set_yield_signal(YieldReason::Sleep(ms as u64));
-            return Ok(Value::nil());
-        }
-        // Outside async (REPL/scripts/top level): unchanged real sleep.
-        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
-        Ok(Value::nil())
-    });
+    // `sleep` is dual-ABI. Under the unified runtime it is a genuinely-blocking
+    // operation: the runtime callback submits it to the thread-pool executor and
+    // SUSPENDS (returning `NativeOutcome::Suspend`) so the worker runs it off the
+    // VM thread — two `async/spawn`ed sleeps then overlap instead of serializing
+    // on the VM thread (unlike `async/sleep`, which is a virtual timer). Outside
+    // a runtime quantum the plain value callback sleeps synchronously.
+    env.set(
+        sema_core::intern("sleep"),
+        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
+            "sleep",
+            |args| {
+                check_arity!(args, "sleep", 1);
+                let ms = args[0]
+                    .as_int()
+                    .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
+                // The plain value ABI is synchronous (REPL, scripts, and nested
+                // host callbacks); the runtime ABI below performs the offload.
+                std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+                Ok(Value::nil())
+            },
+            |_ctx: &mut NativeCallContext<'_>, args: &[Value]| {
+                check_arity!(args, "sleep", 1);
+                let ms = args[0]
+                    .as_int()
+                    .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
+                sleep_via_executor(ms.max(0) as u64)
+            },
+        )),
+    );
 
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "sys/args", |args| {
         check_arity!(args, "sys/args", 0);
@@ -665,93 +1148,72 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         Ok(Value::nil())
     });
 
-    // ─── Signal hooks (Unix only) ────────────────────────────────────────────
+    // ─── Signal hooks ────────────────────────────────────────────────────────
     // sys/on-signal — register a Sema callback for a signal.
     // Supported signals: :winch (SIGWINCH), :int (SIGINT), :term (SIGTERM).
-    // Registering a handler installs the OS signal handler the first time.
+    // An interpreter's first callback for a signal installs the OS handler.
     // Call (sys/check-signals) from your event loop to dispatch pending callbacks.
     #[cfg(unix)]
     {
         use sema_core::NativeFn;
 
+        let registry = Rc::new(SignalRegistry::default());
+        sema_core::register_payload_tracer(
+            std::any::TypeId::of::<SignalRegistry>(),
+            signal_registry_payload_tracer,
+        );
+
+        let on_signal_registry = Rc::downgrade(&registry);
+        let on_signal_payload: Rc<dyn std::any::Any> = registry.clone();
+
         env.set(
             sema_core::intern("sys/on-signal"),
-            Value::native_fn(NativeFn::with_ctx("sys/on-signal", |_ctx, args| {
-                check_arity!(args, "sys/on-signal", 2);
-                let kw = args[0]
-                    .as_keyword()
-                    .ok_or_else(|| SemaError::type_error("keyword", args[0].type_name()))?;
-                let sig_num = match kw.as_str() {
-                    "winch" => libc::SIGWINCH,
-                    "int" => libc::SIGINT,
-                    "term" => libc::SIGTERM,
-                    other => {
-                        return Err(SemaError::eval(format!(
-                            "sys/on-signal: unknown signal :{other}; use :winch, :int, or :term"
-                        )))
-                    }
-                };
-                let callback = args[1].clone();
-                // Install the OS-level signal handler on first registration
-                SIGNAL_CALLBACKS.with(|cbs| {
-                    let mut map = cbs.borrow_mut();
-                    let entry = map.entry(sig_num).or_default();
-                    if entry.is_empty() {
-                        // First callback for this signal: install handler.
-                        // Cast via *const () to avoid the fn_to_numeric_cast lint.
-                        let handler: libc::sighandler_t = match sig_num {
-                            s if s == libc::SIGWINCH => handle_sigwinch as *const () as usize,
-                            s if s == libc::SIGINT => handle_sigint as *const () as usize,
-                            s if s == libc::SIGTERM => handle_sigterm as *const () as usize,
-                            // Unreachable: sig_num is validated against the three above by the
-                            // kw match earlier in this function.
-                            _ => unreachable!("unexpected signal number {sig_num}"),
-                        };
-                        unsafe { libc::signal(sig_num, handler) };
-                    }
-                    entry.push(callback);
-                });
-                Ok(Value::nil())
-            })),
+            Value::native_fn(
+                NativeFn::with_payload("sys/on-signal", on_signal_payload, move |ctx, args| {
+                    check_arity!(args, "sys/on-signal", 2);
+                    let kind = SignalKind::from_value(&args[0])?;
+                    let registry = on_signal_registry.upgrade().ok_or_else(|| {
+                        SemaError::eval("internal error: sys/on-signal registry is unavailable")
+                    })?;
+                    registry.register(ctx, kind, args[1].clone())?;
+                    Ok(Value::nil())
+                })
+                .with_escaping_args(&[1]),
+            ),
         );
 
-        // sys/check-signals — call all pending signal callbacks.
-        // Should be called from the main event loop (e.g., after io/read-key returns).
+        // sys/check-signals — call all pending signal callbacks. Callback
+        // dispatch is runtime-only because a callback may suspend; ordinary
+        // eval entry points already execute through that runtime ABI.
         env.set(
             sema_core::intern("sys/check-signals"),
-            Value::native_fn(NativeFn::with_ctx("sys/check-signals", |ctx, args| {
-                check_arity!(args, "sys/check-signals", 0);
-                let mut to_dispatch: Vec<(i32, Vec<Value>)> = Vec::new();
-
-                if SIGWINCH_PENDING.swap(false, Ordering::Relaxed) {
-                    SIGNAL_CALLBACKS.with(|cbs| {
-                        if let Some(callbacks) = cbs.borrow().get(&libc::SIGWINCH) {
-                            to_dispatch.push((libc::SIGWINCH, callbacks.clone()));
-                        }
-                    });
-                }
-                if SIGINT_PENDING.swap(false, Ordering::Relaxed) {
-                    SIGNAL_CALLBACKS.with(|cbs| {
-                        if let Some(callbacks) = cbs.borrow().get(&libc::SIGINT) {
-                            to_dispatch.push((libc::SIGINT, callbacks.clone()));
-                        }
-                    });
-                }
-                if SIGTERM_PENDING.swap(false, Ordering::Relaxed) {
-                    SIGNAL_CALLBACKS.with(|cbs| {
-                        if let Some(callbacks) = cbs.borrow().get(&libc::SIGTERM) {
-                            to_dispatch.push((libc::SIGTERM, callbacks.clone()));
-                        }
-                    });
-                }
-
-                for (_, callbacks) in to_dispatch {
-                    for cb in &callbacks {
-                        sema_core::call_callback(ctx, cb, &[])?;
-                    }
-                }
-                Ok(Value::nil())
-            })),
+            Value::native_fn(NativeFn::with_payload_result(
+                "sys/check-signals",
+                registry,
+                check_signals,
+            )),
         );
+    }
+
+    // The documented non-Unix ABI is a no-op, not an unbound symbol. Keep the
+    // same arity/keyword validation while retaining no callback values.
+    #[cfg(not(unix))]
+    {
+        register_fn(env, "sys/on-signal", |args| {
+            check_arity!(args, "sys/on-signal", 2);
+            let keyword = args[0]
+                .as_keyword()
+                .ok_or_else(|| SemaError::type_error("keyword", args[0].type_name()))?;
+            match keyword.as_str() {
+                "winch" | "int" | "term" => Ok(Value::nil()),
+                other => Err(SemaError::eval(format!(
+                    "sys/on-signal: unknown signal :{other}; use :winch, :int, or :term"
+                ))),
+            }
+        });
+        register_fn(env, "sys/check-signals", |args| {
+            check_arity!(args, "sys/check-signals", 0);
+            Ok(Value::nil())
+        });
     }
 }

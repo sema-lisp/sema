@@ -12,7 +12,7 @@
 //! at EOF" exit on mid-form EOF.
 
 use std::collections::HashSet;
-use std::io::BufRead;
+use std::io::{self, BufRead, Read};
 
 use sema_core::{intern, pretty_print, Spur, Value};
 use sema_eval::Interpreter;
@@ -34,23 +34,99 @@ pub fn run<R: BufRead>(
     env: &sema_core::Env,
     prelude_keys: &HashSet<Spur>,
 ) -> Result<(), String> {
+    run_with_line_source(
+        |line| {
+            input
+                .read_line(line)
+                .map(|read| read != 0)
+                .map_err(|error| format!("read error: {error}"))
+        },
+        interpreter,
+        env,
+        prelude_keys,
+    )
+}
+
+/// Drive the native headless REPL through the coordinated stdin owner.
+///
+/// The owner may buffer bytes read from the OS, but this loop acquires only one
+/// logical source line before evaluating it. Runtime stdin operations can then
+/// take the next lease and consume any following data from that shared buffer.
+pub fn run_stdin(
+    interpreter: &Interpreter,
+    env: &sema_core::Env,
+    prelude_keys: &HashSet<Spur>,
+) -> Result<(), String> {
+    run(
+        CoordinatedStdinReader::default(),
+        interpreter,
+        env,
+        prelude_keys,
+    )
+}
+
+#[derive(Default)]
+struct CoordinatedStdinReader {
+    line: Vec<u8>,
+    consumed: usize,
+    eof: bool,
+}
+
+impl Read for CoordinatedStdinReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let available = self.fill_buf()?;
+        let read = available.len().min(output.len());
+        output[..read].copy_from_slice(&available[..read]);
+        self.consume(read);
+        Ok(read)
+    }
+}
+
+impl BufRead for CoordinatedStdinReader {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.consumed == self.line.len() && !self.eof {
+            self.line.clear();
+            self.consumed = 0;
+            match sema_stdlib::read_coordinated_stdin_source_line()
+                .map_err(|error| io::Error::other(error.to_string()))?
+            {
+                Some(source_line) => {
+                    self.line.extend_from_slice(source_line.as_bytes());
+                    self.line.push(b'\n');
+                }
+                None => self.eof = true,
+            }
+        }
+        Ok(&self.line[self.consumed..])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.consumed = self.line.len().min(self.consumed.saturating_add(amount));
+    }
+}
+
+fn run_with_line_source(
+    mut read_line: impl FnMut(&mut String) -> Result<bool, String>,
+    interpreter: &Interpreter,
+    env: &sema_core::Env,
+    prelude_keys: &HashSet<Spur>,
+) -> Result<(), String> {
     let mut buffer = String::new();
     let mut in_multiline = false;
     let mut line = String::new();
 
     loop {
         line.clear();
-        match input.read_line(&mut line) {
-            Ok(0) => {
-                // EOF. If we were mid-form, surface that loudly so users
-                // don't silently lose their input.
-                if in_multiline || !buffer.trim().is_empty() {
-                    return Err(format!("unterminated input at EOF: {}", buffer.trim()));
-                }
-                return Ok(());
+        if !read_line(&mut line)? {
+            // EOF. If we were mid-form, surface that loudly so users
+            // don't silently lose their input.
+            if in_multiline || !buffer.trim().is_empty() {
+                return Err(format!("unterminated input at EOF: {}", buffer.trim()));
             }
-            Ok(_) => {}
-            Err(e) => return Err(format!("read error: {e}")),
+            return Ok(());
         }
 
         // Strip the trailing newline that read_line leaves behind, but

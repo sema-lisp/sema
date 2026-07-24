@@ -3,7 +3,7 @@
 //! calls) parks/wakes through ONE pool instead of growing its own runtime.
 //!
 //! Sixth instance of the house type-erased-registration idiom (precedents:
-//! `set_eval_callback`, the otel task callbacks, the usage-scope callbacks,
+//! the macro-expansion callback, the otel task callbacks, the usage-scope callbacks,
 //! `set_blocking_sleep_callback`, `set_interrupt_callback`). Two deliberate
 //! divergences from those: the slot is a process-global `OnceLock` rather than a
 //! thread-local (the backend is reachable from pool threads and plain OS threads
@@ -18,13 +18,13 @@
 //!
 //! # Threading contract (pinned by tokio-assumption tests in `sema-io`)
 //!
-//! `io_block_on` is legal from the VM thread, plain OS threads, and
-//! `io_spawn_blocking` closures; it PANICS from `io_spawn` futures or any other
-//! async-driver thread ("cannot block_on from within a runtime worker"). A
-//! `block_on`'d future may transiently need at most ONE blocking slot of its own
-//! (reqwest's GaiResolver DNS); never nest a second spawn_blocking-and-wait
-//! level inside one — the pool's admission control reserves exactly depth-1
-//! headroom.
+//! `io_block_on` is legal from plain OS threads only while no Sema runtime
+//! quantum is active, and from `io_spawn_blocking` closures. It PANICS from an
+//! active runtime quantum, `io_spawn` futures, or any other async-driver thread
+//! ("cannot block_on from within a runtime worker"). A `block_on`'d future may
+//! transiently need at most ONE blocking slot of its own (reqwest's GaiResolver
+//! DNS); never nest a second spawn_blocking-and-wait level inside one — the
+//! pool's admission control reserves exactly depth-1 headroom.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -136,13 +136,18 @@ pub fn io_spawn_blocking(work: Box<dyn FnOnce() + Send>) {
     require_backend().spawn_blocking(work);
 }
 
-/// Raw seam entry: drive `fut` to completion on the CALLING thread using the
-/// backend's reactor, returning its output. Generic sugar over
+/// Raw host/plain-worker seam: drive `fut` to completion on the CALLING thread
+/// using the backend's reactor, returning its output. Rejects an active runtime
+/// quantum, where callers must suspend on an External wait. Generic sugar over
 /// [`IoBackend::block_on_boxed`]: the output travels through a stack slot, so
 /// `fut` may be non-`Send` and non-`'static` (provider `&self` borrows,
 /// streaming callbacks over Sema values). Consumer crates use
 /// `sema_io::io_block_on`. NATIVE-ONLY semantics — see the trait method.
 pub fn io_block_on<F: Future>(fut: F) -> F::Output {
+    assert!(
+        !crate::in_runtime_quantum(),
+        "io_block_on is a host-only adapter; runtime code must use an External wait"
+    );
     let backend = require_backend();
     let mut slot = None;
     backend.block_on_boxed(Box::pin(async {

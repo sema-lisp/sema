@@ -53,9 +53,9 @@
 
 ;; --- Query parameters ---
 (println "--- Query params ---")
-(define qresp  (http/get "https://httpbin.org/get?lang=sema&type=lisp"))
-(define qbody  (json/decode (:body qresp)))
-(define args   (:args qbody))
+(define qresp (http/get "https://httpbin.org/get?lang=sema&type=lisp"))
+(define qbody (json/decode (:body qresp)))
+(define args (:args qbody))
 (println (format "lang=~a type=~a" (:lang args) (:type args)))
 (println)
 

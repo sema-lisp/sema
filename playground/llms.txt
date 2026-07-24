@@ -1,0 +1,19 @@
+# Sema Playground
+
+> Browser-based Sema editor, evaluator, debugger, examples library, and virtual filesystem. Sema is a Scheme-like Lisp with first-class LLM and agent primitives. The playground runs locally in WebAssembly; it does not send source code to a Sema server.
+
+The playground at https://sema.run exposes an experimental WebMCP tool surface in supported Chrome builds. An agent can read, replace, and format the editor; run or stop code; inspect paged output; find and load examples; manage text files in the virtual filesystem; and drive the breakpoint debugger. Mutating tools reject conflicting operations while the evaluator or debugger is busy. File access is limited to the playground's virtual filesystem.
+
+## Agent resources
+
+- [Sema for LLM agents](https://sema-lang.com/docs/for-agents.md): compact syntax and semantic differences agents should know before writing Sema.
+- [LLM documentation index](https://sema-lang.com/llms.txt): links to the complete Sema documentation, grouped by topic.
+- [Model Context Protocol](https://sema-lang.com/docs/mcp): install and use the native `sema mcp` server, including notebook and user-defined `deftool` tools.
+- [AI Catalog](https://sema-lang.com/.well-known/ai-catalog.json): canonical machine-readable inventory of Sema's MCP, WebMCP, skill, and documentation surfaces.
+- [Sema source](https://github.com/sema-lisp/sema): language, runtime, playground, notebook, and MCP implementation.
+
+## Using the playground
+
+Use the registered WebMCP tools when available instead of manipulating the DOM. Start with `read_editor` or `find_examples`, use `write_editor` or `load_example` to select a program, then call `run_editor` and inspect `read_output`. For debugging, set lines with `set_breakpoints`, call `start_debugging`, and use the step or continue tools until the debugger is paused or idle. Inspect the returned `status` for `paused`, `finished`, `error`, or `stopped`.
+
+WebMCP is an evolving browser API and this integration is an experiment. Browsers without `document.modelContext` keep the normal playground UI and do not register tools.

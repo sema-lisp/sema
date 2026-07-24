@@ -15,15 +15,23 @@
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
-use sema_core::Value;
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{
+    downcast_send_payload, CancelDisposition, CancelHook, CancelHookError, CompletionDecoder,
+    CompletionKind, DecodedCompletion, ExternalFailure, InterruptibleResource, NativeCallContext,
+    PreparedExternalOperation, SendPayload, Trace,
+};
+use sema_core::{Caps, SemaError, Value};
 use sema_mcp::oauth::login::{self, LoginConfig};
 use sema_mcp::oauth::loopback::BrowserOpener;
 use sema_mcp::oauth::scoped::{store_encryption_key, MemoryStore, ScopedFileStore};
 use sema_mcp::oauth::store::{self, TokenSet, TokenStore};
 use sema_mcp::{
-    browser_open_allowed, close_handle, connect_from_config, gated_browser_opener,
-    login_interactive, ConnectFailure, ConnectOpts,
+    browser_open_allowed, close_handle, connect_from_config, connect_send, gated_browser_opener,
+    host_capability_allowed, login_interactive, register_connected, ConnectFailure, ConnectOpts,
+    ConnectedClient,
 };
 use sema_stdlib::workflow_mcp::{
     self, AuthGrant, McpAuthDecl, McpDecl, McpPersist, McpSpecDecl, ServerResolution,
@@ -57,11 +65,8 @@ thread_local! {
 /// unset/empty, and `--no-auth-prompt` was not passed.
 ///
 /// Resolution happens before any workflow phase runs, so a browser prompt here
-/// has nothing to park/resume — this collapses the plan's "live gate"
-/// (yield-signal parking, shared with the deferred HITL-approval-gate
-/// milestone) for the run-start case specifically. That yield machinery is
-/// NOT needed for this path and is not built here; a mid-run re-auth (a token
-/// revoked while phases are already executing) is out of scope too.
+/// has no task to park or resume. A mid-run re-authentication request (for
+/// example, after token revocation) is outside this run-start gate's scope.
 ///
 /// Thread-local because a Sema interpreter (and thus a workflow run) is
 /// single-threaded.
@@ -116,10 +121,479 @@ impl WorkflowMcpResolver for RealResolver {
             .collect()
     }
 
+    fn resolve_prepared(
+        &self,
+        decls: &[McpDecl],
+        workflow: &str,
+        run_id: &str,
+    ) -> Box<PreparedExternalOperation> {
+        // Capture the VM-thread authority (sandbox capabilities, interactive-auth
+        // config, browser opener) BEFORE offloading — the worker's own
+        // sandbox/opener thread-locals are a separate, default set.
+        let cfg = ResolveConfig::capture();
+        let decls = decls.to_vec();
+        let workflow = workflow.to_string();
+        let run_id = run_id.to_string();
+
+        let kind = CompletionKind::try_from_raw(WORKFLOW_MCP_RESOLVE_KIND)
+            .expect("workflow mcp resolve completion kind is nonzero");
+        let resource =
+            InterruptibleResource::new("workflow/mcp-resolve", Box::new(ResolveCancelHook));
+        let decoder = Box::new(ResolveDecoder);
+
+        // The job is a SYNCHRONOUS blocking closure (not one `io_block_on`'d
+        // future), for a hard reason: the resolve calls `login_interactive`, which
+        // spins its OWN current-thread tokio runtime and `block_on`s it. Nesting
+        // that inside a single `io_block_on(async { … })` would panic ("cannot
+        // start a runtime from within a runtime"). Run sequentially instead: each
+        // connect/refresh enters+exits `io_block_on` on its own, and
+        // `login_interactive` runs BETWEEN them, on this plain blocking worker
+        // where no runtime is being driven — exactly like the host path does on
+        // the VM thread, just off the quantum. Cancellation is therefore
+        // best-effort (the sibling of `checkout_external`'s blocking tier): a
+        // mid-flight resolve is not interrupted, but its completion is discarded
+        // on cancel, dropping every `ConnectedClient` in the payload and so
+        // closing any connection it had opened — no handle registered, no leak.
+        let prepared =
+            PreparedExternalOperation::interruptible_blocking(kind, decoder, resource, move || {
+                let outs = resolve_all_send(&decls, &workflow, &run_id, &cfg);
+                Ok(Box::new(outs) as SendPayload)
+            });
+        Box::new(prepared)
+    }
+
     fn close(&self, handles: &[Value]) {
         for handle in handles {
             close_handle(handle);
         }
+    }
+}
+
+/// Completion tag for the workflow `:mcp` resolve offload (`"wfr1"`).
+const WORKFLOW_MCP_RESOLVE_KIND: u64 = 0x7766_7231;
+
+/// A browser opener shared across the VM-thread/worker boundary — `Send + Sync`
+/// so it moves into the offloaded resolve job, `Fn` (not `FnOnce`) so it can be
+/// re-wrapped fresh per interactive attempt.
+type SharedOpener = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+/// VM-thread authority + interactive config captured before the resolve offload,
+/// so the worker resolves with the CALLER's sandbox/opener rather than its own
+/// (default, unrestricted) thread-locals. `Send` (only bools + a `Send + Sync`
+/// opener `Arc`), so it moves into the blocking job.
+struct ResolveConfig {
+    interactive_auth: bool,
+    browser_allowed: bool,
+    network_allowed: bool,
+    process_allowed: bool,
+    /// Shared browser opener captured on the VM thread — wrapped fresh into a
+    /// `BrowserOpener` per interactive attempt. `None` when interactive auth is off.
+    opener: Option<SharedOpener>,
+}
+
+impl ResolveConfig {
+    fn capture() -> Self {
+        let interactive_auth = interactive_auth_enabled();
+        let opener: Option<SharedOpener> = if interactive_auth {
+            // `interactive_login_opener()` reads the TEST/embedder opener seam on
+            // this (VM) thread; re-share it as an `Arc` the worker can wrap once
+            // per interactive attempt.
+            Some(Arc::from(interactive_login_opener()))
+        } else {
+            None
+        };
+        Self {
+            interactive_auth,
+            browser_allowed: browser_open_allowed(),
+            network_allowed: host_capability_allowed(Caps::NETWORK),
+            process_allowed: host_capability_allowed(Caps::PROCESS),
+            opener,
+        }
+    }
+
+    /// A fresh `BrowserOpener` delegating to the shared opener `Arc` — `None` when
+    /// interactive auth is off. Built per interactive attempt (`login_interactive`
+    /// consumes the opener it is handed).
+    fn make_opener(&self) -> Option<BrowserOpener> {
+        self.opener.as_ref().map(|arc| {
+            let arc = Arc::clone(arc);
+            Box::new(move |url: &str| arc(url)) as BrowserOpener
+        })
+    }
+}
+
+/// `Send` per-server outcome the offloaded resolve job hands back; the VM-thread
+/// decoder ([`ResolveDecoder`]) turns each into a `ServerResolution`, minting the
+/// opaque handle `Value` for `Connected` only there. Carries no `Value`/`Rc` — a
+/// `Connected` holds the live `Send` `ConnectedClient` until registration.
+enum SendResolution {
+    Connected {
+        alias: String,
+        // Boxed: `ConnectedClient` wraps a whole `McpClient` (reqwest client +
+        // transport), which would otherwise make this variant dwarf the others.
+        connected: Box<ConnectedClient>,
+        opts: ConnectOpts,
+        auth: Option<AuthGrant>,
+    },
+    NeedsAuth {
+        alias: String,
+        url: String,
+        scopes: Vec<String>,
+        tools: Vec<String>,
+        persist: String,
+    },
+    Failed {
+        alias: String,
+        reason: String,
+    },
+}
+
+/// The off-quantum twin of [`RealResolver::resolve`]: resolves every declared
+/// server on the blocking worker, producing `Send` outcomes (deferring the
+/// `CONNECTIONS`-thread-local registration + handle `Value` to the VM-thread
+/// decoder). Mirrors the synchronous `resolve_one` state machine step for step;
+/// the two are kept in lockstep deliberately (the host path stays byte-identical
+/// while the runtime path runs off the quantum).
+fn resolve_all_send(
+    decls: &[McpDecl],
+    workflow: &str,
+    run_id: &str,
+    cfg: &ResolveConfig,
+) -> Vec<SendResolution> {
+    decls
+        .iter()
+        .map(|decl| resolve_one_send(decl, workflow, run_id, cfg))
+        .collect()
+}
+
+fn resolve_one_send(
+    decl: &McpDecl,
+    workflow: &str,
+    run_id: &str,
+    cfg: &ResolveConfig,
+) -> SendResolution {
+    match (&decl.spec, &decl.auth) {
+        (McpSpecDecl::Stdio { .. }, _) | (McpSpecDecl::Http { .. }, None) => {
+            connect_plain_send(decl, workflow, run_id, cfg)
+        }
+        (McpSpecDecl::Http { .. }, Some(auth)) => {
+            resolve_authenticated_http_send(decl, auth, workflow, run_id, cfg)
+        }
+    }
+}
+
+/// The VM-captured connect capability gate (`Caps::NETWORK` for `:url`,
+/// `Caps::PROCESS` for `:command`), applied on the worker via the pre-resolved
+/// booleans — `connect_send` itself never reads `HOST_SANDBOX`. `Some(reason)`
+/// means denied (mirrors `connect_from_config`'s gate → `ConnectFailure::Failed`).
+fn connect_capability_denied(decl: &McpDecl, cfg: &ResolveConfig) -> Option<String> {
+    let (allowed, cap) = match &decl.spec {
+        McpSpecDecl::Http { .. } => (cfg.network_allowed, Caps::NETWORK),
+        McpSpecDecl::Stdio { .. } => (cfg.process_allowed, Caps::PROCESS),
+    };
+    if allowed {
+        None
+    } else {
+        Some(format!("mcp/connect: permission denied for {}", cap.name()))
+    }
+}
+
+/// Drive `connect_send` on the worker (its `io_block_on` is legal here), after
+/// the VM-captured capability gate. `bearer` injects an `Authorization` header.
+/// The `Send` client comes back for the decoder to register on the VM thread.
+fn connect_send_now(
+    decl: &McpDecl,
+    bearer: Option<&str>,
+    cfg: &ResolveConfig,
+) -> Result<(Box<ConnectedClient>, ConnectOpts), ConnectFailure> {
+    if let Some(reason) = connect_capability_denied(decl, cfg) {
+        return Err(ConnectFailure::Failed(reason));
+    }
+    let cfg_value = spec_config_value(&decl.spec, bearer);
+    let opts = ConnectOpts {
+        interactive_auth: false,
+        allowed_tools: allowed_tools(decl),
+    };
+    let connected = sema_io::io_block_on(connect_send(&cfg_value, &opts, cfg.browser_allowed))?;
+    Ok((Box::new(connected), opts))
+}
+
+fn needs_auth_send(decl: &McpDecl, auth: &McpAuthDecl, url: &str) -> SendResolution {
+    SendResolution::NeedsAuth {
+        alias: decl.alias.clone(),
+        url: url.to_string(),
+        scopes: auth.scopes.clone(),
+        tools: decl.tools.clone(),
+        persist: persist_str(decl.persist).to_string(),
+    }
+}
+
+/// Off-quantum twin of [`connect_plain`].
+fn connect_plain_send(
+    decl: &McpDecl,
+    workflow: &str,
+    run_id: &str,
+    cfg: &ResolveConfig,
+) -> SendResolution {
+    match connect_send_now(decl, None, cfg) {
+        Ok((connected, opts)) => SendResolution::Connected {
+            alias: decl.alias.clone(),
+            connected,
+            opts,
+            auth: None,
+        },
+        Err(ConnectFailure::NeedsAuth { url }) => {
+            let auth = decl.auth.clone().unwrap_or_default();
+            needs_auth_or_interactive_send(decl, &auth, &url, workflow, run_id, cfg)
+        }
+        Err(ConnectFailure::Failed(reason)) => SendResolution::Failed {
+            alias: decl.alias.clone(),
+            reason,
+        },
+    }
+}
+
+/// Off-quantum twin of [`needs_auth_or_interactive`]. `login_interactive` runs on
+/// this plain worker thread — no runtime is being driven here (each connect/
+/// refresh enters+exits `io_block_on` separately), so its private current-thread
+/// runtime does not nest.
+fn needs_auth_or_interactive_send(
+    decl: &McpDecl,
+    auth: &McpAuthDecl,
+    url: &str,
+    workflow: &str,
+    run_id: &str,
+    cfg: &ResolveConfig,
+) -> SendResolution {
+    if !cfg.interactive_auth || !cfg.browser_allowed {
+        return needs_auth_send(decl, auth, url);
+    }
+
+    let scoped_store = match store_for(decl.persist, workflow, run_id) {
+        Ok(s) => s,
+        Err(reason) => {
+            eprintln!("{}: authentication failed — {reason}", decl.alias);
+            return needs_auth_send(decl, auth, url);
+        }
+    };
+
+    eprintln!("{}: authentication required — opening browser…", decl.alias);
+
+    match login_interactive(url, auth.client_id.as_deref(), cfg.make_opener()) {
+        Ok(creds) => {
+            if decl.persist != McpPersist::None {
+                let _ = scoped_store.save(&creds);
+            }
+            // `None` retry_ctx: this connect IS the interactive retry — a still-
+            // rejected freshly-consented token gates immediately, never re-prompts.
+            connect_with_token_send(decl, &creds.tokens, "consented", None, cfg)
+        }
+        Err(reason) => {
+            eprintln!("{}: authentication failed — {reason}", decl.alias);
+            needs_auth_send(decl, auth, url)
+        }
+    }
+}
+
+/// Off-quantum twin of [`resolve_authenticated_http`].
+fn resolve_authenticated_http_send(
+    decl: &McpDecl,
+    auth: &McpAuthDecl,
+    workflow: &str,
+    run_id: &str,
+    cfg: &ResolveConfig,
+) -> SendResolution {
+    let McpSpecDecl::Http { url, .. } = &decl.spec else {
+        unreachable!("declared_mcp rejects :auth on a stdio spec");
+    };
+
+    let scoped_store = match store_for(decl.persist, workflow, run_id) {
+        Ok(s) => s,
+        Err(reason) => {
+            return SendResolution::Failed {
+                alias: decl.alias.clone(),
+                reason,
+            }
+        }
+    };
+
+    let (stored, imported_from_default) = if decl.persist == McpPersist::Keyring {
+        (scoped_store.load(url), false)
+    } else {
+        match scoped_store.load(url) {
+            Some(creds) => (Some(creds), false),
+            None => match store::default_store().load(url) {
+                Some(creds) => (Some(creds), true),
+                None => (None, false),
+            },
+        }
+    };
+
+    let Some(mut stored) = stored else {
+        return needs_auth_or_interactive_send(decl, auth, url, workflow, run_id, cfg);
+    };
+
+    if imported_from_default && decl.persist != McpPersist::None {
+        let _ = scoped_store.save(&stored);
+    }
+
+    let now = store::now_unix();
+    if !stored.tokens.is_expired(now, EXPIRY_SKEW_SECS) {
+        return connect_with_token_send(
+            decl,
+            &stored.tokens,
+            "cached",
+            Some((workflow, run_id)),
+            cfg,
+        );
+    }
+
+    if stored.tokens.refresh_token.is_some() {
+        let login_config = LoginConfig {
+            mcp_url: url,
+            resource_metadata_url: None,
+            requested_scope: stored.tokens.scope.as_deref(),
+            preconfigured_client_id: auth.client_id.as_deref(),
+        };
+        sema_llm::http::ensure_crypto_provider();
+        let http = reqwest::Client::new();
+        match sema_io::io_block_on(login::refresh(&http, &login_config, &stored)) {
+            Ok(tokens) => {
+                stored.tokens = tokens;
+                let _ = scoped_store.save(&stored);
+                return connect_with_token_send(
+                    decl,
+                    &stored.tokens,
+                    "refreshed",
+                    Some((workflow, run_id)),
+                    cfg,
+                );
+            }
+            Err(_) => {
+                return needs_auth_or_interactive_send(decl, auth, url, workflow, run_id, cfg);
+            }
+        }
+    }
+
+    needs_auth_or_interactive_send(decl, auth, url, workflow, run_id, cfg)
+}
+
+/// Off-quantum twin of [`connect_with_token`]. `retry_ctx` semantics are
+/// identical: `Some((workflow, run_id))` allows one interactive retry on a
+/// `NeedsAuth`; `None` gates straight to `needs_auth` (the one-shot guard).
+fn connect_with_token_send(
+    decl: &McpDecl,
+    tokens: &TokenSet,
+    source: &str,
+    retry_ctx: Option<(&str, &str)>,
+    cfg: &ResolveConfig,
+) -> SendResolution {
+    match connect_send_now(decl, Some(&tokens.access_token), cfg) {
+        Ok((connected, opts)) => SendResolution::Connected {
+            alias: decl.alias.clone(),
+            connected,
+            opts,
+            auth: Some(AuthGrant {
+                scopes: split_scopes(tokens.scope.as_deref()),
+                expires_at: tokens.expires_at,
+                source: source.to_string(),
+            }),
+        },
+        Err(ConnectFailure::NeedsAuth { url }) => {
+            let auth = decl.auth.clone().unwrap_or_default();
+            match retry_ctx {
+                Some((workflow, run_id)) => {
+                    needs_auth_or_interactive_send(decl, &auth, &url, workflow, run_id, cfg)
+                }
+                None => needs_auth_send(decl, &auth, &url),
+            }
+        }
+        Err(ConnectFailure::Failed(reason)) => SendResolution::Failed {
+            alias: decl.alias.clone(),
+            reason,
+        },
+    }
+}
+
+/// VM-thread decoder for the resolve offload: registers each `Connected` client
+/// into the `CONNECTIONS` table (minting its opaque handle `Value`) and encodes
+/// the `Vec<ServerResolution>` into the resumed `Value` — the only place a
+/// `Value` is built. Holds no `Value`, so its trace is edge-free.
+struct ResolveDecoder;
+
+impl Trace for ResolveDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CompletionDecoder for ResolveDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        let payload = result.map_err(|failure| {
+            SemaError::eval(format!("workflow/mcp-resolve: {}", failure.message()))
+        })?;
+        let outs = downcast_send_payload::<Vec<SendResolution>>(payload, "workflow/mcp-resolve")
+            .map_err(|failure| SemaError::eval(failure.message().to_string()))?;
+        let resolutions: Vec<ServerResolution> =
+            outs.into_iter().map(register_send_resolution).collect();
+        Ok(workflow_mcp::encode_resolutions(&resolutions))
+    }
+}
+
+/// Register one `Send` outcome on the VM thread, minting the opaque handle for a
+/// `Connected`.
+fn register_send_resolution(res: SendResolution) -> ServerResolution {
+    match res {
+        SendResolution::Connected {
+            alias,
+            connected,
+            opts,
+            auth,
+        } => ServerResolution::Connected {
+            alias,
+            handle: register_connected(*connected, &opts),
+            auth,
+        },
+        SendResolution::NeedsAuth {
+            alias,
+            url,
+            scopes,
+            tools,
+            persist,
+        } => ServerResolution::NeedsAuth {
+            alias,
+            url,
+            scopes,
+            tools,
+            persist,
+        },
+        SendResolution::Failed { alias, reason } => ServerResolution::Failed { alias, reason },
+    }
+}
+
+/// Cancel hook for the resolve offload: the blocking job cannot be interrupted
+/// mid-flight (best-effort, matching `checkout_external`'s blocking tier), so
+/// there is nothing to signal — the runtime discards the completion on cancel,
+/// dropping every `ConnectedClient` in the payload (closing its connection).
+/// Reports the resource reaped either way.
+struct ResolveCancelHook;
+
+impl Trace for ResolveCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CancelHook for ResolveCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
     }
 }
 

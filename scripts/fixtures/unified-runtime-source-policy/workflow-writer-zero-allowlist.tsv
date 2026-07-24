@@ -1,0 +1,5 @@
+# A per-token workflow-writer allowlist with NO rows: any `write_all`/`fs::write` in the
+# scanned file is unallowlisted and fails. Used by the fixtures that assert journal.rs
+# stays write-free (a synchronous `Journal::write` fs call must move to writer.rs).
+#
+# Format: TOKEN<TAB>COUNT<TAB>reason

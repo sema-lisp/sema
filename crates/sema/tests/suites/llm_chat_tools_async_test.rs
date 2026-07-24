@@ -232,7 +232,8 @@ fn tools_async_cancel_leaves_no_slab_entry_and_next_call_works() {
         (let ((p (async/spawn (fn ()
                     (llm/chat (list (message :user "go"))
                       {:model "fake-model" :tools [ping] :max-tool-rounds 12})))))
-          (try (async/timeout 250 p) (catch e nil)))
+          (async/spawn (fn () (async/sleep 250) (async/cancel p)))
+          (try (async/await p) (catch e nil)))
     "#;
     let _ = interp.eval_str_compiled(cancel_src);
     assert_eq!(
@@ -276,6 +277,53 @@ fn tools_sync_regression_outside_async() {
     let val = result.expect("llm/chat :tools at top level should succeed");
     assert_eq!(val.as_str(), Some("sync sunny in Oslo."));
     assert_eq!(recorder.call_count(), 2);
+}
+
+#[test]
+#[serial_test::serial]
+fn blocking_chat_compatibility_native_rejects_runtime_tool_loop() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call("call_1", "get-weather", serde_json::json!({"city": "Oslo"}))
+        .reply("must not finish")
+        .build();
+    let src = format!(
+        r#"
+        {WEATHER_TOOL}
+        (let ((handler-calls 0))
+          (deftool counted
+            "Count calls"
+            {{:city {{:type :string}}}}
+            (fn (_city) (set! handler-calls (+ handler-calls 1))))
+          (try
+            (__llm-chat-blocking
+              (list (message :user "weather?"))
+              {{:model "fake-model" :tools [counted]}})
+            (catch error (list (:message error) handler-calls))))
+        "#
+    );
+    let (result, recorder) = eval_with_fake(&src, fake);
+
+    let result = result
+        .expect("runtime guard error should be catchable")
+        .as_list()
+        .expect("guard result list")
+        .to_vec();
+    let error = result[0].as_str().expect("guard error message");
+    assert!(
+        error.contains("__llm-chat-blocking cannot run a tool loop inside the cooperative runtime"),
+        "unexpected blocking-native error: {error}"
+    );
+    assert_eq!(
+        result[1],
+        Value::int(0),
+        "guard must run before tool handlers"
+    );
+    assert_eq!(
+        recorder.call_count(),
+        0,
+        "guard must run before provider I/O"
+    );
 }
 
 /// Capability gating survives the split into `__llm-chat-blocking` / `__chat-begin`:

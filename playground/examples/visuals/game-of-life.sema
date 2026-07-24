@@ -34,13 +34,13 @@
       (grid-get grid rd cr))))
 
 (define (next-cell grid r c)
-  (let* ((alive  (grid-get grid r c))
-         (n      (count-neighbors grid r c)))
+  (let* ((alive (grid-get grid r c))
+         (n (count-neighbors grid r c)))
     (cond
-      ((and (= alive 1) (< n 2))  0)
-      ((and (= alive 1) (> n 3))  0)
-      ((and (= alive 0) (= n 3))  1)
-      (else                       alive))))
+      ((and (= alive 1) (< n 2)) 0)
+      ((and (= alive 1) (> n 3)) 0)
+      ((and (= alive 0) (= n 3)) 1)
+      (else alive))))
 
 (define (next-gen grid)
   (map (fn (r) (map (fn (c) (next-cell grid r c)) (range COLS))) (range ROWS)))
@@ -49,8 +49,8 @@
   (string/join (map (fn (cell) (if (= cell 1) "█" " ")) row) ""))
 
 (define (show grid gen)
-  (let ((alive   (foldl + 0 (map (fn (row) (foldl + 0 row)) grid)))
-        (border  (string/repeat "─" COLS)))
+  (let ((alive (foldl + 0 (map (fn (row) (foldl + 0 row)) grid)))
+        (border (string/repeat "─" COLS)))
     (println (format "Gen ~a | Live: ~a" gen alive))
     (println (str "┌" border "┐"))
     (for-each

@@ -5,30 +5,30 @@
 ;; Sema — the browser WASM runtime does. Its job is plumbing: serve the embedded
 ;; browser runtime + a synthesized HTML shell + the app's source files.
 
-(define config          (json/decode __web-config-json))
-(define host            (:host config))
-(define port            (:port config))
-(define entry           (:entry config))
-(define runtime-dir     (:runtimeDir config))
-(define app-dir         (:appDir config))
-(define build-dir       (:buildDir config))
-(define shell-template  (:shell config))
+(define config (json/decode __web-config-json))
+(define host (:host config))
+(define port (:port config))
+(define entry (:entry config))
+(define runtime-dir (:runtimeDir config))
+(define app-dir (:appDir config))
+(define build-dir (:buildDir config))
+(define shell-template (:shell config))
 
 ;; How the browser loads the app: single-file apps run from raw source; an app
 ;; that uses `import` can't resolve modules against the browser's (absent) fs, so
 ;; it's compiled to a `.vfs` under build-dir and served from /__build. `__web/prepare`
 ;; (native) decides + (re)builds, returning {:mode "source"|"archive"|"error"}.
-(define app-state  (__web/prepare))
-(define app-mode   (:mode app-state))
-(define app-error  (:error app-state))
+(define app-state (__web/prepare))
+(define app-mode (:mode app-state))
+(define app-error (:error app-state))
 
 ;; Watch the app dir; each poll drains pending events and, if any fired, bumps a
 ;; generation the browser diffs against to trigger a reload. fs/watch emits
 ;; several events per save, but coalescing them into one bump per poll debounces.
 ;; The generation also cache-busts the app-source URL (:static sends a 1h
 ;; cache-control), so a full reload fetches the changed source instead of a copy.
-(define watcher     (fs/watch app-dir))
-(define generation  0)
+(define watcher (fs/watch app-dir))
+(define generation 0)
 
 (define llm-enabled (:llm config))
 
@@ -164,7 +164,7 @@
   (println ""))
 
 (http/serve (http/router routes)
-  {:host           host
-   :port           port
-   :port-fallback  #t
-   :on-listen      announce})
+  {:host host
+   :port port
+   :port-fallback #t
+   :on-listen announce})

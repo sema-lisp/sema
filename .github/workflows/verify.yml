@@ -7,6 +7,11 @@ on:
   workflow_call:
 
 jobs:
+  playground-runtime:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/playground-runtime.yml
+
   verify:
     runs-on: ubuntu-latest
     steps:

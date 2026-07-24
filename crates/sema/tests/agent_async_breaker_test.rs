@@ -297,7 +297,8 @@ fn cancelling_one_agent_leaves_survivor_spans_intact() {
         (defagent survivor {:model "fake-model" :tools [ping] :max-turns 8})
         (define longp (async/spawn (fn () (agent/run longbot  "cancel-me"))))
         (define survp (async/spawn (fn () (agent/run survivor "survive"))))
-        (try (async/timeout 200 longp) (catch e nil))
+        (async/spawn (fn () (async/sleep 200) (async/cancel longp)))
+        (try (async/await longp) (catch e nil))
         (async/await survp)
     "#;
     let val = interp
@@ -471,8 +472,9 @@ fn cancel_then_subsequent_agent_run_still_works() {
         (defagent bot {:model "fake-model" :tools [ping] :max-turns 12})
         (define sib (async/spawn (fn () (begin (async/sleep 20) "sib-ok"))))
         (define a   (async/spawn (fn () (agent/run bot "go"))))
-        ;; Cancel the long agent ~250ms in; swallow the timeout throw.
-        (try (async/timeout 250 a) (catch e nil))
+        ;; Explicitly cancel the long agent ~250ms in and observe the rejection.
+        (async/spawn (fn () (async/sleep 250) (async/cancel a)))
+        (try (async/await a) (catch e nil))
         (let ((sib-res  (async/await sib))
               (next-res  (first (async/all (list (async/spawn (fn () (agent/run bot "again"))))))))
           (list sib-res next-res))

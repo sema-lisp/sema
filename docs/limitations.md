@@ -332,3 +332,15 @@ The last line is the footgun: `and` in head position is the special form, not th
 - **CSV** — csv/parse, csv/parse-maps, csv/encode
 - **REPL** — Line editing, history, multi-line input
 - **LLM integration** — Full suite: complete, stream, chat, extract, classify, batch, pmap, embed, agents, tools, conversations, cost tracking, budgets
+
+## CLI Ctrl-C vs long synchronous natives
+
+A single Ctrl-C cancels the running program cooperatively
+(`RuntimeCommandHandle::cancel_all`): VM bytecode loops and async/External
+waits settle as cancelled within milliseconds. A **long synchronous native
+call** (e.g. a huge `range`/sort or a blocking third-party parse) cannot be
+interrupted mid-call — the command applies when the native returns. A second
+Ctrl-C within 2 s hard-exits (status 130). Before the cooperative handler
+existed the OS default disposition killed the process instantly in all cases;
+the trade is graceful teardown (subprocess reaping, cancelled settlement) for
+that immediacy.

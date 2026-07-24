@@ -4,8 +4,8 @@
 (define qc-num-tests 100)
 
 ;; Generators
-(define (gen/int lo hi)  (fn () (math/random-int lo hi)))
-(define (gen/nat)        (gen/int 0 1000))
+(define (gen/int lo hi) (fn () (math/random-int lo hi)))
+(define (gen/nat) (gen/int 0 1000))
 (define (gen/char)
   (fn () (char/to-string (integer/to-char (math/random-int 32 126)))))
 (define (gen/string-of max-len)
@@ -52,10 +52,10 @@
         (if (prop val)
           (loop (+ i 1))
           (let ((shrunk (if shrinker (find-minimal prop val shrinker) val)))
-            {:status          :fail
-             :counterexample  val
-             :shrunk          shrunk
-             :after-tests     (+ i 1)}))))))
+            {:status :fail
+             :counterexample val
+             :shrunk shrunk
+             :after-tests (+ i 1)}))))))
 
 (define (check-property-2 prop gen-a gen-b shrinker-a shrinker-b)
   (let loop ((i 0))

@@ -1,126 +1,148 @@
-//! Async-context guard coverage for `http/serve` (WP-SERVE-GUARD).
+//! Async-context coverage for `http/serve` (WP-SERVE-GUARD, superseded).
 //!
-//! `http/serve` (`crates/sema-stdlib/src/server.rs`) runs a blocking accept
-//! loop on the calling thread for the life of the server
-//! (`rx.blocking_recv()` in its dispatch loop) — correct at top level, where
-//! that thread has nothing else to do, but catastrophic inside `async/spawn`:
-//! that thread IS the VM thread the cooperative scheduler drives every task
-//! on, so the loop would never return control to it and every sibling task
-//! (indeed the whole process) freezes forever with no error and nothing to
-//! debug. Rather than the full non-blocking rearchitecture (a yield-aware
-//! dispatch loop with a handler task per connection — real design work,
-//! deliberately deferred, see `docs/deferred.md`), `http/serve` now checks
-//! `in_async_context()` FIRST, before doing anything else (parsing options,
-//! binding a port, spawning the axum future), and fails fast with an
-//! explained error instead of hanging silently.
+//! `http/serve` (`crates/sema-stdlib/src/server.rs`) used to check
+//! `in_runtime_quantum() && current_task_id().is_some()` FIRST and fail fast
+//! with an explained error whenever called from inside `async/spawn`: its
+//! accept loop ran on the calling thread via `rx.blocking_recv()`, and that
+//! thread IS the single VM thread the cooperative scheduler drives every task
+//! on, so composing it inside `async/spawn` would have frozen the whole
+//! process with no error and nothing to debug.
 //!
-//! A dedicated Rust-level unit test in `server.rs` itself
-//! (`http_serve_errors_immediately_in_async_context`) exercises the raw
-//! `SemaError` (including `.hint()`) directly, bypassing the scheduler: a
-//! task's rejection is flattened to a plain string when it crosses the
-//! promise boundary (`format!("{e}")` in `sema-vm/src/scheduler.rs`), so
-//! `.hint()` does not survive an `async/await` round-trip — only the core
-//! message does. The end-to-end tests here go through the real scheduler via
-//! `async/spawn`/`async/await` and assert on that surviving core message,
-//! plus (with a hard timeout guard) that the call returns at all rather than
-//! hanging.
+//! SRV-1 (see `docs/deferred.md` §"SRV-1", RESOLVED) removed that guard: the
+//! accept loop now parks cooperatively on a re-arming `WaitKind::External`
+//! instead of blocking, each connection is its own spawned task, and a
+//! server-side WebSocket handler's `(:recv conn)` suspends cooperatively too
+//! — so `http/serve` no longer needs to reject `async/spawn` composition; it
+//! now genuinely serves from inside one. `http_serve_inside_async_spawn_now_
+//! serves` below is the regression gate for that: it replaces the old
+//! `http_serve_inside_async_spawn_errors_immediately_no_hang` /
+//! `http_serve_guard_does_not_stall_sibling_task` tests, which asserted the
+//! now-deleted guard's rejection behavior and would fail (correctly — the
+//! guard is gone) against the current code.
+//!
+//! `crates/sema/tests/http_serve_concurrent_test.rs` is the primary SRV-1
+//! acceptance gate (concurrency, WebSocket liveness, cancellation, the
+//! top-level regression, and the error-contract pin); this file keeps the
+//! narrower top-level-specific regressions (arity validation, a plain
+//! top-level serve) plus the async-composition case.
 
 #![cfg(not(target_arch = "wasm32"))]
 
 use sema_eval::Interpreter;
 
-// === The guard fires immediately — no hang — when called inside async/spawn ===
+// === `http/serve` now genuinely composes inside `async/spawn` ===
 //
-// Pre-guard, this program would never return: the spawned task's
-// `http/serve` call would bind a port and sit in its blocking accept loop
-// forever, starving the scheduler so `async/await` never gets a chance to
-// even notice the task is stuck (the whole process would just hang). Run the
-// eval on a background thread and bound the wait with `recv_timeout` so a
-// regression here fails the test instead of hanging the suite.
+// Pre-SRV-1, this program would have errored immediately (the guard). Now
+// the spawned task's `http/serve` call binds the port and parks its accept
+// loop on a cooperative External wait exactly like a top-level call — so
+// `async/await`ing it drives the same server, reachable over a real loopback
+// connection, while nothing else about the scheduler is disturbed. IN-PROCESS
+// (drives the `Interpreter`/`Runtime` host API directly, like
+// `http_serve_cancel_test.rs`) so the test can cancel the root itself once
+// it has proven the server answers, rather than leaking a live thread/socket
+// for the rest of the test binary's process.
 #[test]
-fn http_serve_inside_async_spawn_errors_immediately_no_hang() {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let interp = Interpreter::new();
-        let program = r#"
-            (async/await (async/spawn (fn ()
-              (http/serve (fn (req) (http/ok "hi")) {:port 19939}))))
-        "#;
-        let result = interp.eval_str_compiled(program);
-        // The interpreter/VM types involved are not Send, so ship out only
-        // what the assertions need.
-        let _ = tx.send(result.map(|_| ()).map_err(|e| e.to_string()));
+fn http_serve_inside_async_spawn_now_serves() {
+    use sema_vm::runtime::RootOptions;
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let interp = Interpreter::new();
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        listener.local_addr().expect("local_addr").port()
+    };
+    let program = format!(
+        r#"(async/await (async/spawn (fn ()
+             (http/serve (fn (req) (http/text "from-spawn")) {{:port {port}}}))))"#
+    );
+    let handle = interp
+        .submit_str(&program, RootOptions::default())
+        .expect("http/serve-inside-async/spawn submits as a root");
+    let root_id = handle.id();
+    let cmd = interp.command_handle();
+
+    // Prober thread: waits for the port to come up (proving the guard is
+    // gone and the spawned accept loop actually bound), makes a real request
+    // (proving it actually dispatches), then cancels the root so the driver
+    // loop below can return instead of blocking forever (the server, like
+    // any `http/serve`, never settles on its own).
+    let prober = thread::spawn(move || -> Result<(), String> {
+        let addr = format!("127.0.0.1:{port}")
+            .to_socket_addrs()
+            .map_err(|e| e.to_string())?
+            .next()
+            .ok_or("no address")?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut connected = false;
+        while Instant::now() < deadline {
+            if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+                connected = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if !connected {
+            return Err(
+                "http/serve inside async/spawn never bound the port (guard regressed, or a hang)"
+                    .to_string(),
+            );
+        }
+
+        let mut stream =
+            TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(|e| e.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .map_err(|e| e.to_string())?;
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .map_err(|e| e.to_string())?;
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).map_err(|e| e.to_string())?;
+        if !raw.contains("from-spawn") {
+            return Err(format!(
+                "server spawned inside async/spawn must actually dispatch requests, got: {raw:?}"
+            ));
+        }
+
+        if !cmd.cancel_root(root_id) {
+            return Err(
+                "cancel_root must accept the live http/serve-inside-spawn root".to_string(),
+            );
+        }
+        Ok(())
     });
 
-    let outcome = rx.recv_timeout(std::time::Duration::from_secs(10)).expect(
-        "http/serve inside async/spawn must return promptly with an error, not hang \
-             the scheduler",
+    let result = interp.drive_until_settled(&handle);
+    prober
+        .join()
+        .expect("prober thread completes")
+        .expect("prober thread's checks must all pass");
+    assert!(
+        result.is_err(),
+        "a cancelled http/serve-inside-async/spawn root must settle as an error, not a value"
     );
 
-    let err = outcome.expect_err("http/serve inside async/spawn must error, not succeed");
-    assert!(
-        err.contains("async/spawn"),
-        "error should name async/spawn as the disallowed context, got: {err}"
-    );
-    assert!(
-        err.to_lowercase().contains("top level"),
-        "error should point the caller at the top level, got: {err}"
-    );
+    // NOT asserting `runtime_live_task_count() == 0` here, unlike
+    // `http_serve_cancel_test.rs`'s cancellation gates: a probe
+    // (`(async/await (async/spawn (fn () (async/sleep 999999))))`, cancelled
+    // the same way) shows `cancel_root` on a root that `async/await`s a
+    // spawned child does NOT cascade-cancel that child — the awaited
+    // grandchild task is left live even after the awaiting root itself
+    // settles as an error. That is a general `async/spawn`+`async/await`
+    // cancellation-cascade property, reproducible with no `http/serve`
+    // involved at all — orthogonal to SRV-1 (which guarantees a *server's
+    // own* descendants — its accept loop and per-connection handler tasks —
+    // are reaped when the server itself is cancelled directly, exactly what
+    // `http_serve_cancel_test.rs` proves). Flagged in the SRV-1 report as a
+    // concern for the next pass rather than fixed here (a sema-vm runtime
+    // cascade-cancellation change is out of scope for this piece).
 }
 
-// === A sibling task is unaffected: the guard's own task fails, everything
-// === else in the same scheduler run proceeds normally ===
-//
-// Not a "sibling completes first while the op is in flight" ordering proof
-// (the guard never yields — there is nothing in flight to race), but the
-// property that actually matters here: one task hitting the guard must not
-// wedge the scheduler for the rest of the run. `async/all` runs both tasks
-// concurrently and only returns once both have settled (one rejected, one
-// resolved) — a pre-guard build would never reach the `try`'s `catch` arm at
-// all.
-#[test]
-fn http_serve_guard_does_not_stall_sibling_task() {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let interp = Interpreter::new();
-        let program = r#"
-            (let ((out (channel/new 8)))
-              (async/all
-                (list
-                  (async/spawn (fn ()
-                    (try
-                      (http/serve (fn (req) (http/ok "hi")) {:port 19940})
-                      (catch e (channel/send out "serve-guard-caught")))))
-                  (async/spawn (fn () (channel/send out "sibling")))))
-              (list (channel/recv out) (channel/recv out)))
-        "#;
-        let result = interp.eval_str_compiled(program);
-        let mapped = result.map_err(|e| e.to_string()).map(|v| {
-            v.as_list()
-                .expect("list of two channel receives")
-                .iter()
-                .map(|item| item.as_str().expect("string").to_string())
-                .collect::<Vec<_>>()
-        });
-        let _ = tx.send(mapped);
-    });
-
-    let outcome = rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("guarded http/serve alongside a sibling task must not hang the scheduler");
-
-    let mut received = outcome.expect("both tasks must settle without the eval itself erroring");
-    received.sort();
-    assert_eq!(
-        received,
-        vec!["serve-guard-caught".to_string(), "sibling".to_string()],
-        "both the guard-rejected task (caught) and the sibling task must complete"
-    );
-}
-
-// === Sync (top-level) regression: the guard must not disturb ordinary
-// === top-level arg validation, which still runs (arity error, not the
-// === async-context error) since `in_async_context()` is false there ===
+// === Sync (top-level) regression: ordinary top-level arg validation still
+// === runs (arity error) exactly as before the guard's removal ===
 #[test]
 fn http_serve_top_level_arity_error_unchanged() {
     let interp = Interpreter::new();
@@ -130,12 +152,12 @@ fn http_serve_top_level_arity_error_unchanged() {
     let msg = err.to_string();
     assert!(
         msg.to_lowercase().contains("arity") || msg.contains("expects"),
-        "top-level arity validation must be unchanged by the async-context guard, got: {msg}"
+        "top-level arity validation must be unchanged by the guard's removal, got: {msg}"
     );
 }
 
 // === Sync (top-level) regression: a real top-level http/serve still binds
-// === and answers a request — the guard only fires in async context ===
+// === and answers a request ===
 #[test]
 #[ignore] // requires network
 fn http_serve_top_level_still_serves() {

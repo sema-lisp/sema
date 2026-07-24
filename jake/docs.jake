@@ -13,7 +13,7 @@ task docs:
 task docs-check:
     cargo run -q -p sema-docs -- gen --strict
     git diff --exit-code crates/sema-docs/builtin_docs.generated.json
-    cargo test -q -p sema-lsp builtin_doc_coverage
+    cargo nextest run -p sema-lsp builtin_doc_coverage
 
 # Regenerate the vendored LLM pricing snapshot from models.dev. Commit the diff
 # to ship updated prices in a patch release.

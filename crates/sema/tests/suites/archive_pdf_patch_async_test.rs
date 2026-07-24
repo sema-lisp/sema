@@ -1,13 +1,17 @@
 //! Async-offload coverage for `zip/*`/`tar/*` (WP-ARCHIVE-PDF-PATCH), `pdf/*`,
 //! and `patch/apply-file`.
 //!
-//! `archive.rs`, `pdf.rs`, and `diff.rs` now branch on `in_async_context()`:
-//! each builtin's real work (already factored into a plain `*_work`
-//! function) runs synchronously at top level, or — inside `async/spawn` —
-//! offloads onto the process-wide I/O pool via `fs_offload` (io.rs) and
-//! yields `AwaitIo`, so a large archive/PDF/patch operation doesn't block the
-//! VM thread (and every sibling task) for its whole duration. At top level
-//! every builtin keeps the original synchronous shape.
+//! `archive.rs`, `pdf.rs`, and `diff.rs` branch on `in_runtime_quantum()`.
+//! Evaluation runs inside the unified runtime, where each builtin offloads
+//! through `quarantined_compute` (`io.rs`) and yields `AwaitIo`, so a large
+//! archive/PDF/patch operation does not block the VM thread and every sibling
+//! task for its whole duration. Only direct native calls outside a runtime
+//! quantum keep the synchronous shape.
+//!
+//! PDF cases cover offload, input guardrails, and compatibility only. The
+//! dependencies can decompress object/content streams and allocate page or
+//! metadata collections before the post-parse caps run, so no PDF operation is
+//! claimed as terminally bounded here.
 //!
 //! Every fixture here is tiny — no real disk/CPU latency needed for these
 //! tests to be meaningful: the offload yields `AwaitIo` the instant it's
@@ -52,6 +56,8 @@ fn pdf_fixture() -> String {
         env!("CARGO_MANIFEST_DIR")
     )
 }
+
+const QUARANTINE_INPUT_LIMIT_ONE_OVER: u64 = 256 * 1024 * 1024 + 1;
 
 /// Run `program`, expecting it to return a 2-element list of strings from a
 /// `(list (channel/recv out) (channel/recv out))` race between an offloaded
@@ -207,6 +213,29 @@ fn archive_async_tar_matches_sync() {
     assert_eq!(async_beta, b"beta payload");
 }
 
+#[test]
+fn archive_async_rejects_oversized_source_before_creating_output() {
+    let interp = Interpreter::new();
+    let dir = TempDir::new("archive-cap");
+    let source = dir.path("oversized.bin");
+    std::fs::File::create(&source)
+        .and_then(|file| file.set_len(QUARANTINE_INPUT_LIMIT_ONE_OVER))
+        .expect("create sparse oversized source");
+    let output = dir.path("must-not-exist.zip");
+
+    let error = interp
+        .eval_str_compiled(&format!(
+            r#"(await (async/spawn (fn () (zip/create "{output}" (list "{source}")))))"#
+        ))
+        .expect_err("one-over archive source must fail before dispatch");
+
+    assert!(error.to_string().contains("input bytes"), "{error}");
+    assert!(
+        !std::path::Path::new(&output).exists(),
+        "pre-dispatch rejection must not create the output archive"
+    );
+}
+
 // === pdf family ===
 
 #[test]
@@ -260,6 +289,24 @@ fn pdf_async_matches_sync() {
     let text = parts[0].as_str().expect("text");
     assert!(text.contains("Invoice"), "got: {text}");
     assert_eq!(parts[2], Value::int(1));
+}
+
+#[test]
+fn pdf_async_rejects_oversized_input_before_parsing() {
+    let interp = Interpreter::new();
+    let dir = TempDir::new("pdf-cap");
+    let source = dir.path("oversized.pdf");
+    std::fs::File::create(&source)
+        .and_then(|file| file.set_len(QUARANTINE_INPUT_LIMIT_ONE_OVER))
+        .expect("create sparse oversized PDF");
+
+    let error = interp
+        .eval_str_compiled(&format!(
+            r#"(await (async/spawn (fn () (pdf/page-count "{source}"))))"#
+        ))
+        .expect_err("one-over PDF must fail before dispatch");
+
+    assert!(error.to_string().contains("input bytes"), "{error}");
 }
 
 // === patch/apply-file family ===
@@ -345,4 +392,30 @@ fn patch_async_matches_sync() {
     let async_patched = std::fs::read_to_string(&async_target).unwrap();
     assert_eq!(sync_patched, async_patched);
     assert_eq!(async_patched, "line1\nCHANGED\nline3\n");
+}
+
+#[test]
+fn patch_async_rejects_oversized_target_without_mutation() {
+    let interp = Interpreter::new();
+    let dir = TempDir::new("patch-cap");
+    let target = dir.path("oversized.txt");
+    std::fs::File::create(&target)
+        .and_then(|file| file.set_len(QUARANTINE_INPUT_LIMIT_ONE_OVER))
+        .expect("create sparse oversized target");
+
+    let error = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (await (async/spawn (fn ()
+              (patch/apply-file "{target}" "@@ -1 +1 @@\n-old\n+new\n"))))
+            "#
+        ))
+        .expect_err("one-over patch target must fail before dispatch");
+
+    assert!(error.to_string().contains("target bytes"), "{error}");
+    assert_eq!(
+        std::fs::metadata(&target).expect("target metadata").len(),
+        QUARANTINE_INPUT_LIMIT_ONE_OVER,
+        "pre-dispatch rejection must leave the target untouched"
+    );
 }

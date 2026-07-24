@@ -7,11 +7,12 @@
 //! skipped. Fixed; see `docs/plans/archive/2026-06-23-async-debugger.md` (the
 //! residual cross-task stepping gap is tracked as ASYNC-2 in `docs/deferred.md`).
 //!
-//! This is a fast MECHANISM-level test (it drives `VM::execute_debug` directly,
-//! NOT the slow binary-protocol DAP harness). It mirrors the DAP run setup in
-//! `crates/sema-dap/src/server.rs`: read_many_with_spans → compile_program_with_spans
-//! → DebugState::new + set_valid_breakpoint_lines + set breakpoint → init_scheduler
-//! → execute_debug on a spawned thread (it blocks on command_rx at a stop).
+//! This is a fast MECHANISM-level test (it drives the unified runtime debug path
+//! directly, NOT the slow binary-protocol DAP harness). It mirrors the native DAP
+//! run setup in `crates/sema-dap/src/server.rs`: read_many_with_spans →
+//! compile_program_with_spans → DebugState::new + set_valid_breakpoint_lines + set
+//! breakpoint → `ActiveDebugGuard::enter(&mut ds)` → `drive_vm_on_runtime` on a
+//! spawned thread (the debug quantum blocks on command_rx at a stop).
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -40,8 +41,8 @@ fn start_debug_run(source: &str, path: &Path, bp_line: u32) -> DebugRun {
     // Everything that touches the `Rc`-laden VM/Interpreter must be built and run
     // on the SAME thread (those types are `!Send`). So we move only the `Send`
     // inputs (source, path, channel halves) into the spawned thread and do the
-    // full DAP-style setup there. execute_debug blocks on command_rx at each stop,
-    // so it must run off the test thread regardless.
+    // full DAP-style setup there. The debug quantum blocks on command_rx at each
+    // stop, so the drive must run off the test thread regardless.
     let source = source.to_string();
     let path = path.to_path_buf();
     let handle = std::thread::spawn(move || -> Result<(), String> {
@@ -71,11 +72,16 @@ fn start_debug_run(source: &str, path: &Path, bp_line: u32) -> DebugRun {
             prog.main_cache_slots,
         )
         .map_err(|e| e.to_string())?;
+        vm.seed_main_frame(prog.closure.clone());
 
-        // Async scheduler must be live so async/spawn + await work under debug.
-        sema_vm::init_scheduler(interpreter.global_env.clone(), Vec::new());
-
-        vm.execute_debug(prog.closure.clone(), &interpreter.ctx, &mut ds)
+        // Register the DebugState as the active session for the drive: the
+        // runtime's `run_parked_quantum` runs the debug-aware quantum, so a
+        // breakpoint inside an async task stops and serves inspection against the
+        // stopped task's own VM. Async/spawn + await are ordinary runtime
+        // suspensions now, so they work under the debugger without a scheduler.
+        let _active = sema_vm::ActiveDebugGuard::enter(&mut ds);
+        interpreter
+            .drive_vm_on_runtime(vm)
             .map(|_| ())
             .map_err(|e| e.to_string())
     });

@@ -21,8 +21,8 @@
 (println "\nDate reformatting:")
 (for-each
   (fn (date-str)
-    (let* ((ts     (time/parse date-str "%Y-%m-%d %H:%M:%S"))
-           (parts  (time/date-parts ts)))
+    (let* ((ts (time/parse date-str "%Y-%m-%d %H:%M:%S"))
+           (parts (time/date-parts ts)))
       (println
         (format "  ~a → ~a (~a)"
           date-str

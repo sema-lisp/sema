@@ -1,6 +1,6 @@
 //! Acceptance gate for Slice B — TRUE cancellation (real socket/process abort).
 //!
-//! When an `async/timeout` (or `async/cancel`) abandons a task parked on an
+//! When `async/cancel` stops a task parked on an
 //! offloaded `AwaitIo` future, the scheduler now runs the handle's abort hook. For
 //! the `spawn`-based subprocess offload that means the in-flight future is aborted
 //! and, because the `tokio::process::Command` is `kill_on_drop(true)`, the child
@@ -10,9 +10,9 @@
 //! (The http abort tier uses the same seam — `AbortHandle::abort()` drops the
 //! reqwest future — and is covered by the unit tests on `IoHandle` + this
 //! subprocess gate. The LLM tier gets its own live-server proof below:
-//! `llm_request_is_aborted_on_timeout` stands up a slow local HTTP server, points
+//! `llm_request_is_aborted_after_explicit_cancel` stands up a slow local HTTP server, points
 //! the ollama provider at it, and observes the client disconnect when the
-//! completion is timed out — the request is truly torn down mid-flight, not left
+//! completion is explicitly cancelled — the request is truly torn down mid-flight, not left
 //! to burn money on a worker.)
 
 #![cfg(not(target_arch = "wasm32"))]
@@ -35,69 +35,73 @@ fn marker(name: &str) -> PathBuf {
 }
 
 /// HEADLINE GATE: the marker is written by a GRANDCHILD (a backgrounded subshell)
-/// that `sh` forks, while `sh` itself stays alive (`wait`). On timeout the whole
+/// that `sh` forks, while `sh` itself stays alive (`wait`). On explicit cancellation the whole
 /// PROCESS GROUP must be killed — so neither `sh` nor the grandchild survives and
 /// the marker never appears. This specifically distinguishes a group kill from a
 /// kill of only the direct `sh` pid (which would orphan the grandchild, leaving it
 /// to `touch` the marker after its sleep).
 #[test]
 #[serial]
-fn subprocess_group_is_killed_on_timeout() {
+fn subprocess_group_is_killed_after_explicit_cancel() {
     let m = marker("killed");
     let interp = Interpreter::new();
     let program = format!(
-        r#"(try
-             (async/timeout 200
-               (async/spawn (fn () (shell "sh" "-c" "(sleep 3; touch {}) & wait"))))
-             (catch e :caught))"#,
+        r#"(define p
+             (async/spawn (fn () (shell "sh" "-c" "(sleep 3; touch {}) & wait"))))
+           (async/spawn (fn () (async/sleep 200) (async/cancel p)))
+           (try (async/await p) (catch e :caught))"#,
         m.display()
     );
     let result = interp
         .eval_str_compiled(&program)
-        .expect("timeout-abandoned shell evaluated");
+        .expect("explicitly cancelled shell evaluated");
     assert_eq!(
         result,
         sema_core::Value::keyword("caught"),
-        "the timeout must surface as a caught error"
+        "explicit cancellation must surface as a caught error"
     );
     // Wait past the grandchild's 3 s sleep. If only `sh` (the direct child) were
     // killed, the orphaned grandchild would `touch` the marker around now.
     std::thread::sleep(Duration::from_millis(4000));
     assert!(
         !m.exists(),
-        "the whole process GROUP must be killed on timeout — marker {} should not exist",
+        "the whole process GROUP must be killed on explicit cancel — marker {} should not exist",
         m.display()
     );
     let _ = std::fs::remove_file(&m);
 }
 
 /// Cancellation must be TRANSITIVE: a subprocess awaited INDIRECTLY (one
-/// `async/await` layer deeper than the timed-out task) must still be killed, and its
+/// `async/await` layer deeper than the explicitly cancelled task) must still be killed, and its
 /// inner task must not survive as an un-reaped orphan. Before transitive cancel, the
-/// timeout cancelled only the outer task and the inner `Blocked(AwaitIo)` shell task
+/// outer-task cancellation did not reach the inner `Blocked(AwaitIo)` shell task, which
 /// ran to completion (marker appeared) AND lingered in the scheduler.
 #[test]
 #[serial]
-fn indirectly_awaited_subprocess_is_killed_on_timeout() {
+fn indirectly_awaited_subprocess_is_killed_after_explicit_cancel() {
     let m = marker("indirect");
     let interp = Interpreter::new();
     let program = format!(
-        r#"(try
-             (async/timeout 200
-               (async/spawn (fn ()
-                 (async/await
-                   (async/spawn (fn () (shell "sh" "-c" "(sleep 3; touch {}) & wait")))))))
-             (catch e :caught))"#,
+        r#"(define p
+             (async/spawn (fn ()
+               (async/await
+                 (async/spawn (fn () (shell "sh" "-c" "(sleep 3; touch {}) & wait")))))))
+           (async/spawn (fn () (async/sleep 200) (async/cancel p)))
+           (try (async/await p) (catch e :caught))"#,
         m.display()
     );
     let result = interp
         .eval_str_compiled(&program)
-        .expect("indirect timeout-abandoned shell evaluated");
+        .expect("indirect explicitly cancelled shell evaluated");
     assert_eq!(result, sema_core::Value::keyword("caught"));
     // No orphaned inner task left behind (would also be a #7 span-at-teardown hazard
     // for the LLM tier): transitive cancel transitioned it to terminal → reaped.
+    // Under the unified cooperative runtime the legacy thread-local scheduler is
+    // unused (its count is trivially 0), so the reap oracle is the interpreter's
+    // persistent runtime live-task count: 0 proves the outer task, the sleeper, AND
+    // the transitively-cancelled inner shell task all settled terminal and reaped.
     assert_eq!(
-        sema_vm::scheduler_task_count(),
+        interp.runtime_live_task_count(),
         0,
         "the indirectly-awaited inner task must be cancelled + reaped, not orphaned"
     );
@@ -110,23 +114,70 @@ fn indirectly_awaited_subprocess_is_killed_on_timeout() {
     let _ = std::fs::remove_file(&m);
 }
 
-/// CONTROL: with a timeout LONGER than the subprocess's work, it completes normally
-/// and the marker IS written — proving the kill gate above isn't a false positive
+/// C2 (ASYNC-TIMEOUT-CANCEL-1): a ONE-SHOT program that cancels an in-flight
+/// subprocess and RETURNS IMMEDIATELY — never awaiting the child — must still
+/// flush the abort before `eval` returns, not defer it to `Interpreter::drop`.
+/// Before eager cancellation delivery, a root that settled right after
+/// `async/cancel` could leave the cancelled child parked on its External wait with
+/// the abort undelivered until the interpreter was dropped. Proof: the interpreter
+/// is still alive after `eval` yet holds ZERO live tasks (the child was cancelled,
+/// aborted, settled, and reaped during the post-settle drain), and the subprocess
+/// group is dead (its survival marker never appears).
+#[test]
+#[serial]
+fn one_shot_cancel_flushes_subprocess_abort_before_returning() {
+    let m = marker("oneshot");
+    let interp = Interpreter::new();
+    let program = format!(
+        r#"(define p
+             (async/spawn (fn () (shell "sh" "-c" "(sleep 3; touch {}) & wait"))))
+           (async/spawn (fn () (async/cancel p)))
+           :done"#,
+        m.display()
+    );
+    let result = interp
+        .eval_str_compiled(&program)
+        .expect("one-shot cancel program evaluated");
+    assert_eq!(
+        result,
+        sema_core::Value::keyword("done"),
+        "the one-shot root returns immediately without awaiting the cancelled child"
+    );
+    // Flushed during the post-settle drain, NOT left for teardown: the interpreter
+    // is still alive here, yet holds zero live tasks.
+    assert_eq!(
+        interp.runtime_live_task_count(),
+        0,
+        "the cancelled in-flight subprocess task must be flushed before return, not orphaned"
+    );
+    // Past the grandchild's 3 s sleep: a surviving process group would touch the
+    // marker around now.
+    std::thread::sleep(Duration::from_millis(4000));
+    assert!(
+        !m.exists(),
+        "the one-shot-cancelled subprocess group must be killed — marker {} should not exist",
+        m.display()
+    );
+    let _ = std::fs::remove_file(&m);
+}
+
+/// CONTROL: without cancellation, the subprocess completes normally and the marker
+/// IS written — proving the kill gate above isn't a false positive
 /// (e.g. the shell never running at all).
 #[test]
 #[serial]
-fn subprocess_completes_when_timeout_is_longer() {
+fn subprocess_completes_without_cancel() {
     let m = marker("completes");
     let interp = Interpreter::new();
     let program = format!(
-        r#"(async/timeout 5000
+        r#"(async/await
              (async/spawn (fn () (shell "sh" "-c" "sleep 1; touch {}"))))"#,
         m.display()
     );
     interp
         .eval_str_compiled(&program)
-        .expect("long-timeout shell evaluated");
-    // The shell ran to completion within the timeout, so the marker exists now.
+        .expect("normally completing shell evaluated");
+    // The shell ran to completion, so the marker exists now.
     assert!(
         m.exists(),
         "the subprocess should have completed and written marker {}",
@@ -224,16 +275,16 @@ fn wait_for_flag(flag: &std::sync::atomic::AtomicBool, ms: u64) -> bool {
     flag.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// LLM-TIER HEADLINE GATE: timing out an async `llm/complete` ABORTS the
+/// LLM-TIER HEADLINE GATE: explicitly cancelling an async `llm/complete` ABORTS the
 /// in-flight provider request. The ollama provider (keyless) points at a local
 /// server that holds the connection for 6 s; the completion is timed out at
-/// 300 ms. Proof of true abort: (a) the eval returns in ~timeout, not the
+/// 300 ms. Proof of true abort: (a) the eval returns after cancellation, not the
 /// server's hold; (b) the SERVER observes the client disconnect — the spawned
 /// wire future was dropped and the connection torn down, so no money/connection
 /// is burned behind the cancel.
 #[test]
 #[serial]
-fn llm_request_is_aborted_on_timeout() {
+fn llm_request_is_aborted_after_explicit_cancel() {
     let server = start_slow_llm_server(6000);
     let interp = Interpreter::new();
     sema_llm::builtins::reset_runtime_state();
@@ -246,28 +297,27 @@ fn llm_request_is_aborted_on_timeout() {
         .as_nanos();
     let program = format!(
         r#"(llm/configure :ollama {{:host "http://127.0.0.1:{port}" :default-model "test-model"}})
-           (try
-             (async/timeout 300
-               (async/spawn (fn () (llm/complete "abort-proof-{nonce}"))))
-             (catch e :caught))"#,
+           (define p (async/spawn (fn () (llm/complete "abort-proof-{nonce}"))))
+           (async/spawn (fn () (async/sleep 300) (async/cancel p)))
+           (try (async/await p) (catch e :caught))"#,
         port = server.port,
     );
 
     let t0 = std::time::Instant::now();
     let result = interp
         .eval_str_compiled(&program)
-        .expect("timed-out llm/complete evaluated");
+        .expect("explicitly cancelled llm/complete evaluated");
     let elapsed = t0.elapsed();
 
     eprintln!("[abort-proof] eval elapsed = {elapsed:?}");
     assert_eq!(
         result,
         sema_core::Value::keyword("caught"),
-        "the timeout must surface as a caught error"
+        "explicit cancellation must surface as a caught error"
     );
     assert!(
         elapsed < Duration::from_millis(2500),
-        "eval must return around the 300 ms timeout, not the server's 6 s hold; took {elapsed:?}"
+        "eval must return around the 300 ms cancellation, not the server's 6 s hold; took {elapsed:?}"
     );
     assert!(
         server.saw_request.load(std::sync::atomic::Ordering::SeqCst),
@@ -297,7 +347,7 @@ fn llm_request_is_aborted_on_timeout() {
 /// `complete()` on the pool's blocking tier inside the spawned wire future.
 /// Aborting that future discards the RESULT, but the blocking call cannot be
 /// interrupted and runs to completion on the worker — cancellation stays
-/// best-effort for sync-only providers. This test pins that tier: the timeout
+/// best-effort for sync-only providers. This test pins that tier: cancellation
 /// returns promptly, nothing panics, and the fake's `complete()` was invoked
 /// (and left to finish) despite the cancel.
 #[test]
@@ -313,20 +363,19 @@ fn sync_only_provider_cancel_is_best_effort() {
     sema_llm::builtins::register_test_provider(Box::new(fake));
 
     let program = r#"
-        (try
-          (async/timeout 150
-            (async/spawn (fn () (llm/complete "best-effort-cancel"))))
-          (catch e :caught))"#;
+        (define p (async/spawn (fn () (llm/complete "best-effort-cancel"))))
+        (async/spawn (fn () (async/sleep 150) (async/cancel p)))
+        (try (async/await p) (catch e :caught))"#;
     let t0 = std::time::Instant::now();
     let result = interp
         .eval_str_compiled(program)
-        .expect("timed-out fake llm/complete evaluated");
+        .expect("explicitly cancelled fake llm/complete evaluated");
     let elapsed = t0.elapsed();
 
     assert_eq!(result, sema_core::Value::keyword("caught"));
     assert!(
         elapsed < Duration::from_millis(600),
-        "the task must be released at the 150 ms timeout, not after the fake's \
+        "the task must be released after the 150 ms cancellation, not after the fake's \
          800 ms blocking delay; took {elapsed:?}"
     );
     // Let the detached blocking call run out — it completes on the worker; its
@@ -341,7 +390,7 @@ fn sync_only_provider_cancel_is_best_effort() {
 }
 
 /// A normally-completing concurrent subprocess must return its real output and must
-/// NOT be aborted (the abort hook fires only on cancel/timeout/interrupt).
+/// NOT be aborted (the abort hook fires only on cancellation or interruption).
 #[test]
 #[serial]
 fn normal_completion_returns_output_and_is_not_aborted() {

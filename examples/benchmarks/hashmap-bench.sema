@@ -47,10 +47,10 @@
 (println "")
 (println "Part 2: Lookups")
 
-(define bt10   (build-btreemap 10))
-(define hm10   (build-hashmap 10))
-(define bt100  (build-btreemap 100))
-(define hm100  (build-hashmap 100))
+(define bt10 (build-btreemap 10))
+(define hm10 (build-hashmap 10))
+(define bt100 (build-btreemap 100))
+(define hm100 (build-hashmap 100))
 
 (bench "BTreeMap get hit (10 keys)" (fn () (get bt10 'k5)) 200000)
 (bench "HashMap get hit (10 keys)" (fn () (get hm10 'k5)) 200000)

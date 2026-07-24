@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::io::BufRead;
+#[cfg(target_arch = "wasm32")]
 use std::io::Read as _;
 use std::io::Write as _;
 
@@ -12,63 +13,264 @@ thread_local! {
     static STDIN_EOF: Cell<bool> = const { Cell::new(false) };
 }
 
-// TTY restore-token store (unix only)
-#[cfg(unix)]
-thread_local! {
-    static TTY_STORE: RefCell<std::collections::BTreeMap<i64, libc::termios>> =
-        const { RefCell::new(std::collections::BTreeMap::new()) };
-    static TTY_COUNTER: Cell<i64> = const { Cell::new(0) };
-    // Count of outstanding DSR (cursor-position) queries. A `CSI…R` is a cursor
-    // report only when one is pending; otherwise it's modified-F3 keyboard input
-    // (`CSI 1;<mod>R`), which is byte-identical to a CPR reply.
-    static EXPECT_CPR: Cell<u32> = const { Cell::new(0) };
+pub(crate) fn mark_stdin_eof() {
+    STDIN_EOF.with(|flag| flag.set(true));
 }
 
-// Returns true if stdin has data ready to read within `timeout_ms` milliseconds (0 = non-blocking).
-#[cfg(unix)]
-fn unix_stdin_ready(timeout_ms: u64) -> bool {
-    unsafe {
-        let mut readfds: libc::fd_set = std::mem::zeroed();
-        libc::FD_ZERO(&mut readfds);
-        libc::FD_SET(libc::STDIN_FILENO, &mut readfds);
-        let mut tv = libc::timeval {
-            tv_sec: (timeout_ms / 1000) as libc::time_t,
-            tv_usec: ((timeout_ms % 1000) * 1000) as libc::suseconds_t,
-        };
-        libc::select(
-            libc::STDIN_FILENO + 1,
-            &mut readfds,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut tv,
-        ) > 0
+#[cfg(not(target_arch = "wasm32"))]
+fn read_line_value(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "read-line", 0);
+    match crate::stream::stdin_text_line_value("read-line")? {
+        Some(line) => Ok(Value::string_owned(line)),
+        None => {
+            mark_stdin_eof();
+            Ok(Value::nil())
+        }
     }
 }
 
-/// Read exactly one byte from stdin (raw-mode key input). Returns None on EOF.
-///
-/// Reads straight from the raw fd, NOT `std::io::stdin()` (an 8 KB `BufReader`).
-/// Buffering there pulls a whole escape-sequence burst (e.g. `ESC [ C` for an
-/// arrow key) into userspace on the first byte, leaving `select()` /
-/// `unix_stdin_ready` — which inspect the kernel fd — blind to the continuation
-/// bytes. The decoder would then emit a lone ESC and let `[C` leak through as
-/// literal characters. An unbuffered read keeps the two in sync. Retry on EINTR
-/// (a SIGWINCH etc. can interrupt a blocking read).
+// HOST-ADAPTER-ONLY: the non-unix (wasm) `read-line` fallback. wasm has no
+// cooperative runtime and no coordinated stdin owner, so this blocking
+// `std::io::stdin().read_line` runs on the host thread only; it is never reached
+// inside a runtime quantum (the unix path routes through `stream::stdin_*`, the
+// coordinated owner). A raw stdin read placed inside an `in_runtime_quantum()`
+// branch fails `scripts/check-unified-runtime-legacy.sh`.
+#[cfg(target_arch = "wasm32")]
+fn read_line_value(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "read-line", 0);
+    let mut input = String::new();
+    let read = std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|error| SemaError::Io(format!("read-line: {error}")))?;
+    if read == 0 {
+        mark_stdin_eof();
+        return Ok(Value::nil());
+    }
+    if input.ends_with('\n') {
+        input.pop();
+        if input.ends_with('\r') {
+            input.pop();
+        }
+    }
+    Ok(Value::string_owned(input))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn read_stdin_value(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "read-stdin", 0);
+    let input = crate::stream::stdin_text_value("read-stdin")?;
+    mark_stdin_eof();
+    Ok(Value::string_owned(input))
+}
+
+// HOST-ADAPTER-ONLY: the non-unix (wasm) `read-stdin` fallback. Same contract as
+// [`read_line_value`] — a host-thread-only blocking `std::io::stdin` read that is
+// never reached inside a runtime quantum; the unix path uses the coordinated
+// stdin owner (`stream::stdin_text_value`).
+#[cfg(target_arch = "wasm32")]
+fn read_stdin_value(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "read-stdin", 0);
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|error| SemaError::Io(format!("read-stdin: {error}")))?;
+    mark_stdin_eof();
+    Ok(Value::string_owned(input))
+}
+
+// Count of outstanding DSR (cursor-position) queries. A `CSI…R` is a cursor
+// report only when one is pending; otherwise it's modified-F3 keyboard input
+// (`CSI 1;<mod>R`), which is byte-identical to a CPR reply.
 #[cfg(unix)]
-fn read_one_byte() -> std::io::Result<Option<u8>> {
-    let mut buf = [0u8; 1];
-    loop {
-        let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, 1) };
-        if n == 1 {
-            return Ok(Some(buf[0]));
-        } else if n == 0 {
-            return Ok(None);
+thread_local! {
+    static EXPECT_CPR: Cell<u32> = const { Cell::new(0) };
+}
+
+// ─── Interpreter-owned raw-mode (termios) guard registry (unix) ──────────────
+//
+// `io/tty-raw!` puts the controlling terminal into raw mode and hands back an
+// integer restore token. Raw mode is an *ambient* mutation of a process-global
+// resource, so its cooked-mode `termios` lives in a RESOURCE-OWNED
+// [`RawModeGuard`] parked in an INTERPRETER-SHARED registry (`Rc<TtyRegistry>`,
+// the `fs_watch` ownership model). The terminal is restored **exactly once** —
+// whichever of an explicit `io/tty-restore!`, a cancelled task that entered raw
+// mode (via its task-context [`RawModeTaskGuard`]), or interpreter teardown
+// reaches the guard first performs the restore; the rest are idempotent no-ops.
+// Without this, a task cancelled or an interpreter torn down while holding raw
+// mode would leave the user's terminal wedged.
+
+/// Observable count of terminal raw-mode restores performed (test hook).
+#[cfg(unix)]
+static TTY_RESTORE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// When set, `io/tty-raw!` records a guard even without a controlling terminal
+/// and issues NO termios syscalls, so the cancel/teardown restore path is
+/// observable off a real TTY (test hook, mirroring [`set_fs_test_delay_ms`]).
+#[cfg(unix)]
+static TTY_FORCE_CAPTURE_FOR_TEST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Number of terminal raw-mode restores performed since the last reset.
+#[cfg(unix)]
+pub fn tty_restore_count() -> usize {
+    TTY_RESTORE_COUNT.load(AtomicOrdering::SeqCst)
+}
+
+/// Reset the raw-mode restore counter (call before observing restore in a test).
+#[cfg(unix)]
+pub fn reset_tty_restore_count() {
+    TTY_RESTORE_COUNT.store(0, AtomicOrdering::SeqCst);
+}
+
+/// Force `io/tty-raw!` to record a restore guard without a real TTY (test hook).
+#[cfg(unix)]
+pub fn set_tty_force_capture_for_test(on: bool) {
+    TTY_FORCE_CAPTURE_FOR_TEST.store(on, AtomicOrdering::SeqCst);
+}
+
+/// A RESOURCE-OWNED cooked-mode restore token for one `io/tty-raw!` entry. The
+/// saved `termios` is reinstated **once**: the first caller across the explicit,
+/// cancellation, and teardown paths wins; subsequent calls short-circuit on the
+/// `restored` flag. Holds only POD state — no `Value`/`Env` (CORE-2 I2).
+#[cfg(unix)]
+struct RawModeGuard {
+    saved: libc::termios,
+    // False in force-capture test mode: never touch fd 0 (which may be a real
+    // terminal under the harness); only the observable counter moves.
+    real_tty: bool,
+    restored: Cell<bool>,
+}
+
+#[cfg(unix)]
+impl RawModeGuard {
+    fn restore(&self) {
+        if self.restored.replace(true) {
+            return;
         }
-        let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::Interrupted {
-            continue;
+        if self.real_tty
+            && unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.saved) } != 0
+        {
+            eprintln!(
+                "io/tty-restore!: tcsetattr failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
-        return Err(e);
+        TTY_RESTORE_COUNT.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+}
+
+/// INTERPRETER-SHARED registry of live raw-mode guards, owned via an `Rc` held by
+/// the `io/tty-*` natives (the `fs_watch` model). A weak interpreter-teardown
+/// hook restores every guard still parked here.
+#[cfg(unix)]
+struct TtyRegistry {
+    guards: RefCell<std::collections::BTreeMap<i64, std::rc::Rc<RawModeGuard>>>,
+    next_id: Cell<i64>,
+    teardown_hook_registered: Cell<bool>,
+}
+
+#[cfg(unix)]
+impl TtyRegistry {
+    fn new() -> Self {
+        Self {
+            guards: RefCell::new(std::collections::BTreeMap::new()),
+            next_id: Cell::new(0),
+            teardown_hook_registered: Cell::new(false),
+        }
+    }
+
+    fn enter(&self, guard: std::rc::Rc<RawModeGuard>) -> i64 {
+        let id = self.next_id.get();
+        self.next_id.set(id.wrapping_add(1));
+        self.guards.borrow_mut().insert(id, guard);
+        id
+    }
+
+    /// Restore + drop the guard for `id`. A missing token — already restored by a
+    /// cancelled task or teardown, or never issued — is a no-op; that is what
+    /// makes an explicit `io/tty-restore!` idempotent with the guard paths.
+    fn restore_token(&self, id: i64) {
+        if let Some(guard) = self.guards.borrow_mut().remove(&id) {
+            guard.restore();
+        }
+    }
+
+    fn ensure_teardown_hook(self: &std::rc::Rc<Self>, ctx: &sema_core::EvalContext) {
+        if !self.teardown_hook_registered.replace(true) {
+            let registry = std::rc::Rc::downgrade(self);
+            ctx.register_interpreter_teardown_hook(move || {
+                if let Some(registry) = registry.upgrade() {
+                    registry.restore_all();
+                }
+            });
+        }
+    }
+
+    fn restore_all(&self) {
+        for (_, guard) in std::mem::take(&mut *self.guards.borrow_mut()) {
+            guard.restore();
+        }
+        self.teardown_hook_registered.set(false);
+    }
+}
+
+/// TASK-PRIVATE cancellation cleanup: a task that entered raw mode carries the
+/// guard(s) it opened. When the task settles — including an `async/cancel` that
+/// tears the task down before its Sema-level `io/tty-restore!` runs — this
+/// extension drops and restores the terminal (idempotent with the registry
+/// paths). A spawned child does NOT inherit the parent's raw-mode ownership.
+#[cfg(unix)]
+struct RawModeTaskGuard {
+    guards: RefCell<Vec<std::rc::Rc<RawModeGuard>>>,
+}
+
+#[cfg(unix)]
+impl Trace for RawModeTaskGuard {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        // Holds only POD termios guards — no `Value`/`Env` edges (CORE-2 I2).
+        true
+    }
+}
+
+#[cfg(unix)]
+impl sema_core::runtime::TaskLocalValue for RawModeTaskGuard {
+    fn inherit(&self) -> std::rc::Rc<dyn sema_core::runtime::TaskLocalValue> {
+        // Children start without the parent's terminal ownership.
+        std::rc::Rc::new(RawModeTaskGuard {
+            guards: RefCell::new(Vec::new()),
+        })
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawModeTaskGuard {
+    fn drop(&mut self) {
+        for guard in self.guards.borrow().iter() {
+            guard.restore();
+        }
+    }
+}
+
+/// Attach `guard` to the running task's cancellation cleanup so a cancel while
+/// it holds raw mode restores the terminal. Merges into the task's existing
+/// [`RawModeTaskGuard`] when one is present (a task may enter raw mode twice).
+#[cfg(unix)]
+fn attach_raw_mode_task_guard(
+    handle: &sema_core::runtime::TaskContextHandle,
+    guard: std::rc::Rc<RawModeGuard>,
+) {
+    if let Some(existing) = handle.get_rc::<RawModeTaskGuard>() {
+        existing.guards.borrow_mut().push(guard);
+    } else {
+        handle
+            .borrow_mut()
+            .insert(std::rc::Rc::new(RawModeTaskGuard {
+                guards: RefCell::new(vec![guard]),
+            }));
     }
 }
 
@@ -331,6 +533,79 @@ fn parse_legacy_csi(csi: &[u8]) -> (&'static str, u32) {
     (name, mbits)
 }
 
+// Raw-mode guard regression (R08C). These exercise the real `TtyRegistry` /
+// `RawModeGuard` / `RawModeTaskGuard` restore-once logic through the observable
+// counter, so the cancel/teardown/explicit paths are asserted deterministically
+// without a controlling terminal or runtime-reap timing. `real_tty: false` keeps
+// every guard off fd 0. The counter and force flag are process-global; under
+// nextest (process-per-test) that is isolation enough, and these three tests do
+// not run concurrently within one process.
+#[cfg(all(test, unix))]
+mod raw_mode_guard_tests {
+    use std::rc::Rc;
+
+    use super::*;
+
+    fn test_guard() -> Rc<RawModeGuard> {
+        Rc::new(RawModeGuard {
+            saved: unsafe { std::mem::zeroed() },
+            real_tty: false,
+            restored: Cell::new(false),
+        })
+    }
+
+    #[test]
+    fn registry_teardown_restores_guard_once() {
+        reset_tty_restore_count();
+        let registry = Rc::new(TtyRegistry::new());
+        let _id = registry.enter(test_guard());
+        assert_eq!(tty_restore_count(), 0, "entering raw mode restores nothing");
+        registry.restore_all(); // interpreter-teardown hook path
+        assert_eq!(tty_restore_count(), 1, "teardown restores the live guard");
+        registry.restore_all();
+        assert_eq!(tty_restore_count(), 1, "a second teardown is a no-op");
+    }
+
+    #[test]
+    fn task_guard_drop_restores_guard_once() {
+        reset_tty_restore_count();
+        let registry = Rc::new(TtyRegistry::new());
+        let guard = test_guard();
+        let id = registry.enter(Rc::clone(&guard));
+        // The extension a task carries; dropping it is exactly what a cancelled
+        // task's context teardown does to the guard.
+        let task_guard = Rc::new(RawModeTaskGuard {
+            guards: RefCell::new(vec![guard]),
+        });
+        drop(task_guard);
+        assert_eq!(tty_restore_count(), 1, "cancellation restores exactly once");
+        // A later explicit restore (or teardown) of the same token is idempotent.
+        registry.restore_token(id);
+        registry.restore_all();
+        assert_eq!(tty_restore_count(), 1, "restore is not repeated");
+    }
+
+    #[test]
+    fn explicit_restore_is_idempotent_across_paths() {
+        reset_tty_restore_count();
+        let registry = Rc::new(TtyRegistry::new());
+        let guard = test_guard();
+        let id = registry.enter(Rc::clone(&guard));
+        let task_guard = Rc::new(RawModeTaskGuard {
+            guards: RefCell::new(vec![guard]),
+        });
+        registry.restore_token(id); // explicit `io/tty-restore!`
+        assert_eq!(tty_restore_count(), 1);
+        drop(task_guard); // task later settles
+        registry.restore_all(); // interpreter later tears down
+        assert_eq!(
+            tty_restore_count(),
+            1,
+            "exactly one restore across all paths"
+        );
+    }
+}
+
 #[cfg(all(test, unix))]
 mod legacy_csi_tests {
     use super::parse_legacy_csi;
@@ -446,36 +721,42 @@ mod terminal_response_tests {
         assert_eq!(kw(&focus_event(true), "focused"), Some(Value::bool(true)));
         assert_eq!(kw(&focus_event(false), "focused"), Some(Value::bool(false)));
     }
-}
 
-/// Read the continuation bytes of a UTF-8 character whose lead byte is `lead`,
-/// returning the decoded string ("?" on invalid UTF-8). A single-byte ASCII
-/// lead returns that char unchanged, so this also covers Alt+ASCII.
-#[cfg(unix)]
-fn read_utf8_char(lead: u8) -> Result<String, SemaError> {
-    let extra = if lead & 0xe0 == 0xc0 {
-        1usize
-    } else if lead & 0xf0 == 0xe0 {
-        2
-    } else if lead & 0xf8 == 0xf0 {
-        3
-    } else {
-        0
-    };
-    let mut bytes = vec![lead];
-    for _ in 0..extra {
-        // Wait up to 20ms for continuation bytes (handles slow pipes / heavy load).
-        if !unix_stdin_ready(20) {
-            break;
-        }
-        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-            None => break,
-            Some(ch) => bytes.push(ch),
-        }
+    #[test]
+    fn runtime_key_decoder_preserves_character_csi_and_paste_shapes() {
+        let character = decode_runtime_key("ø".as_bytes());
+        assert!(is_kw(&character, "kind", "char"));
+        assert_eq!(kw(&character, "char"), Some(Value::string("ø")));
+
+        let right = decode_runtime_key(b"\x1b[1;5C");
+        assert!(is_kw(&right, "kind", "key"));
+        assert!(is_kw(&right, "name", "right"));
+        assert_eq!(mods_of(&right), vec!["ctrl"]);
+
+        let paste = decode_runtime_key(b"\x1b[200~hello\x1b[201~");
+        assert!(is_kw(&paste, "kind", "paste"));
+        assert_eq!(kw(&paste, "text"), Some(Value::string("hello")));
     }
-    Ok(std::str::from_utf8(&bytes)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|_| "?".to_string()))
+
+    #[test]
+    fn runtime_key_framing_waits_for_complete_escape_sequences() {
+        assert!(!runtime_key_complete(b"\x1b[", None));
+        assert!(!runtime_key_complete(b"\x1b[1;5", None));
+        assert!(runtime_key_complete(b"\x1b[1;5C", None));
+        assert!(!runtime_key_complete(b"\x1b[200~hello", None));
+        assert!(runtime_key_complete(b"\x1b[200~hello\x1b[201~", None));
+    }
+
+    #[test]
+    fn kitty_query_timeout_preserves_boolean_contract() {
+        let outcome =
+            terminal_query_runtime_with_timeout(TerminalQueryKind::KittySupport, Duration::ZERO)
+                .expect("kitty query timeout returns its fallback");
+        let NativeOutcome::Return(value) = outcome else {
+            panic!("zero-timeout kitty query must return immediately");
+        };
+        assert_eq!(value, Value::bool(false));
+    }
 }
 
 /// `{:kind :focus :focused <bool>}` — a terminal focus in/out report (enabled
@@ -604,33 +885,6 @@ fn decode_modify_other_keys(csi: &[u8]) -> Value {
     Value::map(m)
 }
 
-/// Collect a bracketed-paste payload: the literal bytes after `ESC[200~` up to
-/// the `ESC[201~` terminator, as `{:kind :paste :text …}`. Pasted content
-/// bypasses key dispatch entirely, so control bytes in a paste can't be
-/// misread as live keystrokes.
-#[cfg(unix)]
-fn read_bracketed_paste() -> Result<Value, SemaError> {
-    const TERMINATOR: &[u8] = b"\x1b[201~";
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
-        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-            None => break,
-            Some(ch) => {
-                buf.push(ch);
-                if buf.ends_with(TERMINATOR) {
-                    buf.truncate(buf.len() - TERMINATOR.len());
-                    break;
-                }
-            }
-        }
-    }
-    let text = String::from_utf8_lossy(&buf).to_string();
-    let mut m = std::collections::BTreeMap::new();
-    m.insert(Value::keyword("kind"), Value::keyword("paste"));
-    m.insert(Value::keyword("text"), Value::string(&text));
-    Ok(Value::map(m))
-}
-
 /// True when stdin is a real terminal (probes are meaningless otherwise).
 #[cfg(unix)]
 fn stdin_is_tty() -> bool {
@@ -647,43 +901,6 @@ fn write_stdout(seq: &str) -> Result<(), SemaError> {
         .map_err(|e| SemaError::Io(format!("term: {e}")))
 }
 
-/// Scan stdin for the next complete CSI sequence (`ESC [ … final`), returning
-/// its body (params + final byte) — or None on a `budget_ms` idle timeout.
-/// Non-CSI bytes are skipped; used only by the capability probes below.
-#[cfg(unix)]
-fn read_one_csi(budget_ms: u64) -> Result<Option<Vec<u8>>, SemaError> {
-    loop {
-        if !unix_stdin_ready(budget_ms) {
-            return Ok(None);
-        }
-        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-            None => return Ok(None),
-            Some(0x1b) => {}
-            Some(_) => continue,
-        }
-        if !unix_stdin_ready(50) {
-            return Ok(None);
-        }
-        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-            Some(b'[') => {}
-            _ => continue,
-        }
-        let mut csi: Vec<u8> = Vec::new();
-        loop {
-            match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-                None => return Ok(None),
-                Some(ch) => {
-                    csi.push(ch);
-                    if (0x40..=0x7e).contains(&ch) {
-                        break;
-                    }
-                }
-            }
-        }
-        return Ok(Some(csi));
-    }
-}
-
 /// Detect kitty-keyboard support: send the flags query `CSI ?u` followed by a
 /// Primary Device Attributes barrier `CSI c` (the method the kitty spec
 /// recommends). A supporting terminal answers the flags query (`ESC[?…u`) before
@@ -697,16 +914,9 @@ fn probe_kitty_support() -> Result<bool, SemaError> {
         return Ok(false);
     }
     write_stdout("\x1b[?u\x1b[c")?;
-    while let Some(csi) = read_one_csi(200)? {
-        let last = *csi.last().unwrap_or(&0);
-        if last == b'u' && csi.first() == Some(&b'?') {
-            return Ok(true);
-        }
-        if last == b'c' {
-            return Ok(false); // DA barrier reached with no kitty reply
-        }
-    }
-    Ok(false)
+    let value =
+        run_terminal_query_value(TerminalQueryKind::KittySupport, Duration::from_millis(200))?;
+    Ok(value.as_bool().unwrap_or(false))
 }
 
 /// Round-trip the cursor position: send DSR (`CSI 6n`) and return `{:row :col}`
@@ -717,129 +927,101 @@ fn query_cursor_position() -> Result<Value, SemaError> {
         return Ok(Value::nil());
     }
     write_stdout("\x1b[6n")?;
-    while let Some(csi) = read_one_csi(200)? {
-        if *csi.last().unwrap_or(&0) == b'R' {
-            let p = csi_params(&csi[..csi.len().saturating_sub(1)]);
-            let mut m = std::collections::BTreeMap::new();
-            m.insert(
-                Value::keyword("row"),
-                Value::int(p.first().copied().unwrap_or(0) as i64),
-            );
-            m.insert(
-                Value::keyword("col"),
-                Value::int(p.get(1).copied().unwrap_or(0) as i64),
-            );
-            return Ok(Value::map(m));
-        }
-    }
-    Ok(Value::nil())
+    run_terminal_query_value(
+        TerminalQueryKind::CursorPosition,
+        Duration::from_millis(200),
+    )
 }
 
-// Parse a key event from stdin (assuming raw mode).
-// Returns Ok(None) on EOF, Ok(Some(value)) on success.
 #[cfg(unix)]
-fn parse_key_input() -> Result<Option<Value>, SemaError> {
-    let b = match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-        None => return Ok(None),
-        Some(b) => b,
-    };
+fn key_character(kind: &str, character: String) -> Value {
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(Value::keyword("kind"), Value::keyword(kind));
+    map.insert(Value::keyword("char"), Value::string_owned(character));
+    Value::map(map)
+}
 
-    // ESC or escape sequence
-    if b == 0x1b {
-        if !unix_stdin_ready(50) {
-            // Plain ESC key
-            let mut m = std::collections::BTreeMap::new();
-            m.insert(Value::keyword("kind"), Value::keyword("key"));
-            m.insert(Value::keyword("name"), Value::keyword("esc"));
-            return Ok(Some(Value::map(m)));
-        }
-        let b2 = match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-            None => {
-                let mut m = std::collections::BTreeMap::new();
-                m.insert(Value::keyword("kind"), Value::keyword("key"));
-                m.insert(Value::keyword("name"), Value::keyword("esc"));
-                return Ok(Some(Value::map(m)));
-            }
-            Some(b) => b,
+#[cfg(unix)]
+fn named_key(name: &str) -> Value {
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(Value::keyword("kind"), Value::keyword("key"));
+    map.insert(Value::keyword("name"), Value::keyword(name));
+    Value::map(map)
+}
+
+/// Decode one complete key event collected by the runtime's nonblocking poll.
+/// An incomplete terminal sequence remains buffered between VM quanta instead
+/// of blocking the VM thread for its next byte.
+#[cfg(unix)]
+fn decode_runtime_key(bytes: &[u8]) -> Value {
+    let first = bytes.first().copied().unwrap_or_default();
+    if first == 0x1b {
+        let Some(second) = bytes.get(1).copied() else {
+            return named_key("esc");
         };
-
-        if b2 == b'[' {
-            // CSI sequence: read until final byte (0x40–0x7e)
-            let mut csi: Vec<u8> = Vec::new();
-            loop {
-                match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-                    None => break,
-                    Some(ch) => {
-                        csi.push(ch);
-                        if (0x40..=0x7e).contains(&ch) {
-                            break;
-                        }
-                    }
-                }
+        if second == b'[' {
+            let csi = &bytes[2..];
+            let last = csi.last().copied().unwrap_or_default();
+            let first = csi.first().copied().unwrap_or_default();
+            if csi.starts_with(b"200~") {
+                const PREFIX_LEN: usize = 4;
+                const TERMINATOR: &[u8] = b"\x1b[201~";
+                let payload_end = csi.len().saturating_sub(TERMINATOR.len());
+                let payload = &csi[PREFIX_LEN.min(payload_end)..payload_end];
+                let mut map = std::collections::BTreeMap::new();
+                map.insert(Value::keyword("kind"), Value::keyword("paste"));
+                map.insert(
+                    Value::keyword("text"),
+                    Value::string_owned(String::from_utf8_lossy(payload).into_owned()),
+                );
+                return Value::map(map);
             }
-            let last = *csi.last().unwrap_or(&0);
-            let first = *csi.first().unwrap_or(&0);
-            // Dispatch by shape (each form is unambiguous by its marker/final byte):
-            //   ESC[<b;x;y M|m  → SGR mouse            ESC[…u        → kitty key
-            //   ESC[?…u         → kitty flags reply    ESC[200~      → bracketed paste
-            //   ESC[I | ESC[O   → focus in/out         ESC[?…c/>…c   → device attrs
-            //   ESC[r;cR        → cursor-position rpt   ESC[27;m;c~   → modifyOtherKeys
-            //   else            → legacy keys + xterm modifier forms + function keys
             if first == b'<' {
-                return Ok(Some(decode_sgr_mouse(&csi, last)));
+                return decode_sgr_mouse(csi, last);
             }
             if last == b'u' {
-                if first == b'?' {
-                    return Ok(Some(decode_kitty_flags(&csi)));
-                }
-                return Ok(Some(decode_kitty(&csi)));
+                return if first == b'?' {
+                    decode_kitty_flags(csi)
+                } else {
+                    decode_kitty(csi)
+                };
             }
-            if csi.as_slice() == b"200~" {
-                return read_bracketed_paste().map(Some);
+            if csi == b"I" {
+                return focus_event(true);
             }
-            if csi.as_slice() == b"I" {
-                return Ok(Some(focus_event(true)));
-            }
-            if csi.as_slice() == b"O" {
-                return Ok(Some(focus_event(false)));
+            if csi == b"O" {
+                return focus_event(false);
             }
             if last == b'c' && (first == b'?' || first == b'>') {
-                return Ok(Some(decode_device_attributes(&csi, first)));
+                return decode_device_attributes(csi, first);
             }
-            // A `CSI…R` is a cursor-position report only when we solicited one;
-            // otherwise it's modified-F3 (`CSI 1;<mod>R`) → fall through to keys.
             if last == b'R'
-                && EXPECT_CPR.with(|c| {
-                    let n = c.get();
-                    if n > 0 {
-                        c.set(n - 1);
-                        true
-                    } else {
+                && EXPECT_CPR.with(|counter| {
+                    let pending = counter.get();
+                    if pending == 0 {
                         false
+                    } else {
+                        counter.set(pending - 1);
+                        true
                     }
                 })
             {
-                return Ok(Some(decode_cpr(&csi)));
+                return decode_cpr(csi);
             }
             if last == b'~' && csi.starts_with(b"27;") {
-                return Ok(Some(decode_modify_other_keys(&csi)));
+                return decode_modify_other_keys(csi);
             }
-            let (name, mbits) = parse_legacy_csi(&csi);
-            let mut m = std::collections::BTreeMap::new();
-            m.insert(Value::keyword("kind"), Value::keyword("key"));
-            m.insert(Value::keyword("name"), Value::keyword(name));
-            if let Some(mods) = mods_list(mbits) {
-                m.insert(Value::keyword("mods"), mods);
+            let (name, modifier_bits) = parse_legacy_csi(csi);
+            let mut map = std::collections::BTreeMap::new();
+            map.insert(Value::keyword("kind"), Value::keyword("key"));
+            map.insert(Value::keyword("name"), Value::keyword(name));
+            if let Some(modifiers) = mods_list(modifier_bits) {
+                map.insert(Value::keyword("mods"), modifiers);
             }
-            return Ok(Some(Value::map(m)));
+            return Value::map(map);
         }
-
-        // ESC O sequences (SS3, e.g. function keys on some terminals)
-        if b2 == b'O' {
-            let b3 = read_one_byte()
-                .map_err(|e| SemaError::Io(format!("io/read-key: {e}")))?
-                .unwrap_or(0);
-            let name = match b3 {
+        if second == b'O' {
+            let name = match bytes.get(2).copied().unwrap_or_default() {
                 b'A' => "up",
                 b'B' => "down",
                 b'C' => "right",
@@ -852,79 +1034,23 @@ fn parse_key_input() -> Result<Option<Value>, SemaError> {
                 b'S' => "f4",
                 _ => "unknown",
             };
-            let mut m = std::collections::BTreeMap::new();
-            m.insert(Value::keyword("kind"), Value::keyword("key"));
-            m.insert(Value::keyword("name"), Value::keyword(name));
-            return Ok(Some(Value::map(m)));
+            return named_key(name);
         }
-
-        // Alt + char (ESC followed by a character; may be multi-byte UTF-8).
-        let alt_str = read_utf8_char(b2)?;
-        let mut m = std::collections::BTreeMap::new();
-        m.insert(Value::keyword("kind"), Value::keyword("alt"));
-        m.insert(Value::keyword("char"), Value::string(&alt_str));
-        return Ok(Some(Value::map(m)));
+        let character = std::str::from_utf8(&bytes[1..]).unwrap_or("?").to_string();
+        return key_character("alt", character);
     }
 
-    // DEL / Backspace (0x7f)
-    if b == 0x7f {
-        let mut m = std::collections::BTreeMap::new();
-        m.insert(Value::keyword("kind"), Value::keyword("key"));
-        m.insert(Value::keyword("name"), Value::keyword("backspace"));
-        return Ok(Some(Value::map(m)));
+    match first {
+        0x7f | 0x08 => named_key("backspace"),
+        0x09 => named_key("tab"),
+        0x0a | 0x0d => named_key("enter"),
+        byte if byte < 0x20 => key_character("ctrl", char::from(byte + 0x60).to_string()),
+        byte if byte < 0x80 => key_character("char", char::from(byte).to_string()),
+        _ => key_character(
+            "char",
+            std::str::from_utf8(bytes).unwrap_or("?").to_string(),
+        ),
     }
-
-    // Control characters (0x00–0x1f, excluding ESC already handled)
-    if b < 0x20 {
-        match b {
-            0x08 => {
-                // Ctrl-H = backspace
-                let mut m = std::collections::BTreeMap::new();
-                m.insert(Value::keyword("kind"), Value::keyword("key"));
-                m.insert(Value::keyword("name"), Value::keyword("backspace"));
-                return Ok(Some(Value::map(m)));
-            }
-            0x09 => {
-                let mut m = std::collections::BTreeMap::new();
-                m.insert(Value::keyword("kind"), Value::keyword("key"));
-                m.insert(Value::keyword("name"), Value::keyword("tab"));
-                return Ok(Some(Value::map(m)));
-            }
-            0x0a | 0x0d => {
-                let mut m = std::collections::BTreeMap::new();
-                m.insert(Value::keyword("kind"), Value::keyword("key"));
-                m.insert(Value::keyword("name"), Value::keyword("enter"));
-                return Ok(Some(Value::map(m)));
-            }
-            _ => {
-                // 0x01–0x1a → Ctrl-A through Ctrl-Z; map to letter
-                let ctrl_char = char::from(b.wrapping_add(0x60));
-                let mut m = std::collections::BTreeMap::new();
-                m.insert(Value::keyword("kind"), Value::keyword("ctrl"));
-                m.insert(
-                    Value::keyword("char"),
-                    Value::string(&ctrl_char.to_string()),
-                );
-                return Ok(Some(Value::map(m)));
-            }
-        }
-    }
-
-    // Regular ASCII (0x20–0x7e)
-    if b < 0x80 {
-        let ch = char::from(b);
-        let mut m = std::collections::BTreeMap::new();
-        m.insert(Value::keyword("kind"), Value::keyword("char"));
-        m.insert(Value::keyword("char"), Value::string(&ch.to_string()));
-        return Ok(Some(Value::map(m)));
-    }
-
-    // Multi-byte UTF-8 character (b >= 0x80)
-    let ch_str = read_utf8_char(b)?;
-    let mut m = std::collections::BTreeMap::new();
-    m.insert(Value::keyword("kind"), Value::keyword("char"));
-    m.insert(Value::keyword("char"), Value::string(&ch_str));
-    Ok(Some(Value::map(m)))
 }
 
 // Shared path-component implementations. Each is registered under both a canonical
@@ -1031,293 +1157,818 @@ fn resolved_path(p: &str) -> std::path::PathBuf {
     }
 }
 
-/// Offload one blocking `std::fs` operation onto THE I/O pool's blocking tier
-/// and yield `AwaitIo`, parking the calling task until the op completes.
-///
-/// Used by the `file/*` builtins when running inside an `async/spawn`'d task,
-/// so a slow read/write (big file, cold media, network mount) doesn't stall
-/// sibling tasks. Callers must resolve + validate arguments (arity, types,
-/// sandbox caps/paths, VFS hits) on the VM thread FIRST; only `Send` facts
-/// cross the thread boundary (`work`'s captured paths/contents out, `T` back).
-/// `decode` turns the facts into the result `Value` on the VM thread, exactly
-/// like the http/shell pollers. Worker errors must be pre-rendered through
-/// [`fs_io_msg`] so the task rejection carries the byte-identical message the
-/// sync path's `SemaError::Io` would display.
-///
-/// No abort hook (`IoHandle::new`): unlike a subprocess or an HTTP round-trip
-/// there is nothing meaningful to tear down mid-flight — a file op finishes in
-/// bounded time — so cancellation is best-effort: the offloaded op runs to
-/// completion and its result is discarded (same policy as the LLM
-/// `spawn_blocking` tier).
-///
-/// Returns `Ok(nil)` after arming the yield signal; the scheduler delivers the
-/// real value on resume.
-pub(crate) fn fs_offload<T: Send + 'static>(
-    work: impl FnOnce() -> Result<T, String> + Send + 'static,
-    decode: impl Fn(T) -> Value + 'static,
-) -> Result<Value, SemaError> {
-    use std::rc::Rc;
-    use tokio::sync::oneshot::error::TryRecvError;
-
-    // Vestigial under CALL_NATIVE (the scheduler delivers the resume value via
-    // `replace_stack_top`, not by re-invoking this native), but kept for
-    // symmetry with the shipped `async/await` yield pattern.
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
-    }
-
-    let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<T, String>>();
-    sema_io::io_spawn_blocking(move || {
-        let _ = tx.send(work());
-        // Wake the parked VM thread so it re-polls promptly.
-        sema_core::notify_io_complete();
-    });
-
-    let handle = Rc::new(sema_core::IoHandle::new(move || match rx.try_recv() {
-        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-        Ok(Ok(t)) => sema_core::IoPoll::Ready(Ok(decode(t))),
-        Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
-        Err(TryRecvError::Closed) => {
-            sema_core::IoPoll::Ready(Err("file: worker dropped".to_string()))
-        }
-    }));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
-}
-
-/// Render a file-op failure exactly as the sync path raises it: through
-/// `SemaError::Io`'s `Display`. A task that fails on the sync path records
-/// `format!("{err}")` as its rejection message, so the offloaded path must
-/// pre-render the same form for sync/async rejections to be byte-identical.
-fn fs_io_msg(msg: String) -> String {
-    SemaError::Io(msg).to_string()
-}
-
-/// Like [`fs_offload`], but `decode` may itself fail. Needed where the fetched
-/// `T` requires further VM-thread-only processing that can reject — e.g.
-/// `load`'s `sema_reader::read_many`, which interns symbols (not `Send`, so it
-/// can't run on the worker) and can itself return a `SemaError` on a parse
-/// error. `fs_offload`'s `decode: Fn(T) -> Value` has no way to signal that;
-/// this sibling thread the `Result` through instead. Same drop-safety and
-/// no-abort-hook rationale as `fs_offload` (see its doc comment) — a file read
-/// finishes in bounded time, so cancellation is best-effort.
-pub(crate) fn fs_offload_parse<T: Send + 'static>(
-    work: impl FnOnce() -> Result<T, String> + Send + 'static,
-    decode: impl Fn(T) -> Result<Value, SemaError> + 'static,
-) -> Result<Value, SemaError> {
-    use std::rc::Rc;
-    use tokio::sync::oneshot::error::TryRecvError;
-
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
-    }
-
-    let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<T, String>>();
-    sema_io::io_spawn_blocking(move || {
-        let _ = tx.send(work());
-        sema_core::notify_io_complete();
-    });
-
-    let handle = Rc::new(sema_core::IoHandle::new(move || match rx.try_recv() {
-        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-        Ok(Ok(t)) => match decode(t) {
-            Ok(v) => sema_core::IoPoll::Ready(Ok(v)),
-            Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
-        },
-        Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
-        Err(TryRecvError::Closed) => {
-            sema_core::IoPoll::Ready(Err("file: worker dropped".to_string()))
-        }
-    }));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
-}
-
-// ── Async line-streaming (file/for-each-line, file/fold-lines[-bytes]) ────
+// ─── Canonical quarantined-bounded external file operations (Task 05 R08A) ───
 //
-// These natives run a Sema callback (`!Send`, touches `Value`s — cannot cross
-// the thread boundary) once per line, so the whole read loop can't just be
-// handed to `fs_offload` like a stateless read/write. Nor can the file be
-// read to completion up front — an unbounded `fs_offload` slurp would defeat
-// the "huge file" case these iterators exist for. Instead each offloaded
-// round-trip reads a BOUNDED chunk of lines on the worker; the chunk is
-// handed back and the callback runs per-line on the VM thread; then the next
-// chunk is offloaded — repeating via a hand-rolled `IoHandle` poll closure
-// (the same "poll immediately re-arms the next stage" shape as
-// `stream.rs`'s `checkout_offload`, minus the checkout: the `BufReader` here
-// is owned solely by this call, never shared, so there's nothing to
-// reinstall/tombstone — an abandoned in-flight chunk read just finishes on
-// the worker and is dropped, exactly like `fs_offload`'s own no-abort-hook
-// rationale).
+// Under the unified runtime (`in_runtime_quantum()`) the finite file ops route
+// through the CANONICAL external-wait path: a `PreparedExternalOperation`
+// submitted to the real thread-pool executor, exactly like `sleep`/`mcp/call`.
+// Each is classified `QuarantinedBounded` — a hard byte/entry cap is fixed on
+// the VM thread BEFORE dispatch, the job carries only an owned `Send` input
+// snapshot (a `String`/`Vec<u8>`, never an `Rc`/`Value`), computes off-thread,
+// and its send-safe payload is decoded back into a `Value` on the VM thread.
+// Every runtime caller receives a structural External suspension; synchronous
+// callers use the native's value ABI.
 
-/// Bounded chunk size for the async line-streaming natives: read up to this
-/// many lines OR this many bytes per offloaded round-trip — large enough to
-/// amortize the worker hop, small enough that a huge file is never pulled
-/// wholly into memory.
-const ASYNC_LINE_CHUNK_MAX_LINES: usize = 256;
-const ASYNC_LINE_CHUNK_MAX_BYTES: usize = 256 * 1024;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::time::Duration;
 
-/// One bounded chunk read of newline-stripped `String` lines (the
-/// `file/for-each-line` / `file/fold-lines` element type). Runs entirely on
-/// the worker thread; `reader` and its `File` are `Send`.
-fn read_line_chunk_str(
-    reader: &mut std::io::BufReader<std::fs::File>,
-    path: &str,
-    op: &str,
-) -> Result<(Vec<String>, bool), String> {
-    let mut lines = Vec::new();
-    let mut budget = 0usize;
-    let mut eof = false;
-    let mut line_buf = String::with_capacity(64);
-    loop {
-        line_buf.clear();
-        let n = reader
-            .read_line(&mut line_buf)
-            .map_err(|e| fs_io_msg(format!("{op} {path}: {e}")))?;
-        if n == 0 {
-            eof = true;
-            break;
-        }
-        if line_buf.ends_with('\n') {
-            line_buf.pop();
-            if line_buf.ends_with('\r') {
-                line_buf.pop();
-            }
-        }
-        budget += n;
-        lines.push(std::mem::take(&mut line_buf));
-        if lines.len() >= ASYNC_LINE_CHUNK_MAX_LINES || budget >= ASYNC_LINE_CHUNK_MAX_BYTES {
-            break;
-        }
-    }
-    Ok((lines, eof))
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{
+    downcast_send_payload, CompletionDecoder, CompletionKind, DecodedCompletion, ExternalFailure,
+    NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, NativeSuspend,
+    PreparedExternalOperation, QuarantineBound, ResumeInput, SendPayload, Trace, WaitKind,
+};
+
+/// Completion tag for a quarantined file operation. A tag only needs to be
+/// consistent between the issued identity and the prepared op; it is not a
+/// uniqueness key, so one shared value for all file ops is correct.
+const FS_COMPLETION_KIND: u64 = 1;
+
+/// Default hard byte cap for a single finite file read/write routed to a worker.
+/// Fixed BEFORE dispatch (via `stat`/in-memory length), it bounds the worst-case
+/// allocation the quarantined job can produce.
+pub const FS_BYTE_CAP_DEFAULT: u64 = 256 * 1024 * 1024; // 256 MiB
+/// Default hard entry cap for a single finite `file/list`. The cap is fixed
+/// before dispatch and stored in the job; the worker aborts if it discovers more.
+pub const FS_LIST_CAP_DEFAULT: u64 = 5_000_000;
+
+static FS_BYTE_CAP: AtomicU64 = AtomicU64::new(FS_BYTE_CAP_DEFAULT);
+static FS_LIST_CAP: AtomicU64 = AtomicU64::new(FS_LIST_CAP_DEFAULT);
+
+/// Live count of quarantined file jobs executing on a worker, and the peak that
+/// count has reached. The peak proves genuine off-thread OVERLAP (two spawned
+/// file ops in flight at once → peak >= 2) without depending on wall-clock
+/// timing. Process-global; a test resets it before observing.
+static FS_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+static FS_PEAK_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// Test-only artificial delay (ms) held inside every quarantined file job while
+/// it occupies its in-flight slot. Defaults to 0 (a single relaxed atomic load
+/// in production, no behavior change); a test raises it to make two concurrent
+/// jobs demonstrably overlap or to keep a job parked long enough to cancel it.
+static FS_TEST_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// A cancelled quarantined file job is detached and reaped when its (now unowned)
+/// completion lands. This deadline is the CleanupRegistry watchdog: a bounded
+/// file job completes in well under this, so its cleanup entry is always reaped
+/// in time; a wedged worker past it faults the runtime rather than leaking.
+const FS_CLEANUP_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Peak simultaneous in-flight quarantined file jobs since the last reset.
+pub fn fs_peak_inflight() -> usize {
+    FS_PEAK_INFLIGHT.load(AtomicOrdering::SeqCst)
 }
 
-/// Byte-oriented sibling of [`read_line_chunk_str`] for `file/fold-lines-bytes`
-/// — no UTF-8 validation, same `\r\n`/`\n` stripping rule.
-fn read_line_chunk_bytes(
-    reader: &mut std::io::BufReader<std::fs::File>,
-    path: &str,
-    op: &str,
-) -> Result<(Vec<Vec<u8>>, bool), String> {
-    let mut lines = Vec::new();
-    let mut budget = 0usize;
-    let mut eof = false;
-    let mut line_buf: Vec<u8> = Vec::with_capacity(128);
-    loop {
-        line_buf.clear();
-        let n = reader
-            .read_until(b'\n', &mut line_buf)
-            .map_err(|e| fs_io_msg(format!("{op} {path}: {e}")))?;
-        if n == 0 {
-            eof = true;
-            break;
-        }
-        let mut end = line_buf.len();
-        if end > 0 && line_buf[end - 1] == b'\n' {
-            end -= 1;
-            if end > 0 && line_buf[end - 1] == b'\r' {
-                end -= 1;
-            }
-        }
-        budget += n;
-        lines.push(line_buf[..end].to_vec());
-        if lines.len() >= ASYNC_LINE_CHUNK_MAX_LINES || budget >= ASYNC_LINE_CHUNK_MAX_BYTES {
-            break;
-        }
-    }
-    Ok((lines, eof))
+/// Quarantined file jobs currently executing on a worker.
+pub fn fs_current_inflight() -> usize {
+    FS_INFLIGHT.load(AtomicOrdering::SeqCst)
 }
 
-/// A bounded chunk-read function for the async line streamers: reads at most
-/// [`ASYNC_LINE_CHUNK_MAX_LINES`]/[`ASYNC_LINE_CHUNK_MAX_BYTES`] worth of `L`
-/// items from `reader`, returning `(items, eof)`. Implemented by
-/// [`read_line_chunk_str`] and [`read_line_chunk_bytes`]; always a plain `fn`
-/// item (no captures), so it's trivially `Send` to move into the worker
-/// closure alongside the reader.
-type LineChunkReader<L> =
-    fn(&mut std::io::BufReader<std::fs::File>, &str, &str) -> Result<(Vec<L>, bool), String>;
+/// Reset the in-flight peak gauge (call before observing overlap in a test).
+pub fn reset_fs_inflight() {
+    FS_PEAK_INFLIGHT.store(0, AtomicOrdering::SeqCst);
+}
 
-/// One offloaded chunk read's outcome: the reinstalled (still-open) reader,
-/// the chunk of items read, and whether EOF was hit.
-type LineChunkResult<L> = Result<(std::io::BufReader<std::fs::File>, Vec<L>, bool), String>;
+/// Override the finite-file byte cap (test hook for the pre-dispatch cap gate).
+pub fn set_fs_byte_cap(bytes: u64) {
+    FS_BYTE_CAP.store(bytes.max(1), AtomicOrdering::SeqCst);
+}
 
-/// Spawn one offloaded chunk read: opens `path` first if `reader` is `None`
-/// (the first round-trip), otherwise resumes the given (still-open) reader.
-/// Sends back the reinstalled reader alongside the chunk so the poller can
-/// kick off the next round without reopening the file.
-fn spawn_line_chunk<L: Send + 'static>(
-    reader: Option<std::io::BufReader<std::fs::File>>,
-    path: String,
+/// Override the `file/list` entry cap (test hook for the pre-dispatch cap gate).
+pub fn set_fs_list_cap(entries: u64) {
+    FS_LIST_CAP.store(entries.max(1), AtomicOrdering::SeqCst);
+}
+
+/// Set the test-only per-job delay (ms). Pass 0 to disable.
+pub fn set_fs_test_delay_ms(ms: u64) {
+    FS_TEST_DELAY_MS.store(ms, AtomicOrdering::SeqCst);
+}
+
+/// Decodes a quarantined file job's send-safe payload back into a `Value` on the
+/// VM thread. The payload is a `Result<T, String>`: `Ok(T)` maps through
+/// `to_value`; `Err(message)` is a domain I/O error rendered exactly like the
+/// synchronous path (`SemaError::Io(message)`). A worker-level `ExternalFailure`
+/// (panic / cancellation / bound-exceeded) surfaces as an evaluation error.
+struct FsDecoder<T: Send + 'static> {
     op: &'static str,
-    read_chunk: LineChunkReader<L>,
-) -> tokio::sync::oneshot::Receiver<LineChunkResult<L>> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    sema_io::io_spawn_blocking(move || {
-        let result = (|| {
-            let mut reader = match reader {
-                Some(r) => r,
-                None => {
-                    let file = std::fs::File::open(&path)
-                        .map_err(|e| fs_io_msg(format!("{op} {path}: {e}")))?;
-                    std::io::BufReader::with_capacity(ASYNC_LINE_CHUNK_MAX_BYTES, file)
-                }
-            };
-            let (items, eof) = read_chunk(&mut reader, &path, op)?;
-            Ok((reader, items, eof))
-        })();
-        let _ = tx.send(result);
-        sema_core::notify_io_complete();
-    });
-    rx
+    to_value: fn(T) -> Value,
 }
 
-/// Drive the bounded-chunk read/callback loop described above to completion,
-/// arming a fresh `AwaitIo` yield for each chunk in flight. `on_chunk` runs
-/// ON THE VM THREAD once per chunk (it's where the Sema callback is invoked —
-/// may hold `Value`s, e.g. a fold accumulator); `finish` builds the final
-/// return value once EOF is reached. Returns `Ok(nil)` after arming the first
-/// yield signal, like `fs_offload`.
-fn async_stream_lines<L: Send + 'static>(
-    op: &'static str,
-    path: String,
-    read_chunk: LineChunkReader<L>,
-    mut on_chunk: impl FnMut(Vec<L>) -> Result<(), SemaError> + 'static,
-    mut finish: impl FnMut() -> Value + 'static,
-) -> Result<Value, SemaError> {
-    use tokio::sync::oneshot::error::TryRecvError;
+impl<T: Send + 'static> Trace for FsDecoder<T> {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
 
-    if let Some(v) = sema_core::take_resume_value() {
-        return Ok(v);
+impl<T: Send + 'static> CompletionDecoder for FsDecoder<T> {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        match result {
+            Ok(payload) => match downcast_send_payload::<Result<T, String>>(payload, self.op) {
+                Ok(Ok(value)) => Ok((self.to_value)(value)),
+                Ok(Err(message)) => Err(SemaError::Io(message)),
+                Err(failure) => Err(SemaError::eval(failure.message().to_string())),
+            },
+            Err(failure) => Err(SemaError::eval(format!(
+                "{}: {}",
+                self.op,
+                failure.message()
+            ))),
+        }
+    }
+}
+
+/// Resumes the parked file-op frame once the worker completes: the decoded value
+/// is injected onto its stack top; a failure or cancellation is raised at the
+/// call site (catchable by an enclosing try/catch).
+struct FsContinuation {
+    op: &'static str,
+}
+
+impl Trace for FsContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for FsContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "{} was cancelled ({reason:?})",
+                self.op
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(format!(
+                "{} continuation received an unexpected runtime response",
+                self.op
+            ))),
+        }
+    }
+}
+
+/// Build a quarantined-bounded external file operation and RETURN it as a
+/// `NativeOutcome::Suspend` on the runtime native ABI. The runtime submits `job`
+/// to the thread-pool executor (so it runs off the VM thread and overlaps sibling
+/// work) and, when the worker completes, resumes this frame with the decoded
+/// value. `job` is `Send` and returns `Result<T, String>` (Ok payload / domain
+/// I/O error).
+fn fs_quarantined<T, F>(op: &'static str, to_value: fn(T) -> Value, job: F) -> NativeResult
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let kind =
+        CompletionKind::try_from_raw(FS_COMPLETION_KIND).expect("file completion kind is nonzero");
+    let bound = QuarantineBound::hard_deadline(FS_CLEANUP_DEADLINE)
+        .expect("file cleanup deadline is nonzero");
+    let prepared = PreparedExternalOperation::quarantined_blocking(
+        kind,
+        Box::new(FsDecoder { op, to_value }),
+        bound,
+        move || {
+            let inflight = FS_INFLIGHT.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            FS_PEAK_INFLIGHT.fetch_max(inflight, AtomicOrdering::SeqCst);
+            let delay = FS_TEST_DELAY_MS.load(AtomicOrdering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+            let result = job();
+            FS_INFLIGHT.fetch_sub(1, AtomicOrdering::SeqCst);
+            Ok(Box::new(result) as SendPayload)
+        },
+    );
+    let suspend = NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(FsContinuation { op }),
+    };
+    Ok(NativeOutcome::Suspend(suspend))
+}
+
+/// Decodes a quarantined COMPUTE job's send-safe payload back into a `Value`.
+/// Unlike [`FsDecoder`], a domain error (the job's `Err(String)`) is surfaced as
+/// `SemaError::eval` rather than `SemaError::Io`. The CPU-bound archive/pdf/diff/
+/// server-file ops already build their own op-prefixed error strings (often the
+/// full `Display` of a `SemaError`), so eval-wrapping preserves their
+/// user-visible error contract.
+struct ComputeDecoder<T: Send + 'static> {
+    op: &'static str,
+    to_value: fn(T) -> Value,
+}
+
+impl<T: Send + 'static> Trace for ComputeDecoder<T> {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl<T: Send + 'static> CompletionDecoder for ComputeDecoder<T> {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        match result {
+            Ok(payload) => match downcast_send_payload::<Result<T, String>>(payload, self.op) {
+                Ok(Ok(value)) => Ok((self.to_value)(value)),
+                Ok(Err(message)) => Err(SemaError::eval(message)),
+                Err(failure) => Err(SemaError::eval(failure.message().to_string())),
+            },
+            Err(failure) => Err(SemaError::eval(format!(
+                "{}: {}",
+                self.op,
+                failure.message()
+            ))),
+        }
+    }
+}
+
+/// Like [`fs_quarantined`], but for a pure CPU-bound compute (archive/pdf/diff/
+/// server-file) whose domain errors are surfaced through `SemaError::eval` (see
+/// [`ComputeDecoder`]). The `job` runs quarantined-bounded on the thread-pool
+/// executor (overlapping siblings) and the decoded value resumes the parked
+/// frame. `job` is `Send` and returns `Result<T, String>` (Ok payload /
+/// pre-rendered domain error); `to_value` decodes the `Ok` payload on the VM
+/// thread. Cancellation is best-effort (the bounded job runs to completion and
+/// its result is discarded), matching `fs_offload`'s no-abort-hook policy.
+pub(crate) fn quarantined_compute<T, F>(
+    op: &'static str,
+    to_value: fn(T) -> Value,
+    job: F,
+) -> NativeResult
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let bound = QuarantineBound::hard_deadline(FS_CLEANUP_DEADLINE)
+        .expect("compute cleanup deadline is nonzero");
+    quarantined_compute_bounded(op, to_value, bound, job)
+}
+
+/// Like [`quarantined_compute`], but the caller supplies the resource's
+/// [`QuarantineBound`] descriptor instead of defaulting to the wall-clock cleanup
+/// deadline. A genuinely *terminally* bounded compute (archive (de)compression,
+/// whose input/output/entry caps are enforced incrementally on the worker) passes
+/// a `QuarantineBound::finite_work` descriptor here so the runtime carries the
+/// declared unit cap, not just a timeout net — the finite work always completes,
+/// so its landing completion reaps the cleanup entry and the reap-attempt bound is
+/// a formality. A non-terminal parser (pdf) keeps the `hard_deadline` net via
+/// [`quarantined_compute`].
+pub(crate) fn quarantined_compute_bounded<T, F>(
+    op: &'static str,
+    to_value: fn(T) -> Value,
+    bound: QuarantineBound,
+    job: F,
+) -> NativeResult
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    let kind = CompletionKind::try_from_raw(FS_COMPLETION_KIND)
+        .expect("compute completion kind is nonzero");
+    let prepared = PreparedExternalOperation::quarantined_blocking(
+        kind,
+        Box::new(ComputeDecoder { op, to_value }),
+        bound,
+        move || Ok(Box::new(job()) as SendPayload),
+    );
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(FsContinuation { op }),
+    }))
+}
+
+/// Like [`quarantined_compute`], but the result is decoded by a caller-supplied
+/// `decoder` that MAY hold Sema `Value`s across the park (e.g. `http/router`'s
+/// route handlers, which must be rebuilt into the dispatch fn once the static
+/// directories canonicalize off-thread). The decoder implements
+/// [`CompletionDecoder`] (whose `Trace` supertrait exposes those `Value` edges to
+/// the collector, so nothing it holds is reclaimed while the job is in flight)
+/// and turns the job's `Send` payload into the resume `Value`.
+pub(crate) fn quarantined_compute_with_decoder<F>(
+    op: &'static str,
+    decoder: Box<dyn CompletionDecoder>,
+    job: F,
+) -> NativeResult
+where
+    F: FnOnce() -> Result<SendPayload, ExternalFailure> + Send + 'static,
+{
+    let kind = CompletionKind::try_from_raw(FS_COMPLETION_KIND)
+        .expect("compute completion kind is nonzero");
+    let bound = QuarantineBound::hard_deadline(FS_CLEANUP_DEADLINE)
+        .expect("compute cleanup deadline is nonzero");
+    let prepared = PreparedExternalOperation::quarantined_blocking(kind, decoder, bound, job);
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(FsContinuation { op }),
+    }))
+}
+
+/// Enforce the finite-file byte cap on the VM thread BEFORE dispatch. `stat`s the
+/// path and rejects an oversized file with a Sema condition (never an unbounded
+/// worker allocation). A missing/unstattable path is NOT rejected here — the job
+/// surfaces the real I/O error, matching the synchronous path's behavior.
+fn fs_byte_cap_check(op: &str, path: &str) -> Result<(), SemaError> {
+    let cap = FS_BYTE_CAP.load(AtomicOrdering::SeqCst);
+    if let Ok(meta) = std::fs::metadata(path) {
+        let len = meta.len();
+        if len > cap {
+            return Err(SemaError::eval(format!(
+                "{op} {path}: file size {len} bytes exceeds the {cap}-byte quarantined read cap"
+            ))
+            .with_hint("read the file in bounded chunks or raise the quarantined byte cap"));
+        }
+    }
+    Ok(())
+}
+
+/// Enforce the finite-file byte cap on an in-memory write payload before dispatch.
+fn fs_write_cap_check(op: &str, len: usize) -> Result<(), SemaError> {
+    let cap = FS_BYTE_CAP.load(AtomicOrdering::SeqCst);
+    if len as u64 > cap {
+        return Err(SemaError::eval(format!(
+            "{op}: payload {len} bytes exceeds the {cap}-byte quarantined write cap"
+        ))
+        .with_hint("write the file in bounded chunks or raise the quarantined byte cap"));
+    }
+    Ok(())
+}
+
+/// Reject a non-regular target (FIFO, socket, character/block device) before a
+/// quarantined or checked-out blocking file op is dispatched inside a runtime
+/// quantum. A blocking `open(2)`/`read(2)`/`write(2)` on such a target is
+/// unbounded — opening a FIFO parks until a peer opens the other end, a
+/// character device can stream without EOF — and there is no portable way to
+/// abort or cancel the parked blocking worker. Regular files bound every
+/// offloaded op to a capped chunk by construction, so this admission stat (a
+/// non-blocking `stat(2)`) is what keeps the cooperative runtime's file I/O
+/// finite. A missing/unstattable path passes through so the real open surfaces
+/// the canonical error, matching [`fs_byte_cap_check`]. Host
+/// (`!in_runtime_quantum`) callers keep their bounded synchronous path and are
+/// never admitted here.
+#[cfg(unix)]
+pub(crate) fn admit_regular_file(op: &str, path: &str) -> Result<(), SemaError> {
+    use std::os::unix::fs::FileTypeExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let ft = meta.file_type();
+        let kind = if ft.is_fifo() {
+            Some("named pipe (FIFO)")
+        } else if ft.is_socket() {
+            Some("socket")
+        } else if ft.is_char_device() {
+            Some("character device")
+        } else if ft.is_block_device() {
+            Some("block device")
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
+            return Err(SemaError::eval(format!(
+                "{op}: {path} is a {kind}, not a regular file"
+            ))
+            .with_hint(
+                "the cooperative runtime only checks out regular files; a blocking read on a pipe or device cannot be bounded or cancelled — read the coordinated *stdin* stream, or drive a device through the proc/* APIs",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Non-unix fallback: named pipes and device nodes are not classified through
+/// `FileTypeExt`, so admission is a no-op and the bounded synchronous path
+/// stands. (Runtime offload of file streams is a native, primarily Unix
+/// feature; wasm has no cooperative file I/O at all.)
+#[cfg(not(unix))]
+pub(crate) fn admit_regular_file(_op: &str, _path: &str) -> Result<(), SemaError> {
+    Ok(())
+}
+
+// ── Cooperative line streaming (file/for-each-line, file/fold-lines[-bytes]) ─
+//
+// The file reader is moved to a blocking worker for one bounded batch of lines,
+// then returned to the VM thread while each Sema callback is driven as a
+// structural `NativeOutcome::Call`. A callback may therefore park on a timer,
+// channel, or nested async operation without blocking sibling tasks. Only raw
+// strings/bytes and the `BufReader` cross the worker boundary; every live Sema
+// `Value` stays in a traced continuation on the VM thread. Cancellation drops
+// that continuation (and its reader) or discards a still-running bounded read.
+
+const FILE_LINE_CHUNK_MAX_LINES: usize = 256;
+const FILE_LINE_CHUNK_MAX_BYTES: usize = 256 * 1024;
+const FILE_LINE_READER_BUFFER_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy)]
+enum FileLineKind {
+    ForEachText,
+    FoldText,
+    FoldBytes,
+}
+
+impl FileLineKind {
+    fn op(self) -> &'static str {
+        match self {
+            Self::ForEachText => "file/for-each-line",
+            Self::FoldText => "file/fold-lines",
+            Self::FoldBytes => "file/fold-lines-bytes",
+        }
     }
 
-    let rx0 = spawn_line_chunk(None, path.clone(), op, read_chunk);
-    let rx = std::rc::Rc::new(std::cell::RefCell::new(rx0));
+    fn is_bytes(self) -> bool {
+        matches!(self, Self::FoldBytes)
+    }
+}
 
-    let poll = move || -> sema_core::IoPoll {
-        let recv = rx.borrow_mut().try_recv();
-        match recv {
-            Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-            Err(TryRecvError::Closed) => {
-                sema_core::IoPoll::Ready(Err(format!("{op}: I/O worker dropped")))
-            }
-            Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
-            Ok(Ok((reader, items, eof))) => {
-                if let Err(e) = on_chunk(items) {
-                    return sema_core::IoPoll::Ready(Err(e.to_string()));
-                }
-                if eof {
-                    return sema_core::IoPoll::Ready(Ok(finish()));
-                }
-                *rx.borrow_mut() = spawn_line_chunk(Some(reader), path.clone(), op, read_chunk);
-                sema_core::IoPoll::Pending
+enum FileLineItem {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+impl FileLineItem {
+    fn into_value(self) -> Value {
+        match self {
+            Self::Text(line) => Value::string_owned(line),
+            Self::Bytes(line) => Value::bytevector(line),
+        }
+    }
+}
+
+struct FileLineReader {
+    reader: std::io::BufReader<std::fs::File>,
+    pending_line: Vec<u8>,
+    batch_lines: bool,
+}
+
+struct FileLineChunk {
+    reader: FileLineReader,
+    lines: std::collections::VecDeque<FileLineItem>,
+    eof: bool,
+    terminal_error: Option<String>,
+}
+
+fn finish_file_line(
+    pending_line: &mut Vec<u8>,
+    terminated: bool,
+    bytes: bool,
+    op: &str,
+    path: &str,
+) -> Result<FileLineItem, String> {
+    if terminated && pending_line.last() == Some(&b'\r') {
+        pending_line.pop();
+    }
+    let line = std::mem::take(pending_line);
+    if bytes {
+        Ok(FileLineItem::Bytes(line))
+    } else {
+        String::from_utf8(line)
+            .map(FileLineItem::Text)
+            .map_err(|_| format!("{op} {path}: stream did not contain valid UTF-8"))
+    }
+}
+
+fn oversized_file_line_error(op: &str, path: &str) -> String {
+    format!(
+        "{op} {path}: line exceeds the {FILE_LINE_CHUNK_MAX_BYTES}-byte cooperative streaming limit"
+    )
+}
+
+fn read_file_line_chunk(
+    op: &'static str,
+    path: &str,
+    reader: Option<FileLineReader>,
+    bytes: bool,
+) -> Result<FileLineChunk, String> {
+    let mut state = match reader {
+        Some(reader) => reader,
+        None => {
+            let file =
+                std::fs::File::open(path).map_err(|error| format!("{op} {path}: {error}"))?;
+            let batch_lines = file.metadata().is_ok_and(|metadata| metadata.is_file());
+            FileLineReader {
+                reader: std::io::BufReader::with_capacity(FILE_LINE_READER_BUFFER_BYTES, file),
+                pending_line: Vec::with_capacity(128),
+                batch_lines,
             }
         }
     };
+    let mut lines = std::collections::VecDeque::with_capacity(FILE_LINE_CHUNK_MAX_LINES);
+    let mut bytes_read = 0usize;
+    let mut eof = false;
+    let mut terminal_error = None;
 
-    let handle = std::rc::Rc::new(sema_core::IoHandle::new(poll));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
+    while lines.len() < FILE_LINE_CHUNK_MAX_LINES && bytes_read < FILE_LINE_CHUNK_MAX_BYTES {
+        let chunk_remaining = FILE_LINE_CHUNK_MAX_BYTES - bytes_read;
+        let pending_len = state.pending_line.len();
+        let (consume, complete) = {
+            let available = match state.reader.fill_buf() {
+                Ok(available) => available,
+                Err(error) => {
+                    terminal_error = Some(format!("{op} {path}: {error}"));
+                    break;
+                }
+            };
+            if available.is_empty() {
+                eof = true;
+                if state.pending_line.len() > FILE_LINE_CHUNK_MAX_BYTES {
+                    terminal_error = Some(oversized_file_line_error(op, path));
+                } else if !state.pending_line.is_empty() {
+                    match finish_file_line(&mut state.pending_line, false, bytes, op, path) {
+                        Ok(line) => lines.push_back(line),
+                        Err(error) => terminal_error = Some(error),
+                    }
+                }
+                break;
+            }
+
+            let scan_len = available.len().min(chunk_remaining);
+            match available[..scan_len].iter().position(|byte| *byte == b'\n') {
+                Some(newline) => {
+                    let trailing_cr = if newline > 0 {
+                        available[newline - 1] == b'\r'
+                    } else {
+                        state.pending_line.last() == Some(&b'\r')
+                    };
+                    let content_len = pending_len + newline - usize::from(trailing_cr);
+                    if content_len > FILE_LINE_CHUNK_MAX_BYTES {
+                        terminal_error = Some(oversized_file_line_error(op, path));
+                        break;
+                    }
+                    state.pending_line.extend_from_slice(&available[..newline]);
+                    (newline + 1, true)
+                }
+                None => {
+                    // Keep one provisional CR beyond the content limit until
+                    // the next byte proves it is a CRLF terminator. EOF or any
+                    // non-LF successor leaves it as oversized line content.
+                    let storage_remaining =
+                        (FILE_LINE_CHUNK_MAX_BYTES + 1).saturating_sub(state.pending_line.len());
+                    if scan_len > storage_remaining
+                        || (pending_len + scan_len > FILE_LINE_CHUNK_MAX_BYTES
+                            && available[scan_len - 1] != b'\r')
+                    {
+                        terminal_error = Some(oversized_file_line_error(op, path));
+                        break;
+                    }
+                    state.pending_line.extend_from_slice(&available[..scan_len]);
+                    (scan_len, false)
+                }
+            }
+        };
+        state.reader.consume(consume);
+        bytes_read += consume;
+
+        if complete {
+            match finish_file_line(&mut state.pending_line, true, bytes, op, path) {
+                Ok(line) => lines.push_back(line),
+                Err(error) => {
+                    terminal_error = Some(error);
+                    break;
+                }
+            }
+            if !state.batch_lines {
+                break;
+            }
+        }
+    }
+
+    Ok(FileLineChunk {
+        reader: state,
+        lines,
+        eof,
+        terminal_error,
+    })
+}
+
+struct FileLineChunkDecoder {
+    op: &'static str,
+    slot: std::rc::Rc<std::cell::RefCell<Option<FileLineChunk>>>,
+}
+
+impl Trace for FileLineChunkDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CompletionDecoder for FileLineChunkDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        match result {
+            Ok(payload) => {
+                match downcast_send_payload::<Result<FileLineChunk, String>>(payload, self.op) {
+                    Ok(Ok(chunk)) => {
+                        *self.slot.borrow_mut() = Some(chunk);
+                        Ok(Value::nil())
+                    }
+                    Ok(Err(message)) => Err(SemaError::Io(message)),
+                    Err(failure) => Err(SemaError::eval(failure.message().to_string())),
+                }
+            }
+            Err(failure) => Err(SemaError::eval(format!(
+                "{}: {}",
+                self.op,
+                failure.message()
+            ))),
+        }
+    }
+}
+
+enum FileLineResult {
+    ForEach,
+    Fold(Value),
+}
+
+impl FileLineResult {
+    fn callback_args(&mut self, line: Value) -> Vec<Value> {
+        match self {
+            Self::ForEach => vec![line],
+            Self::Fold(accumulator) => {
+                vec![std::mem::replace(accumulator, Value::nil()), line]
+            }
+        }
+    }
+
+    fn accept_callback_result(&mut self, value: Value) {
+        if let Self::Fold(accumulator) = self {
+            *accumulator = value;
+        }
+    }
+
+    fn finish(self) -> Value {
+        match self {
+            Self::ForEach => Value::nil(),
+            Self::Fold(accumulator) => accumulator,
+        }
+    }
+
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) {
+        if let Self::Fold(accumulator) = self {
+            sink(GcEdge::Value(accumulator));
+        }
+    }
+}
+
+struct FileLineContinuation {
+    kind: FileLineKind,
+    path: String,
+    callback: Value,
+    result: FileLineResult,
+    reader: Option<FileLineReader>,
+    lines: std::collections::VecDeque<FileLineItem>,
+    eof: bool,
+    terminal_error: Option<String>,
+    read_slot: Option<std::rc::Rc<std::cell::RefCell<Option<FileLineChunk>>>>,
+}
+
+impl Trace for FileLineContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        sink(GcEdge::Value(&self.callback));
+        self.result.trace(sink);
+        true
+    }
+}
+
+impl FileLineContinuation {
+    fn start(
+        kind: FileLineKind,
+        path: String,
+        callback: Value,
+        result: FileLineResult,
+    ) -> NativeResult {
+        Box::new(Self {
+            kind,
+            path,
+            callback,
+            result,
+            reader: None,
+            lines: std::collections::VecDeque::new(),
+            eof: false,
+            terminal_error: None,
+            read_slot: None,
+        })
+        .suspend_read()
+    }
+
+    fn suspend_read(mut self: Box<Self>) -> NativeResult {
+        let op = self.kind.op();
+        let path = self.path.clone();
+        let reader = self.reader.take();
+        let bytes = self.kind.is_bytes();
+        let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        self.read_slot = Some(slot.clone());
+
+        let kind = CompletionKind::try_from_raw(FS_COMPLETION_KIND)
+            .expect("file completion kind is nonzero");
+        let bound = QuarantineBound::hard_deadline(FS_CLEANUP_DEADLINE)
+            .expect("file cleanup deadline is nonzero");
+        let prepared = PreparedExternalOperation::quarantined_blocking(
+            kind,
+            Box::new(FileLineChunkDecoder { op, slot }),
+            bound,
+            move || {
+                let inflight = FS_INFLIGHT.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                FS_PEAK_INFLIGHT.fetch_max(inflight, AtomicOrdering::SeqCst);
+                let delay = FS_TEST_DELAY_MS.load(AtomicOrdering::Relaxed);
+                if delay > 0 {
+                    std::thread::sleep(Duration::from_millis(delay));
+                }
+                let result = read_file_line_chunk(op, &path, reader, bytes);
+                FS_INFLIGHT.fetch_sub(1, AtomicOrdering::SeqCst);
+                Ok(Box::new(result) as SendPayload)
+            },
+        );
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::External(Box::new(prepared)),
+            continuation: self,
+        }))
+    }
+
+    fn continue_iteration(mut self: Box<Self>) -> NativeResult {
+        if let Some(line) = self.lines.pop_front() {
+            let args = self.result.callback_args(line.into_value());
+            return Ok(NativeOutcome::Call(sema_core::runtime::NativeCall {
+                callable: self.callback.clone(),
+                args,
+                continuation: self,
+            }));
+        }
+        if let Some(error) = self.terminal_error.take() {
+            return Err(SemaError::Io(error));
+        }
+        if self.eof {
+            return Ok(NativeOutcome::Return(self.result.finish()));
+        }
+        self.suspend_read()
+    }
+}
+
+impl NativeContinuation for FileLineContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        if let Some(slot) = self.read_slot.take() {
+            match input {
+                ResumeInput::Returned(_) => {}
+                ResumeInput::Failed(error) => return Err(error),
+                ResumeInput::Cancelled(reason) => {
+                    return Err(SemaError::eval(format!(
+                        "{} was cancelled ({reason:?})",
+                        self.kind.op()
+                    )))
+                }
+                ResumeInput::Runtime(_) => {
+                    return Err(SemaError::eval(format!(
+                        "{} continuation received an unexpected runtime response",
+                        self.kind.op()
+                    )))
+                }
+            }
+            let chunk = slot.borrow_mut().take().ok_or_else(|| {
+                SemaError::eval(format!(
+                    "{} completion did not return its line reader",
+                    self.kind.op()
+                ))
+            })?;
+            self.reader = Some(chunk.reader);
+            self.lines = chunk.lines;
+            self.eof = chunk.eof;
+            self.terminal_error = chunk.terminal_error;
+        } else {
+            let value = crate::list::resume_value(input, self.kind.op())?;
+            self.result.accept_callback_result(value);
+        }
+        self.continue_iteration()
+    }
+}
+
+fn file_line_runtime(args: &[Value], kind: FileLineKind) -> NativeResult {
+    let op = kind.op();
+    match kind {
+        FileLineKind::ForEachText => check_arity!(args, op, 2),
+        FileLineKind::FoldText | FileLineKind::FoldBytes => check_arity!(args, op, 3),
+    }
+    let path = args[0]
+        .as_str()
+        .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+        .to_string();
+    let callback = args[1].clone();
+    let result = match kind {
+        FileLineKind::ForEachText => FileLineResult::ForEach,
+        FileLineKind::FoldText | FileLineKind::FoldBytes => FileLineResult::Fold(args[2].clone()),
+    };
+    FileLineContinuation::start(kind, path, callback, result)
 }
 
 /// Crate-internal: poll stdin for a key within `ms` and decode it, for
@@ -1325,13 +1976,9 @@ fn async_stream_lines<L: Send + 'static>(
 /// is ready (or on non-unix platforms, where raw key input isn't wired).
 #[cfg(unix)]
 pub(crate) fn poll_key_event(ms: u64) -> Option<Value> {
-    if !unix_stdin_ready(ms) {
-        return None;
-    }
-    match parse_key_input() {
-        Ok(Some(v)) => Some(v),
-        _ => None,
-    }
+    read_key_from_owner(Some(Duration::from_millis(ms)))
+        .ok()
+        .filter(|value| !value.is_nil())
 }
 
 #[cfg(not(unix))]
@@ -1339,45 +1986,536 @@ pub(crate) fn poll_key_event(_ms: u64) -> Option<Value> {
     None
 }
 
-/// Cooperatively poll `ready` on the scheduler thread until it yields a value or
-/// `timeout_ms` milliseconds have elapsed since `started` (then `nil`), rather
-/// than blocking the OS thread in a `select(2)`/`sleep` wait. The async-context
-/// path of `io/read-key-timeout` and `event/select`: a "wait for input OR agent
-/// progress" loop must not stall the single cooperative scheduler thread while
-/// it waits, so we arm the same `AwaitIo` yield the file/http/shell async paths
-/// use — its poll closure re-checks readiness each scheduler tick (every
-/// sibling step, and at worst ~50 ms while every task is parked). `ready`
-/// returns `Some(Ok(v))` when input is available, `Some(Err(e))` to reject the
-/// task, or `None` while still waiting.
-///
-/// The timeout is checked as `started.elapsed() >= timeout_ms`, never as
-/// `started + Duration` — `Instant + Duration` panics on overflow, and unlike
-/// the sync path (`unix_stdin_ready`, a plain `libc::select` timeval) an
-/// arbitrarily large `ms` must not be able to crash the scheduler thread.
-///
-/// Unlike the `fs_offload`/`shell_async` poll closures (which cross no thread
-/// boundary but deliberately capture only `Send` data), `ready` here runs
-/// entirely on the VM thread and MAY capture Sema `Value`s (e.g. `event/select`'s
-/// source maps). That is sound: the cycle collector (Bacon–Rajan trial deletion)
-/// cannot trace into the boxed closure, so any `Value` it holds keeps a strong
-/// `Rc` the collector can't account for — but only for as long as the
-/// `IoHandle` is alive. The handle (closure and all) is dropped the moment the
-/// task resumes or is cancelled, which releases those `Rc`s normally; nothing
-/// is pinned beyond the handle's own lifetime.
-pub(crate) fn await_io_until(
+// ── Cooperative runtime poll (event/select, io/read-key-timeout) ─────────────
+//
+// The unified-runtime analog of [`await_io_until`]: `io/read-key-timeout` and
+// `event/select` must poll a readiness source that lives ENTIRELY on the VM
+// thread (stdin, a `proc/*` handle registry, elapsed timers) — none of it is
+// `Send`, so it can't move onto a worker like a file read. The runtime path
+// re-checks the source on the VM thread and parks on a structural timer between
+// scans, so sibling tasks run while it waits. The readiness probe (which may hold
+// Sema `Value`s — e.g. `event/select`'s source maps) rides in the resume
+// continuation and is GC-traced, unlike `await_io_until`'s boxed closure.
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug)]
+pub(crate) enum RuntimePollResult {
+    Ready(Value),
+    Failed(String),
+    PendingAfter(Duration),
+}
+
+/// A VM-thread readiness probe for [`await_runtime_until`]. Runs entirely on the
+/// VM thread each scan, so it MAY hold Sema `Value`s (`event/select`'s source
+/// maps); those are live GC edges while the poll is parked and are traced via the
+/// `Trace` supertrait — the runtime can account them, unlike the legacy untraced
+/// `IoHandle`.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) trait RuntimePoll: Trace {
+    fn poll(&mut self) -> RuntimePollResult;
+}
+
+/// Cooperatively poll `probe` under the unified runtime until it yields a value
+/// or `timeout_ms` milliseconds have elapsed since `started` (then nil), yielding
+/// a structural timer between scans so siblings overlap. Returns on the runtime
+/// native ABI (`NativeOutcome::Suspend`/`Return`). The runtime-native twin of
+/// [`await_io_until`].
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn await_runtime_until(
+    probe: Box<dyn RuntimePoll>,
     started: std::time::Instant,
     timeout_ms: u64,
-    mut ready: impl FnMut() -> Option<Result<Value, String>> + 'static,
+) -> NativeResult {
+    runtime_poll_step(probe, Some((started, Duration::from_millis(timeout_ms))))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn await_runtime_indefinitely(probe: Box<dyn RuntimePoll>) -> NativeResult {
+    runtime_poll_step(probe, None)
+}
+
+/// One scan of the cooperative poll: check the probe on the VM thread; resolve if
+/// ready, resolve to nil if the deadline passed, else park until the probe's next
+/// useful check or the overall timeout.
+#[cfg(not(target_arch = "wasm32"))]
+fn runtime_poll_step(
+    mut probe: Box<dyn RuntimePoll>,
+    deadline: Option<(std::time::Instant, Duration)>,
+) -> NativeResult {
+    let requested_delay = match probe.poll() {
+        RuntimePollResult::Ready(value) => return Ok(NativeOutcome::Return(value)),
+        RuntimePollResult::Failed(message) => return Err(SemaError::eval(message)),
+        RuntimePollResult::PendingAfter(delay) => delay,
+    };
+
+    let delay = if let Some((started, timeout)) = deadline {
+        let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+            return Ok(NativeOutcome::Return(Value::nil()));
+        };
+        if remaining.is_zero() {
+            return Ok(NativeOutcome::Return(Value::nil()));
+        }
+        requested_delay.min(remaining)
+    } else {
+        requested_delay
+    };
+
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::Timer(delay),
+        continuation: Box::new(RuntimePollContinuation {
+            probe: Some(probe),
+            deadline,
+        }),
+    }))
+}
+
+/// Resumes a parked cooperative poll after its structural timer elapses: re-check
+/// the probe (start the next scan, or resolve). Carries the `RuntimePoll` probe
+/// across the park and traces any `Value` it holds.
+#[cfg(not(target_arch = "wasm32"))]
+struct RuntimePollContinuation {
+    probe: Option<Box<dyn RuntimePoll>>,
+    deadline: Option<(std::time::Instant, Duration)>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Trace for RuntimePollContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        match &self.probe {
+            Some(probe) => probe.trace(sink),
+            None => true,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl NativeContinuation for RuntimePollContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(_) => {
+                let probe = self.probe.take().expect("runtime poll probe resumed once");
+                runtime_poll_step(probe, self.deadline)
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "cooperative poll was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "cooperative poll continuation received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+/// The VM-thread readiness probe for `io/read-key-timeout`: a keypress is ready
+/// once a byte is available on stdin; EOF resolves to nil. Holds no `Value`.
+#[cfg(unix)]
+struct KeyProbe {
+    lease: crate::stream::StdinInputLease,
+    bytes: Vec<u8>,
+    completed_bytes: Vec<u8>,
+    escape_started: Option<std::time::Instant>,
+    terminal: bool,
+}
+
+#[cfg(unix)]
+impl KeyProbe {
+    fn new() -> Self {
+        Self {
+            lease: crate::stream::acquire_stdin_input(),
+            bytes: Vec::new(),
+            completed_bytes: Vec::new(),
+            escape_started: None,
+            terminal: false,
+        }
+    }
+
+    fn take_completed_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.completed_bytes)
+    }
+
+    fn next_event(&mut self) {
+        debug_assert!(self.bytes.is_empty());
+        debug_assert!(self.completed_bytes.is_empty());
+        self.escape_started = None;
+        self.terminal = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for KeyProbe {
+    fn drop(&mut self) {
+        if !self.terminal {
+            self.lease.return_bytes(&self.bytes);
+        }
+    }
+}
+
+#[cfg(unix)]
+const RUNTIME_KEY_BYTE_CAP: usize = 8 * 1024 * 1024;
+
+#[cfg(unix)]
+fn utf8_event_width(lead: u8) -> usize {
+    if lead & 0xe0 == 0xc0 {
+        2
+    } else if lead & 0xf0 == 0xe0 {
+        3
+    } else if lead & 0xf8 == 0xf0 {
+        4
+    } else {
+        1
+    }
+}
+
+#[cfg(unix)]
+fn runtime_key_complete(bytes: &[u8], escape_started: Option<std::time::Instant>) -> bool {
+    let Some(first) = bytes.first().copied() else {
+        return false;
+    };
+    if first != 0x1b {
+        return bytes.len() >= utf8_event_width(first);
+    }
+    let Some(second) = bytes.get(1).copied() else {
+        return escape_started
+            .is_some_and(|started| started.elapsed() >= Duration::from_millis(50));
+    };
+    if second == b'[' {
+        let csi = &bytes[2..];
+        if csi.starts_with(b"200~") {
+            return csi.ends_with(b"\x1b[201~");
+        }
+        return csi.iter().any(|byte| (0x40..=0x7e).contains(byte));
+    }
+    if second == b'O' {
+        return bytes.len() >= 3;
+    }
+    bytes.len() > utf8_event_width(second)
+}
+
+#[cfg(unix)]
+fn runtime_key_poll_delay(bytes: &[u8], escape_started: Option<std::time::Instant>) -> Duration {
+    if bytes == [0x1b] {
+        let elapsed = escape_started.map_or(Duration::ZERO, |started| started.elapsed());
+        return Duration::from_millis(50).saturating_sub(elapsed);
+    }
+    Duration::from_millis(5)
+}
+
+#[cfg(unix)]
+fn poll_runtime_key(probe: &mut KeyProbe) -> RuntimePollResult {
+    loop {
+        if runtime_key_complete(&probe.bytes, probe.escape_started) {
+            probe.terminal = true;
+            probe.completed_bytes = std::mem::take(&mut probe.bytes);
+            return RuntimePollResult::Ready(decode_runtime_key(&probe.completed_bytes));
+        }
+        match probe.lease.poll(1, None, "io/read-key") {
+            Ok(crate::stream::StdinInputPoll::Data(bytes)) => {
+                let byte = bytes[0];
+                if probe.bytes.is_empty() && byte == 0x1b {
+                    probe.escape_started = Some(std::time::Instant::now());
+                }
+                probe.bytes.push(byte);
+                if probe.bytes.len() > RUNTIME_KEY_BYTE_CAP {
+                    probe.terminal = true;
+                    return RuntimePollResult::Failed(format!(
+                        "io/read-key: input exceeds the {RUNTIME_KEY_BYTE_CAP}-byte event cap"
+                    ));
+                }
+            }
+            Ok(crate::stream::StdinInputPoll::Eof) if probe.bytes.is_empty() => {
+                probe.terminal = true;
+                mark_stdin_eof();
+                return RuntimePollResult::Ready(Value::nil());
+            }
+            Ok(crate::stream::StdinInputPoll::Eof) => {
+                probe.terminal = true;
+                mark_stdin_eof();
+                probe.completed_bytes = std::mem::take(&mut probe.bytes);
+                return RuntimePollResult::Ready(decode_runtime_key(&probe.completed_bytes));
+            }
+            Ok(crate::stream::StdinInputPoll::Pending) => {
+                return RuntimePollResult::PendingAfter(runtime_key_poll_delay(
+                    &probe.bytes,
+                    probe.escape_started,
+                ));
+            }
+            Err(error) => {
+                probe.terminal = true;
+                return RuntimePollResult::Failed(error.to_string());
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Trace for KeyProbe {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+#[cfg(unix)]
+impl RuntimePoll for KeyProbe {
+    fn poll(&mut self) -> RuntimePollResult {
+        poll_runtime_key(self)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum TerminalQueryKind {
+    KittySupport,
+    CursorPosition,
+}
+
+#[cfg(unix)]
+impl TerminalQueryKind {
+    fn fallback(self) -> Value {
+        match self {
+            Self::KittySupport => Value::bool(false),
+            Self::CursorPosition => Value::nil(),
+        }
+    }
+}
+
+#[cfg(unix)]
+struct TerminalQueryProbe {
+    key: KeyProbe,
+    deferred_bytes: Vec<u8>,
+    kind: TerminalQueryKind,
+    cpr_armed: bool,
+    deadline: std::time::Instant,
+}
+
+#[cfg(unix)]
+impl TerminalQueryProbe {
+    fn new(kind: TerminalQueryKind, timeout: Duration) -> Self {
+        let cpr_armed = matches!(kind, TerminalQueryKind::CursorPosition);
+        if cpr_armed {
+            EXPECT_CPR.with(|counter| counter.set(counter.get().saturating_add(1)));
+        }
+        Self {
+            key: KeyProbe::new(),
+            deferred_bytes: Vec::new(),
+            kind,
+            cpr_armed,
+            deadline: std::time::Instant::now() + timeout,
+        }
+    }
+
+    fn is_kind(value: &Value, kind: &str) -> bool {
+        value
+            .as_map_ref()
+            .and_then(|map| map.get(&Value::keyword("kind")).cloned())
+            == Some(Value::keyword(kind))
+    }
+
+    fn defer_completed_event(&mut self, bytes: Vec<u8>) -> Result<(), String> {
+        if bytes.len() > RUNTIME_KEY_BYTE_CAP.saturating_sub(self.deferred_bytes.len()) {
+            // `prepend` places each call before the previous one. Return the
+            // newest event first, then the earlier deferred bytes, so the next
+            // stdin consumer observes their original order.
+            self.key.lease.return_bytes(&bytes);
+            self.key.lease.return_bytes(&self.deferred_bytes);
+            self.deferred_bytes.clear();
+            self.key.terminal = true;
+            return Err(format!(
+                "terminal query: unrelated input exceeds the {RUNTIME_KEY_BYTE_CAP}-byte preservation cap"
+            ));
+        }
+        self.deferred_bytes.extend(bytes);
+        self.key.next_event();
+        Ok(())
+    }
+
+    fn requeue_preserved_input(&mut self) {
+        let partial = std::mem::take(&mut self.key.bytes);
+        self.key.terminal = true;
+        // Return the partial suffix first because each prepend call inserts at
+        // the front. Deferred complete events must be observed before it.
+        self.key.lease.return_bytes(&partial);
+        self.key.lease.return_bytes(&self.deferred_bytes);
+        self.deferred_bytes.clear();
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalQueryProbe {
+    fn drop(&mut self) {
+        self.requeue_preserved_input();
+        if self.cpr_armed {
+            EXPECT_CPR.with(|counter| counter.set(counter.get().saturating_sub(1)));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Trace for TerminalQueryProbe {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        self.key.trace(sink)
+    }
+}
+
+#[cfg(unix)]
+impl RuntimePoll for TerminalQueryProbe {
+    fn poll(&mut self) -> RuntimePollResult {
+        loop {
+            let Some(remaining) = self
+                .deadline
+                .checked_duration_since(std::time::Instant::now())
+            else {
+                return RuntimePollResult::Ready(self.kind.fallback());
+            };
+            if remaining.is_zero() {
+                return RuntimePollResult::Ready(self.kind.fallback());
+            }
+            match self.key.poll() {
+                RuntimePollResult::Ready(value) if value.is_nil() => {
+                    return RuntimePollResult::Ready(self.kind.fallback());
+                }
+                RuntimePollResult::Ready(value) => {
+                    let bytes = self.key.take_completed_bytes();
+                    match self.kind {
+                        TerminalQueryKind::KittySupport if Self::is_kind(&value, "kitty-flags") => {
+                            return RuntimePollResult::Ready(Value::bool(true));
+                        }
+                        TerminalQueryKind::KittySupport
+                            if Self::is_kind(&value, "device-attributes") =>
+                        {
+                            return RuntimePollResult::Ready(Value::bool(false));
+                        }
+                        TerminalQueryKind::CursorPosition if Self::is_kind(&value, "cpr") => {
+                            self.cpr_armed = false;
+                            return RuntimePollResult::Ready(value);
+                        }
+                        _ => {
+                            if let Err(message) = self.defer_completed_event(bytes) {
+                                return RuntimePollResult::Failed(message);
+                            }
+                        }
+                    }
+                }
+                RuntimePollResult::Failed(message) => {
+                    return RuntimePollResult::Failed(message);
+                }
+                RuntimePollResult::PendingAfter(delay) => {
+                    return RuntimePollResult::PendingAfter(delay.min(remaining));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn run_terminal_query_value(
+    kind: TerminalQueryKind,
+    timeout: Duration,
 ) -> Result<Value, SemaError> {
-    let timeout = std::time::Duration::from_millis(timeout_ms);
-    let handle = std::rc::Rc::new(sema_core::IoHandle::new(move || match ready() {
-        Some(Ok(v)) => sema_core::IoPoll::Ready(Ok(v)),
-        Some(Err(e)) => sema_core::IoPoll::Ready(Err(e)),
-        None if started.elapsed() >= timeout => sema_core::IoPoll::Ready(Ok(Value::nil())),
-        None => sema_core::IoPoll::Pending,
-    }));
-    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
-    Ok(Value::nil())
+    let mut probe = TerminalQueryProbe::new(kind, timeout);
+    loop {
+        match probe.poll() {
+            RuntimePollResult::Ready(value) => return Ok(value),
+            RuntimePollResult::Failed(message) => return Err(SemaError::eval(message)),
+            RuntimePollResult::PendingAfter(delay) => std::thread::sleep(delay),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn terminal_query_runtime(kind: TerminalQueryKind) -> NativeResult {
+    terminal_query_runtime_with_timeout(kind, Duration::from_millis(200))
+}
+
+#[cfg(unix)]
+fn terminal_query_runtime_with_timeout(kind: TerminalQueryKind, timeout: Duration) -> NativeResult {
+    await_runtime_indefinitely(Box::new(TerminalQueryProbe::new(kind, timeout)))
+}
+
+/// Synchronous value-ABI body for `io/read-key-timeout` using the shared stdin
+/// owner. The cooperative path lives in the runtime ABI
+/// ([`register_read_key_timeout`]).
+#[cfg(unix)]
+fn read_key_timeout_value(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "io/read-key-timeout", 1);
+    let ms = args[0]
+        .as_int()
+        .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))? as u64;
+
+    read_key_from_owner(Some(Duration::from_millis(ms)))
+}
+
+#[cfg(unix)]
+fn read_key_from_owner(timeout: Option<Duration>) -> Result<Value, SemaError> {
+    let started = std::time::Instant::now();
+    let mut probe = KeyProbe::new();
+    loop {
+        match poll_runtime_key(&mut probe) {
+            RuntimePollResult::Ready(value) => return Ok(value),
+            RuntimePollResult::Failed(message) => return Err(SemaError::eval(message)),
+            RuntimePollResult::PendingAfter(delay) => {
+                let sleep = if let Some(timeout) = timeout {
+                    let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+                        return Ok(Value::nil());
+                    };
+                    if remaining.is_zero() {
+                        return Ok(Value::nil());
+                    }
+                    delay.min(remaining)
+                } else {
+                    delay
+                };
+                std::thread::sleep(sleep);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn read_key_value(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "io/read-key", 0);
+    read_key_from_owner(None)
+}
+
+#[cfg(unix)]
+fn register_read_key(env: &sema_core::Env) {
+    crate::register_runtime_fn(env, "io/read-key", |args| {
+        if sema_core::in_runtime_quantum() {
+            check_arity!(args, "io/read-key", 0);
+            return await_runtime_indefinitely(Box::new(KeyProbe::new()));
+        }
+        read_key_value(args).map(NativeOutcome::Return)
+    });
+}
+
+/// Register `io/read-key-timeout` dual-ABI: the value body is synchronous; the
+/// runtime body uses structural timer wakes so a "key OR agent progress" loop
+/// overlaps sibling tasks.
+#[cfg(unix)]
+fn register_read_key_timeout(env: &sema_core::Env) {
+    env.set(
+        sema_core::intern("io/read-key-timeout"),
+        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
+            "io/read-key-timeout",
+            read_key_timeout_value,
+            |_ctx, args| {
+                if sema_core::in_runtime_quantum() {
+                    check_arity!(args, "io/read-key-timeout", 1);
+                    let ms = args[0]
+                        .as_int()
+                        .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?
+                        as u64;
+                    let started = std::time::Instant::now();
+                    return await_runtime_until(Box::new(KeyProbe::new()), started, ms);
+                }
+                read_key_timeout_value(args).map(NativeOutcome::Return)
+            },
+        )),
+    );
 }
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
@@ -1438,58 +2576,64 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         Ok(Value::nil())
     });
 
-    crate::register_fn_path_gated(env, sandbox, Caps::FS_READ, "file/read", &[0], |args| {
+    crate::register_runtime_fn_path_gated(env, sandbox, Caps::FS_READ, "file/read", &[0], |args| {
         check_arity!(args, "file/read", 1);
         let path = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         if let Some(data) = sema_core::vfs::vfs_read(path) {
             return String::from_utf8(data)
-                .map(Value::string_owned)
-                .map_err(|e| {
-                    SemaError::Io(format!("file/read {path}: invalid UTF-8 in VFS: {e}"))
-                });
+                .map_err(|e| SemaError::Io(format!("file/read {path}: invalid UTF-8 in VFS: {e}")))
+                .map(|s| NativeOutcome::Return(Value::string_owned(s)));
         }
-        if sema_core::in_async_context() {
+        if sema_core::in_runtime_quantum() {
+            admit_regular_file("file/read", path)?;
+            fs_byte_cap_check("file/read", path)?;
             let path = path.to_string();
-            return fs_offload(
-                move || {
-                    std::fs::read_to_string(&path)
-                        .map_err(|e| fs_io_msg(format!("file/read {path}: {e}")))
-                },
-                Value::string_owned,
-            );
+            return fs_quarantined("file/read", Value::string_owned, move || {
+                std::fs::read_to_string(&path).map_err(|e| format!("file/read {path}: {e}"))
+            });
         }
         let content = std::fs::read_to_string(path)
             .map_err(|e| SemaError::Io(format!("file/read {path}: {e}")))?;
-        Ok(Value::string_owned(content))
+        Ok(NativeOutcome::Return(Value::string_owned(content)))
     });
 
-    crate::register_fn_path_gated(env, sandbox, Caps::FS_WRITE, "file/write", &[0], |args| {
-        check_arity!(args, "file/write", 2);
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let content = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        if sema_core::in_async_context() {
-            let path = path.to_string();
-            let content = content.to_string();
-            return fs_offload(
-                move || {
-                    std::fs::write(&path, &content)
-                        .map_err(|e| fs_io_msg(format!("file/write {path}: {e}")))
-                },
-                |()| Value::nil(),
-            );
-        }
-        std::fs::write(path, content)
-            .map_err(|e| SemaError::Io(format!("file/write {path}: {e}")))?;
-        Ok(Value::nil())
-    });
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::FS_WRITE,
+        "file/write",
+        &[0],
+        |args| {
+            check_arity!(args, "file/write", 2);
+            let path = args[0]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            let content = args[1]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+            if sema_core::in_runtime_quantum() {
+                admit_regular_file("file/write", path)?;
+                fs_write_cap_check("file/write", content.len())?;
+                let path = path.to_string();
+                let content = content.to_string();
+                return fs_quarantined(
+                    "file/write",
+                    |()| Value::nil(),
+                    move || {
+                        std::fs::write(&path, &content)
+                            .map_err(|e| format!("file/write {path}: {e}"))
+                    },
+                );
+            }
+            std::fs::write(path, content)
+                .map_err(|e| SemaError::Io(format!("file/write {path}: {e}")))?;
+            Ok(NativeOutcome::Return(Value::nil()))
+        },
+    );
 
-    crate::register_fn_path_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         Caps::FS_READ,
@@ -1501,25 +2645,23 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
             if let Some(data) = sema_core::vfs::vfs_read(path) {
-                return Ok(Value::bytevector(data));
+                return Ok(NativeOutcome::Return(Value::bytevector(data)));
             }
-            if sema_core::in_async_context() {
+            if sema_core::in_runtime_quantum() {
+                admit_regular_file("file/read-bytes", path)?;
+                fs_byte_cap_check("file/read-bytes", path)?;
                 let path = path.to_string();
-                return fs_offload(
-                    move || {
-                        std::fs::read(&path)
-                            .map_err(|e| fs_io_msg(format!("file/read-bytes {path}: {e}")))
-                    },
-                    Value::bytevector,
-                );
+                return fs_quarantined("file/read-bytes", Value::bytevector, move || {
+                    std::fs::read(&path).map_err(|e| format!("file/read-bytes {path}: {e}"))
+                });
             }
             let bytes = std::fs::read(path)
                 .map_err(|e| SemaError::Io(format!("file/read-bytes {path}: {e}")))?;
-            Ok(Value::bytevector(bytes))
+            Ok(NativeOutcome::Return(Value::bytevector(bytes)))
         },
     );
 
-    crate::register_fn_path_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         Caps::FS_WRITE,
@@ -1533,62 +2675,61 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             let bv = args[1]
                 .as_bytevector()
                 .ok_or_else(|| SemaError::type_error("bytevector", args[1].type_name()))?;
-            if sema_core::in_async_context() {
+            if sema_core::in_runtime_quantum() {
+                admit_regular_file("file/write-bytes", path)?;
+                fs_write_cap_check("file/write-bytes", bv.len())?;
                 let path = path.to_string();
                 let bv = bv.to_vec();
-                return fs_offload(
+                return fs_quarantined(
+                    "file/write-bytes",
+                    |()| Value::nil(),
                     move || {
                         std::fs::write(&path, &bv)
-                            .map_err(|e| fs_io_msg(format!("file/write-bytes {path}: {e}")))
+                            .map_err(|e| format!("file/write-bytes {path}: {e}"))
                     },
-                    |()| Value::nil(),
                 );
             }
             std::fs::write(path, bv)
                 .map_err(|e| SemaError::Io(format!("file/write-bytes {path}: {e}")))?;
-            Ok(Value::nil())
+            Ok(NativeOutcome::Return(Value::nil()))
         },
     );
 
-    crate::register_fn_path_gated(env, sandbox, Caps::FS_READ, "file/exists?", &[0], |args| {
-        check_arity!(args, "file/exists?", 1);
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        if let Some(exists) = sema_core::vfs::vfs_exists(path) {
-            if exists {
-                return Ok(Value::bool(true));
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::FS_READ,
+        "file/exists?",
+        &[0],
+        |args| {
+            check_arity!(args, "file/exists?", 1);
+            let path = args[0]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            if let Some(exists) = sema_core::vfs::vfs_exists(path) {
+                if exists {
+                    return Ok(NativeOutcome::Return(Value::bool(true)));
+                }
             }
-        }
-        if sema_core::in_async_context() {
-            let path = path.to_string();
-            return fs_offload(
-                move || Ok(std::path::Path::new(&path).exists()),
-                Value::bool,
-            );
-        }
-        Ok(Value::bool(std::path::Path::new(path).exists()))
-    });
+            if sema_core::in_runtime_quantum() {
+                let path = path.to_string();
+                return fs_quarantined("file/exists?", Value::bool, move || {
+                    Ok(std::path::Path::new(&path).exists())
+                });
+            }
+            Ok(NativeOutcome::Return(Value::bool(
+                std::path::Path::new(path).exists(),
+            )))
+        },
+    );
 
-    register_fn(env, "read-line", |args| {
-        check_arity!(args, "read-line", 0);
-        let mut input = String::new();
-        let n = std::io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| SemaError::Io(format!("read-line: {e}")))?;
-        if n == 0 {
-            // EOF: stdin was closed (piped input exhausted or Ctrl-D in raw mode)
-            STDIN_EOF.with(|f| f.set(true));
-            return Ok(Value::nil());
+    crate::register_runtime_fn(env, "read-line", |args| {
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_runtime_quantum() {
+            check_arity!(args, "read-line", 0);
+            return crate::stream::stdin_text_line("read-line");
         }
-        // Remove trailing newline
-        if input.ends_with('\n') {
-            input.pop();
-            if input.ends_with('\r') {
-                input.pop();
-            }
-        }
-        Ok(Value::string_owned(input))
+        read_line_value(args).map(NativeOutcome::Return)
     });
 
     register_fn(env, "read", |args| {
@@ -1648,14 +2789,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             file.write_all(content.as_bytes())
                 .map_err(|e| format!("file/append {path}: {e}"))
         }
-        if sema_core::in_async_context() {
-            let path = path.to_string();
-            let content = content.to_string();
-            return fs_offload(
-                move || append_impl(&path, &content).map_err(fs_io_msg),
-                |()| Value::nil(),
-            );
-        }
         append_impl(path, content).map_err(SemaError::Io)?;
         Ok(Value::nil())
     });
@@ -1665,16 +2798,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let path = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        if sema_core::in_async_context() {
-            let path = path.to_string();
-            return fs_offload(
-                move || {
-                    std::fs::remove_file(&path)
-                        .map_err(|e| fs_io_msg(format!("file/delete {path}: {e}")))
-                },
-                |()| Value::nil(),
-            );
-        }
         std::fs::remove_file(path)
             .map_err(|e| SemaError::Io(format!("file/delete {path}: {e}")))?;
         Ok(Value::nil())
@@ -1694,24 +2817,13 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             let to = args[1]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-            if sema_core::in_async_context() {
-                let from = from.to_string();
-                let to = to.to_string();
-                return fs_offload(
-                    move || {
-                        std::fs::rename(&from, &to)
-                            .map_err(|e| fs_io_msg(format!("file/rename {from} -> {to}: {e}")))
-                    },
-                    |()| Value::nil(),
-                );
-            }
             std::fs::rename(from, to)
                 .map_err(|e| SemaError::Io(format!("file/rename {from} -> {to}: {e}")))?;
             Ok(Value::nil())
         },
     );
 
-    crate::register_fn_path_gated(env, sandbox, Caps::FS_READ, "file/list", &[0], |args| {
+    crate::register_runtime_fn_path_gated(env, sandbox, Caps::FS_READ, "file/list", &[0], |args| {
         check_arity!(args, "file/list", 1);
         let path = args[0]
             .as_str()
@@ -1724,19 +2836,35 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             }
             Ok(entries)
         }
-        if sema_core::in_async_context() {
+        fn list_to_value(entries: Vec<String>) -> Value {
+            Value::list(entries.into_iter().map(|s| Value::string(&s)).collect())
+        }
+        if sema_core::in_runtime_quantum() {
+            // The entry cap is fixed BEFORE dispatch and stored in the job; the
+            // worker aborts with a named bound-exceeded error if the directory
+            // holds more, so the quarantined job never allocates unboundedly.
+            let cap = FS_LIST_CAP.load(AtomicOrdering::SeqCst);
             let path = path.to_string();
-            return fs_offload(
-                move || list_impl(&path).map_err(fs_io_msg),
-                |entries: Vec<String>| {
-                    Value::list(entries.into_iter().map(|s| Value::string(&s)).collect())
-                },
-            );
+            return fs_quarantined("file/list", list_to_value, move || {
+                let mut entries = Vec::new();
+                for entry in
+                    std::fs::read_dir(&path).map_err(|e| format!("file/list {path}: {e}"))?
+                {
+                    let entry = entry.map_err(|e| format!("file/list {path}: {e}"))?;
+                    if entries.len() as u64 >= cap {
+                        return Err(format!(
+                            "file/list {path}: directory exceeds the {cap}-entry quarantined list cap"
+                        ));
+                    }
+                    entries.push(entry.file_name().to_string_lossy().into_owned());
+                }
+                Ok(entries)
+            });
         }
         let entries = list_impl(path).map_err(SemaError::Io)?;
-        Ok(Value::list(
+        Ok(NativeOutcome::Return(Value::list(
             entries.into_iter().map(|s| Value::string(&s)).collect(),
-        ))
+        )))
     });
 
     crate::register_fn_path_gated(env, sandbox, Caps::FS_WRITE, "file/mkdir", &[0], |args| {
@@ -1744,16 +2872,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let path = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        if sema_core::in_async_context() {
-            let path = path.to_string();
-            return fs_offload(
-                move || {
-                    std::fs::create_dir_all(&path)
-                        .map_err(|e| fs_io_msg(format!("file/mkdir {path}: {e}")))
-                },
-                |()| Value::nil(),
-            );
-        }
         std::fs::create_dir_all(path)
             .map_err(|e| SemaError::Io(format!("file/mkdir {path}: {e}")))?;
         Ok(Value::nil())
@@ -1770,13 +2888,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             let path = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            if sema_core::in_async_context() {
-                let path = path.to_string();
-                return fs_offload(
-                    move || Ok(std::path::Path::new(&path).is_dir()),
-                    Value::bool,
-                );
-            }
             Ok(Value::bool(std::path::Path::new(path).is_dir()))
         },
     );
@@ -1786,13 +2897,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let path = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        if sema_core::in_async_context() {
-            let path = path.to_string();
-            return fs_offload(
-                move || Ok(std::path::Path::new(&path).is_file()),
-                Value::bool,
-            );
-        }
         Ok(Value::bool(std::path::Path::new(path).is_file()))
     });
 
@@ -1807,18 +2911,11 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             let path = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            if sema_core::in_async_context() {
-                let path = path.to_string();
-                return fs_offload(
-                    move || Ok(std::path::Path::new(&path).is_symlink()),
-                    Value::bool,
-                );
-            }
             Ok(Value::bool(std::path::Path::new(path).is_symlink()))
         },
     );
 
-    crate::register_fn_path_gated(env, sandbox, Caps::FS_READ, "file/info", &[0], |args| {
+    crate::register_runtime_fn_path_gated(env, sandbox, Caps::FS_READ, "file/info", &[0], |args| {
         check_arity!(args, "file/info", 1);
         let path = args[0]
             .as_str()
@@ -1847,12 +2944,12 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             }
             Value::map(map)
         }
-        if sema_core::in_async_context() {
+        if sema_core::in_runtime_quantum() {
             let path = path.to_string();
-            return fs_offload(move || info_impl(&path).map_err(fs_io_msg), info_to_value);
+            return fs_quarantined("file/info", info_to_value, move || info_impl(&path));
         }
         let info = info_impl(path).map_err(SemaError::Io)?;
-        Ok(info_to_value(info))
+        Ok(NativeOutcome::Return(info_to_value(info)))
     });
 
     register_fn(env, "path/join", |args| {
@@ -1876,17 +2973,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let s = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        if sema_core::in_async_context() {
-            let s = s.to_string();
-            return fs_offload(
-                move || {
-                    std::fs::canonicalize(&s)
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .map_err(|e| fs_io_msg(format!("path/absolute {s}: {e}")))
-                },
-                Value::string_owned,
-            );
-        }
         let abs = std::fs::canonicalize(s)
             .map_err(|e| SemaError::Io(format!("path/absolute {s}: {e}")))?;
         Ok(Value::string(&abs.to_string_lossy()))
@@ -1913,15 +2999,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                         .collect()
                 })
                 .map_err(|e| format!("file/glob: {e}"))
-        }
-        if sema_core::in_async_context() {
-            let pattern = pattern.to_string();
-            return fs_offload(
-                move || glob_impl(&pattern).map_err(fs_io_msg),
-                |entries: Vec<String>| {
-                    Value::list(entries.into_iter().map(|s| Value::string(&s)).collect())
-                },
-            );
         }
         let items = glob_impl(pattern)
             .map_err(SemaError::Io)?
@@ -1977,17 +3054,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             let s = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            if sema_core::in_async_context() {
-                let s = s.to_string();
-                return fs_offload(
-                    move || {
-                        std::fs::canonicalize(&s)
-                            .map(|p| p.to_string_lossy().into_owned())
-                            .map_err(|e| fs_io_msg(format!("path/canonicalize {s}: {e}")))
-                    },
-                    Value::string_owned,
-                );
-            }
             let c = std::fs::canonicalize(s)
                 .map_err(|e| SemaError::Io(format!("path/canonicalize {s}: {e}")))?;
             Ok(Value::string(&c.to_string_lossy()))
@@ -2057,16 +3123,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     SemaError::Io(format!("file/read-lines {path}: invalid UTF-8 in VFS: {e}"))
                 })?
             } else {
-                if sema_core::in_async_context() {
-                    let path = path.to_string();
-                    return fs_offload(
-                        move || {
-                            std::fs::read_to_string(&path)
-                                .map_err(|e| fs_io_msg(format!("file/read-lines {path}: {e}")))
-                        },
-                        |content| Value::list(content.lines().map(Value::string).collect()),
-                    );
-                }
                 std::fs::read_to_string(path)
                     .map_err(|e| SemaError::Io(format!("file/read-lines {path}: {e}")))?
             };
@@ -2075,7 +3131,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         },
     );
 
-    crate::register_fn_path_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         Caps::FS_READ,
@@ -2083,39 +3139,13 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[0],
         |args| {
             check_arity!(args, "file/for-each-line", 2);
+            if sema_core::in_runtime_quantum() {
+                return file_line_runtime(args, FileLineKind::ForEachText);
+            }
             let path = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
             let func = args[1].clone();
-            if sema_core::in_async_context() {
-                let path_s = path.to_string();
-                let func_async = func.clone();
-                // Snapshot the callback's captured upvalues NOW, while this
-                // native's task VM is still current: the per-line callback runs
-                // from a deferred I/O poll AFTER this task suspends, by which
-                // point its stack is inactive and the upvalues would read nil.
-                sema_vm::snapshot_escaping_closure(&func_async);
-                return async_stream_lines::<String>(
-                    "file/for-each-line",
-                    path_s,
-                    read_line_chunk_str,
-                    move |lines| {
-                        sema_core::with_stdlib_ctx(|ctx| {
-                            for line in &lines {
-                                // Run synchronously on a foreign VM (NOT the inline-task
-                                // path): the scheduler is already taken driving this poll.
-                                sema_vm::run_closure_foreign_sync(
-                                    &func_async,
-                                    ctx,
-                                    &[Value::string(line)],
-                                )?;
-                            }
-                            Ok(())
-                        })
-                    },
-                    Value::nil,
-                );
-            }
             let file = std::fs::File::open(path)
                 .map_err(|e| SemaError::Io(format!("file/for-each-line {path}: {e}")))?;
             let mut reader = std::io::BufReader::new(file);
@@ -2138,12 +3168,12 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     }
                     sema_core::call_callback(ctx, &func, &[Value::string(&line_buf)])?;
                 }
-                Ok(Value::nil())
+                Ok(NativeOutcome::Return(Value::nil()))
             })
         },
     );
 
-    crate::register_fn_path_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         Caps::FS_READ,
@@ -2151,40 +3181,14 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[0],
         |args| {
             check_arity!(args, "file/fold-lines", 3);
+            if sema_core::in_runtime_quantum() {
+                return file_line_runtime(args, FileLineKind::FoldText);
+            }
             let path = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
             let func = args[1].clone();
             let mut acc = args[2].clone();
-            if sema_core::in_async_context() {
-                let path_s = path.to_string();
-                let func_async = func.clone();
-                // See file/for-each-line: snapshot upvalues before yielding.
-                sema_vm::snapshot_escaping_closure(&func_async);
-                let acc_cell = std::rc::Rc::new(std::cell::RefCell::new(acc.clone()));
-                let acc_for_finish = acc_cell.clone();
-                return async_stream_lines::<String>(
-                    "file/fold-lines",
-                    path_s,
-                    read_line_chunk_str,
-                    move |lines| {
-                        sema_core::with_stdlib_ctx(|ctx| {
-                            for line in lines {
-                                let acc = acc_cell.borrow().clone();
-                                // Synchronous foreign-VM call (see for-each-line).
-                                let new_acc = sema_vm::run_closure_foreign_sync(
-                                    &func_async,
-                                    ctx,
-                                    &[acc, Value::string(&line)],
-                                )?;
-                                *acc_cell.borrow_mut() = new_acc;
-                            }
-                            Ok(())
-                        })
-                    },
-                    move || acc_for_finish.borrow().clone(),
-                );
-            }
             let file = std::fs::File::open(path)
                 .map_err(|e| SemaError::Io(format!("file/fold-lines {path}: {e}")))?;
             // 256KB buffer (vs default 8KB) improves throughput for large file reads.
@@ -2215,12 +3219,12 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     let mut cb_args = [std::mem::replace(&mut acc, Value::nil()), line_val];
                     acc = sema_core::call_callback_owned(ctx, &func, &mut cb_args)?;
                 }
-                Ok(acc)
+                Ok(NativeOutcome::Return(acc))
             })
         },
     );
 
-    crate::register_fn_path_gated(
+    crate::register_runtime_fn_path_gated(
         env,
         sandbox,
         Caps::FS_READ,
@@ -2228,40 +3232,14 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[0],
         |args| {
             check_arity!(args, "file/fold-lines-bytes", 3);
+            if sema_core::in_runtime_quantum() {
+                return file_line_runtime(args, FileLineKind::FoldBytes);
+            }
             let path = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
             let func = args[1].clone();
             let mut acc = args[2].clone();
-            if sema_core::in_async_context() {
-                let path_s = path.to_string();
-                let func_async = func.clone();
-                // See file/for-each-line: snapshot upvalues before yielding.
-                sema_vm::snapshot_escaping_closure(&func_async);
-                let acc_cell = std::rc::Rc::new(std::cell::RefCell::new(acc.clone()));
-                let acc_for_finish = acc_cell.clone();
-                return async_stream_lines::<Vec<u8>>(
-                    "file/fold-lines-bytes",
-                    path_s,
-                    read_line_chunk_bytes,
-                    move |lines| {
-                        sema_core::with_stdlib_ctx(|ctx| {
-                            for line in lines {
-                                let acc = acc_cell.borrow().clone();
-                                // Synchronous foreign-VM call (see for-each-line).
-                                let new_acc = sema_vm::run_closure_foreign_sync(
-                                    &func_async,
-                                    ctx,
-                                    &[acc, Value::bytevector(line)],
-                                )?;
-                                *acc_cell.borrow_mut() = new_acc;
-                            }
-                            Ok(())
-                        })
-                    },
-                    move || acc_for_finish.borrow().clone(),
-                );
-            }
             let file = std::fs::File::open(path)
                 .map_err(|e| SemaError::Io(format!("file/fold-lines-bytes {path}: {e}")))?;
             // 256KB buffer (vs default 8KB) improves throughput for large file reads.
@@ -2299,7 +3277,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     let mut cb_args = [std::mem::replace(&mut acc, Value::nil()), line_val];
                     acc = sema_core::call_callback_owned(ctx, &func, &mut cb_args)?;
                 }
-                Ok(acc)
+                Ok(NativeOutcome::Return(acc))
             })
         },
     );
@@ -2328,16 +3306,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 })
                 .collect();
             let content = strs.join("\n");
-            if sema_core::in_async_context() {
-                let path = path.to_string();
-                return fs_offload(
-                    move || {
-                        std::fs::write(&path, &content)
-                            .map_err(|e| fs_io_msg(format!("file/write-lines {path}: {e}")))
-                    },
-                    |()| Value::nil(),
-                );
-            }
             std::fs::write(path, content)
                 .map_err(|e| SemaError::Io(format!("file/write-lines {path}: {e}")))?;
             Ok(Value::nil())
@@ -2352,18 +3320,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let dest = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        if sema_core::in_async_context() {
-            let src = src.to_string();
-            let dest = dest.to_string();
-            return fs_offload(
-                move || {
-                    std::fs::copy(&src, &dest)
-                        .map(|_| ())
-                        .map_err(|e| fs_io_msg(format!("file/copy {src} -> {dest}: {e}")))
-                },
-                |()| Value::nil(),
-            );
-        }
         std::fs::copy(src, dest)
             .map_err(|e| SemaError::Io(format!("file/copy {src} -> {dest}: {e}")))?;
         Ok(Value::nil())
@@ -2401,14 +3357,13 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         Ok(Value::nil())
     });
 
-    register_fn(env, "read-stdin", |args| {
-        check_arity!(args, "read-stdin", 0);
-        let mut buf = String::new();
-        std::io::stdin()
-            .read_to_string(&mut buf)
-            .map_err(|e| SemaError::Io(format!("read-stdin: {e}")))?;
-        STDIN_EOF.with(|f| f.set(true));
-        Ok(Value::string_owned(buf))
+    crate::register_runtime_fn(env, "read-stdin", |args| {
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_runtime_quantum() {
+            check_arity!(args, "read-stdin", 0);
+            return crate::stream::stdin_text("read-stdin");
+        }
+        read_stdin_value(args).map(NativeOutcome::Return)
     });
 
     // io/flush — flush stdout
@@ -2431,54 +3386,71 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     {
         use std::io::IsTerminal;
 
+        // The raw-mode registry is INTERPRETER-SHARED: created once here, owned by
+        // the `io/tty-*` natives via `Rc`, and torn down by a weak interpreter hook.
+        let tty_registry = std::rc::Rc::new(TtyRegistry::new());
+
         // io/tty-raw! — put the controlling TTY into raw mode.
         // Returns a restore-token (integer) on success, nil if stdin is not a TTY.
-        register_fn(env, "io/tty-raw!", |args| {
-            check_arity!(args, "io/tty-raw!", 0);
-            if !std::io::stdin().is_terminal() {
-                return Ok(Value::nil());
-            }
-            // SAFETY: termios is a POD C struct; zero-init is the standard idiom.
-            // tcgetattr (called next) overwrites if successful; we short-circuit if it fails.
-            let mut orig: libc::termios = unsafe { std::mem::zeroed() };
-            if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut orig) } != 0 {
-                return Ok(Value::nil());
-            }
-            let id = TTY_COUNTER.with(|c| {
-                let n = c.get();
-                c.set(n + 1);
-                n
-            });
-            TTY_STORE.with(|s| s.borrow_mut().insert(id, orig));
-            let mut raw = orig;
-            unsafe { libc::cfmakeraw(&mut raw) };
-            raw.c_cc[libc::VMIN] = 1;
-            raw.c_cc[libc::VTIME] = 0;
-            if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
-                return Err(SemaError::eval(format!(
-                    "io/tty-raw!: tcsetattr failed: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            Ok(Value::int(id))
-        });
+        // The saved cooked-mode termios becomes a RESOURCE-OWNED guard: restored on
+        // an explicit `io/tty-restore!`, on cancellation of the task that entered
+        // raw mode, or on interpreter teardown — exactly once.
+        let raw_registry = std::rc::Rc::clone(&tty_registry);
+        env.set(
+            sema_core::intern("io/tty-raw!"),
+            Value::native_fn(NativeFn::with_ctx("io/tty-raw!", move |ctx, args| {
+                check_arity!(args, "io/tty-raw!", 0);
+                let (saved, real_tty) = if TTY_FORCE_CAPTURE_FOR_TEST.load(AtomicOrdering::SeqCst) {
+                    // Test capture: record a guard without touching fd 0.
+                    (unsafe { std::mem::zeroed::<libc::termios>() }, false)
+                } else {
+                    if !std::io::stdin().is_terminal() {
+                        return Ok(Value::nil());
+                    }
+                    // SAFETY: termios is a POD C struct; zero-init is the standard idiom.
+                    // tcgetattr overwrites on success; we short-circuit if it fails.
+                    let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+                    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut orig) } != 0 {
+                        return Ok(Value::nil());
+                    }
+                    let mut raw = orig;
+                    unsafe { libc::cfmakeraw(&mut raw) };
+                    raw.c_cc[libc::VMIN] = 1;
+                    raw.c_cc[libc::VTIME] = 0;
+                    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } != 0 {
+                        return Err(SemaError::eval(format!(
+                            "io/tty-raw!: tcsetattr failed: {}",
+                            std::io::Error::last_os_error()
+                        )));
+                    }
+                    (orig, true)
+                };
+                let guard = std::rc::Rc::new(RawModeGuard {
+                    saved,
+                    real_tty,
+                    restored: Cell::new(false),
+                });
+                let id = raw_registry.enter(std::rc::Rc::clone(&guard));
+                raw_registry.ensure_teardown_hook(ctx);
+                // Inside a runtime quantum the task context is installed; register
+                // the guard for cancellation cleanup on the owning task.
+                if let Some(handle) = ctx.task_context() {
+                    attach_raw_mode_task_guard(&handle, guard);
+                }
+                Ok(Value::int(id))
+            })),
+        );
 
         // io/tty-restore! — restore the TTY to cooked mode using the given restore-token.
-        register_fn(env, "io/tty-restore!", |args| {
+        // Idempotent with the cancellation/teardown guard paths (a token already
+        // restored, or never issued, is a no-op).
+        let restore_registry = std::rc::Rc::clone(&tty_registry);
+        register_fn(env, "io/tty-restore!", move |args| {
             check_arity!(args, "io/tty-restore!", 1);
             let id = args[0]
                 .as_int()
                 .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?;
-            TTY_STORE.with(|s| {
-                if let Some(orig) = s.borrow_mut().remove(&id) {
-                    if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &orig) } != 0 {
-                        eprintln!(
-                            "io/tty-restore!: tcsetattr failed: {}",
-                            std::io::Error::last_os_error()
-                        );
-                    }
-                }
-            });
+            restore_registry.restore_token(id);
             Ok(Value::nil())
         });
 
@@ -2489,102 +3461,38 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         //   {:kind :ctrl   :char "c"}         Ctrl-C (ctrl + letter)
         //   {:kind :key    :name :enter}      named key (:enter :backspace :tab :esc :up …)
         //   {:kind :alt    :char "x"}         Alt + character
-        register_fn(env, "io/read-key", |args| {
-            check_arity!(args, "io/read-key", 0);
-
-            // In an async task, the raw `libc::read(STDIN)` below blocks the
-            // single cooperative VM thread with no timeout — worse than
-            // `io/read-key-timeout`, which at least bounds the stall. Reuse the
-            // same cooperative park (`await_io_until` + `unix_stdin_ready(0)`
-            // polling), just with an effectively unbounded timeout so it waits
-            // for a key exactly like the sync path, without blocking siblings.
-            // The sync path below is byte-identical to before.
-            if sema_core::in_async_context() {
-                if let Some(v) = sema_core::take_resume_value() {
-                    return Ok(v);
-                }
-                let started = std::time::Instant::now();
-                return await_io_until(started, u64::MAX, || {
-                    if !unix_stdin_ready(0) {
-                        return None;
-                    }
-                    match parse_key_input() {
-                        Ok(Some(v)) => Some(Ok(v)),
-                        Ok(None) => {
-                            STDIN_EOF.with(|f| f.set(true));
-                            Some(Ok(Value::nil()))
-                        }
-                        Err(e) => Some(Err(e.to_string())),
-                    }
-                });
-            }
-
-            match parse_key_input()? {
-                None => {
-                    STDIN_EOF.with(|f| f.set(true));
-                    Ok(Value::nil())
-                }
-                Some(v) => Ok(v),
-            }
-        });
+        register_read_key(env);
 
         // io/read-key-timeout — like io/read-key but returns nil if no key arrives within
         // `timeout-ms` milliseconds.
-        register_fn(env, "io/read-key-timeout", |args| {
-            check_arity!(args, "io/read-key-timeout", 1);
-            let ms = args[0]
-                .as_int()
-                .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?
-                as u64;
-
-            // In an async task, park on a cooperative poll instead of blocking the
-            // scheduler thread in `select(2)` for the whole timeout, so a "key OR
-            // agent progress" loop lets sibling tasks run while it waits. Once a
-            // first byte is ready `parse_key_input` may briefly block reading a
-            // multi-byte sequence — identical to the sync path — but the idle wait
-            // no longer does. The sync path below is byte-identical to before.
-            if sema_core::in_async_context() {
-                if let Some(v) = sema_core::take_resume_value() {
-                    return Ok(v);
-                }
-                let started = std::time::Instant::now();
-                return await_io_until(started, ms, || {
-                    if !unix_stdin_ready(0) {
-                        return None;
-                    }
-                    match parse_key_input() {
-                        Ok(Some(v)) => Some(Ok(v)),
-                        Ok(None) => {
-                            STDIN_EOF.with(|f| f.set(true));
-                            Some(Ok(Value::nil()))
-                        }
-                        Err(e) => Some(Err(e.to_string())),
-                    }
-                });
-            }
-
-            if !unix_stdin_ready(ms) {
-                return Ok(Value::nil());
-            }
-            match parse_key_input()? {
-                None => {
-                    STDIN_EOF.with(|f| f.set(true));
-                    Ok(Value::nil())
-                }
-                Some(v) => Ok(v),
-            }
-        });
+        register_read_key_timeout(env);
 
         // Capability probes (raw mode required; they round-trip a query + reply).
         // term/supports-kitty-keys? → bool via `CSI ?u` + DSR barrier.
-        register_fn(env, "term/supports-kitty-keys?", |args| {
+        crate::register_runtime_fn(env, "term/supports-kitty-keys?", |args| {
             check_arity!(args, "term/supports-kitty-keys?", 0);
-            Ok(Value::bool(probe_kitty_support()?))
+            if sema_core::in_runtime_quantum() {
+                if !stdin_is_tty() {
+                    return Ok(NativeOutcome::Return(Value::bool(false)));
+                }
+                write_stdout("\x1b[?u\x1b[c")?;
+                return terminal_query_runtime(TerminalQueryKind::KittySupport);
+            }
+            probe_kitty_support()
+                .map(Value::bool)
+                .map(NativeOutcome::Return)
         });
         // term/cursor-position → {:row :col} (or nil) via a DSR round-trip.
-        register_fn(env, "term/cursor-position", |args| {
+        crate::register_runtime_fn(env, "term/cursor-position", |args| {
             check_arity!(args, "term/cursor-position", 0);
-            query_cursor_position()
+            if sema_core::in_runtime_quantum() {
+                if !stdin_is_tty() {
+                    return Ok(NativeOutcome::Return(Value::nil()));
+                }
+                write_stdout("\x1b[6n")?;
+                return terminal_query_runtime(TerminalQueryKind::CursorPosition);
+            }
+            query_cursor_position().map(NativeOutcome::Return)
         });
         // term/query-cursor-position → write DSR and arm the CPR flag, so the
         // reply (arriving later via io/read-key) is decoded as :cpr rather than
@@ -2624,20 +3532,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let path = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        if sema_core::in_async_context() {
-            let path = path.to_string();
-            return fs_offload_parse(
-                move || {
-                    std::fs::read_to_string(&path)
-                        .map_err(|e| fs_io_msg(format!("load {path}: {e}")))
-                },
-                |content| {
-                    // Parsing/interning isn't `Send` — runs back on the VM thread.
-                    let exprs = sema_reader::read_many(&content)?;
-                    Ok(Value::list(exprs))
-                },
-            );
-        }
         let content = std::fs::read_to_string(path)
             .map_err(|e| SemaError::Io(format!("load {path}: {e}")))?;
         // Parse and return as a list of expressions for the caller to eval
@@ -2671,6 +3565,150 @@ fn register_log_fn(env: &sema_core::Env, name: &str, level: &'static str) {
             Ok(Value::nil())
         })),
     );
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod runtime_poll_tests {
+    use std::time::Instant;
+
+    use super::*;
+
+    struct PendingProbe;
+
+    impl Trace for PendingProbe {
+        fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+            true
+        }
+    }
+
+    impl RuntimePoll for PendingProbe {
+        fn poll(&mut self) -> RuntimePollResult {
+            RuntimePollResult::PendingAfter(Duration::from_millis(37))
+        }
+    }
+
+    #[test]
+    fn runtime_poll_pending_uses_structural_timer() {
+        let outcome = await_runtime_until(Box::new(PendingProbe), Instant::now(), 1_000)
+            .expect("pending probe suspends");
+
+        let NativeOutcome::Suspend(suspend) = outcome else {
+            panic!("pending probe must suspend");
+        };
+        match suspend.wait {
+            WaitKind::Timer(delay) => assert_eq!(delay, Duration::from_millis(37)),
+            WaitKind::External(_) => panic!("poll probe must not occupy an executor worker"),
+            _ => panic!("poll probe must use a structural timer"),
+        }
+    }
+
+    #[test]
+    fn runtime_poll_zero_timeout_returns_nil_immediately() {
+        let outcome = await_runtime_until(Box::new(PendingProbe), Instant::now(), 0)
+            .expect("zero-timeout probe returns");
+
+        let NativeOutcome::Return(value) = outcome else {
+            panic!("zero-timeout probe must not suspend");
+        };
+        assert!(value.is_nil());
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod file_line_trace_tests {
+    use super::*;
+
+    fn edge_count(trace: &dyn Trace) -> usize {
+        let mut count = 0;
+        assert!(trace.trace(&mut |_| count += 1));
+        count
+    }
+
+    #[test]
+    fn line_continuation_traces_callback_and_fold_accumulator() {
+        let continuation = FileLineContinuation {
+            kind: FileLineKind::FoldText,
+            path: "fixture".to_string(),
+            callback: Value::string("callback"),
+            result: FileLineResult::Fold(Value::string("accumulator")),
+            reader: None,
+            lines: std::collections::VecDeque::from([
+                FileLineItem::Text("raw-line".to_string()),
+                FileLineItem::Bytes(vec![1, 2, 3]),
+            ]),
+            eof: false,
+            terminal_error: None,
+            read_slot: Some(std::rc::Rc::new(std::cell::RefCell::new(None))),
+        };
+
+        assert_eq!(edge_count(&continuation), 2);
+    }
+
+    #[test]
+    fn line_decoder_holds_no_value_edges() {
+        let decoder = FileLineChunkDecoder {
+            op: "file/fold-lines",
+            slot: std::rc::Rc::new(std::cell::RefCell::new(None)),
+        };
+
+        assert_eq!(edge_count(&decoder), 0);
+    }
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sema-file-lines-{tag}-{nanos}"))
+    }
+
+    #[test]
+    fn line_chunk_is_bounded_by_line_count() {
+        let path = temp_path("count");
+        let contents: String = (0..261).map(|index| format!("line-{index}\n")).collect();
+        std::fs::write(&path, contents).expect("write line fixture");
+        let path_text = path.to_string_lossy();
+
+        let first = read_file_line_chunk("file/fold-lines", &path_text, None, false)
+            .expect("read first bounded chunk");
+        assert_eq!(first.lines.len(), 256);
+        assert!(!first.eof);
+        let second = read_file_line_chunk("file/fold-lines", &path_text, Some(first.reader), false)
+            .expect("read remaining lines");
+        assert_eq!(second.lines.len(), 5);
+        assert!(second.eof);
+
+        std::fs::remove_file(path).expect("remove line fixture");
+    }
+
+    #[test]
+    fn line_chunk_is_bounded_by_bytes() {
+        let path = temp_path("bytes");
+        let line = vec![b'x'; 130 * 1024];
+        let mut contents = Vec::with_capacity((line.len() + 1) * 3);
+        for _ in 0..3 {
+            contents.extend_from_slice(&line);
+            contents.push(b'\n');
+        }
+        std::fs::write(&path, contents).expect("write byte fixture");
+        let path_text = path.to_string_lossy();
+
+        let first = read_file_line_chunk("file/fold-lines-bytes", &path_text, None, true)
+            .expect("read first byte-bounded chunk");
+        assert_eq!(first.lines.len(), 1);
+        assert!(!first.eof);
+        let second = read_file_line_chunk(
+            "file/fold-lines-bytes",
+            &path_text,
+            Some(first.reader),
+            true,
+        )
+        .expect("read remaining byte line");
+        assert_eq!(second.lines.len(), 2);
+        assert!(second.eof);
+
+        std::fs::remove_file(path).expect("remove byte fixture");
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -2824,494 +3862,5 @@ mod input_decode_tests {
         assert!(is_kw(&plain, "kind", "char"));
         assert_eq!(kw(&plain, "char"), Some(Value::string("q")));
         assert_eq!(kw(&plain, "mods"), None); // bare key: no :mods key
-    }
-}
-
-/// Async-context coverage for the `file/*`/`path/*`/`load`/`io/read-key`
-/// scheduler-offload gates added to this file. `sema-stdlib` doesn't depend
-/// on `sema-vm`/`sema-eval` (the real scheduler + interpreter live there), so
-/// these tests stand in for the scheduler by hand: force
-/// `sema_core::in_async_context()` on, call the native, then poll the
-/// `AwaitIo` handle it arms to completion — exactly what the scheduler does
-/// in production, just single-threaded and synchronous here.
-#[cfg(test)]
-mod async_offload_tests {
-    use super::*;
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    use std::time::{Duration, Instant};
-
-    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
-    /// (even on panic/early return) so a failure can't leak the flag into
-    /// whichever test the harness runs next on the same worker thread —
-    /// mirrors `server.rs`'s `ResetAsyncContext` test guard.
-    struct AsyncCtxGuard;
-    impl Drop for AsyncCtxGuard {
-        fn drop(&mut self) {
-            sema_core::set_async_context(false);
-        }
-    }
-
-    /// A minimal `CallCallbackFn`: invokes a `Value` that must be a native
-    /// fn directly. Stands in for the full interpreter's call dispatch
-    /// (`sema-vm`/`sema-eval`) so the async path of `file/for-each-line` /
-    /// `file/fold-lines*` — which threads the Sema callback through
-    /// `sema_core::call_callback` on the VM thread — has something to call
-    /// in a unit test that has no interpreter.
-    fn invoke_native_value(
-        ctx: &sema_core::EvalContext,
-        func: &Value,
-        args: &[Value],
-    ) -> Result<Value, SemaError> {
-        let nf = func
-            .as_native_fn_ref()
-            .ok_or_else(|| SemaError::eval("test harness: callback must be a native fn"))?;
-        (nf.func)(ctx, args)
-    }
-
-    fn make_env() -> sema_core::Env {
-        let env = sema_core::Env::new();
-        register(&env, &sema_core::Sandbox::allow_all());
-        env
-    }
-
-    fn tmp_path(tag: &str) -> std::path::PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("sema-io-async-test-{tag}-{nanos}"))
-    }
-
-    /// Look up a registered native by name, returning a callable closure that
-    /// invokes it with a fresh `EvalContext` each time (mirroring how the VM
-    /// calls a native).
-    fn native(env: &sema_core::Env, name: &str) -> impl Fn(&[Value]) -> Result<Value, SemaError> {
-        let f = env
-            .get(sema_core::intern(name))
-            .unwrap_or_else(|| panic!("{name} not registered"));
-        move |args: &[Value]| {
-            let nf = f.as_native_fn_ref().expect("native fn");
-            let ctx = sema_core::EvalContext::new();
-            (nf.func)(&ctx, args)
-        }
-    }
-
-    fn call_sync(env: &sema_core::Env, name: &str, args: &[Value]) -> Value {
-        native(env, name)(args).expect("sync call ok")
-    }
-
-    /// Call a native fn with the async-context gate forced on, then drive the
-    /// `AwaitIo` handle it arms to completion by polling. Panics if the
-    /// native didn't yield at all (e.g. it silently took the sync fallback)
-    /// or the offload rejects.
-    fn drive_async(call: impl FnOnce() -> Result<Value, SemaError>) -> Value {
-        let _guard = AsyncCtxGuard;
-        sema_core::set_async_context(true);
-        let armed = call().expect("native call should arm a yield, not error synchronously");
-        assert_eq!(
-            armed,
-            Value::nil(),
-            "an offloading native returns nil immediately after arming its yield signal"
-        );
-        let reason = sema_core::take_yield_signal()
-            .expect("expected a yield signal to be armed — did the native take the sync path?");
-        let handle = match reason {
-            sema_core::YieldReason::AwaitIo(h) => h,
-            other => panic!("expected an AwaitIo yield, got {other:?}"),
-        };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match handle.poll() {
-                sema_core::IoPoll::Ready(Ok(v)) => return v,
-                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
-                sema_core::IoPoll::Pending => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "offload never completed within 10s"
-                    );
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
-        }
-    }
-
-    // ── Stateless fs_offload gates ─────────────────────────────────────
-
-    #[test]
-    fn file_mkdir_offloads_and_creates_dir_async() {
-        let env = make_env();
-        let dir = tmp_path("mkdir");
-        let dir_s = dir.to_string_lossy().to_string();
-        let result = drive_async(|| native(&env, "file/mkdir")(&[Value::string(&dir_s)]));
-        assert_eq!(result, Value::nil());
-        assert!(dir.is_dir());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Same native, sync path — confirms the added async gate left the
-    /// default (non-async) behavior byte-for-byte unchanged.
-    #[test]
-    fn file_mkdir_sync_path_unchanged() {
-        let env = make_env();
-        let dir = tmp_path("mkdir-sync");
-        let dir_s = dir.to_string_lossy().to_string();
-        let result = call_sync(&env, "file/mkdir", &[Value::string(&dir_s)]);
-        assert_eq!(result, Value::nil());
-        assert!(dir.is_dir());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn file_write_bytes_offloads_and_writes_async() {
-        let env = make_env();
-        let path = tmp_path("write-bytes.bin");
-        let path_s = path.to_string_lossy().to_string();
-        let content = b"hello async bytes".to_vec();
-        let result = drive_async(|| {
-            native(&env, "file/write-bytes")(&[
-                Value::string(&path_s),
-                Value::bytevector(content.clone()),
-            ])
-        });
-        assert_eq!(result, Value::nil());
-        assert_eq!(std::fs::read(&path).unwrap(), content);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn file_rename_offloads_async() {
-        let env = make_env();
-        let from = tmp_path("rename-from.txt");
-        let to = tmp_path("rename-to.txt");
-        std::fs::write(&from, "payload").unwrap();
-        let (from_s, to_s) = (
-            from.to_string_lossy().to_string(),
-            to.to_string_lossy().to_string(),
-        );
-        let result = drive_async(|| {
-            native(&env, "file/rename")(&[Value::string(&from_s), Value::string(&to_s)])
-        });
-        assert_eq!(result, Value::nil());
-        assert!(!from.exists());
-        assert_eq!(std::fs::read_to_string(&to).unwrap(), "payload");
-        let _ = std::fs::remove_file(&to);
-    }
-
-    #[test]
-    fn file_list_offloads_async() {
-        let env = make_env();
-        let dir = tmp_path("list");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.txt"), "a").unwrap();
-        std::fs::write(dir.join("b.txt"), "b").unwrap();
-        let dir_s = dir.to_string_lossy().to_string();
-        let result = drive_async(|| native(&env, "file/list")(&[Value::string(&dir_s)]));
-        let mut names: Vec<String> = result
-            .as_list()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap().to_string())
-            .collect();
-        names.sort();
-        assert_eq!(names, vec!["a.txt".to_string(), "b.txt".to_string()]);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn file_glob_offloads_async() {
-        let env = make_env();
-        let dir = tmp_path("glob");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.txt"), "a").unwrap();
-        std::fs::write(dir.join("b.log"), "b").unwrap();
-        let pattern = format!("{}/*.txt", dir.to_string_lossy());
-        let result = drive_async(|| native(&env, "file/glob")(&[Value::string(&pattern)]));
-        let list = result.as_list().unwrap();
-        assert_eq!(list.len(), 1);
-        assert!(list[0].as_str().unwrap().ends_with("a.txt"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn path_canonicalize_offloads_async_matches_sync() {
-        let env = make_env();
-        let dir = tmp_path("canon");
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir_s = dir.to_string_lossy().to_string();
-        let async_result =
-            drive_async(|| native(&env, "path/canonicalize")(&[Value::string(&dir_s)]));
-        let sync_result = call_sync(&env, "path/canonicalize", &[Value::string(&dir_s)]);
-        assert_eq!(async_result, sync_result);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn path_absolute_offloads_async_matches_sync() {
-        let env = make_env();
-        let dir = tmp_path("abs");
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir_s = dir.to_string_lossy().to_string();
-        let async_result = drive_async(|| native(&env, "path/absolute")(&[Value::string(&dir_s)]));
-        let sync_result = call_sync(&env, "path/absolute", &[Value::string(&dir_s)]);
-        assert_eq!(async_result, sync_result);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn stat_predicates_offload_async() {
-        let env = make_env();
-        let dir = tmp_path("stat");
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("f.txt");
-        std::fs::write(&file, "content").unwrap();
-        let dir_s = dir.to_string_lossy().to_string();
-        let file_s = file.to_string_lossy().to_string();
-
-        assert_eq!(
-            drive_async(|| native(&env, "file/is-directory?")(&[Value::string(&dir_s)])),
-            Value::bool(true)
-        );
-        assert_eq!(
-            drive_async(|| native(&env, "file/is-file?")(&[Value::string(&file_s)])),
-            Value::bool(true)
-        );
-        assert_eq!(
-            drive_async(|| native(&env, "file/is-symlink?")(&[Value::string(&file_s)])),
-            Value::bool(false)
-        );
-        assert_eq!(
-            drive_async(|| native(&env, "file/exists?")(&[Value::string(&file_s)])),
-            Value::bool(true)
-        );
-        let info = drive_async(|| native(&env, "file/info")(&[Value::string(&file_s)]));
-        let bt = info.as_map_ref().expect("map");
-        assert_eq!(
-            bt.get(&Value::keyword("size")).cloned(),
-            Some(Value::int(7))
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn file_write_lines_offloads_async() {
-        let env = make_env();
-        let path = tmp_path("write-lines.txt");
-        let path_s = path.to_string_lossy().to_string();
-        let lines = Value::list(vec![Value::string("a"), Value::string("b")]);
-        let result = drive_async(|| {
-            native(&env, "file/write-lines")(&[Value::string(&path_s), lines.clone()])
-        });
-        assert_eq!(result, Value::nil());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn load_offloads_read_and_parses_on_vm_thread_async() {
-        let env = make_env();
-        let path = tmp_path("load.sema");
-        std::fs::write(&path, "(+ 1 2) (list 3 4)").unwrap();
-        let path_s = path.to_string_lossy().to_string();
-        let result = drive_async(|| native(&env, "load")(&[Value::string(&path_s)]));
-        let exprs = result.as_list().expect("list of parsed exprs");
-        assert_eq!(exprs.len(), 2);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn load_offload_rejects_missing_file_like_sync() {
-        let env = make_env();
-        let path = tmp_path("does-not-exist.sema");
-        let path_s = path.to_string_lossy().to_string();
-        let _guard = AsyncCtxGuard;
-        sema_core::set_async_context(true);
-        let armed = native(&env, "load")(&[Value::string(&path_s)]).expect("arms a yield");
-        assert_eq!(armed, Value::nil());
-        let reason = sema_core::take_yield_signal().expect("yield armed");
-        let handle = match reason {
-            sema_core::YieldReason::AwaitIo(h) => h,
-            other => panic!("expected AwaitIo, got {other:?}"),
-        };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match handle.poll() {
-                sema_core::IoPoll::Ready(Err(msg)) => {
-                    assert!(msg.contains("load"), "error should name the op: {msg}");
-                    break;
-                }
-                sema_core::IoPoll::Ready(Ok(v)) => panic!("expected a rejection, got {v:?}"),
-                sema_core::IoPoll::Pending => {
-                    assert!(Instant::now() < deadline, "never completed within 10s");
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
-        }
-    }
-
-    // ── io/read-key: must yield, never block, in async context ─────────
-
-    /// No real/interactive stdin is available in a test process, so this only
-    /// asserts the property the offload exists to guarantee: the native
-    /// returns immediately with a yield ARMED (an `AwaitIo` the scheduler can
-    /// poll) instead of blocking the calling thread in the raw
-    /// `libc::read(STDIN)` forever.
-    #[cfg(unix)]
-    #[test]
-    fn io_read_key_arms_await_io_instead_of_blocking_in_async_context() {
-        let _guard = AsyncCtxGuard;
-        sema_core::set_async_context(true);
-        let env = make_env();
-        let result =
-            native(&env, "io/read-key")(&[]).expect("should return immediately (armed yield)");
-        assert_eq!(result, Value::nil());
-        let reason = sema_core::take_yield_signal().expect("expected an AwaitIo yield to be armed");
-        assert!(matches!(reason, sema_core::YieldReason::AwaitIo(_)));
-    }
-
-    // ── Line-streaming natives (chunked offload + VM-thread callback) ──
-
-    #[test]
-    fn read_line_chunk_str_strips_crlf_and_respects_line_budget() {
-        let path = tmp_path("chunk-str.txt");
-        let mut content = String::new();
-        for i in 0..(ASYNC_LINE_CHUNK_MAX_LINES + 5) {
-            content.push_str(&format!("l{i}\r\n"));
-        }
-        std::fs::write(&path, &content).unwrap();
-        let file = std::fs::File::open(&path).unwrap();
-        let mut reader = std::io::BufReader::new(file);
-
-        let (chunk1, eof1) = read_line_chunk_str(&mut reader, "path", "test").unwrap();
-        assert_eq!(chunk1.len(), ASYNC_LINE_CHUNK_MAX_LINES);
-        assert!(!eof1, "budget-bounded chunk must not report eof early");
-        assert_eq!(chunk1[0], "l0");
-        assert!(!chunk1[0].contains('\r') && !chunk1[0].contains('\n'));
-
-        let (chunk2, eof2) = read_line_chunk_str(&mut reader, "path", "test").unwrap();
-        assert_eq!(chunk2.len(), 5);
-        assert!(eof2);
-        assert_eq!(chunk2[4], format!("l{}", ASYNC_LINE_CHUNK_MAX_LINES + 4));
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn read_line_chunk_bytes_strips_crlf_no_utf8_check() {
-        let path = tmp_path("chunk-bytes.bin");
-        let mut content: Vec<u8> = Vec::new();
-        content.extend_from_slice(b"a\r\n");
-        content.extend_from_slice(&[0xff, 0xfe, b'\n']); // invalid UTF-8, must survive untouched
-        content.extend_from_slice(b"tail-no-newline");
-        std::fs::write(&path, &content).unwrap();
-        let file = std::fs::File::open(&path).unwrap();
-        let mut reader = std::io::BufReader::new(file);
-
-        let (chunk, eof) = read_line_chunk_bytes(&mut reader, "path", "test").unwrap();
-        assert_eq!(chunk.len(), 3);
-        assert_eq!(chunk[0], b"a".to_vec());
-        assert_eq!(chunk[1], vec![0xff, 0xfe]);
-        assert_eq!(chunk[2], b"tail-no-newline".to_vec());
-        assert!(eof);
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn file_for_each_line_streams_multiple_chunks_async() {
-        let env = make_env();
-        let cb_ctx = sema_core::EvalContext::new();
-        sema_core::set_call_callback(&cb_ctx, invoke_native_value);
-
-        let path = tmp_path("for-each-line.txt");
-        // More lines than one chunk holds, so the offload must round-trip
-        // more than once through the worker.
-        let n = ASYNC_LINE_CHUNK_MAX_LINES * 2 + 3;
-        let content: String = (0..n).map(|i| format!("line-{i}\n")).collect();
-        std::fs::write(&path, &content).unwrap();
-        let path_s = path.to_string_lossy().to_string();
-
-        let seen = Rc::new(RefCell::new(Vec::new()));
-        let seen_for_cb = seen.clone();
-        let collector =
-            Value::native_fn(sema_core::NativeFn::simple("test-collect", move |args| {
-                if let Some(s) = args.first().and_then(|v| v.as_str()) {
-                    seen_for_cb.borrow_mut().push(s.to_string());
-                }
-                Ok(Value::nil())
-            }));
-
-        let result = drive_async(|| {
-            native(&env, "file/for-each-line")(&[Value::string(&path_s), collector.clone()])
-        });
-        assert_eq!(result, Value::nil());
-        let seen = seen.borrow();
-        assert_eq!(seen.len(), n);
-        assert_eq!(seen[0], "line-0");
-        assert_eq!(seen[n - 1], format!("line-{}", n - 1));
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn file_fold_lines_accumulates_across_chunks_async() {
-        let env = make_env();
-        let cb_ctx = sema_core::EvalContext::new();
-        sema_core::set_call_callback(&cb_ctx, invoke_native_value);
-
-        let path = tmp_path("fold-lines.txt");
-        let n = ASYNC_LINE_CHUNK_MAX_LINES + 10;
-        let content: String = (0..n).map(|_| "x\n".to_string()).collect();
-        std::fs::write(&path, &content).unwrap();
-        let path_s = path.to_string_lossy().to_string();
-
-        let counter = Value::native_fn(sema_core::NativeFn::simple("test-count", |args| {
-            let acc = args[0].as_int().unwrap_or(0);
-            Ok(Value::int(acc + 1))
-        }));
-
-        let result = drive_async(|| {
-            native(&env, "file/fold-lines")(&[
-                Value::string(&path_s),
-                counter.clone(),
-                Value::int(0),
-            ])
-        });
-        assert_eq!(result.as_int(), Some(n as i64));
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn file_fold_lines_bytes_accumulates_across_chunks_async() {
-        let env = make_env();
-        let cb_ctx = sema_core::EvalContext::new();
-        sema_core::set_call_callback(&cb_ctx, invoke_native_value);
-
-        let path = tmp_path("fold-lines-bytes.bin");
-        let n = ASYNC_LINE_CHUNK_MAX_LINES + 7;
-        let mut content = Vec::new();
-        for _ in 0..n {
-            content.extend_from_slice(b"y\n");
-        }
-        std::fs::write(&path, &content).unwrap();
-        let path_s = path.to_string_lossy().to_string();
-
-        let counter = Value::native_fn(sema_core::NativeFn::simple("test-count-bytes", |args| {
-            let acc = args[0].as_int().unwrap_or(0);
-            Ok(Value::int(acc + 1))
-        }));
-
-        let result = drive_async(|| {
-            native(&env, "file/fold-lines-bytes")(&[
-                Value::string(&path_s),
-                counter.clone(),
-                Value::int(0),
-            ])
-        });
-        assert_eq!(result.as_int(), Some(n as i64));
-
-        let _ = std::fs::remove_file(&path);
     }
 }

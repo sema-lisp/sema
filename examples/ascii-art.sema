@@ -15,8 +15,8 @@
   (let loop ((i 0) (acc '()))
     (if (> i (length row))
       (reverse acc)
-      (let ((left   (if (= i 0) 0 (nth row (- i 1))))
-            (right  (if (= i (length row)) 0 (nth row i))))
+      (let ((left (if (= i 0) 0 (nth row (- i 1))))
+            (right (if (= i (length row)) 0 (nth row i))))
         (loop (+ i 1) (cons (+ left right) acc))))))
 
 ;; Build all rows
@@ -54,16 +54,16 @@
     ;; Top half including middle
     (let loop-top ((i 0))
       (when (<= i half)
-        (let ((spaces  (- half i))
-              (stars   (+ 1 (* 2 i))))
+        (let ((spaces (- half i))
+              (stars (+ 1 (* 2 i))))
           (display (string/repeat " " spaces))
           (println (string/repeat "*" stars)))
         (loop-top (+ i 1))))
     ;; Bottom half
     (let loop-bot ((i (- half 1)))
       (when (>= i 0)
-        (let ((spaces  (- half i))
-              (stars   (+ 1 (* 2 i))))
+        (let ((spaces (- half i))
+              (stars (+ 1 (* 2 i))))
           (display (string/repeat " " spaces))
           (println (string/repeat "*" stars)))
         (loop-bot (- i 1))))))
@@ -75,9 +75,9 @@
 ;; ============================================================
 (println "\n=== 3. ASCII Sine Wave ===\n")
 
-(define wave-cols  60)
-(define wave-rows  21)
-(define wave-mid   (/ (- wave-rows 1) 2))
+(define wave-cols 60)
+(define wave-rows 21)
+(define wave-mid (/ (- wave-rows 1) 2))
 
 ;; Precompute which column each row's '*' goes in for each x
 ;; We'll iterate row by row
@@ -108,11 +108,11 @@
 ;; ============================================================
 (println "\n=== 4. Circle ===\n")
 
-(define circle-w   40)
-(define circle-h   21)
-(define circle-cx  (/ (- circle-w 1) 2.0))
-(define circle-cy  (/ (- circle-h 1) 2.0))
-(define circle-r   9.5)
+(define circle-w 40)
+(define circle-h 21)
+(define circle-cx (/ (- circle-w 1) 2.0))
+(define circle-cy (/ (- circle-h 1) 2.0))
+(define circle-r 9.5)
 
 (let loop-y ((y 0))
   (when (< y circle-h)

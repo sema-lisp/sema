@@ -1,22 +1,38 @@
 //! Run-scoped dynamic context for a workflow run.
 //!
-//! A workflow run installs a [`WorkflowCtx`] into a thread-local for the duration of
-//! the run via [`set_workflow_scope`]; every builtin (`workflow/phase`, `checkpoint`,
-//! …) reaches the live context through [`current`]. The scope is restored on drop via
-//! a panic-safe RAII guard (mirrors `sema_otel`'s `ConversationGuard`), so a nested
-//! run — or a panic unwinding through a phase thunk — cannot leave a stale context
-//! installed.
+//! A workflow run installs a [`WorkflowCtx`] as a scope on the OWNING TASK via
+//! [`set_workflow_scope`]; every builtin (`workflow/phase`, `checkpoint`, …) reaches the
+//! live context through [`current_for`], reading the task-local [`WorkflowTaskState`]
+//! extension. The scope is a token-keyed stack entry restored on drop via a panic-safe
+//! RAII guard (mirrors `DynamicTaskState`'s `ScopeId` removal), so a nested run — or a
+//! panic unwinding through a phase thunk — cannot leave a stale context installed, and a
+//! sibling task interleaved on the same thread never observes another task's run.
+//!
+//! `WorkflowCtx` holds live checkpoint/memo/MCP `Value`s, so the extension is TRACED
+//! (Invariant I2): the `TaskContextHandle` traces each extension, `WorkflowTaskState`
+//! traces its scope stack, and each `WorkflowCtx` traces its `Value`-bearing bags.
+//!
+//! The `WORKFLOW` thread-local survives ONLY as the HOST-ADAPTER fallback for callers
+//! outside a runtime quantum (a synchronous host `call_function`, the non-runtime
+//! restricted VM); it is read only when [`sema_core::in_runtime_quantum`] is false.
 //!
 //! The context owns the run's monotonic `seq` counter, the wall-clock seam (`ts` /
 //! `dur_ms`, both frozen under `SEMA_WORKFLOW_FIXED_TS` for byte-identical goldens),
 //! the append-only [`Journal`], and a Mastra-style checkpoint/state bag.
 
+use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write as _;
 use std::io;
-use std::rc::Rc;
+use std::path::Path;
+use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::Receiver;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use sema_core::cycle::GcEdge;
+use sema_core::runtime::{IdCounter, ScopeId, TaskContextHandle, TaskLocalValue, Trace};
 use sema_core::Value;
 
 use crate::event::WorkflowEvent;
@@ -36,10 +52,72 @@ const RUN_ID_ENV: &str = "SEMA_WORKFLOW_RUN_ID";
 /// Default is [`RUNS_ROOT`] (`./.sema/runs`).
 const RUN_DIR_ENV: &str = "SEMA_WORKFLOW_RUN_DIR";
 
+/// A3 hard caps captured before any VM-thread encode. They bound the CPU/memory a single
+/// leaf can spend materializing state on the quantum; the on-disk writes themselves are
+/// off the VM thread (see `writer.rs`).
+///
+/// Max memos stored per run. Past it a leaf is simply not memoized (it re-runs on
+/// resume) — the same fallback the round-trip guard already uses.
+pub const MEMO_MAX_COUNT: u64 = 4096;
+/// Max serialized bytes per memo. An over-cap value is NOT stored (never JSON-encoded in
+/// full on the VM thread — the compact form is bounded-checked first).
+pub const MEMO_FILE_MAX_BYTES: usize = 1 << 20; // 1 MiB
+/// Cap for the `value_digest` bounded encode. A value larger than this gets a stable
+/// marker digest instead of a full JSON materialization on the VM thread.
+const DIGEST_MAX_BYTES: usize = 1 << 20; // 1 MiB
+
+/// A `fmt::Write` sink that accepts at most `cap` bytes of a value's compact `Display`
+/// form and then aborts (returns `fmt::Error`), so a huge value is never fully
+/// materialized on the VM thread. Char-boundary safe.
+struct CappedWriter {
+    buf: String,
+    cap: usize,
+    truncated: bool,
+}
+
+impl std::fmt::Write for CappedWriter {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        if self.truncated {
+            return Err(std::fmt::Error);
+        }
+        let remaining = self.cap.saturating_sub(self.buf.len());
+        if s.len() <= remaining {
+            self.buf.push_str(s);
+            Ok(())
+        } else {
+            let mut end = remaining;
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.buf.push_str(&s[..end]);
+            self.truncated = true;
+            Err(std::fmt::Error)
+        }
+    }
+}
+
+/// Render `v`'s compact `Display` form into at most `cap` bytes. Returns `(text,
+/// truncated)`: `truncated` ⇒ `v` exceeds `cap` and was NOT fully materialized (rendering
+/// aborted at the cap). For a `v` within `cap`, `text` is its exact compact form. Shared
+/// by the rendered-value / digest / memo caps so none of them can be tricked into
+/// materializing an unbounded value on the quantum.
+pub fn compact_capped(v: &Value, cap: usize) -> (String, bool) {
+    let mut w = CappedWriter {
+        buf: String::new(),
+        cap,
+        truncated: false,
+    };
+    let _ = write!(w, "{v}");
+    (w.buf, w.truncated)
+}
+
 thread_local! {
-    /// The live workflow context, if a run is in progress on this thread. `None`
-    /// outside any run; builtins error with a clear message in that case.
-    static WORKFLOW: RefCell<Option<Rc<WorkflowCtx>>> = const { RefCell::new(None) };
+    /// HOST-ADAPTER-ONLY fallback scope store for callers outside a runtime quantum.
+    /// A per-thread [`WorkflowTaskState`] (same shape as the task-local extension) that
+    /// only synchronous host paths install into / read from; the runtime path lives on
+    /// the owning task's [`TaskContextHandle`] instead. Read only when
+    /// `!sema_core::in_runtime_quantum()`.
+    static WORKFLOW: Rc<WorkflowTaskState> = Rc::new(WorkflowTaskState::default());
 }
 
 /// Run-scoped dynamic context. Cheap to clone-share via `Rc`; all interior state is
@@ -81,11 +159,10 @@ pub struct WorkflowCtx {
     /// phases need the label to emit the matching `phase.ended` when the next marker
     /// (or the run end) closes the phase.
     cur_phase_label: RefCell<Option<String>>,
-    /// Per-name agent invocation counter, for minting unique `agent_id`s.
+    /// Per-name agent invocation counter, for minting unique `agent_id`s. Run-shared
+    /// (via the `Rc<WorkflowCtx>`), so ids stay unique even across concurrent tasks; the
+    /// per-task ACTIVE-agent attribution slot moved to [`WorkflowTaskState::set_cur_agent`].
     agent_n: RefCell<BTreeMap<String, u64>>,
-    /// The `agent_id` of the agent currently executing (set by `workflow/agent`), so
-    /// `workflow/tool-call` can attribute a tool call to it. `None` outside an agent.
-    cur_agent_id: RefCell<Option<String>>,
     /// Resume state. `resuming` ⇒ this run was launched with `--resume`, so leaves whose
     /// content-key is in `resume_memos` short-circuit (return the recorded value, skip
     /// the model + events). `resume_memos` is loaded from the prior run's `memo/` dir at
@@ -98,6 +175,9 @@ pub struct WorkflowCtx {
     code_version: RefCell<String>,
     resume_memos: RefCell<HashMap<String, Value>>,
     key_seen: RefCell<HashMap<String, u32>>,
+    /// Number of memos stored this run, capped at [`MEMO_MAX_COUNT`] so an unbounded fan-out
+    /// can't spill an unbounded number of memo sidecars.
+    memo_count: Cell<u64>,
     /// The run's `--args` JSON string (for the run.started event). Empty if none.
     args_json: String,
     /// Canonical fingerprint of `--args`, folded into resume content-keys. Kept
@@ -167,11 +247,11 @@ impl WorkflowCtx {
             cur_phase_seq: Cell::new(None),
             cur_phase_label: RefCell::new(None),
             agent_n: RefCell::new(BTreeMap::new()),
-            cur_agent_id: RefCell::new(None),
             resuming: Cell::new(false),
             code_version: RefCell::new(String::new()),
             resume_memos: RefCell::new(HashMap::new()),
             key_seen: RefCell::new(HashMap::new()),
+            memo_count: Cell::new(0),
             args_json,
             args_fingerprint,
             fixed_ts,
@@ -215,17 +295,6 @@ impl WorkflowCtx {
         format!("{name}_{n}")
     }
 
-    /// Set (or clear) the agent currently executing, so `workflow/tool-call` can
-    /// attribute to it. Set on `workflow/agent` entry, cleared on exit.
-    pub fn set_cur_agent(&self, agent_id: Option<String>) {
-        *self.cur_agent_id.borrow_mut() = agent_id;
-    }
-
-    /// The `agent_id` of the executing agent, if inside one.
-    pub fn cur_agent(&self) -> Option<String> {
-        self.cur_agent_id.borrow().clone()
-    }
-
     /// A stable short resume key for a checkpoint (`ck_<hex>` over key + digest).
     pub fn content_key(&self, key: &str, value_digest: &str) -> String {
         let h = format!(
@@ -265,7 +334,7 @@ impl WorkflowCtx {
     /// Append one event to the journal. Write errors are swallowed by the journal
     /// (same trust model as the OTel file exporter); journaling never aborts the run.
     pub fn emit(&self, event: WorkflowEvent) {
-        self.journal.borrow_mut().write(&event);
+        self.journal.borrow().write(&event);
     }
 
     /// True under the fixed-timestamp test seam (`SEMA_WORKFLOW_FIXED_TS`). Callers
@@ -295,6 +364,15 @@ impl WorkflowCtx {
     /// diffing — NOT resume identity (resume keys on the input-derived content-key and
     /// stores the real value in `memo/`, round-trip-guarded). Stable within a process.
     pub fn value_digest(&self, v: &Value) -> String {
+        // Bound the work: a value larger than the digest cap is never JSON-encoded in full
+        // on the VM thread — it gets a stable marker digest over its bounded compact prefix.
+        // The digest is NOT the resume identity (memo content-keys are, round-trip-guarded),
+        // and the byte-identical goldens only ever digest tiny values, so a capped path here
+        // never changes a golden digest.
+        let (compact, truncated) = compact_capped(v, DIGEST_MAX_BYTES);
+        if truncated {
+            return format!("oversized_{:x}", md5::compute(compact.as_bytes()));
+        }
         let json = sema_core::json::value_to_json_lossy(v);
         let bytes = serde_json::to_vec(&json).unwrap_or_default();
         format!("{:x}", md5::compute(bytes))
@@ -304,7 +382,7 @@ impl WorkflowCtx {
     /// failure is swallowed like a journal write).
     pub fn write_result(&self, envelope: &Value) {
         let json = sema_core::json::value_to_json_lossy(envelope);
-        let _ = self.journal.borrow().write_result(&json);
+        self.journal.borrow().write_result(&json);
     }
 
     /// True when a `:budget` cap (usd and/or tokens) is in force for this run.
@@ -419,22 +497,50 @@ impl WorkflowCtx {
 
     /// Persist a leaf's value as a memo sidecar AND into the in-run map — but ONLY if it
     /// round-trips through JSON identically (`value_to_json_lossy`→`json_to_value` is
-    /// lossy for keyword/string keys, records, typed arrays). A value that doesn't
-    /// survive is left un-memoized, so it re-runs on resume rather than resuming wrong.
-    /// Must be called OUTSIDE any held journal borrow.
+    /// lossy for keyword/string keys, records, typed arrays) AND fits the A3 caps. A value
+    /// that doesn't survive, or exceeds [`MEMO_MAX_COUNT`]/[`MEMO_FILE_MAX_BYTES`], is left
+    /// un-memoized, so it re-runs on resume rather than resuming wrong. The whole-file
+    /// memo write itself is enqueued to the writer thread (no fs on the VM thread).
     pub fn memo_store(&self, content_key: &str, v: &Value) {
-        let json = sema_core::json::value_to_json_lossy(v);
-        if sema_core::json::json_to_value(&json) == *v {
-            let _ = self.journal.borrow().write_memo(content_key, &json);
-            self.resume_memos
-                .borrow_mut()
-                .insert(content_key.to_string(), v.clone());
+        // Cap 1 — per-run memo count.
+        if self.memo_count.get() >= MEMO_MAX_COUNT {
+            return;
         }
+        // Cap 2 (pre-encode) — bound the compact form so an oversized value is never
+        // JSON-encoded in full on the VM thread. Truncated ⇒ over-cap ⇒ not stored.
+        let (_, truncated) = compact_capped(v, MEMO_FILE_MAX_BYTES);
+        if truncated {
+            return;
+        }
+        let json = sema_core::json::value_to_json_lossy(v);
+        // Round-trip guard: a value that doesn't survive JSON is left un-memoized.
+        if sema_core::json::json_to_value(&json) != *v {
+            return;
+        }
+        // Cap 2 (exact) — a value can be compact-small but JSON-large (deep nesting of
+        // short atoms); reject on the serialized size too.
+        let serialized = serde_json::to_vec(&json).unwrap_or_default();
+        if serialized.len() > MEMO_FILE_MAX_BYTES {
+            return;
+        }
+        self.memo_count.set(self.memo_count.get() + 1);
+        self.journal.borrow().write_memo(content_key, &json);
+        self.resume_memos
+            .borrow_mut()
+            .insert(content_key.to_string(), v.clone());
     }
 
-    /// Best-effort flush of the journal writer (e.g. at `run.ended`).
+    /// Enqueue a terminal flush barrier, returning the ack receiver WITHOUT waiting — the
+    /// runtime terminal path parks on it via an External wait (see `workflow/run`'s
+    /// `finish_run`).
+    pub fn request_flush(&self) -> Receiver<()> {
+        self.journal.borrow().request_flush()
+    }
+
+    /// Bounded blocking flush of the journal writer (host / non-quantum path). NEVER call
+    /// inside a runtime quantum — park on the External flush-ack instead.
     pub fn flush(&self) {
-        self.journal.borrow_mut().flush();
+        self.journal.borrow().flush_blocking();
     }
 
     // ── MCP handle registry (docs/plans/2026-06-24-workflow-mcp-auth.md §3) ────
@@ -464,26 +570,244 @@ impl WorkflowCtx {
     }
 }
 
-/// Panic-safe RAII guard that restores the PREVIOUS workflow context on drop. Copied
-/// from `sema_otel::ConversationGuard`'s shape: the restore happens in `Drop`, so an
-/// `Err` short-circuit OR a panic unwinding through the run body both reinstall the
-/// prior context (supporting nested runs and never leaking a stale `Rc`).
+impl Trace for WorkflowCtx {
+    /// Expose every live `Value` a run holds so the CORE-2 collector never frees a
+    /// checkpoint/memo/MCP handle it can still reach through the owning task (Invariant
+    /// I2). A conflicting borrow means the bag is mid-mutation; report incomplete
+    /// (`false`) so the collector retries rather than under-tracing.
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        let (Ok(state), Ok(memos), Ok(handles)) = (
+            self.state.try_borrow(),
+            self.resume_memos.try_borrow(),
+            self.mcp_handles.try_borrow(),
+        ) else {
+            return false;
+        };
+        for value in state.values() {
+            sink(GcEdge::Value(value));
+        }
+        for value in memos.values() {
+            sink(GcEdge::Value(value));
+        }
+        for value in handles.values() {
+            sink(GcEdge::Value(value));
+        }
+        true
+    }
+}
+
+/// One published workflow scope on a task's stack. A scope this task INSTALLED carries
+/// `Some(token)` and is removed by that exact token (mirrors `DynamicTaskState`'s
+/// `ScopeId` removal — out-of-LIFO teardown across interleaved tasks restores the exact
+/// outer scope). An INHERITED scope (a spawned child observing its spawner's run) carries
+/// `None`: the child sees the workflow for attribution but cannot tear down an ancestor's
+/// scope. The `Rc<WorkflowCtx>` is SCOPE-SHARED, so the child journals into the same run.
+struct WorkflowScope {
+    token: Option<ScopeId>,
+    ctx: Rc<WorkflowCtx>,
+}
+
+struct WorkflowTaskInner {
+    tokens: IdCounter<ScopeId>,
+    scopes: Vec<WorkflowScope>,
+    /// The `agent_id` of the step currently executing ON THIS TASK, so
+    /// `workflow/tool-call` attributes to it. TASK-PRIVATE: two concurrent steps on
+    /// sibling tasks keep distinct active agents (no cross-attribution).
+    cur_agent: Option<String>,
+}
+
+/// Task-local workflow scope: the run stack plus the per-task active-step attribution.
+/// Installed on the owning task's [`TaskContextHandle`] (traced), inherited clone-shared
+/// by spawned children.
+pub struct WorkflowTaskState {
+    inner: RefCell<WorkflowTaskInner>,
+}
+
+impl Default for WorkflowTaskState {
+    fn default() -> Self {
+        Self {
+            inner: RefCell::new(WorkflowTaskInner {
+                tokens: IdCounter::new(),
+                scopes: Vec::new(),
+                cur_agent: None,
+            }),
+        }
+    }
+}
+
+impl WorkflowTaskState {
+    /// Push `ctx` as the live scope, minting a fresh removal token for it.
+    fn install(&self, ctx: Rc<WorkflowCtx>) -> ScopeId {
+        let mut inner = self.inner.borrow_mut();
+        let token = inner
+            .tokens
+            .allocate()
+            .expect("workflow scope identity space exhausted");
+        inner.scopes.push(WorkflowScope {
+            token: Some(token),
+            ctx,
+        });
+        token
+    }
+
+    /// Remove the scope carrying exactly `token`. Returns `false` if it is already gone
+    /// (idempotent teardown).
+    fn remove(&self, token: ScopeId) -> bool {
+        let mut inner = self.inner.borrow_mut();
+        match inner.scopes.iter().position(|s| s.token == Some(token)) {
+            Some(pos) => {
+                inner.scopes.remove(pos);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The innermost live run scope, if any.
+    fn current_ctx(&self) -> Option<Rc<WorkflowCtx>> {
+        self.inner.borrow().scopes.last().map(|s| Rc::clone(&s.ctx))
+    }
+
+    fn cur_agent(&self) -> Option<String> {
+        self.inner.borrow().cur_agent.clone()
+    }
+
+    fn set_cur_agent(&self, agent_id: Option<String>) {
+        self.inner.borrow_mut().cur_agent = agent_id;
+    }
+}
+
+impl Trace for WorkflowTaskState {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        let Ok(inner) = self.inner.try_borrow() else {
+            return false;
+        };
+        for scope in &inner.scopes {
+            if !scope.ctx.trace(sink) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl TaskLocalValue for WorkflowTaskState {
+    /// A spawned child clone-shares the run stack (each `Rc<WorkflowCtx>` is shared, so
+    /// the child journals into the SAME run) and copies the spawner's active-step
+    /// attribution, but inherited scopes reset to `token: None` (the child cannot tear
+    /// down an ancestor's scope) and it mints from a fresh counter.
+    fn inherit(&self) -> Rc<dyn TaskLocalValue> {
+        let inner = self.inner.borrow();
+        let scopes = inner
+            .scopes
+            .iter()
+            .map(|s| WorkflowScope {
+                token: None,
+                ctx: Rc::clone(&s.ctx),
+            })
+            .collect();
+        Rc::new(Self {
+            inner: RefCell::new(WorkflowTaskInner {
+                tokens: IdCounter::new(),
+                scopes,
+                cur_agent: inner.cur_agent.clone(),
+            }),
+        })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Panic-safe RAII guard for one installed workflow scope. Drop removes the EXACT token
+/// it minted from the task (or host) state — an `Err` short-circuit, a panic unwinding
+/// through the run body, OR a continuation dropped without resume all reinstate the
+/// outer scope and never leak. Holds a `Weak` so the guard never keeps the traced state
+/// alive on its own (Invariant I2): the `WorkflowCtx` `Value`s are reachable ONLY through
+/// the traced [`TaskContextHandle`] / host store, never through this guard.
 pub struct WorkflowGuard {
-    prev: Option<Rc<WorkflowCtx>>,
+    state: Weak<WorkflowTaskState>,
+    token: ScopeId,
 }
 
 impl Drop for WorkflowGuard {
     fn drop(&mut self) {
-        WORKFLOW.with(|c| *c.borrow_mut() = self.prev.take());
+        if let Some(state) = self.state.upgrade() {
+            state.remove(self.token);
+        }
     }
 }
 
-/// Low-level: install an already-built `ctx` as the live workflow context for the
-/// current thread, returning a guard whose drop restores whatever was installed
-/// before. Used by unit tests and by [`set_workflow_scope`].
-pub fn install_scope(ctx: Rc<WorkflowCtx>) -> WorkflowGuard {
-    let prev = WORKFLOW.with(|c| c.borrow_mut().replace(ctx));
-    WorkflowGuard { prev }
+/// The per-thread HOST-ADAPTER fallback scope state (used only outside a runtime quantum).
+fn host_state() -> Rc<WorkflowTaskState> {
+    WORKFLOW.with(Rc::clone)
+}
+
+/// Resolve the [`WorkflowTaskState`] a scope installs into: the runtime path's task
+/// context (get-or-create the extension) or the host fallback when there is no task
+/// context.
+fn resolve_state(task_context: Option<&TaskContextHandle>) -> Rc<WorkflowTaskState> {
+    if let Some(handle) = task_context {
+        if let Some(state) = handle.get_rc::<WorkflowTaskState>() {
+            return state;
+        }
+        let state = Rc::new(WorkflowTaskState::default());
+        handle.borrow_mut().insert(Rc::clone(&state));
+        return state;
+    }
+    host_state()
+}
+
+/// Low-level: install an already-built `ctx` as a scope on `task_context` (or the host
+/// fallback), returning a guard whose drop removes that exact scope. Used by unit tests
+/// and by [`set_workflow_scope`].
+pub fn install_scope(
+    task_context: Option<&TaskContextHandle>,
+    ctx: Rc<WorkflowCtx>,
+) -> WorkflowGuard {
+    let state = resolve_state(task_context);
+    let token = state.install(ctx);
+    WorkflowGuard {
+        state: Rc::downgrade(&state),
+        token,
+    }
+}
+
+/// The live workflow context for `task_context`, if a run is in progress on that task.
+/// Reads the task-local extension first; the `WORKFLOW` thread-local is consulted ONLY as
+/// the host-adapter fallback outside a runtime quantum.
+pub fn current_for(task_context: Option<&TaskContextHandle>) -> Option<Rc<WorkflowCtx>> {
+    if let Some(handle) = task_context {
+        if let Some(state) = handle.get_rc::<WorkflowTaskState>() {
+            if let Some(ctx) = state.current_ctx() {
+                return Some(ctx);
+            }
+        }
+    }
+    if !sema_core::in_runtime_quantum() {
+        return host_state().current_ctx();
+    }
+    None
+}
+
+/// The `agent_id` of the step currently executing on `task_context` (TASK-PRIVATE
+/// attribution), for `workflow/tool-call`.
+pub fn cur_agent_for(task_context: Option<&TaskContextHandle>) -> Option<String> {
+    if let Some(handle) = task_context {
+        if let Some(state) = handle.get_rc::<WorkflowTaskState>() {
+            return state.cur_agent();
+        }
+    }
+    if !sema_core::in_runtime_quantum() {
+        return host_state().cur_agent();
+    }
+    None
+}
+
+/// Set (or clear) the step currently executing on `task_context`.
+pub fn set_cur_agent_for(task_context: Option<&TaskContextHandle>, agent_id: Option<String>) {
+    resolve_state(task_context).set_cur_agent(agent_id);
 }
 
 /// Redact secret-bearing values out of the workflow meta map's lossy-JSON form
@@ -526,18 +850,59 @@ fn redact_meta_secrets(mut meta_json: serde_json::Value) -> serde_json::Value {
 /// `meta` is the workflow's metadata map (`{:phases … :budget … :args …}`); it is
 /// recorded into `metadata.json`, and `:budget` is parsed into the run's spend caps.
 /// `:permissions` is enforced by the CLI before the interpreter is built.
-pub fn set_workflow_scope(name: &str, doc: &str, meta: &Value) -> io::Result<WorkflowGuard> {
-    let run_id = resolve_run_id();
+pub fn set_workflow_scope(
+    name: &str,
+    doc: &str,
+    meta: &Value,
+    task_context: Option<&TaskContextHandle>,
+) -> io::Result<WorkflowGuard> {
     let runs_root = resolve_runs_root();
     let code_version = std::env::var(CODE_VERSION_ENV).unwrap_or_default();
-    // Resume mode: reuse the run dir, write a fresh sibling events.resume-<n>.jsonl
-    // segment (keeps the frozen first-line/seq invariants), and preload prior memos.
     let resuming = std::env::var(RESUME_ENV).map(|v| v == "1").unwrap_or(false);
-    let journal = if resuming {
-        let seg = crate::journal::next_resume_segment(&runs_root, &run_id);
-        Journal::open_named(&runs_root, &run_id, &seg)?
+
+    // An explicit run id (the `SEMA_WORKFLOW_RUN_ID` seam, or a future library caller) is
+    // validated HERE as exactly one safe path component before it is ever joined into a
+    // filesystem path — the library is the authoritative gate, not just the CLI.
+    let explicit_id = match std::env::var(RUN_ID_ENV) {
+        Ok(id) if !id.is_empty() => {
+            validate_explicit_run_id(&id)?;
+            Some(id)
+        }
+        _ => None,
+    };
+
+    // Resolve the run id AND open its journal together, because the two decisions are
+    // coupled: a fresh run creates its dir fresh (a pre-existing dir is an error, a
+    // generated-id collision retries with a new nonce), while a resume claims a new
+    // sibling `events.resume-<n>.jsonl` segment in the ALREADY-existing dir.
+    let (run_id, journal) = if resuming {
+        // Resume requires an existing, explicitly-named run — never a generated id.
+        let id = explicit_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workflow resume requires an explicit run id (set SEMA_WORKFLOW_RUN_ID)",
+            )
+        })?;
+        let events = Path::new(&runs_root).join(&id).join("events.jsonl");
+        if !events.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "cannot resume: no prior run journal at {}",
+                    events.display()
+                ),
+            ));
+        }
+        let journal = crate::journal::next_resume_segment(&runs_root, &id)?;
+        (id, journal)
+    } else if let Some(id) = explicit_id {
+        // Fresh run with an operator-chosen id: fail loudly if that dir already exists.
+        let journal = Journal::open(&runs_root, &id).map_err(|e| annotate_fresh_open(e, &id))?;
+        (id, journal)
     } else {
-        Journal::open(&runs_root, &run_id)?
+        // Fresh run with a generated id: retry past the (astronomically unlikely) dir
+        // collision with a new nonce each time.
+        open_fresh_generated(&runs_root)?
     };
     // metadata.json — self-describing run header. Best-effort; not part of the
     // byte-identical events.jsonl oracle.
@@ -548,7 +913,7 @@ pub fn set_workflow_scope(name: &str, doc: &str, meta: &Value) -> io::Result<Wor
         "code_version": code_version,
         "meta": redact_meta_secrets(sema_core::json::value_to_json_lossy(meta)),
     });
-    let _ = journal.write_metadata(&metadata);
+    journal.write_metadata(&metadata);
     // The `:budget` submap of meta becomes the run's enforced spend caps.
     // The CLI sets SEMA_WORKFLOW_ARGS_JSON to the verbatim `--args` string.
     let args_json = std::env::var("SEMA_WORKFLOW_ARGS_JSON").unwrap_or_default();
@@ -561,7 +926,7 @@ pub fn set_workflow_scope(name: &str, doc: &str, meta: &Value) -> io::Result<Wor
             .collect();
         ctx.enter_resume(memos);
     }
-    Ok(install_scope(ctx))
+    Ok(install_scope(task_context, ctx))
 }
 
 /// Extract the `:budget` submap from a workflow `meta` map, flattening its keyword
@@ -586,11 +951,6 @@ pub fn parse_budget(meta: &Value) -> BTreeMap<String, Value> {
 /// `--run-dir`) if present, else the project-local [`RUNS_ROOT`].
 pub fn resolve_runs_root() -> String {
     std::env::var(RUN_DIR_ENV).unwrap_or_else(|_| RUNS_ROOT.to_string())
-}
-
-/// The live workflow context, if a run is in progress on this thread.
-pub fn current() -> Option<Rc<WorkflowCtx>> {
-    WORKFLOW.with(|c| c.borrow().clone())
 }
 
 /// Length-prefixed md5 over a field list → short hex. Length-prefixing each field
@@ -623,21 +983,122 @@ const RESUME_ENV: &str = "SEMA_WORKFLOW_RESUME";
 /// Env seam: a stable hash of the workflow source, folded into every content-key.
 const CODE_VERSION_ENV: &str = "SEMA_WORKFLOW_CODE_VERSION";
 
-/// Resolve the run id for a new run: `SEMA_WORKFLOW_RUN_ID` if set, else a generated
-/// id of the form `wf_<unix_secs>_<pid>` — deterministic-enough to be unique per
-/// process without a random-number dependency, and overridable to a fixed value in
+/// Process-wide monotonic nonce folded into every generated run id, so two runs started
+/// in one process — even within the same nanosecond — never collide on a run directory.
+static RUN_ID_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Max attempts to place a generated run into a free directory. A generated id already
+/// folds in a process nonce, so a collision is astronomically unlikely; the bound only
+/// stops an infinite loop if the filesystem keeps returning `AlreadyExists` for some
+/// other reason.
+const MAX_FRESH_ATTEMPTS: u32 = 8;
+
+/// A freshly generated run id: `wf_<unix_secs>_<subsec_nanos>_<pid>_<nonce>`. No RNG
+/// dependency, yet unique per process: the nanosecond field separates rapid runs and the
+/// process nonce guarantees distinctness even at identical clock readings (two runs in
+/// the same second — or nanosecond — no longer share a directory).
+fn generate_run_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let nonce = RUN_ID_NONCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "wf_{}_{}_{}_{}",
+        now.as_secs(),
+        now.subsec_nanos(),
+        std::process::id(),
+        nonce
+    )
+}
+
+/// Validate an explicit run id (the `SEMA_WORKFLOW_RUN_ID` seam or a library caller) as
+/// exactly ONE safe path component: non-empty, no `/` or `\` separator, no `..` traversal,
+/// not a `.`-only component, and free of NUL / control characters — it joins straight into
+/// a filesystem path, so anything else is a traversal or a broken directory name. Returns
+/// `InvalidInput` on rejection.
+pub fn validate_explicit_run_id(id: &str) -> io::Result<()> {
+    let reject = |why: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("workflow run id {id:?} is not a safe directory name: {why}"),
+        )
+    };
+    if id.is_empty() {
+        return Err(reject("must not be empty"));
+    }
+    if id.contains('/') || id.contains('\\') {
+        return Err(reject("must not contain a path separator"));
+    }
+    if id.contains("..") {
+        return Err(reject("must not contain '..'"));
+    }
+    if id.bytes().all(|b| b == b'.') {
+        return Err(reject("must not be only '.' characters"));
+    }
+    if id.chars().any(|c| c == '\0' || c.is_control()) {
+        return Err(reject("must not contain NUL or control characters"));
+    }
+    Ok(())
+}
+
+/// Resolve the run id for a NEW run: the validated `SEMA_WORKFLOW_RUN_ID` seam if set and
+/// non-empty, else a freshly generated id (see [`generate_run_id`]). An invalid explicit
+/// id is an error rather than a silently sanitized path. Overridable to a fixed value in
 /// tests (the golden oracle sets `SEMA_WORKFLOW_RUN_ID=wf_test_0001`).
-pub fn resolve_run_id() -> String {
-    if let Ok(id) = std::env::var(RUN_ID_ENV) {
-        if !id.is_empty() {
-            return id;
+pub fn resolve_run_id() -> io::Result<String> {
+    match std::env::var(RUN_ID_ENV) {
+        Ok(id) if !id.is_empty() => {
+            validate_explicit_run_id(&id)?;
+            Ok(id)
+        }
+        _ => Ok(generate_run_id()),
+    }
+}
+
+/// Open a fresh run under a generated id, retrying with a new id (fresh nonce) on the
+/// unlikely directory collision. Returns the winning id alongside its opened journal.
+fn open_fresh_generated(runs_root: &str) -> io::Result<(String, Journal)> {
+    open_fresh_with(runs_root, generate_run_id)
+}
+
+/// The collision-retry core, with an injectable id source so the retry path is unit
+/// testable without racing the clock. Bounded by [`MAX_FRESH_ATTEMPTS`].
+fn open_fresh_with(
+    runs_root: &str,
+    mut next_id: impl FnMut() -> String,
+) -> io::Result<(String, Journal)> {
+    let mut last_err = None;
+    for _ in 0..MAX_FRESH_ATTEMPTS {
+        let id = next_id();
+        match Journal::open(runs_root, &id) {
+            Ok(journal) => return Ok((id, journal)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => last_err = Some(e),
+            Err(e) => return Err(e),
         }
     }
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format!("wf_{secs}_{}", std::process::id())
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique workflow run directory",
+        )
+    }))
+}
+
+/// Turn the bare `AlreadyExists` from a fresh journal claim into an actionable message
+/// (keeping the error KIND so callers can still match on it), for an operator-chosen id
+/// whose journal already exists.
+fn annotate_fresh_open(err: io::Error, run_id: &str) -> io::Error {
+    if err.kind() == io::ErrorKind::AlreadyExists {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "a workflow run journal for {run_id:?} already exists; \
+                 choose a fresh run id or resume it with --resume"
+            ),
+        )
+    } else {
+        err
+    }
 }
 
 /// Format `SystemTime::now()` as an RFC3339 / ISO-8601 UTC string (`YYYY-MM-DDTHH:MM:SSZ`)
@@ -870,29 +1331,180 @@ mod tests {
     }
 
     #[test]
-    fn scope_restores_previous_on_drop() {
-        assert!(current().is_none());
-        let outer = WorkflowCtx::new("outer".into(), Journal::null(), BTreeMap::new());
-        let g_outer = install_scope(outer.clone());
+    fn workflow_ctx_traces_state_memo_and_mcp_values() {
+        // Invariant I2: every live `Value` a run holds must be reachable to the
+        // collector — one edge per state-bag / memo / MCP-handle value.
+        let ctx = WorkflowCtx::new("t".into(), Journal::null(), BTreeMap::new());
+        ctx.store_checkpoint("k", Value::int(1));
+        let mut memos = HashMap::new();
+        memos.insert("ck".to_string(), Value::int(2));
+        ctx.enter_resume(memos);
+        let mut handles = BTreeMap::new();
+        handles.insert("asana".to_string(), Value::string("handle"));
+        ctx.set_mcp_handles(handles);
+
+        let mut edges = 0;
+        assert!(ctx.trace(&mut |edge| {
+            assert!(matches!(edge, GcEdge::Value(_)));
+            edges += 1;
+        }));
         assert_eq!(
-            current().map(|c| c.run_id.clone()).as_deref(),
+            edges, 3,
+            "state bag + resume memo + MCP handle each trace once"
+        );
+    }
+
+    #[test]
+    fn host_scope_restores_previous_on_drop() {
+        // The host fallback (no task context) behaves like a scope stack: a nested run
+        // reveals the outer scope again once its guard drops.
+        assert!(current_for(None).is_none());
+        let outer = WorkflowCtx::new("outer".into(), Journal::null(), BTreeMap::new());
+        let g_outer = install_scope(None, outer);
+        assert_eq!(
+            current_for(None).map(|c| c.run_id.clone()).as_deref(),
             Some("outer")
         );
         {
             let inner = WorkflowCtx::new("inner".into(), Journal::null(), BTreeMap::new());
-            let _g_inner = install_scope(inner);
+            let _g_inner = install_scope(None, inner);
             assert_eq!(
-                current().map(|c| c.run_id.clone()).as_deref(),
+                current_for(None).map(|c| c.run_id.clone()).as_deref(),
                 Some("inner")
             );
         }
         // inner guard dropped → outer reinstated
         assert_eq!(
-            current().map(|c| c.run_id.clone()).as_deref(),
+            current_for(None).map(|c| c.run_id.clone()).as_deref(),
             Some("outer")
         );
         drop(g_outer);
-        assert!(current().is_none());
+        assert!(current_for(None).is_none());
+    }
+
+    #[test]
+    fn task_state_removes_the_exact_token_out_of_lifo() {
+        // Two scopes installed, torn down OLDEST-first (out of LIFO order): exact-token
+        // removal restores the surviving inner scope, not whatever happens to be on top.
+        let state = WorkflowTaskState::default();
+        let outer = WorkflowCtx::new("outer".into(), Journal::null(), BTreeMap::new());
+        let inner = WorkflowCtx::new("inner".into(), Journal::null(), BTreeMap::new());
+        let outer_token = state.install(outer);
+        let inner_token = state.install(inner);
+        assert_eq!(
+            state.current_ctx().map(|c| c.run_id.clone()).as_deref(),
+            Some("inner")
+        );
+
+        assert!(state.remove(outer_token));
+        assert!(
+            !state.remove(outer_token),
+            "removing the same token twice is idempotent"
+        );
+        assert_eq!(
+            state.current_ctx().map(|c| c.run_id.clone()).as_deref(),
+            Some("inner"),
+            "removing the outer token leaves the inner scope live and on top"
+        );
+        assert!(state.remove(inner_token));
+        assert!(state.current_ctx().is_none());
+    }
+
+    #[test]
+    fn child_inherits_run_and_agent_but_not_removal_authority() {
+        // A spawned child clone-shares the run scope + copies the active agent, but its
+        // inherited scope is not removable by the child (token stripped to None).
+        let state = Rc::new(WorkflowTaskState::default());
+        let run = WorkflowCtx::new("shared-run".into(), Journal::null(), BTreeMap::new());
+        let parent_token = state.install(run);
+        state.set_cur_agent(Some("scout_1".to_string()));
+
+        let child = state.inherit();
+        let child = child
+            .as_any()
+            .downcast_ref::<WorkflowTaskState>()
+            .expect("inherited workflow state");
+        assert_eq!(
+            child.current_ctx().map(|c| c.run_id.clone()).as_deref(),
+            Some("shared-run"),
+            "child observes the spawner's active run"
+        );
+        assert_eq!(child.cur_agent().as_deref(), Some("scout_1"));
+        // The child cannot tear down the parent's scope with the parent's token.
+        assert!(!child.remove(parent_token));
+        assert_eq!(
+            child.current_ctx().map(|c| c.run_id.clone()).as_deref(),
+            Some("shared-run")
+        );
+        // The parent's own teardown still works.
+        assert!(state.remove(parent_token));
+        assert!(state.current_ctx().is_none());
+    }
+
+    // ── run identity (A2) ────────────────────────────────────────────────
+
+    #[test]
+    fn generated_run_id_has_secs_nanos_pid_and_nonce() {
+        let a = generate_run_id();
+        let b = generate_run_id();
+        assert_ne!(a, b, "the process nonce makes back-to-back ids distinct");
+        for id in [&a, &b] {
+            assert!(id.starts_with("wf_"), "id keeps the wf_ prefix: {id}");
+            let parts: Vec<&str> = id.split('_').collect();
+            assert_eq!(parts.len(), 5, "wf_<secs>_<nanos>_<pid>_<nonce>: {id}");
+            for field in &parts[1..] {
+                assert!(
+                    !field.is_empty() && field.bytes().all(|c| c.is_ascii_digit()),
+                    "each generated id field is a non-empty number: {id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_explicit_run_id_accepts_safe_names_and_rejects_unsafe() {
+        for ok in ["wf_test_0001", "run-42", "abc.def", "a"] {
+            assert!(validate_explicit_run_id(ok).is_ok(), "should accept {ok:?}");
+        }
+        for bad in [
+            "",     // empty
+            "a/b",  // unix separator
+            "a\\b", // windows separator
+            "..",   // traversal
+            "a..b", // embedded traversal
+            ".",    // dot-only
+            "...",  // dots-only
+            "a\0b", // NUL
+            "a\nb", // control char
+        ] {
+            let err = validate_explicit_run_id(bad).expect_err(&format!("should reject {bad:?}"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn open_fresh_with_retries_past_a_colliding_id() {
+        let mut root = std::env::temp_dir();
+        root.push(format!(
+            "sema-wf-fresh-retry-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root_str = root.to_string_lossy().to_string();
+        // The first two candidate ids already have a JOURNAL (events.jsonl); the opener
+        // must skip them (its create_new claim fails) and land on the first free id.
+        for taken in ["taken_1", "taken_2"] {
+            std::fs::create_dir_all(root.join(taken)).unwrap();
+            std::fs::write(root.join(taken).join("events.jsonl"), "{}\n").unwrap();
+        }
+        let mut candidates = ["taken_1", "taken_2", "free_3"].into_iter();
+        let (id, _journal) =
+            open_fresh_with(&root_str, || candidates.next().unwrap().to_string()).unwrap();
+        assert_eq!(id, "free_3", "opener retried past the colliding ids");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

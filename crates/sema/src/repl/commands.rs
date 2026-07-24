@@ -171,7 +171,7 @@ fn doc(env: &Env, name: &str) {
         Some(val) => {
             // VM closures arrive wrapped as NativeFn — peel that first so we
             // print a real arity line instead of a generic "native-fn".
-            if let Some((closure, _funcs)) = sema_vm::extract_vm_closure(&val) {
+            if let Some((closure, _funcs, _natives)) = sema_vm::extract_vm_closure(&val) {
                 let arity = closure.func.arity;
                 let rest = if closure.func.has_rest { " . rest" } else { "" };
                 let params: Vec<String> = (0..arity).map(|i| format!("arg{i}")).collect();

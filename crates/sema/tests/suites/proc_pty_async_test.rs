@@ -2,13 +2,16 @@
 //!
 //! Both natives block on `Child::wait()` for the child's whole lifetime
 //! (`crates/sema-stdlib/src/proc.rs`, `pty.rs`). Inside `async/spawn`'d tasks
-//! that would stall every sibling on the cooperative scheduler; they now
-//! branch on `in_async_context()` and offload the wait through a CHECKOUT
-//! registry slot (`Available`/`CheckedOut`/`Tombstone`) — see the module doc
-//! comments in `proc.rs`/`pty.rs` for the full design. This suite proves the
-//! scheduler-not-stalled property plus exact parity with the unchanged sync
-//! path, including the "wait twice on the same handle" behavior that the sync
-//! path already had (`Child::wait` caches the exit status once reaped).
+//! that would stall every sibling on the cooperative scheduler; in a runtime
+//! quantum they offload the wait through the gate-guarded CHECKOUT
+//! (`runtime_offload::checkout_external`) — the registry slot
+//! (`Available`/`CheckedOut`/`Tombstone`) is serialized by a per-handle
+//! `ResourceGate`; see the module doc comments in `proc.rs`/`pty.rs` for the
+//! full design. This suite proves the scheduler-not-stalled property, exact
+//! parity with the unchanged sync path (including the "wait twice on the same
+//! handle" behavior — `Child::wait` caches the exit status once reaped), and
+//! that a cancelled wait settles cleanly (the process-group SIGKILL abort hook
+//! unsticks the blocking worker) without wedging the registry.
 //!
 //! Every child process here terminates on its own within well under a
 //! second (`sh -c 'exit N'` / `sh -c 'sleep 0.2; exit N'`) per the WP's
@@ -110,6 +113,53 @@ fn proc_wait_async_matches_sync_exit_code() {
         .expect("async proc/wait");
     assert_eq!(sync_v, async_v);
     assert_eq!(sync_v, Value::int(5));
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "proc/close must return the runtime's gate registry to baseline"
+    );
+}
+
+#[test]
+fn proc_close_from_foreign_runtime_is_offloaded_and_closes_owner_gate() {
+    let owner = Interpreter::new();
+    let caller = Interpreter::new();
+    let handle = owner
+        .eval_str_via_runtime(
+            r#"
+            (define foreign-close-proc
+              (proc/spawn (list "sh" "-c" "exit 0")))
+            (proc/wait foreign-close-proc)
+            foreign-close-proc
+            "#,
+        )
+        .expect("owner runtime creates a process gate")
+        .as_int()
+        .expect("proc handle is an integer");
+    assert_eq!(owner.runtime_resource_gate_count(), 1);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+
+    let result = caller
+        .eval_str_via_runtime(&format!(
+            r#"
+            (let ((out (channel/new 2)))
+              (async/all
+                (list
+                  (async/spawn (fn ()
+                    (proc/close {handle})
+                    (channel/send out :proc)))
+                  (async/spawn (fn () (channel/send out :sibling)))))
+              (list (channel/recv out) (channel/recv out)))
+            "#
+        ))
+        .expect("foreign process close uses a caller-runtime External offload");
+    assert_eq!(
+        result.as_seq().expect("receive order"),
+        &[Value::keyword("sibling"), Value::keyword("proc")],
+        "the foreign terminal wait must yield the caller VM to its sibling"
+    );
+    assert_eq!(owner.runtime_resource_gate_count(), 0);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
 }
 
 /// `proc/wait` called twice (sequentially) on the same handle inside one
@@ -162,6 +212,94 @@ fn proc_wait_async_concurrent_waiters_both_succeed() {
         codes,
         vec![Value::int(3), Value::int(3)],
         "both queued waiters must see the same reaped exit code"
+    );
+}
+
+// === Cancellation through the ResourceGate + checkout_external path ===
+//
+// Cancelling a spawned proc chain must settle the task Cancelled (never hang or
+// panic) AND leave the thread-local registry + runtime usable: a fresh proc
+// spawned afterwards waits normally. Exercises the checkout continuations'
+// Cancelled arms and the process-group SIGKILL abort hook.
+#[test]
+fn proc_cancelled_wait_settles_cancelled_and_registry_stays_usable() {
+    let interp = Interpreter::new();
+    let program = r#"
+        (let ((h (proc/spawn (list "sh" "-c" "sleep 2; exit 0"))))
+          (let ((p (async/spawn (fn () (proc/wait h)))))
+            (async/cancel p)
+            (let ((caught (try (async/await p) (catch e :caught))))
+              (proc/close h)
+              ;; a fresh handle must still work after the cancellation
+              (let ((h2 (proc/spawn (list "sh" "-c" "exit 4"))))
+                (let ((code (proc/wait h2)))
+                  (proc/close h2)
+                  (list caught code))))))
+    "#;
+    let result = interp
+        .eval_str_compiled(program)
+        .expect("cancelled proc chain evaluates without wedging the runtime");
+    let parts: Vec<Value> = result.as_list().expect("result list").to_vec();
+    assert_eq!(
+        parts[0],
+        Value::keyword("caught"),
+        "awaiting the cancelled task must raise the :cancelled condition, got {:?}",
+        parts[0]
+    );
+    assert_eq!(
+        parts[1].as_int(),
+        Some(4),
+        "a fresh proc handle must work after the cancellation (registry not wedged)"
+    );
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
+}
+
+// A sibling queued behind a busy handle: `slow` holds the gate on a long
+// `proc/wait`; `queued` parks FIFO behind it, then is cancelled while still
+// queued. The cancelled acquirer must be removed from the gate FIFO (never
+// owning the resource) and settle :cancelled. Cancelling `slow` too fires the
+// process-group SIGKILL abort, unsticking the blocking wait; the whole chain
+// settles cleanly and a fresh handle still works — the registry is not wedged.
+#[test]
+fn proc_cancel_while_queued_behind_busy_handle() {
+    let interp = Interpreter::new();
+    let program = r#"
+        (let ((h (proc/spawn (list "sh" "-c" "sleep 2; exit 0"))))
+          (let ((slow (async/spawn (fn () (proc/wait h))))
+                (queued (async/spawn (fn () (proc/wait h)))))
+            ;; cancel the queued waiter while `slow` holds the gate, then cancel
+            ;; the gate holder — its SIGKILL abort unsticks the blocking wait.
+            (async/cancel queued)
+            (async/cancel slow)
+            (let ((q (try (async/await queued) (catch e :q-cancelled)))
+                  (s (try (async/await slow) (catch e :slow-cancelled))))
+              (proc/close h)
+              ;; a fresh handle must still wait normally after all that
+              (let ((h2 (proc/spawn (list "sh" "-c" "exit 9"))))
+                (let ((code (proc/wait h2)))
+                  (proc/close h2)
+                  (list q s code))))))
+    "#;
+    let result = interp
+        .eval_str_compiled(program)
+        .expect("cancel-while-queued evaluates without hanging or panicking");
+    let parts: Vec<Value> = result.as_list().expect("result list").to_vec();
+    assert_eq!(
+        parts[0],
+        Value::keyword("q-cancelled"),
+        "the queued-then-cancelled waiter must raise :cancelled, got {:?}",
+        parts[0]
+    );
+    assert_eq!(
+        parts[1],
+        Value::keyword("slow-cancelled"),
+        "the cancelled gate holder must raise :cancelled, got {:?}",
+        parts[1]
+    );
+    assert_eq!(
+        parts[2].as_int(),
+        Some(9),
+        "a fresh proc handle must work after cancelling both waiters"
     );
 }
 
@@ -228,6 +366,238 @@ fn pty_wait_async_matches_sync_exit_code() {
         .expect("async pty/wait");
     assert_eq!(sync_v, async_v);
     assert_eq!(sync_v, Value::int(5));
+    assert_eq!(
+        interp.runtime_resource_gate_count(),
+        0,
+        "pty/close must return the runtime's gate registry to baseline"
+    );
+}
+
+#[test]
+fn pty_close_from_foreign_runtime_is_offloaded_and_closes_owner_gate() {
+    if !pty_available() {
+        eprintln!("skipping foreign-runtime pty close: no pty available");
+        return;
+    }
+    let owner = Interpreter::new();
+    let caller = Interpreter::new();
+    let handle = owner
+        .eval_str_via_runtime(
+            r#"
+            (define foreign-close-pty
+              (pty/spawn (list "sh" "-c" "exit 0")))
+            (pty/wait foreign-close-pty)
+            foreign-close-pty
+            "#,
+        )
+        .expect("owner runtime creates a pty gate")
+        .as_int()
+        .expect("pty handle is an integer");
+    assert_eq!(owner.runtime_resource_gate_count(), 1);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+
+    let result = caller
+        .eval_str_via_runtime(&format!(
+            r#"
+            (let ((out (channel/new 2)))
+              (async/all
+                (list
+                  (async/spawn (fn ()
+                    (pty/close {handle})
+                    (channel/send out :pty)))
+                  (async/spawn (fn () (channel/send out :sibling)))))
+              (list (channel/recv out) (channel/recv out)))
+            "#
+        ))
+        .expect("foreign pty close uses a caller-runtime External offload");
+    assert_eq!(
+        result.as_seq().expect("receive order"),
+        &[Value::keyword("sibling"), Value::keyword("pty")],
+        "the foreign pty terminal wait must yield the caller VM to its sibling"
+    );
+    assert_eq!(owner.runtime_resource_gate_count(), 0);
+    assert_eq!(caller.runtime_resource_gate_count(), 0);
+}
+
+/// Cancelling a spawned pty chain settles the task Cancelled and leaves the
+/// registry usable (the pty analogue of the proc cancel test) — the process-
+/// group SIGKILL abort hook unsticks the blocking wait.
+#[test]
+fn pty_cancelled_wait_settles_cancelled_and_registry_stays_usable() {
+    if !pty_available() {
+        eprintln!("skipping pty_cancelled_wait_...: no pty available");
+        return;
+    }
+    let interp = Interpreter::new();
+    let program = r#"
+        (let ((h (pty/spawn (list "sh" "-c" "sleep 2; exit 0"))))
+          (let ((p (async/spawn (fn () (pty/wait h)))))
+            (async/cancel p)
+            (let ((caught (try (async/await p) (catch e :caught))))
+              (pty/close h)
+              (let ((h2 (pty/spawn (list "sh" "-c" "exit 4"))))
+                (let ((code (pty/wait h2)))
+                  (pty/close h2)
+                  (list caught code))))))
+    "#;
+    let result = interp
+        .eval_str_compiled(program)
+        .expect("cancelled pty chain evaluates without wedging the runtime");
+    let parts: Vec<Value> = result.as_list().expect("result list").to_vec();
+    assert_eq!(
+        parts[0],
+        Value::keyword("caught"),
+        "awaiting the cancelled task must raise :cancelled, got {:?}",
+        parts[0]
+    );
+    assert_eq!(
+        parts[1].as_int(),
+        Some(4),
+        "a fresh pty handle must work after the cancellation"
+    );
+    assert_eq!(interp.runtime_resource_gate_count(), 0);
+}
+
+/// A queued pty waiter cancelled while parked behind a busy handle, then the
+/// gate holder cancelled too (SIGKILL abort unsticks it) — both settle
+/// :cancelled and a fresh handle still works.
+#[test]
+fn pty_cancel_while_queued_behind_busy_handle() {
+    if !pty_available() {
+        eprintln!("skipping pty_cancel_while_queued_...: no pty available");
+        return;
+    }
+    let interp = Interpreter::new();
+    let program = r#"
+        (let ((h (pty/spawn (list "sh" "-c" "sleep 2; exit 0"))))
+          (let ((slow (async/spawn (fn () (pty/wait h))))
+                (queued (async/spawn (fn () (pty/wait h)))))
+            (async/cancel queued)
+            (async/cancel slow)
+            (let ((q (try (async/await queued) (catch e :q-cancelled)))
+                  (s (try (async/await slow) (catch e :slow-cancelled))))
+              (pty/close h)
+              (let ((h2 (pty/spawn (list "sh" "-c" "exit 9"))))
+                (let ((code (pty/wait h2)))
+                  (pty/close h2)
+                  (list q s code))))))
+    "#;
+    let result = interp
+        .eval_str_compiled(program)
+        .expect("cancel-while-queued pty evaluates without hanging");
+    let parts: Vec<Value> = result.as_list().expect("result list").to_vec();
+    assert_eq!(parts[0], Value::keyword("q-cancelled"));
+    assert_eq!(parts[1], Value::keyword("slow-cancelled"));
+    assert_eq!(parts[2].as_int(), Some(9));
+}
+
+// === C6 (closes ledger row C14): interpreter drop reaps live proc/pty children ===
+//
+// A child spawned via `proc/spawn`/`pty/spawn` and left in the per-thread
+// registry (never `proc/wait`/`proc/close`d) must be SIGKILLed and reaped when
+// the owning interpreter is dropped. Before the interpreter-teardown hooks the
+// registry survived the drop and the `sleep 30` child leaked (a fresh interpreter
+// on the same thread never touches it either). The child writes its own pid to a
+// file; after `drop(interp)` that pid must become unkillable (`ESRCH`) within a
+// bounded window. Reuses the existing process-group SIGKILL machinery.
+
+#[cfg(unix)]
+fn read_child_pid(path: &std::path::Path) -> i32 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            let trimmed = contents.trim();
+            if let Ok(pid) = trimmed.parse::<i32>() {
+                return pid;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child never wrote its pid to {path:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// `kill(pid, 0)` returns 0 while the process exists (including as a zombie) and
+/// `-1`/`ESRCH` once it is gone AND reaped. Our teardown SIGKILLs then `wait()`s,
+/// so a reaped child reads as gone here.
+#[cfg(unix)]
+fn process_alive(pid: i32) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(unix)]
+fn wait_until_dead(pid: i32) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if !process_alive(pid) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    !process_alive(pid)
+}
+
+#[cfg(unix)]
+#[test]
+fn interpreter_drop_reaps_live_proc_and_pty_children() {
+    let unique = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+
+    // proc: spawn a long-lived child, leave it in the registry, drop the
+    // interpreter, and assert the child was reaped.
+    let proc_pidfile = std::env::temp_dir().join(format!("sema-c6-proc-{unique}.pid"));
+    let _ = std::fs::remove_file(&proc_pidfile);
+    let proc_pid = {
+        let interp = Interpreter::new();
+        let program = format!(
+            r#"(proc/spawn (list "sh" "-c" "echo $$ > '{p}'; exec sleep 30"))"#,
+            p = proc_pidfile.display()
+        );
+        interp
+            .eval_str_compiled(&program)
+            .expect("spawn a long-lived proc child");
+        let pid = read_child_pid(&proc_pidfile);
+        assert!(
+            process_alive(pid),
+            "the proc child must be alive before the interpreter is dropped"
+        );
+        drop(interp);
+        pid
+    };
+    assert!(
+        wait_until_dead(proc_pid),
+        "interpreter drop must SIGKILL+reap the live proc child (pid {proc_pid})"
+    );
+    let _ = std::fs::remove_file(&proc_pidfile);
+
+    // pty: same, only when a real pty can be allocated in this environment.
+    if pty_available() {
+        let pty_pidfile = std::env::temp_dir().join(format!("sema-c6-pty-{unique}.pid"));
+        let _ = std::fs::remove_file(&pty_pidfile);
+        let pty_pid = {
+            let interp = Interpreter::new();
+            let program = format!(
+                r#"(pty/spawn (list "sh" "-c" "echo $$ > '{p}'; exec sleep 30"))"#,
+                p = pty_pidfile.display()
+            );
+            interp
+                .eval_str_compiled(&program)
+                .expect("spawn a long-lived pty child");
+            let pid = read_child_pid(&pty_pidfile);
+            assert!(
+                process_alive(pid),
+                "the pty child must be alive before the interpreter is dropped"
+            );
+            drop(interp);
+            pid
+        };
+        assert!(
+            wait_until_dead(pty_pid),
+            "interpreter drop must SIGKILL+reap the live pty child (pid {pty_pid})"
+        );
+        let _ = std::fs::remove_file(&pty_pidfile);
+    }
 }
 
 /// `pty/wait` called twice (sequentially) on the same handle inside one async

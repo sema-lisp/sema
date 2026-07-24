@@ -8,18 +8,18 @@
 ;; --- Format a station's results ---
 ;; Stats vector layout: [min, max, sum, count]
 (define (format-station name stats)
-  (let ((mn   (round1 (nth stats 0)))
-        (avg  (round1 (/ (nth stats 2) (nth stats 3))))
-        (mx   (round1 (nth stats 1))))
+  (let ((mn (round1 (nth stats 0)))
+        (avg (round1 (/ (nth stats 2) (nth stats 3))))
+        (mx (round1 (nth stats 1))))
     (format "~a=~a/~a/~a" name mn avg mx)))
 
 ;; --- Parse CLI arguments (after "--") ---
 (define (script-args)
   (let loop ((args (sys/args)))
     (cond
-      ((null? args)           '())
-      ((= (first args) "--")  (rest args))
-      (else                   (loop (rest args))))))
+      ((null? args) '())
+      ((= (first args) "--") (rest args))
+      (else (loop (rest args))))))
 
 (define args (script-args))
 (when (< (length args) 1)
@@ -35,10 +35,10 @@
     (fn (acc line)
       (if (= line "")
         acc
-        (let* ((parts     (string/split line ";"))
-               (name      (first parts))
-               (temp      (string->number (nth parts 1)))
-               (existing  (get acc name)))
+        (let* ((parts (string/split line ";"))
+               (name (first parts))
+               (temp (string->number (nth parts 1)))
+               (existing (get acc name)))
           (if (nil? existing)
             (assoc acc name (vector temp temp temp 1))
             (assoc acc

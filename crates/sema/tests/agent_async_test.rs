@@ -131,12 +131,12 @@ fn sibling_ticker_advances_during_agent_rounds() {
     );
 }
 
-/// Cancelling a running agent (via `async/timeout` shorter than the full
-/// conversation) must cut the round loop short: no NEW provider round starts after
-/// the cutoff. Blocking today: `agent/run` is one synchronous native call the
-/// scheduler cannot interrupt, so the timeout can't fire until the agent has
+/// Explicitly cancelling a running agent before the full conversation completes
+/// must cut the round loop short: no NEW provider round starts after the cutoff.
+/// Blocking today: `agent/run` is one synchronous native call the scheduler cannot
+/// interrupt, so the cancellation task can't run until the agent has
 /// already run every round — all `full` provider calls happen. Non-blocking: the
-/// agent parks on `AwaitIo` between rounds, the timeout cancels it there, and the
+/// agent parks on `AwaitIo` between rounds, explicit cancellation stops it there, and the
 /// remaining rounds never dispatch (best-effort for the in-flight round).
 #[test]
 #[serial]
@@ -159,9 +159,9 @@ fn cancelling_agent_run_cuts_the_loop_short() {
         (deftool ping "ping" {:n {:type :number}} (fn (n) "pong"))
         (defagent bot {:model "fake-model" :tools [ping] :max-turns 12})
         (let ((p (async/spawn (fn () (agent/run bot "go")))))
-          ;; (async/timeout ms promise): cancel the agent ~250 ms in. Swallow the
-          ;; timeout throw — we assert on how many rounds dispatched, not the result.
-          (try (async/timeout 250 p) (catch e nil)))
+          (async/spawn (fn () (async/sleep 250) (async/cancel p)))
+          ;; Observe the explicit cancellation; the assertion is on dispatched rounds.
+          (try (async/await p) (catch e nil)))
     "#;
     let _ = interp.eval_str_compiled(program);
 
@@ -169,7 +169,7 @@ fn cancelling_agent_run_cuts_the_loop_short() {
     assert!(
         calls > 0 && calls < 9,
         "expected the cancelled agent to stop short of all 9 provider rounds, but it \
-         made {calls} — the timeout could not interrupt the blocking loop"
+         made {calls} — explicit cancellation could not interrupt the blocking loop"
     );
 }
 
@@ -256,7 +256,8 @@ fn cancelled_agent_leaves_no_slab_entry_and_next_run_works() {
         (deftool ping "ping" {:n {:type :number}} (fn (n) "pong"))
         (defagent bot {:model "fake-model" :tools [ping] :max-turns 12})
         (let ((p (async/spawn (fn () (agent/run bot "go")))))
-          (try (async/timeout 250 p) (catch e nil)))
+          (async/spawn (fn () (async/sleep 250) (async/cancel p)))
+          (try (async/await p) (catch e nil)))
     "#;
     let _ = interp.eval_str_compiled(cancel_program);
 
@@ -306,7 +307,8 @@ fn cancelled_agent_span_is_exported() {
         (deftool ping "ping" {:n {:type :number}} (fn (n) "pong"))
         (defagent bot {:model "fake-model" :tools [ping] :max-turns 12})
         (let ((p (async/spawn (fn () (agent/run bot "go")))))
-          (try (async/timeout 250 p) (catch e nil)))
+          (async/spawn (fn () (async/sleep 250) (async/cancel p)))
+          (try (async/await p) (catch e nil)))
     "#;
     let _ = interp.eval_str_compiled(program);
     assert_eq!(agent_runs_len(), 0, "slab reaped on cancel");

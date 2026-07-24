@@ -104,7 +104,7 @@ thread_local! {
 /// swaps one of these into the thread-locals on task entry and takes it back out
 /// on task leave, so a task that parks mid-span (its `SpanCore` guard still on
 /// the stack) cannot corrupt a sibling task's stack or ids.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct OtelTaskCtx {
     stack: Vec<Context>,
     conversation_id: Option<String>,
@@ -177,7 +177,30 @@ pub fn register_task_callbacks() {
     fn scope_ctx() -> Box<dyn std::any::Any> {
         Box::new(current_conversation_scope())
     }
+    // Fast-path predicate (`TaskScopeSwap`, sema-vm `state.rs`): a captured otel
+    // context is empty when its span stack is empty and no conversation/session/
+    // user identity is set. No allocation.
+    fn is_empty(ctx: &Box<dyn std::any::Any>) -> bool {
+        match ctx.downcast_ref::<OtelTaskCtx>() {
+            Some(c) => {
+                c.stack.is_empty()
+                    && c.conversation_id.is_none()
+                    && c.session_id.is_none()
+                    && c.user_id.is_none()
+            }
+            None => true,
+        }
+    }
+    // Peek (no mutation, no allocation) whether the thread-local otel context is
+    // currently empty.
+    fn ambient_is_empty() -> bool {
+        STACK.with(|s| s.borrow().is_empty())
+            && CONVERSATION_ID.with(|c| c.borrow().is_none())
+            && SESSION_ID.with(|c| c.borrow().is_none())
+            && USER_ID.with(|c| c.borrow().is_none())
+    }
     sema_core::set_otel_task_callbacks(take, install, scope_ctx);
+    sema_core::set_otel_empty_callbacks(is_empty, ambient_is_empty);
 }
 
 /// How an embedded host wires Sema's telemetry (Decisions #12, #14, #16). The
@@ -658,7 +681,9 @@ fn build_provider() -> Option<SdkTracerProvider> {
 
     if let Some(path) = file {
         if let Ok(exp) = JsonlFileExporter::new(&path) {
-            // Simple exporter → deterministic immediate JSONL capture.
+            // Simple processor → one span per `export()` call; the exporter renders on the
+            // VM thread and enqueues to its own writer thread (no VM-thread disk I/O), with
+            // a bounded flush on provider shutdown so the file is complete on return.
             builder = builder.with_simple_exporter(exp);
         }
     }
@@ -1395,9 +1420,7 @@ pub struct ToolSpan {
     inner: Option<SpanCore>,
 }
 
-/// Start a tool-dispatch span (INTERNAL). v1.41 requires the tool name in the span
-/// name: `execute_tool {name}`.
-pub fn tool_span(name: &str, call_id: &str, description: Option<&str>) -> ToolSpan {
+fn tool_span_attrs(name: &str, call_id: &str, description: Option<&str>) -> Vec<KeyValue> {
     let mut attrs = vec![
         KeyValue::new("gen_ai.operation.name", "execute_tool"),
         KeyValue::new("gen_ai.tool.name", name.to_string()),
@@ -1407,7 +1430,36 @@ pub fn tool_span(name: &str, call_id: &str, description: Option<&str>) -> ToolSp
     if let Some(d) = description {
         attrs.push(KeyValue::new("gen_ai.tool.description", d.to_string()));
     }
-    let inner = start(format!("execute_tool {name}"), SpanKind::Internal, attrs);
+    attrs
+}
+
+/// Start a tool-dispatch span (INTERNAL). v1.41 requires the tool name in the span
+/// name: `execute_tool {name}`.
+pub fn tool_span(name: &str, call_id: &str, description: Option<&str>) -> ToolSpan {
+    let inner = start(
+        format!("execute_tool {name}"),
+        SpanKind::Internal,
+        tool_span_attrs(name, call_id, description),
+    );
+    if let Some(c) = &inner {
+        c.set_attrs(compat::span_kind(compat::Kind::Tool));
+    }
+    ToolSpan { inner }
+}
+
+/// Start a DETACHED tool span: parented to the current TL-stack top (captured now,
+/// i.e. the enclosing agent span) but NOT pushed and NOT popping on drop. The
+/// cooperative agent tool loop opens this while its handler runs as a
+/// `NativeOutcome::Call`: the span (and its `Drop`) then survives the continuation
+/// `resume` — which runs OUTSIDE the task's span-stack scope — without disturbing
+/// that stack, so a following round's `chat` span still parents under the agent, not
+/// a stranded tool span.
+pub fn tool_span_detached(name: &str, call_id: &str, description: Option<&str>) -> ToolSpan {
+    let inner = start_detached(
+        format!("execute_tool {name}"),
+        SpanKind::Internal,
+        tool_span_attrs(name, call_id, description),
+    );
     if let Some(c) = &inner {
         c.set_attrs(compat::span_kind(compat::Kind::Tool));
     }

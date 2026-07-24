@@ -9,9 +9,9 @@
 
 ;; ── State ──────────────────────────────────────────────
 
-(define messages    (state '()))
-(define user-input  (state ""))
-(define loading     (state #f))
+(define messages (state '()))
+(define user-input (state ""))
+(define loading (state #f))
 
 ;; ── Event handlers ─────────────────────────────────────
 
@@ -64,10 +64,10 @@
    [:div
     {:class "input-row"}
     [:input
-     {:id           "chat-input"
-      :type         "text"
-      :placeholder  "Type a message..."
-      :on-keyup     "update-input"}]
+     {:id "chat-input"
+      :type "text"
+      :placeholder "Type a message..."
+      :on-keyup "update-input"}]
     [:button {:on-click "send-message" :class "btn"} "Send"]]])
 
 ;; ── Mount ──────────────────────────────────────────────

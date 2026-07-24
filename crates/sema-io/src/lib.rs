@@ -42,10 +42,10 @@
 //!
 //! Pinned by `tests/tokio_pin_test.rs` (re-established on every CI run so a
 //! tokio upgrade that changes the rules fails loudly): `io_block_on` is legal
-//! from plain OS threads (the VM thread) and from this pool's own
-//! `spawn_blocking` closures — `block_on` drives the future on the CALLING
-//! thread, workers supply only the reactor/timers — and panics from async
-//! worker threads.
+//! from plain OS threads only while no Sema runtime quantum is active, and from
+//! this pool's own `spawn_blocking` closures. `block_on` drives the future on the
+//! CALLING thread, workers supply only the reactor/timers. It panics from an
+//! active runtime quantum and from async worker threads.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -55,6 +55,9 @@ use std::sync::OnceLock;
 use sema_core::{AbortHook, BoxIoFuture, IoBackend};
 use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
+
+mod executor;
+pub use executor::{process_executor, ProcessIoExecutor};
 
 /// Cap on the pool's blocking-thread tier.
 const MAX_BLOCKING_THREADS: usize = 512;
@@ -186,8 +189,9 @@ where
 
 /// Drive `fut` to completion ON THE CALLING THREAD using THE pool's reactor,
 /// returning its output. `fut` may be non-`Send` and non-`'static`. Legal from
-/// plain OS threads and `io_spawn_blocking` closures; PANICS from async worker
-/// threads — see the threading contract in the module docs.
+/// plain OS threads and `io_spawn_blocking` closures; rejects an active Sema
+/// runtime quantum and panics from async worker threads — see the threading
+/// contract in the module docs.
 pub fn io_block_on<F: Future>(fut: F) -> F::Output {
     install();
     BLOCK_ON_OPS.fetch_add(1, Ordering::SeqCst);

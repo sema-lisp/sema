@@ -2,27 +2,27 @@
 
 (println "=== Towers of Hanoi ===\n")
 
-(define num-disks     4)
-(define move-counter  (list 0))
+(define num-disks 4)
+(define move-counter (list 0))
 
 (define (make-towers n)
   (map/new :A (range 1 (+ n 1)) :B (list) :C (list)))
 
 (define (move-disk towers from to)
-  (let* ((from-stack  (get towers from))
-         (to-stack    (get towers to))
-         (disk        (car from-stack))
-         (new-from    (cdr from-stack))
-         (new-to      (cons disk to-stack)))
+  (let* ((from-stack (get towers from))
+         (to-stack (get towers to))
+         (disk (car from-stack))
+         (new-from (cdr from-stack))
+         (new-to (cons disk to-stack)))
     (assoc (assoc towers from new-from) to new-to)))
 
 (define (render-disk disk width)
   (if (= disk 0)
     (string/append (string/pad-left "|" width) (string/repeat " " (- width 1)))
-    (let* ((arm          (string/repeat "█" disk))
-           (line         (string/append arm "|" arm))
-           (pad-left     (string/pad-left line width))
-           (total-width  (- (* 2 width) 1)))
+    (let* ((arm (string/repeat "█" disk))
+           (line (string/append arm "|" arm))
+           (pad-left (string/pad-left line width))
+           (total-width (- (* 2 width) 1)))
       (string/pad-right pad-left total-width))))
 
 (define (display-towers towers)
@@ -56,10 +56,10 @@
 (define (solve n from to aux towers)
   (if (= n 0)
     towers
-    (let* ((towers1   (solve (- n 1) from aux to towers))
-           (disk      (car (get towers1 from)))
-           (towers2   (move-disk towers1 from to))
-           (move-num  (+ 1 (car move-counter))))
+    (let* ((towers1 (solve (- n 1) from aux to towers))
+           (disk (car (get towers1 from)))
+           (towers2 (move-disk towers1 from to))
+           (move-num (+ 1 (car move-counter))))
       (set! move-counter (list move-num))
       (println
         (format "--- Move ~a: Disk ~a from ~a → ~a ---"

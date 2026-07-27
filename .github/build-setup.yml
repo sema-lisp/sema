@@ -1,11 +1,25 @@
-# Profile-Guided Optimization setup for release builds.
+# Build setup for release builds: macOS codesign options + Profile-Guided
+# Optimization. One file because dist's `github-build-setup` accepts exactly one.
 #
 # Injected into the `build-local-artifacts` job (right after checkout, before
 # `dist build`) via `github-build-setup` in dist-workspace.toml. After editing
 # THIS file you must run `dist generate` to re-bake it into
 # .github/workflows/release.yml, then commit both.
-#
-# Behavior: on a runner whose host matches the target being built, it
+
+# dist's built-in macos-sign (dist-workspace.toml) reads CODESIGN_OPTIONS and
+# passes it to `codesign --options`. Hardened runtime is required for the Apple
+# notary service (.github/workflows/notarize.yml) to accept the binaries; the
+# other notarization requirement, a secure timestamp, is added by codesign
+# automatically for Developer ID identities. No-op on non-macOS runners, and
+# harmless when the CODESIGN_* secrets are absent (dist skips signing entirely).
+- name: "codesign: hardened runtime on macOS signatures"
+  shell: bash
+  run: |
+    if [ "$(uname -s)" = "Darwin" ]; then
+      echo "CODESIGN_OPTIONS=runtime" >> "$GITHUB_ENV"
+    fi
+
+# PGO: on a runner whose host matches the target being built, this step
 # instruments, trains, and merges a PGO profile, then exports
 # RUSTFLAGS=-Cprofile-use so the subsequent `dist build` produces a PGO binary
 # (measured ~25% faster on 1BRC; see docs/performance-roadmap.md). On

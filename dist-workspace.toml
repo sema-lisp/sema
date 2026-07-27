@@ -13,14 +13,22 @@ installers = ["shell", "powershell", "homebrew"]
 tap = "helgesverre/homebrew-tap"
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
+# Sign macOS binaries with a Developer ID certificate (CODESIGN_* repo secrets;
+# see docs/release-signing.md). Builds stay unsigned when the secrets are absent.
+macos-sign = true
+# Notarize the signed macOS binaries after the release is published
+# (.github/workflows/notarize.yml; APPLE_API_* repo secrets).
+post-announce-jobs = ["./notarize"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Release binaries keep OTLP-over-gRPC support; it is a non-default cargo feature so
 # dev builds skip the tonic/h2 compile (see docs/build-time-report.md).
 features = ["otel-grpc"]
-# PGO: instrument+train+profile-use on native targets before `dist build`.
-# Steps live in .github/pgo-setup.yml; run `dist generate` after editing them.
-github-build-setup = "../pgo-setup.yml"
+# Steps injected into build-local-artifacts before `dist build`: PGO
+# (instrument+train+profile-use on native targets) and the macOS codesign
+# options. Steps live in .github/build-setup.yml; run `dist generate` after
+# editing them.
+github-build-setup = "../build-setup.yml"
 # Don't run the `plan` job on every PR — verify.yml is the real PR gate, and
 # dist config changes are rare enough to be exercised at tag time.
 pr-run-mode = "skip"

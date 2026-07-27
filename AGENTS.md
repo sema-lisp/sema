@@ -184,7 +184,7 @@ Hard-won conventions — follow these or you will reintroduce shipped bugs (see 
 3. **Update CHANGELOG.md** — add a new `## X.Y.Z` section at the top.
 4. **Build release**: `cargo build --release` (also refreshes `Cargo.lock`); verify `./target/release/sema --version`.
 5. **Commit & tag**: `git commit -m "release: X.Y.Z"`, `git tag vX.Y.Z`.
-6. **Push**: `git push origin main --tags` — triggers CI (on the main push), Release/binaries, and Publish (crates.io + npm, gated on verify); the MCPB Bundle chains off Release. Confirm with `gh run list`.
+6. **Push**: `git push origin main --tags` — triggers 4 CI workflows (CI, Release/binaries, Publish to crates.io, Publish to npm); confirm with `gh run list`. The Release workflow also signs + notarizes the macOS binaries when the Apple secrets are configured (`docs/release-signing.md`).
 7. **Deploy website** *only if website content changed*: `cd website && vercel --prod` (see the deploy gotcha under Website).
 
 ## Playground

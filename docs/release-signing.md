@@ -1,9 +1,11 @@
-# macOS release signing & notarization
+# Release binary trust: signing, notarization, attestations
 
 Release macOS binaries are Developer-ID-signed during `dist build` and
 notarized after the release is published (issue #109). Everything is automatic
 in CI once the six repo secrets below exist; without them, releases keep
-working exactly as before (ad-hoc-signed, not notarized).
+working exactly as before (ad-hoc-signed, not notarized). Independently of the
+secrets, every release binary archive gets a GitHub Artifact Attestation
+(issue #107) — see the last section.
 
 ## How it's wired
 
@@ -87,3 +89,20 @@ developer" dialog.
 Developer ID Application certificates last 5 years. On expiry: new cert in
 Keychain Access, re-export, update `CODESIGN_CERTIFICATE` (+ password/identity
 if changed). The API key doesn't expire unless revoked.
+
+## Provenance: GitHub Artifact Attestations
+
+`github-attestations = true` in `dist-workspace.toml` (issue #107) makes the
+build jobs publish Sigstore provenance for each per-target binary archive —
+keyless, signed with the workflow's OIDC identity, no secrets involved. The
+`.sha256` sidecars only guard against corruption (they ship over the same
+channel as the binary); an attestation proves the artifact was built by this
+repo's Release workflow at a specific commit. Verify a download with:
+
+```bash
+gh attestation verify sema-lang-aarch64-apple-darwin.tar.xz --owner sema-lisp
+```
+
+Scope note: dist 0.30.4 attests the binary archives from `build-local-artifacts`
+only — installers (`.sh`/`.ps1`), the Homebrew formula and the source tarball
+are not attested.

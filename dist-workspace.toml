@@ -19,6 +19,11 @@ macos-sign = true
 # Notarize the signed macOS binaries after the release is published
 # (.github/workflows/notarize.yml; APPLE_API_* repo secrets).
 post-announce-jobs = ["./notarize"]
+# Sigstore provenance for every release artifact (all targets, not just macOS):
+# proves it was built by this repo's release workflow at a specific commit.
+# Verify with `gh attestation verify <artifact> --owner sema-lisp`. No secrets
+# needed — keyless signing via the workflow's OIDC identity.
+github-attestations = true
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Release binaries keep OTLP-over-gRPC support; it is a non-default cargo feature so

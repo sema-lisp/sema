@@ -100,11 +100,11 @@ jobs:
           echo "=== codesign --verify --strict ==="
           codesign --verify --strict --verbose=4 "$binary" 2>&1
 
-          echo "=== codesign --display --verbose ==="
-          codesign --display --verbose "$binary" 2>&1
+          echo "=== codesign -dvv ==="
+          codesign -dvv "$binary" 2>&1
 
           echo "=== Signature flags check ==="
-          info="$(codesign --display --verbose "$binary" 2>&1)"
+          info="$(codesign -dvv "$binary" 2>&1)"
           echo "$info"
 
           if grep -q 'flags=.*runtime' <<<"$info"; then

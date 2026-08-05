@@ -4,6 +4,8 @@
 
 # Sema
 
+[![MCP Toplist](https://mcptoplist.com/badge/com.sema-lang%2Fsema.svg)](https://mcptoplist.com/server/com.sema-lang%2Fsema)
+
 **A Lisp where LLM agents are language primitives, not an SDK** — compiled to a fast bytecode VM, shipped as a single binary.
 
 [![Playground](https://img.shields.io/badge/try_it-sema.run-c8a855?style=flat)](https://sema.run)

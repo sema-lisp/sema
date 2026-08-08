@@ -655,10 +655,8 @@ const versionLabel = __SEMA_VERSION__ ? `v${__SEMA_VERSION__} · ` : ''
 }
 
 .form-row {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 6px 18px;
+  display: grid;
+  gap: 6px;
   padding: 18px 22px;
   background: var(--bg-raise);
   transition: background .15s var(--ease);

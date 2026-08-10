@@ -6,7 +6,7 @@
   (list "alice@example.com" "bob AT mail" "charlie@dev.org" "not-an-email"))
 (for-each
   (lambda (e)
-    (if (regex/match? "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$" e)
+    (if (regex/match? #"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$" e)
       (println (format "  ✓ ~a" e))
       (println (format "  ✗ ~a (invalid)" e))))
   emails)
@@ -16,7 +16,7 @@
 (define text-with-urls
   "Check out https://example.com and http://docs.sema-lang.org for info.")
 (define urls
-  (regex/find-all "https?://[a-zA-Z0-9._~:/?#@!$&'()*+,;=-]+" text-with-urls))
+  (regex/find-all #"https?://[a-zA-Z0-9._~:/?#@!$&'()*+,;=-]+" text-with-urls))
 (println (format "Found ~a URL(s):" (length urls)))
 (for-each
   (lambda (u) (println (format "  → ~a" u)))
@@ -33,7 +33,7 @@
   (lambda (line)
     (let ((m
             (regex/match
-              "^(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}) \\[(\\w+)\\] (.+)$"
+              #"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(\w+)\] (.+)$"
               line)))
       (if m
         (let* ((groups (get m :groups))
@@ -57,14 +57,14 @@
 (define md
   "# Hello\nThis is **bold** and *italic* with `code` and [a link](http://x.com).")
 (define stripped
-  (let* ((s (regex/replace-all "^#{1,6}\\s+" "" md))
-         (s (regex/replace-all "\\*{1,3}([^*]+)\\*{1,3}" "$1" s))
-         (s (regex/replace-all "`([^`]+)`" "$1" s))
-         (s (regex/replace-all "\\[([^\\]]+)\\]\\([^)]+\\)" "$1" s)))
+  (let* ((s (regex/replace-all #"^#{1,6}\s+" "" md))
+         (s (regex/replace-all #"\*{1,3}([^*]+)\*{1,3}" "$1" s))
+         (s (regex/replace-all #"`([^`]+)`" "$1" s))
+         (s (regex/replace-all #"\[([^\]]+)\]\([^)]+\)" "$1" s)))
     s))
 (println (format "Before: ~a" md))
 (println (format "After:  ~a" stripped))
 
 (println "\n=== CamelCase Splitter ===\n")
 (define camel "parseHTMLResponseCode")
-(println (format "~a → ~a" camel (regex/find-all "[A-Z]?[a-z]+|[A-Z]+" camel)))
+(println (format "~a → ~a" camel (regex/find-all #"[A-Z]?[a-z]+|[A-Z]+" camel)))

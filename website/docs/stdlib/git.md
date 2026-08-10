@@ -5,7 +5,9 @@ outline: [2, 3]
 # Git (read-only)
 
 Read-only helpers over the `git` binary — they never mutate the repository. All
-require the `PROCESS` capability (see [System](/docs/stdlib/system)).
+require the `process` capability in a sandboxed run. They work without extra
+configuration in Sema's default mode and return `PermissionDenied` when
+`process` is denied. See the [CLI sandbox documentation](/docs/cli#sandbox).
 
 ```sema
 (git/root)                 ; repo toplevel

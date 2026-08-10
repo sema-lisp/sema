@@ -6,6 +6,14 @@ outline: [2, 3]
 
 Streams are first-class byte-oriented I/O handles for reading and writing data incrementally. They provide a unified interface across files, in-memory buffers, strings, and standard I/O — the same `stream/read` and `stream/write` work regardless of the underlying source.
 
+::: tip Sandbox capabilities
+In-memory streams require no capability. In a sandboxed run,
+`stream/open-input` requires `fs-read` and `stream/open-output` requires
+`fs-write`; either returns `PermissionDenied` when its capability is denied.
+File streams work without extra configuration in Sema's default mode. See the
+[CLI sandbox documentation](/docs/cli#sandbox).
+:::
+
 ```sema
 ;; Read a file line by line
 (with-stream (s (stream/open-input "data.txt"))
@@ -54,7 +62,8 @@ Create a read/write in-memory buffer. Writes append to the buffer; reads consume
 
 ### `stream/open-input`
 
-Open a file for reading. Returns a buffered input stream. Sandbox-gated (`FS_READ`).
+Open a file for reading. Returns a buffered input stream. Requires `fs-read` in
+a sandboxed run.
 
 ```sema
 (define s (stream/open-input "data.csv"))
@@ -64,7 +73,8 @@ Open a file for reading. Returns a buffered input stream. Sandbox-gated (`FS_REA
 
 ### `stream/open-output`
 
-Open (or create) a file for writing. Returns a buffered output stream. Sandbox-gated (`FS_WRITE`).
+Open (or create) a file for writing. Returns a buffered output stream. Requires
+`fs-write` in a sandboxed run.
 
 ```sema
 (define s (stream/open-output "output.txt"))

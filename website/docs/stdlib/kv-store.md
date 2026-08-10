@@ -6,8 +6,11 @@ outline: [2, 3]
 
 Sema includes a persistent, JSON-backed key-value store for storing structured data across sessions. Data is automatically flushed to disk on every write.
 
-::: tip
-`kv/open`, `kv/set`, and `kv/delete` require filesystem write capabilities (they are gated by `FS_WRITE`).
+::: tip Sandbox capabilities
+The key-value store works without extra configuration in Sema's default mode.
+In a sandboxed run, `kv/open`, `kv/set`, and `kv/delete` require `fs-write`
+(`FS_WRITE`) and return `PermissionDenied` when it is denied. See the
+[CLI sandbox documentation](/docs/cli#sandbox).
 :::
 
 ## How It Works

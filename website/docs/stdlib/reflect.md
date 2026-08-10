@@ -7,6 +7,13 @@ outline: [2, 3]
 Parse, format, and check Sema source from Sema. Diagnostics come back as data,
 which makes them ideal for agent repair loops.
 
+::: tip Sandbox capabilities
+`sema/check-string` works in memory and requires no capability.
+`sema/check-file` requires `fs-read` in a sandboxed run and returns
+`PermissionDenied` when it is denied. See the
+[CLI sandbox documentation](/docs/cli#sandbox).
+:::
+
 ```sema
 (read/string "(+ 1 2)")            ; => the form (+ 1 2)
 (read/all "(a) (b)")               ; => ((a) (b))

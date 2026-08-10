@@ -4,8 +4,13 @@ outline: [2, 3]
 
 # File I/O & Paths
 
-::: tip Sandbox capability
-`file/*` functions require the `FS_READ` capability (for reads, listings, predicates) or `FS_WRITE` capability (for writes, deletes, renames, mkdir). They run unrestricted under `sema` by default, but are gated in sandboxed environments (e.g., the WASM playground). A sandboxed script that attempts to use them without the capability will receive an error.
+::: tip Sandbox capabilities
+File operations work without extra configuration in Sema's default mode. In a
+sandboxed run, reads, listings, predicates, file watching, and paths that access
+the filesystem require `fs-read` (`FS_READ`). Writes, deletes, renames, copies,
+and directory creation require `fs-write` (`FS_WRITE`). A denied operation
+returns `PermissionDenied`. See the
+[CLI sandbox documentation](/docs/cli#sandbox) for the full function list.
 :::
 
 ## Console I/O
@@ -380,7 +385,8 @@ Test if a path is absolute.
 
 ## File watching
 
-Watch a path for changes and drain events non-blockingly. Requires `FS_READ`.
+Watch a path for changes and drain events non-blockingly. Requires `fs-read` in
+a sandboxed run.
 
 ```sema
 (define w (fs/watch "src" {:recursive true}))

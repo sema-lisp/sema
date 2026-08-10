@@ -6,8 +6,14 @@ outline: [2, 3]
 
 Sema includes built-in SQLite support via the `db/*` functions, backed by [rusqlite](https://docs.rs/rusqlite). Databases are opened by name (a logical handle) and can be either file-backed or in-memory. WAL mode and foreign keys are enabled by default.
 
-::: tip
-`db/open` and `db/open-memory` require filesystem write capabilities (they are gated by `FS_WRITE`).
+::: tip Sandbox capabilities
+SQLite works without extra configuration under Sema's default unrestricted
+mode. In a sandboxed run, `db/open`, `db/open-memory`, `db/exec`, and
+`db/exec-batch` require the `fs-write` capability (`FS_WRITE`). If `fs-write`
+is denied, for example by `--sandbox=strict` or `--sandbox=no-fs-write`, these
+functions return a `PermissionDenied` error. SQLite query functions require
+`fs-read`. See the [CLI sandbox documentation](/docs/cli#sandbox) for all modes
+and capabilities.
 :::
 
 ## Opening & Closing

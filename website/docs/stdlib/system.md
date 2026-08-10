@@ -4,8 +4,14 @@ outline: [2, 3]
 
 # System
 
-::: tip Sandbox capability
-Several `sys/*` functions are gated by sandbox capabilities: environment access (`env`, `sys/env-all`, `sys/set-env`) requires `ENV_READ` or `ENV_WRITE`, and process operations (`shell`, `sys/which`, signal hooks, `exit`) require `PROCESS`. They run unrestricted under `sema` by default but are restricted in sandboxed environments (e.g., the WASM playground). A sandboxed script that attempts to use them without the capability will receive an error.
+::: tip Sandbox capabilities
+System functions work without extra configuration in Sema's default mode. In a
+sandboxed run, `env`, `sys/cwd`, `sys/env-all`, `sys/home-dir`, `sys/temp-dir`,
+and `sys/user` require `env-read`; `sys/set-env` requires `env-write`; and
+`exit`, `sys/args`, `sys/pid`, and `sys/which` require `process`. `shell`
+requires both `shell` and `process`. Denied calls return `PermissionDenied`.
+Signal hooks and the other `sys/*` functions are not capability-gated. See the
+[CLI sandbox documentation](/docs/cli#sandbox).
 :::
 
 ## Environment Variables
@@ -234,7 +240,7 @@ If no signals are pending, this is essentially free — it just checks three ato
 
 ### `shell`
 
-Run a shell command. Returns a map with `:stdout`, `:stderr`, and `:exit-code`. A single-string command runs through the system shell (`sh -c` / `cmd /C`); passing extra arguments runs the command directly, without shell parsing. Requires the `PROCESS` capability.
+Run a shell command. Returns a map with `:stdout`, `:stderr`, and `:exit-code`. A single-string command runs through the system shell (`sh -c` / `cmd /C`); passing extra arguments runs the command directly, without shell parsing. Requires both the `shell` and `process` capabilities in a sandboxed run.
 
 ```sema
 (shell "echo hello")          ; => {:stdout "hello\n" :stderr "" :exit-code 0}

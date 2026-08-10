@@ -10,8 +10,11 @@ Talk to microcontrollers, USB-CDC devices, and any UART over a host serial port.
 Serial ports require the host OS — this module is unavailable in the browser playground.
 :::
 
-::: tip Sandbox capability
-All `serial/*` functions require the `serial` capability. They are denied under `--sandbox=strict` and `--sandbox=all`. Allow with the default sandbox or explicitly opt in (see [CLI sandbox docs](../cli#sandbox)).
+::: tip Sandbox capabilities
+All `serial/*` functions require the `serial` capability in a sandboxed run.
+They work without extra configuration in Sema's default mode and return
+`PermissionDenied` when `serial` is denied, including under `--sandbox=strict`
+and `--sandbox=all`. See the [CLI sandbox documentation](/docs/cli#sandbox).
 :::
 
 ## Connection Lifecycle

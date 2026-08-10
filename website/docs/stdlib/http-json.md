@@ -6,10 +6,14 @@ outline: [2, 3]
 
 ## HTTP
 
-HTTP functions make synchronous requests and return a response map. All HTTP functions require the **network** sandbox capability.
+HTTP request functions make synchronous requests and return a response map.
 
-::: tip Sandbox
-HTTP functions are gated behind the `NETWORK` capability. They are available by default when running scripts with `sema`, but disabled in sandboxed environments (e.g., the WASM playground). A sandboxed script that attempts to use HTTP will receive an error.
+::: tip Sandbox capabilities
+`http/get`, `http/post`, `http/put`, `http/query`, `http/delete`, and
+`http/request` work without extra configuration in Sema's default mode. In a
+sandboxed run they require the `network` capability (`NETWORK`) and return
+`PermissionDenied` when it is denied. The `json/*` functions do not require a
+capability. See the [CLI sandbox documentation](/docs/cli#sandbox).
 :::
 
 ### Response Map

@@ -523,12 +523,12 @@ The table below lists every function gated by each capability. It mirrors the `r
 | Capability  | Functions affected                                                         |
 | ----------- | -------------------------------------------------------------------------- |
 | `shell`     | `shell` (also requires `process`)                                          |
-| `fs-read`   | `file/read`, `file/read-bytes`, `file/read-lines`, `file/for-each-line`, `file/fold-lines`, `file/exists?`, `file/list`, `file/info`, `file/is-file?`, `file/is-directory?`, `file/is-symlink?`, `file/glob`, `path/absolute`, `load`, `pdf/extract-text`, `pdf/extract-text-pages`, `pdf/page-count`, `pdf/metadata`, `stream/open-input`, `http/file`, `db/query`, `db/query-one`, `db/last-insert-id`, `db/tables`, `db/open-memory` |
-| `fs-write`  | `file/write`, `file/write-bytes`, `file/write-lines`, `file/append`, `file/delete`, `file/rename`, `file/mkdir`, `file/copy`, `stream/open-output`, `kv/open`, `kv/set`, `kv/delete`, `db/open`, `db/exec`, `db/exec-batch` |
-| `network`   | `http/get`, `http/post`, `http/put`, `http/delete`, `http/request`, `http/serve` |
+| `fs-read`   | `file/read`, `file/read-bytes`, `file/read-lines`, `file/for-each-line`, `file/fold-lines`, `file/fold-lines-bytes`, `file/exists?`, `file/list`, `file/info`, `file/is-file?`, `file/is-directory?`, `file/is-symlink?`, `file/glob`, `fs/watch`, `path/absolute`, `path/canonicalize`, `load`, `pdf/extract-text`, `pdf/extract-text-pages`, `pdf/page-count`, `pdf/metadata`, `stream/open-input`, `http/file`, `db/query`, `db/query-one`, `db/last-insert-id`, `db/tables`, `zip/list`, `sema/check-file` |
+| `fs-write`  | `file/write`, `file/write-bytes`, `file/write-lines`, `file/append`, `file/delete`, `file/rename`, `file/mkdir`, `file/copy`, `stream/open-output`, `kv/open`, `kv/set`, `kv/delete`, `db/open`, `db/open-memory`, `db/exec`, `db/exec-batch`, `memory/open`, `memory/append`, `patch/apply-file`, `zip/create`, `zip/extract`, `tar/create`, `tar/extract` |
+| `network`   | `http/get`, `http/post`, `http/put`, `http/query`, `http/delete`, `http/request`, `http/serve`, `ws/connect` |
 | `env-read`  | `env`, `sys/env-all`, `sys/cwd`, `sys/home-dir`, `sys/user`, `sys/temp-dir` |
 | `env-write` | `sys/set-env`                                                              |
-| `process`   | `exit`, `sys/pid`, `sys/args`, `sys/which`, `shell`                        |
+| `process`   | `exit`, `sys/pid`, `sys/args`, `sys/which`, `shell`, `git/root`, `git/current-branch`, `git/status`, `git/changed-files`, `git/diff-files`, `git/diff`, `git/recent-files`, `git/ignore-matches?`, `proc/spawn`, `proc/read-stdout`, `proc/read-stderr`, `proc/write-stdin`, `proc/close-stdin`, `proc/wait`, `proc/exit-code`, `proc/running?`, `proc/kill`, `proc/close`, `pty/spawn`, `pty/read`, `pty/write`, `pty/resize`, `pty/wait`, `pty/exit-code`, `pty/running?`, `pty/kill`, `pty/close` |
 | `llm`       | `llm/complete`, `llm/chat`, `llm/send`, `llm/extract-from-image`           |
 | `serial`    | `serial/list`, `serial/open`, `serial/close`, `serial/write`, `serial/read-line`, `serial/send` |
 

@@ -4,8 +4,15 @@ outline: [2, 3]
 
 # Archives
 
-Gzip, zip, and tar. File-touching functions require `FS_READ` / `FS_WRITE`
-(see [System](/docs/stdlib/system)).
+Gzip, zip, and tar.
+
+::: tip Sandbox capabilities
+Archive operations work without extra configuration in Sema's default mode.
+`zip/list` requires `fs-read`; `zip/create`, `zip/extract`, `tar/create`, and
+`tar/extract` require `fs-write`. A denied operation returns `PermissionDenied`.
+The in-memory `gzip/*` functions require neither capability. See the
+[CLI sandbox documentation](/docs/cli#sandbox).
+:::
 
 ```sema
 (gzip/compress (string->bytevector "hello"))   ; => gzip bytevector

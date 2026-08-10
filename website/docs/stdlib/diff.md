@@ -6,6 +6,13 @@ outline: [2, 3]
 
 Produce, inspect, and apply unified diffs.
 
+::: tip Sandbox capabilities
+The in-memory `diff/*` functions are not restricted. `patch/apply-file` changes
+a file and requires `fs-write` in a sandboxed run. It returns
+`PermissionDenied` when that capability is denied. See the
+[CLI sandbox documentation](/docs/cli#sandbox).
+:::
+
 ```sema
 (define patch (diff/unified old-text new-text))   ; unified diff string
 (diff/apply old-text patch)                        ; => new-text

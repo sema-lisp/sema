@@ -6,6 +6,13 @@ outline: [2, 3]
 
 Pure-Rust PDF text extraction, page counting, and metadata reading. No external tools required — works cross-platform including macOS, Linux, and Windows.
 
+::: tip Sandbox capabilities
+PDF functions work without extra configuration in Sema's default mode. Because
+they read PDF files, they require `fs-read` in a sandboxed run and return
+`PermissionDenied` when it is denied. See the
+[CLI sandbox documentation](/docs/cli#sandbox).
+:::
+
 ::: tip
 These functions use the `pdf-extract` and `lopdf` Rust crates internally. They work with text-based PDFs. For scanned/image-only PDFs, consider using [`llm/extract-from-image`](../llm/extraction) with vision models instead.
 :::

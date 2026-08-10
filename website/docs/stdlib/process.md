@@ -6,7 +6,10 @@ outline: [2, 3]
 
 Spawn and drive child processes with streaming I/O. Unlike [`shell`](/docs/stdlib/system)
 (which blocks and returns output only after the process exits), these hand you a
-live handle you poll. All require the `PROCESS` capability (see [System](/docs/stdlib/system)).
+live handle you poll. All require the `process` capability in a sandboxed run.
+They work without extra configuration in Sema's default mode and return
+`PermissionDenied` when `process` is denied. See the
+[CLI sandbox documentation](/docs/cli#sandbox).
 
 ## Streaming processes
 

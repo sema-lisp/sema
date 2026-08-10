@@ -6,6 +6,15 @@ outline: [2, 3]
 
 Sema includes a built-in HTTP server powered by [axum](https://github.com/tokio-rs/axum), with data-driven routing, middleware as function composition, SSE streaming, and WebSocket support. The server runs on a background thread with a Tokio runtime while keeping all Sema evaluation single-threaded — the same model as Node.js.
 
+::: tip Sandbox capabilities
+The server and WebSocket client work without extra configuration in Sema's
+default mode. In a sandboxed run, `http/serve` and `ws/connect` require
+`network`, while `http/file` requires `fs-read`. A denied operation returns
+`PermissionDenied`. Response constructors, routers, and operations on an
+already-open connection require no capability. See the
+[CLI sandbox documentation](/docs/cli#sandbox).
+:::
+
 ## Quick Start
 
 ```sema
@@ -704,7 +713,7 @@ CSS, JS, and images under `./dist/assets/` are served with correct MIME types an
 - **Single-threaded evaluation**: All Sema code runs on the main thread. HTTP I/O runs on a background Tokio runtime. Requests are bridged via channels.
 - **Concurrency model**: Requests are processed sequentially by the evaluator. For LLM-backed services (where each request takes 1–5s of LLM latency), this is fine. For high-throughput APIs, consider a reverse proxy.
 - **Graceful shutdown**: Ctrl+C breaks the channel and the server exits cleanly.
-- **Sandbox-aware**: `http/serve` requires the `NETWORK` capability when running in sandbox mode.
+- **Sandbox-aware**: `http/serve` requires the `network` capability in a sandboxed run.
 
 ## See Also
 

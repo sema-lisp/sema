@@ -189,7 +189,7 @@ This same system prompt should be used at inference time for consistency.
 
 ### Deduplication
 
-- Remove `benchmarks/1brc/sema-src/` copies (207 duplicate files)
+- Ignore historical references to the removed `benchmarks/1brc/sema-src/` snapshot
 - Deduplicate identical training pairs across extraction sources
 - Ensure no test data leaks into training (hold out 10% for evaluation)
 

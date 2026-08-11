@@ -70,8 +70,8 @@ post-trained model. Assessed on 2026-06-24.
 
 ### Deduplication Note
 
-`benchmarks/1brc/sema-src/` contains 207 files that are copies of `examples/` and
-`playground/examples/`. **Deduplicate before training** — only use the originals.
+The removed `benchmarks/1brc/sema-src/` snapshot contained 207 copies of files
+from `examples/` and `playground/examples/`. Only use the originals for training.
 
 ### Quality Assessment
 

@@ -225,4 +225,35 @@ Both are honest **narrowed-terminal** dispositions, not gaps to silently close.
   stdin, a file read inside a quantum is legal when offloaded, so the
   zero-tolerance stdin model does not transfer.)
 
+## WIN-1 — MCP HTTP cancel doesn't always sever the transport on Windows (reopened)
+
+**Originally fixed 2026-07-29** (`run_transport_task` in
+`crates/sema-mcp/src/builtins.rs`, commits `e336e615`/`f6128756`): moved the
+drop of an in-flight HTTP request future, on cancel, onto a task spawned on
+the shared multi-thread Tokio runtime instead of a plain blocking thread, so
+the connection's hyper dispatcher task reliably gets scheduled to notice the
+abandoned request and close the socket. Verified green on Windows CI at the
+time (`runtime_mcp_close_wait_is_promptly_cancellable`,
+`runtime_mcp_call_http_wait_is_promptly_cancellable`,
+`runtime_mcp_connect_http_wait_is_promptly_cancellable`) and archived as
+resolved in `docs/plans/archive/deferred-resolved.md`.
+
+**Reopened 2026-08-11**: nightly run 30979939966 (2026-08-05) failed
+`runtime_mcp_call_http_wait_is_promptly_cancellable` on Windows with the
+pre-fix symptom — clean Sema-side teardown (`live_tasks=0 resource_gates=0
+cancel_accepted=true`) but the peer observed no disconnect within a 30s
+window. `run_transport_task` makes the sever reliable, not guaranteed:
+hyper has no API to force-close a specific pooled connection from outside
+(`hyperium/hyper#3533`), so the fix only ensures a wake is attempted on the
+connection's driver task, not that the resulting close completes before an
+external observer checks. Same category as the Jul 29 nightly flake in
+`windows_inherited_pipe_writer_does_not_block_drain_join` (different
+transport, same shape: Windows I/O teardown latency isn't as tightly bounded
+as the Unix equivalent). **Deferred because** the durable fix — driving the
+HTTP transport through `hyper::client::conn` directly (holding the
+`Connection` future so cancel can abort it explicitly) instead of
+`reqwest::Client`'s pooled connections — is a real transport rewrite that
+needs Windows CI iteration to verify (no Windows dev machine available), and
+the failure rate is low (1 nightly run out of 14 since the original fix
+landed). Revisit if it recurs, or when Windows CI access improves.
 

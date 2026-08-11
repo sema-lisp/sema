@@ -1393,6 +1393,12 @@ un-gated), the stdio liveness probe is a real check on Windows
 in `crates/sema/tests/common/`, and the windows-leg placement decision is
 recorded in nightly.yml (deliberately nightly). RESOLVED 2026-07-29 (#138): the last item below shipped as the offload-split — OAuth legs run inside io_offload_blocking, call/connect route through run_transport_task, two HTTP detectors green on Windows (7196/7196). Originally still open:
 
+**REOPENED 2026-08-11**: not fully resolved — nightly run 30979939966
+(2026-08-05) failed `runtime_mcp_call_http_wait_is_promptly_cancellable` on
+Windows with the pre-fix symptom (clean Sema-side teardown, peer observed no
+disconnect in 30s). `run_transport_task` makes the sever reliable, not
+guaranteed; see the reopened entry in `docs/deferred.md`.
+
 - **`mcp/call` / `mcp/connect` HTTP mid-cancel severing** rides the old
   blocking-thread drop chain: their job futures are non-`Send`
   (`Box<dyn RedirectDriver>` held across awaits in the oauth seam), so they

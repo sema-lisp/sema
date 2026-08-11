@@ -1,5 +1,8 @@
 > ARCHIVED 2026-07-29: all product bugs fixed except the MCP HTTP cancel
 > teardown, tracked with the other leftovers as WIN-1 in docs/deferred.md.
+> UPDATE 2026-08-11: bug 5 below shipped a fix (`run_transport_task`,
+> 2026-07-29) but is not fully closed — a residual low-frequency race
+> remains on Windows. Reopened as WIN-1 in docs/deferred.md.
 
 # Windows product bugs surfaced by the test-porting wave (2026-07-29)
 
@@ -79,6 +82,25 @@ Http `shutdown` in client.rs). Needs Windows-side investigation of
 reqwest/hyper teardown semantics when the op future is dropped.
 Detected by: `runtime_mcp_close_wait_is_promptly_cancellable`
 (mcp_runtime_test; `#[cfg(unix)]` with a pointer here).
+
+**PARTIALLY FIXED 2026-07-29, REOPENED 2026-08-11**: `run_transport_task`
+(`crates/sema-mcp/src/builtins.rs`) moved the drop of the in-flight request
+future onto a task spawned on the shared multi-thread Tokio runtime instead
+of a plain blocking thread, so the connection's hyper dispatcher task
+reliably gets a chance to notice the abandoned request and close the socket
+— green on Windows CI at the time (close, call, and connect detectors all
+passing). But this is best-effort, not a hard guarantee: hyper has no API to
+force-close a specific pooled connection from outside
+(hyperium/hyper#3533) — the fix only ensures a wake is attempted, not that
+the resulting poll completes before an external observer checks. Nightly run
+30979939966 (2026-08-05) reproduced the original symptom on
+`runtime_mcp_call_http_wait_is_promptly_cancellable`: clean Sema-side
+teardown (`live_tasks=0 resource_gates=0 cancel_accepted=true`) but the peer
+saw no disconnect within 30s. Reopened as WIN-1 in `docs/deferred.md`. The
+durable fix likely needs the HTTP transport to drive `hyper::client::conn`
+directly (holding the `Connection` future so cancel can abort it explicitly)
+instead of `reqwest::Client`'s pooled connections, which don't expose that
+control.
 
 ## Test-infra debt (not product)
 

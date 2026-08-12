@@ -118,7 +118,8 @@ An optional third argument takes per-run options. **Passing an options map chang
     {:reasoning-effort :high       ; reasoning effort for this run (see Completion)
      :messages prior-history       ; seed the loop with prior conversation
      :memory mem                   ; persistent thread — see Agent Memory
-     :on-tool-call observe-tool})) ; observe each tool call — see below
+     :on-tool-call observe-tool     ; observe each tool call — see below
+     :on-partial keep-partial}))    ; keep the transcript if the run is cancelled
 
 (:response result)   ; => the final answer string
 (:messages result)   ; => the full conversation (to continue or inspect)
@@ -133,6 +134,29 @@ An optional third argument takes per-run options. **Passing an options map chang
 ```
 
 The event map carries `:event` (`"start"` / `"end"`), `:tool` (the tool name), and `:args`; on `"end"` it adds `:result` (a preview of the return value), `:error` (a boolean), and `:duration-ms`.
+
+**Keeping the transcript of a cancelled run.** A run stopped with `async/cancel`
+has no return value — `async/await` raises instead — so the conversation it had
+assembled would be lost. `:on-partial` receives that conversation as the usual
+`{:response :messages :session}` map, just before the cancellation propagates:
+
+```sema
+(define partial nil)
+(define (keep-partial r) (set! partial r))
+
+(let ((p (async/spawn (fn () (agent/run weather-bot "..." {:on-partial keep-partial})))))
+  (async/spawn (fn () (async/sleep 250) (async/cancel p)))
+  (try (async/await p) (catch e nil)))
+
+(:messages partial)   ; the rounds that completed, ready to pass back as :messages
+```
+
+The callback also fires when a run ends with an error. It runs in the cancelled
+task's last step, which cannot park again, so it must only capture the value —
+never `async/await` or start I/O. It reports the rounds that completed; the text
+of a round still streaming when the cancel lands arrives through `:on-text`
+only. To persist the turns instead of holding them in memory, use `:memory` — a
+cancelled run writes its turns back to the thread too (see Agent Memory).
 
 **Error recovery.** A tool that throws, isn't found, or is called with arguments
 that don't match its declared schema does **not** abort the run — the error is

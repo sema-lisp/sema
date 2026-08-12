@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`agent/run` can hand back the transcript of a cancelled run (#87).** A run
+  stopped with `async/cancel` has no return value — `async/await` raises — so
+  the conversation it had assembled was lost, and the next turn resumed from
+  stale state. The new `:on-partial` option receives the same
+  `{:response :messages :session}` map the run would have returned, including
+  the correlated `assistant(tool_calls)` / `tool_result` rounds, just before the
+  cancellation propagates. It also fires when a run ends with an error. The
+  callback runs in the cancelled task's last step, which cannot park again, so
+  it must only capture the value, never suspend. The text of a round still
+  streaming when the cancel lands is delivered through `:on-text` only. A run
+  with `:memory` already wrote its partial turns back to the thread; that thread
+  is text-only, so `:on-partial` is the route for the correlated `:messages`.
+
 ## 1.34.2
 
 ### Fixed

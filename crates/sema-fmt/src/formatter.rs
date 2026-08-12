@@ -784,74 +784,13 @@ impl Formatter {
                     pending_blank_lines = 0;
 
                     // Try to collect a group of consecutive alignable defines
-                    if self.align && Self::is_alignable_define(&nodes[i]) {
-                        let group_start = i;
-                        let mut group_end = i + 1;
-                        // Look ahead for more consecutive defines (skip newlines but not blank lines)
-                        while group_end < len {
-                            match &nodes[group_end] {
-                                Node::Newline => {
-                                    // Check if this is a blank line (2+ consecutive newlines)
-                                    let mut peek = group_end;
-                                    let mut nl_count = 0;
-                                    while peek < len && matches!(&nodes[peek], Node::Newline) {
-                                        nl_count += 1;
-                                        peek += 1;
-                                    }
-                                    if nl_count > 1 {
-                                        break; // blank line breaks the group
-                                    }
-                                    // Single newline — check if next semantic node is also an alignable define
-                                    if peek < len && Self::is_alignable_define(&nodes[peek]) {
-                                        group_end = peek + 1;
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                // A comment here directly follows a define on
-                                // the same line (standalone comments sit after
-                                // a Newline, which the arm above intercepts):
-                                // it's the define's trailing comment — keep it
-                                // in the group instead of orphaning it below.
-                                Node::Comment(_) => {
-                                    group_end += 1;
-                                }
-                                _ if Self::is_alignable_define(&nodes[group_end]) => {
-                                    group_end += 1;
-                                }
-                                _ => break,
-                            }
+                    if let Some(next_i) = self.try_format_define_run(nodes, i, 0) {
+                        if !self.output.ends_with('\n') {
+                            self.output.push('\n');
                         }
-
-                        // Collect the define nodes in this group, each with its
-                        // trailing comment (if any).
-                        let mut group: Vec<&Node> = Vec::new();
-                        let mut trailing: Vec<Option<String>> = Vec::new();
-                        for node in &nodes[group_start..group_end] {
-                            match node {
-                                Node::Newline => {}
-                                Node::Comment(text) => {
-                                    if let Some(last) = trailing.last_mut() {
-                                        *last = Some(text.clone());
-                                    }
-                                }
-                                _ => {
-                                    group.push(node);
-                                    trailing.push(None);
-                                }
-                            }
-                        }
-
-                        if group.len() >= 2 {
-                            self.format_define_group(&group, &trailing);
-                            if !self.output.ends_with('\n') {
-                                self.output.push('\n');
-                            }
-                            i = group_end;
-                            first_content = false;
-                            continue;
-                        }
-                        // Single define — fall through to normal formatting.
+                        i = next_i;
+                        first_content = false;
+                        continue;
                     }
 
                     // Normal (non-aligned) formatting
@@ -1095,9 +1034,12 @@ impl Formatter {
             emitted = j + 1;
         }
 
-        // Remaining args as body at indent+2
+        // Remaining args as body at indent+2. A module body is otherwise
+        // just like top level for `--align` purposes (see
+        // emit_body_with_comments_impl's doc comment), so it alone opts into
+        // define-run grouping among FormKind::Body's heads.
         let body_start = Self::index_after_nth_semantic(children, emitted);
-        self.emit_body_with_comments(children, body_start, body_indent);
+        self.emit_body_with_comments_impl(children, body_start, body_indent, head_name == "module");
 
         self.output.push_str(close);
     }
@@ -1886,12 +1828,30 @@ impl Formatter {
         start_idx: usize,
         body_indent: usize,
     ) {
+        self.emit_body_with_comments_impl(all_children, start_idx, body_indent, false)
+    }
+
+    /// `emit_body_with_comments`, with `align_defines` additionally grouping
+    /// and column-aligning consecutive one-liner defines under `--align` —
+    /// used for `module` bodies (see `format_body`), which are otherwise
+    /// just like top-level for grouping purposes: their defines are
+    /// exported/visible the same way a true top-level define is.
+    fn emit_body_with_comments_impl(
+        &mut self,
+        all_children: &[Node],
+        start_idx: usize,
+        body_indent: usize,
+        align_defines: bool,
+    ) {
         let mut consecutive_newlines: usize = 0;
         let mut ends_with_comment = false;
-        for child in &all_children[start_idx..] {
+        let mut idx = start_idx;
+        while idx < all_children.len() {
+            let child = &all_children[idx];
             match child {
                 Node::Newline => {
                     consecutive_newlines += 1;
+                    idx += 1;
                 }
                 Node::Comment(text) => {
                     if consecutive_newlines == 0 && !self.output.ends_with('\n') {
@@ -1905,15 +1865,30 @@ impl Formatter {
                     self.output.push_str(text);
                     consecutive_newlines = 0;
                     ends_with_comment = true;
+                    idx += 1;
                 }
-                _ if is_trivia(child) => {}
+                _ if is_trivia(child) => {
+                    idx += 1;
+                }
                 _ => {
-                    self.output.push('\n');
+                    if !self.output.ends_with('\n') {
+                        self.output.push('\n');
+                    }
                     self.emit_blank_lines(consecutive_newlines);
-                    self.push_indent(body_indent);
-                    self.format_node(child, body_indent);
                     consecutive_newlines = 0;
                     ends_with_comment = false;
+
+                    if align_defines {
+                        if let Some(next_idx) =
+                            self.try_format_define_run(all_children, idx, body_indent)
+                        {
+                            idx = next_idx;
+                            continue;
+                        }
+                    }
+                    self.push_indent(body_indent);
+                    self.format_node(child, body_indent);
+                    idx += 1;
                 }
             }
         }
@@ -2086,6 +2061,91 @@ impl Formatter {
         true
     }
 
+    /// If `--align` is on and `nodes[i]` starts a run of 2+ consecutive
+    /// alignable one-liner defines (same rules as `format_top_level`: a
+    /// single newline between members keeps the run going, a blank line or a
+    /// non-define breaks it), emit the whole run column-aligned at `indent`
+    /// and return the index to resume scanning from. Returns `None` when
+    /// `nodes[i]` isn't alignable or doesn't form a 2+ run — the caller falls
+    /// through to normal per-node formatting for `nodes[i]`.
+    ///
+    /// Shared by `format_top_level` (`indent` 0) and `format_body`'s
+    /// `module`-body path (`indent` = the module body's indent) — a
+    /// `(module ...)` body is otherwise just like top level for grouping
+    /// purposes, since its defines are exported/visible the same way.
+    fn try_format_define_run(&mut self, nodes: &[Node], i: usize, indent: usize) -> Option<usize> {
+        if !(self.align && Self::is_alignable_define(&nodes[i])) {
+            return None;
+        }
+        let len = nodes.len();
+        let group_start = i;
+        let mut group_end = i + 1;
+        // Look ahead for more consecutive defines (skip newlines but not blank lines)
+        while group_end < len {
+            match &nodes[group_end] {
+                Node::Newline => {
+                    // Check if this is a blank line (2+ consecutive newlines)
+                    let mut peek = group_end;
+                    let mut nl_count = 0;
+                    while peek < len && matches!(&nodes[peek], Node::Newline) {
+                        nl_count += 1;
+                        peek += 1;
+                    }
+                    if nl_count > 1 {
+                        break; // blank line breaks the group
+                    }
+                    // Single newline — check if next semantic node is also an alignable define
+                    if peek < len && Self::is_alignable_define(&nodes[peek]) {
+                        group_end = peek + 1;
+                    } else {
+                        break;
+                    }
+                }
+                // A comment here directly follows a define on the same line
+                // (standalone comments sit after a Newline, which the arm
+                // above intercepts): it's the define's trailing comment —
+                // keep it in the group instead of orphaning it below.
+                Node::Comment(_) => {
+                    group_end += 1;
+                }
+                _ if Self::is_alignable_define(&nodes[group_end]) => {
+                    group_end += 1;
+                }
+                _ => break,
+            }
+        }
+
+        // Collect the define nodes in this group, each with its
+        // trailing comment (if any).
+        let mut group: Vec<&Node> = Vec::new();
+        let mut trailing: Vec<Option<String>> = Vec::new();
+        for node in &nodes[group_start..group_end] {
+            match node {
+                Node::Newline => {}
+                Node::Comment(text) => {
+                    if let Some(last) = trailing.last_mut() {
+                        *last = Some(text.clone());
+                    }
+                }
+                _ => {
+                    group.push(node);
+                    trailing.push(None);
+                }
+            }
+        }
+
+        if group.len() < 2 {
+            // Single define — fall through to normal formatting.
+            return None;
+        }
+        self.format_define_group(&group, &trailing, indent);
+        // Deliberately no trailing '\n' here — same invariant format_node
+        // leaves for a single form. `format_top_level` terminates the line
+        // itself; `emit_body_with_comments_impl` needs it left open so a
+        // group ending the body attaches directly to the closing delimiter.
+        Some(group_end)
+    }
+
     /// Emit a group of consecutive one-liner defines, column-aligning maximal
     /// sub-runs of members whose aligned line fits the width. A member too
     /// wide to participate is formatted normally and splits the run — which
@@ -2093,8 +2153,10 @@ impl Formatter {
     /// `--align` idempotent (an all-or-nothing group is not: the too-wide
     /// member reflows to two lines and the SECOND pass aligns the survivors).
     /// `trailing[i]` is member `i`'s trailing comment, if any; within an
-    /// aligned run comments share a column past the widest value.
-    fn format_define_group(&mut self, group: &[&Node], trailing: &[Option<String>]) {
+    /// aligned run comments share a column past the widest value. `indent` is
+    /// each line's leading indent (0 at true top level, the body indent when
+    /// called for a `module` body).
+    fn format_define_group(&mut self, group: &[&Node], trailing: &[Option<String>], indent: usize) {
         let min_gap = ALIGN_GAP;
 
         // Split each define; None marks a member that can't be aligned
@@ -2110,7 +2172,7 @@ impl Formatter {
                 let (left, right) = Self::split_define(&semantic)?;
                 if left.contains('\n')
                     || right.contains('\n')
-                    || display_width(&left) + min_gap + display_width(&right) > self.width
+                    || indent + display_width(&left) + min_gap + display_width(&right) > self.width
                 {
                     return None;
                 }
@@ -2142,7 +2204,7 @@ impl Formatter {
             let max_right = run.iter().map(|(_, r)| display_width(r)).max().unwrap();
             let fits = run
                 .iter()
-                .all(|(_, r)| max_left + min_gap + display_width(r) <= self.width);
+                .all(|(_, r)| indent + max_left + min_gap + display_width(r) <= self.width);
             if run.len() >= 2 && max_left > min_left && fits {
                 for slot in &mut run_cols[run_start..run_end] {
                     *slot = Some((max_left, max_right));
@@ -2155,6 +2217,7 @@ impl Formatter {
             if idx > 0 {
                 self.output.push('\n');
             }
+            self.push_indent(indent);
             if let (Some((max_left, max_right)), Some((left, right))) =
                 (&run_cols[idx], &splits[idx])
             {
@@ -2172,7 +2235,7 @@ impl Formatter {
                     self.output.push_str(comment);
                 }
             } else {
-                self.format_node(form, 0);
+                self.format_node(form, indent);
                 if let Some(comment) = trailing[idx].as_ref() {
                     self.output.push(' ');
                     self.output.push_str(comment);

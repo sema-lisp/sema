@@ -747,6 +747,73 @@ fn test_aligned_define_group_idempotent() {
 }
 
 #[test]
+fn test_aligned_define_group_inside_module_body() {
+    // A `(module ...)` body is transparent — its defines are visible/exported
+    // just like top-level ones, so --align must reach inside it too.
+    let input =
+        "(module m\n  (export a bb ccc)\n  (define a 1)\n  (define bb 2)\n  (define ccc 3))";
+    let result = fmt_aligned(input);
+    let lines: Vec<&str> = result.lines().collect();
+    let value_cols: Vec<usize> = lines
+        .iter()
+        .filter(|l| l.trim_start().starts_with("(define"))
+        .map(|l| {
+            let after_name = &l[l.find("(define").unwrap()..];
+            after_name.rfind(' ').unwrap() + l.find("(define").unwrap()
+        })
+        .collect();
+    assert_eq!(value_cols.len(), 3);
+    assert!(
+        value_cols.iter().all(|&c| c == value_cols[0]),
+        "module-wrapped defines should be column-aligned, got {:?}\n{}",
+        value_cols,
+        result
+    );
+    // The module's closing paren still attaches to the last define's line.
+    assert!(
+        result.trim_end().ends_with("))"),
+        "closing delimiters should not be pushed to their own line: {result}"
+    );
+}
+
+#[test]
+fn test_aligned_define_group_inside_module_body_not_applied_without_flag() {
+    let input =
+        "(module m\n  (export a bb ccc)\n  (define a 1)\n  (define bb 2)\n  (define ccc 3))";
+    let result = fmt(input);
+    for line in result.lines() {
+        assert!(
+            !line.contains("define a  ") && !line.contains("define bb  "),
+            "without --align, module-wrapped defines should not be column-aligned: {line}"
+        );
+    }
+}
+
+#[test]
+fn test_aligned_define_group_inside_module_body_idempotent() {
+    let input =
+        "(module m\n  (export a bb ccc)\n  (define a 1)\n  (define bb 2)\n  (define ccc 3))";
+    let first = fmt_aligned(input);
+    let second = fmt_aligned(&first);
+    assert_eq!(
+        first, second,
+        "aligned module-wrapped defines should be idempotent"
+    );
+}
+
+#[test]
+fn test_aligned_define_group_inside_begin_body_not_applied() {
+    // Only `module` bodies opt into define-run grouping — a `begin` body
+    // (an executable sequence, not a namespace) keeps its old behavior.
+    let input = "(begin\n  (define a 1)\n  (define bb 2)\n  (define ccc 3))";
+    let result = fmt_aligned(input);
+    assert_eq!(
+        result, "(begin\n  (define a 1)\n  (define bb 2)\n  (define ccc 3))\n",
+        "begin bodies should not gain define-alignment grouping"
+    );
+}
+
+#[test]
 fn test_aligned_cond_clauses() {
     let input = "(cond\n  ((= x 1) \"one\")\n  ((= x 100) \"hundred\")\n  (else \"other\"))";
     let result = fmt_aligned(input);

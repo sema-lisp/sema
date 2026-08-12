@@ -16,6 +16,7 @@ use tower_lsp::lsp_types::*;
 use sema_core::{Caps, Sandbox, Span, SpanMap};
 
 use crate::builtin_docs;
+use crate::definitions::*;
 use crate::helpers::*;
 use crate::scope;
 
@@ -225,46 +226,6 @@ pub(crate) fn build_selection_range(mut ranges: Vec<Range>, pos: &Position) -> S
     })
 }
 
-/// Heads that introduce a top-level named definition.
-pub(crate) const DEFINITION_HEADS: &[&str] = &[
-    "define",
-    "def",
-    "defun",
-    "defn",
-    "defmacro",
-    "defagent",
-    "deftool",
-    "defworkflow",
-    "defpolicy",
-];
-
-/// If `expr` is a definition form, return its `(name, full-form range, name range)`.
-pub(crate) fn def_of_form(
-    expr: &sema_core::Value,
-    span_map: &SpanMap,
-    symbol_spans: &[(String, Span)],
-    lines: &[&str],
-) -> Option<(String, Range, Range)> {
-    let items = expr.as_list()?;
-    if items.len() < 2 {
-        return None;
-    }
-    let head = items[0].as_symbol()?;
-    if !DEFINITION_HEADS.contains(&head.as_str()) {
-        return None;
-    }
-    // `(define name ...)` or `(define (name args...) ...)` shorthand.
-    let name = items[1].as_symbol().or_else(|| {
-        items[1]
-            .as_list()
-            .and_then(|sig| sig.first().and_then(|v| v.as_symbol()))
-    })?;
-    let form_span = expr_span(expr, span_map)?;
-    let form_range = span_to_range(form_span, lines);
-    let name_range = find_name_span(&name, form_span, symbol_spans, lines).unwrap_or(form_range);
-    Some((name, form_range, name_range))
-}
-
 /// Collect every call site of `target` (a list whose head symbol is `target`) within `exprs`,
 /// recording the head symbol's range. Recurses into nested forms.
 pub(crate) fn collect_call_sites(
@@ -340,6 +301,39 @@ pub(crate) fn quoted_string_range(lines: &[&str], form_range: &Range, path: &str
             character: prefix_utf16 + path_utf16,
         },
     })
+}
+
+/// One workspace file as seen by a workspace-wide search (references, rename,
+/// goto-definition's fallback, workspace symbols, call hierarchy): either an
+/// open document or a still-fresh scanned file, uniformly. See
+/// [`BackendState::iter_workspace_files`].
+pub(crate) struct WorkspaceFile<'a> {
+    pub(crate) uri: Url,
+    pub(crate) ast: &'a [sema_core::Value],
+    pub(crate) span_map: &'a SpanMap,
+    pub(crate) symbol_spans: &'a [(String, Span)],
+    pub(crate) scope_tree: &'a scope::ScopeTree,
+    pub(crate) source: &'a str,
+}
+
+impl<'a> WorkspaceFile<'a> {
+    pub(crate) fn lines(&self) -> Vec<&'a str> {
+        self.source.lines().collect()
+    }
+
+    /// The file's base name without extension, for the "defined in X"
+    /// attribution shown by hover/signature-help.
+    pub(crate) fn stem(&self) -> String {
+        // `to_file_path()` percent-decodes (unlike `uri.path()` directly) —
+        // needed so a scanned file with a space or other escaped character
+        // in its name (`my%20file.sema`) attributes as "my file", not
+        // "my%20file".
+        self.uri
+            .to_file_path()
+            .ok()
+            .and_then(|p| p.file_stem().and_then(|s| s.to_str()).map(str::to_string))
+            .unwrap_or_default()
+    }
 }
 
 impl BackendState {
@@ -451,123 +445,107 @@ impl BackendState {
         self.import_cache.get(&path)
     }
 
+    /// Yield every workspace file once, open documents first: other open
+    /// documents (from `cached_parses`), then still-fresh scanned files not
+    /// already covered by an open document (from `import_cache`, dedup'd by
+    /// canonical path). Every workspace-wide search (references, rename,
+    /// goto-definition's fallback, workspace symbols, call hierarchy) must
+    /// apply this "open wins, stale scans skipped" rule identically — this
+    /// is the one place it's implemented, so a bespoke reimplementation at a
+    /// new call site can't get the dedup or freshness check subtly wrong.
+    pub(crate) fn iter_workspace_files(&self) -> impl Iterator<Item = WorkspaceFile<'_>> + '_ {
+        // Computed eagerly (not interleaved with the `open` iterator below)
+        // so `scanned`'s filter always sees the complete set.
+        let open_paths: HashSet<PathBuf> = self
+            .cached_parses
+            .keys()
+            .filter_map(|uri_str| Url::parse(uri_str).ok())
+            .filter_map(|u| u.to_file_path().ok())
+            .map(|p| canonicalize_or_raw(&p))
+            .collect();
+
+        let open = self.cached_parses.iter().filter_map(|(uri_str, cached)| {
+            Url::parse(uri_str).ok().map(|uri| WorkspaceFile {
+                uri,
+                ast: &cached.ast,
+                span_map: &cached.span_map,
+                symbol_spans: &cached.symbol_spans,
+                scope_tree: &cached.scope_tree,
+                source: &cached.source,
+            })
+        });
+
+        let scanned = self.import_cache.iter().filter_map(move |(path, ic)| {
+            if open_paths.contains(&canonicalize_or_raw(path)) || !ic.is_fresh(path) {
+                return None;
+            }
+            Url::from_file_path(path).ok().map(|uri| WorkspaceFile {
+                uri,
+                ast: &ic.ast,
+                span_map: &ic.span_map,
+                symbol_spans: &ic.symbol_spans,
+                scope_tree: &ic.scope_tree,
+                source: &ic.source,
+            })
+        });
+
+        open.chain(scanned)
+    }
+
     /// Search the whole workspace for a top-level definition of `symbol`:
-    /// other open documents first, then still-fresh scanned files (dedup'd
-    /// against open documents by canonical path — same rules as references
-    /// and rename). Skips `current_uri`: its definitions were already
-    /// consulted by the caller. Returns the defining file's AST (for
-    /// signature/docstring extraction) plus a short display name (file stem)
-    /// for attribution.
+    /// other open documents first, then still-fresh scanned files. Skips
+    /// `current_uri`: its definitions were already consulted by the caller.
+    /// Returns the defining file's AST (for signature/docstring extraction)
+    /// plus a short display name (file stem) for attribution.
     pub(crate) fn find_workspace_definition(
         &self,
         current_uri: &Url,
         symbol: &str,
     ) -> Option<(&[sema_core::Value], String)> {
-        let mut open_paths: HashSet<PathBuf> = HashSet::new();
-        let mut found: Option<(&[sema_core::Value], String)> = None;
-        for (doc_uri_str, cached) in &self.cached_parses {
-            // Collect every open document's canonical path (even after a
-            // match) so the scan-cache dedup below sees the complete set.
-            if let Ok(doc_uri) = Url::parse(doc_uri_str) {
-                if let Ok(doc_path) = doc_uri.to_file_path() {
-                    open_paths.insert(canonicalize_or_raw(&doc_path));
-                }
-            }
-            if found.is_some() || doc_uri_str == current_uri.as_str() {
-                continue;
+        self.iter_workspace_files().find_map(|wf| {
+            if &wf.uri == current_uri {
+                return None;
             }
             // Names only; ranges discarded — &[] skips UTF-16 mapping.
-            let defs =
-                user_definitions_from_ast(&cached.ast, &cached.span_map, &cached.symbol_spans, &[]);
+            let defs = user_definitions_from_ast(wf.ast, wf.span_map, wf.symbol_spans, &[]);
             if defs.iter().any(|(name, _)| name == symbol) {
-                let stem = Path::new(doc_uri_str)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(doc_uri_str)
-                    .to_string();
-                found = Some((&cached.ast, stem));
+                Some((wf.ast, wf.stem()))
+            } else {
+                None
             }
-        }
-        if found.is_some() {
-            return found;
-        }
-
-        for (path, import_cached) in &self.import_cache {
-            if open_paths.contains(&canonicalize_or_raw(path)) {
-                continue;
-            }
-            if !import_cached.is_fresh(path) {
-                continue;
-            }
-            let defs = user_definitions_from_ast(
-                &import_cached.ast,
-                &import_cached.span_map,
-                &import_cached.symbol_spans,
-                &[],
-            );
-            if defs.iter().any(|(name, _)| name == symbol) {
-                let stem = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or_default()
-                    .to_string();
-                return Some((&import_cached.ast, stem));
-            }
-        }
-        None
+        })
     }
 
     /// Index every top-level definition across open documents and still-fresh
     /// scanned workspace files: name → (uri, form range, name range). Open
     /// documents are inserted first, so they win over a scanned entry for the
-    /// same name (`or_insert`); scan entries are dedup'd against open
-    /// documents by canonical path, same rules as references and rename.
+    /// same name (`or_insert`). Uses `SYMBOL_HEADS`, not `DEFINITION_HEADS` —
+    /// this index backs call hierarchy (`handle_call_hierarchy_prepare`),
+    /// which must resolve a `defworkflow` the same way document symbols do,
+    /// even though `defworkflow` isn't a real binding (see `DEFINITION_HEADS`'
+    /// doc comment) — it's still a valid call-hierarchy root/target.
     pub(crate) fn def_index(&self) -> std::collections::HashMap<String, (Url, Range, Range)> {
         let mut index = std::collections::HashMap::new();
-        let mut open_paths: HashSet<PathBuf> = HashSet::new();
-        for (uri_str, cached) in &self.cached_parses {
-            let uri = match Url::parse(uri_str) {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
-            if let Ok(doc_path) = uri.to_file_path() {
-                open_paths.insert(canonicalize_or_raw(&doc_path));
-            }
-            let lines: Vec<&str> = cached.source.lines().collect();
-            for expr in crate::helpers::flatten_module_forms(&cached.ast) {
-                if let Some((name, form_range, name_range)) =
-                    def_of_form(expr, &cached.span_map, &cached.symbol_spans, &lines)
-                {
-                    index
-                        .entry(name)
-                        .or_insert((uri.clone(), form_range, name_range));
-                }
-            }
-        }
-
-        for (path, import_cached) in &self.import_cache {
-            if open_paths.contains(&canonicalize_or_raw(path)) {
-                continue;
-            }
-            if !import_cached.is_fresh(path) {
-                continue;
-            }
-            let uri = match Url::from_file_path(path) {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
-            let lines: Vec<&str> = import_cached.source.lines().collect();
-            for expr in crate::helpers::flatten_module_forms(&import_cached.ast) {
-                if let Some((name, form_range, name_range)) = def_of_form(
-                    expr,
-                    &import_cached.span_map,
-                    &import_cached.symbol_spans,
-                    &lines,
-                ) {
-                    index
-                        .entry(name)
-                        .or_insert((uri.clone(), form_range, name_range));
-                }
+        for wf in self.iter_workspace_files() {
+            let lines = wf.lines();
+            for m in scan_definitions(
+                flatten_module_forms(wf.ast),
+                SYMBOL_HEADS,
+                wf.span_map,
+                wf.symbol_spans,
+                &lines,
+            ) {
+                // A definition form with no span (reader error-recovery) has
+                // nothing to point at — skip it rather than indexing a bogus
+                // 0:0 range that would win the `or_insert` race against the
+                // real definition elsewhere.
+                let Some(form_range) = m.form_range else {
+                    continue;
+                };
+                let name_range = m.name_range.unwrap_or(form_range);
+                index
+                    .entry(m.name)
+                    .or_insert((wf.uri.clone(), form_range, name_range));
             }
         }
         index

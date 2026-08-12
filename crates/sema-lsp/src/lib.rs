@@ -10,9 +10,13 @@
 //!   `handle_*` methods to `BackendState`.
 //! - [`server`] — the tower-lsp `Backend`, the actor loop, request dispatch, and
 //!   the stdin/stdout transport (frame normalization + `run_server`).
+//! - [`definitions`] — scanning a parsed AST for user definitions/imports
+//!   (the `(module ...)`-aware family; see its module doc for why it's
+//!   split out from [`helpers`]).
 //! - [`helpers`], [`scope`], [`builtin_docs`] — shared parsing/analysis support.
 
 pub mod builtin_docs;
+pub(crate) mod definitions;
 pub(crate) mod handlers;
 pub(crate) mod helpers;
 pub mod scope;
@@ -28,12 +32,15 @@ pub use server::run_server;
 pub use handlers::command::{EvalResultNotification, EvalResultParams};
 
 // Re-export public helpers for external consumers.
+pub use definitions::{
+    document_symbols_from_ast, extract_params, extract_params_from_ast, import_path_at_cursor,
+    import_path_from_ast, import_paths_from_ast, user_definitions, user_definitions_from_ast,
+    user_definitions_with_spans,
+};
 pub use helpers::{
-    analyze_document, compile_diagnostics, document_symbols_from_ast, error_span, extract_params,
-    extract_params_from_ast, extract_prefix, extract_symbol_at, find_enclosing_call,
-    import_path_at_cursor, import_path_from_ast, import_paths_from_ast, parse_diagnostics,
-    resolve_import_path, span_to_range, top_level_ranges, user_definitions,
-    user_definitions_from_ast, user_definitions_with_spans, utf16_to_byte_offset,
+    analyze_document, compile_diagnostics, error_span, extract_prefix, extract_symbol_at,
+    find_enclosing_call, parse_diagnostics, resolve_import_path, span_to_range, top_level_ranges,
+    utf16_to_byte_offset,
 };
 
 #[cfg(test)]

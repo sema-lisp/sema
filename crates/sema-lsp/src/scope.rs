@@ -762,7 +762,6 @@ impl ScopeTree {
         }
     }
 
-    /// `(for ((var expr)...) body...)` and similar for-variants.
     /// Collect a binding for a single parameter (symbol or destructuring pattern).
     #[allow(clippy::only_used_in_recursion)]
     fn collect_param_binding(
@@ -939,6 +938,16 @@ impl ScopeTree {
         }
     }
 
+    /// Whether the occurrence of `name` at `(line, col)` resolves to a
+    /// top-level binding — i.e. is not shadowed by a local (`let`, lambda
+    /// param, ...) binding. A name with no binding at all (a builtin, or an
+    /// unresolved symbol) counts as top-level too: workspace-wide searches
+    /// (references, rename, highlight) use this to admit "global" symbol
+    /// occurrences and reject only locally-shadowed ones.
+    pub fn resolves_to_top_level(&self, name: &str, line: usize, col: usize) -> bool {
+        !matches!(self.resolve_at(name, line, col), Some(r) if !r.is_top_level)
+    }
+
     /// Find all occurrences of `name` that resolve to the same definition as
     /// the occurrence at `(line, col)`. Uses symbol_spans to enumerate all
     /// occurrences, then filters to those that resolve to the same scope+binding.
@@ -949,14 +958,10 @@ impl ScopeTree {
         col: usize,
         symbol_spans: &[(String, Span)],
     ) -> Vec<Span> {
-        let resolved = match self.resolve_at(name, line, col) {
-            Some(r) => r,
-            None => {
-                // Not a locally-defined symbol. For top-level/global symbols,
-                // return None to signal the caller should fall back to the
-                // global (all-occurrences) behavior.
-                return Vec::new();
-            }
+        // Not a locally-defined symbol (a top-level/global symbol) — return
+        // empty so the caller falls back to its own global-search behavior.
+        let Some(resolved) = self.resolve_at(name, line, col) else {
+            return Vec::new();
         };
 
         // Collect all occurrences of `name` that resolve to the same definition
@@ -975,6 +980,24 @@ impl ScopeTree {
             }
         }
         refs
+    }
+
+    /// If `name` at `(line, col)` is locally scoped, its scope-aware occurrence
+    /// set (see `find_scope_aware_references`); `None` when it's global, so
+    /// the caller falls through to its own workspace-wide branch. The shared
+    /// "same-document, locally-scoped" first branch of
+    /// references/highlight/rename.
+    pub fn locally_scoped_occurrences(
+        &self,
+        name: &str,
+        line: usize,
+        col: usize,
+        symbol_spans: &[(String, Span)],
+    ) -> Option<Vec<Span>> {
+        if !self.is_locally_scoped(name, line, col) {
+            return None;
+        }
+        Some(self.find_scope_aware_references(name, line, col, symbol_spans))
     }
 
     /// Check if the symbol at the given position is locally scoped (not top-level).

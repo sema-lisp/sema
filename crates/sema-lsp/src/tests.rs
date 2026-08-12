@@ -4,6 +4,7 @@ use tower_lsp::lsp_types::*;
 
 use sema_core::{Caps, Sandbox, Span};
 
+use crate::definitions::*;
 use crate::helpers::*;
 use crate::server::normalize_lsp_message_body;
 use crate::state::{default_sema_binary, position_in_range, BackendState, CachedParse};
@@ -558,6 +559,55 @@ fn call_hierarchy_finds_functions_wrapped_in_module_form() {
     assert_eq!(outgoing[0].to.name, "helper");
 }
 
+#[test]
+fn call_hierarchy_finds_defworkflow_as_a_root_and_a_caller() {
+    // A defworkflow doesn't bind its name (see DEFINITION_HEADS' doc
+    // comment — it expands to a workflow/run call, not a definition), but
+    // it's still a valid call-hierarchy root and a valid caller of
+    // functions it invokes in its body.
+    let src = "(defun helper (x) (* x x))\n(defworkflow wf \"d\" {} (helper 5))";
+    let (state, uri) = parsed_state("file:///ch-workflow.sema", src);
+    let lines: Vec<&str> = src.lines().collect();
+
+    let wf_line = 1u32;
+    let wf_char = lines[wf_line as usize].find("wf").unwrap() as u32;
+    let wf_item = state
+        .handle_call_hierarchy_prepare(
+            &uri,
+            &Position {
+                line: wf_line,
+                character: wf_char,
+            },
+        )
+        .expect("prepare on wf")
+        .remove(0);
+    assert_eq!(wf_item.name, "wf");
+
+    let outgoing = state
+        .handle_call_hierarchy_outgoing(&wf_item)
+        .expect("outgoing");
+    assert_eq!(outgoing.len(), 1);
+    assert_eq!(outgoing[0].to.name, "helper");
+
+    let helper_line = 0u32;
+    let helper_char = lines[helper_line as usize].find("helper").unwrap() as u32;
+    let helper_item = state
+        .handle_call_hierarchy_prepare(
+            &uri,
+            &Position {
+                line: helper_line,
+                character: helper_char,
+            },
+        )
+        .expect("prepare on helper")
+        .remove(0);
+    let incoming = state
+        .handle_call_hierarchy_incoming(&helper_item)
+        .expect("incoming");
+    assert_eq!(incoming.len(), 1);
+    assert_eq!(incoming[0].from.name, "wf");
+}
+
 // ── completion resolve ───────────────────────────────────────
 
 #[test]
@@ -813,6 +863,27 @@ fn user_defs_multiple() {
 fn user_defs_bad_syntax_returns_empty() {
     let defs = user_definitions("(define x");
     assert!(defs.is_empty());
+}
+
+#[test]
+fn definition_head_lists_stay_in_sync() {
+    // Regression guard: this exact bug class (a narrower head-list constant
+    // silently dropping a head, e.g. defworkflow, from some code path) has
+    // been found and fixed four times across this crate's refactors.
+    // DEFINITION_HEADS and semantic_tokens' NAME_CLASS_HEADS must each stay
+    // a subset of SYMBOL_HEADS, the superset used for outline/highlighting.
+    for head in DEFINITION_HEADS {
+        assert!(
+            SYMBOL_HEADS.contains(head),
+            "DEFINITION_HEADS has {head:?}, which SYMBOL_HEADS is missing"
+        );
+    }
+    for head in crate::handlers::semantic_tokens::NAME_CLASS_HEADS {
+        assert!(
+            SYMBOL_HEADS.contains(head),
+            "NAME_CLASS_HEADS has {head:?}, which SYMBOL_HEADS is missing"
+        );
+    }
 }
 
 #[test]
@@ -1992,6 +2063,27 @@ fn semantic_tokens_classifies_macro_wrapped_in_module_form() {
 }
 
 #[test]
+fn semantic_tokens_classifies_defworkflow_head_as_keyword() {
+    // defworkflow isn't a real binding (see DEFINITION_HEADS' doc comment),
+    // but its head symbol is still a keyword-class token like every other
+    // def* form's head — must use SYMBOL_HEADS here, not DEFINITION_HEADS.
+    let src = "(defworkflow wf \"d\" {} (+ 1 2))\n";
+    let (state, uri) = parsed_state("file:///semtok-defworkflow.sema", src);
+    let result = state.handle_semantic_tokens_full(&uri).unwrap();
+    let SemanticTokensResult::Tokens(tokens) = result else {
+        panic!("expected token data");
+    };
+    let has_defworkflow_keyword_token = tokens.data.iter().any(|t| {
+        t.token_type == crate::state::token_types::KEYWORD && t.length == "defworkflow".len() as u32
+    });
+    assert!(
+        has_defworkflow_keyword_token,
+        "expected the defworkflow head to be a KEYWORD token, got {:?}",
+        tokens.data
+    );
+}
+
+#[test]
 fn workflow_approval_and_policy_forms_are_semantic_tokens() {
     let src = "(defworkflow release \"Release\" {} (approval :ship {}))\n\
                (defpolicy safe {})\n\
@@ -2434,6 +2526,39 @@ fn call_hierarchy_outgoing_finds_callee_in_scanned_file() {
 }
 
 // ── hover / signature help: workspace-wide fallback ──────────
+
+#[test]
+fn hover_attributes_scanned_file_with_space_in_name_undecoded() {
+    // A scanned file's stem comes from its URL (percent-encoded for a space
+    // or other reserved char) — must be decoded back to the real filename,
+    // not shown to the user as "my%20lib".
+    let dir = unique_temp_dir("hover-ws-space");
+    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet \"world\")\n");
+    insert_scanned_file(
+        &mut state,
+        &dir.join("my lib.sema"),
+        "(define (greet name) name)\n",
+    );
+
+    let hover = state
+        .handle_hover(
+            &main_uri,
+            &Position {
+                line: 0,
+                character: 1,
+            },
+        )
+        .expect("hover must fall back to the workspace definition");
+    let HoverContents::Markup(content) = hover.contents else {
+        panic!("expected markdown hover");
+    };
+    assert!(
+        content.value.contains("*Defined in `my lib`*"),
+        "stem must be percent-decoded, not raw URL-encoded: {}",
+        content.value
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
 
 #[test]
 fn hover_finds_definition_in_scanned_workspace_file() {

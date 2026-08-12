@@ -5,6 +5,7 @@ use std::path::Path;
 use tower_lsp::lsp_types::*;
 
 use crate::builtin_docs;
+use crate::definitions::*;
 use crate::helpers::*;
 use crate::state::BackendState;
 

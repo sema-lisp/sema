@@ -4,10 +4,32 @@ use std::collections::HashMap;
 
 use tower_lsp::lsp_types::*;
 
+use crate::definitions::*;
 use crate::helpers::*;
 use crate::state::BackendState;
 
 impl BackendState {
+    /// Every occurrence of `symbol` across the workspace that resolves to a
+    /// top-level binding (not shadowed by a local one) — the shared core of
+    /// `handle_references`'s and `handle_rename`'s workspace-wide branch.
+    fn workspace_top_level_occurrences(&self, symbol: &str) -> Vec<(Url, Range)> {
+        let mut out = Vec::new();
+        for wf in self.iter_workspace_files() {
+            let lines = wf.lines();
+            for (name, span) in wf.symbol_spans {
+                if name != symbol
+                    || !wf
+                        .scope_tree
+                        .resolves_to_top_level(name, span.line, span.col)
+                {
+                    continue;
+                }
+                out.push((wf.uri.clone(), span_to_range(span, &lines)));
+            }
+        }
+        out
+    }
+
     pub(crate) fn handle_goto_definition(
         &mut self,
         uri: &Url,
@@ -62,6 +84,12 @@ impl BackendState {
                 Some(c) => c,
                 None => continue,
             };
+            // A path that can't become a URL can't be jumped to — skip this
+            // import and keep searching the rest, instead of aborting the
+            // whole goto-definition on one bad import.
+            let Ok(target_uri) = Url::from_file_path(&resolved) else {
+                continue;
+            };
             let target_lines: Vec<&str> = cached.source.lines().collect();
             let target_defs = user_definitions_from_ast(
                 &cached.ast,
@@ -72,7 +100,6 @@ impl BackendState {
             for (name, range) in &target_defs {
                 if name == &symbol {
                     if let Some(range) = range {
-                        let target_uri = Url::from_file_path(&resolved).ok()?;
                         return Some(GotoDefinitionResponse::Scalar(Location {
                             uri: target_uri,
                             range: *range,
@@ -87,63 +114,15 @@ impl BackendState {
         // treat top-level symbols as workspace-global. Without this, a
         // definition in a sibling file that is not explicitly imported is
         // unreachable even though the scan has already parsed it.
-        let mut searched_paths = std::collections::HashSet::new();
         let mut locations = Vec::new();
-
-        for (doc_uri_str, cached) in &self.cached_parses {
-            let doc_uri = match Url::parse(doc_uri_str) {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
-            if let Ok(doc_path) = doc_uri.to_file_path() {
-                searched_paths.insert(canonicalize_or_raw(&doc_path));
-            }
-            let doc_lines: Vec<&str> = cached.source.lines().collect();
-            let defs = user_definitions_from_ast(
-                &cached.ast,
-                &cached.span_map,
-                &cached.symbol_spans,
-                &doc_lines,
-            );
+        for wf in self.iter_workspace_files() {
+            let lines = wf.lines();
+            let defs = user_definitions_from_ast(wf.ast, wf.span_map, wf.symbol_spans, &lines);
             for (name, range) in &defs {
                 if name == &symbol {
                     if let Some(range) = range {
                         locations.push(Location {
-                            uri: doc_uri.clone(),
-                            range: *range,
-                        });
-                    }
-                }
-            }
-        }
-
-        // Files known only from the workspace scan (import_cache); skip files
-        // already covered above via their open-document parse — by canonical
-        // path, since one file may be addressed under several spellings —
-        // and entries whose on-disk file changed or vanished since the scan.
-        for (path, import_cached) in &self.import_cache {
-            if searched_paths.contains(&canonicalize_or_raw(path)) {
-                continue;
-            }
-            if !import_cached.is_fresh(path) {
-                continue;
-            }
-            let import_uri = match Url::from_file_path(path) {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
-            let import_lines: Vec<&str> = import_cached.source.lines().collect();
-            let defs = user_definitions_from_ast(
-                &import_cached.ast,
-                &import_cached.span_map,
-                &import_cached.symbol_spans,
-                &import_lines,
-            );
-            for (name, range) in &defs {
-                if name == &symbol {
-                    if let Some(range) = range {
-                        locations.push(Location {
-                            uri: import_uri.clone(),
+                            uri: wf.uri.clone(),
                             range: *range,
                         });
                     }
@@ -186,17 +165,13 @@ impl BackendState {
 
         // Check scope tree in the current document
         if let Some(cached) = self.cached_parses.get(uri_str) {
-            if cached
-                .scope_tree
-                .is_locally_scoped(symbol, sema_line, sema_col)
-            {
+            if let Some(refs) = cached.scope_tree.locally_scoped_occurrences(
+                symbol,
+                sema_line,
+                sema_col,
+                &cached.symbol_spans,
+            ) {
                 // Locally scoped — only return references within this document's scope
-                let refs = cached.scope_tree.find_scope_aware_references(
-                    symbol,
-                    sema_line,
-                    sema_col,
-                    &cached.symbol_spans,
-                );
                 return refs
                     .into_iter()
                     .map(|span| Location {
@@ -209,74 +184,10 @@ impl BackendState {
 
         // Top-level/global symbol — search all open documents, but skip
         // occurrences that are shadowed by local bindings in each document.
-        let mut locations = Vec::new();
-        let mut searched_paths = std::collections::HashSet::new();
-
-        for (doc_uri_str, cached) in &self.cached_parses {
-            let doc_uri = match Url::parse(doc_uri_str) {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
-            if let Ok(doc_path) = doc_uri.to_file_path() {
-                searched_paths.insert(canonicalize_or_raw(&doc_path));
-            }
-            let doc_lines: Vec<&str> = self
-                .documents
-                .get(doc_uri_str)
-                .map(|t| t.lines().collect())
-                .unwrap_or_default();
-            for (name, span) in &cached.symbol_spans {
-                if name != symbol {
-                    continue;
-                }
-                // Only include this occurrence if it resolves to the top-level
-                // definition (not shadowed by a local binding).
-                match cached.scope_tree.resolve_at(name, span.line, span.col) {
-                    Some(resolved) if !resolved.is_top_level => continue,
-                    _ => {}
-                }
-                locations.push(Location {
-                    uri: doc_uri.clone(),
-                    range: span_to_range(span, &doc_lines),
-                });
-            }
-        }
-
-        // Also search workspace files not currently open (import_cache).
-        // Skip files already searched via cached_parses — by canonical path,
-        // since one file may be addressed under several spellings — and
-        // entries whose on-disk file changed or vanished since the scan.
-        for (path, import_cached) in &self.import_cache {
-            if searched_paths.contains(&canonicalize_or_raw(path)) {
-                continue;
-            }
-            if !import_cached.is_fresh(path) {
-                continue;
-            }
-            let import_uri = match Url::from_file_path(path) {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
-            let import_lines: Vec<&str> = import_cached.source.lines().collect();
-            for (name, span) in &import_cached.symbol_spans {
-                if name != symbol {
-                    continue;
-                }
-                match import_cached
-                    .scope_tree
-                    .resolve_at(name, span.line, span.col)
-                {
-                    Some(resolved) if !resolved.is_top_level => continue,
-                    _ => {}
-                }
-                locations.push(Location {
-                    uri: import_uri.clone(),
-                    range: span_to_range(span, &import_lines),
-                });
-            }
-        }
-
-        locations
+        self.workspace_top_level_occurrences(symbol)
+            .into_iter()
+            .map(|(uri, range)| Location { uri, range })
+            .collect()
     }
 
     pub(crate) fn handle_document_highlight(
@@ -299,16 +210,12 @@ impl BackendState {
         let sema_col = utf16_to_char_col(line, position.character as usize);
 
         // Use scope-aware references for locally scoped symbols
-        if cached
-            .scope_tree
-            .is_locally_scoped(symbol, sema_line, sema_col)
-        {
-            let refs = cached.scope_tree.find_scope_aware_references(
-                symbol,
-                sema_line,
-                sema_col,
-                &cached.symbol_spans,
-            );
+        if let Some(refs) = cached.scope_tree.locally_scoped_occurrences(
+            symbol,
+            sema_line,
+            sema_col,
+            &cached.symbol_spans,
+        ) {
             let highlights: Vec<DocumentHighlight> = refs
                 .into_iter()
                 .map(|span| DocumentHighlight {
@@ -324,20 +231,20 @@ impl BackendState {
         }
 
         // Top-level/global: all occurrences in this document that resolve to top-level
-        let mut highlights = Vec::new();
-        for (name, span) in &cached.symbol_spans {
-            if name != symbol {
-                continue;
-            }
-            match cached.scope_tree.resolve_at(name, span.line, span.col) {
-                Some(resolved) if !resolved.is_top_level => continue,
-                _ => {}
-            }
-            highlights.push(DocumentHighlight {
+        let highlights: Vec<DocumentHighlight> = cached
+            .symbol_spans
+            .iter()
+            .filter(|(name, span)| {
+                name == symbol
+                    && cached
+                        .scope_tree
+                        .resolves_to_top_level(name, span.line, span.col)
+            })
+            .map(|(_, span)| DocumentHighlight {
                 range: span_to_range(span, &lines),
                 kind: None,
-            });
-        }
+            })
+            .collect();
 
         if highlights.is_empty() {
             None
@@ -419,17 +326,13 @@ impl BackendState {
 
         // Check if the symbol is locally scoped
         if let Some(cached) = self.cached_parses.get(uri.as_str()) {
-            if cached
-                .scope_tree
-                .is_locally_scoped(symbol, sema_line, sema_col)
-            {
+            if let Some(refs) = cached.scope_tree.locally_scoped_occurrences(
+                symbol,
+                sema_line,
+                sema_col,
+                &cached.symbol_spans,
+            ) {
                 // Locally scoped — only rename within this document's scope
-                let refs = cached.scope_tree.find_scope_aware_references(
-                    symbol,
-                    sema_line,
-                    sema_col,
-                    &cached.symbol_spans,
-                );
                 let edits: Vec<TextEdit> = refs
                     .into_iter()
                     .map(|span| TextEdit {
@@ -451,79 +354,11 @@ impl BackendState {
 
         // Top-level/global symbol — rename across all documents,
         // but skip occurrences shadowed by local bindings.
-        let mut searched_paths = std::collections::HashSet::new();
-
-        for (doc_uri_str, cached) in &self.cached_parses {
-            let doc_uri = match Url::parse(doc_uri_str) {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
-            if let Ok(doc_path) = doc_uri.to_file_path() {
-                searched_paths.insert(canonicalize_or_raw(&doc_path));
-            }
-            let doc_lines: Vec<&str> = self
-                .documents
-                .get(doc_uri_str)
-                .map(|t| t.lines().collect())
-                .unwrap_or_default();
-            let mut edits = Vec::new();
-            for (name, span) in &cached.symbol_spans {
-                if name != symbol {
-                    continue;
-                }
-                match cached.scope_tree.resolve_at(name, span.line, span.col) {
-                    Some(resolved) if !resolved.is_top_level => continue,
-                    _ => {}
-                }
-                edits.push(TextEdit {
-                    range: span_to_range(span, &doc_lines),
-                    new_text: new_name.to_string(),
-                });
-            }
-            if !edits.is_empty() {
-                changes.insert(doc_uri, edits);
-            }
-        }
-
-        // Also rename in workspace files not currently open (import_cache).
-        // Skip files already renamed via cached_parses — by canonical path,
-        // since one file may be addressed under several spellings (duplicate
-        // edits for one file would each be applied, corrupting it) — and
-        // entries whose on-disk file changed or vanished since the scan:
-        // their stale offsets would corrupt the file too, so missing that
-        // file is the safe behavior.
-        for (path, import_cached) in &self.import_cache {
-            if searched_paths.contains(&canonicalize_or_raw(path)) {
-                continue;
-            }
-            if !import_cached.is_fresh(path) {
-                continue;
-            }
-            let import_uri = match Url::from_file_path(path) {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
-            let import_lines: Vec<&str> = import_cached.source.lines().collect();
-            let mut edits = Vec::new();
-            for (name, span) in &import_cached.symbol_spans {
-                if name != symbol {
-                    continue;
-                }
-                match import_cached
-                    .scope_tree
-                    .resolve_at(name, span.line, span.col)
-                {
-                    Some(resolved) if !resolved.is_top_level => continue,
-                    _ => {}
-                }
-                edits.push(TextEdit {
-                    range: span_to_range(span, &import_lines),
-                    new_text: new_name.to_string(),
-                });
-            }
-            if !edits.is_empty() {
-                changes.insert(import_uri, edits);
-            }
+        for (uri, range) in self.workspace_top_level_occurrences(symbol) {
+            changes.entry(uri).or_default().push(TextEdit {
+                range,
+                new_text: new_name.to_string(),
+            });
         }
 
         if changes.is_empty() {

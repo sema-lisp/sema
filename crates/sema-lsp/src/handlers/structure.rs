@@ -2,7 +2,7 @@
 //! symbols, signature help, folding ranges, selection ranges, document links,
 //! call hierarchy, and inlay hints.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use tower_lsp::lsp_types::*;
@@ -10,10 +10,11 @@ use tower_lsp::lsp_types::*;
 use sema_core::SpanMap;
 
 use crate::builtin_docs;
+use crate::definitions::*;
 use crate::helpers::*;
 use crate::state::{
-    build_selection_range, collect_call_sites, collect_outgoing_calls, def_of_form,
-    position_in_range, quoted_string_range, BackendState, CachedParse, ImportCache,
+    build_selection_range, collect_call_sites, collect_outgoing_calls, position_in_range,
+    quoted_string_range, BackendState, CachedParse, ImportCache, WorkspaceFile,
 };
 
 impl BackendState {
@@ -73,28 +74,10 @@ impl BackendState {
     pub(crate) fn handle_workspace_symbols(&self, query: &str) -> Vec<SymbolInformation> {
         let mut results = Vec::new();
         let query_lower = query.to_lowercase();
-        let mut searched_paths: HashSet<PathBuf> = HashSet::new();
 
-        for (doc_uri_str, cached) in &self.cached_parses {
-            let doc_uri = match Url::parse(doc_uri_str) {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
-            if let Ok(doc_path) = doc_uri.to_file_path() {
-                searched_paths.insert(canonicalize_or_raw(&doc_path));
-            }
-
-            let doc_lines: Vec<&str> = self
-                .documents
-                .get(doc_uri_str)
-                .map(|t| t.lines().collect())
-                .unwrap_or_default();
-            let symbols = document_symbols_from_ast(
-                &cached.ast,
-                &cached.span_map,
-                &cached.symbol_spans,
-                &doc_lines,
-            );
+        for wf in self.iter_workspace_files() {
+            let lines = wf.lines();
+            let symbols = document_symbols_from_ast(wf.ast, wf.span_map, wf.symbol_spans, &lines);
 
             for sym in symbols {
                 if query.is_empty() || sym.name.to_lowercase().contains(&query_lower) {
@@ -104,48 +87,7 @@ impl BackendState {
                         tags: None,
                         deprecated: None,
                         location: Location {
-                            uri: doc_uri.clone(),
-                            range: sym.selection_range,
-                        },
-                        container_name: None,
-                    });
-                }
-            }
-        }
-
-        // Also search workspace files not currently open (import_cache).
-        // Skip files already returned via cached_parses — by canonical path,
-        // since one file may be addressed under several spellings — and
-        // entries whose on-disk file changed or vanished since the scan.
-        for (path, import_cached) in &self.import_cache {
-            if searched_paths.contains(&canonicalize_or_raw(path)) {
-                continue;
-            }
-            if !import_cached.is_fresh(path) {
-                continue;
-            }
-            let import_uri = match Url::from_file_path(path) {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
-
-            let import_lines: Vec<&str> = import_cached.source.lines().collect();
-            let symbols = document_symbols_from_ast(
-                &import_cached.ast,
-                &import_cached.span_map,
-                &import_cached.symbol_spans,
-                &import_lines,
-            );
-
-            for sym in symbols {
-                if query.is_empty() || sym.name.to_lowercase().contains(&query_lower) {
-                    results.push(SymbolInformation {
-                        name: sym.name,
-                        kind: sym.kind,
-                        tags: None,
-                        deprecated: None,
-                        location: Location {
-                            uri: import_uri.clone(),
+                            uri: wf.uri.clone(),
                             range: sym.selection_range,
                         },
                         container_name: None,
@@ -447,33 +389,42 @@ impl BackendState {
     /// Collect the incoming calls to `target` found in one file's top-level
     /// definitions (shared between open documents and scanned files).
     fn collect_incoming_calls_in_file(
-        uri: &Url,
-        ast: &[sema_core::Value],
-        span_map: &SpanMap,
-        symbol_spans: &[(String, sema_core::Span)],
-        source: &str,
+        wf: &WorkspaceFile,
         target: &str,
         result: &mut Vec<CallHierarchyIncomingCall>,
     ) {
-        let lines: Vec<&str> = source.lines().collect();
-        for expr in flatten_module_forms(ast) {
-            let items = match expr.as_list() {
-                Some(i) => i,
-                None => continue,
+        let lines = wf.lines();
+        // SYMBOL_HEADS, not DEFINITION_HEADS: a defworkflow is a valid call-
+        // hierarchy root/target (see def_index's doc comment) even though
+        // it isn't a real binding.
+        for m in scan_definitions(
+            flatten_module_forms(wf.ast),
+            SYMBOL_HEADS,
+            wf.span_map,
+            wf.symbol_spans,
+            &lines,
+        ) {
+            // Skip a definition form with no span (reader error-recovery) —
+            // nothing to anchor a call-hierarchy item at.
+            let Some(form_range) = m.form_range else {
+                continue;
             };
-            let (name, form_range, name_range) =
-                match def_of_form(expr, span_map, symbol_spans, &lines) {
-                    Some(d) => d,
-                    None => continue,
-                };
-            // Search only the body (skip the head + signature) to avoid matching `(name ...)`
-            // definition shorthands as calls.
-            let body: &[sema_core::Value] = items.get(2..).unwrap_or(&[]);
+            let name_range = m.name_range.unwrap_or(form_range);
+            // Only the body (skip the head/name/param-list) to avoid matching
+            // a same-named parameter as a call — see DefMatch::body.
+            let body = m.body();
             let mut sites = Vec::new();
-            collect_call_sites(body, span_map, symbol_spans, &lines, target, &mut sites);
+            collect_call_sites(
+                body,
+                wf.span_map,
+                wf.symbol_spans,
+                &lines,
+                target,
+                &mut sites,
+            );
             if !sites.is_empty() {
                 result.push(CallHierarchyIncomingCall {
-                    from: Self::call_hierarchy_item(&name, uri, form_range, name_range),
+                    from: Self::call_hierarchy_item(&m.name, &wf.uri, form_range, name_range),
                     from_ranges: sites,
                 });
             }
@@ -488,47 +439,8 @@ impl BackendState {
     ) -> Option<Vec<CallHierarchyIncomingCall>> {
         let target = &item.name;
         let mut result = Vec::new();
-        let mut open_paths: HashSet<PathBuf> = HashSet::new();
-        for (uri_str, cached) in &self.cached_parses {
-            let uri = match Url::parse(uri_str) {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
-            if let Ok(doc_path) = uri.to_file_path() {
-                open_paths.insert(canonicalize_or_raw(&doc_path));
-            }
-            Self::collect_incoming_calls_in_file(
-                &uri,
-                &cached.ast,
-                &cached.span_map,
-                &cached.symbol_spans,
-                &cached.source,
-                target,
-                &mut result,
-            );
-        }
-        // Scanned files: dedup against open documents by canonical path and
-        // skip stale entries — same rules as references and rename.
-        for (path, import_cached) in &self.import_cache {
-            if open_paths.contains(&canonicalize_or_raw(path)) {
-                continue;
-            }
-            if !import_cached.is_fresh(path) {
-                continue;
-            }
-            let uri = match Url::from_file_path(path) {
-                Ok(u) => u,
-                Err(_) => continue,
-            };
-            Self::collect_incoming_calls_in_file(
-                &uri,
-                &import_cached.ast,
-                &import_cached.span_map,
-                &import_cached.symbol_spans,
-                &import_cached.source,
-                target,
-                &mut result,
-            );
+        for wf in self.iter_workspace_files() {
+            Self::collect_incoming_calls_in_file(&wf, target, &mut result);
         }
         Some(result)
     }
@@ -536,44 +448,44 @@ impl BackendState {
     /// The outgoing calls of `name`'s definition if this file defines it
     /// (shared between open documents and scanned files).
     fn outgoing_calls_of_definition(
+        wf: &WorkspaceFile,
         name: &str,
-        ast: &[sema_core::Value],
-        span_map: &SpanMap,
-        symbol_spans: &[(String, sema_core::Span)],
-        source: &str,
         index: &HashMap<String, (Url, Range, Range)>,
     ) -> Option<Vec<CallHierarchyOutgoingCall>> {
-        let lines: Vec<&str> = source.lines().collect();
-        for expr in flatten_module_forms(ast) {
-            let items = match expr.as_list() {
-                Some(i) => i,
-                None => continue,
-            };
-            let def = match def_of_form(expr, span_map, symbol_spans, &lines) {
-                Some(d) => d,
-                None => continue,
-            };
-            if def.0 != name {
-                continue;
+        let lines = wf.lines();
+        // SYMBOL_HEADS, not DEFINITION_HEADS: see collect_incoming_calls_in_file.
+        let m = scan_definitions(
+            flatten_module_forms(wf.ast),
+            SYMBOL_HEADS,
+            wf.span_map,
+            wf.symbol_spans,
+            &lines,
+        )
+        .into_iter()
+        .find(|m| m.name == name)?;
+        let body = m.body();
+        let mut calls: HashMap<String, Vec<Range>> = Default::default();
+        collect_outgoing_calls(
+            body,
+            wf.span_map,
+            wf.symbol_spans,
+            &lines,
+            index,
+            &mut calls,
+        );
+        let mut out = Vec::new();
+        for (callee, sites) in calls {
+            if callee == name {
+                continue; // skip self-recursion in outgoing view
             }
-            let body: &[sema_core::Value] = items.get(2..).unwrap_or(&[]);
-            let mut calls: HashMap<String, Vec<Range>> = Default::default();
-            collect_outgoing_calls(body, span_map, symbol_spans, &lines, index, &mut calls);
-            let mut out = Vec::new();
-            for (callee, sites) in calls {
-                if callee == name {
-                    continue; // skip self-recursion in outgoing view
-                }
-                if let Some((curi, crange, cname_range)) = index.get(&callee) {
-                    out.push(CallHierarchyOutgoingCall {
-                        to: Self::call_hierarchy_item(&callee, curi, *crange, *cname_range),
-                        from_ranges: sites,
-                    });
-                }
+            if let Some((curi, crange, cname_range)) = index.get(&callee) {
+                out.push(CallHierarchyOutgoingCall {
+                    to: Self::call_hierarchy_item(&callee, curi, *crange, *cname_range),
+                    from_ranges: sites,
+                });
             }
-            return Some(out);
         }
-        None
+        Some(out)
     }
 
     /// Which functions this function calls: known definitions invoked from
@@ -585,49 +497,10 @@ impl BackendState {
     ) -> Option<Vec<CallHierarchyOutgoingCall>> {
         let name = &item.name;
         let index = self.def_index();
-        let mut open_paths: HashSet<PathBuf> = HashSet::new();
-        let mut found: Option<Vec<CallHierarchyOutgoingCall>> = None;
-        for (uri_str, cached) in &self.cached_parses {
-            // Collect every open document's canonical path (even after a
-            // match) so the scan-cache dedup below sees the complete set.
-            if let Ok(uri) = Url::parse(uri_str) {
-                if let Ok(doc_path) = uri.to_file_path() {
-                    open_paths.insert(canonicalize_or_raw(&doc_path));
-                }
-            }
-            if found.is_none() {
-                found = Self::outgoing_calls_of_definition(
-                    name,
-                    &cached.ast,
-                    &cached.span_map,
-                    &cached.symbol_spans,
-                    &cached.source,
-                    &index,
-                );
-            }
-        }
-        if let Some(out) = found {
-            return Some(out);
-        }
-        for (path, import_cached) in &self.import_cache {
-            if open_paths.contains(&canonicalize_or_raw(path)) {
-                continue;
-            }
-            if !import_cached.is_fresh(path) {
-                continue;
-            }
-            if let Some(out) = Self::outgoing_calls_of_definition(
-                name,
-                &import_cached.ast,
-                &import_cached.span_map,
-                &import_cached.symbol_spans,
-                &import_cached.source,
-                &index,
-            ) {
-                return Some(out);
-            }
-        }
-        Some(Vec::new())
+        let found = self
+            .iter_workspace_files()
+            .find_map(|wf| Self::outgoing_calls_of_definition(&wf, name, &index));
+        Some(found.unwrap_or_default())
     }
 
     pub(crate) fn handle_inlay_hints(

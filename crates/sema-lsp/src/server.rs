@@ -15,6 +15,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
+use crate::definitions::*;
 use crate::helpers::*;
 use crate::scope;
 use crate::state::{semantic_token_legend, BackendState, CachedParse, WorkspaceScanner};

@@ -3,6 +3,7 @@
 use tower_lsp::lsp_types::*;
 
 use crate::builtin_docs;
+use crate::definitions::*;
 use crate::helpers::*;
 use crate::state::BackendState;
 
@@ -180,21 +181,8 @@ impl BackendState {
                 }
             }
         }
-        for cached in self.cached_parses.values() {
-            if let Some(doc) = extract_docstring_from_ast(&cached.ast, name) {
-                return Some(doc);
-            }
-        }
-        // Scanned workspace files (covers items completed from the scan cache).
-        for (path, entry) in &self.import_cache {
-            if !entry.is_fresh(path) {
-                continue;
-            }
-            if let Some(doc) = extract_docstring_from_ast(&entry.ast, name) {
-                return Some(doc);
-            }
-        }
-        None
+        self.iter_workspace_files()
+            .find_map(|wf| extract_docstring_from_ast(wf.ast, name))
     }
 
     /// Build a one-line signature `(name params...)` for a user-defined function, preferring the
@@ -220,20 +208,8 @@ impl BackendState {
                 }
             }
         }
-        for cached in self.cached_parses.values() {
-            if let Some(params) = extract_params_from_ast(&cached.ast, name) {
-                return Some(render(params));
-            }
-        }
-        // Scanned workspace files (covers items completed from the scan cache).
-        for (path, entry) in &self.import_cache {
-            if !entry.is_fresh(path) {
-                continue;
-            }
-            if let Some(params) = extract_params_from_ast(&entry.ast, name) {
-                return Some(render(params));
-            }
-        }
-        None
+        self.iter_workspace_files()
+            .find_map(|wf| extract_params_from_ast(wf.ast, name))
+            .map(render)
     }
 }

@@ -15,6 +15,22 @@
   ],
   "redirects": [
     {
+      "source": "/:path*",
+      "has": [
+        { "type": "host", "value": "sema-lisp.com" }
+      ],
+      "destination": "https://sema-lang.com/:path*",
+      "permanent": true
+    },
+    {
+      "source": "/:path*",
+      "has": [
+        { "type": "host", "value": "www.sema-lisp.com" }
+      ],
+      "destination": "https://sema-lang.com/:path*",
+      "permanent": true
+    },
+    {
       "source": "/install.sh",
       "destination": "https://github.com/sema-lisp/sema/releases/latest/download/sema-lang-installer.sh",
       "statusCode": 302

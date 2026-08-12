@@ -397,6 +397,25 @@ pub fn extract_symbol_at(line: &str, byte_offset: usize) -> &str {
     &line[start..end]
 }
 
+/// Flatten `forms` so that any `(module name (export ...) body...)` wrapper is
+/// replaced by its body — a module's definitions are reachable as if they were
+/// file-top-level for goto-definition/hover/completion purposes. Recurses into
+/// nested modules. Every other form (including forms that merely start with
+/// the symbol `module` but have no name/export slot) passes through unchanged.
+pub(crate) fn flatten_module_forms(forms: &[sema_core::Value]) -> Vec<&sema_core::Value> {
+    let mut out = Vec::new();
+    for expr in forms {
+        if let Some(items) = expr.as_list() {
+            if items.len() >= 2 && items[0].as_symbol().as_deref() == Some("module") {
+                out.extend(flatten_module_forms(&items[2..]));
+                continue;
+            }
+        }
+        out.push(expr);
+    }
+    out
+}
+
 /// Collect user-defined names with their spans from a pre-parsed AST.
 /// Returns (name, range) for each top-level form that creates a reusable binding.
 /// When `symbol_spans` is provided, returns the precise span of just the name symbol;
@@ -408,22 +427,7 @@ pub fn user_definitions_from_ast(
     lines: &[&str],
 ) -> Vec<(String, Option<Range>)> {
     let mut defs = Vec::new();
-    collect_user_definitions(ast, span_map, symbol_spans, lines, &mut defs);
-    defs
-}
-
-/// Walk `forms`, collecting definitions and recursing into `(module ...)`
-/// bodies — a module's exports are still reachable at the file's top level
-/// for goto-definition/references purposes, so a `define` nested inside one
-/// must be found the same way as a file-top-level `define`.
-fn collect_user_definitions(
-    forms: &[sema_core::Value],
-    span_map: &SpanMap,
-    symbol_spans: &[(String, Span)],
-    lines: &[&str],
-    defs: &mut Vec<(String, Option<Range>)>,
-) {
-    for expr in forms {
+    for expr in flatten_module_forms(ast) {
         if let Some(items) = expr.as_list() {
             if items.len() >= 2 {
                 if let Some(head) = items[0].as_symbol() {
@@ -455,22 +459,13 @@ fn collect_user_definitions(
                                 }
                             }
                         }
-                        "module" => {
-                            // (module name (export ...) body...) — recurse into the body.
-                            collect_user_definitions(
-                                &items[2..],
-                                span_map,
-                                symbol_spans,
-                                lines,
-                                defs,
-                            );
-                        }
                         _ => {}
                     }
                 }
             }
         }
     }
+    defs
 }
 
 /// Convenience wrapper: parse text and collect user definitions with spans.
@@ -485,7 +480,18 @@ pub fn user_definitions_with_spans(text: &str) -> Vec<(String, Option<Range>)> {
 
 /// Extract parameter list string from a pre-parsed AST for hover display.
 pub fn extract_params_from_ast(ast: &[sema_core::Value], name: &str) -> Option<String> {
-    for expr in ast {
+    extract_params_from_forms(flatten_module_forms(ast), name)
+}
+
+/// `extract_params_from_ast`, operating on an already-flattened form list —
+/// lets a caller that needs the flattened list for another purpose too
+/// (e.g. `document_symbols_from_ast`, once per definition it finds) reuse it
+/// instead of re-flattening the whole file on every call.
+fn extract_params_from_forms<'a>(
+    forms: impl IntoIterator<Item = &'a sema_core::Value>,
+    name: &str,
+) -> Option<String> {
+    for expr in forms {
         if let Some(items) = expr.as_list() {
             if items.len() >= 3 {
                 if let Some(head) = items[0].as_symbol() {
@@ -528,7 +534,7 @@ pub fn extract_params_from_ast(ast: &[sema_core::Value], name: &str) -> Option<S
 /// value, not documentation). `(defun f (x) "doc" body)` → `Some("doc")`; `(defun f (x) "ret")` →
 /// `None`. No language change is needed — a leading string body form is already legal.
 pub fn extract_docstring_from_ast(ast: &[sema_core::Value], name: &str) -> Option<String> {
-    for expr in ast {
+    for expr in flatten_module_forms(ast) {
         let items = match expr.as_list() {
             Some(items) if items.len() >= 2 => items,
             _ => continue,
@@ -612,7 +618,7 @@ pub fn import_path_from_ast(
     span_map: &SpanMap,
     line: u32,
 ) -> Option<String> {
-    for expr in ast {
+    for expr in flatten_module_forms(ast) {
         if let Some(items) = expr.as_list() {
             if items.len() >= 2 {
                 if let Some(head) = items[0].as_symbol() {
@@ -648,7 +654,7 @@ pub fn import_path_at_cursor(text: &str, line: u32, _character: u32) -> Option<S
 /// Extract all import/load path strings from a pre-parsed AST.
 pub fn import_paths_from_ast(ast: &[sema_core::Value]) -> Vec<String> {
     let mut paths = Vec::new();
-    for expr in ast {
+    for expr in flatten_module_forms(ast) {
         if let Some(items) = expr.as_list() {
             if items.len() >= 2 {
                 if let Some(head) = items[0].as_symbol() {
@@ -1090,7 +1096,9 @@ pub fn document_symbols_from_ast(
     lines: &[&str],
 ) -> Vec<DocumentSymbol> {
     let mut symbols = Vec::new();
-    for expr in ast {
+    let flattened = flatten_module_forms(ast);
+    for expr in &flattened {
+        let expr = *expr;
         if let Some(items) = expr.as_list() {
             if items.len() >= 2 {
                 if let Some(head) = items[0].as_symbol() {
@@ -1186,7 +1194,7 @@ pub fn document_symbols_from_ast(
                     let selection_range = name_range.unwrap_or(form_range);
 
                     let detail = if kind == SymbolKind::FUNCTION {
-                        extract_params_from_ast(ast, &name)
+                        extract_params_from_forms(flattened.iter().copied(), &name)
                     } else {
                         None
                     };

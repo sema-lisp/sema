@@ -4,7 +4,7 @@ use std::collections::HashSet;
 
 use tower_lsp::lsp_types::*;
 
-use crate::helpers::char_col_to_utf16;
+use crate::helpers::{char_col_to_utf16, flatten_module_forms};
 use crate::state::{token_modifiers, token_types, BackendState, DEFINITION_HEADS};
 
 impl BackendState {
@@ -16,7 +16,7 @@ impl BackendState {
         let mut user_fn_names = HashSet::new();
         let mut user_macro_names = HashSet::new();
         let mut workflow_names = HashSet::new();
-        for expr in &cached.ast {
+        for expr in flatten_module_forms(&cached.ast) {
             if let Some(items) = expr.as_list() {
                 if items.len() >= 2 {
                     if let Some(head) = items[0].as_symbol() {

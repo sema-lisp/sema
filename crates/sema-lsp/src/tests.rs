@@ -430,6 +430,25 @@ fn document_links_empty_when_no_imports() {
     assert!(state.handle_document_links(&uri).unwrap().is_empty());
 }
 
+#[test]
+fn document_links_finds_import_wrapped_in_module_form() {
+    let dir = unique_temp_dir("doclinks-module");
+    std::fs::write(dir.join("foo.sema"), "(define x 1)\n").unwrap();
+    let main_uri = Url::from_file_path(dir.join("main.sema")).unwrap();
+    let src =
+        "(module util\n  (export helper)\n  (import \"./foo.sema\")\n  (define (helper x) x))\n";
+    let (state, uri) = parsed_state(main_uri.as_str(), src);
+    let links = state.handle_document_links(&uri).expect("links");
+    assert_eq!(links.len(), 1);
+    assert!(links[0]
+        .target
+        .as_ref()
+        .unwrap()
+        .path()
+        .ends_with("foo.sema"));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 // ── call hierarchy ───────────────────────────────────────────
 
 const CALL_SRC: &str = "(defun helper (x) (* x x))\n(defun main () (helper 5))";
@@ -489,6 +508,51 @@ fn call_hierarchy_outgoing_finds_callees() {
     assert_eq!(item.name, "main");
     let outgoing = state
         .handle_call_hierarchy_outgoing(&item)
+        .expect("outgoing");
+    assert_eq!(outgoing.len(), 1);
+    assert_eq!(outgoing[0].to.name, "helper");
+}
+
+#[test]
+fn call_hierarchy_finds_functions_wrapped_in_module_form() {
+    let src = "(module m\n  (export helper main)\n  (defun helper (x) (* x x))\n  (defun main () (helper 5)))";
+    let (state, uri) = parsed_state("file:///ch-module.sema", src);
+    let lines: Vec<&str> = src.lines().collect();
+
+    let helper_line = 2u32;
+    let helper_char = lines[helper_line as usize].find("helper").unwrap() as u32;
+    let helper_item = state
+        .handle_call_hierarchy_prepare(
+            &uri,
+            &Position {
+                line: helper_line,
+                character: helper_char,
+            },
+        )
+        .expect("prepare on helper")
+        .remove(0);
+    assert_eq!(helper_item.name, "helper");
+
+    let incoming = state
+        .handle_call_hierarchy_incoming(&helper_item)
+        .expect("incoming");
+    assert_eq!(incoming.len(), 1);
+    assert_eq!(incoming[0].from.name, "main");
+
+    let main_line = 3u32;
+    let main_char = lines[main_line as usize].find("main").unwrap() as u32;
+    let main_item = state
+        .handle_call_hierarchy_prepare(
+            &uri,
+            &Position {
+                line: main_line,
+                character: main_char,
+            },
+        )
+        .expect("prepare on main")
+        .remove(0);
+    let outgoing = state
+        .handle_call_hierarchy_outgoing(&main_item)
         .expect("outgoing");
     assert_eq!(outgoing.len(), 1);
     assert_eq!(outgoing[0].to.name, "helper");
@@ -749,6 +813,20 @@ fn user_defs_multiple() {
 fn user_defs_bad_syntax_returns_empty() {
     let defs = user_definitions("(define x");
     assert!(defs.is_empty());
+}
+
+#[test]
+fn user_defs_finds_definition_wrapped_in_module_form() {
+    let src = "(module util\n  (export helper)\n  (define (helper x) (* x 2)))\n";
+    let defs = user_definitions(src);
+    assert_eq!(defs, vec!["helper"]);
+}
+
+#[test]
+fn user_defs_finds_definitions_in_nested_module_forms() {
+    let src = "(module outer\n  (export helper)\n  (module inner\n    (export helper)\n    (define (helper x) x)))\n";
+    let defs = user_definitions(src);
+    assert_eq!(defs, vec!["helper"]);
 }
 
 // ── compile_diagnostics / analyze_document ─────────────────
@@ -1050,6 +1128,14 @@ fn extract_params_define_variable() {
     assert!(params.is_none());
 }
 
+#[test]
+fn extract_params_finds_function_wrapped_in_module_form() {
+    let src = "(module util\n  (export helper)\n  (define (helper x) (* x 2)))\n";
+    let params = extract_params(src, "helper");
+    assert!(params.is_some());
+    assert!(params.unwrap().contains("x"));
+}
+
 // ── import_path_at_cursor ────────────────────────────────────
 
 #[test]
@@ -1147,6 +1233,15 @@ fn import_paths_mixed() {
     let (ast, _) = sema_reader::read_many_with_spans(src).unwrap();
     let paths = import_paths_from_ast(&ast);
     assert_eq!(paths, vec!["a.sema", "b.sema", "c.sema"]);
+}
+
+#[test]
+fn import_paths_finds_import_wrapped_in_module_form() {
+    let src =
+        "(module util\n  (export helper)\n  (import \"other.sema\")\n  (define (helper x) x))\n";
+    let (ast, _) = sema_reader::read_many_with_spans(src).unwrap();
+    let paths = import_paths_from_ast(&ast);
+    assert_eq!(paths, vec!["other.sema"]);
 }
 
 // ── find_enclosing_call ──────────────────────────────────────
@@ -1418,6 +1513,17 @@ fn docstring_handles_define_shorthand() {
     );
 }
 
+#[test]
+fn docstring_finds_function_wrapped_in_module_form() {
+    let ast = ast_of(
+        "(module util\n  (export helper)\n  (defun helper (x)\n    \"Double x.\"\n    (* x 2)))",
+    );
+    assert_eq!(
+        extract_docstring_from_ast(&ast, "helper"),
+        Some("Double x.".to_string())
+    );
+}
+
 // ── find_arg_positions_in_form ───────────────────────────────
 
 #[test]
@@ -1630,6 +1736,17 @@ fn doc_symbols_workflow_and_policy() {
     assert_eq!(symbols[0].kind, SymbolKind::FUNCTION);
     assert_eq!(symbols[1].name, "safe");
     assert_eq!(symbols[1].kind, SymbolKind::VARIABLE);
+}
+
+#[test]
+fn doc_symbols_finds_definition_wrapped_in_module_form() {
+    let src = "(module util\n  (export helper)\n  (define (helper x) (* x 2)))\n";
+    let (ast, span_map, sym_spans) = sema_reader::read_many_with_symbol_spans(src).unwrap();
+    let lines: Vec<&str> = src.lines().collect();
+    let symbols = document_symbols_from_ast(&ast, &span_map, &sym_spans, &lines);
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "helper");
+    assert_eq!(symbols[0].kind, SymbolKind::FUNCTION);
 }
 
 // ── find_enclosing_call edge cases ───────────────────────────
@@ -1851,6 +1968,26 @@ fn semantic_token_start_column_is_utf16_after_astral_char() {
     assert!(
         absolute.contains(&(1, 11)),
         "token after 🎉 must start at UTF-16 column 11, got {absolute:?}"
+    );
+}
+
+#[test]
+fn semantic_tokens_classifies_macro_wrapped_in_module_form() {
+    let src = "(module m\n  (export dbl)\n  (defmacro dbl (x) x))\n(dbl 5)\n";
+    let (state, uri) = parsed_state("file:///semtok-module.sema", src);
+    let result = state.handle_semantic_tokens_full(&uri).unwrap();
+    let SemanticTokensResult::Tokens(tokens) = result else {
+        panic!("expected token data");
+    };
+    let macro_tokens = tokens
+        .data
+        .iter()
+        .filter(|t| t.token_type == crate::state::token_types::MACRO)
+        .count();
+    assert!(
+        macro_tokens >= 2,
+        "expected the module-wrapped defmacro's def site and call site to be \
+         classified as MACRO tokens, got {macro_tokens}"
     );
 }
 

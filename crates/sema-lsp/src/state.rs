@@ -534,7 +534,7 @@ impl BackendState {
                 open_paths.insert(canonicalize_or_raw(&doc_path));
             }
             let lines: Vec<&str> = cached.source.lines().collect();
-            for expr in &cached.ast {
+            for expr in crate::helpers::flatten_module_forms(&cached.ast) {
                 if let Some((name, form_range, name_range)) =
                     def_of_form(expr, &cached.span_map, &cached.symbol_spans, &lines)
                 {
@@ -557,7 +557,7 @@ impl BackendState {
                 Err(_) => continue,
             };
             let lines: Vec<&str> = import_cached.source.lines().collect();
-            for expr in &import_cached.ast {
+            for expr in crate::helpers::flatten_module_forms(&import_cached.ast) {
                 if let Some((name, form_range, name_range)) = def_of_form(
                     expr,
                     &import_cached.span_map,

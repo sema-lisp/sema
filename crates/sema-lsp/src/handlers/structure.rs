@@ -384,7 +384,7 @@ impl BackendState {
         let cached = self.cached_parses.get(uri.as_str())?;
         let lines: Vec<&str> = cached.source.lines().collect();
         let mut links = Vec::new();
-        for expr in &cached.ast {
+        for expr in flatten_module_forms(&cached.ast) {
             let items = match expr.as_list() {
                 Some(i) if i.len() >= 2 => i,
                 _ => continue,
@@ -456,7 +456,7 @@ impl BackendState {
         result: &mut Vec<CallHierarchyIncomingCall>,
     ) {
         let lines: Vec<&str> = source.lines().collect();
-        for expr in ast {
+        for expr in flatten_module_forms(ast) {
             let items = match expr.as_list() {
                 Some(i) => i,
                 None => continue,
@@ -544,7 +544,7 @@ impl BackendState {
         index: &HashMap<String, (Url, Range, Range)>,
     ) -> Option<Vec<CallHierarchyOutgoingCall>> {
         let lines: Vec<&str> = source.lines().collect();
-        for expr in ast {
+        for expr in flatten_module_forms(ast) {
             let items = match expr.as_list() {
                 Some(i) => i,
                 None => continue,

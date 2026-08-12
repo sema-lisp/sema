@@ -587,7 +587,8 @@ pub fn list_mcp_tools(
             "type": "object",
             "properties": {
                 "file_path": { "type": "string", "description": "Path to the Sema file (relative to CWD or absolute)." },
-                "arguments": { "type": "array", "items": { "type": "string" }, "description": "Optional positional arguments to pass to the script." }
+                "arguments": { "type": "array", "items": { "type": "string" }, "description": "Optional positional arguments to pass to the script." },
+                "timeout_ms": { "type": "integer", "description": "Override the server's default per-call timeout for this run, in milliseconds. 0 disables the timeout for this call only (not recommended — a runaway loop then blocks the server indefinitely)." }
             },
             "required": ["file_path"]
         })),
@@ -602,7 +603,8 @@ pub fn list_mcp_tools(
         ("eval", "Evaluate a single Sema expression string and return the result and captured stdout/stderr.", json!({
             "type": "object",
             "properties": {
-                "code": { "type": "string", "description": "The Sema expression to evaluate (e.g., '(+ 1 2)')." }
+                "code": { "type": "string", "description": "The Sema expression to evaluate (e.g., '(+ 1 2)')." },
+                "timeout_ms": { "type": "integer", "description": "Override the server's default per-call timeout for this eval, in milliseconds. 0 disables the timeout for this call only (not recommended — a runaway loop then blocks the server indefinitely)." }
             },
             "required": ["code"]
         })),
@@ -826,9 +828,36 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// Read an optional per-call `timeout_ms` argument, falling back to the
+/// server-configured default. `Some(Duration::ZERO)` means "disabled" (either
+/// because the call explicitly asked for it, or the default is disabled and
+/// the call didn't override it) — callers must check `is_zero()` themselves,
+/// this only resolves precedence. A present-but-malformed `timeout_ms` (not
+/// an unsigned integer) is ignored in favor of the server default rather than
+/// erroring the whole call over one bad optional param.
+fn resolve_call_timeout(
+    arguments: &JsonValue,
+    default_timeout: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    match arguments.get("timeout_ms").and_then(|v| v.as_u64()) {
+        Some(ms) => Some(std::time::Duration::from_millis(ms)),
+        None => default_timeout,
+    }
+}
+
 /// Dispatch a tool call, converting any panic during evaluation into an
 /// `isError` result instead of letting it unwind out and terminate the
 /// (single-threaded) MCP server loop.
+///
+/// Arms a wall-clock deadline on `interpreter.ctx` before dispatch and always
+/// clears it after (both success and panic paths), the same arm-before /
+/// always-clear-after shape `sema_notebook::Engine::eval_source_named` uses
+/// for per-cell timeouts. This is a runaway-loop backstop for `eval`/
+/// `run_file`/tool-handler dispatch — see issue #153, a wedged eval left the
+/// single-threaded stdio server unresponsive forever with no recovery short
+/// of killing the process. `default_tool_timeout` is the server-wide
+/// default (`sema mcp --timeout-ms`); an MCP caller can override it per call
+/// via a `timeout_ms` argument on `eval`/`run_file` (`resolve_call_timeout`).
 pub fn call_mcp_tool(
     name: &str,
     arguments: &JsonValue,
@@ -836,7 +865,17 @@ pub fn call_mcp_tool(
     notebook_cache: &NotebookCache,
     include_tools: Option<&[String]>,
     exclude_tools: Option<&[String]>,
+    default_tool_timeout: Option<std::time::Duration>,
 ) -> CallToolResult {
+    match resolve_call_timeout(arguments, default_tool_timeout) {
+        Some(budget) if !budget.is_zero() => {
+            interpreter
+                .ctx
+                .set_eval_deadline(Some(std::time::Instant::now() + budget));
+        }
+        _ => interpreter.ctx.set_eval_deadline(None),
+    }
+
     let dispatch = std::panic::AssertUnwindSafe(|| {
         call_mcp_tool_inner(
             name,
@@ -847,13 +886,16 @@ pub fn call_mcp_tool(
             exclude_tools,
         )
     });
-    match std::panic::catch_unwind(dispatch) {
+    let result = match std::panic::catch_unwind(dispatch) {
         Ok(result) => result,
         Err(panic) => error_result(format!(
             "Tool '{name}' panicked during evaluation: {}",
             panic_message(panic.as_ref())
         )),
-    }
+    };
+
+    interpreter.ctx.set_eval_deadline(None);
+    result
 }
 
 fn call_mcp_tool_inner(

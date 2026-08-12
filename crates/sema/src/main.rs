@@ -344,6 +344,14 @@ enum Commands {
         /// Defaults to the top-level --sandbox value, else allows everything.
         #[arg(long, value_name = "MODE")]
         sandbox: Option<String>,
+        /// Default per-tool-call timeout in milliseconds for eval/run_file/
+        /// tool-handler calls (a caller can override it per call via a
+        /// `timeout_ms` argument). 0 disables the timeout: a runaway loop
+        /// then wedges the single-threaded server indefinitely (issue #153),
+        /// so this is not recommended. Defaults to SEMA_MCP_EVAL_TIMEOUT_MS
+        /// if set, else 300000 (5 minutes).
+        #[arg(long, value_name = "MS")]
+        timeout_ms: Option<u64>,
     },
     /// Cell-based notebook with a browser UI
     Notebook {
@@ -836,6 +844,33 @@ enum NotebookCommands {
     },
 }
 
+/// Default `sema mcp` per-tool-call timeout: a wedge-recovery backstop
+/// (issue #153), not a fine-grained UX limit — generous enough that a
+/// legitimate `llm/*` agent-loop eval isn't cut off, since a CPU-bound
+/// runaway loop is caught almost immediately regardless of how long the
+/// deadline is (`EvalContext::check_loop_interrupt` polls it every ~16k VM
+/// steps).
+const DEFAULT_MCP_TOOL_TIMEOUT_MS: u64 = 300_000;
+
+/// Resolve the `sema mcp` per-tool-call timeout: an explicit `--timeout-ms`
+/// wins outright; otherwise `SEMA_MCP_EVAL_TIMEOUT_MS` (same precedence and
+/// env var naming convention as `sema-notebook`'s `resolve_cell_timeout`);
+/// otherwise `DEFAULT_MCP_TOOL_TIMEOUT_MS`. `0` (from either source) means
+/// "disabled" and returns `None`.
+fn resolve_mcp_tool_timeout(explicit_ms: Option<u64>) -> Option<std::time::Duration> {
+    let ms = explicit_ms.unwrap_or_else(|| {
+        std::env::var("SEMA_MCP_EVAL_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(DEFAULT_MCP_TOOL_TIMEOUT_MS)
+    });
+    if ms == 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(ms))
+    }
+}
+
 /// Build the standard CLI interpreter: stdlib + LLM (registered inside sema-eval)
 /// plus the MCP *client* builtins (`mcp/connect`, `mcp/tools`, `mcp/tools->sema`,
 /// …). The MCP builtins live in `sema-mcp`, which depends on `sema-eval`, so they
@@ -1274,6 +1309,7 @@ fn main() {
                 include,
                 exclude,
                 sandbox: mcp_sandbox,
+                timeout_ms,
             } => {
                 if let Some(auth) = auth {
                     let result = match auth {
@@ -1343,7 +1379,10 @@ fn main() {
                 // Sync loop, deliberately NO tokio runtime: with an ambient
                 // runtime, llm/* builtins hit io_block_on's runtime-in-runtime
                 // panic and killed the server on the first LLM tool call.
-                if let Err(e) = sema_mcp::run_mcp_server_sync(interpreter, inc_tools, exc_tools) {
+                let tool_timeout = resolve_mcp_tool_timeout(timeout_ms);
+                if let Err(e) =
+                    sema_mcp::run_mcp_server_sync(interpreter, inc_tools, exc_tools, tool_timeout)
+                {
                     print_cli_error(format!("MCP server failed: {e}"));
                     std::process::exit(1);
                 }
@@ -3421,11 +3460,14 @@ fn try_run_embedded() -> Option<i32> {
     if is_mcp {
         let mut include = None;
         let mut exclude = None;
+        let mut timeout_ms = None;
         for window in args.windows(2) {
             if window[0] == "--include" {
                 include = Some(window[1].clone());
             } else if window[0] == "--exclude" {
                 exclude = Some(window[1].clone());
+            } else if window[0] == "--timeout-ms" {
+                timeout_ms = window[1].trim().parse::<u64>().ok();
             }
         }
         for arg in &args {
@@ -3433,6 +3475,8 @@ fn try_run_embedded() -> Option<i32> {
                 include = Some(rest.to_string());
             } else if let Some(rest) = arg.strip_prefix("--exclude=") {
                 exclude = Some(rest.to_string());
+            } else if let Some(rest) = arg.strip_prefix("--timeout-ms=") {
+                timeout_ms = rest.trim().parse::<u64>().ok();
             }
         }
 
@@ -3446,6 +3490,7 @@ fn try_run_embedded() -> Option<i32> {
                 .map(|x| x.trim().to_string())
                 .collect::<Vec<String>>()
         });
+        let tool_timeout = resolve_mcp_tool_timeout(timeout_ms);
 
         if let Err(e) = run_bytecode_bytes(&interpreter, &bytecode) {
             print_error(&e);
@@ -3453,7 +3498,9 @@ fn try_run_embedded() -> Option<i32> {
         }
 
         // Same no-ambient-runtime rule as the CLI mcp arm (llm/* + io_block_on).
-        if let Err(e) = sema_mcp::run_mcp_server_sync(interpreter, inc_tools, exc_tools) {
+        if let Err(e) =
+            sema_mcp::run_mcp_server_sync(interpreter, inc_tools, exc_tools, tool_timeout)
+        {
             print_cli_error(format!("MCP server failed: {e}"));
             std::process::exit(1);
         }

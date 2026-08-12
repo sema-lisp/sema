@@ -190,9 +190,9 @@ When started, the MCP server exposes a set of core developer tools:
 
 | Tool Name | Description | Parameters |
 |---|---|---|
-| `run_file` | Run a `.sema` or `.semac` file and get output/return value | `file_path` (string), `arguments` (array of strings, optional) |
+| `run_file` | Run a `.sema` or `.semac` file and get output/return value | `file_path` (string), `arguments` (array of strings, optional), `timeout_ms` (integer, optional — see [Eval Timeouts](#eval-timeouts)) |
 | `compile` | Compile a `.sema` file to `.semac` bytecode | `source_path` (string), `output_path` (string, optional) |
-| `eval` | Evaluate a single Sema expression string and capture output | `code` (string) |
+| `eval` | Evaluate a single Sema expression string and capture output | `code` (string), `timeout_ms` (integer, optional — see [Eval Timeouts](#eval-timeouts)) |
 | `docs` | Retrieve docstring and signature details for any symbol | `symbol` (string) |
 | `fmt` | Format a Sema file or code string | `file_path` (string, optional), `code` (string, optional) |
 | `disasm` | Disassemble a `.sema` or `.semac` file to VM instructions | `file_path` (string) |
@@ -201,6 +201,45 @@ When started, the MCP server exposes a set of core developer tools:
 
 ### Path Resolution
 All file paths passed to these tools are resolved relative to the current working directory (CWD) of the MCP server process. Both absolute and relative paths are supported.
+
+### Eval Timeouts
+
+The server's stdio loop handles one request at a time. Without a bound, a
+runaway `eval` (or `run_file`, or a `deftool` handler) — an infinite loop,
+not necessarily anything unusual-looking — spins the process forever and
+leaves every later request unread, with no recovery short of killing the
+process.
+
+To prevent this, `eval`, `run_file`, and `deftool` handler calls run under a
+wall-clock deadline. On expiry the call returns a normal tool error
+(`evaluation exceeded time budget (looks like an infinite loop?)`) instead of
+hanging, and the server keeps serving requests.
+
+```bash
+# Default is 300000ms (5 minutes) — generous on purpose. A CPU-bound
+# runaway loop is caught almost immediately regardless of how long the
+# deadline is; a short default risks cutting off a legitimate, slow
+# llm/* agent-loop eval instead.
+sema mcp --timeout-ms 60000
+
+# Or via environment variable (useful when the server is launched by a
+# client config that only lets you set env vars):
+SEMA_MCP_EVAL_TIMEOUT_MS=60000 sema mcp
+```
+
+An explicit `--timeout-ms` wins over the environment variable. `0` disables
+the timeout entirely — not recommended, since it reintroduces the wedge
+described above.
+
+`eval` and `run_file` also accept a `timeout_ms` argument that overrides the
+server's default for that one call — useful when a caller knows a specific
+call should fail fast, or needs more time than the default allows:
+
+```json
+{"name": "eval", "arguments": {"code": "(long-running-agent-loop)", "timeout_ms": 900000}}
+```
+
+`timeout_ms: 0` disables the timeout for that call only.
 
 ---
 

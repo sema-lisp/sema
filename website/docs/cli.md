@@ -419,7 +419,7 @@ sema mcp logout <url>
 sema mcp list
 ```
 
-- `sema mcp` (no subcommand) starts the stdio MCP **server** — see the [MCP documentation](/docs/mcp).
+- `sema mcp` (no subcommand) starts the stdio MCP **server** — see the [MCP documentation](/docs/mcp). `--include`/`--exclude` filter which tools are exposed, `--sandbox` restricts capabilities, and `--timeout-ms` (default 300000, `0` disables, or `SEMA_MCP_EVAL_TIMEOUT_MS`) bounds how long a single `eval`/`run_file`/tool-handler call may run before it's aborted — see [Eval Timeouts](/docs/mcp#eval-timeouts).
 - `sema mcp login <url>` authenticates to a remote MCP **server** you want to *consume* and caches the OAuth token so later `mcp/connect` calls are silent. `--device` uses the headless device-code flow; `--client-id` supplies a pre-registered OAuth client; `--token` installs a pre-issued access token directly (the headless/CI escape hatch — no browser, no device flow), optionally with `--expires-in`.
 - `sema mcp logout <url>` clears the cached credentials for a server.
 - `sema mcp list` prints every server with cached credentials — one line per server (in canonical-URL order): the URL followed by `token present` or `token expired`. It reads only the local credential store (never the network) and never prints token values. The OS keychain backend has no enumeration API, so `list` reports that limitation and points at `SEMA_MCP_TOKEN_STORE=file` instead of pretending the store is empty.

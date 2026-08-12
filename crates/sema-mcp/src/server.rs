@@ -10,6 +10,7 @@ pub async fn run_mcp_server(
     interpreter: Interpreter,
     include_tools: Option<Vec<String>>,
     exclude_tools: Option<Vec<String>>,
+    tool_timeout: Option<std::time::Duration>,
 ) -> Result<(), String> {
     run_mcp_server_on(
         tokio::io::stdin(),
@@ -17,6 +18,7 @@ pub async fn run_mcp_server(
         interpreter,
         include_tools,
         exclude_tools,
+        tool_timeout,
     )
     .await
 }
@@ -34,6 +36,7 @@ pub fn run_mcp_server_sync(
     interpreter: Interpreter,
     include_tools: Option<Vec<String>>,
     exclude_tools: Option<Vec<String>>,
+    tool_timeout: Option<std::time::Duration>,
 ) -> Result<(), String> {
     use std::io::BufRead;
 
@@ -86,6 +89,7 @@ pub fn run_mcp_server_sync(
             &notebook_cache,
             include_tools.as_deref(),
             exclude_tools.as_deref(),
+            tool_timeout,
         );
 
         if let Some(resp) = response {
@@ -156,6 +160,7 @@ pub async fn run_mcp_server_on<R, W>(
     interpreter: Interpreter,
     include_tools: Option<Vec<String>>,
     exclude_tools: Option<Vec<String>>,
+    tool_timeout: Option<std::time::Duration>,
 ) -> Result<(), String>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -209,6 +214,7 @@ where
             &notebook_cache,
             include_tools.as_deref(),
             exclude_tools.as_deref(),
+            tool_timeout,
         );
 
         if let Some(resp) = response {
@@ -256,6 +262,7 @@ fn handle_request(
     notebook_cache: &NotebookCache,
     include_tools: Option<&[String]>,
     exclude_tools: Option<&[String]>,
+    tool_timeout: Option<std::time::Duration>,
 ) -> Option<JsonRpcResponse> {
     // Per JSON-RPC 2.0, a request without an `id` is a notification: the server
     // MUST NOT reply to it. Bailing out with None here keeps us silent for every
@@ -301,6 +308,7 @@ fn handle_request(
                 notebook_cache,
                 include_tools,
                 exclude_tools,
+                tool_timeout,
             );
             Ok(json!(call_res))
         }

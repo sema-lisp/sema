@@ -29,7 +29,7 @@ async fn test_mcp_initialize_and_tools_list() {
     local
         .run_until(async move {
             let server_task = tokio::task::spawn_local(async move {
-                run_mcp_server_on(client_read, client_write, interpreter, None, None).await
+                run_mcp_server_on(client_read, client_write, interpreter, None, None, None).await
             });
 
             // 1. Send initialize request
@@ -139,7 +139,7 @@ async fn test_mcp_notebook_state() {
     local
         .run_until(async move {
             let server_task = tokio::task::spawn_local(async move {
-                run_mcp_server_on(client_read, client_write, interpreter, None, None).await
+                run_mcp_server_on(client_read, client_write, interpreter, None, None, None).await
             });
 
             let mut reader = tokio::io::BufReader::new(&mut server_read);
@@ -347,7 +347,7 @@ async fn test_mcp_notification_gets_no_response() {
     local
         .run_until(async move {
             let server_task = tokio::task::spawn_local(async move {
-                run_mcp_server_on(client_read, client_write, interpreter, None, None).await
+                run_mcp_server_on(client_read, client_write, interpreter, None, None, None).await
             });
 
             // Notification: no `id` field. Server must stay silent.
@@ -395,7 +395,7 @@ async fn test_mcp_invalid_utf8_recovers() {
     local
         .run_until(async move {
             let server_task = tokio::task::spawn_local(async move {
-                run_mcp_server_on(client_read, client_write, interpreter, None, None).await
+                run_mcp_server_on(client_read, client_write, interpreter, None, None, None).await
             });
 
             // Non-UTF-8 bytes followed by a newline.
@@ -447,7 +447,7 @@ async fn test_mcp_sandbox_param_not_advertised() {
     local
         .run_until(async move {
             let server_task = tokio::task::spawn_local(async move {
-                run_mcp_server_on(client_read, client_write, interpreter, None, None).await
+                run_mcp_server_on(client_read, client_write, interpreter, None, None, None).await
             });
 
             let list = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} });
@@ -492,7 +492,7 @@ async fn test_mcp_notebook_new_no_clobber_and_resets_env() {
     local
         .run_until(async move {
             let server_task = tokio::task::spawn_local(async move {
-                run_mcp_server_on(client_read, client_write, interpreter, None, None).await
+                run_mcp_server_on(client_read, client_write, interpreter, None, None, None).await
             });
             let mut reader = tokio::io::BufReader::new(&mut server_read);
             let mut resp_line = String::new();
@@ -652,7 +652,7 @@ async fn test_mcp_deftool_arg_validation() {
     local
         .run_until(async move {
             let server_task = tokio::task::spawn_local(async move {
-                run_mcp_server_on(client_read, client_write, interpreter, None, None).await
+                run_mcp_server_on(client_read, client_write, interpreter, None, None, None).await
             });
             let mut reader = tokio::io::BufReader::new(&mut server_read);
             let mut line = String::new();
@@ -796,7 +796,7 @@ async fn test_mcp_docs_search() {
     local
         .run_until(async move {
             let server_task = tokio::task::spawn_local(async move {
-                run_mcp_server_on(client_read, client_write, interpreter, None, None).await
+                run_mcp_server_on(client_read, client_write, interpreter, None, None, None).await
             });
             let mut reader = tokio::io::BufReader::new(&mut server_read);
             let mut line = String::new();
@@ -887,7 +887,7 @@ async fn test_mcp_print_output_does_not_corrupt_protocol() {
     local
         .run_until(async move {
             let server_task = tokio::task::spawn_local(async move {
-                run_mcp_server_on(client_read, client_write, interpreter, None, None).await
+                run_mcp_server_on(client_read, client_write, interpreter, None, None, None).await
             });
 
             // Evaluate code that prints to stdout and also returns a value.
@@ -916,6 +916,191 @@ async fn test_mcp_print_output_does_not_corrupt_protocol() {
                 text.contains("3"),
                 "result value 3 should be present: {text}"
             );
+
+            drop(server_write);
+            server_task.await.unwrap().unwrap();
+        })
+        .await;
+}
+
+/// Read one JSON-RPC response line from the server.
+async fn read_response(
+    reader: &mut tokio::io::BufReader<&mut tokio::io::DuplexStream>,
+) -> serde_json::Value {
+    let mut resp_line = String::new();
+    reader.read_line(&mut resp_line).await.unwrap();
+    serde_json::from_str(&resp_line).unwrap()
+}
+
+/// Regression test for issue #153: a runaway `eval` used to spin the
+/// single-threaded server forever with no recovery short of killing the
+/// process, since the next request never even got read off stdin. With a
+/// server-default timeout armed, the infinite loop must settle as an
+/// `isError` "time budget" response instead of hanging, AND the server must
+/// still be alive and answering afterward — that second part is the actual
+/// bug, not just that the timed-out call itself eventually errors.
+#[tokio::test]
+async fn test_eval_infinite_loop_recovers_via_deadline() {
+    let (client_read, mut server_write) = tokio::io::duplex(4096);
+    let (mut server_read, client_write) = tokio::io::duplex(4096);
+
+    let interpreter = Interpreter::new();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                run_mcp_server_on(
+                    client_read,
+                    client_write,
+                    interpreter,
+                    None,
+                    None,
+                    Some(std::time::Duration::from_millis(200)),
+                )
+                .await
+            });
+
+            let mut reader = tokio::io::BufReader::new(&mut server_read);
+
+            call_tool(
+                &mut server_write,
+                1,
+                "eval",
+                json!({ "code": "(let loop ((i 0)) (loop (+ i 1)))" }),
+            )
+            .await;
+
+            let resp = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                read_response(&mut reader).await
+            })
+            .await
+            .expect("server did not respond to the runaway eval within 5s — still wedged");
+            assert_eq!(resp["id"], 1);
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("time budget"),
+                "expected a deadline-exceeded error, got: {text}"
+            );
+            assert_eq!(resp["result"]["isError"], true);
+
+            // The actual regression check: the server must still be alive and
+            // answering a fresh, unrelated request on the same connection.
+            call_tool(&mut server_write, 2, "eval", json!({ "code": "(+ 1 2)" })).await;
+            let resp = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                read_response(&mut reader).await
+            })
+            .await
+            .expect("server did not answer a request after recovering from the timeout");
+            assert_eq!(resp["id"], 2);
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("Result: 3"), "got: {text}");
+
+            drop(server_write);
+            server_task.await.unwrap().unwrap();
+        })
+        .await;
+}
+
+/// The per-call deadline must not leak across calls: two fast evals under a
+/// short server-default timeout must both succeed (the deadline is cleared
+/// after each call, not left armed against the next one).
+#[tokio::test]
+async fn test_eval_deadline_does_not_leak_across_calls() {
+    let (client_read, mut server_write) = tokio::io::duplex(4096);
+    let (mut server_read, client_write) = tokio::io::duplex(4096);
+
+    let interpreter = Interpreter::new();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                run_mcp_server_on(
+                    client_read,
+                    client_write,
+                    interpreter,
+                    None,
+                    None,
+                    Some(std::time::Duration::from_millis(200)),
+                )
+                .await
+            });
+
+            let mut reader = tokio::io::BufReader::new(&mut server_read);
+
+            for id in 1..=2 {
+                call_tool(&mut server_write, id, "eval", json!({ "code": "(+ 1 1)" })).await;
+                let resp = read_response(&mut reader).await;
+                assert_eq!(resp["id"], id);
+                let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+                assert!(text.contains("Result: 2"), "call {id} got: {text}");
+            }
+
+            drop(server_write);
+            server_task.await.unwrap().unwrap();
+        })
+        .await;
+}
+
+/// A per-call `timeout_ms` argument must override a generous server default
+/// — a caller that knows a given eval should fail fast can ask for that
+/// without needing a short process-wide timeout that would also clip
+/// legitimately slow `llm/*` agent-loop evals.
+#[tokio::test]
+async fn test_eval_timeout_ms_argument_overrides_server_default() {
+    let (client_read, mut server_write) = tokio::io::duplex(4096);
+    let (mut server_read, client_write) = tokio::io::duplex(4096);
+
+    let interpreter = Interpreter::new();
+
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let server_task = tokio::task::spawn_local(async move {
+                run_mcp_server_on(
+                    client_read,
+                    client_write,
+                    interpreter,
+                    None,
+                    None,
+                    Some(std::time::Duration::from_secs(5)),
+                )
+                .await
+            });
+
+            let mut reader = tokio::io::BufReader::new(&mut server_read);
+
+            call_tool(
+                &mut server_write,
+                1,
+                "eval",
+                json!({ "code": "(let loop ((i 0)) (loop (+ i 1)))", "timeout_ms": 100 }),
+            )
+            .await;
+
+            let resp = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                read_response(&mut reader).await
+            })
+            .await
+            .expect("per-call timeout_ms did not override the generous server default");
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("time budget"),
+                "expected a deadline-exceeded error, got: {text}"
+            );
+
+            // timeout_ms: 0 disables the timeout for this call only.
+            call_tool(
+                &mut server_write,
+                2,
+                "eval",
+                json!({ "code": "(+ 1 1)", "timeout_ms": 0 }),
+            )
+            .await;
+            let resp = read_response(&mut reader).await;
+            let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("Result: 2"), "got: {text}");
 
             drop(server_write);
             server_task.await.unwrap().unwrap();

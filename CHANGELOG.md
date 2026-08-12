@@ -17,6 +17,21 @@
   with `:memory` already wrote its partial turns back to the thread; that thread
   is text-only, so `:on-partial` is the route for the correlated `:messages`.
 
+### Fixed
+
+- **`sema mcp` no longer wedges permanently on a runaway `eval` (#153).** The
+  server's stdio loop is single-threaded and serial, so a call that ran
+  forever (an infinite loop, no I/O) spun the process at 100% CPU and left
+  every later request unread on stdin — the only recovery was killing the
+  process. `eval`, `run_file`, and user-defined `deftool` handlers now run
+  under the same wall-clock deadline mechanism `sema run --timeout` and
+  notebook cells already use: a runaway call now returns a normal
+  `evaluation exceeded time budget` tool error and the server keeps serving
+  requests. Configure the default with `sema mcp --timeout-ms <MS>` or
+  `SEMA_MCP_EVAL_TIMEOUT_MS` (default 300000ms / 5 minutes; `0` disables —
+  not recommended). A caller can also override it per call with a
+  `timeout_ms` argument on `eval`/`run_file`.
+
 ## 1.34.2
 
 ### Fixed

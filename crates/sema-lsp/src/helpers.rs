@@ -408,7 +408,22 @@ pub fn user_definitions_from_ast(
     lines: &[&str],
 ) -> Vec<(String, Option<Range>)> {
     let mut defs = Vec::new();
-    for expr in ast {
+    collect_user_definitions(ast, span_map, symbol_spans, lines, &mut defs);
+    defs
+}
+
+/// Walk `forms`, collecting definitions and recursing into `(module ...)`
+/// bodies — a module's exports are still reachable at the file's top level
+/// for goto-definition/references purposes, so a `define` nested inside one
+/// must be found the same way as a file-top-level `define`.
+fn collect_user_definitions(
+    forms: &[sema_core::Value],
+    span_map: &SpanMap,
+    symbol_spans: &[(String, Span)],
+    lines: &[&str],
+    defs: &mut Vec<(String, Option<Range>)>,
+) {
+    for expr in forms {
         if let Some(items) = expr.as_list() {
             if items.len() >= 2 {
                 if let Some(head) = items[0].as_symbol() {
@@ -440,13 +455,22 @@ pub fn user_definitions_from_ast(
                                 }
                             }
                         }
+                        "module" => {
+                            // (module name (export ...) body...) — recurse into the body.
+                            collect_user_definitions(
+                                &items[2..],
+                                span_map,
+                                symbol_spans,
+                                lines,
+                                defs,
+                            );
+                        }
                         _ => {}
                     }
                 }
             }
         }
     }
-    defs
 }
 
 /// Convenience wrapper: parse text and collect user definitions with spans.

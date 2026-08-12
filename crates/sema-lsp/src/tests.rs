@@ -2550,6 +2550,48 @@ fn goto_definition_finds_symbol_in_scanned_workspace_file() {
 }
 
 #[test]
+fn goto_definition_finds_symbol_wrapped_in_module_form_via_import() {
+    // github.com/sema-lisp/sema/issues/151 — a call site of an imported
+    // symbol whose definition lives inside a `(module ...)` form returns
+    // null: `user_definitions_from_ast` only looks at forms directly at
+    // the AST's top level, so a `define` nested inside `module` is
+    // invisible to it, even though the import itself resolves fine.
+    let dir = unique_temp_dir("goto-module-import");
+    let util_path = dir.join("util.sema");
+    std::fs::write(
+        &util_path,
+        "(module util\n  (export helper)\n  (define (helper x) (* x 2)))\n",
+    )
+    .unwrap();
+
+    let main_path = dir.join("main.sema");
+    let main_uri = Url::from_file_path(&main_path).unwrap();
+    let (mut state, main_uri) = parsed_state(
+        main_uri.as_str(),
+        "(import \"util.sema\" helper)\n(define (main) (helper 21))\n",
+    );
+
+    // Cursor on `helper` at its call site inside `(main)`'s body.
+    let result = state
+        .handle_goto_definition(
+            &main_uri,
+            &Position {
+                line: 1,
+                character: 18,
+            },
+        )
+        .expect("expected the definition inside the module form");
+    match result {
+        GotoDefinitionResponse::Scalar(location) => {
+            assert_eq!(location.uri, Url::from_file_path(&util_path).unwrap());
+            assert_eq!(location.range.start.line, 2);
+        }
+        other => panic!("expected a scalar location, got {other:?}"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn goto_definition_returns_all_candidates_when_name_defined_in_multiple_files() {
     // Two workspace files both define `greet`: cache iteration order is
     // arbitrary, so the handler must return every candidate, not a coin flip.

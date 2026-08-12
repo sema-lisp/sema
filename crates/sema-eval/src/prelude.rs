@@ -920,6 +920,21 @@ pub const PRELUDE: &str = r#"
                  (if (:done __r) (__agent-finish __h) (__agent-drive __h)))
           (__agent-finish __h)))))
 
+;; `:on-partial` egress for a run that ends by error or cancellation. `__agent-finish`
+;; already builds the `{:response :messages :session}` map on that path (it is what the
+;; memory writeback uses), but the value is unreachable: the error propagates instead,
+;; and a cancelled task has no return value at all (`async/await` raises). Hand the map
+;; to the caller's callback before rethrowing, so an interrupted turn keeps the
+;; correlated transcript it had assembled (issue #87).
+;;
+;; The callback runs in the cancelled task's last bytecode, which cannot park again:
+;; it must only capture the value (`set!`), never suspend (no I/O, no await).
+(define (__agent-partial __rest __partial)
+  (if (or (null? __rest) (not (map? (car __rest))) (nil? __partial))
+      nil
+      (let ((__cb (:on-partial (car __rest))))
+        (if (nil? __cb) nil (__cb __partial)))))
+
 (define (agent/run __agent __input . __rest)
   (if (or (__async-context?) (__runtime-quantum?))
       (let ((__h (apply __agent-begin __agent __input __rest)))
@@ -927,7 +942,8 @@ pub const PRELUDE: &str = r#"
         ;; the failure status (notably a cancellation, whose bytecode now runs this
         ;; catch), not ended "unset".
         (try (__agent-drive __h)
-             (catch __e (begin (__agent-finish __h __e) (throw __e)))))
+             (catch __e (begin (__agent-partial __rest (__agent-finish __h __e))
+                               (throw __e)))))
       (apply __agent-run-blocking __agent __input __rest)))
 
 ;; llm/chat: a thin dispatcher like `agent/run` above. A native cannot retain its

@@ -347,10 +347,10 @@ F31	crates/sema-eval/src/eval.rs:8686:                           (async/spawn (f
 F31	crates/sema-eval/src/eval.rs:8687:                   (list (channel/recv out) (channel/recv out)))",
 F31	crates/sema-eval/src/eval.rs:8705:                 (begin (async (channel/send ch :ran)) :end)",
 F31	crates/sema-eval/src/eval.rs:8711:            .eval_str_via_runtime("(channel/recv ch)")
-F34C	crates/sema-eval/src/prelude.rs:1012:;; CONTEXT — a callback that itself suspends (async/sleep, channel ops, await) is
-F34A	crates/sema-eval/src/prelude.rs:1045:;; connection, spawned via `async/spawn`'s runtime ABI, which requires a
-F34A	crates/sema-eval/src/prelude.rs:1049:;; being `async/spawn`'s trivial promise-handle mapping —
-F34A	crates/sema-eval/src/prelude.rs:1076:  (let ((factory (fn (h req responder) (async/spawn (fn () (responder (h req)))))))
+F34C	crates/sema-eval/src/prelude.rs:1028:;; CONTEXT — a callback that itself suspends (async/sleep, channel ops, await) is
+F34A	crates/sema-eval/src/prelude.rs:1061:;; connection, spawned via `async/spawn`'s runtime ABI, which requires a
+F34A	crates/sema-eval/src/prelude.rs:1065:;; being `async/spawn`'s trivial promise-handle mapping —
+F34A	crates/sema-eval/src/prelude.rs:1092:  (let ((factory (fn (h req responder) (async/spawn (fn () (responder (h req)))))))
 F34D	crates/sema-eval/src/prelude.rs:137:;; (async/await (ws/listen sock {:on-message (fn (c m) (println m))}))
 F34A	crates/sema-eval/src/prelude.rs:146:       (async/spawn
 F34A	crates/sema-eval/src/prelude.rs:534:;; The OWNED combinators (`async/spawn-all`, `async/map`, `async/pool-map`,
@@ -398,6 +398,7 @@ F34B	crates/sema-eval/src/prelude.rs:886:    (let ((outcome (try {:v (async/race
 F34A	crates/sema-eval/src/prelude.rs:889:      (async/cancel child)
 F34B	crates/sema-eval/src/prelude.rs:890:      (async/cancel timer)
 F34A	crates/sema-eval/src/prelude.rs:900:;; sibling tasks overlap and `async/timeout`/`async/cancel` can cut the loop at
+F34A	crates/sema-eval/src/prelude.rs:926:;; and a cancelled task has no return value at all (`async/await` raises). Hand the map
 F35B	crates/sema-io/src/executor.rs:11://! burning one worker apiece — the ceiling the old blocking-tier `io_block_on`
 F35A	crates/sema-io/src/executor.rs:379:                std::thread::sleep(Duration::from_millis(ms));
 F35A	crates/sema-io/src/executor.rs:409:        rx.recv_timeout(Duration::from_secs(2))

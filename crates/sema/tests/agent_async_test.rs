@@ -388,3 +388,48 @@ fn normal_and_error_completion_leave_slab_empty() {
     );
     assert_eq!(agent_runs_len(), 0, "error completion must empty the slab");
 }
+
+/// Issue #87: a cancelled `agent/run` must be able to hand back the partial
+/// transcript it had assembled. The `:on-partial` callback fires from the
+/// driver's cancel catch with the same `{:response :messages :session}` map
+/// `__agent-finish` builds, so the interrupted turn keeps its correlated
+/// history (assistant tool_calls + tool_result rounds), which `async/await`
+/// cannot return for a cancelled task.
+#[test]
+#[serial]
+fn cancelled_agent_run_reports_partial_transcript() {
+    reset_io_inflight();
+
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .chat_delay(100)
+        .tool_loop(8, "ping", serde_json::json!({ "n": 1 }), "done")
+        .build();
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let program = r#"
+        (deftool ping "ping" {:n {:type :number}} (fn (n) "pong"))
+        (defagent bot {:model "fake-model" :tools [ping] :max-turns 12})
+        (define partial nil)
+        (let ((p (async/spawn
+                   (fn () (agent/run bot "go"
+                            {:on-partial (fn (r) (set! partial r))})))))
+          (async/spawn (fn () (async/sleep 250) (async/cancel p)))
+          (try (async/await p) (catch e nil)))
+        (if (nil? partial) 0 (length (:messages partial)))
+    "#;
+    let n = interp
+        .eval_str_compiled(program)
+        .expect("program should run")
+        .as_int()
+        .expect("message count");
+    assert!(
+        n > 1,
+        "the cancelled run must report the transcript it had (user turn + at \
+         least one completed round), got {n} messages"
+    );
+    assert_eq!(agent_runs_len(), 0, "slab still reaped on cancel");
+}

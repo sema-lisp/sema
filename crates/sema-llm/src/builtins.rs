@@ -923,6 +923,11 @@ pub fn last_usage_snapshot() -> Option<LastUsage> {
 pub struct LeafUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Prompt tokens served from the provider's prompt cache. See `Usage::
+    /// cache_read_input_tokens` for the per-provider accounting caveat.
+    pub cache_read_input_tokens: u64,
+    /// Tokens written to the prompt cache. See `Usage::cache_creation_input_tokens`.
+    pub cache_creation_input_tokens: u64,
     /// Summed cost; `None` while no priced call has landed, `Some` once one has (a
     /// later unpriced call leaves the running sum unchanged).
     pub cost_usd: Option<f64>,
@@ -944,6 +949,8 @@ fn accumulate_into(slot: &Rc<RefCell<LeafUsage>>, usage: &Usage, cost: Option<f6
     let mut acc = slot.borrow_mut();
     acc.input_tokens += input;
     acc.output_tokens += output;
+    acc.cache_read_input_tokens += usage.cache_read_input_tokens as u64;
+    acc.cache_creation_input_tokens += usage.cache_creation_input_tokens as u64;
     if let Some(c) = cost {
         acc.cost_usd = Some(acc.cost_usd.unwrap_or(0.0) + c);
     }
@@ -951,6 +958,25 @@ fn accumulate_into(slot: &Rc<RefCell<LeafUsage>>, usage: &Usage, cost: Option<f6
         acc.model = usage.model.clone();
     }
     acc.calls += 1;
+}
+
+/// Fold a child leaf's tally into a parent's, used when a nested [`UsageScope`] drops
+/// so the outer scope it shadowed isn't left blind to tokens the inner one collected.
+fn merge_leaf(dst: &mut LeafUsage, src: &LeafUsage) {
+    if src.calls == 0 {
+        return;
+    }
+    dst.input_tokens += src.input_tokens;
+    dst.output_tokens += src.output_tokens;
+    dst.cache_read_input_tokens += src.cache_read_input_tokens;
+    dst.cache_creation_input_tokens += src.cache_creation_input_tokens;
+    if let Some(c) = src.cost_usd {
+        dst.cost_usd = Some(dst.cost_usd.unwrap_or(0.0) + c);
+    }
+    if !src.model.is_empty() {
+        dst.model = src.model.clone();
+    }
+    dst.calls += src.calls;
 }
 
 /// RAII handle for a per-leaf usage accumulator. Installs a fresh frame as the active
@@ -972,6 +998,12 @@ impl UsageScope {
 
 impl Drop for UsageScope {
     fn drop(&mut self) {
+        // Nesting (e.g. `agent/run` opening its own scope inside an already-active
+        // `workflow/step` scope) must not blind the outer scope to tokens the inner
+        // one collected: fold this leaf's tally into the parent before restoring it.
+        if let Some(parent) = &self.prev {
+            merge_leaf(&mut parent.borrow_mut(), &self.slot.borrow());
+        }
         ACTIVE_LEAF_SCOPE.with(|s| *s.borrow_mut() = self.prev.take());
     }
 }
@@ -3134,6 +3166,41 @@ fn gc_otel_observer(event: &sema_core::GcPassEvent) {
     sema_otel::gc_pass_span(event);
 }
 
+// Build the `:usage` map for `agent/run`'s result (both the blocking and non-blocking
+// paths), from a `LeafUsage` tally accumulated over a `UsageScope`. Same key names as
+// `llm/last-usage`/`llm/session-usage` for consistency, plus `:calls` — the number of
+// billed provider round trips this turn, which neither of those two (single-call /
+// process-global) accessors can report.
+fn agent_usage_value(u: &LeafUsage) -> Value {
+    let mut map = BTreeMap::new();
+    map.insert(
+        Value::keyword("prompt-tokens"),
+        Value::int(u.input_tokens as i64),
+    );
+    map.insert(
+        Value::keyword("completion-tokens"),
+        Value::int(u.output_tokens as i64),
+    );
+    map.insert(
+        Value::keyword("total-tokens"),
+        Value::int((u.input_tokens + u.output_tokens) as i64),
+    );
+    map.insert(
+        Value::keyword("cache-read-tokens"),
+        Value::int(u.cache_read_input_tokens as i64),
+    );
+    map.insert(
+        Value::keyword("cache-creation-tokens"),
+        Value::int(u.cache_creation_input_tokens as i64),
+    );
+    map.insert(Value::keyword("model"), Value::string(&u.model));
+    if let Some(cost) = u.cost_usd {
+        map.insert(Value::keyword("cost-usd"), Value::float(cost));
+    }
+    map.insert(Value::keyword("calls"), Value::int(u.calls as i64));
+    Value::map(map)
+}
+
 pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     let unrestricted = sandbox.is_unrestricted();
 
@@ -4697,6 +4764,11 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         // by the nested per-round chat spans) inside run_tool_loop.
         let _tele = install_call_telemetry(opts.as_ref());
 
+        // Tally this turn's usage independently of the process-global `llm/session-usage`
+        // (issue #86). Nests correctly under an enclosing `workflow/step` scope, if any —
+        // `UsageScope::Drop` folds this leaf's tally into the parent's before restoring it.
+        let _usage_scope = open_usage_scope();
+
         let (result, final_messages) = run_tool_loop(
             ctx,
             messages,
@@ -4759,6 +4831,10 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 chat_messages_to_sema_list(&final_messages),
             );
             map.insert(Value::keyword("session"), Value::conversation(session_conv));
+            map.insert(
+                Value::keyword("usage"),
+                agent_usage_value(&_usage_scope.usage()),
+            );
             Ok(Value::map(map))
         } else {
             // 2-arg form: return string (backward compat)
@@ -11452,6 +11528,13 @@ struct AgentLoopState {
     /// `Drop` can forget it when the otel thread-locals are already gone (see below).
     agent_span: Option<sema_otel::AgentSpan>,
     conv_guard: Option<sema_otel::ConversationGuard>,
+    /// This turn's usage tally (issue #86), read by `__agent-finish` for the `:usage`
+    /// result key. `Some` for `agent/run` (opened in `agent_begin`), `None` for
+    /// `llm/chat` (`chat_begin` always sets `has_opts: false`, so no map — and no
+    /// `:usage` — is ever built from this state). `Option` for the same reason as
+    /// `agent_span`/`conv_guard`: `Drop` must be able to `.take()` it to choose
+    /// drop-normally vs. forget-at-thread-teardown.
+    usage_scope: Option<UsageScope>,
     /// The scheduler task this run's driver loop executes on (captured in
     /// `__agent-begin`); `None` for a top-level (non-task) run. When that task is
     /// CANCELLED its bytecode never resumes, so `__agent-finish` never fires —
@@ -11477,7 +11560,23 @@ impl Drop for AgentLoopState {
             std::mem::forget(self.agent_span.take());
             std::mem::forget(self.conv_guard.take());
         }
+        // `usage_scope` touches a different (this crate's own) thread-local than the
+        // otel guards above, which can be destroyed in a different order at thread
+        // teardown — probe it independently rather than reusing `sema_otel::tls_alive()`.
+        if usage_tls_alive() {
+            drop(self.usage_scope.take());
+        } else {
+            std::mem::forget(self.usage_scope.take());
+        }
     }
+}
+
+/// Whether `ACTIVE_LEAF_SCOPE` is still accessible on this thread. Mirrors
+/// `sema_otel::tls_alive()`'s purpose for the otel thread-locals: lets a held
+/// `UsageScope`'s `Drop` avoid touching an already-destroyed thread-local during
+/// thread teardown (a leaked/cancelled `AgentLoopState` dropped at process exit).
+fn usage_tls_alive() -> bool {
+    ACTIVE_LEAF_SCOPE.try_with(|_| ()).is_ok()
 }
 
 thread_local! {
@@ -11742,6 +11841,7 @@ fn agent_begin(args: &[Value]) -> Result<Value, SemaError> {
         agent_model: agent.model.clone(),
         agent_span: Some(agent_span),
         conv_guard,
+        usage_scope: Some(open_usage_scope()),
         owning_task_id: sema_core::current_task_id(),
     };
 
@@ -11876,6 +11976,9 @@ fn chat_begin(args: &[Value]) -> Result<Value, SemaError> {
         agent_model,
         agent_span: Some(agent_span),
         conv_guard,
+        // llm/chat always returns the bare string (has_opts: false above) — no map, so
+        // no :usage to expose; don't open a scope nobody will read.
+        usage_scope: None,
         owning_task_id: sema_core::current_task_id(),
     };
 
@@ -12636,6 +12739,12 @@ fn agent_finish(token: u64, finish_error: Option<String>) -> Result<Value, SemaE
             chat_messages_to_sema_list(&st.messages),
         );
         map.insert(Value::keyword("session"), Value::conversation(session_conv));
+        let usage = st
+            .usage_scope
+            .as_ref()
+            .map(|s| s.usage())
+            .unwrap_or_default();
+        map.insert(Value::keyword("usage"), agent_usage_value(&usage));
         Ok(Value::map(map))
     } else {
         Ok(Value::string(&result))

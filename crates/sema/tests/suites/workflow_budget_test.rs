@@ -134,6 +134,45 @@ fn usd_budget_enforced_end_to_end_via_pinned_pricing() {
     assert!(budget[0]["cost_usd"].as_f64().unwrap() > 0.0);
 }
 
+/// Regression for issue #86: `agent/run` now opens its own `UsageScope` (to report a
+/// `:usage` result key), nested inside the step's own scope on the `:agent` path —
+/// `step` routes `:agent A` through `agent/run`, unlike `:tools`, which stays on
+/// `llm/chat`/`run_tool_loop` directly and never nests. Without `UsageScope::Drop`
+/// folding the inner tally into the parent before restoring it, the step's own Budget
+/// event would only see the LAST round of the agent's own 2-round tool loop (or
+/// nothing), not the full total — silently under-reporting/under-charging the step.
+#[test]
+fn agent_path_step_sums_usage_across_its_own_multi_round_tool_loop() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call("call_1", "get-weather", serde_json::json!({"city": "Oslo"}))
+        .reply_with_usage("It is sunny in Oslo.", 20, 8)
+        .build();
+
+    let src = r#"
+        (deftool get-weather "Get weather"
+          {:city {:type :string}}
+          (lambda (city) "sunny"))
+        (defagent scout
+          {:model "fake-model" :tools [get-weather] :max-turns 5})
+        (defworkflow agent-path-demo
+          "an :agent step whose own tool loop makes 2 provider rounds"
+          {:phases ["Go"]}
+          (phase "Go")
+          (def r (step "weather in Oslo?" {:agent scout}))
+          {:status :success :r r})
+    "#;
+
+    let out = wc::run_once(src, fake, "wf_agent_path_usage");
+
+    let budget = wc::events_of(&out.events, "budget");
+    assert_eq!(budget.len(), 1, "one leaf, one budget event");
+    // tool_call round (fake default 10/5) + reply round (20/8) = 30/13 total — both
+    // rounds of the agent's OWN tool loop, correctly attributed to the enclosing step.
+    assert_eq!(budget[0]["input_tokens"], 30);
+    assert_eq!(budget[0]["output_tokens"], 13);
+}
+
 #[test]
 fn budget_latch_fails_run_and_refuses_further_leaves_under_fanout() {
     // A pipeline fan-out over 20 items with a tiny budget. The latch can't stop siblings

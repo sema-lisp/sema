@@ -87,6 +87,71 @@ fn agent_loop_completes_with_tool_call() {
     );
 }
 
+/// Issue #86: the 3-arg (opts) form of `agent/run` folds this turn's OWN cumulative
+/// usage into the result map as `:usage`, summed across every round of the tool loop —
+/// not just the most recent round (`llm/last-usage`) and not polluted by other calls in
+/// the process (`llm/session-usage`). A `llm/complete` warmup call before the agent run
+/// proves the isolation: its 100/50 tokens must NOT leak into `:usage`, but must still
+/// land in the untouched, process-global `llm/session-usage`.
+#[test]
+fn agent_run_result_map_carries_this_turns_usage() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .reply_with_usage("warmup done", 100, 50)
+        .tool_call("call_1", "get-weather", serde_json::json!({"city": "Oslo"}))
+        .reply_with_usage("It is sunny in Oslo.", 20, 8)
+        .build();
+
+    let src = r#"
+        (deftool get-weather "Get weather"
+          {:city {:type :string}}
+          (lambda (city) "sunny"))
+        (defagent weather-bot
+          {:model "fake-model" :tools [get-weather] :max-turns 5})
+        (llm/complete "warmup")
+        (list (:usage (agent/run weather-bot "weather in Oslo?" {}))
+              (:total-tokens (llm/session-usage)))
+    "#;
+
+    let (result, recorder) = eval_with_fake(src, fake);
+    let val = result.expect("agent/run should complete against the fake");
+    let items = val.as_seq().expect("result is a list");
+    let usage = items[0].as_map_rc().expect(":usage is a map");
+
+    assert_eq!(recorder.call_count(), 3, "warmup + 2 agent rounds");
+    // tool_call round (fake default 10/5) + reply round (20/8) = 30/13 — the warmup's
+    // 100/50 must not appear here.
+    assert_eq!(
+        usage
+            .get(&Value::keyword("prompt-tokens"))
+            .and_then(|v| v.as_int()),
+        Some(30)
+    );
+    assert_eq!(
+        usage
+            .get(&Value::keyword("completion-tokens"))
+            .and_then(|v| v.as_int()),
+        Some(13)
+    );
+    assert_eq!(
+        usage
+            .get(&Value::keyword("total-tokens"))
+            .and_then(|v| v.as_int()),
+        Some(43)
+    );
+    assert_eq!(
+        usage.get(&Value::keyword("calls")).and_then(|v| v.as_int()),
+        Some(2),
+        "two billed provider round trips this turn"
+    );
+    // fake-model is unpriced — no :cost-usd key, mirroring llm/last-usage's convention.
+    assert!(usage.get(&Value::keyword("cost-usd")).is_none());
+
+    // The warmup's tokens (100+50=150) plus the agent's own 43 land in the
+    // untouched, process-global session accumulator.
+    assert_eq!(items[1].as_int(), Some(193));
+}
+
 /// Strict oracle for the Phase 2 tool-result protocol fix: round 2 must echo the
 /// assistant's tool_calls and send the result as a correlated tool message
 /// (`tool_call_id` matching the call). This is what OpenAI-family providers

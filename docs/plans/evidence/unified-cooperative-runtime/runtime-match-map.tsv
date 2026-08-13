@@ -347,10 +347,10 @@ F31	crates/sema-eval/src/eval.rs:8686:                           (async/spawn (f
 F31	crates/sema-eval/src/eval.rs:8687:                   (list (channel/recv out) (channel/recv out)))",
 F31	crates/sema-eval/src/eval.rs:8705:                 (begin (async (channel/send ch :ran)) :end)",
 F31	crates/sema-eval/src/eval.rs:8711:            .eval_str_via_runtime("(channel/recv ch)")
-F34C	crates/sema-eval/src/prelude.rs:1028:;; CONTEXT — a callback that itself suspends (async/sleep, channel ops, await) is
-F34A	crates/sema-eval/src/prelude.rs:1061:;; connection, spawned via `async/spawn`'s runtime ABI, which requires a
-F34A	crates/sema-eval/src/prelude.rs:1065:;; being `async/spawn`'s trivial promise-handle mapping —
-F34A	crates/sema-eval/src/prelude.rs:1092:  (let ((factory (fn (h req responder) (async/spawn (fn () (responder (h req)))))))
+F34C	crates/sema-eval/src/prelude.rs:1033:;; CONTEXT — a callback that itself suspends (async/sleep, channel ops, await) is
+F34A	crates/sema-eval/src/prelude.rs:1066:;; connection, spawned via `async/spawn`'s runtime ABI, which requires a
+F34A	crates/sema-eval/src/prelude.rs:1070:;; being `async/spawn`'s trivial promise-handle mapping —
+F34A	crates/sema-eval/src/prelude.rs:1097:  (let ((factory (fn (h req responder) (async/spawn (fn () (responder (h req)))))))
 F34D	crates/sema-eval/src/prelude.rs:137:;; (async/await (ws/listen sock {:on-message (fn (c m) (println m))}))
 F34A	crates/sema-eval/src/prelude.rs:146:       (async/spawn
 F34A	crates/sema-eval/src/prelude.rs:534:;; The OWNED combinators (`async/spawn-all`, `async/map`, `async/pool-map`,
@@ -422,48 +422,48 @@ C07D	crates/sema-llm/src/anthropic.rs:540:        sema_io::io_block_on(self.comp
 C07D	crates/sema-llm/src/anthropic.rs:556:        // io_block_on drives ON THIS thread: `on_chunk` may touch non-Send Sema
 C07D	crates/sema-llm/src/anthropic.rs:558:        sema_io::io_block_on(self.stream_complete_async(request, on_chunk))
 C07D	crates/sema-llm/src/anthropic.rs:562:        sema_io::io_block_on(async {
-C08	crates/sema-llm/src/builtins.rs:1053:// `async/spawn` and swaps it around every task step. Read-only flags ride as value
-C11	crates/sema-llm/src/builtins.rs:10571:thread_local! {
-C07D	crates/sema-llm/src/builtins.rs:10651:/// Synchronous-path loop (the VM thread; provider `block_on` already returned
-C10	crates/sema-llm/src/builtins.rs:10652:/// before the backoff `thread::sleep`); the async wire stage uses the twin
-C10	crates/sema-llm/src/builtins.rs:10675:                        std::thread::sleep(std::time::Duration::from_millis(wait));
-C07D	crates/sema-llm/src/builtins.rs:11092:        // synchronous caller thread (the provider's own block_on has already
-C10	crates/sema-llm/src/builtins.rs:11097:            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
-C10	crates/sema-llm/src/builtins.rs:11113:/// offloaded future, or a `std::thread::sleep` on a pool worker) so sibling
-C11	crates/sema-llm/src/builtins.rs:11483:thread_local! {
-C07B	crates/sema-llm/src/builtins.rs:11979:    // `async/cancel` cuts the loop at an inter-round park.
-C07B	crates/sema-llm/src/builtins.rs:12037:    // `mcp/call`'s runtime external wait, or an `async/await` inside the handler),
-C07C	crates/sema-llm/src/builtins.rs:12062:            let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
-C07C	crates/sema-llm/src/builtins.rs:12098:            let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
-C11	crates/sema-llm/src/builtins.rs:12746:thread_local! {
-C11	crates/sema-llm/src/builtins.rs:13399:                    match rx.recv() {
-C11	crates/sema-llm/src/builtins.rs:1340:thread_local! {
-C10	crates/sema-llm/src/builtins.rs:13640:            std::thread::sleep(std::time::Duration::from_millis(STREAM_POLL_INTERVAL_MS));
-C07C	crates/sema-llm/src/builtins.rs:13878:                let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
-C07C	crates/sema-llm/src/builtins.rs:13931:                let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
-C07C	crates/sema-llm/src/builtins.rs:14004:    let result = sema_core::call_callback(ctx, &tool_def.handler, &sema_args)?;
-C07B	crates/sema-llm/src/builtins.rs:1548:// `async/timeout` or a pool error-path) still runs to completion and decrements the
-C07C	crates/sema-llm/src/builtins.rs:1928:                let result = sema_core::call_callback(
-C07C	crates/sema-llm/src/builtins.rs:1942:                results.push(sema_core::call_callback(
-C07C	crates/sema-llm/src/builtins.rs:1954:                    let result = sema_core::call_callback(
-C07C	crates/sema-llm/src/builtins.rs:1972:                if sema_core::call_callback(ctx, &plan.callback, std::slice::from_ref(&argument))?
-C07B	crates/sema-llm/src/builtins.rs:2196:/// `NativeOutcome::Call`, so an async op inside the thunk (`async/spawn`,
-C07C	crates/sema-llm/src/builtins.rs:2198:/// `call_callback` re-entry would suspend the runtime quantum and hit the
-C07C	crates/sema-llm/src/builtins.rs:2200:/// synchronous `call_callback` extent): a thunk that only builds a promise tears down
-C07C	crates/sema-llm/src/builtins.rs:2220:                let result = sema_core::call_callback(ctx, &body_fn, &[]);
-C07C	crates/sema-llm/src/builtins.rs:2731:            sema_core::call_callback(ctx, &complete_fn, &[request_map])
+C11	crates/sema-llm/src/builtins.rs:10647:thread_local! {
+C07D	crates/sema-llm/src/builtins.rs:10727:/// Synchronous-path loop (the VM thread; provider `block_on` already returned
+C10	crates/sema-llm/src/builtins.rs:10728:/// before the backoff `thread::sleep`); the async wire stage uses the twin
+C10	crates/sema-llm/src/builtins.rs:10751:                        std::thread::sleep(std::time::Duration::from_millis(wait));
+C08	crates/sema-llm/src/builtins.rs:1085:// `async/spawn` and swaps it around every task step. Read-only flags ride as value
+C07D	crates/sema-llm/src/builtins.rs:11168:        // synchronous caller thread (the provider's own block_on has already
+C10	crates/sema-llm/src/builtins.rs:11173:            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+C10	crates/sema-llm/src/builtins.rs:11189:/// offloaded future, or a `std::thread::sleep` on a pool worker) so sibling
+C11	crates/sema-llm/src/builtins.rs:11582:thread_local! {
+C07B	crates/sema-llm/src/builtins.rs:12082:    // `async/cancel` cuts the loop at an inter-round park.
+C07B	crates/sema-llm/src/builtins.rs:12140:    // `mcp/call`'s runtime external wait, or an `async/await` inside the handler),
+C07C	crates/sema-llm/src/builtins.rs:12165:            let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
+C07C	crates/sema-llm/src/builtins.rs:12201:            let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
+C11	crates/sema-llm/src/builtins.rs:12855:thread_local! {
+C11	crates/sema-llm/src/builtins.rs:13508:                    match rx.recv() {
+C11	crates/sema-llm/src/builtins.rs:1372:thread_local! {
+C10	crates/sema-llm/src/builtins.rs:13749:            std::thread::sleep(std::time::Duration::from_millis(STREAM_POLL_INTERVAL_MS));
+C07C	crates/sema-llm/src/builtins.rs:13987:                let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
+C07C	crates/sema-llm/src/builtins.rs:14040:                let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
+C07C	crates/sema-llm/src/builtins.rs:14113:    let result = sema_core::call_callback(ctx, &tool_def.handler, &sema_args)?;
+C07B	crates/sema-llm/src/builtins.rs:1580:// `async/timeout` or a pool error-path) still runs to completion and decrements the
+C07C	crates/sema-llm/src/builtins.rs:1960:                let result = sema_core::call_callback(
+C07C	crates/sema-llm/src/builtins.rs:1974:                results.push(sema_core::call_callback(
+C07C	crates/sema-llm/src/builtins.rs:1986:                    let result = sema_core::call_callback(
+C07C	crates/sema-llm/src/builtins.rs:2004:                if sema_core::call_callback(ctx, &plan.callback, std::slice::from_ref(&argument))?
+C07B	crates/sema-llm/src/builtins.rs:2228:/// `NativeOutcome::Call`, so an async op inside the thunk (`async/spawn`,
+C07C	crates/sema-llm/src/builtins.rs:2230:/// `call_callback` re-entry would suspend the runtime quantum and hit the
+C07C	crates/sema-llm/src/builtins.rs:2232:/// synchronous `call_callback` extent): a thunk that only builds a promise tears down
+C07C	crates/sema-llm/src/builtins.rs:2252:                let result = sema_core::call_callback(ctx, &body_fn, &[]);
+C07C	crates/sema-llm/src/builtins.rs:2763:            sema_core::call_callback(ctx, &complete_fn, &[request_map])
 C11	crates/sema-llm/src/builtins.rs:28:thread_local! {
-C07C	crates/sema-llm/src/builtins.rs:3988:                sema_core::call_callback(ctx, cb, &[Value::string(chunk)])
-C07B	crates/sema-llm/src/builtins.rs:4780:    // is not `async/cancel`-addressable). The prelude `agent/run` / `llm/chat`
-C07B	crates/sema-llm/src/builtins.rs:4785:    // `async/await` inside it) parks on the active task and resumes through the
-C07C	crates/sema-llm/src/builtins.rs:4925:                let result = sema_core::call_callback(ctx, func, std::slice::from_ref(item))?;
-C07C	crates/sema-llm/src/builtins.rs:7007:                let result = sema_core::call_callback(ctx, &body_fn, &[]);
-C10	crates/sema-llm/src/builtins.rs:7588:        std::thread::sleep(std::time::Duration::from_millis(ms));
-C07C	crates/sema-llm/src/builtins.rs:7804:                sema_core::call_callback(ctx, &callable, std::slice::from_ref(&argument))
+C07C	crates/sema-llm/src/builtins.rs:4055:                sema_core::call_callback(ctx, cb, &[Value::string(chunk)])
+C07B	crates/sema-llm/src/builtins.rs:4856:    // is not `async/cancel`-addressable). The prelude `agent/run` / `llm/chat`
+C07B	crates/sema-llm/src/builtins.rs:4861:    // `async/await` inside it) parks on the active task and resumes through the
+C07C	crates/sema-llm/src/builtins.rs:5001:                let result = sema_core::call_callback(ctx, func, std::slice::from_ref(item))?;
+C07C	crates/sema-llm/src/builtins.rs:7083:                let result = sema_core::call_callback(ctx, &body_fn, &[]);
+C10	crates/sema-llm/src/builtins.rs:7664:        std::thread::sleep(std::time::Duration::from_millis(ms));
+C07C	crates/sema-llm/src/builtins.rs:7880:                sema_core::call_callback(ctx, &callable, std::slice::from_ref(&argument))
 C11	crates/sema-llm/src/builtins.rs:79:/// so they satisfy the `'static` bound required by `thread_local!`.
-C11	crates/sema-llm/src/builtins.rs:8201:thread_local! {
-C07C	crates/sema-llm/src/builtins.rs:8381:        sema_core::call_callback(ctx, on_text, &[Value::string(chunk)])
-C07D	crates/sema-llm/src/builtins.rs:9456:/// async tier drives futures with `block_on` (no task-abort). Lives on the runtime
+C11	crates/sema-llm/src/builtins.rs:8277:thread_local! {
+C07C	crates/sema-llm/src/builtins.rs:8457:        sema_core::call_callback(ctx, on_text, &[Value::string(chunk)])
+C07D	crates/sema-llm/src/builtins.rs:9532:/// async tier drives futures with `block_on` (no task-abort). Lives on the runtime
 C07D	crates/sema-llm/src/embeddings.rs:237:        sema_io::io_block_on(self.embed_async(request))
 C07D	crates/sema-llm/src/embeddings.rs:247:            Some(dialect) => sema_io::io_block_on(self.rerank_async(request, dialect)),
 C07D	crates/sema-llm/src/embeddings.rs:392:        sema_io::io_block_on(self.embed_async(request))
@@ -494,10 +494,10 @@ C07D	crates/sema-llm/src/openai.rs:919:        sema_io::io_block_on(async {
 C07D	crates/sema-llm/src/openai.rs:929:        sema_io::io_block_on(self.embed_async(request))
 C09	crates/sema-llm/src/pricing.rs:92:thread_local! {
 H05	crates/sema-lsp/src/handlers/command.rs:209:        handle.block_on(async {
-H05	crates/sema-lsp/src/server.rs:758:    // `blocking_recv` observes channel closure (and the join below can finish)
-H05	crates/sema-lsp/src/server.rs:778:            rx.blocking_recv()
-H05	crates/sema-lsp/src/server.rs:869:                    handle.block_on(async {
-H05	crates/sema-lsp/src/server.rs:879:                    handle.block_on(async {
+H05	crates/sema-lsp/src/server.rs:759:    // `blocking_recv` observes channel closure (and the join below can finish)
+H05	crates/sema-lsp/src/server.rs:779:            rx.blocking_recv()
+H05	crates/sema-lsp/src/server.rs:870:                    handle.block_on(async {
+H05	crates/sema-lsp/src/server.rs:880:                    handle.block_on(async {
 C13	crates/sema-mcp/src/builtins.rs:1144:            let result = sema_io::io_block_on(run_transport_task(async move {
 C13	crates/sema-mcp/src/builtins.rs:1361:        sema_io::io_block_on(async move {
 C13	crates/sema-mcp/src/builtins.rs:1519:    let result = block_on(call_tool_async(
@@ -534,7 +534,7 @@ C13	crates/sema-mcp/src/client_auth.rs:89:/// `block_on` already active on the s
 C13	crates/sema-mcp/src/client_auth.rs:96:    rt.block_on(async {
 C13	crates/sema-mcp/src/oauth/flow.rs:276:            let request = server.recv().expect("receive token request");
 H07	crates/sema-mcp/src/oauth/loopback.rs:98:                .recv_timeout(remaining.min(OPENER_ERROR_POLL))
-C13	crates/sema-mcp/src/server.rs:27:/// synchronously and LLM builtins reach `sema_io::io_block_on`, which panics
+C13	crates/sema-mcp/src/server.rs:29:/// synchronously and LLM builtins reach `sema_io::io_block_on`, which panics
 H07	crates/sema-mcp/src/tools.rs:566:    // runtime, the sole async engine, so async/await, channels, and timers work
 H06	crates/sema-notebook/src/bridge.rs:138:                while let Some(req) = rt.block_on(rx.recv()) {
 H06	crates/sema-notebook/src/engine.rs:144:    /// whichever cell this engine is currently driving (`async/sleep 60000`
@@ -908,16 +908,16 @@ H01	crates/sema/src/lib.rs:134:        sema_core::set_eval_callback(&ctx, sema_e
 H01	crates/sema/src/lib.rs:135:        sema_core::set_call_callback(&ctx, sema_eval::call_value);
 H01	crates/sema/src/lib.rs:136:        sema_core::set_call_owned_callback(&ctx, sema_eval::call_value_owned);
 H02	crates/sema/src/main.rs:107:thread_local! {
-H02	crates/sema/src/main.rs:1262:                    .block_on(sema_lsp::run_server());
-H02	crates/sema/src/main.rs:1269:                    .block_on(sema_dap::run_server());
-H02	crates/sema/src/main.rs:1344:                // runtime, llm/* builtins hit io_block_on's runtime-in-runtime
-H02	crates/sema/src/main.rs:2250:                .block_on(workflow_view::serve_with_approval(
-H02	crates/sema/src/main.rs:2577:                .block_on(async {
-H02	crates/sema/src/main.rs:2595:        std::thread::sleep(std::time::Duration::from_millis(250));
-H02	crates/sema/src/main.rs:2800:            std::thread::sleep(std::time::Duration::from_secs(3600));
-H02	crates/sema/src/main.rs:2905:                .block_on(sema_notebook::serve(path, &host, port));
-H02	crates/sema/src/main.rs:3455:        // Same no-ambient-runtime rule as the CLI mcp arm (llm/* + io_block_on).
-H02	crates/sema/src/main.rs:4895:    // runtime, the sole async engine, so async/await, channels, and timers work
+H02	crates/sema/src/main.rs:1297:                    .block_on(sema_lsp::run_server());
+H02	crates/sema/src/main.rs:1304:                    .block_on(sema_dap::run_server());
+H02	crates/sema/src/main.rs:1380:                // runtime, llm/* builtins hit io_block_on's runtime-in-runtime
+H02	crates/sema/src/main.rs:2289:                .block_on(workflow_view::serve_with_approval(
+H02	crates/sema/src/main.rs:2616:                .block_on(async {
+H02	crates/sema/src/main.rs:2634:        std::thread::sleep(std::time::Duration::from_millis(250));
+H02	crates/sema/src/main.rs:2839:            std::thread::sleep(std::time::Duration::from_secs(3600));
+H02	crates/sema/src/main.rs:2944:                .block_on(sema_notebook::serve(path, &host, port));
+H02	crates/sema/src/main.rs:3500:        // Same no-ambient-runtime rule as the CLI mcp arm (llm/* + io_block_on).
+H02	crates/sema/src/main.rs:4942:    // runtime, the sole async engine, so async/await, channels, and timers work
 H02	crates/sema/src/pkg.rs:1663:                std::thread::sleep(jittered(wait));
 H02	crates/sema/src/pkg.rs:1676:                std::thread::sleep(jittered(backoff));
 H03	crates/sema/src/repl/completer.rs:16:thread_local! {

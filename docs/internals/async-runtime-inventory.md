@@ -1,5 +1,14 @@
 # Async Runtime Migration Inventory
 
+**Historical record. The migration is finished and this ledger is no longer
+machine-checked.** It was paired with `runtime-match-map.tsv`, a file:line
+snapshot of every production match, and `scripts/check-unified-runtime-inventory.sh`,
+which failed CI whenever a fresh scan differed from that snapshot. Both are
+deleted: with every row terminal, the snapshot only detected line numbers moving,
+so any unrelated edit above a recorded line broke the build. The live guard is
+`scripts/check-unified-runtime-legacy.sh` (driven by `runtime_conformance_test`),
+which forbids *new* blocking/legacy call sites and needs no snapshot.
+
 This ledger is the review boundary for the hard cut to one interpreter-owned
 cooperative runtime. Every production match from the Task 01 discovery scans is
 mapped below. Later tasks update rows; they do not delete unexplained rows.

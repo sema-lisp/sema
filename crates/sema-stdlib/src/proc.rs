@@ -36,7 +36,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -261,23 +261,28 @@ pub(crate) fn poll_ready(id: i64) -> Option<(bool, bool)> {
     })
 }
 
+/// Decode an argv list/vector of strings. Shared by `proc/spawn` and
+/// `proc/run` so both reject the same shapes with the same message.
+fn argv_strings(op: &str, v: &Value) -> Result<Vec<String>, SemaError> {
+    let argv = v
+        .as_list()
+        .or_else(|| v.as_vector())
+        .ok_or_else(|| SemaError::type_error("list of strings (argv)", v.type_name()))?;
+    if argv.is_empty() {
+        return Err(SemaError::eval(format!("{op}: argv must be non-empty")));
+    }
+    argv.iter()
+        .map(|a| {
+            a.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| SemaError::type_error("string", a.type_name()))
+        })
+        .collect()
+}
+
 fn spawn(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "proc/spawn", 1..=2);
-    let argv = args[0]
-        .as_list()
-        .or_else(|| args[0].as_vector())
-        .ok_or_else(|| SemaError::type_error("list of strings (argv)", args[0].type_name()))?;
-    if argv.is_empty() {
-        return Err(SemaError::eval("proc/spawn: argv must be non-empty"));
-    }
-    let mut parts: Vec<String> = Vec::with_capacity(argv.len());
-    for v in argv {
-        parts.push(
-            v.as_str()
-                .ok_or_else(|| SemaError::type_error("string", v.type_name()))?
-                .to_string(),
-        );
-    }
+    let parts = argv_strings("proc/spawn", &args[0])?;
 
     let mut cmd = Command::new(&parts[0]);
     cmd.args(&parts[1..])
@@ -338,6 +343,95 @@ fn spawn(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value, SemaErro
         )
     });
     Ok(Value::int(id))
+}
+
+/// Put the controlling TTY back in cooked mode for the lifetime of the guard and
+/// restore the caller's termios on drop, so a `proc/run` issued from inside
+/// `io/with-raw-mode` hands the child a normal line-edited terminal and the TUI
+/// is still in raw mode when the child exits. Constructing cooked mode by
+/// re-enabling the flags `cfmakeraw` clears is the standard inverse — there is
+/// no `cfmakecooked`, and the pre-raw termios belongs to `io/tty-raw!`'s private
+/// registry, not to this call.
+#[cfg(unix)]
+struct CookedMode(Option<libc::termios>);
+
+#[cfg(unix)]
+impl CookedMode {
+    fn enter() -> Self {
+        // SAFETY: termios is a POD C struct; zero-init is the standard idiom and
+        // tcgetattr overwrites it on success. Same shape as `io/tty-raw!`.
+        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut saved) } != 0 {
+            return Self(None);
+        }
+        let mut cooked = saved;
+        cooked.c_lflag |= libc::ECHO | libc::ICANON | libc::ISIG | libc::IEXTEN;
+        cooked.c_iflag |= libc::ICRNL | libc::IXON | libc::BRKINT;
+        cooked.c_oflag |= libc::OPOST;
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &cooked) };
+        Self(Some(saved))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CookedMode {
+    fn drop(&mut self) {
+        if let Some(saved) = self.0 {
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &saved) };
+        }
+    }
+}
+
+/// `proc/run` — run a child on the PARENT'S terminal and block until it exits,
+/// returning its exit code (`-1` if it was killed by a signal).
+///
+/// The child inherits fd 0/1/2 unchanged and, unlike `shell` and `proc/spawn`,
+/// stays in the parent's foreground process group — a child in its own group
+/// gets SIGTTIN and stops the moment it reads the TTY. This is the
+/// "suspend the TUI, run `$EDITOR`, resume" primitive (#95): `shell` pipes the
+/// output, `proc/spawn` buffers it, and `pty/spawn` gives the child a NEW pty,
+/// so none of the three hand over the real terminal.
+///
+/// It blocks the VM thread for the child's whole lifetime, on purpose: the child
+/// owns the screen and the keyboard, so no sibling task may run and write to
+/// either. That also means no eval deadline can fire while it runs, which is why
+/// the call is refused outright when fd 0 is not a terminal — under `sema mcp`
+/// (stdio JSON-RPC) or a notebook cell, inheriting fd 1 would corrupt the
+/// protocol stream and inheriting fd 0 would wedge the server (#153).
+fn run(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "proc/run", 1..=2);
+    let parts = argv_strings("proc/run", &args[0])?;
+
+    if !std::io::stdin().is_terminal() {
+        return Err(SemaError::eval("proc/run: stdin is not a terminal").with_hint(
+            "proc/run hands the child the parent's terminal; use `shell` or `proc/spawn` \
+             when there is no TTY (a pipe, `sema mcp`, or a notebook cell)",
+        ));
+    }
+
+    let mut cmd = Command::new(&parts[0]);
+    cmd.args(&parts[1..])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if let Some(m) = args.get(1).and_then(|v| v.as_map_ref()) {
+        let (cwd, env_vars) = crate::system::command_opts(m);
+        if let Some(dir) = &cwd {
+            cmd.current_dir(dir);
+        }
+        for (k, val) in &env_vars {
+            cmd.env(k, val);
+        }
+    }
+
+    // Flush first: buffered Sema output would otherwise appear after the child's.
+    let _ = std::io::stdout().flush();
+    #[cfg(unix)]
+    let _cooked = CookedMode::enter();
+    let status = cmd
+        .status()
+        .map_err(|e| SemaError::eval(format!("proc/run {}: {e}", parts[0])))?;
+    Ok(Value::int(status.code().unwrap_or(-1) as i64))
 }
 
 /// Offload one blocking `proc/*` operation on the handle `id` through the
@@ -595,6 +689,7 @@ fn proc_close_runtime(id: i64) -> NativeResult {
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     crate::register_fn_gated_ctx(env, sandbox, Caps::PROCESS, "proc/spawn", spawn);
+    crate::register_fn_gated(env, sandbox, Caps::PROCESS, "proc/run", run);
 
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "proc/read-stdout", |args| {
         check_arity!(args, "proc/read-stdout", 1);

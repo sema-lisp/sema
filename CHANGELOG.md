@@ -4,6 +4,22 @@
 
 ### Added
 
+- **`proc/run` runs a child on the parent's terminal (#95).** There was no way
+  to hand the terminal to an interactive program: `shell` captures stdout and
+  stderr into pipes, `proc/spawn` streams them into buffers you poll, and
+  `pty/spawn` gives the child a *new* pty, so a terminal app could not shell out
+  to `$EDITOR` or a pager. `(proc/run ["nvim" path])` blocks until the child
+  exits and returns its exit code; the child inherits stdin, stdout, and stderr
+  unchanged and stays in the parent's foreground process group, which it must to
+  read the keyboard. It takes the same `{:cwd … :env {…}}` options map as
+  `shell` and `proc/spawn`, and needs the `process` capability. Called from
+  inside `io/with-raw-mode` it hands the child a terminal in cooked mode and
+  restores raw mode when the child exits. It blocks the whole VM for the child's
+  lifetime, by design — the child owns the screen and the keyboard, so no
+  sibling task may run and write to either — and for that reason it refuses to
+  run when stdin is not a terminal, where inheriting the file descriptors would
+  corrupt a host's I/O stream (`sema mcp`, a notebook cell) instead.
+
 - **`agent/run` can hand back the transcript of a cancelled run (#87).** A run
   stopped with `async/cancel` has no return value — `async/await` raises — so
   the conversation it had assembled was lost, and the next turn resumed from

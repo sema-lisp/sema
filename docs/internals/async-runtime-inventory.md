@@ -196,8 +196,8 @@ matches, the language/callback scan returns 302, and the broader legacy scanner
 returns 971. Their sorted unique union contains 1,257 exact `path:line:text`
 records.
 
-[`runtime-match-map.tsv`](../plans/evidence/unified-cooperative-runtime/runtime-match-map.tsv)
-assigns every union member to a stable ledger row. It is the match-level coverage
+`runtime-match-map.tsv` (deleted; see the note at the top of this file)
+assigned every union member to a stable ledger row. It is the match-level coverage
 artifact; path-family ranges are not accepted as proof. Mixed-policy files use
 the split rows above—for example R08A finite file jobs, R08B descriptor streams,
 and R08C stdin/terminal waits—and callback matches map to their callback rows.

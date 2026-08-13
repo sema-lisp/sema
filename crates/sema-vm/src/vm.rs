@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use smallvec::SmallVec;
 use web_time::Instant;
@@ -512,6 +513,20 @@ pub struct VM {
     /// adopts the callee's table as the main's and a later `MakeClosure` indexes
     /// the wrong (too-short) table.
     base_functions: Rc<Vec<Rc<Function>>>,
+    /// The VM's *base* (top-level main) globals env, fixed at construction —
+    /// same rationale as `base_functions` (#152). `self.globals` swaps to a
+    /// callee's home env on every cross-unit VM-closure call and is restored
+    /// on return, so it is NOT a stable "main" reference: when a quantum
+    /// suspends mid-call (a structural native, e.g. an I/O builtin, can yield
+    /// the cooperative runtime), `run_inner` returns with `self.globals` still
+    /// pointing at the callee's env. The *next* quantum's `run_inner` call
+    /// re-derives its `base_globals` local at entry — if it read `self.globals`
+    /// directly, a quantum resumed mid-foreign-call would wrongly adopt that
+    /// foreign env as "the top-level script env" for the rest of the run,
+    /// silently losing access to real top-level bindings once execution
+    /// returns to the `None`-globals main closure. Resolve a `None` closure's
+    /// env from THIS stable field instead.
+    base_globals: Rc<Env>,
     /// Per-instruction inline cache for global lookups:
     /// (spur_bits, env_version, decoded binding).
     /// spur_bits distinguishes globals sharing the same slot (cross-VM closures).
@@ -1667,6 +1682,24 @@ fn close_open_upvalues_above(
     }
 }
 
+/// Process-wide source of inline-cache offsets. A closure compiled by one
+/// unit (a script, an `import`/`load`ed module, an `eval`'d program) can be
+/// invoked as a nested frame on a VM built for a *different* unit — the
+/// frame stack is shared, and `self.inline_cache` is one flat `Vec` indexed
+/// by `frame.cache_base + cache_slot`. Numbering each unit's functions from
+/// 0 (or from its own main chunk's slot count) independently, as if every
+/// unit always got a private array, let two unrelated units land the same
+/// physical index and alias each other's global lookups (#152). Drawing
+/// every unit's base from one monotonic counter instead makes that impossible:
+/// no two functions compiled anywhere in the process ever share an offset.
+static NEXT_CACHE_BASE: AtomicUsize = AtomicUsize::new(0);
+
+/// Reserve `n` consecutive, process-wide-unique inline-cache slots and
+/// return the base index.
+fn alloc_cache_base(n: usize) -> usize {
+    NEXT_CACHE_BASE.fetch_add(n, Ordering::Relaxed)
+}
+
 impl VM {
     /// Create a new VM. If `native_spurs` is non-empty, each entry is resolved
     /// from `globals` to build a direct-dispatch table for CallNative opcodes.
@@ -1677,23 +1710,41 @@ impl VM {
         main_cache_slots: u16,
     ) -> Result<Self, SemaError> {
         let native_fns = Self::resolve_native_table(&globals, native_spurs)?;
-        // Assign cache_offset to each function and compute total cache size.
-        // Main closure's cache_offset is 0; child functions start after it.
-        let mut total_cache_slots: usize = main_cache_slots as usize;
+        // Assign each function a process-wide-unique cache_offset, drawn from
+        // NEXT_CACHE_BASE, so it can never alias another compile unit's slots
+        // if later invoked as a nested frame on a different VM. The main
+        // closure's own cache_offset stays 0 (hardcoded in compile_program),
+        // so each reservation includes a main-sized prefix before its child
+        // ranges. This keeps the first unit's children out of its main range.
+        let children_slots: usize = functions
+            .iter()
+            .map(|f| f.chunk.n_global_cache_slots as usize)
+            .sum();
+        let mut offset = alloc_cache_base(main_cache_slots as usize + children_slots)
+            + main_cache_slots as usize;
         for func_rc in &mut functions {
             let func = Rc::make_mut(func_rc);
-            func.cache_offset = total_cache_slots;
-            total_cache_slots += func.chunk.n_global_cache_slots as usize;
+            func.cache_offset = offset;
+            offset += func.chunk.n_global_cache_slots as usize;
         }
         ensure_cycle_gc_wired();
         let functions = Rc::new(functions);
         Ok(VM {
             stack: Vec::with_capacity(256),
             frames: Vec::with_capacity(64),
+            base_globals: globals.clone(),
             globals,
             functions: functions.clone(),
             base_functions: functions,
-            inline_cache: vec![(u32::MAX, 0, CachedGlobal::Plain(Value::nil())); total_cache_slots],
+            // Sized for the main closure's own slots only — ensure_cache_space
+            // grows this lazily before any frame (main, a same-VM child, or a
+            // cross-module closure) whose cache_offset+slots exceed it is
+            // pushed, so this never eagerly allocates up to the (unboundedly
+            // growing) process-wide counter value.
+            inline_cache: vec![
+                (u32::MAX, 0, CachedGlobal::Plain(Value::nil()));
+                main_cache_slots as usize
+            ],
             native_fns: Rc::new(native_fns),
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
@@ -1753,6 +1804,7 @@ impl VM {
         VM {
             stack: Vec::with_capacity(256),
             frames: Vec::with_capacity(64),
+            base_globals: globals.clone(),
             globals,
             base_functions: functions.clone(),
             functions,
@@ -1785,6 +1837,7 @@ impl VM {
         Ok(VM {
             stack: Vec::with_capacity(256),
             frames: Vec::with_capacity(64),
+            base_globals: globals.clone(),
             globals,
             base_functions: functions.clone(),
             functions,
@@ -1838,6 +1891,7 @@ impl VM {
             total_cache_slots,
             (u32::MAX, 0, CachedGlobal::Plain(Value::nil())),
         );
+        self.base_globals = globals.clone();
         self.globals = globals;
         self.base_functions = functions.clone();
         self.functions = functions;
@@ -2674,7 +2728,18 @@ impl VM {
         // (which carries no explicit home env) resolves against. `self.globals`
         // is kept pointing at the running frame's home env (below); this
         // immutable snapshot is the fallback for `None` closures (M1).
-        let base_globals = self.globals.clone();
+        //
+        // Read from `self.base_globals`, NOT `self.globals` (#152): a quantum
+        // can suspend and resume mid-call, deep inside a foreign (imported)
+        // closure's frame, where `self.globals` legitimately points at that
+        // closure's own home env. If this snapshot read `self.globals`
+        // directly, a quantum that happens to *start* mid-foreign-call would
+        // wrongly adopt that foreign env as "the top-level script env" for its
+        // whole duration — so a later pop back to the `None`-globals main
+        // frame restores `self.globals` to the wrong env, and top-level
+        // bindings defined before the suspend become unreachable. Mirrors the
+        // existing `base_functions` fix for the same class of bug (M4).
+        let base_globals = self.base_globals.clone();
 
         // Rejection resume: a frame parked on a structural suspend is being
         // re-run because its awaited promise settled Failed. The park left a nil
@@ -6468,20 +6533,31 @@ pub fn compile_program(
 /// (mirrors that construction in `VM::make_closure`).
 ///
 /// Nested function cache offsets are assigned here the same way `VM::new`
-/// assigns them for a freshly loaded program (starting after the main
-/// chunk's own `main_cache_slots`): `compile_program`'s `functions` come
-/// straight from the compiler with default (colliding) offsets, since
+/// assigns them for a freshly loaded program: `compile_program`'s `functions`
+/// come straight from the compiler with default (colliding) offsets, since
 /// offset assignment normally only happens once, in `VM::new`. Skipping this
 /// would alias the eval'd program's inline-cache slots with a nested
 /// closure's, corrupting global lookups inside it.
+///
+/// Offsets are drawn from the same process-wide `NEXT_CACHE_BASE` counter
+/// `VM::new` uses, not renumbered locally from `prog.main_cache_slots` — an
+/// `import`/`load`ed module's exported functions get invoked as nested
+/// frames on whatever VM calls them (sharing that VM's `inline_cache`), so a
+/// locally-restarted numbering could alias an unrelated global in the caller
+/// or in another module (#152).
 pub fn program_as_callable(prog: CompiledProgram, home: Rc<Env>) -> Result<Value, SemaError> {
     let native_fns = Rc::new(VM::resolve_native_table(&home, &prog.native_table)?);
     let mut functions = prog.functions;
-    let mut total_cache_slots = prog.main_cache_slots as usize;
+    let children_slots: usize = functions
+        .iter()
+        .map(|f| f.chunk.n_global_cache_slots as usize)
+        .sum();
+    let mut offset = alloc_cache_base(prog.main_cache_slots as usize + children_slots)
+        + prog.main_cache_slots as usize;
     for func_rc in &mut functions {
         let func = Rc::make_mut(func_rc);
-        func.cache_offset = total_cache_slots;
-        total_cache_slots += func.chunk.n_global_cache_slots as usize;
+        func.cache_offset = offset;
+        offset += func.chunk.n_global_cache_slots as usize;
     }
     let functions: Rc<Vec<Rc<Function>>> = Rc::new(functions);
     let closure = Rc::new(Closure {
@@ -6539,6 +6615,84 @@ mod tests {
     use std::any::Any;
     use std::cell::Cell;
     use std::time::Duration;
+
+    #[test]
+    fn two_compile_units_never_share_a_child_cache_offset() {
+        // Regression for #152: `import`/`load` each compile their target as
+        // an independent unit via VM::new/program_as_callable. If each unit
+        // renumbered its own functions' cache_offset starting near 0, two
+        // unrelated units' exported functions could land on the same
+        // physical inline_cache slot once invoked as nested frames on a
+        // shared VM, aliasing an unrelated global. Offsets must be
+        // process-wide unique instead.
+        // Each function body reads a global (`shared-global`) so the compiler
+        // actually allocates it a global cache slot — a function that only
+        // touches locals/constants gets `n_global_cache_slots == 0`, which
+        // would make this assertion vacuous.
+        let vals =
+            sema_reader::read_many("(define shared-global 1) (define (f1) shared-global)").unwrap();
+        let prog1 = compile_program(&vals, None).unwrap();
+        assert!(!prog1.functions.is_empty());
+        let vm1 = VM::new(
+            make_test_env(),
+            prog1.functions,
+            &prog1.native_table,
+            prog1.main_cache_slots,
+        )
+        .unwrap();
+
+        let vals =
+            sema_reader::read_many("(define shared-global 2) (define (f2) shared-global)").unwrap();
+        let prog2 = compile_program(&vals, None).unwrap();
+        assert!(!prog2.functions.is_empty());
+        let vm2 = VM::new(
+            make_test_env(),
+            prog2.functions,
+            &prog2.native_table,
+            prog2.main_cache_slots,
+        )
+        .unwrap();
+
+        let range1: Vec<usize> = vm1
+            .functions
+            .iter()
+            .map(|f| f.cache_offset)
+            .flat_map(|off| off..off + 1)
+            .collect();
+        let range2: Vec<usize> = vm2
+            .functions
+            .iter()
+            .map(|f| f.cache_offset)
+            .flat_map(|off| off..off + 1)
+            .collect();
+        assert!(
+            range1.iter().all(|o| !range2.contains(o)),
+            "two independently compiled units must never share a cache_offset: {range1:?} vs {range2:?}"
+        );
+    }
+
+    #[test]
+    fn child_cache_offsets_do_not_overlap_the_main_chunk() {
+        let vals = sema_reader::read_many("(define x 1) (define (read-x) x) x").unwrap();
+        let prog = compile_program(&vals, None).unwrap();
+        assert!(prog.main_cache_slots > 0);
+        assert!(!prog.functions.is_empty());
+
+        let vm = VM::new(
+            make_test_env(),
+            prog.functions,
+            &prog.native_table,
+            prog.main_cache_slots,
+        )
+        .unwrap();
+
+        assert!(
+            vm.functions
+                .iter()
+                .all(|function| function.cache_offset >= prog.main_cache_slots as usize),
+            "child cache ranges must start after the main chunk's cache range"
+        );
+    }
 
     struct DebugIdentityContinuation;
 

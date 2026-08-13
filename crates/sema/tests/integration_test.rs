@@ -1042,6 +1042,63 @@ fn test_imported_hof_transitive_closure_no_slot_clobber() {
 }
 
 #[test]
+fn test_two_imports_with_load_and_io_do_not_unbind_unrelated_global() {
+    // Regression for #152: a script-level `define` went "Unbound variable"
+    // after (1) importing two separately-compiled modules, (2) the first
+    // module's function calling `(load ...)` (introducing a new top-level
+    // binding into its own module env), then (3) a call into the *second*
+    // module touching an I/O builtin (`file/exists?`). Neither module ever
+    // references the script's global by name — cross-compile-unit inline
+    // cache slot aliasing corrupted an unrelated lookup.
+    let dir = unique_temp_dir("cross-import-load-io-clobber");
+
+    let site = dir.join("site.sema");
+    std::fs::write(&site, r#"(define config {:title "T" :theme "sema"})"#).unwrap();
+
+    let config_mod = dir.join("config.sema");
+    std::fs::write(
+        &config_mod,
+        r#"(module config
+             (export load-config)
+             (define (load-config site-path)
+               (load site-path)
+               config))"#,
+    )
+    .unwrap();
+
+    let theme_mod = dir.join("mod.sema");
+    std::fs::write(
+        &theme_mod,
+        r#"(module theme
+             (export resolve-theme)
+             (define (resolve-theme unrelated-name probe-path)
+               (file/exists? probe-path)
+               "done"))"#,
+    )
+    .unwrap();
+
+    let result = eval(&format!(
+        r#"
+        (begin
+          (import "{}")
+          (import "{}")
+          (define cfg (load-config "{}"))
+          (resolve-theme cfg ".")
+          cfg)
+        "#,
+        lisp_path(&config_mod),
+        lisp_path(&theme_mod),
+        lisp_path(&site),
+    ));
+
+    assert_eq!(
+        result,
+        eval(r#"{:title "T" :theme "sema"}"#),
+        "script-level `cfg` must survive an unrelated cross-module call after a nested `load`"
+    );
+}
+
+#[test]
 fn test_cyclic_import_returns_error_instead_of_stack_overflow() {
     let dir = unique_temp_dir("cyclic-import");
     let module_a = dir.join("a.sema");

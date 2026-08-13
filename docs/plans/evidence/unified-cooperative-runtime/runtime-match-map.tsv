@@ -879,16 +879,16 @@ F08A	crates/sema-vm/src/runtime/wait.rs:620:                inbox.recv_timeout(t
 F08A	crates/sema-vm/src/runtime/wait.rs:622:            None => inbox.recv().ok(),
 F08A	crates/sema-vm/src/runtime/wait.rs:74:/// so it wakes a parked `block_on_inbox` with no separate channel or select
 F08A	crates/sema-vm/src/runtime/wait.rs:88:/// wakes a thread parked in `block_on_inbox` exactly like a completion does.
-F29	crates/sema-vm/src/vm.rs:159:    /// callee is not a native fn (keywords, callables routed via `call_callback`).
-F30	crates/sema-vm/src/vm.rs:1995:            match debug.command_rx.recv() {
-F30	crates/sema-vm/src/vm.rs:2087:            match debug.command_rx.recv() {
-C17	crates/sema-vm/src/vm.rs:219:thread_local! {
-F29	crates/sema-vm/src/vm.rs:2405:    /// `async/spawn` task or a cooperative HOF callback VM) owns its value out of
-F30	crates/sema-vm/src/vm.rs:2899:                                    // spawn_blocking thread on `reply_rx.recv()`, so
-F29	crates/sema-vm/src/vm.rs:4333:        let result = sema_core::call_callback(ctx, &func_val, &call_args);
-F29	crates/sema-vm/src/vm.rs:4708:    /// foreign stack (an `async/spawn` task, a fresh fallback VM, an inline-task
-C17	crates/sema-vm/src/vm.rs:687:thread_local! {
-F28	crates/sema-vm/src/vm.rs:81:    /// (an `async/spawn` task VM, a fresh fallback VM, an inline-task HOF)
+F29	crates/sema-vm/src/vm.rs:160:    /// callee is not a native fn (keywords, callables routed via `call_callback`).
+F30	crates/sema-vm/src/vm.rs:2049:            match debug.command_rx.recv() {
+F30	crates/sema-vm/src/vm.rs:2141:            match debug.command_rx.recv() {
+C17	crates/sema-vm/src/vm.rs:220:thread_local! {
+F29	crates/sema-vm/src/vm.rs:2459:    /// `async/spawn` task or a cooperative HOF callback VM) owns its value out of
+F30	crates/sema-vm/src/vm.rs:2964:                                    // spawn_blocking thread on `reply_rx.recv()`, so
+F29	crates/sema-vm/src/vm.rs:4398:        let result = sema_core::call_callback(ctx, &func_val, &call_args);
+F29	crates/sema-vm/src/vm.rs:4773:    /// foreign stack (an `async/spawn` task, a fresh fallback VM, an inline-task
+C17	crates/sema-vm/src/vm.rs:702:thread_local! {
+F28	crates/sema-vm/src/vm.rs:82:    /// (an `async/spawn` task VM, a fresh fallback VM, an inline-task HOF)
 H10A	crates/sema-wasm/src/driver.rs:428:    // immediate turn here, a cancelled `(async/sleep 5000)` would sit
 H10A	crates/sema-wasm/src/driver.rs:775:/// honor a pending `WaitKind::Timer` deadline (`async/sleep`) instead of
 H09	crates/sema-wasm/src/driver.rs:82:thread_local! {

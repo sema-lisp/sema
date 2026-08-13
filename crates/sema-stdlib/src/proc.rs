@@ -403,10 +403,12 @@ fn run(args: &[Value]) -> Result<Value, SemaError> {
     let parts = argv_strings("proc/run", &args[0])?;
 
     if !std::io::stdin().is_terminal() {
-        return Err(SemaError::eval("proc/run: stdin is not a terminal").with_hint(
-            "proc/run hands the child the parent's terminal; use `shell` or `proc/spawn` \
+        return Err(
+            SemaError::eval("proc/run: stdin is not a terminal").with_hint(
+                "proc/run hands the child the parent's terminal; use `shell` or `proc/spawn` \
              when there is no TTY (a pipe, `sema mcp`, or a notebook cell)",
-        ));
+            ),
+        );
     }
 
     let mut cmd = Command::new(&parts[0]);

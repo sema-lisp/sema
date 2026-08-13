@@ -307,4 +307,3 @@ fn unified_runtime_scanner_detects_raw_blocking_recv_fixture() {
         "raw blocking recv was not reported; stdout:\n{stdout}"
     );
 }
-

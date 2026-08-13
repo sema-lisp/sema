@@ -7,8 +7,8 @@ Date: 2026-07-16. Branch: `codex/unified-async-runtime`.
 > work landed SRV-1, Promise-driven WASM roots, and runtime-scoped identity, then
 > continued across resource ownership and callback boundaries. Its gate counts
 > and release verdict therefore do not describe current HEAD. Follow the tracked
-> [finish-remediation plan](../../2026-07-18-unified-runtime-finish-remediation.md)
-> and [terminal-inventory follow-up](../../2026-07-19-unified-runtime-terminal-inventory.md)
+> [finish-remediation plan](../../archive/2026-07-18-unified-runtime-finish-remediation.md)
+> and [terminal-inventory follow-up](../../archive/2026-07-19-unified-runtime-terminal-inventory.md)
 > until a final verification record lands.
 >
 > **Final terminal-inventory sign-off — 2026-07-23.** The terminal-inventory

@@ -212,5 +212,6 @@ Hard-won conventions — follow these or you will reintroduce shipped bugs (see 
 - `docs/limitations.md` — known gaps and limitations
 - `docs/deferred.md` — items parked with rationale (won't-fix or revisit-later)
 - `docs/plans/` — individual implementation plans, named `YYYY-MM-DD-<slug>.md` (completed plans move to `docs/plans/archive/`)
+- `docs/plans/archive/` — **the only archive**. Every finished plan, spec, and superseded design document lives here, whatever produced it. Do not create a second archive directory.
 - `docs/vm-status.md`, `docs/performance-roadmap.md` — VM internals reference
 - `docs/bugs/` — short write-ups of specific known test/code issues

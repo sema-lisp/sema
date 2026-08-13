@@ -1320,7 +1320,7 @@ Update the Sema section to reflect the new numbers and implementation approach. 
 
 # Execution Handoff
 
-**Plan complete and saved to `docs/superpowers/plans/2026-06-27-sema-runtime-performance-plan.md`.**
+**Plan complete and saved to `docs/plans/archive/2026-06-27-sema-runtime-performance-plan.md`.**
 
 Two execution options:
 

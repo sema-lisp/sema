@@ -6,7 +6,7 @@
 # Output:  crates/sema-llm/src/pricing-data.json
 #
 # models.dev is the single source of truth for model pricing (see
-# docs/done/plans/2026-06-18-llm-pricing-models-dev.md). We embed a full snapshot at
+# docs/plans/archive/2026-06-18-llm-pricing-models-dev.md). We embed a full snapshot at
 # build time via include_str! and refresh it with minor patch releases rather than
 # fetching at runtime. Run this, review the diff, and commit.
 #

@@ -935,6 +935,11 @@ pub const PRELUDE: &str = r#"
       (let ((__cb (:on-partial (car __rest))))
         (if (nil? __cb) nil (__cb __partial)))))
 
+(define (__agent-partial-preserving-error __rest __partial __error)
+  (try (__agent-partial __rest __partial)
+       (catch __callback-error nil))
+  (throw __error))
+
 (define (agent/run __agent __input . __rest)
   (if (or (__async-context?) (__runtime-quantum?))
       (let ((__h (apply __agent-begin __agent __input __rest)))
@@ -942,8 +947,8 @@ pub const PRELUDE: &str = r#"
         ;; the failure status (notably a cancellation, whose bytecode now runs this
         ;; catch), not ended "unset".
         (try (__agent-drive __h)
-             (catch __e (begin (__agent-partial __rest (__agent-finish __h __e))
-                               (throw __e)))))
+             (catch __e (__agent-partial-preserving-error
+                          __rest (__agent-finish __h __e) __e))))
       (apply __agent-run-blocking __agent __input __rest)))
 
 ;; llm/chat: a thin dispatcher like `agent/run` above. A native cannot retain its

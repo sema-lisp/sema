@@ -239,7 +239,14 @@ call should fail fast, or needs more time than the default allows:
 {"name": "eval", "arguments": {"code": "(long-running-agent-loop)", "timeout_ms": 900000}}
 ```
 
-`timeout_ms: 0` disables the timeout for that call only.
+`timeout_ms: 0` disables the timeout for that call only. The value must be a
+non-negative integer; negative, fractional, and string values return a tool
+error instead of using the server default.
+
+The VM checks the deadline at loop back-edges and frame transitions. It bounds
+runaway Sema loops, but it cannot interrupt a native tool handler while that
+handler is executing. Native handlers must apply their own timeouts to blocking
+operations.
 
 ---
 

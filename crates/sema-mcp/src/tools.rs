@@ -832,16 +832,19 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
 /// server-configured default. `Some(Duration::ZERO)` means "disabled" (either
 /// because the call explicitly asked for it, or the default is disabled and
 /// the call didn't override it) — callers must check `is_zero()` themselves,
-/// this only resolves precedence. A present-but-malformed `timeout_ms` (not
-/// an unsigned integer) is ignored in favor of the server default rather than
-/// erroring the whole call over one bad optional param.
+/// this only resolves precedence. A present-but-malformed `timeout_ms` is an
+/// error so a caller cannot accidentally run with a longer default timeout.
 fn resolve_call_timeout(
     arguments: &JsonValue,
     default_timeout: Option<std::time::Duration>,
-) -> Option<std::time::Duration> {
-    match arguments.get("timeout_ms").and_then(|v| v.as_u64()) {
-        Some(ms) => Some(std::time::Duration::from_millis(ms)),
-        None => default_timeout,
+) -> Result<Option<std::time::Duration>, &'static str> {
+    match arguments.get("timeout_ms") {
+        Some(value) => value
+            .as_u64()
+            .map(std::time::Duration::from_millis)
+            .map(Some)
+            .ok_or("Invalid parameter: timeout_ms must be a non-negative integer"),
+        None => Ok(default_timeout),
     }
 }
 
@@ -867,14 +870,20 @@ pub fn call_mcp_tool(
     exclude_tools: Option<&[String]>,
     default_tool_timeout: Option<std::time::Duration>,
 ) -> CallToolResult {
-    match resolve_call_timeout(arguments, default_tool_timeout) {
-        Some(budget) if !budget.is_zero() => {
-            interpreter
-                .ctx
-                .set_eval_deadline(Some(std::time::Instant::now() + budget));
-        }
-        _ => interpreter.ctx.set_eval_deadline(None),
-    }
+    let timeout = match resolve_call_timeout(arguments, default_tool_timeout) {
+        Ok(timeout) => timeout,
+        Err(message) => return error_result(message),
+    };
+    let previous_deadline = interpreter.ctx.eval_deadline.get();
+    let call_deadline = timeout
+        .filter(|budget| !budget.is_zero())
+        .map(|budget| std::time::Instant::now() + budget);
+    let effective_deadline = match (previous_deadline, call_deadline) {
+        (Some(outer), Some(inner)) => Some(outer.min(inner)),
+        (outer @ Some(_), None) => outer,
+        (None, inner) => inner,
+    };
+    interpreter.ctx.set_eval_deadline(effective_deadline);
 
     let dispatch = std::panic::AssertUnwindSafe(|| {
         call_mcp_tool_inner(
@@ -894,7 +903,7 @@ pub fn call_mcp_tool(
         )),
     };
 
-    interpreter.ctx.set_eval_deadline(None);
+    interpreter.ctx.set_eval_deadline(previous_deadline);
     result
 }
 
@@ -1528,6 +1537,43 @@ fn error_result(text: impl Into<String>) -> CallToolResult {
 mod schema_tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn malformed_call_timeout_is_rejected() {
+        let default = Some(std::time::Duration::from_secs(300));
+        for value in [json!(-1), json!(1.5), json!("100")] {
+            let arguments = json!({ "timeout_ms": value });
+            assert_eq!(
+                resolve_call_timeout(&arguments, default),
+                Err("Invalid parameter: timeout_ms must be a non-negative integer")
+            );
+        }
+    }
+
+    #[test]
+    fn tool_call_preserves_and_restores_an_outer_deadline() {
+        let interpreter = Interpreter::new();
+        let outer = std::time::Instant::now();
+        interpreter.ctx.set_eval_deadline(Some(outer));
+        let started = std::time::Instant::now();
+
+        let result = call_mcp_tool(
+            "eval",
+            &json!({
+                "code": "(let loop ((i 0)) (loop (+ i 1)))",
+                "timeout_ms": 1000
+            }),
+            &interpreter,
+            &crate::notebook::new_cache(),
+            None,
+            None,
+            None,
+        );
+
+        assert!(result.is_error, "the earlier outer deadline must win");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(interpreter.ctx.eval_deadline.get(), Some(outer));
+    }
 
     fn schema_for(param_type: &str) -> serde_json::Value {
         let mut spec = BTreeMap::new();

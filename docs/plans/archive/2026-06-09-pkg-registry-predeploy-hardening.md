@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-09
 **Status:** Shipped 2026-07-05 — all four items landed, plus extras found during the sweep: axum's 2 MB default extractor body cap silently overrode `max_tarball_bytes` (fixed with a `DefaultBodyLimit` layer on the publish route); malformed metadata JSON was silently swallowed to defaults, dropping deps/description (now a 400); API error boilerplate consolidated into a shared `ApiError` type (`pkg/src/api/mod.rs`). Note on the atomicity acceptance test: with dep validation now up front, a mid-transaction dep-insert failure can't be induced via the API, so the integration test asserts the equivalent no-partial-state property (invalid dep in the list → 400, zero package/version/dependency rows, clean retry succeeds).
-**Supersedes:** `docs/archived/2026-02-23-pkg-hardening.md` Task 7. Group A (CLI-side tasks 1-6) of that plan shipped; its Task 7 was written against the pre-SeaORM sqlx codebase and is no longer executable as written. This plan contains only the items still live after the SeaORM rewrite, re-verified 2026-06-09.
+**Supersedes:** `docs/plans/archive/2026-02-23-pkg-hardening.md` Task 7. Group A (CLI-side tasks 1-6) of that plan shipped; its Task 7 was written against the pre-SeaORM sqlx codebase and is no longer executable as written. This plan contains only the items still live after the SeaORM rewrite, re-verified 2026-06-09.
 
 ## 1. Publish transaction must cover version + dependency inserts (MUST-FIX, correctness bug)
 

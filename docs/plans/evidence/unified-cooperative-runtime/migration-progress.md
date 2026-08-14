@@ -3,8 +3,8 @@
 > **Historical progress log.** Entries below preserve what was known at each
 > dated checkpoint; “remaining,” “deferred,” and gate-count statements are not
 > current-HEAD status. Follow the tracked
-> [finish-remediation plan](../../2026-07-18-unified-runtime-finish-remediation.md)
-> and [terminal-inventory follow-up](../../2026-07-19-unified-runtime-terminal-inventory.md)
+> [finish-remediation plan](../../archive/2026-07-18-unified-runtime-finish-remediation.md)
+> and [terminal-inventory follow-up](../../archive/2026-07-19-unified-runtime-terminal-inventory.md)
 > for current work.
 
 ## C1-DONE (2026-07-16): `async/run` self-resolving-waits barrier (ASYNC-RUN-BARRIER-1)

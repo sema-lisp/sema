@@ -67,6 +67,15 @@ pub fn install() -> Result<(), BackendError> {
 /// Remove this thread's backend and stop running compiled code.
 pub fn uninstall() {
     sema_vm::jit::uninstall_backend();
+    backend::CraneliftBackend::forget_installed();
+}
+
+/// Functions this thread's backend turned down, and why.
+///
+/// Each entry is the function's name and the first thing in its body that falls
+/// outside the compilable subset. Empty when no backend is installed.
+pub fn rejections() -> Vec<(String, Reject)> {
+    backend::CraneliftBackend::installed_rejections()
 }
 
 /// Whether a backend is installed on this thread.

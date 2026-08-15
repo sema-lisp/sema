@@ -20,6 +20,13 @@ use sema_vm::Function;
 use crate::decode::{analyze, Reject};
 use crate::translate::{translate, TranslateCtx};
 
+thread_local! {
+    /// A second handle on the backend this thread installed, so `--jit-stats`
+    /// can read its rejection log back. `sema_vm::jit` holds the backend as an
+    /// opaque `dyn JitBackend` and deliberately knows nothing about Cranelift.
+    static INSTALLED: RefCell<Option<Rc<CraneliftBackend>>> = const { RefCell::new(None) };
+}
+
 /// A Cranelift-backed native code generator.
 pub struct CraneliftBackend {
     inner: RefCell<Inner>,
@@ -109,8 +116,29 @@ impl CraneliftBackend {
     pub fn install() -> Result<(), BackendError> {
         let backend = Rc::new(CraneliftBackend::new()?);
         sema_vm::jit::threshold_from_env();
+        INSTALLED.with(|slot| *slot.borrow_mut() = Some(backend.clone()));
         sema_vm::jit::install_backend(backend);
         Ok(())
+    }
+
+    /// Forget this thread's diagnostic handle on the installed backend.
+    pub(crate) fn forget_installed() {
+        INSTALLED.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    /// Why each function the installed backend turned down was turned down.
+    ///
+    /// Diagnostic only, and the reason a `--jit-stats` "rejected" count is
+    /// actionable rather than just discouraging: it names the opcode or the
+    /// condition that stopped compilation, which is what tells you where to
+    /// widen the subset next.
+    pub(crate) fn installed_rejections() -> Vec<(String, Reject)> {
+        INSTALLED.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|b| b.rejections())
+                .unwrap_or_default()
+        })
     }
 
     /// Rejected functions and their reasons, oldest first.

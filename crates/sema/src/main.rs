@@ -1148,6 +1148,31 @@ impl Drop for JitReport {
             "jit: {} compiled, {} rejected, {} native calls, {} bailouts, {} non-immediate args",
             s.compiled, s.rejected, s.native_calls, s.bailouts, s.arg_rejects
         );
+        // Group the rejections by reason. A bare count says how much was left
+        // on the table; the reasons say what to widen to get it.
+        let rejections = sema_codegen::rejections();
+        if !rejections.is_empty() {
+            let mut by_reason: std::collections::BTreeMap<String, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for (name, reason) in rejections {
+                by_reason
+                    .entry(format!("{reason:?}"))
+                    .or_default()
+                    .push(name);
+            }
+            for (reason, mut names) in by_reason {
+                names.sort();
+                names.dedup();
+                let shown: Vec<&str> = names.iter().take(4).map(String::as_str).collect();
+                let more = names.len().saturating_sub(shown.len());
+                let suffix = if more > 0 {
+                    format!(" (+{more} more)")
+                } else {
+                    String::new()
+                };
+                eprintln!("  {reason}: {}{suffix}", shown.join(", "));
+            }
+        }
     }
 }
 

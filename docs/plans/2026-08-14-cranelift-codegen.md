@@ -244,18 +244,62 @@ Bugs these caught during development, all of which would have shipped:
 2. Cranelift branch arguments passed to both edges of a conditional.
 3. `>=` and `<=` disagreeing with the VM for NaN operands.
 
+## What the subset actually reaches today
+
+`--jit-stats` reports why each function was turned down. Aggregated over the
+runnable examples, the reasons rank:
+
+| rejections | reason | what it means |
+|---|---|---|
+| 28 | `CallGlobal` | the body calls another function |
+| 25 | `LoadGlobal` | the body reads a global |
+| 12 | `MakeClosure` | the body builds a closure |
+| 11 | `LoadUpvalue` | the body reads a captured variable |
+| ~20 | `Length` / `IsNull` / `Car` / `Get` / `Nth` / `IsPair` | list, string, and map work |
+| 6 | `NonImmediateConst` | a string or list literal in the body |
+
+So roughly 60% of rejections are globals and 27% are closures. The subset
+currently reaches self-contained self-recursive numeric functions and very
+little else.
+
+`examples/mandelbrot.sema` is the sharpest case. `mandelbrot-iter` is a pure
+float `do` loop whose every other instruction is already in the subset, and it
+is rejected by exactly one: `CALL_GLOBAL * argc=3`, from the three-argument
+`(* 2.0 old-zr zi)`. A two-argument spelling would compile. That single data
+point sets the priority order below.
+
 ## Deliberately not done
 
 - **AOT object emission.** `cranelift-object` plus the system linker would make
   `sema build` produce a true native binary instead of a runner plus `.semac`.
   `decode.rs` and `translate.rs` are reusable as-is; what is missing is a
   runtime static library and linker driving.
-- **Runtime trampolines.** Calling back into stdlib natives (`string/split`,
-  `json/encode`) from compiled code would widen the subset a long way, but it
-  reintroduces `Rc` ownership across the boundary, which is exactly what phase 1
-  avoids. It needs its own ownership design, not an incremental patch.
-- **Calls to other functions.** Same reason: a general call returns an owned
-  `Value` that may be heap-backed.
+## Priority order for phase 2
+
+Ranked by the measurements above, cheapest first.
+
+1. **N-ary arithmetic.** `(* a b c)` becomes a `CallGlobal` today. Folding the
+   n-ary arithmetic builtins into repeated binary opcodes during lowering, or
+   recognizing them in `decode.rs`, is a small change that unlocks whole loops —
+   `mandelbrot-iter` among them. No ownership work involved.
+2. **Reading globals.** A `LoadGlobal` whose bound value is an immediate can be
+   guarded and inlined; the inline cache already holds the value and a version
+   stamp to invalidate against. Still no `Rc` crosses the boundary.
+3. **Calls to other compiled functions.** The large one. A callee returns an
+   owned `Value` that may be heap-backed, so this needs the ownership design
+   phase 1 deliberately avoids: either restrict callees to ones proven to return
+   immediates, or teach compiled code to hold and release refcounts.
+4. **Runtime trampolines into stdlib natives** (`string/split`, `json/encode`).
+   Same ownership problem, plus an error path — a native can raise, and compiled
+   code currently cannot.
+5. **Closures.** `MakeClosure` and `LoadUpvalue` need `Rc<UpvalueCell>` handling,
+   so they come after 3.
+
+## Also not done
+
+- **On-stack replacement.** Would remove the bail-late cost measured above by
+  resuming the VM mid-loop from the compiled frame, instead of discarding the
+  call. Much larger than anything in phase 2.
 - **WebAssembly.** Browsers cannot map executable pages, so `sema-wasm` keeps
   using the VM. This is not a gap to close.
 - **Tail calls into compiled code.** `tail_call_vm_closure` would have to pop

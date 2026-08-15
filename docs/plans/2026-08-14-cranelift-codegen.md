@@ -178,7 +178,10 @@ iterations inside a single VM frame, so a function that spends a second looping
 is still only one call and would never reach a 32-call threshold — leaving
 exactly the code the generator exists for on the VM. A function whose chunk
 contains a self-tail-call or a backward branch is therefore compiled on its
-first call. The scan walks instructions through `serialize::advance_pc` rather
+first call.
+
+The generator is opt-in: `sema --jit`, or `SEMA_JIT=1` when the process
+arguments must stay unchanged (a shebang script reading `sys/args`). The scan walks instructions through `serialize::advance_pc` rather
 than searching for opcode bytes, since an operand byte can hold any value.
 
 When no backend is installed the whole path costs one thread-local `bool` load.
@@ -189,12 +192,19 @@ When no backend is installed the whole path costs one thread-local `bool` load.
 
 | program | VM | JIT | |
 |---|---|---|---|
+| `examples/benchmarks/tak.sema`, 500 iterations | 2827ms | 178ms | 15.9x |
+| `fib-naive(30)` (scheme-algorithms) | 215ms | 20ms | 10.8x |
+| Ackermann `A(3,8)` (scheme-algorithms) | 458ms | 50ms | 9.2x |
 | `fib 32` (non-tail recursion) | 0.59s | 0.07s | 8.4x |
-| collatz to 300k | 6.13s | 0.61s | 10.0x |
-| float iteration, 3M steps | 0.25s | 0.03s | 8.3x |
-| escape-time inner loop, 200k points | 13.92s | 2.03s | 6.9x |
-| tail-recursive sum, 5M | 0.39s | 0.06s | 6.5x |
-| sum of squares mod 1000, 1M | 0.18s | 0.03s | 6.0x |
+| Collatz step counts to 300k | 6.13s | 0.61s | 10.0x |
+| Escape-time inner loop, 200k points | 13.92s | 2.03s | 6.9x |
+| Float iteration, 3M steps | 0.25s | 0.03s | 8.3x |
+| Tail-recursive sum, 5M | 0.39s | 0.06s | 6.5x |
+| Sum of squares mod 1000, 1M | 0.18s | 0.03s | 6.0x |
+
+Code that is not numeric is untouched, as intended: `deriv.sema` (symbolic
+differentiation over lists) runs 1674ms versus 1716ms, and a 500-element
+mergesort stays at 3ms. Neither is compilable, so both keep running on the VM.
 
 ### The cost of bailing late
 

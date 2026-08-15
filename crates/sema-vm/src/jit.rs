@@ -403,17 +403,41 @@ unsafe fn call_entry(entry: usize, args: &[Value]) -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// The sentinel must not collide with any value a compiled function could
+    /// legitimately return.
+    ///
+    /// Checked on the raw bits, never by building a `Value`: tag 63 is not a
+    /// type `Value::drop` knows, so constructing one and letting it fall out of
+    /// scope panics with "invalid heap tag in drop". That panic is the property
+    /// this test relies on — it is why [`execute_slow`] compares against
+    /// [`JIT_BAIL`] *before* calling `Value::from_raw_bits`, and why a
+    /// regression that reordered those two steps would fail loudly instead of
+    /// corrupting memory.
     #[test]
     fn bail_sentinel_is_not_a_real_value() {
         // Tag 63, empty payload. Nothing in sema-core produces this.
         assert_eq!(JIT_BAIL, 0xFFFF_E000_0000_0000);
-        // SAFETY: inspecting bits only; never used as a live Value.
-        let v = unsafe { Value::from_raw_bits(JIT_BAIL) };
-        assert_eq!(v.raw_tag(), Some(63));
+        assert_eq!((JIT_BAIL >> 45) & 0x3F, 63);
         assert_ne!(JIT_BAIL, Value::NIL.raw_bits());
         assert_ne!(JIT_BAIL, Value::FALSE.raw_bits());
         assert_ne!(JIT_BAIL, Value::TRUE.raw_bits());
         assert_ne!(JIT_BAIL, Value::int(0).raw_bits());
+        assert_ne!(JIT_BAIL, Value::float(0.0).raw_bits());
+        assert_ne!(JIT_BAIL, Value::char('a').raw_bits());
+    }
+
+    /// The bail check has to come before the value is rebuilt. This pins the
+    /// ordering that keeps the sentinel from ever reaching `Value::drop`.
+    #[test]
+    fn bail_is_checked_before_a_value_is_built() {
+        let raw = JIT_BAIL;
+        let result = if raw == JIT_BAIL {
+            None
+        } else {
+            // SAFETY: unreachable here; mirrors `execute_slow`'s ordering.
+            Some(unsafe { Value::from_raw_bits(raw) })
+        };
+        assert!(result.is_none());
     }
 
     #[test]

@@ -33,6 +33,62 @@ All benchmarks were run on Apple Silicon (M-series), processing the 1BRC dataset
 > (long-lived async servers no longer accrete unreachable closures) and blocking
 > I/O yields to the scheduler so sibling tasks interleave.
 
+## Native Code Generation (Aug 2026)
+
+Every optimization above makes the bytecode VM's dispatch loop cheaper. Native
+code generation removes the dispatch loop instead: once a function is hot and
+its body falls inside a small subset of the bytecode, `sema-codegen` compiles it
+to machine code with [Cranelift](https://cranelift.dev/) and the VM calls that
+rather than pushing a frame. It is opt-in behind `sema --jit`; see the
+[CLI reference](/docs/cli#native-code-generation-jit) for what the subset covers.
+
+Cranelift fits Sema's existing design closely. It is pure Rust, so it joins the
+Cargo workspace with no C++ toolchain. A `Value` is a NaN-boxed `u64`, so
+compiled functions pass and return plain 64-bit integers in registers and every
+type test is one mask plus one compare. And because Sema refcounts with `Rc`
+rather than tracing, there are no GC safepoints or stack maps to emit — the work
+that makes custom backends hard for Go, Java, and OCaml.
+
+Measured on x86-64 Linux, release build, `sema -e` versus `sema --jit -e`:
+
+| Program | VM | JIT | Speedup |
+| --- | --- | --- | --- |
+| `examples/benchmarks/tak.sema`, 500 iterations | 2827ms | 178ms | 15.9x |
+| `fib-naive(30)` (scheme-algorithms) | 215ms | 20ms | 10.8x |
+| Ackermann `A(3,8)` (scheme-algorithms) | 458ms | 50ms | 9.2x |
+| `fib 32` (non-tail recursion) | 0.59s | 0.07s | 8.4x |
+| Collatz step counts to 300k | 6.13s | 0.61s | 10.0x |
+| Escape-time inner loop, 200k points | 13.92s | 2.03s | 6.9x |
+| Float iteration, 3M steps | 0.25s | 0.03s | 8.3x |
+| Tail-recursive sum, 5M | 0.39s | 0.06s | 6.5x |
+| Sum of squares mod 1000, 1M | 0.18s | 0.03s | 6.0x |
+
+Code that is not numeric is untouched, as intended: `examples/benchmarks/deriv.sema`
+(symbolic differentiation over lists) runs 1674ms versus 1716ms, and a
+500-element mergesort stays at 3ms. Neither falls inside the compilable subset,
+so both keep running on the VM.
+
+The design rests on one restriction: compiled code only ever handles
+**immediate** values — fixnums, floats, booleans, nil, chars, symbols, keywords
+— which hold no `Rc` pointer, so generated code performs no reference-count work
+at all. An entry guard rejects any argument that is not immediate, and the
+opcode whitelist keeps compiled code from producing one. Anything that would
+need to allocate or raise returns a bail sentinel, and the VM runs the call
+instead. Bailing is safe because the subset admits no side effects, so an
+abandoned compiled call has changed nothing.
+
+That safety has a cost worth knowing: a bail discards the whole compiled call.
+A loop that runs 20M iterations and overflows the fixnum range on the last one
+pays for the compiled run *and* the VM run.
+
+Self-tail-calls compile to machine loops with no call at all. Non-tail
+self-recursion runs on the machine stack and counts its own depth, bailing at
+the VM's frame limit so unbounded recursion still raises `stack overflow` rather
+than crashing the process.
+
+WebAssembly builds are unaffected: browsers cannot map executable pages, so the
+[playground](https://sema.run) keeps using the VM.
+
 ## Non-Suspending HOF Fast Path (Jul 2026)
 
 The unified cooperative async runtime initially drove **every** stdlib

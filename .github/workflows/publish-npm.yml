@@ -80,6 +80,7 @@ jobs:
           publish sema-reader
           publish sema-fmt
           publish sema-vm
+          publish sema-codegen
           publish sema-otel
           publish sema-policy
           publish sema-workflow

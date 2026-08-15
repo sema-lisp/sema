@@ -7,9 +7,12 @@
 - **`sema --jit` compiles hot numeric functions to native code (Cranelift).**
   Off by default; results are identical either way. The new `sema-codegen` crate
   compiles a function's bytecode to machine code once it is hot, and the VM
-  calls that instead of pushing a frame. Measured on this workstation: `fib 32`
-  8.4x, a collatz sweep 10.0x, an escape-time inner loop 6.9x, a 3M-step float
-  loop 8.3x, a 5M-step tail-recursive sum 6.5x.
+  calls that instead of pushing a frame. Measured on this workstation with the
+  repo's own benchmarks: `examples/benchmarks/tak.sema` 15.9x (2827ms → 178ms),
+  `fib-naive(30)` 10.8x, Ackermann `A(3,8)` 9.2x, a collatz sweep 10.0x, an
+  escape-time inner loop 6.9x, a 3M-step float loop 8.3x. Non-numeric code is
+  untouched: `deriv.sema` and a 500-element mergesort are unchanged, because
+  neither falls inside the compilable subset.
 
   The compilable subset is deliberately narrow: constants, local slots, `if` /
   `and` / `or`, `+ - * / modulo`, negation, `not`, numeric comparison, and
@@ -28,7 +31,8 @@
   the VM's frame limit so unbounded recursion still raises "stack overflow"
   rather than crashing the process.
 
-  `--jit-stats` prints what was compiled, rejected, and bailed.
+  `SEMA_JIT=1` enables it without changing the arguments the script sees, for
+  shebang scripts. `--jit-stats` prints what was compiled, rejected, and bailed.
   `SEMA_JIT_THRESHOLD` sets how many calls a function takes before compilation
   (default 32); a function containing a loop is compiled on its first call,
   since a loop that runs for a second is still only one call. WebAssembly builds

@@ -183,7 +183,7 @@ fi
 mkdir -p "$PACKAGE_DIR/.cargo"
 {
   echo '[patch.crates-io]'
-  for crate in core reader vm eval stdlib llm fmt workflow lsp dap docs notebook mcp otel io; do
+  for crate in core reader vm codegen eval stdlib llm fmt workflow lsp dap docs notebook mcp otel io; do
     printf 'sema-%s = { path = "%s/crates/sema-%s" }\n' "$crate" "$ROOT" "$crate"
   done
 } >"$PACKAGE_DIR/.cargo/config.toml"

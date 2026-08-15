@@ -174,8 +174,10 @@ struct Cli {
 
     /// Compile hot numeric functions to native code (Cranelift).
     ///
-    /// Off by default. Results are identical either way: a function outside the
-    /// compilable subset, or a compiled call that hits a guard, runs on the VM.
+    /// Off by default; `SEMA_JIT=1` does the same without changing the
+    /// arguments the script sees. Results are identical either way: a function
+    /// outside the compilable subset, or a compiled call that hits a guard,
+    /// runs on the VM.
     #[arg(long)]
     jit: bool,
 
@@ -1185,8 +1187,11 @@ fn main() {
 
     // Native code generation is opt-in. Failing to build a backend is not fatal:
     // the program runs on the VM, which is what would have happened anyway.
+    // `SEMA_JIT` is the flagless route, for shebang scripts and for turning code
+    // generation on without changing the process arguments the script sees.
+    let jit_env = std::env::var("SEMA_JIT").is_ok_and(|v| !v.is_empty() && v != "0");
     let jit_stats = cli.jit_stats;
-    if cli.jit || jit_stats {
+    if cli.jit || jit_stats || jit_env {
         if let Err(e) = sema_codegen::install() {
             eprintln!("warning: {e}; running on the bytecode VM");
         }

@@ -4,6 +4,59 @@
 
 ### Added
 
+- **N-ary `+`, `-`, and `*` compile to inline opcodes instead of a stdlib call.**
+  `(* 2.0 zr zi)` in an inner loop was costing a global lookup plus a native
+  dispatch every iteration; three-or-more-argument `+`, `-`, and `*` now fold
+  into the existing binary opcodes. This speeds up the **bytecode VM itself** —
+  a 3M-iteration loop over `(+ acc (* 2.0 1.0000001 acc) 1)` drops from 0.75s to
+  0.48s — and it is what lets `examples/mandelbrot.sema`'s inner loop reach the
+  native code generator, taking a 400x300 render from 3.48s to 0.47s with
+  `--jit`.
+
+  Results are unchanged. The fold reproduces the stdlib native exactly,
+  including its accumulator seed: `+` starts at integer 0 and `*` at integer 1,
+  so a leading float is combined as `0.0 + f` / `1.0 * f`. That is observable
+  through `-0.0` (`(+ -0.0 -0.0 -0.0)` stays `0.0`), so the seed is emitted
+  rather than skipped. `/` is deliberately not folded: its native goes through
+  the numeric tower and raises a differently worded division-by-zero error.
+  Verified by a 5832-case differential run over every ordered triple and
+  quadruple of edge-case operands, byte-identical before and after.
+
+- **`sema --jit` compiles hot numeric functions to native code (Cranelift).**
+  Off by default; results are identical either way. The new `sema-codegen` crate
+  compiles a function's bytecode to machine code once it is hot, and the VM
+  calls that instead of pushing a frame. Measured on this workstation with the
+  repo's own benchmarks: `examples/benchmarks/tak.sema` 15.9x (2827ms → 178ms),
+  `fib-naive(30)` 10.8x, Ackermann `A(3,8)` 9.2x, a collatz sweep 10.0x, an
+  escape-time inner loop 6.9x, a 3M-step float loop 8.3x. Non-numeric code is
+  untouched: `deriv.sema` and a 500-element mergesort are unchanged, because
+  neither falls inside the compilable subset.
+
+  The compilable subset is deliberately narrow: constants, local slots, `if` /
+  `and` / `or`, `+ - * / modulo`, negation, `not`, numeric comparison, and
+  self-recursion (tail and non-tail). Values are limited to *immediates* —
+  fixnums, floats, booleans, nil, chars, symbols, keywords — which own no `Rc`,
+  so generated code performs no refcount work at all. Everything else runs on
+  the VM exactly as before, and any case that would need to allocate or raise
+  (a sum that overflows the fixnum range into a bignum, an inexact integer
+  division, division by zero, a non-numeric operand) makes the compiled call
+  bail so the VM runs it instead. Bailing is safe because the subset admits no
+  side effects, and it costs a redo: a long loop that bails on its last
+  iteration does the work twice.
+
+  A tail-recursive loop compiles to a machine loop with no call at all. Non-tail
+  self-recursion runs on the machine stack and counts its own depth, bailing at
+  the VM's frame limit so unbounded recursion still raises "stack overflow"
+  rather than crashing the process.
+
+  `SEMA_JIT=1` enables it without changing the arguments the script sees, for
+  shebang scripts. `--jit-stats` prints what was compiled, rejected, and bailed.
+  `SEMA_JIT_THRESHOLD` sets how many calls a function takes before compilation
+  (default 32); a function containing a loop is compiled on its first call,
+  since a loop that runs for a second is still only one call. WebAssembly builds
+  are unaffected — browsers cannot map executable pages, so `sema-wasm` keeps
+  using the VM. See `docs/plans/2026-08-14-cranelift-codegen.md`.
+
 - **`agent/run` can hand back the transcript of a cancelled run (#87).** A run
   stopped with `async/cancel` has no return value — `async/await` raises — so
   the conversation it had assembled was lost, and the next turn resumed from

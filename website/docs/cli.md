@@ -23,8 +23,64 @@ sema [OPTIONS] [FILE] [-- SCRIPT_ARGS...]
 | `--embedding-model <NAME>`  | Set embedding model                   |
 | `--embedding-provider <NAME>` | Set embedding provider              |
 | `--sandbox <MODE>`   | Restrict dangerous operations (see below)    |
+| `--jit`              | Compile hot numeric functions to native code (see below) |
+| `--jit-stats`        | Print code generation counters on exit (implies `--jit`) |
 | `-V, --version`      | Print version                                |
 | `-h, --help`         | Print help                                   |
+
+## Native Code Generation (`--jit`)
+
+`sema --jit` compiles hot numeric functions to machine code with
+[Cranelift](https://cranelift.dev/). It is off by default, and results are
+identical either way — a function outside the compilable subset, or a compiled
+call that hits a guard, runs on the bytecode VM.
+
+```bash
+# Run with native code generation
+sema --jit script.sema
+
+# Same thing without changing the arguments the script sees (useful in a shebang)
+SEMA_JIT=1 sema script.sema
+
+# See what was compiled
+sema --jit-stats -e '(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (fib 30)'
+# 832040
+# jit: 1 compiled, 0 rejected, 23 native calls, 0 bailouts, 0 non-immediate args
+```
+
+### What it compiles
+
+Constants, local variables, `if` / `and` / `or`, `+ - * / modulo`, negation,
+`not`, numeric comparison, and self-recursion. Values are limited to fixnums,
+floats, booleans, nil, chars, symbols, and keywords. A tail-recursive loop
+becomes a machine loop.
+
+Everything else — lists, strings, maps, closures, globals, stdlib calls, LLM
+primitives, async — runs on the VM as before. So does any operation that would
+need to allocate or raise at runtime: an arithmetic result that outgrows the
+fixnum range into a bignum, an integer division that is not exact, division by
+zero, or a non-numeric operand.
+
+### When it helps
+
+Loop-heavy and recursive numeric code, typically 6–10x. It does nothing for
+programs bound by I/O, HTTP, or LLM calls, and nothing for code that spends its
+time in lists, strings, or maps.
+
+One case is slower rather than faster: a long-running loop whose result leaves
+the fixnum range near the end. The compiled loop runs, hits the guard, and the
+VM redoes the whole call — correct answer, doubled work.
+
+### Tuning
+
+`SEMA_JIT=1` turns code generation on without passing a flag, so a script's
+`sys/args` stays unchanged. `SEMA_JIT_THRESHOLD` sets how many calls a function
+takes before compilation is attempted (default 32). `0` compiles on the first call. A function containing a
+loop is always compiled on its first call, since a loop that runs for a second
+is still only one call.
+
+Native code generation is not available in the browser playground — WebAssembly
+hosts cannot map executable pages, so [sema.run](https://sema.run) uses the VM.
 
 ## Subcommands
 

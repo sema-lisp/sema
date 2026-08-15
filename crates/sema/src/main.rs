@@ -172,6 +172,20 @@ struct Cli {
     #[arg(long, value_name = "DIRS")]
     allowed_paths: Option<String>,
 
+    /// Compile hot numeric functions to native code (Cranelift).
+    ///
+    /// Off by default; `SEMA_JIT=1` does the same without changing the
+    /// arguments the script sees. Results are identical either way: a function
+    /// outside the compilable subset, or a compiled call that hits a guard,
+    /// runs on the VM.
+    #[arg(long)]
+    jit: bool,
+
+    /// Print native code generation counters when the program finishes.
+    /// Implies --jit.
+    #[arg(long)]
+    jit_stats: bool,
+
     /// Arguments passed to the script (after --)
     #[arg(last = true)]
     script_args: Vec<String>,
@@ -1115,6 +1129,53 @@ mod ctrlc_tests {
     }
 }
 
+/// Prints native code generation counters when `--jit-stats` was given.
+///
+/// A guard rather than a call at the end of `main` because the run can finish
+/// through several paths. Like `_otel_guard`, it reports on a normal return; a
+/// path that calls `std::process::exit` directly skips it.
+struct JitReport {
+    enabled: bool,
+}
+
+impl Drop for JitReport {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let s = sema_codegen::stats();
+        eprintln!(
+            "jit: {} compiled, {} rejected, {} native calls, {} bailouts, {} non-immediate args",
+            s.compiled, s.rejected, s.native_calls, s.bailouts, s.arg_rejects
+        );
+        // Group the rejections by reason. A bare count says how much was left
+        // on the table; the reasons say what to widen to get it.
+        let rejections = sema_codegen::rejections();
+        if !rejections.is_empty() {
+            let mut by_reason: std::collections::BTreeMap<String, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for (name, reason) in rejections {
+                by_reason
+                    .entry(format!("{reason:?}"))
+                    .or_default()
+                    .push(name);
+            }
+            for (reason, mut names) in by_reason {
+                names.sort();
+                names.dedup();
+                let shown: Vec<&str> = names.iter().take(4).map(String::as_str).collect();
+                let more = names.len().saturating_sub(shown.len());
+                let suffix = if more > 0 {
+                    format!(" (+{more} more)")
+                } else {
+                    String::new()
+                };
+                eprintln!("  {reason}: {}{suffix}", shown.join(", "));
+            }
+        }
+    }
+}
+
 fn main() {
     // reqwest is built with rustls-no-provider (see workspace Cargo.toml); install
     // the ring provider before anything (OTLP exporter, pkg, LLM) builds a client.
@@ -1148,6 +1209,19 @@ fn main() {
     // lifetime; its Drop does the bounded flush+shutdown on normal return. (The JSONL
     // file exporter writes synchronously, so it survives a `std::process::exit` too.)
     let _otel_guard = sema_otel::init_from_env();
+
+    // Native code generation is opt-in. Failing to build a backend is not fatal:
+    // the program runs on the VM, which is what would have happened anyway.
+    // `SEMA_JIT` is the flagless route, for shebang scripts and for turning code
+    // generation on without changing the process arguments the script sees.
+    let jit_env = std::env::var("SEMA_JIT").is_ok_and(|v| !v.is_empty() && v != "0");
+    let jit_stats = cli.jit_stats;
+    if cli.jit || jit_stats || jit_env {
+        if let Err(e) = sema_codegen::install() {
+            eprintln!("warning: {e}; running on the bytecode VM");
+        }
+    }
+    let _jit_report = JitReport { enabled: jit_stats };
 
     let sandbox = match &cli.sandbox {
         Some(value) => sema_core::Sandbox::parse_cli(value).unwrap_or_else(|e| {
@@ -4925,6 +4999,7 @@ fn run_bytecode_bytes(
             source_file: None,
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         }),
         upvalues: Vec::new(),
         // Top-level main closure: uses the VM's own globals and function table.

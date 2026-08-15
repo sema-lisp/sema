@@ -6,6 +6,7 @@ pub mod debug;
 mod disasm;
 mod emit;
 mod hof_sync;
+pub mod jit;
 mod lower;
 mod opcodes;
 mod optimize;

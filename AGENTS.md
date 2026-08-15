@@ -72,11 +72,12 @@ jake test.notebook-e2e  # Playwright E2E tests for notebook
 
 ## Architecture (Cargo workspace)
 
-Dependency flow (arrows = "depends on"): `sema-core ← sema-reader ← sema-vm ← sema-eval ← sema-stdlib/sema-llm ← sema`. **Critical**: `sema-stdlib` and `sema-llm` depend on `sema-core` but NOT on `sema-eval` (avoids circular deps). Stdlib calls eval via thread-local callbacks registered by sema-eval.
+Dependency flow (arrows = "depends on"): `sema-core ← sema-reader ← sema-vm ← sema-eval ← sema-stdlib/sema-llm ← sema`. `sema-codegen` hangs off `sema-vm` (it depends on the VM, never the reverse). **Critical**: `sema-stdlib` and `sema-llm` depend on `sema-core` but NOT on `sema-eval` (avoids circular deps). Stdlib calls eval via thread-local callbacks registered by sema-eval.
 
 - **sema-core** → NaN-boxed `Value(u64)` struct, `Env` (Rc+RefCell+hashbrown::HashMap), `SemaError` (thiserror), `EvalContext`, eval/call callbacks (`set_eval_callback`/`set_call_callback`), thread-local VFS
 - **sema-reader** → Lexer + s-expression parser → `Value` AST. Handles regex literals (`#"..."`), f-strings (`f"...${expr}..."`), short lambdas (`#(...)`), shebang lines
 - **sema-vm** → Bytecode compiler (lowering → optimization → resolution → compilation), stack-based VM with intrinsic opcodes, NaN-boxed fast paths, debug hooks for DAP. **The sole evaluator** (the tree-walker has been retired).
+- **sema-codegen** → Cranelift native code generator. Compiles a hot `Function`'s bytecode to machine code and hands the entry point to `sema-vm`'s `jit` seam; the VM stays the sole evaluator. Native-only (opt-in via `sema --jit`), off by default. Handles only *immediate* values (fixnum/float/bool/nil/char/symbol/keyword) so generated code never touches an `Rc`; anything else, and any operation that would allocate or raise, bails back to the VM. See `docs/plans/2026-08-14-cranelift-codegen.md`.
 - **sema-eval** → `Interpreter`, special forms, macro expansion (VM-native), module system (`EvalContext` holds module cache, call stack, spans), `call_value` for stdlib callback dispatch, destructuring/pattern matching (`destructure.rs`), prelude macros (`->`, `->>`, `as->`, `some->`, `when-let`, `if-let`)
 - **sema-stdlib** → Native functions across many modules registered into `Env`. Higher-order fns (map, filter, fold) call through `sema_core::call_callback` — no mini-eval.
 - **sema-llm** → LLM provider trait + Anthropic/OpenAI/Gemini/Ollama clients (tokio `block_on`), dynamic pricing from llm-prices.com with disk cache fallback

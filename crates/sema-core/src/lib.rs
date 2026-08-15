@@ -76,8 +76,9 @@ pub use value::{
     AsyncPromise, Channel, Conversation, Env, FileAccess, ImageAttachment, Lambda, Macro, Message,
     MultiMethod, MutableArray, MutableCell, NativeFn, NativeSuspensionClass, PromiseState, Prompt,
     Record, Role, SemaStream, StreamBox, SyntaxRules, Thunk, ToolDefinition, ToolPolicySubject,
-    Value, ValueView, ValueViewRef, NAN_INT_SIGN_BIT, NAN_INT_SMALL_PATTERN, NAN_PAYLOAD_BITS,
-    NAN_PAYLOAD_MASK, NAN_TAG_MASK, TAG_NATIVE_FN,
+    Value, ValueView, ValueViewRef, NAN_BOX_MASK, NAN_CANONICAL, NAN_INT_SIGN_BIT,
+    NAN_INT_SMALL_PATTERN, NAN_MAX_IMMEDIATE_TAG, NAN_PAYLOAD_BITS, NAN_PAYLOAD_MASK, NAN_TAG_6BIT,
+    NAN_TAG_MASK, NAN_TAG_SHIFT, TAG_NATIVE_FN,
 };
 
 pub mod runtime;

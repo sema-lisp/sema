@@ -1,0 +1,28 @@
+[package]
+name = "sema-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Cranelift native-code generator for the Sema programming language"
+readme = "README.md"
+
+[dependencies]
+sema-core.workspace = true
+sema-vm.workspace = true
+# Cranelift is pure Rust: no C++ toolchain, no LLVM, and it cross-compiles with
+# the rest of the workspace. `cranelift-jit` maps the emitted code W^X-correctly
+# on every host we ship binaries for.
+cranelift-codegen = "0.134"
+cranelift-frontend = "0.134"
+cranelift-module = "0.134"
+cranelift-jit = "0.134"
+# Resolves the host ISA explicitly so an unsupported host is an error, not the
+# panic `JITBuilder::with_flags` would raise.
+cranelift-native = "0.134"
+
+[dev-dependencies]
+sema-eval = { path = "../sema-eval" }
+sema-stdlib = { path = "../sema-stdlib" }
+sema-reader = { path = "../sema-reader" }

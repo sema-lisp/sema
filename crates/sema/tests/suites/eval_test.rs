@@ -18,6 +18,37 @@ eval_tests! {
     big_int_sub_overflows_small: "(let ((x 9000000000000) (y -9000000000000)) (- x y))" => Value::int(18000000000000),
     big_int_distributivity: "(let ((a 32768) (b 320462586) (c 352969177)) (- (* a (+ b c)) (+ (* a b) (* a c))))" => Value::int(0),
 
+    // N-ary `+`, `-`, `*` fold into repeated binary opcodes instead of one
+    // global call to the stdlib native. The fold has to reproduce the native
+    // exactly, and the observable part is its accumulator seed: `+` starts at
+    // integer 0 and `*` at integer 1, so a leading float is combined as
+    // `0.0 + f` / `1.0 * f` rather than taken as-is. `-0.0` is what makes that
+    // visible, because `0.0 + -0.0` is `0.0` while `1.0 * -0.0` is `-0.0`.
+    // Variables, not literals: literal operands are constant-folded and never
+    // reach the runtime opcodes.
+    nary_add_seed_absorbs_negative_zero: "(let ((z -0.0)) (+ z z z))" => common::eval("0.0"),
+    nary_mul_seed_preserves_negative_zero: "(let ((z -0.0) (o 1.0)) (* z o o))" => common::eval("-0.0"),
+    nary_sub_takes_first_operand_directly: "(let ((z -0.0) (o 0.0)) (- z o o))" => common::eval("-0.0"),
+    // Two-argument `+` keeps its own long-standing answer here (the binary
+    // opcode has no seed), which the fold must not disturb.
+    binary_add_negative_zero_unchanged: "(let ((z -0.0)) (+ z z))" => common::eval("-0.0"),
+
+    nary_add_ints: "(let ((a 1) (b 2) (c 3) (d 4)) (+ a b c d))" => Value::int(10),
+    nary_sub_folds_left: "(let ((a 100) (b 1) (c 2) (d 3)) (- a b c d))" => Value::int(94),
+    nary_mul_ints: "(let ((a 2) (b 3) (c 4) (d 5)) (* a b c d))" => Value::int(120),
+    nary_mixed_int_float: "(let ((a 1) (b 2.5) (c 3)) (+ a b c))" => common::eval("6.5"),
+    nary_sub_mixed: "(let ((a 10) (b 1) (c 2.5)) (- a b c))" => common::eval("6.5"),
+    nary_mul_float_first: "(let ((a 2.0) (b 3) (c 4)) (* a b c))" => common::eval("24.0"),
+
+    // The fold must promote past the fixnum range exactly as the native did.
+    nary_mul_promotes_to_bignum: "(let ((a 5000000000) (b 5000000000) (c 2)) (* a b c))" => common::eval("50000000000000000000"),
+    nary_add_promotes_to_bignum: "(let ((a 9000000000000000000) (b 9000000000000000000) (c 1)) (+ a b c))" => common::eval("18000000000000000001"),
+
+    // `/` is deliberately NOT folded: its native goes through the numeric tower
+    // and raises a differently worded division-by-zero error than `Op::Div`.
+    nary_div_stays_exact: "(let ((a 1) (b 3) (c 2)) (/ a b c))" => common::eval("1/6"),
+    nary_div_ints: "(let ((a 100) (b 5) (c 2)) (/ a b c))" => Value::int(10),
+
     // Regression: get-in must distinguish a key present with a nil value from a
     // missing key, and an empty path returns the root (found by ultracode hunt).
     // (otel/span ...) is a no-op when telemetry is disabled (no provider installed,

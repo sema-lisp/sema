@@ -76,6 +76,11 @@ pub struct Function {
     /// global env chain it was resolved against (a rebind re-analyzes). Not
     /// serialized (like `cache_offset`); computed lazily per process.
     pub suspend_cache: std::cell::Cell<Option<(u64, bool)>>,
+    /// Native-code state: hot-call counter and compiled entry point, filled in
+    /// by `crate::jit` when a code generator backend is installed. Not
+    /// serialized (like `cache_offset`) — a `.semac` file carries bytecode, and
+    /// each process decides for itself what to compile.
+    pub jit: crate::jit::JitSlot,
 }
 
 /// Describes how an upvalue is captured relative to the immediately enclosing function.

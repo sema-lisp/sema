@@ -1021,6 +1021,35 @@ pub const NAN_INT_SIGN_BIT: u64 = INT_SIGN_BIT;
 /// Number of payload bits in NaN-boxed values (45).
 pub const NAN_PAYLOAD_BITS: u32 = 45;
 
+/// Sign + exponent + quiet-NaN bits. `(bits & NAN_BOX_MASK) == NAN_BOX_MASK`
+/// means the value is boxed (i.e. not a float).
+pub const NAN_BOX_MASK: u64 = BOX_MASK;
+
+/// Bit position of the 6-bit tag inside a boxed value (same as [`NAN_PAYLOAD_BITS`]).
+pub const NAN_TAG_SHIFT: u32 = 45;
+
+/// The 6-bit tag mask, before shifting.
+pub const NAN_TAG_6BIT: u64 = TAG_MASK_6BIT;
+
+/// Highest tag that encodes an *immediate* value — one whose payload is data,
+/// not an `Rc` pointer. Tags `0..=NAN_MAX_IMMEDIATE_TAG` are nil, false, true,
+/// small int, char, symbol, keyword; every tag above it stores a pointer whose
+/// refcount the holder owns.
+///
+/// A `Value` is immediate when it is a float (not boxed) or its tag is at most
+/// this. Immediates can be copied, discarded, and reconstructed from raw bits
+/// with no refcount traffic at all, which is what makes them safe to hand to
+/// generated native code. See [`Value::is_immediate`].
+pub const NAN_MAX_IMMEDIATE_TAG: u64 = TAG_KEYWORD;
+
+/// Canonical quiet NaN bits — the only NaN pattern a `Value` float may hold.
+///
+/// Hardware produces `0xFFF8_0000_0000_0000` (negative quiet NaN) as the default
+/// result of an invalid f64 operation, and that pattern is bit-identical to a
+/// boxed `Value::NIL`. Any producer of float bits that does not go through
+/// [`Value::float`] must map NaN results onto this constant.
+pub const NAN_CANONICAL: u64 = CANONICAL_NAN;
+
 // ── Helpers for encoding/decoding ─────────────────────────────────
 
 #[inline(always)]
@@ -1596,6 +1625,18 @@ impl Value {
     #[inline(always)]
     pub fn is_float(&self) -> bool {
         !is_boxed(self.0)
+    }
+
+    /// True when the whole value lives in its own 8 bytes — no `Rc` pointer in
+    /// the payload, so `Clone` and `Drop` are no-ops for it.
+    ///
+    /// Floats, nil, booleans, small ints, chars, symbols, and keywords are
+    /// immediate; every other type stores a refcounted pointer. Generated
+    /// native code (`sema-codegen`) only ever handles immediates, which is why
+    /// it can pass values around as raw `u64` without touching a refcount.
+    #[inline(always)]
+    pub fn is_immediate(&self) -> bool {
+        !is_boxed(self.0) || get_tag(self.0) <= NAN_MAX_IMMEDIATE_TAG
     }
 
     /// Recover an Rc<T> pointer from the payload WITHOUT consuming ownership.
@@ -4329,5 +4370,86 @@ mod tests {
         let real = Value::complex(n(5), n(0));
         assert!(!real.is_complex());
         assert_eq!(real.as_int(), Some(5));
+    }
+}
+
+#[cfg(test)]
+mod immediate_tests {
+    use super::*;
+
+    /// Every immediate constructor must report `is_immediate()`. These are the
+    /// only values `sema-codegen` may pass to, or accept back from, generated
+    /// native code as raw bits.
+    #[test]
+    fn immediates_are_immediate() {
+        let cases = [
+            Value::nil(),
+            Value::bool(true),
+            Value::bool(false),
+            Value::int(0),
+            Value::int(SMALL_INT_MAX),
+            Value::int(SMALL_INT_MIN),
+            Value::float(1.5),
+            Value::float(f64::NAN),
+            Value::float(f64::NEG_INFINITY),
+            Value::char('x'),
+            Value::symbol("a"),
+            Value::keyword("k"),
+        ];
+        for v in cases {
+            assert!(v.is_immediate(), "expected immediate: {v:?}");
+        }
+    }
+
+    /// Every heap-backed value must report `!is_immediate()`. A false positive
+    /// here would let generated code copy an `Rc` pointer as raw bits and
+    /// double-free it.
+    #[test]
+    fn heap_values_are_not_immediate() {
+        let big = Value::from_bigint(BigInt::from(SMALL_INT_MAX) * 4);
+        let cases = [
+            big,
+            Value::string("s"),
+            Value::list(vec![Value::int(1)]),
+            Value::vector(vec![Value::int(1)]),
+            Value::map(BTreeMap::new()),
+            Value::bytevector(vec![1u8]),
+            Value::f64_array(vec![1.0]),
+            Value::i64_array(vec![1]),
+        ];
+        for v in cases {
+            assert!(!v.is_immediate(), "expected heap value: {v:?}");
+        }
+    }
+
+    /// The split is a tag comparison, so it has to line up with the tag
+    /// constants exactly: the last immediate tag is `TAG_KEYWORD`, and the first
+    /// heap tag is the very next one. Inserting a new immediate tag above
+    /// `TAG_KEYWORD`, or a new heap tag below `TAG_INT_BIG`, breaks this.
+    #[test]
+    fn immediate_tag_boundary_matches_tag_constants() {
+        const _: () = assert!(NAN_MAX_IMMEDIATE_TAG == TAG_KEYWORD);
+        const _: () = assert!(TAG_INT_BIG == TAG_KEYWORD + 1);
+        const _: () = assert!(TAG_CHAR < TAG_KEYWORD);
+        const _: () = assert!(TAG_INT_SMALL < TAG_KEYWORD);
+    }
+
+    /// The bail sentinel used by generated code (tag 63) must not collide with
+    /// any tag a real `Value` can carry.
+    #[test]
+    fn top_tag_is_unused_by_real_values() {
+        // TAG_MUTABLE_CELL is the highest tag any constructor uses.
+        const _: () = assert!(TAG_MUTABLE_CELL < TAG_MASK_6BIT);
+        let sentinel = BOX_MASK | (TAG_MASK_6BIT << NAN_TAG_SHIFT);
+        assert_eq!(sentinel, NAN_TAG_MASK);
+    }
+
+    /// Hardware's default NaN is bit-identical to `Value::NIL`, so anything
+    /// producing float bits outside `Value::float` has to canonicalize.
+    #[test]
+    fn default_hardware_nan_collides_with_nil() {
+        assert_eq!(0xFFF8_0000_0000_0000u64, Value::NIL.raw_bits());
+        assert_ne!(NAN_CANONICAL, Value::NIL.raw_bits());
+        assert!(f64::from_bits(NAN_CANONICAL).is_nan());
     }
 }

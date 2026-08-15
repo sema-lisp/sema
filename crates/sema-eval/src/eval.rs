@@ -1689,6 +1689,7 @@ fn compiled_program_from_result(result: sema_vm::CompileResult) -> sema_vm::Comp
             source_file: None,
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         }),
         upvalues: Vec::new(),
         globals: None,

@@ -495,7 +495,7 @@ struct CallFrame {
 }
 
 /// Maximum number of call frames before raising a stack overflow error.
-const MAX_FRAMES: usize = 2048;
+pub(crate) const MAX_FRAMES: usize = 2048;
 
 /// The bytecode virtual machine.
 pub struct VM {
@@ -4541,6 +4541,17 @@ impl VM {
         // base = stack.len() - argc
         let base = self.stack.len() - argc;
 
+        // Native-code fast path. Runs the whole call as compiled machine code
+        // and leaves only its result on the stack — no frame is pushed, so the
+        // dispatch loop resumes in the caller's frame at the saved pc. Returns
+        // `None` whenever the function is not compiled or a guard failed, in
+        // which case the call proceeds through the VM below.
+        if let Some(result) = crate::jit::try_execute(&closure.func, &self.stack[base..]) {
+            self.stack.truncate(base);
+            self.stack.push(result);
+            return Ok(());
+        }
+
         if has_rest {
             // Collect extra args into a rest list
             let rest: Vec<Value> = self.stack[base + arity..base + argc].to_vec();
@@ -4604,6 +4615,15 @@ impl VM {
         // Copy args directly from stack into new locals — no Vec allocation
         let func_idx = self.stack.len() - 1 - argc;
         let base = func_idx; // reuse the callee's slot as new frame base
+
+        // Native-code fast path. Consumes the callee slot and the args and
+        // leaves only the result, so no frame is pushed and the dispatch loop
+        // resumes in the caller's frame. See `call_vm_closure_direct`.
+        if let Some(result) = crate::jit::try_execute(&closure.func, &self.stack[func_idx + 1..]) {
+            self.stack.truncate(func_idx);
+            self.stack.push(result);
+            return Ok(());
+        }
 
         // Copy params: clone each arg into its local slot.
         // dest (base+i) < src (func_idx+1+i) so forward copy is safe.
@@ -6358,6 +6378,7 @@ pub fn compile_program_with_spans_and_natives(
             local_scopes: Vec::new(),
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         }),
         upvalues: Vec::new(),
         // Top-level main closure: uses the VM's own globals and function table.
@@ -6503,6 +6524,7 @@ pub fn compile_program(
             local_scopes: Vec::new(),
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         }),
         upvalues: Vec::new(),
         // Top-level main closure: uses the VM's own globals and function table.
@@ -7371,6 +7393,7 @@ mod tests {
             local_scopes: Vec::new(),
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         });
         let closure = Rc::new(Closure {
             func: func.clone(),
@@ -7424,6 +7447,7 @@ mod tests {
             local_scopes: Vec::new(),
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         });
         let closure = Rc::new(Closure {
             func: func.clone(),
@@ -7982,6 +8006,7 @@ mod tests {
             local_scopes: Vec::new(),
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         });
         let closure = Rc::new(Closure {
             func,
@@ -8025,6 +8050,7 @@ mod tests {
             local_scopes: Vec::new(),
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         });
         let closure = Rc::new(Closure {
             func,
@@ -9024,6 +9050,7 @@ mod tests {
             local_scopes: Vec::new(),
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         });
         let closure = Rc::new(Closure {
             func,
@@ -9176,6 +9203,7 @@ mod tests {
             local_scopes: Vec::new(),
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         });
 
         let mut chunk_b = Chunk::new();
@@ -9201,6 +9229,7 @@ mod tests {
             local_scopes: Vec::new(),
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         });
 
         let main = Rc::new(Closure {
@@ -9282,6 +9311,7 @@ mod tests {
             local_scopes: Vec::new(),
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         });
         let closure = Rc::new(Closure {
             func,

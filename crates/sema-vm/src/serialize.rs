@@ -779,6 +779,7 @@ pub fn deserialize_function(
         source_file: None,
         cache_offset: 0,
         suspend_cache: std::cell::Cell::new(None),
+        jit: Default::default(),
     })
 }
 
@@ -797,7 +798,10 @@ fn u32_to_spur(bits: u32) -> Spur {
 }
 
 /// Compute the next PC after the instruction at `code[pc]`, validating operand bounds.
-fn advance_pc(code: &[u8], pc: usize) -> Result<(Op, usize), SemaError> {
+///
+/// The single authoritative instruction-width walk. `crate::jit` reuses it to
+/// scan a chunk for loops rather than keeping a second copy of the widths.
+pub(crate) fn advance_pc(code: &[u8], pc: usize) -> Result<(Op, usize), SemaError> {
     let Some(op) = Op::from_u8(code[pc]) else {
         return Err(SemaError::eval(format!(
             "invalid opcode 0x{:02x} at pc {pc}",
@@ -2037,6 +2041,7 @@ mod tests {
             local_scopes: vec![(2, 0, 7), (3, 4, 9)],
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         };
 
         let mut buf = Vec::new();
@@ -2085,6 +2090,7 @@ mod tests {
             local_scopes: Vec::new(),
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         };
 
         let mut buf = Vec::new();
@@ -2153,6 +2159,7 @@ mod tests {
             local_scopes: Vec::new(),
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         };
 
         let result = CompileResult::new(chunk, vec![func]);

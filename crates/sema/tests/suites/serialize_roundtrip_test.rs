@@ -43,6 +43,7 @@ fn eval_roundtrip(input: &str) -> Value {
             source_file: None,
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         }),
         upvalues: Vec::new(),
         globals: None,

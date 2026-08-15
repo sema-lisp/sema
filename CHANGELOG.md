@@ -4,6 +4,37 @@
 
 ### Added
 
+- **`sema --jit` compiles hot numeric functions to native code (Cranelift).**
+  Off by default; results are identical either way. The new `sema-codegen` crate
+  compiles a function's bytecode to machine code once it is hot, and the VM
+  calls that instead of pushing a frame. Measured on this workstation: `fib 32`
+  8.4x, a collatz sweep 10.0x, an escape-time inner loop 6.9x, a 3M-step float
+  loop 8.3x, a 5M-step tail-recursive sum 6.5x.
+
+  The compilable subset is deliberately narrow: constants, local slots, `if` /
+  `and` / `or`, `+ - * / modulo`, negation, `not`, numeric comparison, and
+  self-recursion (tail and non-tail). Values are limited to *immediates* —
+  fixnums, floats, booleans, nil, chars, symbols, keywords — which own no `Rc`,
+  so generated code performs no refcount work at all. Everything else runs on
+  the VM exactly as before, and any case that would need to allocate or raise
+  (a sum that overflows the fixnum range into a bignum, an inexact integer
+  division, division by zero, a non-numeric operand) makes the compiled call
+  bail so the VM runs it instead. Bailing is safe because the subset admits no
+  side effects, and it costs a redo: a long loop that bails on its last
+  iteration does the work twice.
+
+  A tail-recursive loop compiles to a machine loop with no call at all. Non-tail
+  self-recursion runs on the machine stack and counts its own depth, bailing at
+  the VM's frame limit so unbounded recursion still raises "stack overflow"
+  rather than crashing the process.
+
+  `--jit-stats` prints what was compiled, rejected, and bailed.
+  `SEMA_JIT_THRESHOLD` sets how many calls a function takes before compilation
+  (default 32); a function containing a loop is compiled on its first call,
+  since a loop that runs for a second is still only one call. WebAssembly builds
+  are unaffected — browsers cannot map executable pages, so `sema-wasm` keeps
+  using the VM. See `docs/plans/2026-08-14-cranelift-codegen.md`.
+
 - **`agent/run` can hand back the transcript of a cancelled run (#87).** A run
   stopped with `async/cancel` has no return value — `async/await` raises — so
   the conversation it had assembled was lost, and the next turn resumed from

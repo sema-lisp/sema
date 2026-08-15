@@ -549,6 +549,7 @@ pub fn run_bytecode_bytes(
             source_file: None,
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         }),
         upvalues: Vec::new(),
         // Top-level main closure: uses the VM's own globals and function table.

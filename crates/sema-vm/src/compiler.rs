@@ -816,6 +816,7 @@ impl Compiler {
             source_file: None,
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
+            jit: Default::default(),
         };
         self.functions.push(func);
         self.functions.extend(child_functions);

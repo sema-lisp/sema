@@ -1,6 +1,7 @@
 # Cranelift native code generation (`sema-codegen`)
 
-Status: phase 1 landed (JIT, immediate-only numeric subset). Phases 2 and 3 open.
+Status: phase 1 landed (JIT, immediate-only numeric subset). Phase 2 item 1 (n-ary
+arithmetic) landed. Items 2-5 and phase 3 open.
 
 ## Problem
 
@@ -251,7 +252,7 @@ runnable examples, the reasons rank:
 
 | rejections | reason | what it means |
 |---|---|---|
-| 28 | `CallGlobal` | the body calls another function |
+| 28 | `CallGlobal` | the body calls another function (n-ary arithmetic was a large share of this, now folded) |
 | 25 | `LoadGlobal` | the body reads a global |
 | 12 | `MakeClosure` | the body builds a closure |
 | 11 | `LoadUpvalue` | the body reads a captured variable |
@@ -278,10 +279,31 @@ point sets the priority order below.
 
 Ranked by the measurements above, cheapest first.
 
-1. **N-ary arithmetic.** `(* a b c)` becomes a `CallGlobal` today. Folding the
-   n-ary arithmetic builtins into repeated binary opcodes during lowering, or
-   recognizing them in `decode.rs`, is a small change that unlocks whole loops —
-   `mandelbrot-iter` among them. No ownership work involved.
+1. ~~**N-ary arithmetic.**~~ **Done.** `(+ a b c)`, `(- a b c)`, and `(* a b c)`
+   now fold into repeated binary opcodes in `try_compile_intrinsic` instead of
+   one `CallGlobal` into the stdlib native, guarded by the same
+   `redefined_globals` check the fixed-arity intrinsics use.
+
+   The fold has to reproduce the native exactly, and the observable part is its
+   accumulator seed: `+` starts at integer 0 and `*` at integer 1, so a leading
+   float is combined as `0.0 + f` / `1.0 * f` rather than taken as-is. That is
+   visible through `-0.0` — `(+ -0.0 -0.0 -0.0)` is `0.0`, not `-0.0` — so the
+   seed is emitted rather than skipped. `-` takes its first operand directly,
+   matching the native's `i == 0` case. A 5832-case differential run over every
+   ordered triple and quadruple of edge-case operands is byte-identical before
+   and after.
+
+   `/` is deliberately excluded: its native folds through the numeric tower and
+   raises a differently worded division-by-zero error than `Op::Div` does.
+
+   This also speeds up the **plain VM**, with no code generator involved: a
+   3M-iteration loop over `(+ acc (* 2.0 1.0000001 acc) 1)` goes from 0.75s to
+   0.48s, because each iteration no longer does two global lookups and two
+   native dispatches.
+
+   `examples/mandelbrot.sema`'s `mandelbrot-iter` now compiles. Rendering a
+   400x300 grid: 3.48s before the fold, 2.95s after it on the VM, 0.47s with the
+   code generator — 7.4x end to end, 120,000 native calls, zero bailouts.
 2. **Reading globals.** A `LoadGlobal` whose bound value is an immediate can be
    guarded and inlined; the inline cache already holds the value and a version
    stamp to invalidate against. Still no `Rc` crosses the boundary.

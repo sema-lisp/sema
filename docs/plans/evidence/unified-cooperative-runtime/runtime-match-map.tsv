@@ -1,3 +1,4 @@
+C20	crates/sema-codegen/src/backend.rs:23:thread_local! {
 F06	crates/sema-core/src/async_signal.rs:101:thread_local! {
 F08B	crates/sema-core/src/async_signal.rs:106:/// real `Atomics.wait` on a `SharedArrayBuffer`, so `async/sleep` paces in real
 F08B	crates/sema-core/src/async_signal.rs:109:/// `std::thread::sleep` default below.
@@ -909,16 +910,16 @@ H01	crates/sema/src/lib.rs:134:        sema_core::set_eval_callback(&ctx, sema_e
 H01	crates/sema/src/lib.rs:135:        sema_core::set_call_callback(&ctx, sema_eval::call_value);
 H01	crates/sema/src/lib.rs:136:        sema_core::set_call_owned_callback(&ctx, sema_eval::call_value_owned);
 H02	crates/sema/src/main.rs:107:thread_local! {
-H02	crates/sema/src/main.rs:1341:                    .block_on(sema_lsp::run_server());
-H02	crates/sema/src/main.rs:1348:                    .block_on(sema_dap::run_server());
-H02	crates/sema/src/main.rs:1424:                // runtime, llm/* builtins hit io_block_on's runtime-in-runtime
-H02	crates/sema/src/main.rs:2333:                .block_on(workflow_view::serve_with_approval(
-H02	crates/sema/src/main.rs:2660:                .block_on(async {
-H02	crates/sema/src/main.rs:2678:        std::thread::sleep(std::time::Duration::from_millis(250));
-H02	crates/sema/src/main.rs:2883:            std::thread::sleep(std::time::Duration::from_secs(3600));
-H02	crates/sema/src/main.rs:2988:                .block_on(sema_notebook::serve(path, &host, port));
-H02	crates/sema/src/main.rs:3544:        // Same no-ambient-runtime rule as the CLI mcp arm (llm/* + io_block_on).
-H02	crates/sema/src/main.rs:4987:    // runtime, the sole async engine, so async/await, channels, and timers work
+H02	crates/sema/src/main.rs:1371:                    .block_on(sema_lsp::run_server());
+H02	crates/sema/src/main.rs:1378:                    .block_on(sema_dap::run_server());
+H02	crates/sema/src/main.rs:1454:                // runtime, llm/* builtins hit io_block_on's runtime-in-runtime
+H02	crates/sema/src/main.rs:2363:                .block_on(workflow_view::serve_with_approval(
+H02	crates/sema/src/main.rs:2690:                .block_on(async {
+H02	crates/sema/src/main.rs:2708:        std::thread::sleep(std::time::Duration::from_millis(250));
+H02	crates/sema/src/main.rs:2913:            std::thread::sleep(std::time::Duration::from_secs(3600));
+H02	crates/sema/src/main.rs:3018:                .block_on(sema_notebook::serve(path, &host, port));
+H02	crates/sema/src/main.rs:3574:        // Same no-ambient-runtime rule as the CLI mcp arm (llm/* + io_block_on).
+H02	crates/sema/src/main.rs:5017:    // runtime, the sole async engine, so async/await, channels, and timers work
 H02	crates/sema/src/pkg.rs:1663:                std::thread::sleep(jittered(wait));
 H02	crates/sema/src/pkg.rs:1676:                std::thread::sleep(jittered(backoff));
 H03	crates/sema/src/repl/completer.rs:16:thread_local! {

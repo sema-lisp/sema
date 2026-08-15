@@ -4,6 +4,24 @@
 
 ### Added
 
+- **N-ary `+`, `-`, and `*` compile to inline opcodes instead of a stdlib call.**
+  `(* 2.0 zr zi)` in an inner loop was costing a global lookup plus a native
+  dispatch every iteration; three-or-more-argument `+`, `-`, and `*` now fold
+  into the existing binary opcodes. This speeds up the **bytecode VM itself** —
+  a 3M-iteration loop over `(+ acc (* 2.0 1.0000001 acc) 1)` drops from 0.75s to
+  0.48s — and it is what lets `examples/mandelbrot.sema`'s inner loop reach the
+  native code generator, taking a 400x300 render from 3.48s to 0.47s with
+  `--jit`.
+
+  Results are unchanged. The fold reproduces the stdlib native exactly,
+  including its accumulator seed: `+` starts at integer 0 and `*` at integer 1,
+  so a leading float is combined as `0.0 + f` / `1.0 * f`. That is observable
+  through `-0.0` (`(+ -0.0 -0.0 -0.0)` stays `0.0`), so the seed is emitted
+  rather than skipped. `/` is deliberately not folded: its native goes through
+  the numeric tower and raises a differently worded division-by-zero error.
+  Verified by a 5832-case differential run over every ordered triple and
+  quadruple of edge-case operands, byte-identical before and after.
+
 - **`sema --jit` compiles hot numeric functions to native code (Cranelift).**
   Off by default; results are identical either way. The new `sema-codegen` crate
   compiles a function's bytecode to machine code once it is hot, and the VM

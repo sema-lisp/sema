@@ -860,6 +860,48 @@ impl Compiler {
         let name = resolve_spur(spur);
         let argc = args.len();
 
+        // N-ary `+`, `-`, `*` fold into repeated binary opcodes instead of one
+        // global call into the stdlib native. `(* 2.0 zr zi)` in an inner loop
+        // was costing a global lookup plus a native dispatch per iteration.
+        //
+        // The fold must reproduce the native exactly, which means matching its
+        // accumulator seed: `+` starts at integer 0 and `*` at integer 1, so
+        // the first float operand is combined as `0.0 + f` / `1.0 * f`, not
+        // taken as-is. That is observable — `(+ -0.0 -0.0 -0.0)` is `0.0`, not
+        // `-0.0` — so the seed is emitted rather than skipped. `-` takes its
+        // first operand directly, exactly as the native's `i == 0` case does.
+        //
+        // `/` is deliberately excluded: its native folds through the numeric
+        // tower and raises a differently worded division-by-zero error than
+        // `Op::Div` does.
+        if argc >= 3 {
+            let folded = match name.as_str() {
+                "+" => Some((Op::AddInt, Some(Value::int(0)))),
+                "*" => Some((Op::MulInt, Some(Value::int(1)))),
+                "-" => Some((Op::SubInt, None)),
+                _ => None,
+            };
+            if let Some((op, seed)) = folded {
+                let seeded = seed.is_some();
+                if let Some(seed) = seed {
+                    self.compile_const(&seed)?;
+                    self.stack_height += 1;
+                }
+                for (i, arg) in args.iter().enumerate() {
+                    self.compile_expr(arg)?;
+                    self.stack_height += 1;
+                    if seeded || i > 0 {
+                        self.emit.emit_op(op);
+                        self.stack_height -= 1;
+                    }
+                }
+                // One value is left on the stack: the result, which this
+                // convention does not count (same as the fixed-arity path).
+                self.stack_height -= 1;
+                return Ok(true);
+            }
+        }
+
         let op = match (name.as_str(), argc) {
             // Unary
             ("not", 1) => Op::Not,

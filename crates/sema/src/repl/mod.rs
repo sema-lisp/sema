@@ -13,7 +13,7 @@ use reedline::Signal;
 use sema_core::{intern, pretty_print, Spur, Value};
 use sema_eval::Interpreter;
 
-use crate::{drain_async_scheduler, print_error, LAST_FILE, LAST_SOURCE};
+use crate::{drain_async_scheduler, print_error, set_last_input};
 
 mod apropos;
 mod commands;
@@ -97,8 +97,7 @@ pub fn run(interpreter: Interpreter, quiet: bool, sandbox_mode: Option<&str>) {
                     CommandOutcome::Passthrough => {}
                 }
 
-                LAST_SOURCE.with(|s| *s.borrow_mut() = Some(trimmed.clone()));
-                LAST_FILE.with(|f| *f.borrow_mut() = None);
+                set_last_input(&trimmed, None);
 
                 match interpreter.eval_str_in_global(&trimmed) {
                     Ok(val) => {

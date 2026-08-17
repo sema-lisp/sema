@@ -105,8 +105,22 @@ fn read_source_file(path: impl AsRef<Path>) -> Result<String, String> {
 }
 
 thread_local! {
-    pub(crate) static LAST_SOURCE: RefCell<Option<String>> = const { RefCell::new(None) };
-    pub(crate) static LAST_FILE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    /// The most recent program source (with the file it came from, if any) whose
+    /// errors are still eligible for a source-snippet render. Set as a pair so
+    /// the `file` and `source` can never disagree.
+    pub(crate) static LAST_INPUT: RefCell<Option<(String, Option<PathBuf>)>> =
+        const { RefCell::new(None) };
+}
+
+/// Record the current program source for error snippets. `file` is `Some` for
+/// `--load`/positional-FILE paths and `None` for REPL/stdin/`-e` input.
+pub(crate) fn set_last_input(source: &str, file: Option<PathBuf>) {
+    LAST_INPUT.with(|s| *s.borrow_mut() = Some((source.to_string(), file)));
+}
+
+/// The most recently recorded `(source, file)` pair, if any.
+pub(crate) fn last_input() -> Option<(String, Option<PathBuf>)> {
+    LAST_INPUT.with(|s| s.borrow().clone())
 }
 
 // REPL completer, command set, and trait impls have moved to `src/repl/`.
@@ -1469,8 +1483,7 @@ fn main() {
         }
         match read_source_file(load_file) {
             Ok(content) => {
-                LAST_SOURCE.with(|s| *s.borrow_mut() = Some(content.clone()));
-                LAST_FILE.with(|f| *f.borrow_mut() = Some(PathBuf::from(load_file)));
+                crate::set_last_input(&content, Some(PathBuf::from(load_file)));
                 match interpreter.eval_str_compiled(&content) {
                     Ok(_) => {
                         interpreter.ctx.pop_file_path();
@@ -1493,8 +1506,7 @@ fn main() {
 
     // Handle --eval
     if let Some(expr) = &cli.eval {
-        LAST_SOURCE.with(|s| *s.borrow_mut() = Some(expr.clone()));
-        LAST_FILE.with(|f| *f.borrow_mut() = None);
+        crate::set_last_input(expr, None);
         match interpreter.eval_str_compiled(expr) {
             Ok(val) => {
                 drain_async_scheduler(&interpreter);
@@ -1515,8 +1527,7 @@ fn main() {
 
     // Handle --print
     if let Some(expr) = &cli.print {
-        LAST_SOURCE.with(|s| *s.borrow_mut() = Some(expr.clone()));
-        LAST_FILE.with(|f| *f.borrow_mut() = None);
+        crate::set_last_input(expr, None);
         match interpreter.eval_str_compiled(expr) {
             Ok(val) => {
                 drain_async_scheduler(&interpreter);
@@ -1561,8 +1572,7 @@ fn main() {
         }
         match read_source_file(file) {
             Ok(content) => {
-                LAST_SOURCE.with(|s| *s.borrow_mut() = Some(content.clone()));
-                LAST_FILE.with(|f| *f.borrow_mut() = Some(PathBuf::from(file)));
+                crate::set_last_input(&content, Some(PathBuf::from(file)));
                 match interpreter.eval_str_compiled(&content) {
                     Ok(_) => {
                         interpreter.ctx.pop_file_path();
@@ -5453,8 +5463,7 @@ pub(crate) fn format_source_snippet(
         let content = std::fs::read_to_string(path).ok()?;
         (content, Some(path.to_path_buf()))
     } else {
-        let source = LAST_SOURCE.with(|s| s.borrow().clone())?;
-        let file = LAST_FILE.with(|f| f.borrow().clone());
+        let (source, file) = last_input()?;
         (source, file)
     };
 
@@ -5792,6 +5801,27 @@ mod tests {
             .any(|(path, bytes)| path == &helper && bytes == helper_bytes));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn last_input_setter_getter_round_trip() {
+        // The pair must be written and read atomically: whatever file was set
+        // last is what the getter returns, never a mix of two producers.
+        set_last_input("with file", Some(PathBuf::from("a.sema")));
+        assert_eq!(
+            last_input(),
+            Some(("with file".to_string(), Some(PathBuf::from("a.sema"))))
+        );
+
+        set_last_input("no file", None);
+        assert_eq!(last_input(), Some(("no file".to_string(), None)));
+
+        // Overwriting with a new pair replaces both halves.
+        set_last_input("with file again", Some(PathBuf::from("b.sema")));
+        assert_eq!(
+            last_input(),
+            Some(("with file again".to_string(), Some(PathBuf::from("b.sema"))))
+        );
     }
 
     #[test]

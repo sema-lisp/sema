@@ -17,7 +17,7 @@ use std::io::{self, BufRead, Read};
 use sema_core::{intern, pretty_print, Spur, Value};
 use sema_eval::Interpreter;
 
-use crate::{drain_async_scheduler, print_error, LAST_FILE, LAST_SOURCE};
+use crate::{drain_async_scheduler, print_error, set_last_input};
 
 use super::commands::{self, CommandOutcome};
 use super::validator::is_input_complete;
@@ -163,8 +163,7 @@ fn run_with_line_source(
             continue;
         }
 
-        LAST_SOURCE.with(|s| *s.borrow_mut() = Some(submitted.clone()));
-        LAST_FILE.with(|f| *f.borrow_mut() = None);
+        set_last_input(&submitted, None);
 
         match interpreter.eval_str_in_global(&submitted) {
             Ok(val) => {

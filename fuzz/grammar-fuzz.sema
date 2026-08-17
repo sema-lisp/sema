@@ -1790,12 +1790,14 @@
 
 (define *twin-checks* 0)  ; programs where a twin was derived and evaluated
 (define *twin-blocked* 0) ; programs skipped: a non-mechanical construct
-(define *tw-async* 0)     ; (async ...) task rewrites
-(define *tw-await* 0)     ; (async/await ...) rewrites
-(define *tw-all* 0)       ; (async/all ...) rewrites
-(define *tw-map* 0)       ; (async/map ...) rewrites
-(define *tw-pool* 0)      ; (async/pool-map ...) rewrites
-(define *tw-spawnall* 0)  ; (async/spawn-all ...) rewrites
+;; Rewrite counters per twin-class production family, keyed by symbol so a
+;; snapshot/restore is one map and a bump is one call instead of six parallel
+;; globals. Labels: :async :await :all :map :pool-map :spawn-all.
+(define *tw-counts* {})
+
+;; Count one rewrite of the `k` twin class.
+(define (tw-bump! k)
+  (set! *tw-counts* (assoc *tw-counts* k (+ 1 (get *tw-counts* k 0)))))
 
 (define (twin-blocked!) (throw :twin-blocked))
 
@@ -1847,33 +1849,33 @@
         ((= h 'sleep) nil)
         ((= h 'async)
           (begin
-            (set! *tw-async* (+ *tw-async* 1))
+            (tw-bump! :async)
             (cons 'begin (map twin (rest form)))))
         ((= h 'async/await)
           (begin
-            (set! *tw-await* (+ *tw-await* 1))
+            (tw-bump! :await)
             (twin (nth form 1))))
         ((= h 'async/all)
           (begin
-            (set! *tw-all* (+ *tw-all* 1))
+            (tw-bump! :all)
             (twin-all-arg (nth form 1))))
         ((= h 'async/map)
           (if (contains-throw? form)
             (twin-blocked!)
             (begin
-              (set! *tw-map* (+ *tw-map* 1))
+              (tw-bump! :map)
               (list 'map (twin (nth form 1)) (twin (nth form 2))))))
         ((= h 'async/pool-map)
           (if (contains-throw? form)
             (twin-blocked!)
             (begin
-              (set! *tw-pool* (+ *tw-pool* 1))
+              (tw-bump! :pool-map)
               (list 'map (twin (nth form 1)) (twin (nth form 2))))))
         ((= h 'async/spawn-all)
           (if (contains-throw? form)
             (twin-blocked!)
             (begin
-              (set! *tw-spawnall* (+ *tw-spawnall* 1))
+              (tw-bump! :spawn-all)
               (twin-spawn-all-arg (nth form 1)))))
         ((twin-blocker? h) (twin-blocked!))
         (else (map twin form))))))
@@ -1885,12 +1887,7 @@
 (define (check-twin form expected)
   (if (not *async*)
     #t
-    (let ((s-async *tw-async*)
-          (s-await *tw-await*)
-          (s-all *tw-all*)
-          (s-map *tw-map*)
-          (s-pool *tw-pool*)
-          (s-spawnall *tw-spawnall*))
+    (let ((saved *tw-counts*))
       (try
         (let ((tw (twin form)))
           (if (= tw form)
@@ -1906,12 +1903,7 @@
         (catch e
           (if (= (:value e) :twin-blocked)
             (begin
-              (set! *tw-async* s-async)
-              (set! *tw-await* s-await)
-              (set! *tw-all* s-all)
-              (set! *tw-map* s-map)
-              (set! *tw-pool* s-pool)
-              (set! *tw-spawnall* s-spawnall)
+              (set! *tw-counts* saved)
               (set! *twin-blocked* (+ *twin-blocked* 1))
               #t)
             ;; an error in the walker itself — report it, never mask it
@@ -2004,17 +1996,17 @@
     (display " non-mechanical=")
     (display (number->string *twin-blocked*))
     (display " rewrites: async=")
-    (display (number->string *tw-async*))
+    (display (number->string (get *tw-counts* :async 0)))
     (display " await=")
-    (display (number->string *tw-await*))
+    (display (number->string (get *tw-counts* :await 0)))
     (display " all=")
-    (display (number->string *tw-all*))
+    (display (number->string (get *tw-counts* :all 0)))
     (display " map=")
-    (display (number->string *tw-map*))
+    (display (number->string (get *tw-counts* :map 0)))
     (display " pool-map=")
-    (display (number->string *tw-pool*))
+    (display (number->string (get *tw-counts* :pool-map 0)))
     (display " spawn-all=")
-    (display (number->string *tw-spawnall*))
+    (display (number->string (get *tw-counts* :spawn-all 0)))
     (newline))
   (if (= *failures* 0)
     (begin

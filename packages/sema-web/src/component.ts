@@ -861,6 +861,28 @@ function cleanupListener(ctx: SemaWebContext, key: string): void {
   ctx.listeners.delete(key);
 }
 
+/**
+ * Drain an owned-id registry during teardown, running `cleanup` for each id
+ * inside a try/catch that reports (never throws) on a failing individual
+ * cleanup, before the caller clears the registry. The stream case passes a
+ * composing callback because it cleans up two registries per item.
+ */
+function drainOwned<T>(
+  component: MountedComponent,
+  ctx: SemaWebContext,
+  ids: Iterable<T>,
+  cleanup: (id: T) => void,
+  label: string,
+): void {
+  for (const id of ids) {
+    try {
+      cleanup(id);
+    } catch (e) {
+      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `${label}:${component.componentFn}`);
+    }
+  }
+}
+
 function destroyMountedComponent(selector: string, component: MountedComponent, ctx: SemaWebContext): void {
   // Before anything is drained. An effect body that unmounts its own component
   // is still on the stack below this call, and the flush it will return into
@@ -905,59 +927,25 @@ function destroyMountedComponent(selector: string, component: MountedComponent, 
     component.eventCleanup = null;
   }
 
-  for (const listenerKey of component.ownedListenerKeys) {
-    try {
-      cleanupListener(ctx, listenerKey);
-    } catch (e) {
-      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `component-listener-cleanup:${component.componentFn}`);
-    }
-  }
+  drainOwned(component, ctx, component.ownedListenerKeys, (k) => cleanupListener(ctx, k), 'component-listener-cleanup');
   component.ownedListenerKeys.clear();
 
-  for (const signalId of component.ownedSignalIds) {
-    try {
-      disposeSignal(ctx, signalId);
-    } catch (e) {
-      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `component-signal-cleanup:${component.componentFn}`);
-    }
-  }
+  drainOwned(component, ctx, component.ownedSignalIds, (id) => disposeSignal(ctx, id), 'component-signal-cleanup');
   component.ownedSignalIds.clear();
 
-  for (const watchId of component.ownedWatchIds) {
-    try {
-      cleanupWatch(ctx, watchId);
-    } catch (e) {
-      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `component-watch-cleanup:${component.componentFn}`);
-    }
-  }
+  drainOwned(component, ctx, component.ownedWatchIds, (id) => cleanupWatch(ctx, id), 'component-watch-cleanup');
   component.ownedWatchIds.clear();
 
-  for (const intervalId of component.ownedIntervalIds) {
-    try {
-      cleanupInterval(ctx, intervalId);
-    } catch (e) {
-      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `component-interval-cleanup:${component.componentFn}`);
-    }
-  }
+  drainOwned(component, ctx, component.ownedIntervalIds, (id) => cleanupInterval(ctx, id), 'component-interval-cleanup');
   component.ownedIntervalIds.clear();
 
-  for (const signalId of component.ownedStreamIds) {
-    try {
-      cleanupStream(ctx, signalId);
-      disposeSignal(ctx, signalId);
-    } catch (e) {
-      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `component-stream-cleanup:${component.componentFn}`);
-    }
-  }
+  drainOwned(component, ctx, component.ownedStreamIds, (id) => {
+    cleanupStream(ctx, id);
+    disposeSignal(ctx, id);
+  }, 'component-stream-cleanup');
   component.ownedStreamIds.clear();
 
-  for (const signalId of component.localState.values()) {
-    try {
-      disposeSignal(ctx, signalId);
-    } catch (e) {
-      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `component-local-state-cleanup:${component.componentFn}`);
-    }
-  }
+  drainOwned(component, ctx, component.localState.values(), (id) => disposeSignal(ctx, id), 'component-local-state-cleanup');
   component.localState.clear();
 
   for (const child of Array.from(component.target.childNodes)) {

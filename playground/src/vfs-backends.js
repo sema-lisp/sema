@@ -28,6 +28,41 @@ export function makeVfsHost(interp) {
   };
 }
 
+// ── Shared collectors ─────────────────────────────────────────────────
+
+/**
+ * Recursively collect the absolute paths of every file under `dir`.
+ * @param {{listFiles: Function, isDirectory: Function}} host
+ * @param {string} dir
+ */
+function collectFiles(host, dir) {
+  const result = [];
+  for (const name of host.listFiles(dir)) {
+    const full = dir === '/' ? '/' + name : dir + '/' + name;
+    if (host.isDirectory(full)) result.push(...collectFiles(host, full));
+    else result.push(full);
+  }
+  return result;
+}
+
+/**
+ * Recursively collect the absolute paths of every directory under `dir`
+ * (including `dir` itself for non-root calls).
+ * @param {{listFiles: Function, isDirectory: Function}} host
+ * @param {string} dir
+ */
+function collectDirs(host, dir) {
+  const result = [];
+  for (const name of host.listFiles(dir)) {
+    const full = dir === '/' ? '/' + name : dir + '/' + name;
+    if (host.isDirectory(full)) {
+      result.push(full);
+      result.push(...collectDirs(host, full));
+    }
+  }
+  return result;
+}
+
 // ── Backends ──────────────────────────────────────────────────────────
 
 /** In-memory backend — ephemeral, no persistence. */
@@ -75,12 +110,12 @@ class WebStorageBackend {
     }
     for (const key of toRemove) this._storage.removeItem(key);
 
-    const files = this._collectFiles(host, '/');
+    const files = collectFiles(host, '/');
     for (const path of files) {
       const content = host.readFile(path);
       if (content !== null) this._storage.setItem(this._filePrefix + path, content);
     }
-    this._storage.setItem(this._dirsKey, JSON.stringify(this._collectDirs(host, '/')));
+    this._storage.setItem(this._dirsKey, JSON.stringify(collectDirs(host, '/')));
   }
 
   async reset() {
@@ -92,28 +127,6 @@ class WebStorageBackend {
       }
     }
     for (const key of toRemove) this._storage.removeItem(key);
-  }
-
-  _collectFiles(host, dir) {
-    const result = [];
-    for (const name of host.listFiles(dir)) {
-      const full = dir === '/' ? '/' + name : dir + '/' + name;
-      if (host.isDirectory(full)) result.push(...this._collectFiles(host, full));
-      else result.push(full);
-    }
-    return result;
-  }
-
-  _collectDirs(host, dir) {
-    const result = [];
-    for (const name of host.listFiles(dir)) {
-      const full = dir === '/' ? '/' + name : dir + '/' + name;
-      if (host.isDirectory(full)) {
-        result.push(full);
-        result.push(...this._collectDirs(host, full));
-      }
-    }
-    return result;
   }
 }
 
@@ -171,12 +184,12 @@ export class IndexedDBBackend {
     store.clear();
 
     // Write directories
-    for (const dir of this._collectDirs(host, '/')) {
+    for (const dir of collectDirs(host, '/')) {
       store.put({ path: dir, isDir: true });
     }
 
     // Write files
-    for (const filePath of this._collectFiles(host, '/')) {
+    for (const filePath of collectFiles(host, '/')) {
       const content = host.readFile(filePath);
       if (content !== null) {
         store.put({ path: filePath, content, isDir: false });
@@ -221,28 +234,6 @@ export class IndexedDBBackend {
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
     });
-  }
-
-  _collectFiles(host, dir) {
-    const result = [];
-    for (const name of host.listFiles(dir)) {
-      const full = dir === '/' ? '/' + name : dir + '/' + name;
-      if (host.isDirectory(full)) result.push(...this._collectFiles(host, full));
-      else result.push(full);
-    }
-    return result;
-  }
-
-  _collectDirs(host, dir) {
-    const result = [];
-    for (const name of host.listFiles(dir)) {
-      const full = dir === '/' ? '/' + name : dir + '/' + name;
-      if (host.isDirectory(full)) {
-        result.push(full);
-        result.push(...this._collectDirs(host, full));
-      }
-    }
-    return result;
   }
 }
 

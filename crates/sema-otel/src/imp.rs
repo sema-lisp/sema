@@ -909,17 +909,18 @@ where
     parent.with_span(span)
 }
 
-/// Start a span as a child of the current TL-stack top (or `Context::current()` when
-/// the stack is empty — Decision #13), push it onto the stack, return its core.
-/// Returns `None` when telemetry is disabled (no `global` touch, near-zero cost).
-fn start(name: String, kind: SpanKind, attrs: Vec<KeyValue>) -> Option<SpanCore> {
+/// Shared body of [`start`]/[`start_detached`]: resolve the parent, route through a
+/// host-supplied provider (OwnProvider mode) when set, else the global provider
+/// (standalone install or host's ambient provider), build the span context, apply
+/// the active conversation/session/user identity uniformly, and conditionally push
+/// onto `STACK` per `push`. Returns `None` when telemetry is disabled (no `global`
+/// touch, near-zero cost).
+fn start_impl(name: String, kind: SpanKind, attrs: Vec<KeyValue>, push: bool) -> Option<SpanCore> {
     if !ENABLED.load(Ordering::Relaxed) {
         return None;
     }
     let parent = STACK.with(|s| s.borrow().last().cloned());
     let parent = parent.unwrap_or_else(Context::current);
-    // Route through a host-supplied provider (OwnProvider mode) when set; else the
-    // global provider (standalone install or host's ambient provider).
     let owned = OWNED_PROVIDER.with(|c| c.borrow().clone());
     let ctx = match owned {
         Some(p) => build_ctx(&p.tracer_with_scope(scope()), name, kind, attrs, &parent),
@@ -931,10 +932,12 @@ fn start(name: String, kind: SpanKind, attrs: Vec<KeyValue>) -> Option<SpanCore>
             &parent,
         ),
     };
-    STACK.with(|s| s.borrow_mut().push(ctx.clone()));
+    if push {
+        STACK.with(|s| s.borrow_mut().push(ctx.clone()));
+    }
     let core = SpanCore {
         ctx,
-        detached: false,
+        detached: !push,
     };
     // Apply the active conversation/session/user identity to EVERY span uniformly.
     if let Some(id) = CONVERSATION_ID.with(|c| c.borrow().clone()) {
@@ -953,6 +956,13 @@ fn start(name: String, kind: SpanKind, attrs: Vec<KeyValue>) -> Option<SpanCore>
     Some(core)
 }
 
+/// Start a span as a child of the current TL-stack top (or `Context::current()` when
+/// the stack is empty — Decision #13), push it onto the stack, return its core.
+/// Returns `None` when telemetry is disabled (no `global` touch, near-zero cost).
+fn start(name: String, kind: SpanKind, attrs: Vec<KeyValue>) -> Option<SpanCore> {
+    start_impl(name, kind, attrs, true)
+}
+
 /// Start a DETACHED span: parented to the current TL-stack top (captured now) but
 /// NOT pushed onto the stack, and whose `Drop` does NOT pop. For a leaf span whose
 /// lifetime is decoupled from the stack discipline — e.g. an async embeddings span
@@ -960,39 +970,7 @@ fn start(name: String, kind: SpanKind, attrs: Vec<KeyValue>) -> Option<SpanCore>
 /// possibly while a sibling task's span sits on the stack. Returns `None` when
 /// telemetry is disabled.
 fn start_detached(name: String, kind: SpanKind, attrs: Vec<KeyValue>) -> Option<SpanCore> {
-    if !ENABLED.load(Ordering::Relaxed) {
-        return None;
-    }
-    let parent = STACK.with(|s| s.borrow().last().cloned());
-    let parent = parent.unwrap_or_else(Context::current);
-    let owned = OWNED_PROVIDER.with(|c| c.borrow().clone());
-    let ctx = match owned {
-        Some(p) => build_ctx(&p.tracer_with_scope(scope()), name, kind, attrs, &parent),
-        None => build_ctx(
-            &global::tracer_with_scope(scope()),
-            name,
-            kind,
-            attrs,
-            &parent,
-        ),
-    };
-    // NOTE: no STACK push — this is the whole point of "detached".
-    let core = SpanCore {
-        ctx,
-        detached: true,
-    };
-    if let Some(id) = CONVERSATION_ID.with(|c| c.borrow().clone()) {
-        core.set_str("gen_ai.conversation.id", id);
-    }
-    if let Some(id) = SESSION_ID.with(|c| c.borrow().clone()) {
-        core.set_str("session.id", id);
-    }
-    if let Some(id) = USER_ID.with(|c| c.borrow().clone()) {
-        core.set_str("user.id", id);
-    }
-    let session = SESSION_ID.with(|c| c.borrow().clone());
-    core.set_attrs(compat::identity(session.as_deref(), release()));
-    Some(core)
+    start_impl(name, kind, attrs, false)
 }
 
 /// Whether message-content capture is enabled (off by default). Standard flag with a

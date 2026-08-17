@@ -1132,23 +1132,73 @@ impl sema_core::McpCassetteRecordTarget for CassetteState {
 
 type CassetteScope = Rc<CassetteState>;
 
-/// The dynamically-scoped LLM state captured onto a task and swapped in/out per step.
-#[derive(Clone)]
-struct LlmDynScope {
-    cache_enabled: bool,
-    cache_ttl_secs: i64,
-    stream_budget_pregate: bool,
-    call_tags: Vec<String>,
-    call_meta: Vec<(String, String)>,
-    last_usage: Option<Usage>,
-    fallback_chain: Option<Vec<FallbackEntry>>,
-    rate_limit_rps: Option<f64>,
+/// Declares [`LlmDynScope`]'s struct, `Default` impl, and its `read_llm_scope`/
+/// `write_llm_scope` round-trip from ONE field table, so a new per-task LLM
+/// config field is added in exactly one place instead of the 3-4 sites that
+/// have to be kept in lockstep by hand (a defect this codebase has shipped at
+/// least 3 times — commits b181d195, eec95fb4, 0a58f9ac — most recently when
+/// `custom_pricing`/`budget_stack` were left as ambient TLS entirely, letting a
+/// sibling task's `(llm/set-pricing ...)` reprice a suspended task's usage).
+/// `llm_dyn_scope_is_default`/`llm_scope_ambient_is_empty` are hand-written and
+/// NOT generated here: their exclusion of `stream_budget_pregate`/`cache_ttl_secs`/
+/// `rate_limit_last` from the default-check is deliberate and asymmetric with
+/// this table, and `llm_scope_ambient_is_empty` is a documented allocation-free
+/// fast path that must stay hand-optimized.
+macro_rules! llm_dyn_scope_fields {
+    ($($(#[$meta:meta])* $field:ident : $ty:ty = default $default:expr, read $read:expr, write $write:expr;)*) => {
+        /// The dynamically-scoped LLM state captured onto a task and swapped in/out per step.
+        #[derive(Clone)]
+        struct LlmDynScope {
+            $($(#[$meta])* $field: $ty,)*
+        }
+
+        impl Default for LlmDynScope {
+            fn default() -> Self {
+                LlmDynScope { $($field: $default,)* }
+            }
+        }
+
+        /// Read (clone) the current thread's LLM dynamic scope without disturbing it.
+        fn read_llm_scope() -> LlmDynScope {
+            LlmDynScope { $($field: $read,)* }
+        }
+
+        /// Overwrite the current thread's LLM dynamic scope with `s`, returning the previous one.
+        fn write_llm_scope(s: LlmDynScope) -> LlmDynScope {
+            let prev = read_llm_scope();
+            $(($write)(s.$field);)*
+            prev
+        }
+    };
+}
+
+llm_dyn_scope_fields! {
+    cache_enabled: bool
+        = default false, read CACHE_ENABLED.with(|c| c.get()), write |v| CACHE_ENABLED.with(|c| c.set(v));
+    cache_ttl_secs: i64
+        = default 3600, read CACHE_TTL_SECS.with(|c| c.get()), write |v| CACHE_TTL_SECS.with(|c| c.set(v));
+    stream_budget_pregate: bool
+        = default false, read STREAM_BUDGET_PREGATE.with(|c| c.get()), write |v| STREAM_BUDGET_PREGATE.with(|c| c.set(v));
+    call_tags: Vec<String>
+        = default Vec::new(), read CALL_TAGS.with(|t| t.borrow().clone()), write |v| CALL_TAGS.with(|t| *t.borrow_mut() = v);
+    call_meta: Vec<(String, String)>
+        = default Vec::new(), read CALL_META.with(|m| m.borrow().clone()), write |v| CALL_META.with(|m| *m.borrow_mut() = v);
+    last_usage: Option<Usage>
+        = default None, read LAST_USAGE.with(|u| u.borrow().clone()), write |v| LAST_USAGE.with(|u| *u.borrow_mut() = v);
+    fallback_chain: Option<Vec<FallbackEntry>>
+        = default None, read FALLBACK_CHAIN.with(|c| c.borrow().clone()), write |v| FALLBACK_CHAIN.with(|c| *c.borrow_mut() = v);
+    rate_limit_rps: Option<f64>
+        = default None, read RATE_LIMIT_RPS.with(|r| r.get()), write |v| RATE_LIMIT_RPS.with(|r| r.set(v));
     /// Siblings spawned inside one rate-limit scope reserve against one cursor.
-    rate_limit_last: Option<Rc<Cell<u64>>>,
-    retry_base_ms: u64,
-    network_max_retries: u32,
+    rate_limit_last: Option<Rc<Cell<u64>>>
+        = default None, read RATE_LIMIT_LAST.with(|last| last.borrow().clone()), write |v| RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = v);
+    retry_base_ms: u64
+        = default 500, read RETRY_BASE_MS.with(|base| base.get()), write |v| RETRY_BASE_MS.with(|base| base.set(v));
+    network_max_retries: u32
+        = default 3, read NETWORK_MAX_RETRIES.with(|retries| retries.get()), write |v| NETWORK_MAX_RETRIES.with(|retries| retries.set(v));
     /// The active budget frame, shared by `Rc` so concurrent siblings charge one aggregate.
-    budget: Option<Rc<RefCell<BudgetFrame>>>,
+    budget: Option<Rc<RefCell<BudgetFrame>>>
+        = default None, read ACTIVE_BUDGET.with(|b| b.borrow().clone()), write |v| ACTIVE_BUDGET.with(|b| *b.borrow_mut() = v);
     /// Saved outer budget frames for nested `llm/with-budget` scopes (TASK-PRIVATE
     /// bookkeeping). A push saves the frame in force; the matching pop restores it.
     /// Parking this stack onto the task is what lets interleaved nested budget scopes
@@ -1156,89 +1206,22 @@ struct LlmDynScope {
     /// would pop a sibling's frame out of LIFO order. The saved frames are shared by
     /// `Rc` (a restored outer frame is the same aggregate), but the stack structure is
     /// per-task.
-    budget_stack: Vec<Option<Rc<RefCell<BudgetFrame>>>>,
+    budget_stack: Vec<Option<Rc<RefCell<BudgetFrame>>>>
+        = default Vec::new(), read BUDGET_STACK.with(|s| s.borrow().clone()), write |v| BUDGET_STACK.with(|stack| *stack.borrow_mut() = v);
     /// Custom per-model pricing overrides (TASK-SNAPSHOT config). Parked onto the task so
     /// a sibling's `(llm/set-pricing ...)` never reprices a suspended task's usage.
-    custom_pricing: std::collections::HashMap<String, (f64, f64)>,
+    custom_pricing: std::collections::HashMap<String, (f64, f64)>
+        = default std::collections::HashMap::new(), read pricing::snapshot_custom_pricing(), write pricing::restore_custom_pricing;
     /// The cassette selected by this scope. Spawned siblings share one tape so
     /// replay and recording remain coherent across quantum boundaries.
-    cassette: Option<CassetteScope>,
-    policies: Vec<ActivePolicy>,
-    policy_bypass: Vec<String>,
-    policy_agent_id: Option<String>,
-}
-
-impl Default for LlmDynScope {
-    fn default() -> Self {
-        LlmDynScope {
-            cache_enabled: false,
-            cache_ttl_secs: 3600,
-            stream_budget_pregate: false,
-            call_tags: Vec::new(),
-            call_meta: Vec::new(),
-            last_usage: None,
-            fallback_chain: None,
-            rate_limit_rps: None,
-            rate_limit_last: None,
-            retry_base_ms: 500,
-            network_max_retries: 3,
-            budget: None,
-            budget_stack: Vec::new(),
-            custom_pricing: std::collections::HashMap::new(),
-            cassette: None,
-            policies: Vec::new(),
-            policy_bypass: Vec::new(),
-            policy_agent_id: None,
-        }
-    }
-}
-
-/// Read (clone) the current thread's LLM dynamic scope without disturbing it.
-fn read_llm_scope() -> LlmDynScope {
-    LlmDynScope {
-        cache_enabled: CACHE_ENABLED.with(|c| c.get()),
-        cache_ttl_secs: CACHE_TTL_SECS.with(|c| c.get()),
-        stream_budget_pregate: STREAM_BUDGET_PREGATE.with(|c| c.get()),
-        call_tags: CALL_TAGS.with(|t| t.borrow().clone()),
-        call_meta: CALL_META.with(|m| m.borrow().clone()),
-        last_usage: LAST_USAGE.with(|u| u.borrow().clone()),
-        fallback_chain: FALLBACK_CHAIN.with(|c| c.borrow().clone()),
-        rate_limit_rps: RATE_LIMIT_RPS.with(|r| r.get()),
-        rate_limit_last: RATE_LIMIT_LAST.with(|last| last.borrow().clone()),
-        retry_base_ms: RETRY_BASE_MS.with(|base| base.get()),
-        network_max_retries: NETWORK_MAX_RETRIES.with(|retries| retries.get()),
-        budget: ACTIVE_BUDGET.with(|b| b.borrow().clone()),
-        budget_stack: BUDGET_STACK.with(|s| s.borrow().clone()),
-        custom_pricing: pricing::snapshot_custom_pricing(),
-        cassette: CASSETTE.with(|c| c.borrow().clone()),
-        policies: ACTIVE_POLICIES.with(|policies| policies.borrow().clone()),
-        policy_bypass: POLICY_BYPASS.with(|bypass| bypass.borrow().clone()),
-        policy_agent_id: POLICY_AGENT_ID.with(|agent| agent.borrow().clone()),
-    }
-}
-
-/// Overwrite the current thread's LLM dynamic scope with `s`, returning the previous one.
-fn write_llm_scope(s: LlmDynScope) -> LlmDynScope {
-    let prev = read_llm_scope();
-    CACHE_ENABLED.with(|c| c.set(s.cache_enabled));
-    CACHE_TTL_SECS.with(|c| c.set(s.cache_ttl_secs));
-    STREAM_BUDGET_PREGATE.with(|c| c.set(s.stream_budget_pregate));
-    CALL_TAGS.with(|t| *t.borrow_mut() = s.call_tags);
-    CALL_META.with(|m| *m.borrow_mut() = s.call_meta);
-    LAST_USAGE.with(|u| *u.borrow_mut() = s.last_usage);
-    FALLBACK_CHAIN.with(|c| *c.borrow_mut() = s.fallback_chain);
-    RATE_LIMIT_RPS.with(|r| r.set(s.rate_limit_rps));
-    RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = s.rate_limit_last);
-    RETRY_BASE_MS.with(|base| base.set(s.retry_base_ms));
-    NETWORK_MAX_RETRIES.with(|retries| retries.set(s.network_max_retries));
-    ACTIVE_BUDGET.with(|b| *b.borrow_mut() = s.budget);
-    BUDGET_STACK.with(|stack| *stack.borrow_mut() = s.budget_stack);
-    pricing::restore_custom_pricing(s.custom_pricing);
-    CASSETTE.with(|c| *c.borrow_mut() = s.cassette);
-    ACTIVE_POLICIES.with(|policies| *policies.borrow_mut() = s.policies);
-    POLICY_BYPASS.with(|bypass| *bypass.borrow_mut() = s.policy_bypass);
-    POLICY_AGENT_ID.with(|agent| *agent.borrow_mut() = s.policy_agent_id);
-    prev
+    cassette: Option<CassetteScope>
+        = default None, read CASSETTE.with(|c| c.borrow().clone()), write |v| CASSETTE.with(|c| *c.borrow_mut() = v);
+    policies: Vec<ActivePolicy>
+        = default Vec::new(), read ACTIVE_POLICIES.with(|policies| policies.borrow().clone()), write |v| ACTIVE_POLICIES.with(|policies| *policies.borrow_mut() = v);
+    policy_bypass: Vec<String>
+        = default Vec::new(), read POLICY_BYPASS.with(|bypass| bypass.borrow().clone()), write |v| POLICY_BYPASS.with(|bypass| *bypass.borrow_mut() = v);
+    policy_agent_id: Option<String>
+        = default None, read POLICY_AGENT_ID.with(|agent| agent.borrow().clone()), write |v| POLICY_AGENT_ID.with(|agent| *agent.borrow_mut() = v);
 }
 
 /// Capture (clone) the LLM dynamic scope to seed onto a freshly-spawned task.

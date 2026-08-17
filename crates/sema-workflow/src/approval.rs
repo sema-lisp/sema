@@ -514,22 +514,7 @@ pub fn ensure_request(
         }
     };
 
-    let decision_path = decision_path(run_dir, &request.approval_id);
-    if !path_entry_exists(&decision_path)? {
-        return Ok(ApprovalResolution::Pending(request));
-    }
-    let decision: ApprovalDecision = match read_json(&decision_path) {
-        Ok(decision) => decision,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(ApprovalResolution::Pending(request));
-        }
-        Err(error) => return Err(error),
-    };
-    decision.validate_for(&request)?;
-    Ok(match decision.decision {
-        ApprovalDecisionKind::Approve => ApprovalResolution::Approved(request, decision),
-        ApprovalDecisionKind::Reject => ApprovalResolution::Rejected(request, decision),
-    })
+    read_resolution(run_dir, request)
 }
 
 #[allow(clippy::too_many_arguments)]

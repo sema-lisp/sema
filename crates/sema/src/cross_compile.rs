@@ -198,6 +198,39 @@ pub(crate) fn http_client() -> Result<reqwest::blocking::Client, reqwest::Error>
         .build()
 }
 
+/// Map a non-success HTTP status from a runtime-download request to a
+/// user-facing error: a `404` (no release assets, e.g. a dev build) with
+/// `--runtime`/`SEMA_RUNTIME_BASE_URL` hints, a `403`/`429` (GitHub rate
+/// limit) with a mirror hint, or a generic `HTTP {status}` fallback naming
+/// `what` (`"checksum"` or `"runtime"`) that was being downloaded.
+fn github_status_error(
+    status: reqwest::StatusCode,
+    what: &str,
+    target: &str,
+    version: &str,
+    has_custom_base: bool,
+) -> Box<dyn std::error::Error> {
+    if status.as_u16() == 404 {
+        let mut msg = format!(
+            "No runtime release found for {target} (v{version}). \
+             You may be running a dev build without published release assets.\n  \
+             Hint: use `--runtime /path/to/sema` to provide a runtime binary manually."
+        );
+        if !has_custom_base {
+            msg.push_str(
+                "\n  Hint: set SEMA_RUNTIME_BASE_URL to use a different release location.",
+            );
+        }
+        msg.into()
+    } else if status.as_u16() == 403 || status.as_u16() == 429 {
+        "GitHub rate-limited the download. \
+             Try again later or set SEMA_RUNTIME_BASE_URL to use a mirror."
+            .into()
+    } else {
+        format!("failed to download {what} for {target}: HTTP {status}").into()
+    }
+}
+
 /// Download, verify, and extract the runtime binary for a given target.
 ///
 /// Streams the download to a temp file (hashing incrementally) to avoid
@@ -228,26 +261,13 @@ fn download_runtime(
         .send()
         .map_err(|e| format!("failed to download checksum for {target}: {e}"))?;
     if !checksum_response.status().is_success() {
-        let status = checksum_response.status();
-        if status.as_u16() == 404 {
-            let mut msg = format!(
-                "No runtime release found for {target} (v{version}). \
-                 You may be running a dev build without published release assets.\n  \
-                 Hint: use `--runtime /path/to/sema` to provide a runtime binary manually."
-            );
-            if !has_custom_base {
-                msg.push_str(
-                    "\n  Hint: set SEMA_RUNTIME_BASE_URL to use a different release location.",
-                );
-            }
-            return Err(msg.into());
-        } else if status.as_u16() == 403 || status.as_u16() == 429 {
-            return Err("GitHub rate-limited the download. \
-                 Try again later or set SEMA_RUNTIME_BASE_URL to use a mirror."
-                .into());
-        } else {
-            return Err(format!("failed to download checksum for {target}: HTTP {status}").into());
-        }
+        return Err(github_status_error(
+            checksum_response.status(),
+            "checksum",
+            target,
+            version,
+            has_custom_base,
+        ));
     }
     let checksum_text = checksum_response
         .text()
@@ -296,28 +316,13 @@ fn download_runtime(
             .send()
             .map_err(|e| format!("failed to download runtime for {target}: {e}"))?;
         if !response.status().is_success() {
-            let status = response.status();
-            if status.as_u16() == 404 {
-                let mut msg = format!(
-                    "No runtime release found for {target} (v{version}). \
-                     You may be running a dev build without published release assets.\n  \
-                     Hint: use `--runtime /path/to/sema` to provide a runtime binary manually."
-                );
-                if !has_custom_base {
-                    msg.push_str(
-                        "\n  Hint: set SEMA_RUNTIME_BASE_URL to use a different release location.",
-                    );
-                }
-                return Err(msg.into());
-            } else if status.as_u16() == 403 || status.as_u16() == 429 {
-                return Err("GitHub rate-limited the download. \
-                     Try again later or set SEMA_RUNTIME_BASE_URL to use a mirror."
-                    .into());
-            } else {
-                return Err(
-                    format!("failed to download runtime for {target}: HTTP {status}").into(),
-                );
-            }
+            return Err(github_status_error(
+                response.status(),
+                "runtime",
+                target,
+                version,
+                has_custom_base,
+            ));
         }
         // Live progress bar only when a human is watching and the size is known;
         // piped/CI output keeps the single "Downloading..." line, no bar frames.
@@ -553,6 +558,62 @@ pub fn list_targets() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // github_status_error
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_github_status_error_404_hints_runtime_flag() {
+        let err = github_status_error(
+            reqwest::StatusCode::NOT_FOUND,
+            "runtime",
+            "x86_64-unknown-linux-gnu",
+            "1.0.0",
+            false,
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("No runtime release found"));
+        assert!(msg.contains("--runtime /path/to/sema"));
+        assert!(msg.contains("SEMA_RUNTIME_BASE_URL"));
+    }
+
+    #[test]
+    fn test_github_status_error_404_omits_base_url_hint_when_already_custom() {
+        let err = github_status_error(
+            reqwest::StatusCode::NOT_FOUND,
+            "runtime",
+            "x86_64-unknown-linux-gnu",
+            "1.0.0",
+            true,
+        );
+        assert!(!err.to_string().contains("SEMA_RUNTIME_BASE_URL"));
+    }
+
+    #[test]
+    fn test_github_status_error_rate_limited() {
+        for status in [
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+        ] {
+            let err = github_status_error(status, "checksum", "target", "1.0.0", false);
+            assert!(err.to_string().contains("rate-limited"));
+        }
+    }
+
+    #[test]
+    fn test_github_status_error_other_names_what() {
+        let err = github_status_error(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "checksum",
+            "target",
+            "1.0.0",
+            false,
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("failed to download checksum for target"));
+        assert!(msg.contains("500"));
+    }
 
     // -----------------------------------------------------------------------
     // resolve_target

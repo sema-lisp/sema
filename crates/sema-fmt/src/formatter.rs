@@ -828,6 +828,33 @@ impl Formatter {
     }
 
     /// Format a single node at the given indentation level.
+    /// Try to render `children` as a single flat line: no inner comments, not
+    /// originally multi-line anywhere in the tree (respect layout intent), an
+    /// additional caller-supplied guard (e.g. `format_list`'s
+    /// `!should_force_multiline`), and the result fits `self.width`. On success,
+    /// writes the flat form and returns `true`; on failure, writes nothing and
+    /// returns `false` so the caller falls through to its multi-line layout.
+    fn try_flat(
+        &mut self,
+        children: &[Node],
+        indent: usize,
+        open: &str,
+        close: &str,
+        extra_ok: bool,
+    ) -> bool {
+        let has_comments = children.iter().any(has_any_comments);
+        let originally_multiline = children.iter().any(has_any_newlines);
+        if has_comments || originally_multiline || !extra_ok {
+            return false;
+        }
+        let one_line = flat_string(children, open, close);
+        if indent + one_line.len() > self.width {
+            return false;
+        }
+        self.output.push_str(&one_line);
+        true
+    }
+
     fn format_node(&mut self, node: &Node, indent: usize) {
         match node {
             Node::Atom(tok) => {
@@ -885,19 +912,18 @@ impl Formatter {
         }
 
         let kind = classify_form(children);
-        let has_comments = children.iter().any(has_any_comments);
-        let originally_multiline = children.iter().any(has_any_newlines);
 
-        // Try one-line format:
-        // - No inner comments
-        // - Not originally multi-line anywhere in tree (respect layout intent)
-        // - No structural reason to force multi-line (e.g. 2+ body exprs)
-        if !has_comments && !originally_multiline && !should_force_multiline(kind, &semantic) {
-            let one_line = flat_string(children, open, close);
-            if indent + one_line.len() <= self.width {
-                self.output.push_str(&one_line);
-                return;
-            }
+        // Try one-line format (no structural reason to force multi-line, e.g. 2+
+        // body exprs, on top of try_flat's own no-comments/not-originally-multiline/
+        // fits-width checks).
+        if self.try_flat(
+            children,
+            indent,
+            open,
+            close,
+            !should_force_multiline(kind, &semantic),
+        ) {
+            return;
         }
 
         // Multi-line: dispatch based on form kind
@@ -1324,17 +1350,9 @@ impl Formatter {
             return self.format_empty_with_comments(children, indent, open, close);
         }
 
-        // If children contain comments, force multi-line to preserve them
-        let has_comments = children.iter().any(has_any_comments);
-        let originally_multiline = children.iter().any(has_any_newlines);
-
         // Try one-line first (only if no inner comments and not originally multi-line)
-        if !has_comments && !originally_multiline {
-            let one_line = flat_string(children, open, close);
-            if indent + one_line.len() <= self.width {
-                self.output.push_str(&one_line);
-                return;
-            }
+        if self.try_flat(children, indent, open, close, true) {
+            return;
         }
 
         self.output.push_str(open);
@@ -1436,14 +1454,8 @@ impl Formatter {
         let kv_start = if head_name == "assoc" { 2 } else { 1 };
 
         // Try one-line first
-        let has_comments = children.iter().any(has_any_comments);
-        let originally_multiline = children.iter().any(has_any_newlines);
-        if !has_comments && !originally_multiline {
-            let one_line = flat_string(children, open, close);
-            if indent + one_line.len() <= self.width {
-                self.output.push_str(&one_line);
-                return;
-            }
+        if self.try_flat(children, indent, open, close, true) {
+            return;
         }
 
         let pair_indent = indent + self.indent_size;
@@ -1550,18 +1562,14 @@ impl Formatter {
             return self.format_empty_with_comments(children, indent, open, close);
         }
 
+        // Try one-line (only if no inner comments and not originally multi-line)
+        if self.try_flat(children, indent, open, close, true) {
+            return;
+        }
+
         // If children contain comments, force multi-line to preserve them
         let has_comments = children.iter().any(has_any_comments);
         let originally_multiline = children.iter().any(has_any_newlines);
-
-        // Try one-line (only if no inner comments and not originally multi-line)
-        if !has_comments && !originally_multiline {
-            let one_line = flat_string(children, open, close);
-            if indent + one_line.len() <= self.width {
-                self.output.push_str(&one_line);
-                return;
-            }
-        }
 
         // Multi-line bytevector: preserve the user's own row breaks (a
         // hand-arranged grid is often meaningful); wrap at the width only
@@ -1688,18 +1696,13 @@ impl Formatter {
             return self.format_empty_with_comments(children, indent, open, close);
         }
 
+        // Try one-line (only if no inner comments and not originally multi-line)
+        if self.try_flat(children, indent, open, close, true) {
+            return;
+        }
+
         // If children contain comments, force multi-line to preserve them
         let has_comments = children.iter().any(has_any_comments);
-        let originally_multiline = children.iter().any(has_any_newlines);
-
-        // Try one-line (only if no inner comments and not originally multi-line)
-        if !has_comments && !originally_multiline {
-            let one_line = flat_string(children, open, close);
-            if indent + one_line.len() <= self.width {
-                self.output.push_str(&one_line);
-                return;
-            }
-        }
 
         // Multi-line: align map values when possible, otherwise preserve comments.
         let pair_indent = indent + open.len();

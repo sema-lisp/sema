@@ -183,8 +183,8 @@ impl McpClient {
     /// the last request was refused for auth (Streamable HTTP or legacy SSE).
     pub fn http_challenge(&self) -> Option<String> {
         match &self.transport {
-            Transport::Http(t) => t.last_challenge.clone(),
-            Transport::LegacySse(t) => t.last_challenge.clone(),
+            Transport::Http(t) => t.auth.last_challenge.clone(),
+            Transport::LegacySse(t) => t.auth.last_challenge.clone(),
             Transport::Stdio(_) => None,
         }
     }
@@ -194,8 +194,8 @@ impl McpClient {
     /// `405`) or a mid-session auth challenge (`401`/`403`).
     pub fn http_last_status(&self) -> Option<u16> {
         match &self.transport {
-            Transport::Http(t) => t.last_status,
-            Transport::LegacySse(t) => t.last_status,
+            Transport::Http(t) => t.auth.last_status,
+            Transport::LegacySse(t) => t.auth.last_status,
             Transport::Stdio(_) => None,
         }
     }
@@ -477,6 +477,33 @@ impl Drop for StdioTransport {
 // Streamable HTTP transport
 // ---------------------------------------------------------------------------
 
+/// Auth-challenge/status tracking shared by `HttpTransport` and
+/// `LegacySseTransport`: the status and `WWW-Authenticate` header of the most
+/// recent non-success response, so the auth layer can detect a legacy server
+/// (`404`/`405`) or discover where to log in and retry (`401`/`403`).
+#[derive(Default)]
+struct HttpAuthState {
+    last_status: Option<u16>,
+    last_challenge: Option<String>,
+}
+
+impl HttpAuthState {
+    /// Record a response's status/challenge, clearing both on success.
+    fn record(&mut self, response: &reqwest::Response) {
+        let status = response.status();
+        self.last_status = (!status.is_success()).then_some(status.as_u16());
+        self.last_challenge = if status.is_success() {
+            None
+        } else {
+            response
+                .headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+    }
+}
+
 struct HttpTransport {
     client: reqwest::Client,
     url: String,
@@ -487,12 +514,7 @@ struct HttpTransport {
     /// The protocol version negotiated in `InitializeResult`, sent back as the
     /// `MCP-Protocol-Version` header on all following requests.
     protocol_version: Option<String>,
-    /// The `WWW-Authenticate` header from the most recent `401`, so the auth
-    /// layer can discover where to log in and retry.
-    last_challenge: Option<String>,
-    /// The status code of the most recent non-success response, so a caller can
-    /// detect a `404`/`405` that signals a legacy (HTTP+SSE) server.
-    last_status: Option<u16>,
+    auth: HttpAuthState,
 }
 
 impl HttpTransport {
@@ -510,8 +532,7 @@ impl HttpTransport {
             headers: config.headers,
             session_id: None,
             protocol_version: None,
-            last_challenge: None,
-            last_status: None,
+            auth: HttpAuthState::default(),
         })
     }
 
@@ -576,19 +597,10 @@ impl HttpTransport {
         self.capture_session(&response);
 
         let status = response.status();
-        self.last_status = (!status.is_success()).then_some(status.as_u16());
         // Record any `WWW-Authenticate` challenge (cleared on success) so the auth
         // layer can re-authorize and retry — a `401` (token missing/expired) or a
         // `403 insufficient_scope` (needs step-up). Reflects the current response.
-        self.last_challenge = if status.is_success() {
-            None
-        } else {
-            response
-                .headers()
-                .get("www-authenticate")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-        };
+        self.auth.record(&response);
         if status.as_u16() == 404 {
             // Session was terminated/expired; per the spec the client must start
             // a fresh session with a new `initialize`. Surface it so the caller
@@ -757,8 +769,7 @@ struct LegacySseTransport {
     /// Status + `WWW-Authenticate` of the most recent POST failure, so a mid-
     /// session `401`/`403` on a legacy server can be re-authorized like an HTTP
     /// one (parity — many servers still run this transport).
-    last_status: Option<u16>,
-    last_challenge: Option<String>,
+    auth: HttpAuthState,
 }
 
 impl LegacySseTransport {
@@ -794,8 +805,7 @@ impl LegacySseTransport {
             headers: config.headers,
             stream: Box::pin(stream),
             buffer: Vec::new(),
-            last_status: None,
-            last_challenge: None,
+            auth: HttpAuthState::default(),
         };
 
         // The first meaningful event names the POST endpoint.
@@ -852,16 +862,7 @@ impl LegacySseTransport {
             .await
             .map_err(|err| format!("legacy SSE POST failed: {err}"))?;
         let status = response.status();
-        self.last_status = (!status.is_success()).then_some(status.as_u16());
-        self.last_challenge = if status.is_success() {
-            None
-        } else {
-            response
-                .headers()
-                .get("www-authenticate")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-        };
+        self.auth.record(&response);
         if !status.is_success() {
             return Err(format!("legacy SSE POST returned HTTP {}", status.as_u16()));
         }

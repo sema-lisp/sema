@@ -926,9 +926,9 @@ fn call_mcp_tool_inner(
 
     match name {
         "run_file" => {
-            let file_path = match arguments.get("file_path").and_then(|v| v.as_str()) {
-                Some(p) => p,
-                None => return error_result("Missing required parameter: file_path"),
+            let file_path = match require_str(arguments, "file_path") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
             let args = arguments.get("arguments").and_then(|v| v.as_array());
 
@@ -996,9 +996,9 @@ fn call_mcp_tool_inner(
             }
         }
         "compile" => {
-            let source_path = match arguments.get("source_path").and_then(|v| v.as_str()) {
-                Some(p) => p,
-                None => return error_result("Missing required parameter: source_path"),
+            let source_path = match require_str(arguments, "source_path") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
             let output_path = arguments.get("output_path").and_then(|v| v.as_str());
 
@@ -1035,9 +1035,9 @@ fn call_mcp_tool_inner(
             success_result(format!("Compiled successfully to {}", out_path.display()))
         }
         "eval" => {
-            let code = match arguments.get("code").and_then(|v| v.as_str()) {
-                Some(c) => c,
-                None => return error_result("Missing required parameter: code"),
+            let code = match require_str(arguments, "code") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
 
             let (res, stdout) = eval_with_capture(|| interpreter.eval_str_compiled(code));
@@ -1061,9 +1061,9 @@ fn call_mcp_tool_inner(
             }
         }
         "docs" => {
-            let symbol = match arguments.get("symbol").and_then(|v| v.as_str()) {
-                Some(s) => s,
-                None => return error_result("Missing required parameter: symbol"),
+            let symbol = match require_str(arguments, "symbol") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
 
             // First check user-defined deftool in env
@@ -1103,9 +1103,9 @@ fn call_mcp_tool_inner(
             }
         }
         "docs_search" => {
-            let query = match arguments.get("query").and_then(|v| v.as_str()) {
-                Some(q) => q,
-                None => return error_result("Missing required parameter: query"),
+            let query = match require_str(arguments, "query") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
             let limit = arguments
                 .get("limit")
@@ -1151,9 +1151,9 @@ fn call_mcp_tool_inner(
             }
         }
         "disasm" => {
-            let file_path = match arguments.get("file_path").and_then(|v| v.as_str()) {
-                Some(f) => f,
-                None => return error_result("Missing required parameter: file_path"),
+            let file_path = match require_str(arguments, "file_path") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
 
             let bytes = match std::fs::read(file_path) {
@@ -1198,13 +1198,13 @@ fn call_mcp_tool_inner(
             success_result(disasm_str)
         }
         "build" => {
-            let source_path = match arguments.get("source_path").and_then(|v| v.as_str()) {
-                Some(s) => s,
-                None => return error_result("Missing required parameter: source_path"),
+            let source_path = match require_str(arguments, "source_path") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
-            let output_path = match arguments.get("output_path").and_then(|v| v.as_str()) {
-                Some(o) => o,
-                None => return error_result("Missing required parameter: output_path"),
+            let output_path = match require_str(arguments, "output_path") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
 
             // Call standard sema command line tool using current executable
@@ -1244,9 +1244,9 @@ fn call_mcp_tool_inner(
         }
         // Stateful Notebook operations
         "notebook/new" => {
-            let path_str = match arguments.get("path").and_then(|v| v.as_str()) {
-                Some(p) => p,
-                None => return error_result("Missing required parameter: path"),
+            let path_str = match require_str(arguments, "path") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
             let title = arguments.get("title").and_then(|v| v.as_str());
             let overwrite = arguments
@@ -1263,9 +1263,9 @@ fn call_mcp_tool_inner(
             }
         }
         "notebook/read" => {
-            let path_str = match arguments.get("path").and_then(|v| v.as_str()) {
-                Some(p) => p,
-                None => return error_result("Missing required parameter: path"),
+            let path_str = match require_str(arguments, "path") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
 
             match get_or_create_engine(notebook_cache, path_str) {
@@ -1278,17 +1278,17 @@ fn call_mcp_tool_inner(
             }
         }
         "notebook/add_cell" => {
-            let path_str = match arguments.get("path").and_then(|v| v.as_str()) {
-                Some(p) => p,
-                None => return error_result("Missing required parameter: path"),
+            let path_str = match require_str(arguments, "path") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
-            let cell_type = match arguments.get("type").and_then(|v| v.as_str()) {
-                Some(t) => t,
-                None => return error_result("Missing required parameter: type"),
+            let cell_type = match require_str(arguments, "type") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
-            let source = match arguments.get("source").and_then(|v| v.as_str()) {
-                Some(s) => s,
-                None => return error_result("Missing required parameter: source"),
+            let source = match require_str(arguments, "source") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
             let after_id = arguments.get("after_id").and_then(|v| v.as_str());
 
@@ -1310,13 +1310,13 @@ fn call_mcp_tool_inner(
             }
         }
         "notebook/update_cell" => {
-            let path_str = match arguments.get("path").and_then(|v| v.as_str()) {
-                Some(p) => p,
-                None => return error_result("Missing required parameter: path"),
+            let path_str = match require_str(arguments, "path") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
-            let cell_id = match arguments.get("id").and_then(|v| v.as_str()) {
-                Some(i) => i,
-                None => return error_result("Missing required parameter: id"),
+            let cell_id = match require_str(arguments, "id") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
             let source = arguments.get("source").and_then(|v| v.as_str());
             let cell_type = arguments.get("type").and_then(|v| v.as_str());
@@ -1339,13 +1339,13 @@ fn call_mcp_tool_inner(
             }
         }
         "notebook/delete_cell" => {
-            let path_str = match arguments.get("path").and_then(|v| v.as_str()) {
-                Some(p) => p,
-                None => return error_result("Missing required parameter: path"),
+            let path_str = match require_str(arguments, "path") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
-            let cell_id = match arguments.get("id").and_then(|v| v.as_str()) {
-                Some(i) => i,
-                None => return error_result("Missing required parameter: id"),
+            let cell_id = match require_str(arguments, "id") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
 
             match get_or_create_engine(notebook_cache, path_str) {
@@ -1359,13 +1359,13 @@ fn call_mcp_tool_inner(
             }
         }
         "notebook/eval_cell" => {
-            let path_str = match arguments.get("path").and_then(|v| v.as_str()) {
-                Some(p) => p,
-                None => return error_result("Missing required parameter: path"),
+            let path_str = match require_str(arguments, "path") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
-            let cell_id = match arguments.get("id").and_then(|v| v.as_str()) {
-                Some(i) => i,
-                None => return error_result("Missing required parameter: id"),
+            let cell_id = match require_str(arguments, "id") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
 
             match get_or_create_engine(notebook_cache, path_str) {
@@ -1398,9 +1398,9 @@ fn call_mcp_tool_inner(
             }
         }
         "notebook/eval_all" => {
-            let path_str = match arguments.get("path").and_then(|v| v.as_str()) {
-                Some(p) => p,
-                None => return error_result("Missing required parameter: path"),
+            let path_str = match require_str(arguments, "path") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
 
             match get_or_create_engine(notebook_cache, path_str) {
@@ -1438,13 +1438,13 @@ fn call_mcp_tool_inner(
             }
         }
         "notebook/export" => {
-            let path_str = match arguments.get("path").and_then(|v| v.as_str()) {
-                Some(p) => p,
-                None => return error_result("Missing required parameter: path"),
+            let path_str = match require_str(arguments, "path") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
-            let format = match arguments.get("format").and_then(|v| v.as_str()) {
-                Some(f) => f,
-                None => return error_result("Missing required parameter: format"),
+            let format = match require_str(arguments, "format") {
+                Ok(v) => v,
+                Err(e) => return e,
             };
             let output_path = arguments.get("output_path").and_then(|v| v.as_str());
 
@@ -1531,6 +1531,16 @@ fn error_result(text: impl Into<String>) -> CallToolResult {
         content: vec![ToolContent::Text { text: text.into() }],
         is_error: true,
     }
+}
+
+/// Extract a required string argument, or a `CallToolResult` error with the
+/// same "Missing required parameter: {name}" text every call site used to
+/// hand-roll.
+fn require_str<'a>(arguments: &'a JsonValue, name: &str) -> Result<&'a str, CallToolResult> {
+    arguments
+        .get(name)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| error_result(format!("Missing required parameter: {name}")))
 }
 
 #[cfg(test)]

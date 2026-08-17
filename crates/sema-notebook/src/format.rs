@@ -173,6 +173,17 @@ impl Notebook {
         self.cells.iter().position(|c| c.id == id)
     }
 
+    /// The 1-based ordinal of a code cell among code cells only (matching
+    /// `render::render_notebook`'s numbering), or `None` if `id` doesn't name
+    /// a code cell.
+    pub fn cell_number(&self, id: &str) -> Option<usize> {
+        self.cells
+            .iter()
+            .filter(|c| c.cell_type == CellType::Code)
+            .position(|c| c.id == id)
+            .map(|i| i + 1)
+    }
+
     /// Mark all cells after `index` as stale.
     pub fn mark_downstream_stale(&mut self, index: usize) {
         for cell in self.cells.iter_mut().skip(index + 1) {

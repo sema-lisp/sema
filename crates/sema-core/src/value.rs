@@ -1791,51 +1791,12 @@ impl Value {
     /// without perturbing the count (the collector's trial-deletion seed).
     /// `None` for floats and immediates.
     pub(crate) fn heap_strong_count(&self) -> Option<usize> {
-        /// Read the strong count of the `Rc<T>` whose data pointer is `ptr`.
-        ///
-        /// SAFETY: caller must pass the data pointer of a live `Rc<T>` with the
-        /// correct `T` for the value's tag (same tag→type table as `view()`,
-        /// `Clone`, and `Drop`). `ManuallyDrop` prevents the reconstructed `Rc`
-        /// from decrementing the count it merely reads — the established
-        /// pattern from `with_hashmap_mut_if_unique`.
-        unsafe fn count_at<T>(ptr: *const u8) -> usize {
-            let rc = std::mem::ManuallyDrop::new(unsafe { Rc::from_raw(ptr as *const T) });
-            Rc::strong_count(&rc)
-        }
         let ptr = self.heap_ptr()?;
-        let n = unsafe {
-            match get_tag(self.0) {
-                TAG_INT_BIG => count_at::<i64>(ptr),
-                TAG_BIGINT => count_at::<BigInt>(ptr),
-                TAG_RATIONAL => count_at::<BigRational>(ptr),
-                TAG_COMPLEX => count_at::<SemaComplex>(ptr),
-                TAG_STRING => count_at::<String>(ptr),
-                TAG_LIST | TAG_VECTOR => count_at::<Vec<Value>>(ptr),
-                TAG_MAP => count_at::<BTreeMap<Value, Value>>(ptr),
-                TAG_HASHMAP => count_at::<hashbrown::HashMap<Value, Value>>(ptr),
-                TAG_LAMBDA => count_at::<Lambda>(ptr),
-                TAG_MACRO => count_at::<Macro>(ptr),
-                TAG_NATIVE_FN => count_at::<NativeFn>(ptr),
-                TAG_PROMPT => count_at::<Prompt>(ptr),
-                TAG_MESSAGE => count_at::<Message>(ptr),
-                TAG_CONVERSATION => count_at::<Conversation>(ptr),
-                TAG_TOOL_DEF => count_at::<ToolDefinition>(ptr),
-                TAG_AGENT => count_at::<Agent>(ptr),
-                TAG_THUNK => count_at::<Thunk>(ptr),
-                TAG_RECORD => count_at::<Record>(ptr),
-                TAG_BYTEVECTOR => count_at::<Vec<u8>>(ptr),
-                TAG_MULTIMETHOD => count_at::<MultiMethod>(ptr),
-                TAG_STREAM => count_at::<StreamBox>(ptr),
-                TAG_F64_ARRAY => count_at::<Vec<f64>>(ptr),
-                TAG_I64_ARRAY => count_at::<Vec<i64>>(ptr),
-                TAG_ASYNC_PROMISE => count_at::<AsyncPromise>(ptr),
-                TAG_CHANNEL => count_at::<Channel>(ptr),
-                TAG_MUTABLE_ARRAY => count_at::<MutableArray>(ptr),
-                TAG_MUTABLE_CELL => count_at::<MutableCell>(ptr),
-                _ => unreachable!("invalid heap tag in heap_strong_count"),
-            }
-        };
-        Some(n)
+        // SAFETY: `ptr` is a live heap payload pointer for this value (guaranteed
+        // by `heap_ptr`'s tag/boxed checks), and every heap tag's `RcBox` header
+        // sits at the same `RC_HEADER` offset (the invariant `Clone`/`Drop` rely
+        // on, pinned by `tests::rc_header_matches_std_layout`).
+        Some(unsafe { rc_strong_cell(ptr).get() })
     }
 
     // -- Typed accessors (ergonomic, avoid full view match) --

@@ -28,8 +28,6 @@ thread_local! {
         s.insert("/".to_string());
         s
     });
-    /// Total bytes currently stored in the VFS
-    static VFS_TOTAL_BYTES: Cell<usize> = const { Cell::new(0) };
     /// Optional sink called with each completed output line as it is produced
     /// (installed via `setOutputSink`). The Web Worker uses it to stream
     /// `println` output to the main thread live, so a long-running program
@@ -404,6 +402,14 @@ const VFS_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024; // 16 MB total
 const VFS_MAX_FILE_BYTES: usize = 1024 * 1024; // 1 MB per file
 const VFS_MAX_FILES: usize = 256;
 
+/// Total bytes currently stored in the VFS, computed on demand instead of
+/// hand-maintained at every mutation site (at most `VFS_MAX_FILES` short
+/// strings, so an O(n) scan is not measurable — this is called once per
+/// write/append quota check and by the rare, JS-driven `vfsStats` query).
+fn vfs_total_bytes() -> usize {
+    VFS.with(|vfs| vfs.borrow().values().map(|s| s.len()).sum())
+}
+
 fn vfs_check_quota(file_name: &str, new_content_len: usize) -> Result<(), SemaError> {
     if new_content_len > VFS_MAX_FILE_BYTES {
         return Err(SemaError::eval(format!(
@@ -424,7 +430,7 @@ fn vfs_check_quota(file_name: &str, new_content_len: usize) -> Result<(), SemaEr
             )));
         }
 
-        let total = VFS_TOTAL_BYTES.with(|t| t.get());
+        let total = vfs_total_bytes();
         let new_total = total
             .saturating_add(new_content_len)
             .saturating_sub(old_len);
@@ -1269,16 +1275,8 @@ fn register_wasm_io(env: &Env) {
                 .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
             vfs_check_quota(path, content.len())?;
             VFS.with(|vfs| {
-                let mut map = vfs.borrow_mut();
-                let old_len = map.get(path.as_str()).map_or(0, |s| s.len());
-                map.insert(path.to_string(), content.to_string());
-                VFS_TOTAL_BYTES.with(|t| {
-                    t.set(
-                        t.get()
-                            .saturating_add(content.len())
-                            .saturating_sub(old_len),
-                    );
-                });
+                vfs.borrow_mut()
+                    .insert(path.to_string(), content.to_string());
             });
             Ok(Value::nil())
         }),
@@ -1311,10 +1309,7 @@ fn register_wasm_io(env: &Env) {
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
             let path = &normalize_path(path)?;
             VFS.with(|vfs| match vfs.borrow_mut().remove(path.as_str()) {
-                Some(old) => {
-                    VFS_TOTAL_BYTES.with(|t| t.set(t.get().saturating_sub(old.len())));
-                    Ok(Value::nil())
-                }
+                Some(_) => Ok(Value::nil()),
                 None => Err(SemaError::Io(format!("file/delete {path}: No such file"))),
             })
         }),
@@ -1338,9 +1333,7 @@ fn register_wasm_io(env: &Env) {
                 let mut map = vfs.borrow_mut();
                 match map.remove(from.as_str()) {
                     Some(content) => {
-                        let overwritten_len = map.get(to.as_str()).map_or(0, |s| s.len());
                         map.insert(to.to_string(), content);
-                        VFS_TOTAL_BYTES.with(|t| t.set(t.get().saturating_sub(overwritten_len)));
                         Ok(Value::nil())
                     }
                     None => Err(SemaError::Io(format!(
@@ -1481,7 +1474,6 @@ fn register_wasm_io(env: &Env) {
                     .and_modify(|existing| existing.push_str(content))
                     .or_insert_with(|| content.to_string());
             });
-            VFS_TOTAL_BYTES.with(|t| t.set(t.get() + content.len()));
             Ok(Value::nil())
         }),
     );
@@ -1508,15 +1500,7 @@ fn register_wasm_io(env: &Env) {
                         drop(map);
                         vfs_check_quota(dest, content.len())?;
                         let mut map = vfs.borrow_mut();
-                        let old_len = map.get(dest.as_str()).map_or(0, |s| s.len());
                         map.insert(dest.to_string(), content.clone());
-                        VFS_TOTAL_BYTES.with(|t| {
-                            t.set(
-                                t.get()
-                                    .saturating_add(content.len())
-                                    .saturating_sub(old_len),
-                            );
-                        });
                         Ok(Value::nil())
                     }
                     None => Err(SemaError::Io(format!(
@@ -1578,14 +1562,8 @@ fn register_wasm_io(env: &Env) {
                 .collect();
             let content = strs.join("\n");
             vfs_check_quota(path, content.len())?;
-            let content_len = content.len();
             VFS.with(|vfs| {
-                let mut map = vfs.borrow_mut();
-                let old_len = map.get(path.as_str()).map_or(0, |s| s.len());
-                map.insert(path.to_string(), content);
-                VFS_TOTAL_BYTES.with(|t| {
-                    t.set(t.get().saturating_add(content_len).saturating_sub(old_len));
-                });
+                vfs.borrow_mut().insert(path.to_string(), content);
             });
             Ok(Value::nil())
         }),
@@ -3224,16 +3202,8 @@ impl WasmInterpreter {
         match vfs_check_quota(&path, content.len()) {
             Ok(()) => {
                 VFS.with(|vfs| {
-                    let mut map = vfs.borrow_mut();
-                    let old_len = map.get(&path).map_or(0, |s| s.len());
-                    map.insert(path.to_string(), content.to_string());
-                    VFS_TOTAL_BYTES.with(|t| {
-                        t.set(
-                            t.get()
-                                .saturating_add(content.len())
-                                .saturating_sub(old_len),
-                        );
-                    });
+                    vfs.borrow_mut()
+                        .insert(path.to_string(), content.to_string());
                 });
                 JsValue::NULL
             }
@@ -3248,13 +3218,7 @@ impl WasmInterpreter {
             Ok(p) => p,
             Err(_) => return false,
         };
-        VFS.with(|vfs| match vfs.borrow_mut().remove(&path) {
-            Some(old) => {
-                VFS_TOTAL_BYTES.with(|t| t.set(t.get().saturating_sub(old.len())));
-                true
-            }
-            None => false,
-        })
+        VFS.with(|vfs| vfs.borrow_mut().remove(&path).is_some())
     }
 
     /// List files and directories in the given directory path.
@@ -3342,7 +3306,7 @@ impl WasmInterpreter {
     #[wasm_bindgen(js_name = vfsStats)]
     pub fn vfs_stats(&self) -> JsValue {
         let file_count = VFS.with(|vfs| vfs.borrow().len());
-        let total_bytes = VFS_TOTAL_BYTES.with(|t| t.get());
+        let total_bytes = vfs_total_bytes();
         let json_str = format!(
             "{{\"files\":{},\"bytes\":{},\"maxFiles\":{},\"maxBytes\":{},\"maxFileBytes\":{}}}",
             file_count, total_bytes, VFS_MAX_FILES, VFS_MAX_TOTAL_BYTES, VFS_MAX_FILE_BYTES
@@ -3359,7 +3323,6 @@ impl WasmInterpreter {
             set.clear();
             set.insert("/".to_string());
         });
-        VFS_TOTAL_BYTES.with(|t| t.set(0));
     }
 
     /// Snapshot the entire VFS as a plain JS object `{ files: {path: content},
@@ -3404,7 +3367,6 @@ impl WasmInterpreter {
                         continue;
                     };
                     if let Some(content) = val.as_string() {
-                        VFS_TOTAL_BYTES.with(|t| t.set(t.get() + content.len()));
                         VFS.with(|vfs| {
                             vfs.borrow_mut().insert(path, content);
                         });

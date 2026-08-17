@@ -313,19 +313,17 @@ fn checkout_runtime<T: Send + 'static>(
     decode: impl FnOnce(T) -> Value + 'static,
     abort: Option<Box<dyn FnOnce()>>,
 ) -> NativeResult {
-    let kind =
-        CompletionKind::try_from_raw(PTY_COMPLETION_KIND).expect("pty completion kind is nonzero");
     let gate = PTY_GATES.with(|g| g.borrow().get(&id).cloned());
-    checkout_external(CheckoutOp {
+    crate::runtime_offload::checkout_runtime_op(
         op_name,
-        kind,
+        PTY_COMPLETION_KIND,
         gate,
-        store_gate: Box::new(move |gid| {
+        Box::new(move |gid| {
             PTY_GATES.with(|g| {
                 g.borrow_mut().insert(id, gid);
             });
         }),
-        remove_gate: Rc::new(move |gid| {
+        Rc::new(move |gid| {
             PTY_GATES.with(|g| {
                 let mut gates = g.borrow_mut();
                 if gates.get(&id).map(ResourceGateHandle::id) == Some(gid) {
@@ -333,24 +331,21 @@ fn checkout_runtime<T: Send + 'static>(
                 }
             });
         }),
-        take: Box::new(move || take_pty(op_name, id)),
-        op: Box::new(op),
-        reinstall: Box::new(move |pt| {
+        Box::new(move || take_pty(op_name, id)),
+        op,
+        Box::new(move |pt| {
             PTYS.with(|p| {
                 p.borrow_mut().insert(id, PtySlot::Available(pt));
             });
         }),
-        decode: Box::new(move |t| Ok(decode(t))),
-        success_value: None,
-        tombstone: Rc::new(move |msg| {
+        decode,
+        Rc::new(move |msg| {
             PTYS.with(|p| {
                 p.borrow_mut().insert(id, PtySlot::Tombstone(msg));
             });
         }),
         abort,
-        reclaim: None,
-        terminal_on_success: false,
-    })
+    )
 }
 
 /// The async-context `pty/wait`: offload `child.wait()` + the reader-thread join

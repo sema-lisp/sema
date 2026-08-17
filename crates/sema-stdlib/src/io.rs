@@ -1391,6 +1391,43 @@ impl<T: Send + 'static> CompletionDecoder for ComputeDecoder<T> {
     }
 }
 
+/// The effective per-call cap: the module hard ceiling, lowered by any
+/// per-call override (never raised above the ceiling). Shared by the
+/// csv/secret/markup/crypto/diff/git cap-override seams.
+pub(crate) fn effective_cap<V: Copy + Ord>(override_val: Option<V>, hard_cap: V) -> V {
+    override_val.map_or(hard_cap, |over| over.min(hard_cap))
+}
+
+/// The shared "exceeds the quarantined limit" error. The exact wording is part
+/// of the observable contract (tests assert on it via `.contains(...)`), so the
+/// per-module checks build it here and add their own hint.
+pub(crate) fn quarantined_limit_error(
+    op: &str,
+    dimension: &str,
+    actual: u64,
+    limit: u64,
+) -> SemaError {
+    SemaError::eval(format!(
+        "{op}: {dimension} {actual} exceeds the quarantined limit {limit}"
+    ))
+}
+
+/// Reject `actual` over `limit` with the shared message plus this module's own
+/// hint. Reads an existing `len()`/count — no snapshot — so an over-cap input
+/// is rejected without any excess allocation.
+pub(crate) fn check_quarantined_limit(
+    op: &str,
+    dimension: &str,
+    actual: u64,
+    limit: u64,
+    hint: &str,
+) -> Result<(), SemaError> {
+    if actual > limit {
+        return Err(quarantined_limit_error(op, dimension, actual, limit).with_hint(hint));
+    }
+    Ok(())
+}
+
 /// Like [`fs_quarantined`], but for a pure CPU-bound compute (archive/pdf/diff/
 /// server-file) whose domain errors are surfaced through `SemaError::eval` (see
 /// [`ComputeDecoder`]). The `job` runs quarantined-bounded on the thread-pool

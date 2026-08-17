@@ -59,11 +59,10 @@ thread_local! {
 /// lowered by any per-call override (never raised above it).
 #[cfg(not(target_arch = "wasm32"))]
 fn effective_secret_input_byte_cap() -> u64 {
-    SECRET_INPUT_BYTE_CAP_OVERRIDE
-        .with(Cell::get)
-        .map_or(SECRET_INPUT_BYTE_CAP, |over| {
-            over.min(SECRET_INPUT_BYTE_CAP)
-        })
+    crate::io::effective_cap(
+        SECRET_INPUT_BYTE_CAP_OVERRIDE.with(Cell::get),
+        SECRET_INPUT_BYTE_CAP,
+    )
 }
 
 /// Lower the per-input byte cap (clamped to the hard ceiling) for subsequent
@@ -79,13 +78,13 @@ pub fn set_secret_input_byte_cap_override(bytes: Option<u64>) {
 /// excess allocation.
 #[cfg(not(target_arch = "wasm32"))]
 fn check_secret_limit(op: &str, actual: u64, limit: u64) -> Result<(), SemaError> {
-    if actual > limit {
-        return Err(SemaError::eval(format!(
-            "{op}: input bytes {actual} exceeds the quarantined limit {limit}"
-        ))
-        .with_hint("reduce or split the input text"));
-    }
-    Ok(())
+    crate::io::check_quarantined_limit(
+        op,
+        "input bytes",
+        actual,
+        limit,
+        "reduce or split the input text",
+    )
 }
 
 /// Decode an offloaded redaction result (owned `String`) into a `Value` on the

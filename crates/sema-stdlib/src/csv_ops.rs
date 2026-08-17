@@ -51,9 +51,10 @@ thread_local! {
 /// lowered by any per-call override (never raised above it).
 #[cfg(not(target_arch = "wasm32"))]
 fn effective_csv_input_byte_cap() -> u64 {
-    CSV_INPUT_BYTE_CAP_OVERRIDE
-        .with(Cell::get)
-        .map_or(CSV_INPUT_BYTE_CAP, |over| over.min(CSV_INPUT_BYTE_CAP))
+    crate::io::effective_cap(
+        CSV_INPUT_BYTE_CAP_OVERRIDE.with(Cell::get),
+        CSV_INPUT_BYTE_CAP,
+    )
 }
 
 /// Lower the per-input byte cap (clamped to the hard ceiling) for subsequent
@@ -68,13 +69,13 @@ pub fn set_csv_input_byte_cap_override(bytes: Option<u64>) {
 /// so an over-cap input is rejected without any excess allocation.
 #[cfg(not(target_arch = "wasm32"))]
 fn check_csv_limit(op: &str, dimension: &str, actual: u64, limit: u64) -> Result<(), SemaError> {
-    if actual > limit {
-        return Err(SemaError::eval(format!(
-            "{op}: {dimension} {actual} exceeds the quarantined limit {limit}"
-        ))
-        .with_hint("reduce or split the CSV input"));
-    }
-    Ok(())
+    crate::io::check_quarantined_limit(
+        op,
+        dimension,
+        actual,
+        limit,
+        "reduce or split the CSV input",
+    )
 }
 
 /// Parse `s` into a table of owned cell strings, enforcing the row/cell caps

@@ -65,9 +65,10 @@ thread_local! {
 /// lowered by any per-call override (never raised above it).
 #[cfg(not(target_arch = "wasm32"))]
 fn effective_diff_input_byte_cap() -> u64 {
-    DIFF_INPUT_BYTE_CAP_OVERRIDE
-        .with(Cell::get)
-        .map_or(DIFF_INPUT_BYTE_CAP, |over| over.min(DIFF_INPUT_BYTE_CAP))
+    crate::io::effective_cap(
+        DIFF_INPUT_BYTE_CAP_OVERRIDE.with(Cell::get),
+        DIFF_INPUT_BYTE_CAP,
+    )
 }
 
 /// Lower the per-input byte cap (clamped to the hard ceiling) for subsequent
@@ -80,13 +81,13 @@ pub fn set_diff_input_byte_cap_override(bytes: Option<u64>) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn check_diff_limit(op: &str, dimension: &str, actual: u64, limit: u64) -> Result<(), SemaError> {
-    if actual > limit {
-        return Err(SemaError::eval(format!(
-            "{op}: {dimension} {actual} exceeds the quarantined limit {limit}"
-        ))
-        .with_hint("reduce or split the diff input"));
-    }
-    Ok(())
+    crate::io::check_quarantined_limit(
+        op,
+        dimension,
+        actual,
+        limit,
+        "reduce or split the diff input",
+    )
 }
 
 /// Pre-dispatch caps for a patch-consuming synchronous op (`diff/stat`,

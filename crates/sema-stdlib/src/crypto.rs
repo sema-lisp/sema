@@ -37,11 +37,10 @@ thread_local! {
 /// lowered by any per-call override (never raised above it).
 #[cfg(not(target_arch = "wasm32"))]
 fn effective_crypto_input_byte_cap() -> u64 {
-    CRYPTO_INPUT_BYTE_CAP_OVERRIDE
-        .with(std::cell::Cell::get)
-        .map_or(CRYPTO_INPUT_BYTE_CAP, |over| {
-            over.min(CRYPTO_INPUT_BYTE_CAP)
-        })
+    crate::io::effective_cap(
+        CRYPTO_INPUT_BYTE_CAP_OVERRIDE.with(std::cell::Cell::get),
+        CRYPTO_INPUT_BYTE_CAP,
+    )
 }
 
 /// Lower the per-input byte cap (clamped to the hard ceiling) for subsequent
@@ -56,13 +55,13 @@ pub fn set_crypto_input_byte_cap_override(bytes: Option<u64>) {
 /// snapshot — so an over-cap input is rejected without any excess allocation.
 #[cfg(not(target_arch = "wasm32"))]
 fn check_crypto_limit(op: &str, actual: u64, limit: u64) -> Result<(), SemaError> {
-    if actual > limit {
-        return Err(SemaError::eval(format!(
-            "{op}: input bytes {actual} exceeds the quarantined limit {limit}"
-        ))
-        .with_hint("reduce or split the input"));
-    }
-    Ok(())
+    crate::io::check_quarantined_limit(
+        op,
+        "input bytes",
+        actual,
+        limit,
+        "reduce or split the input",
+    )
 }
 
 /// Enforce the input-byte cap for `op` ONLY inside a runtime quantum (a direct

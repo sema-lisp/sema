@@ -39,6 +39,8 @@
 (define (rng-int! n)
   (if (<= n 1) 0 (mod (abs (bit/shift-right (rng-next!) 17)) n)))
 
+(define (rng-pick! xs) (nth xs (rng-int! (length xs))))
+
 ;; ── generation state ────────────────────────────────────────────────────
 ;; `*args*` holds the values the positional placeholders will be called with;
 ;; `*max-used*` / `*rest-used*` track what the generated body actually
@@ -58,59 +60,82 @@
 ;; gen-expr returns (src-string expected-value); small ints only, `+`-heavy to
 ;; keep values well inside i64.
 (define (gen-expr depth)
-  (let ((arity (count *args*))
-        (pick (rng-int! (if (= depth 0) 3 11))))
-    (cond
-      ;; leaf: int literal
-      ((= pick 0)
-       (let ((k (rng-int! 100)))
-         (list (str k) k)))
-      ;; leaf: positional placeholder (falls back to a literal when arity 0)
-      ((or (= pick 1) (= pick 2))
-       (if (= arity 0)
-         (let ((k (rng-int! 100))) (list (str k) k))
-         (let ((i (+ 1 (rng-int! arity))))
-           (list (if (and (= i 1) (= (rng-int! 2) 0)) "%" f"%${i}")
-             (use-placeholder! i)))))
-      ;; (+ a b)
-      ((= pick 3)
-       (let ((a (gen-expr (- depth 1))) (b (gen-expr (- depth 1))))
-         (list f"(+ ${(first a)} ${(first b)})" (+ (second a) (second b)))))
-      ;; (- a)
-      ((= pick 4)
-       (let ((a (gen-expr (- depth 1))))
-         (list f"(- ${(first a)})" (- (second a)))))
-      ;; rest-arg sum (falls back to + when no rest args this round)
-      ((= pick 5)
-       (if (empty? *rest*)
-         (let ((a (gen-expr (- depth 1))) (b (gen-expr (- depth 1))))
-           (list f"(+ ${(first a)} ${(first b)})" (+ (second a) (second b))))
-         (begin
-           (set! *rest-used* #t)
-           (if (= (rng-int! 2) 0)
-             (list "(apply + %&)" (sum *rest*))
-             ;; splice through a quasiquote for the ,@%& path
-             (list "(apply + `(,@%&))" (sum *rest*))))))
-      ;; nested lambda applied immediately — the issue #116 shape
-      ((= pick 6)
-       (let ((e (gen-expr (- depth 1))) (k (rng-int! 50)))
-         (list f"((lambda (y) (+ y ${(first e)})) ${k})" (+ k (second e)))))
-      ;; nested fn, two params, one shadowing-prone name
-      ((= pick 7)
-       (let ((e (gen-expr (- depth 1))) (k (rng-int! 50)))
-         (list f"((fn (y) (+ y ${(first e)})) ${k})" (+ k (second e)))))
-      ;; map literal, placeholder in the value position
-      ((= pick 8)
-       (let ((e (gen-expr (- depth 1))))
-         (list f"(get {:k ${(first e)}} :k)" (second e))))
-      ;; vector literal
-      ((= pick 9)
-       (let ((a (gen-expr (- depth 1))) (b (gen-expr (- depth 1))))
-         (list f"(nth [${(first a)} ${(first b)}] 1)" (second b))))
-      ;; quasiquote + unquote
-      (else
-       (let ((e (gen-expr (- depth 1))))
-         (list f"(first `(,${(first e)}))" (second e)))))))
+  (let ((arity (count *args*)))
+    ((rng-pick!
+      ;; depth 0: leaf-only picks (int literal / placeholder ×2) — the first
+      ;; three slots of the depth>0 list, matched to the original `(rng-int!
+      ;; (if (= depth 0) 3 11))` bound per depth.
+      (if (= depth 0)
+        (list
+          (lambda () (let ((k (rng-int! 100))) (list (str k) k)))
+          (lambda ()
+            (if (= arity 0)
+              (let ((k (rng-int! 100))) (list (str k) k))
+              (let ((i (+ 1 (rng-int! arity))))
+                (list (if (and (= i 1) (= (rng-int! 2) 0)) "%" f"%${i}")
+                  (use-placeholder! i)))))
+          (lambda ()
+            (if (= arity 0)
+              (let ((k (rng-int! 100))) (list (str k) k))
+              (let ((i (+ 1 (rng-int! arity))))
+                (list (if (and (= i 1) (= (rng-int! 2) 0)) "%" f"%${i}")
+                  (use-placeholder! i))))))
+        (list
+          ;; leaf: int literal
+          (lambda () (let ((k (rng-int! 100))) (list (str k) k)))
+          ;; leaf: positional placeholder (falls back to a literal when arity 0)
+          (lambda ()
+            (if (= arity 0)
+              (let ((k (rng-int! 100))) (list (str k) k))
+              (let ((i (+ 1 (rng-int! arity))))
+                (list (if (and (= i 1) (= (rng-int! 2) 0)) "%" f"%${i}")
+                  (use-placeholder! i)))))
+          (lambda ()
+            (if (= arity 0)
+              (let ((k (rng-int! 100))) (list (str k) k))
+              (let ((i (+ 1 (rng-int! arity))))
+                (list (if (and (= i 1) (= (rng-int! 2) 0)) "%" f"%${i}")
+                  (use-placeholder! i)))))
+          ;; (+ a b)
+          (lambda ()
+            (let ((a (gen-expr (- depth 1))) (b (gen-expr (- depth 1))))
+              (list f"(+ ${(first a)} ${(first b)})" (+ (second a) (second b)))))
+          ;; (- a)
+          (lambda ()
+            (let ((a (gen-expr (- depth 1))))
+              (list f"(- ${(first a)})" (- (second a)))))
+          ;; rest-arg sum (falls back to + when no rest args this round)
+          (lambda ()
+            (if (empty? *rest*)
+              (let ((a (gen-expr (- depth 1))) (b (gen-expr (- depth 1))))
+                (list f"(+ ${(first a)} ${(first b)})" (+ (second a) (second b))))
+              (begin
+                (set! *rest-used* #t)
+                (if (= (rng-int! 2) 0)
+                  (list "(apply + %&)" (sum *rest*))
+                  ;; splice through a quasiquote for the ,@%& path
+                  (list "(apply + `(,@%&))" (sum *rest*))))))
+          ;; nested lambda applied immediately — the issue #116 shape
+          (lambda ()
+            (let ((e (gen-expr (- depth 1))) (k (rng-int! 50)))
+              (list f"((lambda (y) (+ y ${(first e)})) ${k})" (+ k (second e)))))
+          ;; nested fn, two params, one shadowing-prone name
+          (lambda ()
+            (let ((e (gen-expr (- depth 1))) (k (rng-int! 50)))
+              (list f"((fn (y) (+ y ${(first e)})) ${k})" (+ k (second e)))))
+          ;; map literal, placeholder in the value position
+          (lambda ()
+            (let ((e (gen-expr (- depth 1))))
+              (list f"(get {:k ${(first e)}} :k)" (second e))))
+          ;; vector literal
+          (lambda ()
+            (let ((a (gen-expr (- depth 1))) (b (gen-expr (- depth 1))))
+              (list f"(nth [${(first a)} ${(first b)}] 1)" (second b))))
+          ;; quasiquote + unquote
+          (lambda ()
+            (let ((e (gen-expr (- depth 1))))
+              (list f"(first `(,${(first e)}))" (second e))))))
+      ))))
 
 (define (run-one seed depth)
   (rng-seed! seed)

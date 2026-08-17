@@ -6,6 +6,8 @@ use tower_lsp::lsp_types::*;
 pub(crate) use sema_core::SemaError;
 use sema_core::{Span, SpanMap};
 
+use sema_reader::lexer::{tokenize, SpannedToken, Token};
+
 // ── Public helpers (also used by tests) ──────────────────────────
 
 /// Check if a character is valid inside a Sema symbol.
@@ -441,10 +443,137 @@ pub(crate) fn parse_param_names(params_str: &str) -> Vec<String> {
         .collect()
 }
 
-/// Find the 0-indexed (line, col) positions of arguments in a list form
-/// by scanning the source text. Skips the function name (first token) and
-/// returns positions of up to `max_args` subsequent arguments.
+/// Find the 0-indexed (line, col) positions of arguments in a list form.
+/// Skips the function name (first token) and returns positions of up to
+/// `max_args` subsequent arguments. Primary path lexes the form through the
+/// real reader so char literals (`#\(`), f-strings, regex literals and
+/// escapes stay correct by construction; on malformed source it falls back to
+/// a lenient char-by-char scan so inlay hints keep working while the user
+/// is mid-edit.
 pub(crate) fn find_arg_positions_in_form(
+    form_span: &Span,
+    lines: &[&str],
+    max_args: usize,
+) -> Vec<(usize, usize)> {
+    match tokenize_form_substring(form_span, lines) {
+        Some(tokens) => positions_from_tokens(form_span, lines, &tokens, max_args),
+        None => find_arg_positions_scanned(form_span, lines, max_args),
+    }
+}
+
+/// Extract the source substring a form span covers and lex it. Returns `None`
+/// when the code is too malformed for the lexer (unterminated string, bad
+/// escape, …), in which case the caller falls back to the lenient scan.
+fn tokenize_form_substring(form_span: &Span, lines: &[&str]) -> Option<Vec<SpannedToken>> {
+    let start_line = form_span.line.saturating_sub(1); // 0-indexed
+    let end_line = form_span.end_line.saturating_sub(1);
+    if start_line >= lines.len() {
+        return None;
+    }
+    let end_line = end_line.min(lines.len().saturating_sub(1));
+    if end_line < start_line {
+        return None;
+    }
+
+    let start_line_str = lines[start_line];
+    let end_line_str = lines[end_line];
+    // Span columns count chars; convert to byte offsets so multi-byte chars
+    // earlier on the line can't desync the slice.
+    let start_byte = char_col_to_byte(start_line_str, form_span.col).min(start_line_str.len());
+    let end_byte = char_col_to_byte(end_line_str, form_span.end_col).min(end_line_str.len());
+
+    let mut substring = String::new();
+    if start_line == end_line {
+        substring.push_str(&start_line_str[start_byte..end_byte]);
+    } else {
+        substring.push_str(&start_line_str[start_byte..]);
+        for line in &lines[start_line + 1..end_line] {
+            substring.push('\n');
+            substring.push_str(line);
+        }
+        substring.push('\n');
+        substring.push_str(&end_line_str[..end_byte]);
+    }
+
+    tokenize(&substring).ok()
+}
+
+/// Walk the lexed tokens of a form, tracking bracket depth, and collect the
+/// positions of top-level (depth-1) arguments after the head.
+fn positions_from_tokens(
+    form_span: &Span,
+    lines: &[&str],
+    tokens: &[SpannedToken],
+    max_args: usize,
+) -> Vec<(usize, usize)> {
+    let mut positions = Vec::new();
+    let mut depth = 0i32;
+    // First depth-1 token (or nested form opening) is the head, not an arg.
+    let mut seen_head = false;
+
+    for tok in tokens {
+        // Comments and newlines are not arguments.
+        if matches!(tok.token, Token::Comment(_) | Token::Newline) {
+            continue;
+        }
+        match &tok.token {
+            Token::LParen | Token::LBracket | Token::LBrace => {
+                if depth == 1 {
+                    if seen_head {
+                        // A nested argument form's opening is a top-level arg.
+                        positions.push(token_position(form_span, lines, tok));
+                    } else {
+                        // The head is itself a nested form; consume it as the head.
+                        seen_head = true;
+                    }
+                }
+                depth += 1;
+            }
+            Token::RParen | Token::RBracket | Token::RBrace => {
+                depth -= 1;
+                if depth <= 0 {
+                    return positions;
+                }
+            }
+            _ => {
+                if depth == 1 {
+                    if seen_head {
+                        positions.push(token_position(form_span, lines, tok));
+                    } else {
+                        seen_head = true;
+                    }
+                }
+            }
+        }
+        if positions.len() >= max_args {
+            return positions;
+        }
+    }
+
+    positions
+}
+
+/// Map a token's substring-relative span back to a document (line, byte-offset).
+fn token_position(form_span: &Span, lines: &[&str], tok: &SpannedToken) -> (usize, usize) {
+    let start_line = form_span.line.saturating_sub(1);
+    // `tok.span.line` is 1-indexed within the substring (line 1 is the form's
+    // first line); `tok.span.col` is a 1-indexed char column.
+    let global_line = start_line + (tok.span.line.saturating_sub(1));
+    let line = lines.get(global_line).copied().unwrap_or("");
+    let document_char_col = if tok.span.line == 1 {
+        // First substring line is the form's start line, sliced from
+        // `form_span.col`, so add the substring-relative column offset.
+        form_span.col + tok.span.col - 1
+    } else {
+        tok.span.col
+    };
+    (global_line, char_col_to_byte(line, document_char_col))
+}
+
+/// Lenient fallback: walk the form text char-by-char, tracking bracket depth,
+/// strings, escapes and comments, and collect top-level argument positions.
+/// Never fails — used when the lexer rejects a mid-edit form.
+fn find_arg_positions_scanned(
     form_span: &Span,
     lines: &[&str],
     max_args: usize,

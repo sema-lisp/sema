@@ -1696,6 +1696,47 @@ fn arg_positions_after_astral_char_on_line() {
     assert_eq!(positions, vec![(0, 17), (0, 19)]);
 }
 
+#[test]
+fn arg_positions_with_char_literal_bracket() {
+    // A bracket inside a char literal breaks the char-by-char scanner (it
+    // treats `\` as an escape only inside strings, so `#\(` still bumps
+    // depth). The lexer path keeps the char literal a single token whose span
+    // starts at the `#`, so both arguments are found — this is the concrete
+    // case the old scan got wrong.
+    let text = "(f #\\( x)";
+    let lines: Vec<&str> = text.lines().collect();
+    let span = sema_core::Span::new(1, 1, 1, 10);
+    let positions = find_arg_positions_in_form(&span, &lines, 2);
+    // '#' of '#\(' at byte 3, 'x' at byte 7.
+    assert_eq!(positions, vec![(0, 3), (0, 7)]);
+}
+
+#[test]
+fn arg_positions_unclosed_paren_is_lenient() {
+    // A form the user is still typing (missing closing paren) lexes fine and
+    // still yields argument positions, so inlay hints keep working.
+    let text = "(foo a b";
+    let lines: Vec<&str> = text.lines().collect();
+    let span = sema_core::Span::new(1, 1, 1, 9);
+    let positions = find_arg_positions_in_form(&span, &lines, 2);
+    // 'a' at byte 5, 'b' at byte 7.
+    assert_eq!(positions, vec![(0, 5), (0, 7)]);
+}
+
+#[test]
+fn arg_positions_unterminated_string_falls_back() {
+    // An unterminated string makes the lexer reject the source; the lenient
+    // scan takes over and still reports the argument positions it can see, so
+    // hints never hard-fail while the user is mid-edit.
+    let text = "(foo a \"unterminated\n  b)";
+    let lines: Vec<&str> = text.lines().collect();
+    let span = sema_core::Span::new(1, 1, 2, 4);
+    let positions = find_arg_positions_in_form(&span, &lines, 2);
+    // 'a' at byte 5 on line 0; the unterminated string's opening '"' at
+    // byte 7 on line 0 counts as the second argument region.
+    assert_eq!(positions, vec![(0, 5), (0, 7)]);
+}
+
 // ── top_level_ranges ─────────────────────────────────────────
 
 #[test]

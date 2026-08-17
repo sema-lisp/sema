@@ -51,6 +51,24 @@ pub struct SpannedToken {
     pub byte_end: usize,
 }
 
+/// Map a single-character delimiter to its token, if it is one of the
+/// no-lookahead delimiter tokens: `( ) [ ] { } ' ` @`. The two-char `,`
+/// (unquote / unquote-splice) case is handled separately in `tokenize`.
+fn single_char_token(ch: char) -> Option<Token> {
+    Some(match ch {
+        '(' => Token::LParen,
+        ')' => Token::RParen,
+        '[' => Token::LBracket,
+        ']' => Token::RBracket,
+        '{' => Token::LBrace,
+        '}' => Token::RBrace,
+        '\'' => Token::Quote,
+        '`' => Token::Quasiquote,
+        '@' => Token::Deref,
+        _ => return None,
+    })
+}
+
 pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
     let mut tokens = Vec::new();
     let chars: Vec<char> = input.chars().collect();
@@ -108,84 +126,12 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                 col = end_col;
             }
 
-            // Delimiters
-            '(' => {
+            // Single-character delimiters: ( ) [ ] { } ' ` @
+            c if let Some(token) = single_char_token(c) => {
                 col += 1;
                 i += 1;
                 tokens.push(SpannedToken {
-                    token: Token::LParen,
-                    span: span.with_end(line, col),
-                    byte_start: byte_offsets[i - 1],
-                    byte_end: byte_offsets[i],
-                });
-            }
-            ')' => {
-                col += 1;
-                i += 1;
-                tokens.push(SpannedToken {
-                    token: Token::RParen,
-                    span: span.with_end(line, col),
-                    byte_start: byte_offsets[i - 1],
-                    byte_end: byte_offsets[i],
-                });
-            }
-            '[' => {
-                col += 1;
-                i += 1;
-                tokens.push(SpannedToken {
-                    token: Token::LBracket,
-                    span: span.with_end(line, col),
-                    byte_start: byte_offsets[i - 1],
-                    byte_end: byte_offsets[i],
-                });
-            }
-            ']' => {
-                col += 1;
-                i += 1;
-                tokens.push(SpannedToken {
-                    token: Token::RBracket,
-                    span: span.with_end(line, col),
-                    byte_start: byte_offsets[i - 1],
-                    byte_end: byte_offsets[i],
-                });
-            }
-            '{' => {
-                col += 1;
-                i += 1;
-                tokens.push(SpannedToken {
-                    token: Token::LBrace,
-                    span: span.with_end(line, col),
-                    byte_start: byte_offsets[i - 1],
-                    byte_end: byte_offsets[i],
-                });
-            }
-            '}' => {
-                col += 1;
-                i += 1;
-                tokens.push(SpannedToken {
-                    token: Token::RBrace,
-                    span: span.with_end(line, col),
-                    byte_start: byte_offsets[i - 1],
-                    byte_end: byte_offsets[i],
-                });
-            }
-
-            // Quote forms
-            '\'' => {
-                col += 1;
-                i += 1;
-                tokens.push(SpannedToken {
-                    token: Token::Quote,
-                    span: span.with_end(line, col),
-                    byte_start: byte_offsets[i - 1],
-                    byte_end: byte_offsets[i],
-                });
-            }
-            '`' => {
-                col += 1;
-                i += 1;
-                tokens.push(SpannedToken {
-                    token: Token::Quasiquote,
+                    token,
                     span: span.with_end(line, col),
                     byte_start: byte_offsets[i - 1],
                     byte_end: byte_offsets[i],
@@ -211,18 +157,6 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                         byte_end: byte_offsets[i],
                     });
                 }
-            }
-
-            // Deref reader macro: @expr -> (deref expr)
-            '@' => {
-                col += 1;
-                i += 1;
-                tokens.push(SpannedToken {
-                    token: Token::Deref,
-                    span: span.with_end(line, col),
-                    byte_start: byte_offsets[i - 1],
-                    byte_end: byte_offsets[i],
-                });
             }
 
             // Strings

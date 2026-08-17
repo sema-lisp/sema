@@ -40,63 +40,68 @@ impl AnthropicProvider {
         // why this grouping belongs here and not in the shared request.
         let mut messages: Vec<AnthropicMessage> = Vec::new();
         for m in request.messages.iter().filter(|m| m.role != "system") {
-            if !m.tool_calls.is_empty() {
-                // Assistant turn → tool_use content blocks (with optional leading text).
-                let mut blocks: Vec<serde_json::Value> = Vec::new();
-                let text = m.content.to_text();
-                if !text.is_empty() {
-                    blocks.push(serde_json::json!({ "type": "text", "text": text }));
-                }
-                for tc in &m.tool_calls {
-                    blocks.push(serde_json::json!({
-                        "type": "tool_use",
-                        "id": tc.id,
-                        "name": tc.name,
-                        "input": tc.arguments,
-                    }));
-                }
-                messages.push(AnthropicMessage {
-                    role: "assistant".to_string(),
-                    content: serde_json::Value::Array(blocks),
-                });
-            } else if m.role == "tool" {
-                // Tool result → a tool_result block keyed by tool_use_id
-                // (Anthropic's correlation mechanism), carried on a user message.
-                let block = serde_json::json!({
-                    "type": "tool_result",
-                    "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
-                    "content": m.content.to_text(),
-                });
-                let appended = messages.last_mut().is_some_and(|last| {
-                    if last.role != "user" {
-                        return false;
+            match m.kind() {
+                crate::types::MessageKind::AssistantWithToolCalls(content, tcs) => {
+                    // Assistant turn → tool_use content blocks (with optional leading text).
+                    let mut blocks: Vec<serde_json::Value> = Vec::new();
+                    let text = content.to_text();
+                    if !text.is_empty() {
+                        blocks.push(serde_json::json!({ "type": "text", "text": text }));
                     }
-                    match &mut last.content {
-                        // Only extend a message that is ITSELF tool results, so a
-                        // genuine user turn is never absorbed.
-                        serde_json::Value::Array(blocks)
-                            if !blocks.is_empty()
-                                && blocks.iter().all(|b| {
-                                    b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                                }) =>
-                        {
-                            blocks.push(block.clone());
-                            true
-                        }
-                        _ => false,
+                    for tc in tcs {
+                        blocks.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.name,
+                            "input": tc.arguments,
+                        }));
                     }
-                });
-                if !appended {
                     messages.push(AnthropicMessage {
-                        role: "user".to_string(),
-                        content: serde_json::Value::Array(vec![block]),
+                        role: "assistant".to_string(),
+                        content: serde_json::Value::Array(blocks),
                     });
                 }
-            } else {
-                messages.push(AnthropicMessage {
-                    role: m.role.clone(),
-                    content: serialize_anthropic_content(&m.content),
-                });
+                crate::types::MessageKind::ToolResult { id, content, .. } => {
+                    // Tool result → a tool_result block keyed by tool_use_id
+                    // (Anthropic's correlation mechanism), carried on a user message.
+                    let block = serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": id.unwrap_or_default(),
+                        "content": content.to_text(),
+                    });
+                    let appended = messages.last_mut().is_some_and(|last| {
+                        if last.role != "user" {
+                            return false;
+                        }
+                        match &mut last.content {
+                            // Only extend a message that is ITSELF tool results, so a
+                            // genuine user turn is never absorbed.
+                            serde_json::Value::Array(blocks)
+                                if !blocks.is_empty()
+                                    && blocks.iter().all(|b| {
+                                        b.get("type").and_then(|t| t.as_str())
+                                            == Some("tool_result")
+                                    }) =>
+                            {
+                                blocks.push(block.clone());
+                                true
+                            }
+                            _ => false,
+                        }
+                    });
+                    if !appended {
+                        messages.push(AnthropicMessage {
+                            role: "user".to_string(),
+                            content: serde_json::Value::Array(vec![block]),
+                        });
+                    }
+                }
+                crate::types::MessageKind::Other(role, content) => {
+                    messages.push(AnthropicMessage {
+                        role: role.to_string(),
+                        content: serialize_anthropic_content(content),
+                    });
+                }
             }
         }
 
@@ -303,8 +308,8 @@ struct AnthropicStreamAccum {
     cache_read_input_tokens: u32,
     cache_creation_input_tokens: u32,
     stop_reason: Option<String>,
-    // index -> (id, name, partial-json)
-    tool_accs: std::collections::BTreeMap<u64, (String, String, String)>,
+    // index -> a partial tool call (id, name, accumulated partial_json)
+    tool_accs: std::collections::BTreeMap<u64, crate::types::PartialToolCall>,
     tool_calls: Vec<ToolCall>,
 }
 
@@ -348,7 +353,14 @@ impl AnthropicStreamAccum {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    self.tool_accs.insert(index, (id, name, String::new()));
+                    self.tool_accs.insert(
+                        index,
+                        crate::types::PartialToolCall {
+                            id,
+                            name,
+                            args: String::new(),
+                        },
+                    );
                 }
                 None
             }
@@ -362,7 +374,7 @@ impl AnthropicStreamAccum {
                         .and_then(|t| t.as_str())
                     {
                         if let Some(acc) = self.tool_accs.get_mut(&index) {
-                            acc.2.push_str(pj);
+                            acc.args.push_str(pj);
                         }
                     }
                     None
@@ -370,7 +382,7 @@ impl AnthropicStreamAccum {
             }
             Some("content_block_stop") => {
                 if let Some(acc) = self.tool_accs.remove(&index) {
-                    self.tool_calls.push(Self::finalize(acc));
+                    self.tool_calls.push(acc.finish());
                 }
                 None
             }
@@ -390,25 +402,10 @@ impl AnthropicStreamAccum {
         }
     }
 
-    fn finalize(acc: (String, String, String)) -> ToolCall {
-        let (id, name, json) = acc;
-        let arguments = if json.trim().is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::from_str(&json).unwrap_or_else(|_| serde_json::json!({}))
-        };
-        ToolCall {
-            id,
-            name,
-            arguments,
-            thought_signature: None,
-        }
-    }
-
     fn into_response(mut self, model: String) -> ChatResponse {
         // Finalize any tool block that never saw a content_block_stop (defensive).
         for acc in std::mem::take(&mut self.tool_accs).into_values() {
-            self.tool_calls.push(Self::finalize(acc));
+            self.tool_calls.push(acc.finish());
         }
         ChatResponse {
             content: self.content,

@@ -3088,17 +3088,8 @@ fn run_eval(
             .read_to_string(&mut buf)
             .unwrap_or_else(|e| {
                 if json {
-                    print_eval_json(&EvalJsonResult {
-                        ok: false,
-                        value: None,
-                        stdout: "",
-                        stderr: "",
-                        error_msg: None,
-                        error_hint: None,
-                        error_line: None,
-                        error_col: None,
-                        elapsed_ms: 0,
-                    });
+                    let msg = format!("could not read stdin: {e}");
+                    print_eval_json(&EvalJsonResult::early_error(&msg));
                 } else {
                     print_cli_error(format!("could not read stdin: {e}"));
                 }
@@ -3109,17 +3100,9 @@ fn run_eval(
         e
     } else {
         if json {
-            print_eval_json(&EvalJsonResult {
-                ok: false,
-                value: None,
-                stdout: "",
-                stderr: "",
-                error_msg: Some("Either --stdin or --expr is required"),
-                error_hint: None,
-                error_line: None,
-                error_col: None,
-                elapsed_ms: 0,
-            });
+            print_eval_json(&EvalJsonResult::early_error(
+                "Either --stdin or --expr is required",
+            ));
         } else {
             print_cli_error("either --stdin or --expr is required");
         }
@@ -3130,17 +3113,8 @@ fn run_eval(
     let sandbox = match &sandbox_arg {
         Some(value) => sema_core::Sandbox::parse_cli(value).unwrap_or_else(|e| {
             if json {
-                print_eval_json(&EvalJsonResult {
-                    ok: false,
-                    value: None,
-                    stdout: "",
-                    stderr: "",
-                    error_msg: Some(&format!("Invalid sandbox: {e}")),
-                    error_hint: None,
-                    error_line: None,
-                    error_col: None,
-                    elapsed_ms: 0,
-                });
+                let msg = format!("Invalid sandbox: {e}");
+                print_eval_json(&EvalJsonResult::early_error(&msg));
             } else {
                 print_cli_error(e);
             }
@@ -3328,6 +3302,25 @@ struct EvalJsonResult<'a> {
     error_line: Option<usize>,
     error_col: Option<usize>,
     elapsed_ms: u64,
+}
+
+impl<'a> EvalJsonResult<'a> {
+    /// An early-failure envelope used before evaluation runs: `ok:false`, no
+    /// value, no captured output, no source span, zero elapsed time. The only
+    /// thing that varies between sites is the error message.
+    fn early_error(msg: &'a str) -> Self {
+        Self {
+            ok: false,
+            value: None,
+            stdout: "",
+            stderr: "",
+            error_msg: Some(msg),
+            error_hint: None,
+            error_line: None,
+            error_col: None,
+            elapsed_ms: 0,
+        }
+    }
 }
 
 fn print_eval_json(r: &EvalJsonResult) {

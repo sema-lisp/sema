@@ -15149,6 +15149,29 @@ fn test_eval_stdin_json() {
 }
 
 #[test]
+fn test_eval_stdin_read_error_json_has_message() {
+    // Feed the child a *directory* as its stdin. Reading a directory fd fails
+    // with an io error (EISDIR), so `stdin().read_to_string()` errors — the
+    // stdin-read-failure early-exit path, which previously emitted
+    // `"error": null` and silently dropped the actual cause.
+    let stdin_file =
+        std::fs::File::open(&std::env::temp_dir()).expect("failed to open a directory as stdin");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["eval", "--stdin", "--json", "--no-llm"])
+        .stdin(std::process::Stdio::from(stdin_file))
+        .output()
+        .expect("failed to run sema eval");
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+    assert_eq!(json["ok"], false);
+    let msg = json["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        !msg.is_empty(),
+        "expected a non-null error message reporting the stdin read failure: {json}"
+    );
+}
+
+#[test]
 fn test_eval_error_json() {
     let output = sema_cmd()
         .args(["eval", "--expr", "(/ 1 0)", "--json", "--no-llm"])

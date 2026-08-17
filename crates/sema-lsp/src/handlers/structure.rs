@@ -14,7 +14,7 @@ use crate::definitions::*;
 use crate::helpers::*;
 use crate::state::{
     build_selection_range, collect_call_sites, collect_outgoing_calls, position_in_range,
-    quoted_string_range, BackendState, CachedParse, ImportCache, WorkspaceFile,
+    quoted_string_range, BackendState, ImportCache, ParsedFile, WorkspaceFile,
 };
 
 impl BackendState {
@@ -77,7 +77,12 @@ impl BackendState {
 
         for wf in self.iter_workspace_files() {
             let lines = wf.lines();
-            let symbols = document_symbols_from_ast(wf.ast, wf.span_map, wf.symbol_spans, &lines);
+            let symbols = document_symbols_from_ast(
+                &wf.parsed.ast,
+                &wf.parsed.span_map,
+                &wf.parsed.symbol_spans,
+                &lines,
+            );
 
             for sym in symbols {
                 if query.is_empty() || sym.name.to_lowercase().contains(&query_lower) {
@@ -160,7 +165,7 @@ impl BackendState {
                 Some(c) => c,
                 None => continue,
             };
-            if let Some(params_str) = extract_params_from_ast(&cached.ast, &func_name) {
+            if let Some(params_str) = extract_params_from_ast(&cached.parsed.ast, &func_name) {
                 return Some(Self::user_signature_help(
                     &func_name,
                     &params_str,
@@ -398,10 +403,10 @@ impl BackendState {
         // hierarchy root/target (see def_index's doc comment) even though
         // it isn't a real binding.
         for m in scan_definitions(
-            flatten_module_forms(wf.ast),
+            flatten_module_forms(&wf.parsed.ast),
             SYMBOL_HEADS,
-            wf.span_map,
-            wf.symbol_spans,
+            &wf.parsed.span_map,
+            &wf.parsed.symbol_spans,
             &lines,
         ) {
             // Skip a definition form with no span (reader error-recovery) —
@@ -416,8 +421,8 @@ impl BackendState {
             let mut sites = Vec::new();
             collect_call_sites(
                 body,
-                wf.span_map,
-                wf.symbol_spans,
+                &wf.parsed.span_map,
+                &wf.parsed.symbol_spans,
                 &lines,
                 target,
                 &mut sites,
@@ -455,10 +460,10 @@ impl BackendState {
         let lines = wf.lines();
         // SYMBOL_HEADS, not DEFINITION_HEADS: see collect_incoming_calls_in_file.
         let m = scan_definitions(
-            flatten_module_forms(wf.ast),
+            flatten_module_forms(&wf.parsed.ast),
             SYMBOL_HEADS,
-            wf.span_map,
-            wf.symbol_spans,
+            &wf.parsed.span_map,
+            &wf.parsed.symbol_spans,
             &lines,
         )
         .into_iter()
@@ -467,8 +472,8 @@ impl BackendState {
         let mut calls: HashMap<String, Vec<Range>> = Default::default();
         collect_outgoing_calls(
             body,
-            wf.span_map,
-            wf.symbol_spans,
+            &wf.parsed.span_map,
+            &wf.parsed.symbol_spans,
             &lines,
             index,
             &mut calls,
@@ -553,7 +558,7 @@ impl BackendState {
         text: &str,
         uri: &Url,
         range: &Range,
-        cached_parses: &HashMap<String, CachedParse>,
+        cached_parses: &HashMap<String, ParsedFile>,
         import_cache: &HashMap<PathBuf, ImportCache>,
         builtin_docs: &builtin_docs::BuiltinDocs,
         hints: &mut Vec<InlayHint>,
@@ -700,7 +705,7 @@ impl BackendState {
     fn resolve_param_names_immut(
         uri: &Url,
         func_name: &str,
-        cached_parses: &HashMap<String, CachedParse>,
+        cached_parses: &HashMap<String, ParsedFile>,
         import_cache: &HashMap<PathBuf, ImportCache>,
         builtin_docs: &builtin_docs::BuiltinDocs,
     ) -> Option<Vec<String>> {
@@ -727,7 +732,8 @@ impl BackendState {
                 // Cache keys are canonical paths (see get_import_cache);
                 // resolve_import_path may yield an un-normalized spelling.
                 if let Some(import_cached) = import_cache.get(&canonicalize_or_raw(&resolved)) {
-                    if let Some(params_str) = extract_params_from_ast(&import_cached.ast, func_name)
+                    if let Some(params_str) =
+                        extract_params_from_ast(&import_cached.parsed.ast, func_name)
                     {
                         let names = parse_param_names(&params_str);
                         if !names.is_empty() {

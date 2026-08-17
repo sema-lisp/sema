@@ -7,7 +7,7 @@ use sema_core::{Caps, Sandbox, Span};
 use crate::definitions::*;
 use crate::helpers::*;
 use crate::server::normalize_lsp_message_body;
-use crate::state::{default_sema_binary, position_in_range, BackendState, CachedParse};
+use crate::state::{default_sema_binary, position_in_range, BackendState, ParsedFile};
 use crate::{builtin_docs, scope};
 
 // ── doc coverage gate ────────────────────────────────────────
@@ -307,7 +307,7 @@ fn parsed_state(uri: &str, source: &str) -> (BackendState, Url) {
     let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
     state.cached_parses.insert(
         uri.to_string(),
-        CachedParse {
+        ParsedFile {
             ast,
             span_map,
             symbol_spans,
@@ -2738,7 +2738,7 @@ fn insert_parsed_doc(state: &mut BackendState, uri: &str, source: &str) {
     let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
     state.cached_parses.insert(
         uri.to_string(),
-        CachedParse {
+        ParsedFile {
             ast,
             span_map,
             symbol_spans,
@@ -2776,11 +2776,13 @@ fn insert_scanned_file(state: &mut BackendState, path: &std::path::Path, source:
     state.import_cache.insert(
         path.to_path_buf(),
         crate::state::ImportCache {
-            ast,
-            span_map,
-            symbol_spans,
-            scope_tree,
-            source: source.to_string(),
+            parsed: ParsedFile {
+                ast,
+                span_map,
+                symbol_spans,
+                scope_tree,
+                source: source.to_string(),
+            },
             mtime,
         },
     );

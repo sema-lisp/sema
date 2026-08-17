@@ -18,7 +18,7 @@ use tower_lsp::{Client, LanguageServer, LspService, Server};
 use crate::definitions::*;
 use crate::helpers::*;
 use crate::scope;
-use crate::state::{semantic_token_legend, BackendState, CachedParse, WorkspaceScanner};
+use crate::state::{semantic_token_legend, BackendState, ParsedFile, WorkspaceScanner};
 
 // ── Backend thread messages ──────────────────────────────────────
 
@@ -856,7 +856,7 @@ pub async fn run_server() {
                     let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
                     state.cached_parses.insert(
                         uri_str.clone(),
-                        CachedParse {
+                        ParsedFile {
                             ast,
                             span_map,
                             symbol_spans,

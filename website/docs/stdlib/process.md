@@ -28,7 +28,35 @@ as it happens.
 
 Full set: `proc/spawn`, `proc/read-stdout`, `proc/read-stderr`,
 `proc/write-stdin`, `proc/close-stdin`, `proc/wait`, `proc/exit-code`,
-`proc/running?`, `proc/kill`, `proc/close`.
+`proc/running?`, `proc/kill`, `proc/close`, and `proc/run` (below).
+
+## Handing over the terminal
+
+`proc/run` runs a child on the *parent's* terminal and blocks until it exits.
+The child inherits stdin, stdout, and stderr unchanged and stays in the
+foreground process group, so it can read the keyboard and draw on the screen —
+this is how a terminal app shells out to `$EDITOR` or a pager.
+
+```sema
+(define code (proc/run [(or (env "EDITOR") "vi") "notes.md"]))
+(proc/run ["less" "log.txt"] {:cwd "/tmp" :env {"LESS" "-R"}})
+```
+
+Inside [`io/with-raw-mode`](/docs/stdlib/terminal) the child gets a terminal in
+cooked mode (line editing and echo on) and raw mode is restored when it exits.
+Leave the alternate screen first if the child draws its own full-screen UI:
+
+```sema
+(term/leave-alt-screen)
+(proc/run ["nvim" path])
+(term/enter-alt-screen)
+```
+
+`proc/run` blocks the whole VM until the child exits, by design: the child owns
+the screen and the keyboard, so no other task may run and write to either. It
+errors when stdin is not a terminal (a pipe, `sema mcp`, a notebook cell), where
+inheriting the file descriptors would corrupt the host's I/O stream — use
+`shell` or `proc/spawn` there.
 
 ## Pseudo-terminals
 

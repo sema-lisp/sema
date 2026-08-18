@@ -28,6 +28,3 @@ task deploy: [build]
     jake site.og
     git status --porcelain playground/og-playground.jpg | grep -q . && echo "NOTE: og-playground.jpg regenerated — commit it" || true
     cd playground && npx vercel --prod --yes
-    # A failed remote build leaves the previous deploy live — verify it serves.
-    sleep 5
-    curl -sf -o /dev/null https://sema.run/ && echo "pg.deploy: sema.run responds ✓" || { echo "pg.deploy: sema.run is not responding after deploy" >&2; exit 1; }

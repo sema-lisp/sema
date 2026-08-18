@@ -27,6 +27,26 @@ Get cumulative usage across all LLM calls in the current session.
 ;     :cache-read-tokens 1024 :cache-creation-tokens 0 :cost-usd 0.012}
 ```
 
+### Per-turn attribution: `agent/run`'s `:usage`
+
+`llm/last-usage` covers one call and `llm/session-usage` covers every call in
+the process — neither attributes a single agent turn that makes N provider
+calls in its tool loop. The map `agent/run` returns carries `:usage`: exactly
+that turn's total, in the same shape as `llm/session-usage` plus `:model` and
+`:calls` (the number of billed round trips). See
+[Tools & Agents](./tools-agents#agent-run).
+
+```sema
+(let ((result (agent/run weather-bot "Weather in Tokyo?" {})))
+  (:cost-usd (:usage result)))   ; => this turn's cost, not the session's
+```
+
+### Notebook cost tracking
+
+The [notebook](../notebook#llm-cost-tracking) applies the same attribution per
+cell: each cell's output records its cost and token counts (shown as a badge),
+and the status bar shows the session total, matching `(llm/session-usage)`.
+
 #### Prompt-cache tokens
 
 `:cache-read-tokens` and `:cache-creation-tokens` report how many input tokens

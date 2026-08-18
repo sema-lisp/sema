@@ -123,7 +123,16 @@ An optional third argument takes per-run options. **Passing an options map chang
 
 (:response result)   ; => the final answer string
 (:messages result)   ; => the full conversation (to continue or inspect)
+(:usage result)      ; => this turn's own token/cost tally, summed across
+                     ;    every round of the tool loop — see Cost Tracking
 ```
+
+`:usage` is `{:prompt-tokens :completion-tokens :total-tokens
+:cache-read-tokens :cache-creation-tokens :model :cost-usd :calls}` —
+`:cost-usd` only when the model is priced, `:calls` the number of billed
+provider round trips. Unlike `llm/last-usage` (most recent call only) or
+`llm/session-usage` (every call in the process), it is exactly this turn's
+total.
 
 **Observing tool calls.** `:on-tool-call` fires once when each tool starts and once when it ends. The event is a map — branch on `(:event e)`, the string `"start"` or `"end"`:
 
@@ -138,7 +147,7 @@ The event map carries `:event` (`"start"` / `"end"`), `:tool` (the tool name), a
 **Keeping the transcript of a cancelled run.** A run stopped with `async/cancel`
 has no return value — `async/await` raises instead — so the conversation it had
 assembled would be lost. `:on-partial` receives that conversation as the usual
-`{:response :messages :session}` map, just before the cancellation propagates:
+`{:response :messages :session :usage}` map, just before the cancellation propagates:
 
 ```sema
 (define partial nil)

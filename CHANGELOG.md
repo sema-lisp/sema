@@ -34,6 +34,16 @@
   run when stdin is not a terminal, where inheriting the file descriptors would
   corrupt a host's I/O stream (`sema mcp`, a notebook cell) instead.
 
+- **`agent/run` reports its own token/cost tally as `:usage`.** The 3-arg form's
+  result map gains `:usage` — `{:prompt-tokens :completion-tokens :total-tokens
+  :cache-read-tokens :cache-creation-tokens :model :cost-usd :calls}` — summed
+  across every round of the tool loop, on both the blocking and non-blocking
+  paths. Before, the only cumulative accessor was the process-global
+  `llm/session-usage`, which mixes in every other call and needs diffing to
+  attribute one turn. Nested scopes now also merge into their parent on drop,
+  so an `agent/run` inside a `workflow/step` no longer blinds the step's own
+  usage attribution.
+
 - **`agent/run` can hand back the transcript of a cancelled run (#87).** A run
   stopped with `async/cancel` has no return value — `async/await` raises — so
   the conversation it had assembled was lost, and the next turn resumed from
@@ -46,6 +56,9 @@
   streaming when the cancel lands is delivered through `:on-text` only. A run
   with `:memory` already wrote its partial turns back to the thread; that thread
   is text-only, so `:on-partial` is the route for the correlated `:messages`.
+  An `:on-partial` callback that itself raises is ignored, so it can never
+  replace the run's original error (a timeout or cancellation surfaces as
+  itself, not as the callback's failure).
 
 ### Removed
 
@@ -75,7 +88,52 @@
   requests. Configure the default with `sema mcp --timeout-ms <MS>` or
   `SEMA_MCP_EVAL_TIMEOUT_MS` (default 300000ms / 5 minutes; `0` disables —
   not recommended). A caller can also override it per call with a
-  `timeout_ms` argument on `eval`/`run_file`.
+  `timeout_ms` argument on `eval`/`run_file`. `timeout_ms` must be a
+  non-negative integer; negative, fractional, and string values return a tool
+  error instead of silently using the server default. The deadline is checked
+  at VM loop back-edges, so it bounds runaway Sema loops but cannot interrupt
+  a native handler mid-operation.
+
+- **Cross-module `import`/`load` no longer unbinds unrelated globals (#152).**
+  Two compounding VM bugs: inline-cache slot offsets were numbered per compiled
+  unit, so functions from two unrelated units could collide on the same
+  physical cache slot; and a stale `base_globals` snapshot could drop a script
+  global defined between module compilations. Cache offsets now come from one
+  process-wide counter, and the snapshot is taken correctly — a script that
+  imports a `load`-calling module and later calls another module through an
+  I/O builtin no longer hits `Unbound variable` on its own globals.
+
+- **LSP: definitions and imports nested inside `(module …)` forms are found by
+  every scanner.** Goto-definition, hover/completion docs, the outline,
+  workspace symbol search, call hierarchy, document links, and semantic-token
+  classification all scanned only true top-level forms and went blind inside a
+  module wrapper; they now share one module-flattening pass.
+
+- **LSP: inlay-hint argument positions come from the real tokenizer.** The
+  char-by-char scan mis-classified char literals (`#\(`), f-strings, regex
+  literals, quote prefixes (`'a` counted as two arguments), and `#(…)` short
+  lambdas (which truncated the position list) — parameter-name hints landed on
+  the wrong arguments. Positions are now derived from `sema-reader`'s lexer,
+  falling back to the lenient scan on mid-edit lexer errors.
+
+- **`sema fmt --align` groups consecutive one-liner `define`s inside `(module
+  …)` bodies**, not just at true top level.
+
+- **`sema eval --json` includes stdin read errors in the envelope.** Reading
+  code from a failing stdin reported `"error": null`; the envelope now carries
+  the actual cause.
+
+- **`(- -0.0 …)` and `(+ -0.0)` keep the signed zero.** The shared numeric fold
+  seeded its accumulator through the additive identity, and `0.0 + -0.0` is
+  `+0.0` under IEEE 754; the first operand now seeds by direct assignment.
+
+- **Regex literals (`#"…"`) are scoped as regex by the playground and website
+  highlighters** instead of leaking into the surrounding form's scope.
+
+### Changed
+
+- **Vendored LLM pricing snapshot refreshed** (2026-07-17 → 2026-08-18, 6319
+  prices from models.dev).
 
 ## 1.34.2
 

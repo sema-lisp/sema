@@ -481,6 +481,11 @@ fn tokenize_form_substring(form_span: &Span, lines: &[&str]) -> Option<Vec<Spann
     // earlier on the line can't desync the slice.
     let start_byte = char_col_to_byte(start_line_str, form_span.col).min(start_line_str.len());
     let end_byte = char_col_to_byte(end_line_str, form_span.end_col).min(end_line_str.len());
+    // A degenerate same-line span (end before start — malformed mid-edit source)
+    // would panic slicing below; fall back to the lenient scan instead.
+    if start_line == end_line && end_byte < start_byte {
+        return None;
+    }
 
     let mut substring = String::new();
     if start_line == end_line {
@@ -500,6 +505,14 @@ fn tokenize_form_substring(form_span: &Span, lines: &[&str]) -> Option<Vec<Spann
 
 /// Walk the lexed tokens of a form, tracking bracket depth, and collect the
 /// positions of top-level (depth-1) arguments after the head.
+///
+/// A quote/quasiquote/unquote/unquote-splice/deref prefix (`'`, `` ` ``, `,`,
+/// `,@`, `@`) is its own token, immediately followed by the token(s) of the
+/// expression it applies to — but it is still one AST argument. `pending_prefix`
+/// marks that the last depth-1 token pushed was such a prefix, so the next
+/// depth-1 token (its operand) is consumed without pushing a second position.
+/// Consecutive prefixes (`` `,a ``) chain through this the same way, since each
+/// one only re-arms `pending_prefix` instead of pushing again.
 fn positions_from_tokens(
     form_span: &Span,
     lines: &[&str],
@@ -510,6 +523,7 @@ fn positions_from_tokens(
     let mut depth = 0i32;
     // First depth-1 token (or nested form opening) is the head, not an arg.
     let mut seen_head = false;
+    let mut pending_prefix = false;
 
     for tok in tokens {
         // Comments and newlines are not arguments.
@@ -517,11 +531,22 @@ fn positions_from_tokens(
             continue;
         }
         match &tok.token {
-            Token::LParen | Token::LBracket | Token::LBrace => {
+            // `#(` and `#u8(` are single tokens whose matching close is a
+            // plain `)` with no separate open-paren token — treat them like
+            // an opening bracket so depth tracks their body correctly.
+            Token::LParen
+            | Token::LBracket
+            | Token::LBrace
+            | Token::ShortLambdaStart
+            | Token::BytevectorStart => {
                 if depth == 1 {
                     if seen_head {
-                        // A nested argument form's opening is a top-level arg.
-                        positions.push(token_position(form_span, lines, tok));
+                        // A nested argument form's opening is a top-level arg,
+                        // unless it's the operand of a prefix already counted.
+                        if !pending_prefix {
+                            positions.push(token_position(form_span, lines, tok));
+                        }
+                        pending_prefix = false;
                     } else {
                         // The head is itself a nested form; consume it as the head.
                         seen_head = true;
@@ -535,10 +560,29 @@ fn positions_from_tokens(
                     return positions;
                 }
             }
+            Token::Quote
+            | Token::Quasiquote
+            | Token::Unquote
+            | Token::UnquoteSplice
+            | Token::Deref => {
+                if depth == 1 {
+                    if seen_head {
+                        if !pending_prefix {
+                            positions.push(token_position(form_span, lines, tok));
+                        }
+                        pending_prefix = true;
+                    } else {
+                        seen_head = true;
+                    }
+                }
+            }
             _ => {
                 if depth == 1 {
                     if seen_head {
-                        positions.push(token_position(form_span, lines, tok));
+                        if !pending_prefix {
+                            positions.push(token_position(form_span, lines, tok));
+                        }
+                        pending_prefix = false;
                     } else {
                         seen_head = true;
                     }

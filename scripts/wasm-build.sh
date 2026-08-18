@@ -32,18 +32,20 @@ SYSROOT="$(rustc --print sysroot)"
 # layout: the binaries live at the install root, not under bin/.
 install_wasm_bindgen_cli() {
   local version
-  version="$(grep -A2 '^name = "wasm-bindgen"' "$ROOT/Cargo.lock" |
-    grep '^version' | head -1 | cut -d'"' -f2)"
+  version="$(grep -A2 '^name = "wasm-bindgen"$' "$ROOT/Cargo.lock" |
+    grep '^version' | head -1 | cut -d'"' -f2 || true)"
   if [ -z "$version" ]; then
     echo "wasm-build: could not resolve wasm-bindgen version from Cargo.lock" >&2
     exit 1
   fi
   # Mirrors wasm-pack's cache location (dirs::cache_dir + "/.wasm-pack").
   local cache
-  if [ -n "${XDG_CACHE_HOME:-}" ]; then
-    cache="$XDG_CACHE_HOME/.wasm-pack"
-  elif [ "$(uname -s)" = "Darwin" ]; then
+  if [ "$(uname -s)" = "Darwin" ]; then
+    # dirs::cache_dir() always returns ~/Library/Caches on macOS, ignoring
+    # XDG_CACHE_HOME — must not consult it here or the pre-install misses.
     cache="$HOME/Library/Caches/.wasm-pack"
+  elif [ -n "${XDG_CACHE_HOME:-}" ]; then
+    cache="$XDG_CACHE_HOME/.wasm-pack"
   else
     cache="$HOME/.cache/.wasm-pack"
   fi

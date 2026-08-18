@@ -1737,6 +1737,56 @@ fn arg_positions_unterminated_string_falls_back() {
     assert_eq!(positions, vec![(0, 5), (0, 7)]);
 }
 
+#[test]
+fn arg_positions_quote_prefix_counts_as_one_arg() {
+    // `'a` is one AST argument (quote a); the prefix glyph and its operand
+    // must not be counted as two separate positions.
+    let text = "(f 'a x)";
+    let lines: Vec<&str> = text.lines().collect();
+    let span = sema_core::Span::new(1, 1, 1, 8);
+    let positions = find_arg_positions_in_form(&span, &lines, 2);
+    // `'` at byte 3 (start of the quoted arg), 'x' at byte 6.
+    assert_eq!(positions, vec![(0, 3), (0, 6)]);
+}
+
+#[test]
+fn arg_positions_quasiquote_unquote_counts_as_one_arg() {
+    // `` `(a ,b) `` is one AST argument; the nested `,b` must not leak out
+    // as a top-level position since it's inside the quasiquoted list.
+    let text = "(f `(a ,b) x)";
+    let lines: Vec<&str> = text.lines().collect();
+    let span = sema_core::Span::new(1, 1, 1, 13);
+    let positions = find_arg_positions_in_form(&span, &lines, 2);
+    // '`' at byte 3, 'x' at byte 11.
+    assert_eq!(positions, vec![(0, 3), (0, 11)]);
+}
+
+#[test]
+fn arg_positions_short_lambda_is_one_arg() {
+    // `#(...)` has no separate opening LParen token — its close is a plain
+    // `)`. Without tracking it as an opener, the lambda body leaks as
+    // top-level args and its `)` prematurely ends the whole scan, dropping
+    // `xs` entirely.
+    let text = "(map #(inc %) xs)";
+    let lines: Vec<&str> = text.lines().collect();
+    let span = sema_core::Span::new(1, 1, 1, 18);
+    let positions = find_arg_positions_in_form(&span, &lines, 2);
+    // '#' of '#(...)' at byte 5, 'xs' at byte 14.
+    assert_eq!(positions, vec![(0, 5), (0, 14)]);
+}
+
+#[test]
+fn arg_positions_degenerate_span_falls_back() {
+    // A same-line span with end before start (malformed/mid-edit) must not
+    // panic slicing the source substring; the lenient scan takes over.
+    let text = "(foo a b)";
+    let lines: Vec<&str> = text.lines().collect();
+    let span = sema_core::Span::new(1, 5, 1, 2);
+    let positions = find_arg_positions_in_form(&span, &lines, 2);
+    // No assertion on content — the point is this does not panic.
+    let _ = positions;
+}
+
 // ── top_level_ranges ─────────────────────────────────────────
 
 #[test]

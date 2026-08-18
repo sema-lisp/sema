@@ -139,8 +139,8 @@
   ;; exercises the `a+bi` reader/printer path.
   (make-rectangular (rng-range! -50 50) (rng-pick! *nz*)))
 
-(define (gen-atom)
-  ((rng-pick! (list
+(define *gen-atom-prods*
+  (list
     (lambda () (rng-range! -100000 100000))
     (lambda () (gen-float))
     (lambda () (rng-bool!))
@@ -152,7 +152,10 @@
     (lambda () (gen-bignum))
     (lambda () (gen-rational-atom))
     (lambda () (gen-complex-atom))
-    ))))
+    ))
+
+(define (gen-atom)
+  ((rng-pick! *gen-atom-prods*)))
 
 (define (gen-list depth)
   (let ((k (rng-int! 5)))
@@ -252,50 +255,10 @@
 (define *nz* (list 1 2 3 -1 -2 -3 4 -4 7 -7 11 -11))
 
 ;; ── int ──────────────────────────────────────────────────────────────────
-;; Adapt a uniform (env depth) production to a zero-arg thunk for rng-pick! .
-(define (gen-thunk f)
-  (lambda (env depth) (f env depth)))
-
 (define (gen-int env depth)
   (if (<= depth 0)
     (gen-int-leaf env)
-    ((rng-pick! (list
-      ;; slots 0-2: leaf (weight 3 of 26)
-      (lambda (env depth) (gen-int-leaf env))
-      (lambda (env depth) (gen-int-leaf env))
-      (lambda (env depth) (gen-int-leaf env))
-      (lambda (env depth) (gen-int-bin '+ env depth +))
-      (lambda (env depth) (gen-int-bin '- env depth -))
-      (lambda (env depth) (gen-int-bin '* env depth *))
-      (gen-thunk gen-int-vararith)
-      (gen-thunk gen-int-minmax)
-      (gen-thunk gen-int-unary)
-      (gen-thunk gen-int-mod)
-      (gen-thunk gen-int-if)
-      (gen-thunk gen-int-cond)
-      (gen-thunk gen-int-let)
-      (gen-thunk gen-int-app)
-      (gen-thunk gen-int-fromlist)
-      (gen-thunk gen-int-recur)
-      ;; NOTE: set! is deliberately NOT generated. The value oracle computes
-      ;; `expected` bottom-up assuming every sub-expression is referentially
-      ;; transparent (same value however many times / whenever evaluated).
-      ;; set! is the only impurity in the grammar; combined with async tasks
-      ;; or law-style duplication its evaluation count diverges from the
-      ;; model, yielding false positives (a depth-7 program reported a 2x
-      ;; mismatch that was an oracle artifact, not a VM bug). set! correctness
-      ;; is covered by the dual-eval set! tests instead. Slot 16 -> a leaf.
-      (lambda (env depth) (gen-int-leaf env))
-      (gen-thunk gen-int-try)
-      (gen-thunk gen-int-match)
-      (gen-thunk gen-int-case)
-      (gen-thunk gen-int-apply)
-      (gen-thunk gen-int-curry)
-      (gen-thunk gen-int-bits)
-      (gen-thunk gen-int-asyncsum)
-      (gen-thunk gen-int-asyncchan)
-      (gen-thunk gen-int-fromcontainer)
-      )) env depth)))
+    ((rng-pick! *gen-int-prods*) env depth)))
 
 (define (gen-int-leaf env)
   (let ((r (maybe-ref env 'int)))
@@ -419,26 +382,7 @@
 (define (gen-bool env depth)
   (if (<= depth 0)
     (gen-bool-leaf env)
-    ((rng-pick! (list
-      ;; slots 0-1: leaf (weight 2 of 17)
-      (lambda (env depth) (gen-bool-leaf env))
-      (lambda (env depth) (gen-bool-leaf env))
-      (lambda (env depth) (gen-bool-cmp '= env depth =))
-      (lambda (env depth) (gen-bool-cmp '< env depth <))
-      (lambda (env depth) (gen-bool-cmp '> env depth >))
-      (lambda (env depth) (gen-bool-cmp '<= env depth <=))
-      (lambda (env depth) (gen-bool-cmp '>= env depth >=))
-      (gen-thunk gen-bool-logic)
-      (gen-thunk gen-bool-not)
-      (gen-thunk gen-bool-pred)
-      (gen-thunk gen-bool-if)
-      (gen-thunk gen-bool-floatcmp)
-      (gen-thunk gen-bool-mapcontains)
-      (gen-thunk gen-bool-typepred)
-      (gen-thunk gen-bool-strcontains)
-      (gen-thunk gen-law)
-      (gen-thunk gen-bool-let)
-      )) env depth)))
+    ((rng-pick! *gen-bool-prods*) env depth)))
 
 (define (gen-bool-leaf env)
   (let ((r (maybe-ref env 'bool)))
@@ -492,26 +436,7 @@
 (define (gen-ilist env depth)
   (if (<= depth 0)
     (gen-list-leaf env)
-    ((rng-pick! (list
-      ;; slots 0-2: leaf (weight 3 of 17)
-      (lambda (env depth) (gen-list-leaf env))
-      (lambda (env depth) (gen-list-leaf env))
-      (lambda (env depth) (gen-list-leaf env))
-      (gen-thunk gen-list-cons)
-      (gen-thunk gen-list-reverse)
-      (gen-thunk gen-list-append)
-      (gen-thunk gen-list-map)
-      (gen-thunk gen-list-filter)
-      (gen-thunk gen-list-range)
-      (gen-thunk gen-list-rest)
-      (gen-thunk gen-list-take)
-      (gen-thunk gen-list-drop)
-      (gen-thunk gen-list-sort)
-      (gen-thunk gen-list-vals)
-      (gen-thunk gen-list-fromvec)
-      (gen-thunk gen-list-asyncall)
-      (gen-thunk gen-list-let)
-      )) env depth)))
+    ((rng-pick! *gen-ilist-prods*) env depth)))
 
 (define (gen-list-leaf env)
   (let ((r (maybe-ref env 'list)))
@@ -664,35 +589,7 @@
 
 ;; Pull an int out of a vec / string / map.
 (define (gen-int-fromcontainer env depth)
-  ((rng-pick! (list
-    (lambda (env depth)
-      (let* ((v (gen-vec env (- depth 1))) (vv (gv v)))
-        (if (> (count vv) 0)
-          (let ((i (rng-int! (count vv))))
-            (mk (list 'nth (gf v) i) (nth vv i)))
-          (mk (list 'count (gf v)) (count vv)))))
-    (lambda (env depth)
-      (let ((v (gen-vec env (- depth 1))))
-        (mk (list 'count (gf v)) (count (gv v)))))
-    (lambda (env depth)
-      (let ((s (gen-str env (- depth 1))))
-        (mk (list 'string-length (gf s)) (string-length (gv s)))))
-    (lambda (env depth)
-      (let ((m (gen-map-v env (- depth 1))))
-        (mk (list 'count (gf m)) (count (gv m)))))
-    (lambda (env depth)
-      (let* ((l (gen-ilist env (- depth 1))) (lv (gv l)))
-        ;; last of a nonempty list; fall back to length when empty
-        (if (> (length lv) 0)
-          (mk (list 'last (gf l)) (last lv))
-          (mk (list 'length (gf l)) (length lv)))))
-    (lambda (env depth)
-      (let* ((m (gen-map-v env (- depth 1)))
-             (mv (gv m))
-             (d (rng-range! -9 9)))
-        ;; get with default: deterministic regardless of key presence
-        (mk (list 'get (gf m) :zzz d) (get mv :zzz d))))
-    )) env depth))
+  ((rng-pick! *gen-int-fromcontainer-prods*) env depth))
 
 ;; ── bit ops + expt (int) ─────────────────────────────────────────────────────
 (define (gen-int-bits env depth)
@@ -1205,35 +1102,7 @@
 ;; exercises the channel-backed semaphore), and async/spawn-all over closed
 ;; thunks of generated int programs.
 (define (gen-async-owned-ok env depth)
-  ((rng-pick! (list
-    (lambda (env depth)
-      (let* ((n (rng-range! 1 8))
-             (k (rng-range! -5 5))
-             (x (gensym "x"))
-             (items (range 1 (+ n 1)))
-             (body (cons 'begin (with-sleeps (list (list '+ x k))))))
-        (mk (list 'async/map (list 'lambda (list x) body) (cons 'list items))
-          (map (lambda (i) (+ i k)) items))))
-    (lambda (env depth)
-      (let* ((n (rng-range! 1 8))
-             (w (rng-range! 1 4))
-             (x (gensym "x"))
-             (items (range 1 (+ n 1)))
-             (body (cons 'begin (with-sleeps (list (list '* x x))))))
-        (mk
-          (list 'async/pool-map (list 'lambda (list x) body) (cons 'list items) w)
-          (map (lambda (i) (* i i)) items))))
-    (lambda (env depth)
-      (let ((kk (rng-range! 1 3)))
-        (let loop ((i 0) (thunks (list)) (vals (list)))
-          (if (< i kk)
-            (let ((t (gen-int env (- depth 1))))
-              (loop (+ i 1)
-                (cons (list 'lambda (list) (gf t)) thunks)
-                (cons (gv t) vals)))
-            (mk (list 'async/spawn-all (cons 'list (reverse thunks)))
-              (reverse vals)))))))
-    ) env depth))
+  ((rng-pick! *gen-async-owned-ok-prods*) env depth))
 
 ;; Insert x into xs at index i (0 <= i <= (length xs)).
 (define (insert-at xs i x)
@@ -1396,23 +1265,7 @@
 (define (gen-async env depth)
   (if (<= depth 0)
     (gen-async-leaf env)
-    ((rng-pick! (list
-      (gen-thunk gen-async-chan-pipeline)
-      (gen-thunk gen-async-chan-recvfirst)
-      (gen-thunk gen-async-chan-fanin)
-      (gen-thunk gen-async-chan-close)
-      (gen-thunk gen-async-chan-closewake)
-      (gen-thunk gen-async-chan-closesend)
-      (gen-thunk gen-async-tryrecv)
-      (gen-thunk gen-async-spawn-tree)
-      (gen-thunk gen-async-cancel)
-      (gen-thunk gen-async-owned-fail)
-      (gen-thunk gen-async-owned-ok)
-      (gen-thunk gen-async-race)
-      (gen-thunk gen-async-with-timeout)
-      (gen-thunk gen-async-causal)
-      (gen-thunk gen-async-offload)
-      )) env depth)))
+    ((rng-pick! *gen-async-prods*) env depth)))
 
 ;; ── metamorphic / differential laws (independent oracle for native ops) ──────
 ;; The plain value oracle computes `expected` by calling the SAME builtin the
@@ -1424,7 +1277,10 @@
 (define (law form) (mk form #t)) ; a law: must evaluate to #t on a correct VM
 
 (define (gen-law env depth)
-  ((rng-pick! (list
+  ((rng-pick! *gen-law-prods*) env depth))
+
+(define *gen-law-prods*
+  (list
     ;; reverse == fold-cons
     (lambda (env depth)
       (let ((l (gen-ilist env (- depth 1))))
@@ -1560,8 +1416,7 @@
         (law
           (list '=
             (list 'count (list 'vector->list (gf v)))
-            (list 'count (gf v)))))))
-    ) env depth))
+            (list 'count (gf v))))))))
 
 ;; ── float ──────────────────────────────────────────────────────────────────
 ;; Magnitudes kept small so +/-/* never overflow to inf and never produce NaN;
@@ -1569,18 +1424,7 @@
 (define (gen-flt env depth)
   (if (<= depth 0)
     (gen-flt-leaf env)
-    ((rng-pick! (list
-      ;; slots 0-2: leaf (weight 3 of 9)
-      (lambda (env depth) (gen-flt-leaf env))
-      (lambda (env depth) (gen-flt-leaf env))
-      (lambda (env depth) (gen-flt-leaf env))
-      (lambda (env depth) (gen-flt-bin '+ env depth +))
-      (lambda (env depth) (gen-flt-bin '- env depth -))
-      (lambda (env depth) (gen-flt-bin '* env depth *))
-      (gen-thunk gen-flt-unary)
-      (gen-thunk gen-flt-if)
-      (gen-thunk gen-flt-let)
-      )) env depth)))
+    ((rng-pick! *gen-flt-prods*) env depth)))
 
 (define (gen-flt-leaf env)
   (let ((r (maybe-ref env 'float)))
@@ -1634,20 +1478,7 @@
 (define (gen-str env depth)
   (if (<= depth 0)
     (gen-str-leaf env)
-    ((rng-pick! (list
-      ;; slots 0-2: leaf (weight 3 of 11)
-      (lambda (env depth) (gen-str-leaf env))
-      (lambda (env depth) (gen-str-leaf env))
-      (lambda (env depth) (gen-str-leaf env))
-      (gen-thunk gen-str-append)
-      (gen-thunk gen-str-sub)
-      (lambda (env depth) (gen-str-case env depth #t))
-      (lambda (env depth) (gen-str-case env depth #f))
-      (gen-thunk gen-str-reverse)
-      (gen-thunk gen-str-repeat)
-      (gen-thunk gen-str-numstr)
-      (gen-thunk gen-str-let)
-      )) env depth)))
+    ((rng-pick! *gen-str-prods*) env depth)))
 
 (define (gen-str-leaf env)
   (let ((r (maybe-ref env 'string)))
@@ -1707,15 +1538,7 @@
 (define (gen-map-v env depth)
   (if (<= depth 0)
     (gen-map-leaf env)
-    ((rng-pick! (list
-      (lambda (env depth) (gen-map-leaf env))  ; 0
-      (lambda (env depth) (gen-map-leaf env))  ; 1
-      (lambda (env depth) (gen-map-leaf env))  ; 2
-      (gen-thunk gen-map-assoc)                ; 3
-      (gen-thunk gen-map-dissoc)               ; 4
-      (gen-thunk gen-map-merge)                ; 5
-      (lambda (env depth) (gen-map-leaf env))  ; 6 = else -> leaf
-      )) env depth)))
+    ((rng-pick! *gen-map-v-prods*) env depth)))
 
 (define (gen-map-leaf env)
   (let ((r (maybe-ref env 'map)))
@@ -1744,6 +1567,223 @@
 (define (gen-bool-mapcontains env depth)
   (let ((m (gen-map-v env (- depth 1))) (k (rng-pick! *map-keys*)))
     (mk (list 'contains? (gf m) k) (contains? (gv m) k))))
+
+;; ── production lists (hoisted top-level defines, built once) ────────────────
+;; Every gen-X dispatcher used to rebuild its production list (up to ~26
+;; closures) on every call via `(rng-pick! (list ...))`. The lists below are
+;; built once at load time; `rng-pick!` still draws exactly one index per
+;; call, same as before, so the RNG draw count/order and slot ordering are
+;; unchanged. Only lists whose elements close over nothing per-call are
+;; hoisted here — each element is a plain `(lambda (env depth) ...)` or a bare
+;; reference to an already-defined `(env depth)` function, never a closure
+;; over a caller's `depth`/`env`/other per-call local. `gen-datum`'s list
+;; (closes over the caller's `depth`) and `with-sleeps`' list (closes over the
+;; caller's `body-forms`) are genuinely per-call and stay inline.
+
+(define *gen-int-prods*
+  (list
+    ;; slots 0-2: leaf (weight 3 of 26)
+    (lambda (env depth) (gen-int-leaf env))
+    (lambda (env depth) (gen-int-leaf env))
+    (lambda (env depth) (gen-int-leaf env))
+    (lambda (env depth) (gen-int-bin '+ env depth +))
+    (lambda (env depth) (gen-int-bin '- env depth -))
+    (lambda (env depth) (gen-int-bin '* env depth *))
+    gen-int-vararith
+    gen-int-minmax
+    gen-int-unary
+    gen-int-mod
+    gen-int-if
+    gen-int-cond
+    gen-int-let
+    gen-int-app
+    gen-int-fromlist
+    gen-int-recur
+    ;; NOTE: set! is deliberately NOT generated. The value oracle computes
+    ;; `expected` bottom-up assuming every sub-expression is referentially
+    ;; transparent (same value however many times / whenever evaluated).
+    ;; set! is the only impurity in the grammar; combined with async tasks
+    ;; or law-style duplication its evaluation count diverges from the
+    ;; model, yielding false positives (a depth-7 program reported a 2x
+    ;; mismatch that was an oracle artifact, not a VM bug). set! correctness
+    ;; is covered by the dual-eval set! tests instead. Slot 16 -> a leaf.
+    (lambda (env depth) (gen-int-leaf env))
+    gen-int-try
+    gen-int-match
+    gen-int-case
+    gen-int-apply
+    gen-int-curry
+    gen-int-bits
+    gen-int-asyncsum
+    gen-int-asyncchan
+    gen-int-fromcontainer
+    ))
+
+(define *gen-bool-prods*
+  (list
+    ;; slots 0-1: leaf (weight 2 of 17)
+    (lambda (env depth) (gen-bool-leaf env))
+    (lambda (env depth) (gen-bool-leaf env))
+    (lambda (env depth) (gen-bool-cmp '= env depth =))
+    (lambda (env depth) (gen-bool-cmp '< env depth <))
+    (lambda (env depth) (gen-bool-cmp '> env depth >))
+    (lambda (env depth) (gen-bool-cmp '<= env depth <=))
+    (lambda (env depth) (gen-bool-cmp '>= env depth >=))
+    gen-bool-logic
+    gen-bool-not
+    gen-bool-pred
+    gen-bool-if
+    gen-bool-floatcmp
+    gen-bool-mapcontains
+    gen-bool-typepred
+    gen-bool-strcontains
+    gen-law
+    gen-bool-let
+    ))
+
+(define *gen-ilist-prods*
+  (list
+    ;; slots 0-2: leaf (weight 3 of 17)
+    (lambda (env depth) (gen-list-leaf env))
+    (lambda (env depth) (gen-list-leaf env))
+    (lambda (env depth) (gen-list-leaf env))
+    gen-list-cons
+    gen-list-reverse
+    gen-list-append
+    gen-list-map
+    gen-list-filter
+    gen-list-range
+    gen-list-rest
+    gen-list-take
+    gen-list-drop
+    gen-list-sort
+    gen-list-vals
+    gen-list-fromvec
+    gen-list-asyncall
+    gen-list-let
+    ))
+
+(define *gen-int-fromcontainer-prods*
+  (list
+    (lambda (env depth)
+      (let* ((v (gen-vec env (- depth 1))) (vv (gv v)))
+        (if (> (count vv) 0)
+          (let ((i (rng-int! (count vv))))
+            (mk (list 'nth (gf v) i) (nth vv i)))
+          (mk (list 'count (gf v)) (count vv)))))
+    (lambda (env depth)
+      (let ((v (gen-vec env (- depth 1))))
+        (mk (list 'count (gf v)) (count (gv v)))))
+    (lambda (env depth)
+      (let ((s (gen-str env (- depth 1))))
+        (mk (list 'string-length (gf s)) (string-length (gv s)))))
+    (lambda (env depth)
+      (let ((m (gen-map-v env (- depth 1))))
+        (mk (list 'count (gf m)) (count (gv m)))))
+    (lambda (env depth)
+      (let* ((l (gen-ilist env (- depth 1))) (lv (gv l)))
+        ;; last of a nonempty list; fall back to length when empty
+        (if (> (length lv) 0)
+          (mk (list 'last (gf l)) (last lv))
+          (mk (list 'length (gf l)) (length lv)))))
+    (lambda (env depth)
+      (let* ((m (gen-map-v env (- depth 1)))
+             (mv (gv m))
+             (d (rng-range! -9 9)))
+        ;; get with default: deterministic regardless of key presence
+        (mk (list 'get (gf m) :zzz d) (get mv :zzz d))))
+    ))
+
+(define *gen-flt-prods*
+  (list
+    ;; slots 0-2: leaf (weight 3 of 9)
+    (lambda (env depth) (gen-flt-leaf env))
+    (lambda (env depth) (gen-flt-leaf env))
+    (lambda (env depth) (gen-flt-leaf env))
+    (lambda (env depth) (gen-flt-bin '+ env depth +))
+    (lambda (env depth) (gen-flt-bin '- env depth -))
+    (lambda (env depth) (gen-flt-bin '* env depth *))
+    gen-flt-unary
+    gen-flt-if
+    gen-flt-let
+    ))
+
+(define *gen-str-prods*
+  (list
+    ;; slots 0-2: leaf (weight 3 of 11)
+    (lambda (env depth) (gen-str-leaf env))
+    (lambda (env depth) (gen-str-leaf env))
+    (lambda (env depth) (gen-str-leaf env))
+    gen-str-append
+    gen-str-sub
+    (lambda (env depth) (gen-str-case env depth #t))
+    (lambda (env depth) (gen-str-case env depth #f))
+    gen-str-reverse
+    gen-str-repeat
+    gen-str-numstr
+    gen-str-let
+    ))
+
+(define *gen-map-v-prods*
+  (list
+    (lambda (env depth) (gen-map-leaf env))  ; 0
+    (lambda (env depth) (gen-map-leaf env))  ; 1
+    (lambda (env depth) (gen-map-leaf env))  ; 2
+    gen-map-assoc                            ; 3
+    gen-map-dissoc                           ; 4
+    gen-map-merge                            ; 5
+    (lambda (env depth) (gen-map-leaf env))  ; 6 = else -> leaf
+    ))
+
+(define *gen-async-prods*
+  (list
+    gen-async-chan-pipeline
+    gen-async-chan-recvfirst
+    gen-async-chan-fanin
+    gen-async-chan-close
+    gen-async-chan-closewake
+    gen-async-chan-closesend
+    gen-async-tryrecv
+    gen-async-spawn-tree
+    gen-async-cancel
+    gen-async-owned-fail
+    gen-async-owned-ok
+    gen-async-race
+    gen-async-with-timeout
+    gen-async-causal
+    gen-async-offload
+    ))
+
+(define *gen-async-owned-ok-prods*
+  (list
+    (lambda (env depth)
+      (let* ((n (rng-range! 1 8))
+             (k (rng-range! -5 5))
+             (x (gensym "x"))
+             (items (range 1 (+ n 1)))
+             (body (cons 'begin (with-sleeps (list (list '+ x k))))))
+        (mk (list 'async/map (list 'lambda (list x) body) (cons 'list items))
+          (map (lambda (i) (+ i k)) items))))
+    (lambda (env depth)
+      (let* ((n (rng-range! 1 8))
+             (w (rng-range! 1 4))
+             (x (gensym "x"))
+             (items (range 1 (+ n 1)))
+             (body (cons 'begin (with-sleeps (list (list '* x x))))))
+        (mk
+          (list 'async/pool-map (list 'lambda (list x) body) (cons 'list items) w)
+          (map (lambda (i) (* i i)) items))))
+    (lambda (env depth)
+      (let ((kk (rng-range! 1 3)))
+        (let loop ((i 0) (thunks (list)) (vals (list)))
+          (if (< i kk)
+            (let ((t (gen-int env (- depth 1))))
+              (loop (+ i 1)
+                (cons (list 'lambda (list) (gf t)) thunks)
+                (cons (gv t) vals)))
+            (mk (list 'async/spawn-all (cons 'list (reverse thunks)))
+              (reverse vals)))))))
+    )
 
 ;; Top-level: pick a result type (int-biased) and generate a closed program.
 (define (gen-typed depth)

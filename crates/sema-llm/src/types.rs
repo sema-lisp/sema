@@ -143,6 +143,10 @@ impl ChatMessage {
         if !self.tool_calls.is_empty() {
             MessageKind::AssistantWithToolCalls(&self.content, &self.tool_calls)
         } else if self.role == "tool" {
+            // `tool_call_id == None` here still classifies as ToolResult (not
+            // Other) — the serializers then emit an empty correlation id. This
+            // is the single place to harden if a missing id ever needs to be
+            // rejected instead.
             MessageKind::ToolResult {
                 id: self.tool_call_id.as_deref(),
                 name: self.tool_name.as_deref(),
@@ -540,6 +544,22 @@ mod tests {
         // the Option None so providers that distinguish None from "" still can.
         let plain = ChatMessage::new("user", "hi");
         assert!(matches!(plain.kind(), MessageKind::Other("user", c) if c.as_text() == Some("hi")));
+    }
+
+    #[test]
+    fn message_kind_tool_role_without_id_still_classifies_as_tool_result() {
+        // role == "tool" with no tool_call_id still classifies as ToolResult
+        // (not Other) — id is None, and serializers emit an empty correlation
+        // id downstream. Pinning this pre-existing behavior.
+        let orphan = ChatMessage::new("tool", "42");
+        assert!(matches!(
+            orphan.kind(),
+            MessageKind::ToolResult {
+                id: None,
+                name: None,
+                ..
+            }
+        ));
     }
 
     #[test]

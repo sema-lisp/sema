@@ -41,10 +41,16 @@ task og: [deps]
 @group site
 @desc "Build + deploy the docs site to production (Vercel)"
 @needs npx
-task deploy: [build]
+task deploy: [og, build]
     @confirm "Deploy the docs site to production?"
+    # `og` ran first (hash-idempotent) so the cards match the current version and
+    # titles; they are git-tracked, so flag a regen that still needs committing.
+    git status --porcelain website/public/og website/og-manifest.json playground/og-playground.jpg | grep -q . && echo "NOTE: OG cards regenerated — commit website/public/og + og-manifest.json (+ playground/og-playground.jpg)" || true
     # Vercel uploads only `website/`, so the workspace Cargo.toml is absent during the
     # remote build and config.ts cannot read the version from it. Pass it explicitly;
     # without this the hero silently renders without a version.
-    @cd website
-    npx vercel --prod --yes --build-env SEMA_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' ../Cargo.toml | head -1)"
+    cd website && npx vercel --prod --yes --build-env SEMA_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' ../Cargo.toml | head -1)"
+    # A failed remote build leaves the previous deploy live — verify the promoted
+    # site actually serves the current version before calling this done.
+    sleep 5
+    curl -sf https://sema-lang.com/ | grep -q "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1) · MIT" && echo "site.deploy: live hero serves v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1) ✓" || { echo "site.deploy: the live hero does not show the current version — the deploy did not promote or SEMA_VERSION was lost" >&2; exit 1; }

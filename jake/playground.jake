@@ -23,5 +23,11 @@ task dev: [build]
 @needs npx
 task deploy: [build]
     @confirm "Deploy the playground to production?"
-    @cd playground
-    npx vercel --prod --yes
+    # site.og also writes playground/og-playground.jpg; hash-idempotent, so this
+    # is a no-op unless the template, logo, or version changed.
+    jake site.og
+    git status --porcelain playground/og-playground.jpg | grep -q . && echo "NOTE: og-playground.jpg regenerated — commit it" || true
+    cd playground && npx vercel --prod --yes
+    # A failed remote build leaves the previous deploy live — verify it serves.
+    sleep 5
+    curl -sf -o /dev/null https://sema.run/ && echo "pg.deploy: sema.run responds ✓" || { echo "pg.deploy: sema.run is not responding after deploy" >&2; exit 1; }

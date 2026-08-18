@@ -1,9 +1,5 @@
 import { test, expect } from '@playwright/test';
-
-async function waitForReady(page) {
-  await page.goto('/');
-  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
-}
+import { waitForReady } from './helpers';
 
 const PERLIN_HELPERS = `
 (define seed 42)

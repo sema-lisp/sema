@@ -6,54 +6,10 @@
 // evaluated. The bar throughout is the same: never a 5xx, never a hang, and the
 // notebook still coherent afterwards.
 
-import { test, expect, APIRequestContext } from '@playwright/test';
+import { test, expect } from '@playwright/test';
+import { createCell, fetchNotebook, installNotebookRestore } from './helpers';
 
-const createdCells: string[] = [];
-let pristineOrder: string[] = [];
-
-async function createCell(
-  request: APIRequestContext,
-  source: string,
-  type: 'code' | 'markdown' = 'code',
-  after?: string
-): Promise<string> {
-  const data: Record<string, unknown> = { type, source };
-  if (after !== undefined) data.after = after;
-  const res = await request.post('/api/cells', { data });
-  expect(res.ok()).toBeTruthy();
-  const { id } = await res.json();
-  createdCells.push(id);
-  return id;
-}
-
-async function fetchNotebook(request: APIRequestContext) {
-  const res = await request.get('/api/notebook');
-  expect(res.ok()).toBeTruthy();
-  return res.json();
-}
-
-test.beforeAll(async ({ request }) => {
-  pristineOrder = (await fetchNotebook(request)).cells.map((c: any) => c.id);
-});
-
-test.afterAll(async ({ request }) => {
-  // Delete by DIFFERENCE against the pristine set rather than by replaying a
-  // list of ids. Tests here race deletes against evaluations, so a bookkeeping
-  // list drifts from reality; asking the server what is actually there cannot.
-  const live = (await fetchNotebook(request)).cells.map((c: any) => c.id);
-  for (const id of live.filter((id: string) => !pristineOrder.includes(id))) {
-    await request.delete(`/api/cells/${id}`).catch(() => {});
-  }
-  createdCells.length = 0;
-  if (pristineOrder.length > 0) {
-    await request.post('/api/cells/reorder', { data: { cell_ids: pristineOrder } }).catch(() => {});
-  }
-  await request.post('/api/reset').catch(() => {});
-
-  const final = await fetchNotebook(request);
-  expect(final.cells.map((c: any) => c.id)).toEqual(pristineOrder);
-  expect(final.can_undo).toBeFalsy();
-});
+installNotebookRestore(test);
 
 test.describe('Overlapping requests', () => {
   test('a reset issued during an evaluation leaves the server healthy', async ({ request }) => {
@@ -137,7 +93,6 @@ test.describe('Insertion position', () => {
     expect(res.status(), 'a bogus anchor must not 5xx').toBeLessThan(500);
     if (res.ok()) {
       const { id } = await res.json();
-      createdCells.push(id);
       // However it resolves, the cell must be reachable exactly once.
       const ids = (await fetchNotebook(request)).cells.map((c: any) => c.id);
       expect(ids.filter((x: string) => x === id).length).toBe(1);

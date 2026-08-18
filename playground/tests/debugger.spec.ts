@@ -1,34 +1,6 @@
 import { test, expect, Page } from '@playwright/test';
 import { toggleBreakpoint, getCurrentDebugLine, getBreakpointLines } from './gutter';
-
-async function waitForReady(page: Page) {
-  await page.goto('/');
-  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
-}
-
-async function setEditorCode(page: Page, code: string) {
-  await page.getByTestId('editor').fill(code);
-}
-
-/** Get the current debug state from the status bar. */
-async function getStatus(page: Page): Promise<string> {
-  return await page.getByTestId('status').textContent() ?? '';
-}
-
-/** Get all output lines (text content). */
-async function getOutputLines(page: Page): Promise<string[]> {
-  return page.getByTestId('output-line').allTextContents();
-}
-
-/** Get all error output. */
-async function getErrors(page: Page): Promise<string[]> {
-  return page.getByTestId('output-error').allTextContents();
-}
-
-/** Get debug variable names from the variables panel. */
-async function getDebugVarNames(page: Page): Promise<string[]> {
-  return page.getByTestId('debug-var-name').allTextContents();
-}
+import { waitForReady, setEditorCode, getErrors, getStatus, getOutputLines } from './helpers';
 
 /** Get debug variable values from the variables panel. */
 async function getDebugVars(page: Page): Promise<{name: string, value: string}[]> {

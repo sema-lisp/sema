@@ -1,25 +1,5 @@
-import { test, expect, Page } from '@playwright/test';
-
-// ── Helpers ────────────────────────────────────────────────────
-
-/** Wait for the notebook to finish loading cells. */
-async function waitForLoad(page: Page) {
-  await page.goto('/', { waitUntil: 'networkidle' });
-  // Cells are loaded via JS fetch after page load — wait for them
-  await page.getByTestId('cell').first().waitFor({ timeout: 15000 });
-}
-
-/** Get all cells on the page. */
-function cells(page: Page) {
-  return page.getByTestId('cell');
-}
-
-/** Get cells of a specific type. */
-function cellsOfType(page: Page, type: 'code' | 'markdown') {
-  // data-cell-type is a real data attribute (not a testid) used to distinguish
-  // code/markdown cells; narrow the testid-selected set with it via `.and()`.
-  return page.getByTestId('cell').and(page.locator(`[data-cell-type="${type}"]`));
-}
+import { test, expect } from '@playwright/test';
+import { waitForLoad, cells, cellsOfType } from './helpers';
 
 // ── Page Structure Tests ───────────────────────────────────────
 

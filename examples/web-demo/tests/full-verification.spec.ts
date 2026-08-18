@@ -2,17 +2,8 @@
  * Full verification test — exercises the real end-to-end flow for all three demos.
  * Makes real LLM API calls and verifies the full pipeline.
  */
-import { test, expect, type Page } from "@playwright/test";
-
-async function waitForSema(page: Page) {
-  await page.waitForFunction(
-    () => (window as any).__semaWeb || (window as any).__semaInitError,
-    null,
-    { timeout: 15_000 }
-  );
-  const err = await page.evaluate(() => (window as any).__semaInitError);
-  if (err) throw new Error(`SemaWeb init failed: ${err}`);
-}
+import { test, expect } from "@playwright/test";
+import { waitForSema } from "./helpers";
 
 test.describe("Full Verification: Board Demo", () => {
   test("board renders, cards work, persistence works", async ({ page }) => {

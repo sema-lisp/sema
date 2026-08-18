@@ -1,9 +1,5 @@
 import { test, expect, Page } from '@playwright/test';
-
-async function waitForReady(page: Page) {
-  await page.goto('/');
-  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
-}
+import { waitForReady } from './helpers';
 
 async function clickRun(page: Page) {
   await page.getByTestId('run-btn').click();

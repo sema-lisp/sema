@@ -14,7 +14,7 @@ use sema_core::{pretty_print, resolve, Spur, Value};
 use sema_eval::Interpreter;
 use sema_vm::runtime::{OutputEvent, RootOptions, RuntimeCommandHandle};
 
-use crate::format::{CellOutput, CellType, Notebook, OutputType};
+use crate::format::{CellOutput, CellType, CellUsage, Notebook, OutputType};
 
 /// Default wall-clock budget for a single cell evaluation.
 /// Override via the `SEMA_NOTEBOOK_TIMEOUT_MS` environment variable; set the
@@ -217,6 +217,7 @@ impl Engine {
                 sema_value: None,
                 timestamp: Utc::now(),
                 cost_usd: None,
+                usage: None,
                 requires_reeval: false,
                 duration_ms: None,
             });
@@ -253,6 +254,9 @@ impl Engine {
     /// routing.
     fn eval_source_named(&mut self, source: &str, name: Option<String>) -> EvalResult {
         let start = Instant::now();
+        // Attribute LLM spend to this cell: offloaded completions fold into the
+        // scope captured at dispatch, so async spend lands here too (ASYNC-1).
+        let usage_scope = sema_llm::builtins::open_usage_scope();
 
         // Apply the wall-clock deadline to the interpreter context so an
         // infinite loop in a cell does not hang the engine thread forever.
@@ -317,6 +321,20 @@ impl Engine {
         self.interpreter.ctx.set_eval_deadline(None);
 
         let duration_ms = start.elapsed().as_millis() as u64;
+        // Snapshot when the root settles: a detached task that settles later
+        // still folds into the session total, but misses this cell's badge.
+        let leaf = usage_scope.usage();
+        drop(usage_scope);
+        // A cache-hit-only cell shows a visible $0; no LLM activity shows nothing.
+        let cost_usd = leaf.cost_usd.or((leaf.cache_hits > 0).then_some(0.0));
+        let usage = (leaf.calls > 0 || leaf.cache_hits > 0).then(|| CellUsage {
+            prompt_tokens: leaf.input_tokens,
+            completion_tokens: leaf.output_tokens,
+            total_tokens: leaf.input_tokens + leaf.output_tokens,
+            cache_read_tokens: leaf.cache_read_input_tokens,
+            cache_creation_tokens: leaf.cache_creation_input_tokens,
+            cost_usd,
+        });
 
         match eval_result {
             Ok(value) => {
@@ -330,7 +348,8 @@ impl Engine {
                         display,
                         sema_value: Some(sema_value),
                         timestamp: Utc::now(),
-                        cost_usd: None,
+                        cost_usd,
+                        usage,
                         requires_reeval: is_opaque(&value),
                         duration_ms: Some(duration_ms),
                     },
@@ -343,7 +362,8 @@ impl Engine {
                     display: format_error(&err),
                     sema_value: None,
                     timestamp: Utc::now(),
-                    cost_usd: None,
+                    cost_usd,
+                    usage,
                     requires_reeval: false,
                     duration_ms: Some(duration_ms),
                 },
@@ -522,6 +542,58 @@ mod tests {
         let outputs = &engine.notebook.cell(&id).unwrap().outputs;
         assert!(!outputs.is_empty());
         assert!(outputs.iter().any(|o| o.output_type == OutputType::Value));
+    }
+
+    #[test]
+    fn eval_cell_attributes_llm_cost_and_usage() {
+        use sema_llm::builtins::{register_test_provider, reset_runtime_state};
+        use sema_llm::fake::FakeProvider;
+
+        let mut engine = test_engine();
+        reset_runtime_state();
+        register_test_provider(Box::new(
+            FakeProvider::builder("fake")
+                .model("gpt-4o")
+                .reply_with_usage("pong", 100, 10)
+                .build(),
+        ));
+
+        let (_, result) = engine.create_and_eval(r#"(llm/complete "hi")"#).unwrap();
+        let usage = result.output.usage.expect("LLM cell must carry usage");
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.completion_tokens, 10);
+        assert_eq!(usage.total_tokens, 110);
+        assert!(result.output.cost_usd.unwrap() > 0.0);
+        assert!(sema_llm::builtins::session_cost_snapshot() > 0.0);
+
+        let (_, result) = engine.create_and_eval("(+ 1 2)").unwrap();
+        assert_eq!(result.output.cost_usd, None);
+        assert_eq!(result.output.usage, None);
+    }
+
+    #[test]
+    fn cached_rerun_reports_zero_cost() {
+        use sema_llm::builtins::{register_test_provider, reset_runtime_state};
+        use sema_llm::fake::FakeProvider;
+
+        let mut engine = test_engine();
+        reset_runtime_state();
+        register_test_provider(Box::new(
+            FakeProvider::builder("fake")
+                .model("gpt-4o")
+                .reply_with_usage("pong", 100, 10)
+                .build(),
+        ));
+
+        let src = r#"(llm/with-cache {:ttl 3600} (fn () (llm/complete "q")))"#;
+        engine.create_and_eval(src).unwrap();
+        let (_, cached) = engine.create_and_eval(src).unwrap();
+        assert_eq!(cached.output.cost_usd, Some(0.0));
+        let usage = cached
+            .output
+            .usage
+            .expect("cached cell still carries usage");
+        assert_eq!(usage.total_tokens, 0);
     }
 
     #[test]

@@ -8,6 +8,7 @@ document.addEventListener('alpine:init', () => {
     title: 'Untitled',
     focusedCellId: null,
     canUndo: false,
+    sessionCostUsd: 0,
     shiftEnterUsed: localStorage.getItem('sema-nb-shift-enter-used') === 'true',
     resetDialogOpen: false,
 
@@ -34,6 +35,7 @@ document.addEventListener('alpine:init', () => {
         const data = await this.api('GET', '/api/notebook');
         this.title = data.title || 'Untitled';
         this.canUndo = !!data.can_undo;
+        this.sessionCostUsd = data.session_cost_usd || 0;
         // The notebook owns the markdown edit<->render toggle (`_rendered`): preserve
         // it across reloads; new/empty markdown opens in edit, content-bearing renders.
         const prev = {};
@@ -252,8 +254,16 @@ document.addEventListener('alpine:init', () => {
       if (output.meta) {
         if (output.meta.duration_ms != null) parts.push(output.meta.duration_ms + 'ms');
         if (output.meta.cost_usd != null) parts.push('$' + output.meta.cost_usd.toFixed(4));
+        if (output.meta.usage) parts.push(output.meta.usage.total_tokens.toLocaleString() + ' tok');
       }
       return parts.join(' \u00b7 ');
+    },
+
+    formatMetaTitle(output) {
+      const u = output.meta && output.meta.usage;
+      if (!u) return '';
+      return u.prompt_tokens.toLocaleString() + ' prompt + '
+        + u.completion_tokens.toLocaleString() + ' completion tokens';
     },
 
     toggleOutput(header) {

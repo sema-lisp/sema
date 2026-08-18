@@ -934,6 +934,10 @@ pub struct LeafUsage {
     /// The model of the most recent priced/recorded call in this scope.
     pub model: String,
     pub calls: u32,
+    /// Completions served from `llm/with-cache` (all-zero usage). Not counted
+    /// in `calls`, so `calls == 0` gates still treat a purely-cached leaf as
+    /// free, while consumers can distinguish "cached, $0" from "no LLM call".
+    pub cache_hits: u32,
 }
 
 /// Fold one completion's usage into a `LeafUsage` tally. A cache hit (all-zero usage)
@@ -944,6 +948,7 @@ fn accumulate_into(slot: &Rc<RefCell<LeafUsage>>, usage: &Usage, cost: Option<f6
     // A cache hit reports no tokens and no cost. Priced models can report the
     // cost as `Some(0.0)`, so `cost.is_none()` cannot identify cache hits.
     if input == 0 && output == 0 && cost.unwrap_or(0.0) == 0.0 {
+        slot.borrow_mut().cache_hits += 1;
         return;
     }
     let mut acc = slot.borrow_mut();
@@ -963,9 +968,10 @@ fn accumulate_into(slot: &Rc<RefCell<LeafUsage>>, usage: &Usage, cost: Option<f6
 /// Fold a child leaf's tally into a parent's, used when a nested [`UsageScope`] drops
 /// so the outer scope it shadowed isn't left blind to tokens the inner one collected.
 fn merge_leaf(dst: &mut LeafUsage, src: &LeafUsage) {
-    if src.calls == 0 {
+    if src.calls == 0 && src.cache_hits == 0 {
         return;
     }
+    dst.cache_hits += src.cache_hits;
     dst.input_tokens += src.input_tokens;
     dst.output_tokens += src.output_tokens;
     dst.cache_read_input_tokens += src.cache_read_input_tokens;
@@ -1656,6 +1662,13 @@ fn take_serving_provider() -> Option<String> {
 
 struct LispProviderCallbacks {
     complete_fn: Value,
+}
+
+/// Snapshot this thread's cumulative session LLM cost in USD — the same figure
+/// `(llm/session-usage)` reports as `:cost-usd`. Zeroed by
+/// [`reset_runtime_state`], i.e. on interpreter construction.
+pub fn session_cost_snapshot() -> f64 {
+    SESSION_COST.with(|sc| *sc.borrow())
 }
 
 /// Reset LLM runtime state used by builtins.
@@ -14322,6 +14335,28 @@ mod tests {
     use super::*;
     use sema_core::{intern, Lambda};
     use serde_json::json;
+
+    #[test]
+    fn accumulate_into_counts_cache_hits_without_calls() {
+        let slot = Rc::new(RefCell::new(LeafUsage::default()));
+        accumulate_into(&slot, &Usage::default(), None);
+        let usage = slot.borrow().clone();
+        assert_eq!(usage.cache_hits, 1);
+        assert_eq!(usage.calls, 0);
+        assert_eq!(usage.cost_usd, None);
+    }
+
+    #[test]
+    fn merge_leaf_propagates_cache_hits() {
+        let mut dst = LeafUsage::default();
+        let src = LeafUsage {
+            cache_hits: 2,
+            ..LeafUsage::default()
+        };
+        merge_leaf(&mut dst, &src);
+        assert_eq!(dst.cache_hits, 2);
+        assert_eq!(dst.calls, 0);
+    }
 
     fn runtime_quantum_probe(
         ctx: &EvalContext,

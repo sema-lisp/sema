@@ -82,12 +82,33 @@ pub struct CellOutput {
     /// Estimated LLM cost in USD, if applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
+    /// LLM token usage for this evaluation, if it made any LLM calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<CellUsage>,
     /// Whether this value requires re-evaluation (e.g. file handles).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub requires_reeval: bool,
     /// Duration of evaluation in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+}
+
+/// Per-cell LLM usage, mirroring the `(llm/session-usage)` map shape.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CellUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read_tokens: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_creation_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Output type discriminator.
@@ -268,6 +289,7 @@ mod tests {
             sema_value: None,
             timestamp: Utc::now(),
             cost_usd: None,
+            usage: None,
             requires_reeval: false,
             duration_ms: None,
         };
@@ -320,6 +342,7 @@ mod tests {
             sema_value: Some("3".to_string()),
             timestamp: Utc::now(),
             cost_usd: None,
+            usage: None,
             requires_reeval: false,
             duration_ms: Some(5),
         }];

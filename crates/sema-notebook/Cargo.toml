@@ -10,6 +10,7 @@ description = "Notebook interface for Sema — cell-based evaluation with HTTP A
 [dependencies]
 sema-core.workspace = true
 sema-eval.workspace = true
+sema-llm.workspace = true
 sema-otel.workspace = true
 sema-vm.workspace = true
 serde.workspace = true

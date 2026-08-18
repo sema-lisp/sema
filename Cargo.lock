@@ -3562,6 +3562,7 @@ dependencies = [
  "chrono",
  "sema-core",
  "sema-eval",
+ "sema-llm",
  "sema-otel",
  "sema-vm",
  "serde",

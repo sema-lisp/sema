@@ -15155,7 +15155,7 @@ fn test_eval_stdin_read_error_json_has_message() {
     // stdin-read-failure early-exit path, which previously emitted
     // `"error": null` and silently dropped the actual cause.
     let stdin_file =
-        std::fs::File::open(&std::env::temp_dir()).expect("failed to open a directory as stdin");
+        std::fs::File::open(std::env::temp_dir()).expect("failed to open a directory as stdin");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
         .args(["eval", "--stdin", "--json", "--no-llm"])
         .stdin(std::process::Stdio::from(stdin_file))

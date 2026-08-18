@@ -74,6 +74,15 @@ After evaluating a cell, click **Undo** (or the inline "Undo cell" button on err
 
 This is useful when a cell modifies global state unexpectedly.
 
+## LLM Cost Tracking
+
+Cost visibility is ambient — no `(llm/session-usage)` cell needed:
+
+- **Per-cell badge**: a cell that makes LLM calls shows its cost and token count next to the duration in the output header (`$0.0123 · 1,234 tok`); hover for the prompt/completion split. A re-run served entirely from `llm/with-cache` shows `$0.0000`. Cells with no LLM activity show nothing.
+- **Session total**: the status bar shows the cumulative cost of the session (`session $0.0456`), matching `(llm/session-usage)`. **Reset** clears it along with the environment.
+
+Cost attribution follows the call that started the work: spend from async tasks and agents started in a cell is charged to that cell, even when it completes while a later cell runs.
+
 ## File Format
 
 Notebooks are saved as `.sema-nb` files in JSON format:
@@ -131,7 +140,6 @@ more `CellOutput` objects. Here is a cell with every field populated:
       "display": "3",
       "sema_value": "3",
       "timestamp": "2026-01-01T12:34:56.789Z",
-      "cost_usd": 0.0,
       "requires_reeval": false,
       "duration_ms": 12
     }
@@ -145,7 +153,8 @@ Field reference (`CellOutput`):
 - `display` — human-readable string shown in the UI.
 - `sema_value` — round-trippable S-expression form of the value (omitted when not applicable, e.g. for `error` / `stdout` outputs).
 - `timestamp` — RFC 3339 UTC timestamp of when the output was produced.
-- `cost_usd` — estimated LLM cost, for outputs from LLM calls; omitted otherwise.
+- `cost_usd` — estimated LLM cost of the evaluation, for cells that made LLM calls; `0.0` when every call was served from `llm/with-cache`; omitted for cells with no LLM activity or when the model is unpriced.
+- `usage` — LLM token counts for the evaluation (`prompt_tokens`, `completion_tokens`, `total_tokens`, plus `cache_read_tokens` / `cache_creation_tokens` when non-zero, and `cost_usd`), mirroring the `(llm/session-usage)` map shape; omitted for cells with no LLM activity.
 - `requires_reeval` — `true` for opaque values (lambdas, native fns, macros, streams, thunks) that cannot be round-tripped through `sema_value` and must be re-evaluated on notebook reload.
 - `duration_ms` — wall-clock evaluation time of the cell, in milliseconds.
 
@@ -178,7 +187,7 @@ Run all cells without starting the browser UI:
 sema notebook run my-notebook.sema-nb
 ```
 
-This evaluates all code cells in order, printing stdout to the terminal. Useful for CI validation or batch processing.
+This evaluates all code cells in order, printing stdout to the terminal. Useful for CI validation or batch processing. Cells that made LLM calls print a cost line (`[2/5] cost: $0.0123 (100 prompt + 10 completion tok)`), and a `session cost: $…` summary follows the last cell when the run spent anything.
 
 Run specific cells by index (1-based):
 
@@ -208,7 +217,7 @@ The notebook server exposes a JSON HTTP API on the same port as the browser UI. 
 
 | Method | Path                       | Description                                        |
 | ------ | -------------------------- | -------------------------------------------------- |
-| GET    | `/api/notebook`            | Return the full notebook (cells + metadata)        |
+| GET    | `/api/notebook`            | Return the full notebook (cells + metadata + `session_cost_usd`) |
 | POST   | `/api/cells`               | Create a new cell                                  |
 | GET    | `/api/cells/{id}`          | Fetch a single rendered cell                       |
 | POST   | `/api/cells/{id}`          | Update a cell's source or type                     |

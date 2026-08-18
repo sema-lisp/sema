@@ -41,6 +41,10 @@ test.describe('Page structure', () => {
     await expect(page.getByTestId('status-indicator')).toHaveText('Ready');
   });
 
+  test('session cost is hidden while the session has spent nothing', async ({ page }) => {
+    await expect(page.getByTestId('session-cost')).toBeHidden();
+  });
+
   test('demo notebook loads with correct cell count', async ({ page }) => {
     // 16 cells total: 5 markdown + 11 code (including error cell)
     // But let's just check we have a reasonable number

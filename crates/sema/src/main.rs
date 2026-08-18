@@ -3007,6 +3007,20 @@ fn run_notebook_command(command: NotebookCommands) {
                         if !r.output.display.is_empty() {
                             println!("[{}/{}] {}", i + 1, total, r.output.display);
                         }
+                        if let Some(u) = &r.output.usage {
+                            let cost = r
+                                .output
+                                .cost_usd
+                                .map(|c| format!("${c:.4}"))
+                                .unwrap_or_else(|| "unpriced".to_string());
+                            println!(
+                                "[{}/{}] cost: {cost} ({} prompt + {} completion tok)",
+                                i + 1,
+                                total,
+                                u.prompt_tokens,
+                                u.completion_tokens
+                            );
+                        }
                         if r.output.output_type == sema_notebook::format::OutputType::Error {
                             had_error = true;
                         }
@@ -3016,6 +3030,11 @@ fn run_notebook_command(command: NotebookCommands) {
                         had_error = true;
                     }
                 }
+            }
+
+            let session_cost = sema_llm::builtins::session_cost_snapshot();
+            if session_cost > 0.0 {
+                println!("session cost: ${session_cost:.4}");
             }
 
             // Save updated outputs back to the file

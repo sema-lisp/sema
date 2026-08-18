@@ -228,7 +228,7 @@
                              :data-testid="'cell-output-' + (output.output_type === 'error' ? 'error' : output.output_type === 'stdout' ? 'stdout' : 'value')">
                           <div class="cell-output-header" data-testid="cell-output-header" @click="toggleOutput($el)">
                             <span class="output-chevron" data-testid="output-chevron">&#9660;</span>
-                            <span class="output-meta" data-testid="output-meta" x-text="formatMeta(output)"></span>
+                            <span class="output-meta" data-testid="output-meta" x-text="formatMeta(output)" :title="formatMetaTitle(output)"></span>
                           </div>
                           <div class="cell-output-content" data-testid="output-content">
                             <template x-if="output.output_type === 'error'">
@@ -273,6 +273,7 @@
 <!-- ── Status bar ── -->
 <div id="status-bar" data-testid="status-bar">
   <span class="status-text" id="cell-count" data-testid="cell-count" x-text="cells.length + ' cell' + (cells.length !== 1 ? 's' : '')">0 cells</span>
+  <span class="status-text" id="session-cost" data-testid="session-cost" x-show="sessionCostUsd > 0" x-text="'session $' + sessionCostUsd.toFixed(4)"></span>
   <span class="status-text status-ready" id="status-indicator" data-testid="status-indicator">Ready</span>
 </div>
 

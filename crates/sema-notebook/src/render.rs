@@ -41,6 +41,8 @@ pub struct OutputMeta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::format::CellUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
     pub requires_reeval: bool,
 }
@@ -100,6 +102,7 @@ pub fn render_output(output: &CellOutput) -> RenderedOutput {
         meta: OutputMeta {
             duration_ms: output.duration_ms,
             cost_usd: output.cost_usd,
+            usage: output.usage.clone(),
             timestamp: Some(output.timestamp.to_rfc3339()),
             requires_reeval: output.requires_reeval,
         },
@@ -184,6 +187,8 @@ pub struct NotebookResponse {
     pub cells: Vec<RenderedCell>,
     /// Whether the last cell evaluation can be undone.
     pub can_undo: bool,
+    /// Cumulative LLM cost of this engine session in USD; reset zeroes it.
+    pub session_cost_usd: f64,
 }
 
 /// API response for undoing the last cell evaluation.
@@ -204,11 +209,16 @@ pub struct CreateCellData {
 }
 
 /// Produce the full notebook response for the API.
-pub fn notebook_response(notebook: &Notebook, can_undo: bool) -> NotebookResponse {
+pub fn notebook_response(
+    notebook: &Notebook,
+    can_undo: bool,
+    session_cost_usd: f64,
+) -> NotebookResponse {
     NotebookResponse {
         title: notebook.metadata.title.clone(),
         cells: render_notebook(notebook),
         can_undo,
+        session_cost_usd,
     }
 }
 
@@ -253,6 +263,7 @@ mod tests {
             sema_value: None,
             timestamp: chrono::Utc::now(),
             cost_usd: None,
+            usage: None,
             requires_reeval: false,
             duration_ms: None,
         }];
@@ -272,6 +283,7 @@ mod tests {
             sema_value: None,
             timestamp: chrono::Utc::now(),
             cost_usd: None,
+            usage: None,
             requires_reeval: false,
             duration_ms: None,
         }];
@@ -289,6 +301,7 @@ mod tests {
             sema_value: Some("42".to_string()),
             timestamp: chrono::Utc::now(),
             cost_usd: None,
+            usage: None,
             requires_reeval: false,
             duration_ms: Some(10),
         };
@@ -306,6 +319,7 @@ mod tests {
             sema_value: None,
             timestamp: chrono::Utc::now(),
             cost_usd: None,
+            usage: None,
             requires_reeval: false,
             duration_ms: None,
         };
@@ -316,7 +330,7 @@ mod tests {
     #[test]
     fn notebook_response_includes_title() {
         let nb = Notebook::new("Hello");
-        let resp = notebook_response(&nb, false);
+        let resp = notebook_response(&nb, false, 0.0);
         assert_eq!(resp.title, "Hello");
         assert!(resp.cells.is_empty());
         assert!(!resp.can_undo);

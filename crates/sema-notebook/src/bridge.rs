@@ -141,6 +141,7 @@ impl EngineHandle {
                             let _ = reply.send(render::notebook_response(
                                 &engine.notebook,
                                 engine.can_undo(),
+                                sema_llm::builtins::session_cost_snapshot(),
                             ));
                         }
                         EngineRequest::CreateCell {

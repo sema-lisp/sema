@@ -4,6 +4,20 @@
 
 ### Added
 
+- **Notebook LLM cost tracking (#68).** Cost visibility is now ambient instead
+  of a `(llm/session-usage)` cell you remember to add. Every cell eval runs in
+  a per-leaf usage scope (the same mechanism workflow leaves use, so spend from
+  async tasks and agents started in a cell is attributed to that cell), and the
+  cell's output records `cost_usd` plus a `usage` object (prompt/completion/
+  total tokens, cache tokens) mirroring the `(llm/session-usage)` shape. The UI
+  shows a per-cell badge (`$0.0123 · 1,234 tok`, prompt/completion split on
+  hover) and a session-cumulative `session $…` total in the status bar; reset
+  zeroes it. A re-run served from `llm/with-cache` visibly costs `$0.0000`
+  (`LeafUsage` gained a `cache_hits` counter to tell "cached" from "no LLM
+  call"), while unpriced models stay unmarked. Headless `sema notebook run`
+  prints per-cell cost lines and a final `session cost:` summary. The
+  `.sema-nb` `usage` field is optional, so existing notebooks are unaffected.
+
 - **`proc/run` runs a child on the parent's terminal (#95).** There was no way
   to hand the terminal to an interactive program: `shell` captures stdout and
   stderr into pipes, `proc/spawn` streams them into buffers you poll, and

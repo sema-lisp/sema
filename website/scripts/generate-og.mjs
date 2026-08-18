@@ -42,11 +42,13 @@ function semaVersion() {
   }
 }
 
-// Recursively collect every .md page under website/ (excluding node_modules).
+// Recursively collect every .md page under website/. Skips node_modules,
+// public, and every dot-entry — a stale `.vercel/output` from a local CLI
+// build contains generated .md copies of every page and must not count.
 function collectPages(dir) {
   const out = []
   for (const name of readdirSync(dir).sort()) {
-    if (name === 'node_modules' || name === '.vitepress' || name === 'public') continue
+    if (name.startsWith('.') || name === 'node_modules' || name === 'public') continue
     const full = join(dir, name)
     const st = statSync(full)
     if (st.isDirectory()) out.push(...collectPages(full))

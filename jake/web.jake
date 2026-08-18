@@ -50,3 +50,7 @@ task deploy: [og, build]
     # remote build and config.ts cannot read the version from it. Pass it explicitly;
     # without this the hero silently renders without a version.
     cd website && npx vercel --prod --yes --build-env SEMA_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' ../Cargo.toml | head -1)"
+    # A failed remote build leaves the previous deploy live — verify the promoted
+    # site actually serves the current version before calling this done.
+    sleep 5
+    curl -sf https://sema-lang.com/ | grep -q "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1) · MIT" && echo "site.deploy: live hero serves v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1) ✓" || { echo "site.deploy: the live hero does not show the current version — the deploy did not promote or SEMA_VERSION was lost" >&2; exit 1; }

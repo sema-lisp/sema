@@ -54,17 +54,6 @@
     }
   ],
   "repository": {
-    "regex": {
-      "name": "string.regexp.sema",
-      "begin": "#\"",
-      "end": "\"",
-      "patterns": [
-        {
-          "name": "string.regexp.sema",
-          "match": "\\\\."
-        }
-      ]
-    },
     "block-comment": {
       "name": "comment.block.sema",
       "begin": "#\\|",
@@ -78,6 +67,17 @@
     "comment": {
       "name": "comment.line.semicolon.sema",
       "match": ";.*$"
+    },
+    "regex": {
+      "name": "string.regexp.sema",
+      "begin": "#\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "string.regexp.sema",
+          "match": "\\\\."
+        }
+      ]
     },
     "string": {
       "name": "string.quoted.double.sema",
@@ -576,7 +576,7 @@
         },
         {
           "comment": "issue #12 grammar sweep (gated): proc builtins",
-          "match": "(?<=[\\s(\\[{])(?:proc/close|proc/close-stdin|proc/exit-code|proc/kill|proc/read-stderr|proc/read-stdout|proc/running\\?|proc/spawn|proc/wait|proc/write-stdin)(?=[\\s)\\]}]|$)",
+          "match": "(?<=[\\s(\\[{])(?:proc/close|proc/close-stdin|proc/exit-code|proc/kill|proc/read-stderr|proc/read-stdout|proc/run|proc/running\\?|proc/spawn|proc/wait|proc/write-stdin)(?=[\\s)\\]}]|$)",
           "name": "support.function.sema"
         },
         {

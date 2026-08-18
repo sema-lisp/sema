@@ -669,6 +669,21 @@ test.describe('Regression — notebook UI fixes', () => {
     await titleInput.blur();
   });
 
+  test('title input grows to fit a long title instead of truncating', async ({ page }) => {
+    const titleInput = page.getByTestId('notebook-title');
+    const original = await titleInput.inputValue();
+    await titleInput.fill('A Rather Long Notebook Title That Would Previously Truncate In The Toolbar');
+
+    const state = await titleInput.evaluate((input: HTMLElement) => (
+      { scrollWidth: input.scrollWidth, clientWidth: input.clientWidth }
+    ));
+    expect(state.scrollWidth, 'the input must widen to fit the title (field-sizing: content)')
+      .toBeLessThanOrEqual(state.clientWidth + 1);
+
+    await titleInput.fill(original);
+    await titleInput.blur();
+  });
+
   test('insert dropdown stays visible when the pointer moves onto its items', async ({ page }) => {
     const divider = page.getByTestId('cell-divider').first();
     await divider.hover();

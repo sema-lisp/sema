@@ -107,7 +107,11 @@ body {
   outline: none;
   box-shadow: none;
   text-align: center;
-  min-width: 120px;
+  /* Size to the title text; unsupporting browsers keep the fixed width. */
+  field-sizing: content;
+  width: auto;
+  min-inline-size: 120px;
+  max-inline-size: min(80ch, 60vw);
   padding: 0;
 }
 #notebook-title::part(control):focus-visible {

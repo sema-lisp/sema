@@ -130,6 +130,10 @@
 - **Regex literals (`#"…"`) are scoped as regex by the playground and website
   highlighters** instead of leaking into the surrounding form's scope.
 
+- **Notebook: the toolbar title input sizes to its content** (`field-sizing:
+  content`) instead of truncating long titles; browsers without support keep
+  the previous fixed width.
+
 ### Changed
 
 - **Vendored LLM pricing snapshot refreshed** (2026-07-17 → 2026-08-18, 6319

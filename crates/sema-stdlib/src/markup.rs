@@ -51,11 +51,10 @@ thread_local! {
 /// The effective per-input byte cap for the current call: the module ceiling,
 /// lowered by any per-call override (never raised above it).
 fn effective_markup_input_byte_cap() -> u64 {
-    MARKUP_INPUT_BYTE_CAP_OVERRIDE
-        .with(Cell::get)
-        .map_or(MARKUP_INPUT_BYTE_CAP, |over| {
-            over.min(MARKUP_INPUT_BYTE_CAP)
-        })
+    crate::io::effective_cap(
+        MARKUP_INPUT_BYTE_CAP_OVERRIDE.with(Cell::get),
+        MARKUP_INPUT_BYTE_CAP,
+    )
 }
 
 /// Lower the per-input byte cap (clamped to the hard ceiling) for subsequent
@@ -68,13 +67,13 @@ pub fn set_markup_input_byte_cap_override(bytes: Option<u64>) {
 /// Reject `actual` bytes over `limit`. Reads the argument's existing `len()` — no
 /// snapshot — so an over-cap input is rejected without any excess allocation.
 fn check_markup_limit(op: &str, actual: u64, limit: u64) -> Result<(), SemaError> {
-    if actual > limit {
-        return Err(SemaError::eval(format!(
-            "{op}: input bytes {actual} exceeds the quarantined limit {limit}"
-        ))
-        .with_hint("reduce or split the markup input"));
-    }
-    Ok(())
+    crate::io::check_quarantined_limit(
+        op,
+        "input bytes",
+        actual,
+        limit,
+        "reduce or split the markup input",
+    )
 }
 
 /// Reject a parsed DOM whose node count exceeds the guardrail (runs on the worker

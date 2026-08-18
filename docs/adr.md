@@ -670,7 +670,7 @@ This decision is informed by the agent quality-sweep audit, which catalogued the
 
 ## Rehomed from docs/decisions.md (archived 2026-06-09)
 
-The following entries were moved here from the legacy `docs/decisions.md` (now in `docs/archived/`), with factual corrections applied during the move.
+The following entries were moved here from the legacy `docs/decisions.md` (now in `docs/plans/archive/`), with factual corrections applied during the move.
 
 ### 60. NaN-boxed Value representation
 

@@ -433,3 +433,35 @@ fn cancelled_agent_run_reports_partial_transcript() {
     );
     assert_eq!(agent_runs_len(), 0, "slab still reaped on cancel");
 }
+
+#[test]
+#[serial]
+fn failing_on_partial_callback_does_not_mask_agent_error() {
+    let mut fake = FakeProvider::builder("fake").model("fake-model");
+    for i in 0..6 {
+        fake = fake.tool_call(&format!("c{i}"), "flaky", serde_json::json!({ "x": "bad" }));
+    }
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake.build()));
+    let error = interp
+        .eval_str_compiled(
+            r#"
+            (deftool flaky "Always fails" {:x {:type :string}}
+              (fn (x) (throw "tool failed")))
+            (defagent bot {:model "fake-model" :tools [flaky] :max-turns 10})
+            (async/await
+              (async/spawn
+                (fn () (agent/run bot "go"
+                         {:on-partial (fn (partial) (throw "callback failed"))}))))
+            "#,
+        )
+        .expect_err("the agent run must retain its original error");
+
+    assert!(
+        error.to_string().contains("consecutive tool errors"),
+        "the callback must not replace the agent error: {error}"
+    );
+    assert_eq!(agent_runs_len(), 0);
+}

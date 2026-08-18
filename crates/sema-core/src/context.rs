@@ -233,35 +233,7 @@ fn check_module_cycle(stack: &[PathBuf], path: &PathBuf) -> Result<(), SemaError
 
 impl EvalContext {
     pub fn new() -> Self {
-        EvalContext {
-            module_cache: RefCell::new(BTreeMap::new()),
-            embedded_files: RefCell::new(BTreeMap::new()),
-            embedded_files_only: Cell::new(false),
-            current_file: RefCell::new(Vec::new()),
-            module_exports: RefCell::new(Vec::new()),
-            module_load_stack: RefCell::new(Vec::new()),
-            call_stack: RefCell::new(Vec::new()),
-            span_table: RefCell::new(HashMap::new()),
-            eval_depth: Cell::new(0),
-            max_eval_depth: Cell::new(0),
-            eval_step_limit: Cell::new(0),
-            eval_steps: Cell::new(0),
-            eval_deadline: Cell::new(None),
-            sandbox: Sandbox::allow_all(),
-            user_context: RefCell::new(vec![BTreeMap::new()]),
-            hidden_context: RefCell::new(vec![BTreeMap::new()]),
-            context_stacks: ContextStacks::default(),
-            signal_callbacks: RefCell::default(),
-            interpreter_teardown_hooks: RefCell::default(),
-            eval_fn: Cell::new(None),
-            macro_expand_fn: Cell::new(None),
-            call_fn: Cell::new(None),
-            call_owned_fn: Cell::new(None),
-            interactive: Cell::new(false),
-            task_context: RefCell::new(None),
-            legacy_call_env: RefCell::new(None),
-            runtime_quantum_active: Cell::new(false),
-        }
+        Self::new_with_sandbox(Sandbox::allow_all())
     }
 
     pub fn new_with_sandbox(sandbox: Sandbox) -> Self {

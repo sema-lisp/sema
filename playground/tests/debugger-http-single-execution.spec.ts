@@ -1,15 +1,14 @@
 import { test, expect, Page } from '@playwright/test';
 import { getCurrentDebugLine, toggleBreakpoint } from './gutter';
+import { waitForReady, getErrors } from './helpers';
 
 // Regression test for the promise-driven debugger's single-execution HTTP
 // contract. The paused VM must resume the same frame after fetch; restarting
 // the program would duplicate the request and any earlier side effects.
 
-async function waitForReady(page: Page) {
-  await page.goto('/');
-  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
-}
-
+// waitForPaused/waitForIdle stay local: this suite waits on real HTTP calls,
+// so it needs a much longer default timeout (30s) than the other debugger
+// specs (5-12s).
 async function waitForPaused(page: Page, timeout = 30000) {
   await page.waitForFunction(
     () => document.getElementById('status')?.textContent?.startsWith('Paused'),
@@ -22,10 +21,6 @@ async function waitForIdle(page: Page, timeout = 30000) {
     () => document.getElementById('status')?.textContent === 'Ready',
     { timeout }
   );
-}
-
-async function getErrors(page: Page): Promise<string[]> {
-  return page.getByTestId('output-error').allTextContents();
 }
 
 test('debug session resumes one HTTP request without replaying the program', async ({ page }) => {

@@ -44,7 +44,7 @@ sema-mcp.workspace = true
 sema-otel.workspace = true
 sema-io.workspace = true
 tokio.workspace = true
-reedline = "0.48"
+reedline = "0.50"
 nu-ansi-term = "0.50"
 crossterm = "0.29"
 glob.workspace = true
@@ -94,5 +94,5 @@ opentelemetry_sdk = { version = "0.32", features = ["trace", "testing"] }
 reqwest.workspace = true
 portable-pty = "0.9"
 serde_json.workspace = true
-serial_test = "3"
-tungstenite = "0.28"
+serial_test = "4"
+tungstenite = "0.30"

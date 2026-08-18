@@ -99,9 +99,9 @@ impl BackendState {
                 };
                 // Names only; ranges discarded — &[] skips UTF-16 mapping.
                 let target_defs = user_definitions_from_ast(
-                    &import_cached.ast,
-                    &import_cached.span_map,
-                    &import_cached.symbol_spans,
+                    &import_cached.parsed.ast,
+                    &import_cached.parsed.span_map,
+                    &import_cached.parsed.symbol_spans,
                     &[],
                 );
                 if target_defs.iter().any(|(n, _)| n == &symbol) {
@@ -110,7 +110,9 @@ impl BackendState {
                         .and_then(|s| s.to_str())
                         .unwrap_or(path_str);
                     let mut hover_text = format!("```sema\n({symbol}");
-                    if let Some(params) = extract_params_from_ast(&import_cached.ast, &symbol) {
+                    if let Some(params) =
+                        extract_params_from_ast(&import_cached.parsed.ast, &symbol)
+                    {
                         hover_text.push(' ');
                         hover_text.push_str(&params);
                     }

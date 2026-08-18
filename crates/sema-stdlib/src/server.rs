@@ -29,13 +29,7 @@ fn http_file_marker(resolved: (String, String)) -> Value {
 fn static_file_response(resolved: (bool, String, String)) -> Value {
     let (escapes, path_str, content_type) = resolved;
     if escapes {
-        let mut headers = BTreeMap::new();
-        headers.insert(Value::string("content-type"), Value::string("text/plain"));
-        let mut result = BTreeMap::new();
-        result.insert(Value::keyword("status"), Value::int(403));
-        result.insert(Value::keyword("headers"), Value::map(headers));
-        result.insert(Value::keyword("body"), Value::string("Forbidden"));
-        return Value::map(result);
+        return raw_response(403, &[("content-type", "text/plain")], "Forbidden");
     }
     let mut map = BTreeMap::new();
     map.insert(Value::keyword("__file"), Value::bool(true));
@@ -108,16 +102,7 @@ fn tool_route_arguments(req_args: &[Value]) -> Result<Vec<Value>, SemaError> {
 
 fn tool_route_response(result: &Value) -> Value {
     let body = value_to_json_lossy_string(result).unwrap_or_else(|_| format!("{result}"));
-    let mut headers = BTreeMap::new();
-    headers.insert(
-        Value::string("content-type"),
-        Value::string("application/json"),
-    );
-    let mut response = BTreeMap::new();
-    response.insert(Value::keyword("status"), Value::int(200));
-    response.insert(Value::keyword("headers"), Value::map(headers));
-    response.insert(Value::keyword("body"), Value::string(&body));
-    Value::map(response)
+    raw_response(200, &[("content-type", "application/json")], body)
 }
 
 fn tool_route_handler(payload: &ToolRouteHandlerPayload) -> Result<Value, SemaError> {
@@ -326,18 +311,27 @@ fn json_response(status: i64, val: &Value) -> Result<Value, SemaError> {
     let json = sema_core::value_to_json_lossy(val);
     let body = serde_json::to_string(&json)
         .map_err(|e| SemaError::eval(format!("http response: json encode: {e}")))?;
+    Ok(raw_response(
+        status,
+        &[("content-type", "application/json")],
+        body,
+    ))
+}
 
-    let mut headers = BTreeMap::new();
-    headers.insert(
-        Value::string("content-type"),
-        Value::string("application/json"),
-    );
-
+/// Build a `{:status :headers :body}` response map: integer status, a headers
+/// map with string keys, and a string body. The encode-side counterpart of
+/// `value_to_raw_response`, which reads this same shape back out.
+fn raw_response(status: i64, headers: &[(&str, &str)], body: impl Into<String>) -> Value {
+    let body = body.into();
+    let mut header_map = BTreeMap::new();
+    for (k, v) in headers {
+        header_map.insert(Value::string(k), Value::string(v));
+    }
     let mut result = BTreeMap::new();
     result.insert(Value::keyword("status"), Value::int(status));
-    result.insert(Value::keyword("headers"), Value::map(headers));
+    result.insert(Value::keyword("headers"), Value::map(header_map));
     result.insert(Value::keyword("body"), Value::string(&body));
-    Ok(Value::map(result))
+    Value::map(result)
 }
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
@@ -358,11 +352,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     register_fn(env, "http/no-content", |args| {
         check_arity!(args, "http/no-content", 0);
-        let mut result = BTreeMap::new();
-        result.insert(Value::keyword("status"), Value::int(204));
-        result.insert(Value::keyword("headers"), Value::map(BTreeMap::new()));
-        result.insert(Value::keyword("body"), Value::string(""));
-        Ok(Value::map(result))
+        Ok(raw_response(204, &[], ""))
     });
 
     register_fn(env, "http/not-found", |args| {
@@ -376,14 +366,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
 
-        let mut headers = BTreeMap::new();
-        headers.insert(Value::string("location"), Value::string(url));
-
-        let mut result = BTreeMap::new();
-        result.insert(Value::keyword("status"), Value::int(302));
-        result.insert(Value::keyword("headers"), Value::map(headers));
-        result.insert(Value::keyword("body"), Value::string(""));
-        Ok(Value::map(result))
+        Ok(raw_response(302, &[("location", url)], ""))
     });
 
     register_fn(env, "http/error", |args| {
@@ -400,14 +383,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
 
-        let mut headers = BTreeMap::new();
-        headers.insert(Value::string("content-type"), Value::string("text/html"));
-
-        let mut result = BTreeMap::new();
-        result.insert(Value::keyword("status"), Value::int(200));
-        result.insert(Value::keyword("headers"), Value::map(headers));
-        result.insert(Value::keyword("body"), Value::string(content));
-        Ok(Value::map(result))
+        Ok(raw_response(200, &[("content-type", "text/html")], content))
     });
 
     register_fn(env, "http/text", |args| {
@@ -416,14 +392,11 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
 
-        let mut headers = BTreeMap::new();
-        headers.insert(Value::string("content-type"), Value::string("text/plain"));
-
-        let mut result = BTreeMap::new();
-        result.insert(Value::keyword("status"), Value::int(200));
-        result.insert(Value::keyword("headers"), Value::map(headers));
-        result.insert(Value::keyword("body"), Value::string(content));
-        Ok(Value::map(result))
+        Ok(raw_response(
+            200,
+            &[("content-type", "text/plain")],
+            content,
+        ))
     });
 
     crate::register_runtime_fn_path_gated(
@@ -602,16 +575,11 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     body_map.insert(Value::string("parameters"), Value::string(&schema_json));
                     let body = value_to_json_lossy_string(&Value::map(body_map))
                         .unwrap_or_else(|_| "{}".to_string());
-                    let mut headers = BTreeMap::new();
-                    headers.insert(
-                        Value::string("content-type"),
-                        Value::string("application/json"),
-                    );
-                    let mut resp = BTreeMap::new();
-                    resp.insert(Value::keyword("status"), Value::int(200));
-                    resp.insert(Value::keyword("headers"), Value::map(headers));
-                    resp.insert(Value::keyword("body"), Value::string(&body));
-                    Ok(Value::map(resp))
+                    Ok(raw_response(
+                        200,
+                        &[("content-type", "application/json")],
+                        body,
+                    ))
                 },
             ));
 
@@ -954,13 +922,11 @@ fn dispatch_body(
 
                 // Security: reject path traversal
                 if rel_path.contains("..") {
-                    let mut headers = BTreeMap::new();
-                    headers.insert(Value::string("content-type"), Value::string("text/plain"));
-                    let mut result = BTreeMap::new();
-                    result.insert(Value::keyword("status"), Value::int(400));
-                    result.insert(Value::keyword("headers"), Value::map(headers));
-                    result.insert(Value::keyword("body"), Value::string("Bad Request"));
-                    return Ok(NativeOutcome::Return(Value::map(result)));
+                    return Ok(NativeOutcome::Return(raw_response(
+                        400,
+                        &[("content-type", "text/plain")],
+                        "Bad Request",
+                    )));
                 }
 
                 let file_path = std::path::Path::new(dir_path).join(rel_path);
@@ -1072,16 +1038,11 @@ fn dispatch_body(
     }
 
     // No route matched — return 404
-    let mut headers = BTreeMap::new();
-    headers.insert(
-        Value::string("content-type"),
-        Value::string("application/json"),
-    );
-    let mut result = BTreeMap::new();
-    result.insert(Value::keyword("status"), Value::int(404));
-    result.insert(Value::keyword("headers"), Value::map(headers));
-    result.insert(Value::keyword("body"), Value::string("\"Not Found\""));
-    Ok(NativeOutcome::Return(Value::map(result)))
+    Ok(NativeOutcome::Return(raw_response(
+        404,
+        &[("content-type", "application/json")],
+        "\"Not Found\"",
+    )))
 }
 
 struct RouteHandlerContinuation;

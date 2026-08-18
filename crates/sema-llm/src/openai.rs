@@ -194,55 +194,60 @@ impl OpenAiProvider {
         }
 
         for m in &request.messages {
-            if !m.tool_calls.is_empty() {
-                // Assistant turn that invoked tools — echo the tool_calls so the
-                // following tool results can be correlated.
-                let text = m.content.to_text();
-                messages.push(OpenAiMessage {
-                    role: "assistant".to_string(),
-                    content: if text.is_empty() {
-                        None
-                    } else {
-                        Some(serde_json::Value::String(text))
-                    },
-                    tool_calls: Some(
-                        m.tool_calls
-                            .iter()
-                            .map(|tc| OpenAiToolCall {
-                                id: tc.id.clone(),
-                                call_type: "function".to_string(),
-                                function: OpenAiFunctionCall {
-                                    name: tc.name.clone(),
-                                    arguments: tc.arguments.to_string(),
-                                },
-                            })
-                            .collect(),
-                    ),
-                    tool_call_id: None,
-                    name: None,
-                });
-            } else if m.role == "tool" {
-                // Mistral also requires the originating function name on a
-                // correlated tool result; OpenAI-compatible peers do not.
-                messages.push(OpenAiMessage {
-                    role: "tool".to_string(),
-                    content: Some(serialize_openai_content(&m.content)),
-                    tool_calls: None,
-                    tool_call_id: m.tool_call_id.clone(),
-                    name: if self.name == "mistral" {
-                        m.tool_name.clone()
-                    } else {
-                        None
-                    },
-                });
-            } else {
-                messages.push(OpenAiMessage {
-                    role: m.role.clone(),
-                    content: Some(serialize_openai_content(&m.content)),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    name: None,
-                });
+            match m.kind() {
+                crate::types::MessageKind::AssistantWithToolCalls(content, tcs) => {
+                    // Assistant turn that invoked tools — echo the tool_calls so the
+                    // following tool results can be correlated.
+                    let text = content.to_text();
+                    messages.push(OpenAiMessage {
+                        role: "assistant".to_string(),
+                        content: if text.is_empty() {
+                            None
+                        } else {
+                            Some(serde_json::Value::String(text))
+                        },
+                        tool_calls: Some(
+                            tcs.iter()
+                                .map(|tc| OpenAiToolCall {
+                                    id: tc.id.clone(),
+                                    call_type: "function".to_string(),
+                                    function: OpenAiFunctionCall {
+                                        name: tc.name.clone(),
+                                        arguments: tc.arguments.to_string(),
+                                    },
+                                })
+                                .collect(),
+                        ),
+                        tool_call_id: None,
+                        name: None,
+                    });
+                }
+                crate::types::MessageKind::ToolResult {
+                    id, name, content, ..
+                } => {
+                    // Mistral also requires the originating function name on a
+                    // correlated tool result; OpenAI-compatible peers do not.
+                    messages.push(OpenAiMessage {
+                        role: "tool".to_string(),
+                        content: Some(serialize_openai_content(content)),
+                        tool_calls: None,
+                        tool_call_id: id.map(str::to_string),
+                        name: if self.name == "mistral" {
+                            name.map(str::to_string)
+                        } else {
+                            None
+                        },
+                    });
+                }
+                crate::types::MessageKind::Other(role, content) => {
+                    messages.push(OpenAiMessage {
+                        role: role.to_string(),
+                        content: Some(serialize_openai_content(content)),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                    });
+                }
             }
         }
 
@@ -509,8 +514,8 @@ impl OpenAiProvider {
         let mut finish_reason = None;
         // Streamed tool calls arrive as index-keyed fragments: the first delta for an
         // index carries `id` + `function.name`, later deltas append `function.arguments`
-        // chunks. Accumulate (id, name, args) per index, then assemble at the end.
-        let mut tool_acc: Vec<(String, String, String)> = Vec::new();
+        // chunks. Accumulate one PartialToolCall per index, then assemble at the end.
+        let mut tool_acc: Vec<crate::types::PartialToolCall> = Vec::new();
 
         crate::sse::parse_sse_stream(resp, |data| {
             if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) {
@@ -553,16 +558,12 @@ impl OpenAiProvider {
                                     let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0)
                                         as usize;
                                     while tool_acc.len() <= idx {
-                                        tool_acc.push((
-                                            String::new(),
-                                            String::new(),
-                                            String::new(),
-                                        ));
+                                        tool_acc.push(crate::types::PartialToolCall::default());
                                     }
                                     let entry = &mut tool_acc[idx];
                                     if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
                                         if !id.is_empty() {
-                                            entry.0 = id.to_string();
+                                            entry.id = id.to_string();
                                         }
                                     }
                                     if let Some(f) = tc.get("function") {
@@ -573,12 +574,12 @@ impl OpenAiProvider {
                                             // that repeats the name per chunk
                                             // produced "get_weatherget_weather"
                                             // and then "tool not found".
-                                            entry.1 = name.to_string();
+                                            entry.name = name.to_string();
                                         }
                                         if let Some(args) =
                                             f.get("arguments").and_then(|v| v.as_str())
                                         {
-                                            entry.2.push_str(args);
+                                            entry.args.push_str(args);
                                         }
                                     }
                                 }
@@ -598,14 +599,8 @@ impl OpenAiProvider {
 
         let tool_calls: Vec<ToolCall> = tool_acc
             .into_iter()
-            .filter(|(_, name, _)| !name.is_empty())
-            .map(|(id, name, args)| ToolCall {
-                id,
-                name,
-                arguments: serde_json::from_str(&args)
-                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
-                thought_signature: None,
-            })
+            .filter(|p| !p.name.is_empty())
+            .map(|p| p.finish())
             .collect();
 
         Ok(ChatResponse {

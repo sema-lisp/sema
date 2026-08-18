@@ -124,6 +124,7 @@ OAuth terms are all fine).
 
 - Rust 2021, single-threaded (`Rc`, not `Arc`), `hashbrown::HashMap` for `Env` bindings, `BTreeMap` for user-facing sorted maps.
 - Errors: `SemaError::eval()` / `::type_error()` / `::arity()` constructors — never raw enum variants. Use `.with_hint()` for actionable user guidance.
+- Prefer returning `SemaError` over `unwrap()`/`expect()` when the failure depends on user-supplied Sema values. Keep `unwrap()` only where a preceding explicit check or a hard invariant guarantees success.
 - Native fns: `NativeFn` takes `(&EvalContext, &[Value])` → `Result<Value, SemaError>`. Use `NativeFn::simple()` (no context) or `NativeFn::with_ctx()`. Special forms return `Trampoline`.
 - Comments describe the code as it stands, not what changed. Drop change-narration ("now uses X instead of Y", "switched from", "previously", "fixed to"); keep the *why* (rationale, invariants, gotchas). Git tracks the story; the source shouldn't. Contrasting with a sibling (`unlike string/lower`) is fine; contrasting with a past version is not.
 - **Sema naming (Decision #24)**: slash-namespaced for all new functions (`file/read`, `path/join`, `regex/match?`, `http/get`, `json/encode`, `string/split`); legacy Scheme names kept (`string-append`, `string-length`, `string-ref`, `substring`); arrow conversions (`string->symbol`, `keyword->string`); predicates end in `?` (`null?`, `list?`, `file/exists?`).
@@ -211,5 +212,6 @@ Hard-won conventions — follow these or you will reintroduce shipped bugs (see 
 - `docs/limitations.md` — known gaps and limitations
 - `docs/deferred.md` — items parked with rationale (won't-fix or revisit-later)
 - `docs/plans/` — individual implementation plans, named `YYYY-MM-DD-<slug>.md` (completed plans move to `docs/plans/archive/`)
+- `docs/plans/archive/` — **the only archive**. Every finished plan, spec, and superseded design document lives here, whatever produced it. Do not create a second archive directory.
 - `docs/vm-status.md`, `docs/performance-roadmap.md` — VM internals reference
 - `docs/bugs/` — short write-ups of specific known test/code issues

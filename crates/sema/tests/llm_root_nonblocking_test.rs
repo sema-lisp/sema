@@ -187,6 +187,43 @@ fn spawned_task_starts_without_its_parents_last_usage() {
     assert!(value.is_nil(), "child inherited parent usage: {value}");
 }
 
+/// Issue #86, non-blocking path: `agent/run` inside a runtime task drives the loop via
+/// `__agent-step`/`__agent-exec-tools` (not `run_tool_loop`), a separate code path from
+/// the blocking form covered in `llm_fake_test::agent_run_result_map_carries_this_turns_usage`.
+/// Its own `:usage` key must likewise sum every round of the tool loop.
+#[test]
+#[serial]
+fn agent_run_usage_map_sums_the_turn_in_async_context() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call("call_1", "get-weather", serde_json::json!({"city": "Oslo"}))
+        .reply_with_usage("It is sunny in Oslo.", 20, 8)
+        .build();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let value = interp
+        .eval_str_compiled(
+            r#"
+            (deftool get-weather "Get weather"
+              {:city {:type :string}}
+              (lambda (city) "sunny"))
+            (defagent weather-bot
+              {:model "fake-model" :tools [get-weather] :max-turns 5})
+            (:total-tokens
+              (:usage (await (async/spawn (fn () (agent/run weather-bot "weather in Oslo?" {}))))))
+            "#,
+        )
+        .expect("agent/run should complete against the fake under the runtime");
+
+    assert_eq!(
+        value.as_int(),
+        Some(43),
+        "tool_call round (fake default 10/5) + reply round (20/8) = 43"
+    );
+}
+
 #[test]
 #[serial]
 fn root_chat_keeps_a_sema_defined_provider_on_the_vm_thread() {

@@ -124,7 +124,7 @@ jobs:
           # publishing. Earlier runner images (Node 22.22.2) shipped a
           # corrupted bundled npm whose `arborist` was missing `promise-retry`,
           # making both `npm install -g npm@latest` and `npm publish` fail.
-          node-version: '24'
+          node-version-file: '.nvmrc'
           registry-url: 'https://registry.npmjs.org'
 
       - name: Verify npm is functional

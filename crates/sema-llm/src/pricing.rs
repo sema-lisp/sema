@@ -5,7 +5,7 @@
 //! `include_str!`. Refresh it with `jake update-pricing` (see
 //! `scripts/update-pricing.sh`) and ship the diff in a patch release — we deliberately do
 //! not fetch pricing at runtime (no dependency on a third-party endpoint we don't control;
-//! see `docs/done/plans/2026-06-18-llm-pricing-models-dev.md`).
+//! see `docs/plans/archive/2026-06-18-llm-pricing-models-dev.md`).
 //!
 //! Resolution order in [`model_pricing`]:
 //! 1. Custom per-pattern overrides set via `(llm/set-pricing ...)`.

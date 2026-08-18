@@ -1,18 +1,5 @@
-import { test, expect, type Page } from "@playwright/test";
-
-async function waitForSema(page: Page) {
-  // Wait for SemaWeb to initialize (or fail with useful error)
-  const result = await page.waitForFunction(
-    () => {
-      const w = window as any;
-      return w.__semaWeb || w.__semaInitError;
-    },
-    null,
-    { timeout: 15_000 }
-  );
-  const initError = await page.evaluate(() => (window as any).__semaInitError);
-  if (initError) throw new Error(`SemaWeb init failed: ${initError}`);
-}
+import { test, expect } from "@playwright/test";
+import { waitForSema } from "./helpers";
 
 test.describe("AI Chat Demo", () => {
   test("page loads and renders chat UI", async ({ page }) => {

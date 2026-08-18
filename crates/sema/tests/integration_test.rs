@@ -1042,6 +1042,63 @@ fn test_imported_hof_transitive_closure_no_slot_clobber() {
 }
 
 #[test]
+fn test_two_imports_with_load_and_io_do_not_unbind_unrelated_global() {
+    // Regression for #152: a script-level `define` went "Unbound variable"
+    // after (1) importing two separately-compiled modules, (2) the first
+    // module's function calling `(load ...)` (introducing a new top-level
+    // binding into its own module env), then (3) a call into the *second*
+    // module touching an I/O builtin (`file/exists?`). Neither module ever
+    // references the script's global by name — cross-compile-unit inline
+    // cache slot aliasing corrupted an unrelated lookup.
+    let dir = unique_temp_dir("cross-import-load-io-clobber");
+
+    let site = dir.join("site.sema");
+    std::fs::write(&site, r#"(define config {:title "T" :theme "sema"})"#).unwrap();
+
+    let config_mod = dir.join("config.sema");
+    std::fs::write(
+        &config_mod,
+        r#"(module config
+             (export load-config)
+             (define (load-config site-path)
+               (load site-path)
+               config))"#,
+    )
+    .unwrap();
+
+    let theme_mod = dir.join("mod.sema");
+    std::fs::write(
+        &theme_mod,
+        r#"(module theme
+             (export resolve-theme)
+             (define (resolve-theme unrelated-name probe-path)
+               (file/exists? probe-path)
+               "done"))"#,
+    )
+    .unwrap();
+
+    let result = eval(&format!(
+        r#"
+        (begin
+          (import "{}")
+          (import "{}")
+          (define cfg (load-config "{}"))
+          (resolve-theme cfg ".")
+          cfg)
+        "#,
+        lisp_path(&config_mod),
+        lisp_path(&theme_mod),
+        lisp_path(&site),
+    ));
+
+    assert_eq!(
+        result,
+        eval(r#"{:title "T" :theme "sema"}"#),
+        "script-level `cfg` must survive an unrelated cross-module call after a nested `load`"
+    );
+}
+
+#[test]
 fn test_cyclic_import_returns_error_instead_of_stack_overflow() {
     let dir = unique_temp_dir("cyclic-import");
     let module_a = dir.join("a.sema");
@@ -15089,6 +15146,29 @@ fn test_eval_stdin_json() {
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(json["ok"], true);
     assert_eq!(json["value"], "42");
+}
+
+#[test]
+fn test_eval_stdin_read_error_json_has_message() {
+    // Feed the child a *directory* as its stdin. Reading a directory fd fails
+    // with an io error (EISDIR), so `stdin().read_to_string()` errors — the
+    // stdin-read-failure early-exit path, which previously emitted
+    // `"error": null` and silently dropped the actual cause.
+    let stdin_file =
+        std::fs::File::open(&std::env::temp_dir()).expect("failed to open a directory as stdin");
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["eval", "--stdin", "--json", "--no-llm"])
+        .stdin(std::process::Stdio::from(stdin_file))
+        .output()
+        .expect("failed to run sema eval");
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("invalid JSON output");
+    assert_eq!(json["ok"], false);
+    let msg = json["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        !msg.is_empty(),
+        "expected a non-null error message reporting the stdin read failure: {json}"
+    );
 }
 
 #[test]

@@ -226,52 +226,54 @@ impl GeminiProvider {
             if msg.role == "system" {
                 continue; // handled separately
             }
-            if !msg.tool_calls.is_empty() {
-                // Assistant turn → a "model" content with functionCall parts.
-                let mut parts: Vec<serde_json::Value> = Vec::new();
-                let text = msg.content.to_text();
-                if !text.is_empty() {
-                    parts.push(serde_json::json!({ "text": text }));
-                }
-                for tc in &msg.tool_calls {
-                    let mut part = serde_json::json!({
-                        "functionCall": { "name": tc.name, "args": tc.arguments }
-                    });
-                    // Echo the opaque thoughtSignature captured from the model's
-                    // original functionCall part — Gemini 2.5+ rejects a resent
-                    // tool-call turn without it (400 INVALID_ARGUMENT).
-                    if let Some(sig) = &tc.thought_signature {
-                        part["thoughtSignature"] = serde_json::Value::String(sig.clone());
+            match msg.kind() {
+                crate::types::MessageKind::AssistantWithToolCalls(content, tcs) => {
+                    // Assistant turn → a "model" content with functionCall parts.
+                    let mut parts: Vec<serde_json::Value> = Vec::new();
+                    let text = content.to_text();
+                    if !text.is_empty() {
+                        parts.push(serde_json::json!({ "text": text }));
                     }
-                    parts.push(part);
-                }
-                contents.push(serde_json::json!({ "role": "model", "parts": parts }));
-                continue;
-            }
-            if msg.role == "tool" {
-                // Tool result → a "user" content with a functionResponse part keyed
-                // by the tool name (Gemini correlates results by name).
-                let name = msg.tool_name.clone().unwrap_or_default();
-                contents.push(serde_json::json!({
-                    "role": "user",
-                    "parts": [{
-                        "functionResponse": {
-                            "name": name,
-                            "response": { "result": msg.content.to_text() }
+                    for tc in tcs {
+                        let mut part = serde_json::json!({
+                            "functionCall": { "name": tc.name, "args": tc.arguments }
+                        });
+                        // Echo the opaque thoughtSignature captured from the model's
+                        // original functionCall part — Gemini 2.5+ rejects a resent
+                        // tool-call turn without it (400 INVALID_ARGUMENT).
+                        if let Some(sig) = &tc.thought_signature {
+                            part["thoughtSignature"] = serde_json::Value::String(sig.clone());
                         }
-                    }]
-                }));
-                continue;
+                        parts.push(part);
+                    }
+                    contents.push(serde_json::json!({ "role": "model", "parts": parts }));
+                }
+                crate::types::MessageKind::ToolResult { name, content, .. } => {
+                    // Tool result → a "user" content with a functionResponse part keyed
+                    // by the tool name (Gemini correlates results by name).
+                    let name = name.unwrap_or_default();
+                    contents.push(serde_json::json!({
+                        "role": "user",
+                        "parts": [{
+                            "functionResponse": {
+                                "name": name,
+                                "response": { "result": content.to_text() }
+                            }
+                        }]
+                    }));
+                }
+                crate::types::MessageKind::Other(role, content) => {
+                    let role = match role {
+                        "assistant" => "model",
+                        other => other,
+                    };
+                    let parts = serialize_gemini_parts(content);
+                    contents.push(serde_json::json!({
+                        "role": role,
+                        "parts": parts
+                    }));
+                }
             }
-            let role = match msg.role.as_str() {
-                "assistant" => "model",
-                other => other,
-            };
-            let parts = serialize_gemini_parts(&msg.content);
-            contents.push(serde_json::json!({
-                "role": role,
-                "parts": parts
-            }));
         }
 
         let mut body = serde_json::json!({

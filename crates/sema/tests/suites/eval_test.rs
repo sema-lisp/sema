@@ -1801,6 +1801,23 @@ eval_tests! {
     deep_reentrant_recursion_no_abort: "(begin (define (nest d) (if (= d 0) 0 (+ 1 (first (map (fn (x) (nest (- d 1))) (list 0)))))) (nest 1000))" => Value::int(1000),
 }
 
+// Regression: the numeric-tower fold shared by `+`/`-`/`*` (24b09a47) seeded
+// its accumulator by folding the first operand through the identity (`0 +
+// first`). `0.0 + -0.0 == 0.0` per IEEE 754, so that silently flipped a
+// leading -0.0 to +0.0 (`1.0 * -0.0 == -0.0`, so `*`'s identity seed was
+// unaffected). Fixed by seeding the accumulator from the first operand
+// directly. `let`-bound operands (not literals) force these through the
+// `CALL_GLOBAL`/stdlib fold path rather than the `SUB_INT`/`ADD_INT` VM
+// intrinsics, which only fire for exactly 2 literal-arity args and were never
+// affected. Sign is observed via `(/ 1.0 x)`, since the printer does not
+// distinguish -0.0 from 0.0.
+eval_tests! {
+    sub_leading_neg_zero_keeps_sign:
+        "(let ((a (- 0.0)) (b 0.0) (c 0.0)) (< (/ 1.0 (- a b c)) 0.0))" => Value::bool(true),
+    add_single_neg_zero_keeps_sign:
+        "(let ((a (- 0.0))) (< (/ 1.0 (+ a)) 0.0))" => Value::bool(true),
+}
+
 // Task 7.1: VM/stdlib parity at the i64 boundary. Each case pins the same
 // literal oracle whether the operands flow through the inline `*_INT` VM fast
 // path (forced by `let`-binding the operands so they are runtime values, not

@@ -138,7 +138,7 @@ The existing `drop` impl does a tag-dispatch match on every drop. For the common
 
 **Impact: ~3-5%**
 
-Already covered in the [VM Performance Plan](../plans/2026-02-17-vm-performance.md) and [Roadmap](../plans/2026-02-17-vm-performance-roadmap.md). Cached frame locals, raw pointer bytecode reads, and `u8` match dispatch apply here too but have less relative impact than on tak since dispatch is only 16.5% self-time (vs ~30%+ on tak).
+Already covered in the [VM Performance Plan](../plans/archive/2026-02-17-vm-performance.md) and [Roadmap](../plans/archive/2026-02-17-vm-performance-roadmap.md). Cached frame locals, raw pointer bytecode reads, and `u8` match dispatch apply here too but have less relative impact than on tak since dispatch is only 16.5% self-time (vs ~30%+ on tak).
 
 ## Comparison with Compute-Heavy Benchmarks
 

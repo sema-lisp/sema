@@ -7,7 +7,7 @@ use sema_core::{Caps, Sandbox, Span};
 use crate::definitions::*;
 use crate::helpers::*;
 use crate::server::normalize_lsp_message_body;
-use crate::state::{default_sema_binary, position_in_range, BackendState, CachedParse};
+use crate::state::{default_sema_binary, position_in_range, BackendState, ParsedFile};
 use crate::{builtin_docs, scope};
 
 // ── doc coverage gate ────────────────────────────────────────
@@ -307,7 +307,7 @@ fn parsed_state(uri: &str, source: &str) -> (BackendState, Url) {
     let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
     state.cached_parses.insert(
         uri.to_string(),
-        CachedParse {
+        ParsedFile {
             ast,
             span_map,
             symbol_spans,
@@ -1696,6 +1696,97 @@ fn arg_positions_after_astral_char_on_line() {
     assert_eq!(positions, vec![(0, 17), (0, 19)]);
 }
 
+#[test]
+fn arg_positions_with_char_literal_bracket() {
+    // A bracket inside a char literal breaks the char-by-char scanner (it
+    // treats `\` as an escape only inside strings, so `#\(` still bumps
+    // depth). The lexer path keeps the char literal a single token whose span
+    // starts at the `#`, so both arguments are found — this is the concrete
+    // case the old scan got wrong.
+    let text = "(f #\\( x)";
+    let lines: Vec<&str> = text.lines().collect();
+    let span = sema_core::Span::new(1, 1, 1, 10);
+    let positions = find_arg_positions_in_form(&span, &lines, 2);
+    // '#' of '#\(' at byte 3, 'x' at byte 7.
+    assert_eq!(positions, vec![(0, 3), (0, 7)]);
+}
+
+#[test]
+fn arg_positions_unclosed_paren_is_lenient() {
+    // A form the user is still typing (missing closing paren) lexes fine and
+    // still yields argument positions, so inlay hints keep working.
+    let text = "(foo a b";
+    let lines: Vec<&str> = text.lines().collect();
+    let span = sema_core::Span::new(1, 1, 1, 9);
+    let positions = find_arg_positions_in_form(&span, &lines, 2);
+    // 'a' at byte 5, 'b' at byte 7.
+    assert_eq!(positions, vec![(0, 5), (0, 7)]);
+}
+
+#[test]
+fn arg_positions_unterminated_string_falls_back() {
+    // An unterminated string makes the lexer reject the source; the lenient
+    // scan takes over and still reports the argument positions it can see, so
+    // hints never hard-fail while the user is mid-edit.
+    let text = "(foo a \"unterminated\n  b)";
+    let lines: Vec<&str> = text.lines().collect();
+    let span = sema_core::Span::new(1, 1, 2, 4);
+    let positions = find_arg_positions_in_form(&span, &lines, 2);
+    // 'a' at byte 5 on line 0; the unterminated string's opening '"' at
+    // byte 7 on line 0 counts as the second argument region.
+    assert_eq!(positions, vec![(0, 5), (0, 7)]);
+}
+
+#[test]
+fn arg_positions_quote_prefix_counts_as_one_arg() {
+    // `'a` is one AST argument (quote a); the prefix glyph and its operand
+    // must not be counted as two separate positions.
+    let text = "(f 'a x)";
+    let lines: Vec<&str> = text.lines().collect();
+    let span = sema_core::Span::new(1, 1, 1, 8);
+    let positions = find_arg_positions_in_form(&span, &lines, 2);
+    // `'` at byte 3 (start of the quoted arg), 'x' at byte 6.
+    assert_eq!(positions, vec![(0, 3), (0, 6)]);
+}
+
+#[test]
+fn arg_positions_quasiquote_unquote_counts_as_one_arg() {
+    // `` `(a ,b) `` is one AST argument; the nested `,b` must not leak out
+    // as a top-level position since it's inside the quasiquoted list.
+    let text = "(f `(a ,b) x)";
+    let lines: Vec<&str> = text.lines().collect();
+    let span = sema_core::Span::new(1, 1, 1, 13);
+    let positions = find_arg_positions_in_form(&span, &lines, 2);
+    // '`' at byte 3, 'x' at byte 11.
+    assert_eq!(positions, vec![(0, 3), (0, 11)]);
+}
+
+#[test]
+fn arg_positions_short_lambda_is_one_arg() {
+    // `#(...)` has no separate opening LParen token — its close is a plain
+    // `)`. Without tracking it as an opener, the lambda body leaks as
+    // top-level args and its `)` prematurely ends the whole scan, dropping
+    // `xs` entirely.
+    let text = "(map #(inc %) xs)";
+    let lines: Vec<&str> = text.lines().collect();
+    let span = sema_core::Span::new(1, 1, 1, 18);
+    let positions = find_arg_positions_in_form(&span, &lines, 2);
+    // '#' of '#(...)' at byte 5, 'xs' at byte 14.
+    assert_eq!(positions, vec![(0, 5), (0, 14)]);
+}
+
+#[test]
+fn arg_positions_degenerate_span_falls_back() {
+    // A same-line span with end before start (malformed/mid-edit) must not
+    // panic slicing the source substring; the lenient scan takes over.
+    let text = "(foo a b)";
+    let lines: Vec<&str> = text.lines().collect();
+    let span = sema_core::Span::new(1, 5, 1, 2);
+    let positions = find_arg_positions_in_form(&span, &lines, 2);
+    // No assertion on content — the point is this does not panic.
+    let _ = positions;
+}
+
 // ── top_level_ranges ─────────────────────────────────────────
 
 #[test]
@@ -2697,7 +2788,7 @@ fn insert_parsed_doc(state: &mut BackendState, uri: &str, source: &str) {
     let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
     state.cached_parses.insert(
         uri.to_string(),
-        CachedParse {
+        ParsedFile {
             ast,
             span_map,
             symbol_spans,
@@ -2735,11 +2826,13 @@ fn insert_scanned_file(state: &mut BackendState, path: &std::path::Path, source:
     state.import_cache.insert(
         path.to_path_buf(),
         crate::state::ImportCache {
-            ast,
-            span_map,
-            symbol_spans,
-            scope_tree,
-            source: source.to_string(),
+            parsed: ParsedFile {
+                ast,
+                span_map,
+                symbol_spans,
+                scope_tree,
+                source: source.to_string(),
+            },
             mtime,
         },
     );

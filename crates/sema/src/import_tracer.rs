@@ -46,12 +46,16 @@ fn trace_imports_with_mode(root_file: &Path, strict: bool) -> Result<StrictImpor
         .ok_or_else(|| format!("root file has no parent directory: {}", root_file.display()))?
         .to_path_buf();
 
-    let mut visited: HashSet<PathBuf> = HashSet::new();
-    let mut result: HashMap<String, Vec<u8>> = HashMap::new();
-    let mut filesystem_files: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+    let mut state = TraceState {
+        root_dir: &root_dir,
+        visited: HashSet::new(),
+        result: HashMap::new(),
+        filesystem_files: HashMap::new(),
+        strict,
+    };
 
     // Mark the root file as visited so we never add it to the result map.
-    visited.insert(root_file.clone());
+    state.visited.insert(root_file.clone());
 
     // Read and parse the root file, then trace its imports.
     let source = std::fs::read_to_string(&root_file)
@@ -65,20 +69,25 @@ fn trace_imports_with_mode(root_file: &Path, strict: bool) -> Result<StrictImpor
         )
     })?;
 
-    trace_file_imports(
-        &exprs,
-        &root_file,
-        &root_dir,
-        &mut visited,
-        &mut result,
-        &mut filesystem_files,
-        strict,
-    )?;
+    trace_file_imports(&exprs, &root_file, &mut state)?;
 
     Ok(StrictImportSnapshot {
-        files: result,
-        filesystem_files,
+        files: state.result,
+        filesystem_files: state.filesystem_files,
     })
+}
+
+/// The parts of import-tracing state that stay fixed for the whole recursive
+/// walk (`root_dir`, `strict`) alongside the accumulators every recursive call
+/// threads through (`visited`, `result`, `filesystem_files`) — bundled so each
+/// function takes one `&mut TraceState` plus the one value that actually
+/// varies per call (`current_file`/`import_path`/`expr`).
+struct TraceState<'a> {
+    root_dir: &'a Path,
+    visited: HashSet<PathBuf>,
+    result: HashMap<String, Vec<u8>>,
+    filesystem_files: HashMap<PathBuf, Vec<u8>>,
+    strict: bool,
 }
 
 /// Parse the expressions from a single file and extract all import/load paths,
@@ -86,22 +95,10 @@ fn trace_imports_with_mode(root_file: &Path, strict: bool) -> Result<StrictImpor
 fn trace_file_imports(
     exprs: &[Value],
     current_file: &Path,
-    root_dir: &Path,
-    visited: &mut HashSet<PathBuf>,
-    result: &mut HashMap<String, Vec<u8>>,
-    filesystem_files: &mut HashMap<PathBuf, Vec<u8>>,
-    strict: bool,
+    state: &mut TraceState,
 ) -> Result<(), String> {
     for expr in exprs {
-        extract_imports(
-            expr,
-            current_file,
-            root_dir,
-            visited,
-            result,
-            filesystem_files,
-            strict,
-        )?;
+        extract_imports(expr, current_file, state)?;
     }
     Ok(())
 }
@@ -112,11 +109,7 @@ fn trace_file_imports(
 fn extract_imports(
     expr: &Value,
     current_file: &Path,
-    root_dir: &Path,
-    visited: &mut HashSet<PathBuf>,
-    result: &mut HashMap<String, Vec<u8>>,
-    filesystem_files: &mut HashMap<PathBuf, Vec<u8>>,
-    strict: bool,
+    state: &mut TraceState,
 ) -> Result<(), String> {
     let items = match expr.as_list() {
         Some(items) if !items.is_empty() => items,
@@ -131,17 +124,9 @@ fn extract_imports(
             "import" | "load" => {
                 if items.len() >= 2 {
                     if let Some(path_str) = items[1].as_str() {
-                        process_import(
-                            path_str,
-                            current_file,
-                            root_dir,
-                            visited,
-                            result,
-                            filesystem_files,
-                            strict,
-                        )?;
+                        process_import(path_str, current_file, state)?;
                     } else {
-                        if strict {
+                        if state.strict {
                             return Err(format!(
                                 "dynamic {head} in {} cannot be bound to an approval revision",
                                 current_file.display()
@@ -165,15 +150,7 @@ fn extract_imports(
                 // may be an (export ...) form in there too -- just recurse
                 // into everything after the name.
                 for item in items.iter().skip(2) {
-                    extract_imports(
-                        item,
-                        current_file,
-                        root_dir,
-                        visited,
-                        result,
-                        filesystem_files,
-                        strict,
-                    )?;
+                    extract_imports(item, current_file, state)?;
                 }
                 return Ok(());
             }
@@ -183,15 +160,7 @@ fn extract_imports(
 
     // For any other list, recurse into all children.
     for item in items.iter() {
-        extract_imports(
-            item,
-            current_file,
-            root_dir,
-            visited,
-            result,
-            filesystem_files,
-            strict,
-        )?;
+        extract_imports(item, current_file, state)?;
     }
 
     Ok(())
@@ -202,21 +171,10 @@ fn extract_imports(
 fn process_import(
     import_path: &str,
     current_file: &Path,
-    root_dir: &Path,
-    visited: &mut HashSet<PathBuf>,
-    result: &mut HashMap<String, Vec<u8>>,
-    filesystem_files: &mut HashMap<PathBuf, Vec<u8>>,
-    strict: bool,
+    state: &mut TraceState,
 ) -> Result<(), String> {
     if is_package_import(import_path) {
-        return process_package_import(
-            import_path,
-            root_dir,
-            visited,
-            result,
-            filesystem_files,
-            strict,
-        );
+        return process_package_import(import_path, state);
     }
 
     // Resolve relative to the directory of the importing file.
@@ -235,7 +193,7 @@ fn process_import(
     let canonical = match resolved.canonicalize() {
         Ok(c) => c,
         Err(_) => {
-            if strict {
+            if state.strict {
                 return Err(format!(
                     "import {import_path:?} from {} cannot be resolved for approval binding",
                     current_file.display()
@@ -252,19 +210,19 @@ fn process_import(
     };
 
     // Circular import protection.
-    if visited.contains(&canonical) {
-        if let Some(contents) = filesystem_files.get(&canonical).cloned() {
-            filesystem_files.insert(resolved, contents);
+    if state.visited.contains(&canonical) {
+        if let Some(contents) = state.filesystem_files.get(&canonical).cloned() {
+            state.filesystem_files.insert(resolved, contents);
         }
         return Ok(());
     }
-    visited.insert(canonical.clone());
+    state.visited.insert(canonical.clone());
 
     // Read file contents.
     let contents = match std::fs::read(&canonical) {
         Ok(c) => c,
         Err(_) => {
-            if strict {
+            if state.strict {
                 return Err(format!(
                     "import {} cannot be read for approval binding",
                     canonical.display()
@@ -278,8 +236,10 @@ fn process_import(
             return Ok(());
         }
     };
-    filesystem_files.insert(resolved, contents.clone());
-    filesystem_files.insert(canonical.clone(), contents.clone());
+    state.filesystem_files.insert(resolved, contents.clone());
+    state
+        .filesystem_files
+        .insert(canonical.clone(), contents.clone());
 
     // Compute relative path for the VFS key.
     // Check packages_dir FIRST — package files must get package-relative keys
@@ -291,10 +251,10 @@ fn process_import(
         if let Some(ref cpkg) = canon_pkg {
             if let Ok(rel) = canonical.strip_prefix(cpkg) {
                 rel.to_string_lossy().replace('\\', "/")
-            } else if let Ok(rel) = canonical.strip_prefix(root_dir) {
+            } else if let Ok(rel) = canonical.strip_prefix(state.root_dir) {
                 rel.to_string_lossy().replace('\\', "/")
             } else {
-                if strict {
+                if state.strict {
                     return Err(format!(
                         "imported file {} is outside the project and packages directories",
                         canonical.display()
@@ -307,10 +267,10 @@ fn process_import(
                 ));
                 return Ok(());
             }
-        } else if let Ok(rel) = canonical.strip_prefix(root_dir) {
+        } else if let Ok(rel) = canonical.strip_prefix(state.root_dir) {
             rel.to_string_lossy().replace('\\', "/")
         } else {
-            if strict {
+            if state.strict {
                 return Err(format!(
                     "imported file {} is outside the project directory",
                     canonical.display()
@@ -330,7 +290,7 @@ fn process_import(
         .map_err(|e| format!("invalid VFS key for {}: {e}", canonical.display()))?;
 
     // Detect collisions: if a key already exists with different content, error
-    if let Some(existing) = result.get(&rel_path) {
+    if let Some(existing) = state.result.get(&rel_path) {
         if *existing != contents {
             return Err(format!(
                 "VFS key collision: \"{}\" maps to two different files with different content",
@@ -339,7 +299,7 @@ fn process_import(
         }
         // Same content — skip reinserting (diamond dependency)
     } else {
-        result.insert(rel_path, contents.clone());
+        state.result.insert(rel_path, contents.clone());
     }
 
     // Recursively trace the imported file's own imports.
@@ -347,17 +307,9 @@ fn process_import(
     if let Ok(source) = std::str::from_utf8(&contents) {
         match sema_reader::read_many(source) {
             Ok(exprs) => {
-                trace_file_imports(
-                    &exprs,
-                    &canonical,
-                    root_dir,
-                    visited,
-                    result,
-                    filesystem_files,
-                    strict,
-                )?;
+                trace_file_imports(&exprs, &canonical, state)?;
             }
-            Err(error) if strict => {
+            Err(error) if state.strict => {
                 return Err(format!(
                     "cannot parse imported file {} for approval binding: {}",
                     canonical.display(),
@@ -373,15 +325,8 @@ fn process_import(
 }
 
 /// Resolve a package import via `resolve_package_import`, read its contents,
-/// and add it to the result map using the package path as the VFS key.
-fn process_package_import(
-    import_path: &str,
-    root_dir: &Path,
-    visited: &mut HashSet<PathBuf>,
-    result: &mut HashMap<String, Vec<u8>>,
-    filesystem_files: &mut HashMap<PathBuf, Vec<u8>>,
-    strict: bool,
-) -> Result<(), String> {
+/// and add it to the state.result map using the package path as the VFS key.
+fn process_package_import(import_path: &str, state: &mut TraceState) -> Result<(), String> {
     let resolved = match resolve_package_import(import_path) {
         Ok(p) => p,
         Err(_) => {
@@ -399,21 +344,23 @@ fn process_package_import(
         )
     })?;
 
-    if visited.contains(&canonical) {
+    if state.visited.contains(&canonical) {
         return Ok(());
     }
-    visited.insert(canonical.clone());
+    state.visited.insert(canonical.clone());
 
     let contents = std::fs::read(&canonical)
         .map_err(|e| format!("cannot read {}: {e}", canonical.display()))?;
-    filesystem_files.insert(canonical.clone(), contents.clone());
+    state
+        .filesystem_files
+        .insert(canonical.clone(), contents.clone());
 
     // Use the package path as the VFS key for portability.
     // Validate and check for collisions.
     sema_core::vfs::validate_vfs_path(import_path)
         .map_err(|e| format!("invalid VFS key for package \"{import_path}\": {e}"))?;
 
-    if let Some(existing) = result.get(import_path) {
+    if let Some(existing) = state.result.get(import_path) {
         if *existing != contents {
             return Err(format!(
                 "VFS key collision: \"{}\" maps to two different files with different content",
@@ -421,24 +368,18 @@ fn process_package_import(
             ));
         }
     } else {
-        result.insert(import_path.to_string(), contents.clone());
+        state
+            .result
+            .insert(import_path.to_string(), contents.clone());
     }
 
     // Recursively trace the package file's own imports.
     if let Ok(source) = std::str::from_utf8(&contents) {
         match sema_reader::read_many(source) {
             Ok(exprs) => {
-                trace_file_imports(
-                    &exprs,
-                    &canonical,
-                    root_dir,
-                    visited,
-                    result,
-                    filesystem_files,
-                    strict,
-                )?;
+                trace_file_imports(&exprs, &canonical, state)?;
             }
-            Err(error) if strict => {
+            Err(error) if state.strict => {
                 return Err(format!(
                     "cannot parse package import {import_path:?} for approval binding: {}",
                     error.format_plain()

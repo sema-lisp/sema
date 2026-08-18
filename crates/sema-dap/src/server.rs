@@ -794,14 +794,21 @@ fn reply_session_ended(cmd: DebugCommand) {
     }
 }
 
+/// All state for a launched, not-yet-run debug program. Populated in the
+/// `Launch` arm and consumed in `ConfigurationDone`. `vm` is moved into the
+/// interpreter's runtime drive, so it is the only field taken out of place.
+struct LaunchedProgram {
+    vm: sema_vm::VM,
+    closure: std::rc::Rc<sema_vm::Closure>,
+    debug_state: DebugState,
+    interp: sema_eval::Interpreter,
+}
+
 fn backend_thread(
     mut rx: tokio_mpsc::Receiver<BackendRequest>,
     event_tx: tokio_mpsc::Sender<DebugEvent>,
 ) {
-    let mut vm: Option<sema_vm::VM> = None;
-    let mut closure: Option<std::rc::Rc<sema_vm::Closure>> = None;
-    let mut debug_state: Option<DebugState> = None;
-    let mut interp: Option<sema_eval::Interpreter> = None;
+    let mut launched: Option<LaunchedProgram> = None;
     let mut pending_breakpoints: Vec<(PathBuf, Vec<SourceBreakpoint>)> = Vec::new();
     let mut pending_break_on_uncaught = false;
 
@@ -879,7 +886,6 @@ fn backend_thread(
                     ds.set_breakpoints_with_conditions(&file, &breakpoints);
                 }
 
-                closure = Some(prog.closure.clone());
                 let new_vm = match sema_vm::VM::new(
                     interpreter.global_env.clone(),
                     prog.functions,
@@ -908,9 +914,12 @@ fn backend_thread(
                 });
 
                 // Store state but don't run yet — wait for configurationDone
-                debug_state = Some(ds);
-                vm = Some(new_vm);
-                interp = Some(interpreter);
+                launched = Some(LaunchedProgram {
+                    vm: new_vm,
+                    closure: prog.closure.clone(),
+                    debug_state: ds,
+                    interp: interpreter,
+                });
             }
 
             BackendRequest::SetBreakpoints {
@@ -918,8 +927,10 @@ fn backend_thread(
                 breakpoints,
                 reply,
             } => {
-                if let Some(ref mut ds) = debug_state {
-                    let resolved = ds.set_breakpoints_with_conditions(&file, &breakpoints);
+                if let Some(lp) = launched.as_mut() {
+                    let resolved = lp
+                        .debug_state
+                        .set_breakpoints_with_conditions(&file, &breakpoints);
                     let _ = reply.blocking_send(resolved);
                 } else {
                     // Store for application at launch time, reply immediately
@@ -945,17 +956,29 @@ fn backend_thread(
             }
 
             BackendRequest::SetExceptionBreakpoints { break_on_uncaught } => {
-                if let Some(ref mut ds) = debug_state {
-                    ds.break_on_uncaught = break_on_uncaught;
+                if let Some(lp) = launched.as_mut() {
+                    lp.debug_state.break_on_uncaught = break_on_uncaught;
                 } else {
                     pending_break_on_uncaught = break_on_uncaught;
                 }
             }
 
             BackendRequest::ConfigurationDone => {
-                if let (Some(ref cl), Some(ref mut ds), Some(ref interpreter)) =
-                    (&closure, &mut debug_state, &interp)
-                {
+                // Take ownership of the launched program. The drive consumes the
+                // VM, and after it finishes a Terminated event is sent and the
+                // frontend disconnects, so no later request can target a live
+                // session (breakpoint/exception requests after launch arrive
+                // before ConfigurationDone and use `launched.as_mut()` above).
+                if let Some(launched_prog) = launched.take() {
+                    let LaunchedProgram {
+                        vm,
+                        closure,
+                        mut debug_state,
+                        interp,
+                    } = launched_prog;
+                    let cl = &closure;
+                    let ds = &mut debug_state;
+                    let interpreter = &interp;
                     // Redirect program stdout/stderr into DAP Output events so they
                     // don't corrupt the JSON-RPC protocol stream on the server's stdout.
                     let event_tx_stdout = event_tx.clone();
@@ -996,7 +1019,7 @@ fn backend_thread(
                     // channels, sleep, external I/O) Just Work under the debugger
                     // because they are ordinary runtime suspensions now.
                     let result = {
-                        let mut vm_inst = vm.take().expect("debug VM present at configurationDone");
+                        let mut vm_inst = vm;
                         vm_inst.seed_main_frame(cl.clone());
                         let _active = sema_vm::ActiveDebugGuard::enter(ds);
                         interpreter.drive_vm_on_runtime(vm_inst)

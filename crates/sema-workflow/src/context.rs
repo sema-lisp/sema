@@ -202,13 +202,12 @@ pub struct WorkflowCtx {
     /// position. Shared with inherited tasks so the owning run cannot report success
     /// after a detached child tried to create a gate.
     approval_failure: RefCell<Option<String>>,
-    /// `start_seq` of the currently-open phase (the phase.started event's seq), so
-    /// checkpoints/agents/budget events can be attributed to their phase.
-    cur_phase_seq: Cell<Option<u64>>,
-    /// Label of the currently-open phase, paired with `cur_phase_seq`. Marker-style
-    /// phases need the label to emit the matching `phase.ended` when the next marker
-    /// (or the run end) closes the phase.
-    cur_phase_label: RefCell<Option<String>>,
+    /// `(start_seq, label)` of the currently-open marker-style phase — `start_seq` is
+    /// the phase.started event's seq, so checkpoints/agents/budget events can be
+    /// attributed to their phase; `label` is needed to emit the matching `phase.ended`
+    /// when the next marker (or the run end) closes the phase. `None` when no phase
+    /// is open.
+    cur_phase: RefCell<Option<(u64, String)>>,
     /// Per-name agent invocation counter, for minting unique `agent_id`s. Run-shared
     /// (via the `Rc<WorkflowCtx>`), so ids stay unique even across concurrent tasks; the
     /// per-task ACTIVE-agent attribution slot moved to [`WorkflowTaskState::set_cur_agent`].
@@ -304,8 +303,7 @@ impl WorkflowCtx {
             tokens_spent: Cell::new(0),
             over_budget: Cell::new(false),
             approval_failure: RefCell::new(None),
-            cur_phase_seq: Cell::new(None),
-            cur_phase_label: RefCell::new(None),
+            cur_phase: RefCell::new(None),
             agent_n: RefCell::new(BTreeMap::new()),
             resuming: Cell::new(false),
             code_version: RefCell::new(String::new()),
@@ -369,22 +367,19 @@ impl WorkflowCtx {
     /// marker (or the run end) can emit the matching `phase.ended`. Subsequent
     /// checkpoints / agents / budget events attribute to `start_seq`.
     pub fn open_phase(&self, start_seq: u64, label: String) {
-        self.cur_phase_seq.set(Some(start_seq));
-        *self.cur_phase_label.borrow_mut() = Some(label);
+        *self.cur_phase.borrow_mut() = Some((start_seq, label));
     }
 
     /// Close the currently-open phase, returning its `(start_seq, label)` so the caller
     /// can emit `phase.ended`. Clears the open-phase tracking; returns `None` when no
     /// phase is open (e.g. a workflow with no `(phase …)` markers).
     pub fn take_open_phase(&self) -> Option<(u64, String)> {
-        let label = self.cur_phase_label.borrow_mut().take()?;
-        let seq = self.cur_phase_seq.replace(None);
-        seq.map(|s| (s, label))
+        self.cur_phase.borrow_mut().take()
     }
 
     /// `start_seq` of the open phase, if any.
     pub fn phase_seq(&self) -> Option<u64> {
-        self.cur_phase_seq.get()
+        self.cur_phase.borrow().as_ref().map(|(seq, _)| *seq)
     }
 
     /// Mint a unique `agent_id` for an agent of role `name` (`<name>_<n>`, 1-based).
@@ -575,7 +570,11 @@ impl WorkflowCtx {
     /// The label of the currently-open phase (empty outside any phase). Part of a
     /// content-key so the same leaf in different phases keys distinctly.
     pub fn cur_phase_label(&self) -> String {
-        self.cur_phase_label.borrow().clone().unwrap_or_default()
+        self.cur_phase
+            .borrow()
+            .as_ref()
+            .map(|(_, label)| label.clone())
+            .unwrap_or_default()
     }
 
     /// Next 0-based occurrence ordinal for a content-key base, so identical-input leaves

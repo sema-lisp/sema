@@ -453,19 +453,17 @@ fn checkout_runtime<T: Send + 'static>(
     decode: impl FnOnce(T) -> Value + 'static,
     abort: Option<Box<dyn FnOnce()>>,
 ) -> NativeResult {
-    let kind = CompletionKind::try_from_raw(PROC_COMPLETION_KIND)
-        .expect("proc completion kind is nonzero");
     let gate = PROC_GATES.with(|g| g.borrow().get(&id).cloned());
-    checkout_external(CheckoutOp {
+    crate::runtime_offload::checkout_runtime_op(
         op_name,
-        kind,
+        PROC_COMPLETION_KIND,
         gate,
-        store_gate: Box::new(move |gid| {
+        Box::new(move |gid| {
             PROC_GATES.with(|g| {
                 g.borrow_mut().insert(id, gid);
             });
         }),
-        remove_gate: Rc::new(move |gid| {
+        Rc::new(move |gid| {
             PROC_GATES.with(|g| {
                 let mut gates = g.borrow_mut();
                 if gates.get(&id).map(ResourceGateHandle::id) == Some(gid) {
@@ -473,24 +471,21 @@ fn checkout_runtime<T: Send + 'static>(
                 }
             });
         }),
-        take: Box::new(move || take_proc(op_name, id)),
-        op: Box::new(op),
-        reinstall: Box::new(move |pr| {
+        Box::new(move || take_proc(op_name, id)),
+        op,
+        Box::new(move |pr| {
             PROCS.with(|p| {
                 p.borrow_mut().insert(id, ProcSlot::Available(pr));
             });
         }),
-        decode: Box::new(move |t| Ok(decode(t))),
-        success_value: None,
-        tombstone: Rc::new(move |msg| {
+        decode,
+        Rc::new(move |msg| {
             PROCS.with(|p| {
                 p.borrow_mut().insert(id, ProcSlot::Tombstone(msg));
             });
         }),
         abort,
-        reclaim: None,
-        terminal_on_success: false,
-    })
+    )
 }
 
 /// The async-context `proc/wait`: offload `child.wait()` + the pump-thread joins

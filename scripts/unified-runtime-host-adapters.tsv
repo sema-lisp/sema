@@ -2,7 +2,7 @@
 EVAL_CALLBACK	crates/sema-core/src/context.rs	4	host-only evaluator callback definition plus same-context/cross-context rejection and host compatibility tests
 EVAL_CALLBACK_FN	crates/sema-core/src/context.rs	3	public host-compatibility callback type, context slot, and setter signature
 EVAL_CALLBACK_FN	crates/sema-core/src/lib.rs	1	public re-export retained for embedding API compatibility
-EVAL_FN	crates/sema-core/src/context.rs	6	host-only evaluator callback slot initialization, registration, and guarded invocation
+EVAL_FN	crates/sema-core/src/context.rs	5	host-only evaluator callback slot initialization, registration, and guarded invocation (new() now delegates to new_with_sandbox() instead of duplicating the field list)
 SET_EVAL_CALLBACK	crates/sema-core/src/context.rs	4	host-only evaluator setter definition plus compatibility and rejection tests
 SET_EVAL_CALLBACK	crates/sema-eval/src/eval.rs	2	interpreter construction installs the host evaluator callback on each context
 SET_EVAL_CALLBACK	crates/sema-wasm/src/lib.rs	1	WASM interpreter construction installs the guarded host evaluator callback

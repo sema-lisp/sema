@@ -105,13 +105,17 @@ impl BackendState {
                 Err(_) => continue,
             };
             // Names only; ranges discarded — &[] skips UTF-16 mapping.
-            let defs =
-                user_definitions_from_ast(&entry.ast, &entry.span_map, &entry.symbol_spans, &[]);
+            let defs = user_definitions_from_ast(
+                &entry.parsed.ast,
+                &entry.parsed.span_map,
+                &entry.parsed.symbol_spans,
+                &[],
+            );
             for (name, _) in defs {
                 if !(prefix.is_empty() || name.starts_with(prefix)) || emitted.contains(&name) {
                     continue;
                 }
-                let detail = extract_params_from_ast(&entry.ast, &name);
+                let detail = extract_params_from_ast(&entry.parsed.ast, &name);
                 emitted.insert(name.clone());
                 items.push(CompletionItem {
                     label: name,
@@ -182,7 +186,7 @@ impl BackendState {
             }
         }
         self.iter_workspace_files()
-            .find_map(|wf| extract_docstring_from_ast(wf.ast, name))
+            .find_map(|wf| extract_docstring_from_ast(&wf.parsed.ast, name))
     }
 
     /// Build a one-line signature `(name params...)` for a user-defined function, preferring the
@@ -209,7 +213,7 @@ impl BackendState {
             }
         }
         self.iter_workspace_files()
-            .find_map(|wf| extract_params_from_ast(wf.ast, name))
+            .find_map(|wf| extract_params_from_ast(&wf.parsed.ast, name))
             .map(render)
     }
 }

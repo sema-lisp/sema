@@ -1,24 +1,11 @@
 import { test, expect, Page } from '@playwright/test';
 import { toggleBreakpoint, getCurrentDebugLine } from './gutter';
+import { waitForReady, setEditorCode, getErrors, getStatus, getOutputLines } from './helpers';
 
 // E2E gate (Slice 2): breakpoints INSIDE async tasks STOP + CONTINUE in the
 // cooperative WASM playground debugger. Modeled on debugger.spec.ts — same UI
 // flow + selectors. We inject our OWN known programs (not a built-in example) so
 // the breakpoint line is deterministic.
-
-async function waitForReady(page: Page) {
-  await page.goto('/');
-  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
-}
-
-async function setEditorCode(page: Page, code: string) {
-  await page.getByTestId('editor').fill(code);
-}
-
-/** Get all error output. */
-async function getErrors(page: Page): Promise<string[]> {
-  return page.getByTestId('output-error').allTextContents();
-}
 
 /** Wait for the debugger to pause (status bar shows "Paused at line ..."). */
 async function waitForPaused(page: Page, timeout = 8000) {
@@ -34,14 +21,6 @@ async function waitForIdle(page: Page, timeout = 12000) {
     () => document.getElementById('status')?.textContent === 'Ready',
     { timeout }
   );
-}
-
-async function getStatus(page: Page): Promise<string> {
-  return await page.getByTestId('status').textContent() ?? '';
-}
-
-async function getOutputLines(page: Page): Promise<string[]> {
-  return page.getByTestId('output-line').allTextContents();
 }
 
 /** Click a debug control (by testid) and wait until the debugger is paused

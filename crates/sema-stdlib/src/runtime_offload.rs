@@ -854,6 +854,45 @@ pub(crate) fn checkout_external<Res: Send + 'static, T: Send + 'static>(
     }
 }
 
+/// Build a [`CheckoutOp`] from the module-supplied pieces and run it through
+/// [`checkout_external`]. The per-handle resource modules (proc, pty, — the
+/// "closest twins" — and later serial/kv/stream) hand over their registry
+/// operations as closures; the ~40-line `CheckoutOp { .. }` literal with its
+/// kind construction lives here once instead of per module. All teardown (abort
+/// hooks, `close` paths) and error text stay in the calling module.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn checkout_runtime_op<Res: Send + 'static, T: Send + 'static>(
+    op_name: &'static str,
+    kind_tag: u64,
+    cached_gate: Option<ResourceGateHandle>,
+    store_gate: Box<dyn FnOnce(ResourceGateHandle)>,
+    remove_gate: Rc<dyn Fn(ResourceGateId)>,
+    take: Box<dyn FnOnce() -> Result<Res, SemaError>>,
+    op: impl FnOnce(&mut Res) -> Result<T, String> + Send + 'static,
+    reinstall: Box<dyn FnOnce(Res)>,
+    decode: impl FnOnce(T) -> Value + 'static,
+    tombstone: Rc<dyn Fn(String)>,
+    abort: Option<Box<dyn FnOnce()>>,
+) -> NativeResult {
+    let kind = CompletionKind::try_from_raw(kind_tag).expect("completion kind is nonzero");
+    checkout_external(CheckoutOp {
+        op_name,
+        kind,
+        gate: cached_gate,
+        store_gate,
+        remove_gate,
+        take,
+        op: Box::new(op),
+        reinstall,
+        decode: Box::new(move |t| Ok(decode(t))),
+        success_value: None,
+        tombstone,
+        abort,
+        reclaim: None,
+        terminal_on_success: false,
+    })
+}
+
 /// Stage 0: a freshly-created gate arrives; store it against the handle, then
 /// suspend on it. Holds no `Value`.
 struct CreateGateCont<Res: Send + 'static, T: Send + 'static> {

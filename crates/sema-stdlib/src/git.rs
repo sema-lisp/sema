@@ -64,9 +64,10 @@ thread_local! {
 /// lowered by any per-call override (never raised above it). Read on the VM
 /// thread pre-dispatch, then captured by the offloaded job.
 fn effective_git_max_output_bytes() -> usize {
-    GIT_MAX_OUTPUT_OVERRIDE
-        .with(Cell::get)
-        .map_or(GIT_MAX_OUTPUT_BYTES, |over| over.min(GIT_MAX_OUTPUT_BYTES))
+    crate::io::effective_cap(
+        GIT_MAX_OUTPUT_OVERRIDE.with(Cell::get),
+        GIT_MAX_OUTPUT_BYTES,
+    )
 }
 
 /// Lower the per-pipe output cap (clamped to the hard ceiling) for subsequent

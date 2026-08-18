@@ -171,13 +171,7 @@ impl EngineHandle {
                                     engine.notebook.cells.insert(insert_at, cell);
                                 }
                                 let cell = engine.notebook.cell(&id).unwrap();
-                                let cell_number = engine
-                                    .notebook
-                                    .cells
-                                    .iter()
-                                    .filter(|c| c.cell_type == CellType::Code)
-                                    .position(|c| c.id == id)
-                                    .map(|i| i + 1);
+                                let cell_number = engine.notebook.cell_number(&id);
                                 let rendered = render::render_cell(cell, cell_number);
                                 Ok(render::CreateCellData { id, cell: rendered })
                             })();
@@ -186,13 +180,7 @@ impl EngineHandle {
                         EngineRequest::GetCell { id, reply } => {
                             let result = match engine.notebook.cell(&id) {
                                 Some(cell) => {
-                                    let cell_number = engine
-                                        .notebook
-                                        .cells
-                                        .iter()
-                                        .filter(|c| c.cell_type == CellType::Code)
-                                        .position(|c| c.id == id)
-                                        .map(|i| i + 1);
+                                    let cell_number = engine.notebook.cell_number(&id);
                                     Ok(render::render_cell(cell, cell_number))
                                 }
                                 None => Err(format!("Cell not found: {id}")),
@@ -230,13 +218,7 @@ impl EngineHandle {
                                     };
                                 }
                                 let cell = engine.notebook.cell(&id).unwrap();
-                                let cell_number = engine
-                                    .notebook
-                                    .cells
-                                    .iter()
-                                    .filter(|c| c.cell_type == CellType::Code)
-                                    .position(|c| c.id == id)
-                                    .map(|i| i + 1);
+                                let cell_number = engine.notebook.cell_number(&id);
                                 Ok(render::render_cell(cell, cell_number))
                             })();
                             let _ = reply.send(result);

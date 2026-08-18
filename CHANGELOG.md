@@ -33,6 +33,21 @@
   with `:memory` already wrote its partial turns back to the thread; that thread
   is text-only, so `:on-partial` is the route for the correlated `:messages`.
 
+### Removed
+
+- **The async-runtime migration inventory gate.** `runtime-match-map.tsv` was a
+  file:line snapshot of every production match from the unified-runtime
+  discovery scan, and `scripts/check-unified-runtime-inventory.sh` failed CI
+  whenever a fresh scan differed from it. The migration is finished and every
+  ledger row is terminal, so the snapshot no longer detected migration work — it
+  detected line numbers moving, and any unrelated edit above a recorded line
+  broke the build (the `sema mcp` timeout fix in #153 did exactly that). The
+  snapshot, the checker, and the five tests that drove it are deleted. The live
+  guard is unchanged: `scripts/check-unified-runtime-legacy.sh`, driven by
+  `runtime_conformance_test`, still forbids *new* blocking and legacy call
+  sites, and needs no snapshot to do it.
+  `docs/internals/async-runtime-inventory.md` stays as the historical record.
+
 ### Fixed
 
 - **`sema mcp` no longer wedges permanently on a runaway `eval` (#153).** The

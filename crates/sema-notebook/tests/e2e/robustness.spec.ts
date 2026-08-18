@@ -1,5 +1,5 @@
 // Robustness / durability coverage for the notebook, complementing
-// `notebook.spec.ts` (which covers the happy paths of each feature).
+// `ui.spec.ts` (which covers the happy paths of each feature).
 //
 // The question this file exists to answer is "can I trust the notebook with my
 // work?", so it concentrates on the three things that erode that trust and were
@@ -9,95 +9,25 @@
 // Every request here goes through the same HTTP API the UI uses, so a failure
 // is a real defect rather than a testing artifact.
 
-import { test, expect, Page, APIRequestContext } from '@playwright/test';
+import { test, expect } from '@playwright/test';
+import {
+  waitForLoad,
+  createCell,
+  evalCell,
+  fetchNotebook,
+  expectClientError,
+  installNotebookRestore,
+} from './helpers';
 
-// ── Helpers ────────────────────────────────────────────────────
+installNotebookRestore(test);
 
-async function waitForLoad(page: Page) {
-  await page.goto('/', { waitUntil: 'networkidle' });
-  await page.getByTestId('cell').first().waitFor({ timeout: 15000 });
-}
-
-/**
- * Cells this suite created, so it can delete them again.
- *
- * These tests share one long-lived server with `notebook.spec.ts`, which is
- * deliberately hermetic and asserts exact cell counts, markdown rendering and
- * "undo is disabled initially". Leaving a single cell — or an evaluated one,
- * which enables undo — behind fails those tests from the outside, so this file
- * must return the notebook to the state it found it in.
- */
-const createdCells: string[] = [];
-
-/** Create a code cell and return its id. Registered for cleanup. */
-async function createCell(
-  request: APIRequestContext,
-  source: string,
-  type: 'code' | 'markdown' = 'code'
-): Promise<string> {
-  const res = await request.post('/api/cells', { data: { type, source } });
-  expect(res.ok(), `creating a ${type} cell should succeed`).toBeTruthy();
-  const { id } = await res.json();
-  expect(id, 'a created cell must come back with an id').toBeTruthy();
-  createdCells.push(id);
-  return id;
-}
-
-/** Evaluate a cell and return the parsed response body. */
-async function evalCell(request: APIRequestContext, id: string) {
-  const res = await request.post(`/api/cells/${id}/eval`);
-  expect(res.ok(), `evaluating cell ${id} should return 2xx`).toBeTruthy();
-  return res.json();
-}
-
-/** The notebook as the server currently has it. */
-async function fetchNotebook(request: APIRequestContext) {
-  const res = await request.get('/api/notebook');
-  expect(res.ok()).toBeTruthy();
-  return res.json();
-}
-
-/** A status a client error may legitimately use — anything but 5xx/success. */
-function expectClientError(status: number, what: string) {
-  expect(
-    status >= 400 && status < 500,
-    `${what} should be rejected with a 4xx, got ${status}`
-  ).toBeTruthy();
-}
-
-/** Cell order as the suite found it, restored in the final cleanup. */
-let pristineOrder: string[] = [];
-
-test.beforeAll(async ({ request }) => {
-  pristineOrder = (await fetchNotebook(request)).cells.map((c: any) => c.id);
-});
-
-test.afterAll(async ({ request }) => {
-  for (const id of createdCells.reverse()) {
-    await request.delete(`/api/cells/${id}`).catch(() => {});
-  }
-  createdCells.length = 0;
-  if (pristineOrder.length > 0) {
-    await request.post('/api/cells/reorder', { data: { cell_ids: pristineOrder } }).catch(() => {});
-  }
-  // Clears outputs AND the undo history that evaluating enabled.
-  await request.post('/api/reset').catch(() => {});
-
-  const final = await fetchNotebook(request);
-  expect(
-    final.cells.map((c: any) => c.id),
-    'this suite must leave the notebook exactly as it found it'
-  ).toEqual(pristineOrder);
-  expect(final.can_undo, 'cleanup must also clear the undo history').toBeFalsy();
-});
-
-// ── Durability ─────────────────────────────────────────────────
+// ── Server-state durability ────────────────────────────────────
 //
 // The notebook saves through to its .sema-nb file. If an edit reaches the UI
 // but not the file, the user loses work at the next restart — the single worst
 // failure this feature can have, and the least visible.
 
-test.describe('Durability', () => {
+test.describe('Server-state durability', () => {
   test('a created cell is present in the served notebook', async ({ request }) => {
     const id = await createCell(request, '(+ 1 1) ; durability probe');
     const notebook = await fetchNotebook(request);

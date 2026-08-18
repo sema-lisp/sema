@@ -18,8 +18,7 @@ pub fn run(interpreter: &Interpreter, expr_str: &str) {
     }
 
     // Track the source for error rendering, same way ,type / ,time do.
-    crate::LAST_SOURCE.with(|s| *s.borrow_mut() = Some(expr_str.to_string()));
-    crate::LAST_FILE.with(|f| *f.borrow_mut() = None);
+    crate::set_last_input(expr_str, None);
 
     let exprs = match read_many(expr_str) {
         Ok(v) => v,

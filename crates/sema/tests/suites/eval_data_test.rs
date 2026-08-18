@@ -74,6 +74,7 @@ eval_tests! {
     hash_md5: r#"(string? (hash/md5 "test"))"# => Value::bool(true),
     hash_md5_length: r#"(string-length (hash/md5 "test"))"# => Value::int(32),
     hash_sha256_deterministic: r#"(equal? (hash/sha256 "test") (hash/sha256 "test"))"# => Value::bool(true),
+    hash_hmac_sha256_deterministic: r#"(equal? (hash/hmac-sha256 "key" "msg") (hash/hmac-sha256 "key" "msg"))"# => Value::bool(true),
 }
 
 // ============================================================

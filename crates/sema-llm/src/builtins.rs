@@ -923,6 +923,11 @@ pub fn last_usage_snapshot() -> Option<LastUsage> {
 pub struct LeafUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Prompt tokens served from the provider's prompt cache. See `Usage::
+    /// cache_read_input_tokens` for the per-provider accounting caveat.
+    pub cache_read_input_tokens: u64,
+    /// Tokens written to the prompt cache. See `Usage::cache_creation_input_tokens`.
+    pub cache_creation_input_tokens: u64,
     /// Summed cost; `None` while no priced call has landed, `Some` once one has (a
     /// later unpriced call leaves the running sum unchanged).
     pub cost_usd: Option<f64>,
@@ -944,6 +949,8 @@ fn accumulate_into(slot: &Rc<RefCell<LeafUsage>>, usage: &Usage, cost: Option<f6
     let mut acc = slot.borrow_mut();
     acc.input_tokens += input;
     acc.output_tokens += output;
+    acc.cache_read_input_tokens += usage.cache_read_input_tokens as u64;
+    acc.cache_creation_input_tokens += usage.cache_creation_input_tokens as u64;
     if let Some(c) = cost {
         acc.cost_usd = Some(acc.cost_usd.unwrap_or(0.0) + c);
     }
@@ -951,6 +958,25 @@ fn accumulate_into(slot: &Rc<RefCell<LeafUsage>>, usage: &Usage, cost: Option<f6
         acc.model = usage.model.clone();
     }
     acc.calls += 1;
+}
+
+/// Fold a child leaf's tally into a parent's, used when a nested [`UsageScope`] drops
+/// so the outer scope it shadowed isn't left blind to tokens the inner one collected.
+fn merge_leaf(dst: &mut LeafUsage, src: &LeafUsage) {
+    if src.calls == 0 {
+        return;
+    }
+    dst.input_tokens += src.input_tokens;
+    dst.output_tokens += src.output_tokens;
+    dst.cache_read_input_tokens += src.cache_read_input_tokens;
+    dst.cache_creation_input_tokens += src.cache_creation_input_tokens;
+    if let Some(c) = src.cost_usd {
+        dst.cost_usd = Some(dst.cost_usd.unwrap_or(0.0) + c);
+    }
+    if !src.model.is_empty() {
+        dst.model = src.model.clone();
+    }
+    dst.calls += src.calls;
 }
 
 /// RAII handle for a per-leaf usage accumulator. Installs a fresh frame as the active
@@ -972,6 +998,12 @@ impl UsageScope {
 
 impl Drop for UsageScope {
     fn drop(&mut self) {
+        // Nesting (e.g. `agent/run` opening its own scope inside an already-active
+        // `workflow/step` scope) must not blind the outer scope to tokens the inner
+        // one collected: fold this leaf's tally into the parent before restoring it.
+        if let Some(parent) = &self.prev {
+            merge_leaf(&mut parent.borrow_mut(), &self.slot.borrow());
+        }
         ACTIVE_LEAF_SCOPE.with(|s| *s.borrow_mut() = self.prev.take());
     }
 }
@@ -1100,23 +1132,73 @@ impl sema_core::McpCassetteRecordTarget for CassetteState {
 
 type CassetteScope = Rc<CassetteState>;
 
-/// The dynamically-scoped LLM state captured onto a task and swapped in/out per step.
-#[derive(Clone)]
-struct LlmDynScope {
-    cache_enabled: bool,
-    cache_ttl_secs: i64,
-    stream_budget_pregate: bool,
-    call_tags: Vec<String>,
-    call_meta: Vec<(String, String)>,
-    last_usage: Option<Usage>,
-    fallback_chain: Option<Vec<FallbackEntry>>,
-    rate_limit_rps: Option<f64>,
+/// Declares [`LlmDynScope`]'s struct, `Default` impl, and its `read_llm_scope`/
+/// `write_llm_scope` round-trip from ONE field table, so a new per-task LLM
+/// config field is added in exactly one place instead of the 3-4 sites that
+/// have to be kept in lockstep by hand (a defect this codebase has shipped at
+/// least 3 times — commits b181d195, eec95fb4, 0a58f9ac — most recently when
+/// `custom_pricing`/`budget_stack` were left as ambient TLS entirely, letting a
+/// sibling task's `(llm/set-pricing ...)` reprice a suspended task's usage).
+/// `llm_dyn_scope_is_default`/`llm_scope_ambient_is_empty` are hand-written and
+/// NOT generated here: their exclusion of `stream_budget_pregate`/`cache_ttl_secs`/
+/// `rate_limit_last` from the default-check is deliberate and asymmetric with
+/// this table, and `llm_scope_ambient_is_empty` is a documented allocation-free
+/// fast path that must stay hand-optimized.
+macro_rules! llm_dyn_scope_fields {
+    ($($(#[$meta:meta])* $field:ident : $ty:ty = default $default:expr, read $read:expr, write $write:expr;)*) => {
+        /// The dynamically-scoped LLM state captured onto a task and swapped in/out per step.
+        #[derive(Clone)]
+        struct LlmDynScope {
+            $($(#[$meta])* $field: $ty,)*
+        }
+
+        impl Default for LlmDynScope {
+            fn default() -> Self {
+                LlmDynScope { $($field: $default,)* }
+            }
+        }
+
+        /// Read (clone) the current thread's LLM dynamic scope without disturbing it.
+        fn read_llm_scope() -> LlmDynScope {
+            LlmDynScope { $($field: $read,)* }
+        }
+
+        /// Overwrite the current thread's LLM dynamic scope with `s`, returning the previous one.
+        fn write_llm_scope(s: LlmDynScope) -> LlmDynScope {
+            let prev = read_llm_scope();
+            $(($write)(s.$field);)*
+            prev
+        }
+    };
+}
+
+llm_dyn_scope_fields! {
+    cache_enabled: bool
+        = default false, read CACHE_ENABLED.with(|c| c.get()), write |v| CACHE_ENABLED.with(|c| c.set(v));
+    cache_ttl_secs: i64
+        = default 3600, read CACHE_TTL_SECS.with(|c| c.get()), write |v| CACHE_TTL_SECS.with(|c| c.set(v));
+    stream_budget_pregate: bool
+        = default false, read STREAM_BUDGET_PREGATE.with(|c| c.get()), write |v| STREAM_BUDGET_PREGATE.with(|c| c.set(v));
+    call_tags: Vec<String>
+        = default Vec::new(), read CALL_TAGS.with(|t| t.borrow().clone()), write |v| CALL_TAGS.with(|t| *t.borrow_mut() = v);
+    call_meta: Vec<(String, String)>
+        = default Vec::new(), read CALL_META.with(|m| m.borrow().clone()), write |v| CALL_META.with(|m| *m.borrow_mut() = v);
+    last_usage: Option<Usage>
+        = default None, read LAST_USAGE.with(|u| u.borrow().clone()), write |v| LAST_USAGE.with(|u| *u.borrow_mut() = v);
+    fallback_chain: Option<Vec<FallbackEntry>>
+        = default None, read FALLBACK_CHAIN.with(|c| c.borrow().clone()), write |v| FALLBACK_CHAIN.with(|c| *c.borrow_mut() = v);
+    rate_limit_rps: Option<f64>
+        = default None, read RATE_LIMIT_RPS.with(|r| r.get()), write |v| RATE_LIMIT_RPS.with(|r| r.set(v));
     /// Siblings spawned inside one rate-limit scope reserve against one cursor.
-    rate_limit_last: Option<Rc<Cell<u64>>>,
-    retry_base_ms: u64,
-    network_max_retries: u32,
+    rate_limit_last: Option<Rc<Cell<u64>>>
+        = default None, read RATE_LIMIT_LAST.with(|last| last.borrow().clone()), write |v| RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = v);
+    retry_base_ms: u64
+        = default 500, read RETRY_BASE_MS.with(|base| base.get()), write |v| RETRY_BASE_MS.with(|base| base.set(v));
+    network_max_retries: u32
+        = default 3, read NETWORK_MAX_RETRIES.with(|retries| retries.get()), write |v| NETWORK_MAX_RETRIES.with(|retries| retries.set(v));
     /// The active budget frame, shared by `Rc` so concurrent siblings charge one aggregate.
-    budget: Option<Rc<RefCell<BudgetFrame>>>,
+    budget: Option<Rc<RefCell<BudgetFrame>>>
+        = default None, read ACTIVE_BUDGET.with(|b| b.borrow().clone()), write |v| ACTIVE_BUDGET.with(|b| *b.borrow_mut() = v);
     /// Saved outer budget frames for nested `llm/with-budget` scopes (TASK-PRIVATE
     /// bookkeeping). A push saves the frame in force; the matching pop restores it.
     /// Parking this stack onto the task is what lets interleaved nested budget scopes
@@ -1124,89 +1206,22 @@ struct LlmDynScope {
     /// would pop a sibling's frame out of LIFO order. The saved frames are shared by
     /// `Rc` (a restored outer frame is the same aggregate), but the stack structure is
     /// per-task.
-    budget_stack: Vec<Option<Rc<RefCell<BudgetFrame>>>>,
+    budget_stack: Vec<Option<Rc<RefCell<BudgetFrame>>>>
+        = default Vec::new(), read BUDGET_STACK.with(|s| s.borrow().clone()), write |v| BUDGET_STACK.with(|stack| *stack.borrow_mut() = v);
     /// Custom per-model pricing overrides (TASK-SNAPSHOT config). Parked onto the task so
     /// a sibling's `(llm/set-pricing ...)` never reprices a suspended task's usage.
-    custom_pricing: std::collections::HashMap<String, (f64, f64)>,
+    custom_pricing: std::collections::HashMap<String, (f64, f64)>
+        = default std::collections::HashMap::new(), read pricing::snapshot_custom_pricing(), write pricing::restore_custom_pricing;
     /// The cassette selected by this scope. Spawned siblings share one tape so
     /// replay and recording remain coherent across quantum boundaries.
-    cassette: Option<CassetteScope>,
-    policies: Vec<ActivePolicy>,
-    policy_bypass: Vec<String>,
-    policy_agent_id: Option<String>,
-}
-
-impl Default for LlmDynScope {
-    fn default() -> Self {
-        LlmDynScope {
-            cache_enabled: false,
-            cache_ttl_secs: 3600,
-            stream_budget_pregate: false,
-            call_tags: Vec::new(),
-            call_meta: Vec::new(),
-            last_usage: None,
-            fallback_chain: None,
-            rate_limit_rps: None,
-            rate_limit_last: None,
-            retry_base_ms: 500,
-            network_max_retries: 3,
-            budget: None,
-            budget_stack: Vec::new(),
-            custom_pricing: std::collections::HashMap::new(),
-            cassette: None,
-            policies: Vec::new(),
-            policy_bypass: Vec::new(),
-            policy_agent_id: None,
-        }
-    }
-}
-
-/// Read (clone) the current thread's LLM dynamic scope without disturbing it.
-fn read_llm_scope() -> LlmDynScope {
-    LlmDynScope {
-        cache_enabled: CACHE_ENABLED.with(|c| c.get()),
-        cache_ttl_secs: CACHE_TTL_SECS.with(|c| c.get()),
-        stream_budget_pregate: STREAM_BUDGET_PREGATE.with(|c| c.get()),
-        call_tags: CALL_TAGS.with(|t| t.borrow().clone()),
-        call_meta: CALL_META.with(|m| m.borrow().clone()),
-        last_usage: LAST_USAGE.with(|u| u.borrow().clone()),
-        fallback_chain: FALLBACK_CHAIN.with(|c| c.borrow().clone()),
-        rate_limit_rps: RATE_LIMIT_RPS.with(|r| r.get()),
-        rate_limit_last: RATE_LIMIT_LAST.with(|last| last.borrow().clone()),
-        retry_base_ms: RETRY_BASE_MS.with(|base| base.get()),
-        network_max_retries: NETWORK_MAX_RETRIES.with(|retries| retries.get()),
-        budget: ACTIVE_BUDGET.with(|b| b.borrow().clone()),
-        budget_stack: BUDGET_STACK.with(|s| s.borrow().clone()),
-        custom_pricing: pricing::snapshot_custom_pricing(),
-        cassette: CASSETTE.with(|c| c.borrow().clone()),
-        policies: ACTIVE_POLICIES.with(|policies| policies.borrow().clone()),
-        policy_bypass: POLICY_BYPASS.with(|bypass| bypass.borrow().clone()),
-        policy_agent_id: POLICY_AGENT_ID.with(|agent| agent.borrow().clone()),
-    }
-}
-
-/// Overwrite the current thread's LLM dynamic scope with `s`, returning the previous one.
-fn write_llm_scope(s: LlmDynScope) -> LlmDynScope {
-    let prev = read_llm_scope();
-    CACHE_ENABLED.with(|c| c.set(s.cache_enabled));
-    CACHE_TTL_SECS.with(|c| c.set(s.cache_ttl_secs));
-    STREAM_BUDGET_PREGATE.with(|c| c.set(s.stream_budget_pregate));
-    CALL_TAGS.with(|t| *t.borrow_mut() = s.call_tags);
-    CALL_META.with(|m| *m.borrow_mut() = s.call_meta);
-    LAST_USAGE.with(|u| *u.borrow_mut() = s.last_usage);
-    FALLBACK_CHAIN.with(|c| *c.borrow_mut() = s.fallback_chain);
-    RATE_LIMIT_RPS.with(|r| r.set(s.rate_limit_rps));
-    RATE_LIMIT_LAST.with(|last| *last.borrow_mut() = s.rate_limit_last);
-    RETRY_BASE_MS.with(|base| base.set(s.retry_base_ms));
-    NETWORK_MAX_RETRIES.with(|retries| retries.set(s.network_max_retries));
-    ACTIVE_BUDGET.with(|b| *b.borrow_mut() = s.budget);
-    BUDGET_STACK.with(|stack| *stack.borrow_mut() = s.budget_stack);
-    pricing::restore_custom_pricing(s.custom_pricing);
-    CASSETTE.with(|c| *c.borrow_mut() = s.cassette);
-    ACTIVE_POLICIES.with(|policies| *policies.borrow_mut() = s.policies);
-    POLICY_BYPASS.with(|bypass| *bypass.borrow_mut() = s.policy_bypass);
-    POLICY_AGENT_ID.with(|agent| *agent.borrow_mut() = s.policy_agent_id);
-    prev
+    cassette: Option<CassetteScope>
+        = default None, read CASSETTE.with(|c| c.borrow().clone()), write |v| CASSETTE.with(|c| *c.borrow_mut() = v);
+    policies: Vec<ActivePolicy>
+        = default Vec::new(), read ACTIVE_POLICIES.with(|policies| policies.borrow().clone()), write |v| ACTIVE_POLICIES.with(|policies| *policies.borrow_mut() = v);
+    policy_bypass: Vec<String>
+        = default Vec::new(), read POLICY_BYPASS.with(|bypass| bypass.borrow().clone()), write |v| POLICY_BYPASS.with(|bypass| *bypass.borrow_mut() = v);
+    policy_agent_id: Option<String>
+        = default None, read POLICY_AGENT_ID.with(|agent| agent.borrow().clone()), write |v| POLICY_AGENT_ID.with(|agent| *agent.borrow_mut() = v);
 }
 
 /// Capture (clone) the LLM dynamic scope to seed onto a freshly-spawned task.
@@ -3134,6 +3149,41 @@ fn gc_otel_observer(event: &sema_core::GcPassEvent) {
     sema_otel::gc_pass_span(event);
 }
 
+// Build the `:usage` map for `agent/run`'s result (both the blocking and non-blocking
+// paths), from a `LeafUsage` tally accumulated over a `UsageScope`. Same key names as
+// `llm/last-usage`/`llm/session-usage` for consistency, plus `:calls` — the number of
+// billed provider round trips this turn, which neither of those two (single-call /
+// process-global) accessors can report.
+fn agent_usage_value(u: &LeafUsage) -> Value {
+    let mut map = BTreeMap::new();
+    map.insert(
+        Value::keyword("prompt-tokens"),
+        Value::int(u.input_tokens as i64),
+    );
+    map.insert(
+        Value::keyword("completion-tokens"),
+        Value::int(u.output_tokens as i64),
+    );
+    map.insert(
+        Value::keyword("total-tokens"),
+        Value::int((u.input_tokens + u.output_tokens) as i64),
+    );
+    map.insert(
+        Value::keyword("cache-read-tokens"),
+        Value::int(u.cache_read_input_tokens as i64),
+    );
+    map.insert(
+        Value::keyword("cache-creation-tokens"),
+        Value::int(u.cache_creation_input_tokens as i64),
+    );
+    map.insert(Value::keyword("model"), Value::string(&u.model));
+    if let Some(cost) = u.cost_usd {
+        map.insert(Value::keyword("cost-usd"), Value::float(cost));
+    }
+    map.insert(Value::keyword("calls"), Value::int(u.calls as i64));
+    Value::map(map)
+}
+
 pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     let unrestricted = sandbox.is_unrestricted();
 
@@ -4697,6 +4747,11 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         // by the nested per-round chat spans) inside run_tool_loop.
         let _tele = install_call_telemetry(opts.as_ref());
 
+        // Tally this turn's usage independently of the process-global `llm/session-usage`
+        // (issue #86). Nests correctly under an enclosing `workflow/step` scope, if any —
+        // `UsageScope::Drop` folds this leaf's tally into the parent's before restoring it.
+        let _usage_scope = open_usage_scope();
+
         let (result, final_messages) = run_tool_loop(
             ctx,
             messages,
@@ -4759,6 +4814,10 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 chat_messages_to_sema_list(&final_messages),
             );
             map.insert(Value::keyword("session"), Value::conversation(session_conv));
+            map.insert(
+                Value::keyword("usage"),
+                agent_usage_value(&_usage_scope.usage()),
+            );
             Ok(Value::map(map))
         } else {
             // 2-arg form: return string (backward compat)
@@ -11452,6 +11511,13 @@ struct AgentLoopState {
     /// `Drop` can forget it when the otel thread-locals are already gone (see below).
     agent_span: Option<sema_otel::AgentSpan>,
     conv_guard: Option<sema_otel::ConversationGuard>,
+    /// This turn's usage tally (issue #86), read by `__agent-finish` for the `:usage`
+    /// result key. `Some` for `agent/run` (opened in `agent_begin`), `None` for
+    /// `llm/chat` (`chat_begin` always sets `has_opts: false`, so no map — and no
+    /// `:usage` — is ever built from this state). `Option` for the same reason as
+    /// `agent_span`/`conv_guard`: `Drop` must be able to `.take()` it to choose
+    /// drop-normally vs. forget-at-thread-teardown.
+    usage_scope: Option<UsageScope>,
     /// The scheduler task this run's driver loop executes on (captured in
     /// `__agent-begin`); `None` for a top-level (non-task) run. When that task is
     /// CANCELLED its bytecode never resumes, so `__agent-finish` never fires —
@@ -11477,7 +11543,23 @@ impl Drop for AgentLoopState {
             std::mem::forget(self.agent_span.take());
             std::mem::forget(self.conv_guard.take());
         }
+        // `usage_scope` touches a different (this crate's own) thread-local than the
+        // otel guards above, which can be destroyed in a different order at thread
+        // teardown — probe it independently rather than reusing `sema_otel::tls_alive()`.
+        if usage_tls_alive() {
+            drop(self.usage_scope.take());
+        } else {
+            std::mem::forget(self.usage_scope.take());
+        }
     }
+}
+
+/// Whether `ACTIVE_LEAF_SCOPE` is still accessible on this thread. Mirrors
+/// `sema_otel::tls_alive()`'s purpose for the otel thread-locals: lets a held
+/// `UsageScope`'s `Drop` avoid touching an already-destroyed thread-local during
+/// thread teardown (a leaked/cancelled `AgentLoopState` dropped at process exit).
+fn usage_tls_alive() -> bool {
+    ACTIVE_LEAF_SCOPE.try_with(|_| ()).is_ok()
 }
 
 thread_local! {
@@ -11742,6 +11824,7 @@ fn agent_begin(args: &[Value]) -> Result<Value, SemaError> {
         agent_model: agent.model.clone(),
         agent_span: Some(agent_span),
         conv_guard,
+        usage_scope: Some(open_usage_scope()),
         owning_task_id: sema_core::current_task_id(),
     };
 
@@ -11876,6 +11959,9 @@ fn chat_begin(args: &[Value]) -> Result<Value, SemaError> {
         agent_model,
         agent_span: Some(agent_span),
         conv_guard,
+        // llm/chat always returns the bare string (has_opts: false above) — no map, so
+        // no :usage to expose; don't open a scope nobody will read.
+        usage_scope: None,
         owning_task_id: sema_core::current_task_id(),
     };
 
@@ -12636,6 +12722,12 @@ fn agent_finish(token: u64, finish_error: Option<String>) -> Result<Value, SemaE
             chat_messages_to_sema_list(&st.messages),
         );
         map.insert(Value::keyword("session"), Value::conversation(session_conv));
+        let usage = st
+            .usage_scope
+            .as_ref()
+            .map(|s| s.usage())
+            .unwrap_or_default();
+        map.insert(Value::keyword("usage"), agent_usage_value(&usage));
         Ok(Value::map(map))
     } else {
         Ok(Value::string(&result))

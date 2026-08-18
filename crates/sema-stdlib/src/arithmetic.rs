@@ -5,10 +5,129 @@ use sema_core::{check_arity, SemaError, Value, ValueViewRef};
 
 use crate::register_fn;
 
-/// Shared "expected number" type error for arithmetic operand validation.
-/// Sum `values` through the numeric tower: an i64 fast path that promotes to
-/// bignum on overflow, and to f64 as soon as any operand is real.
+/// One fold operator over the numeric tower: the int fast path (returning
+/// `None` on overflow so the caller promotes to bignum), the float path, and
+/// the bignum/`SemaNumber` path.
+fn add_f64(a: f64, b: f64) -> f64 {
+    a + b
+}
+fn sub_f64(a: f64, b: f64) -> f64 {
+    a - b
+}
+fn mul_f64(a: f64, b: f64) -> f64 {
+    a * b
+}
+
+#[derive(Clone, Copy)]
+struct TowerFold {
+    int: fn(i64, i64) -> Option<i64>,
+    float: fn(f64, f64) -> f64,
+    tower: fn(SemaNumber, SemaNumber) -> SemaNumber,
+}
+
+const ADD: TowerFold = TowerFold {
+    int: i64::checked_add,
+    float: add_f64,
+    tower: SemaNumber::add,
+};
+const SUB: TowerFold = TowerFold {
+    int: i64::checked_sub,
+    float: sub_f64,
+    tower: SemaNumber::sub,
+};
+const MUL: TowerFold = TowerFold {
+    int: i64::checked_mul,
+    float: mul_f64,
+    tower: SemaNumber::mul,
+};
+
+/// Fold `values` through the numeric tower: an i64 fast path that promotes to
+/// bignum on overflow, and to f64 as soon as any operand is real. The first
+/// operand seeds the accumulator by direct assignment (never folded through
+/// an identity) so its exact bits, including a signed zero, survive; `fold`
+/// combines every operand after that. `identity` is only the result for zero
+/// operands (0 for `+`, 1 for `*` — `-` and `*` with 1+ args never reach it).
 ///
+/// Direct-assignment seeding matters because folding through an identity can
+/// silently change a signed zero: `0.0 + -0.0 == 0.0` under IEEE 754, so
+/// seeding via `0 + first` turned `(- -0.0 0.0)` into `0.0` instead of `-0.0`.
+/// `1.0 * -0.0 == -0.0` so `*` was never affected, but `+`'s single-argument
+/// case (`(+ -0.0)`) folded through the same `0 + first` and had the same bug.
+fn fold_through_tower<'a>(
+    values: impl Iterator<Item = &'a Value>,
+    identity: i64,
+    fold: TowerFold,
+) -> Result<Value, SemaError> {
+    let mut has_float = false;
+    let mut int_acc: i64 = identity;
+    let mut float_acc: f64 = identity as f64;
+    // Engaged once an operand overflows the i64 fast path or is itself a
+    // bignum; from that point on every remaining operand folds through the
+    // tower instead of the i64/f64 accumulators.
+    let mut tower: Option<SemaNumber> = None;
+    for (i, arg) in values.enumerate() {
+        let first = i == 0;
+        if let Some(acc) = tower.take() {
+            let n = arg.as_number().ok_or_else(|| not_a_number(arg))?;
+            tower = Some((fold.tower)(acc, n));
+            continue;
+        }
+        match arg.view_ref() {
+            ValueViewRef::Int(n) => {
+                if has_float {
+                    float_acc = (fold.float)(float_acc, n as f64);
+                } else if first {
+                    int_acc = n;
+                } else {
+                    match (fold.int)(int_acc, n) {
+                        Some(s) => int_acc = s,
+                        None => {
+                            tower = Some((fold.tower)(
+                                SemaNumber::from_i64(int_acc),
+                                SemaNumber::from_i64(n),
+                            ));
+                        }
+                    }
+                }
+            }
+            ValueViewRef::Float(f) => {
+                if first {
+                    float_acc = f;
+                    has_float = true;
+                } else {
+                    if !has_float {
+                        float_acc = int_acc as f64;
+                        has_float = true;
+                    }
+                    float_acc = (fold.float)(float_acc, f);
+                }
+            }
+            ValueViewRef::BigInt(_) => {
+                let n = arg.as_number().ok_or_else(|| not_a_number(arg))?;
+                if first {
+                    tower = Some(n);
+                } else {
+                    let seed_num = if has_float {
+                        SemaNumber::Real(float_acc)
+                    } else {
+                        SemaNumber::from_i64(int_acc)
+                    };
+                    tower = Some((fold.tower)(seed_num, n));
+                }
+            }
+            _ => return Err(not_a_number(arg)),
+        }
+    }
+    if let Some(acc) = tower {
+        Ok(Value::from_number(acc))
+    } else if has_float {
+        Ok(Value::float(float_acc))
+    } else {
+        Ok(Value::int(int_acc))
+    }
+}
+
+/// Sum `values` through the numeric tower (see [`fold_through_tower`]).
 /// Shared by `+` and `list/sum` so the two cannot disagree — they did. Where
 /// this promotes, `list/sum` used a bare `int_sum += n`, which wrapped silently
 /// past i64::MAX, so the same list summed two different ways gave two different
@@ -17,59 +136,7 @@ use crate::register_fn;
 pub(crate) fn sum_through_tower<'a>(
     values: impl Iterator<Item = &'a Value>,
 ) -> Result<Value, SemaError> {
-    let mut has_float = false;
-    let mut int_sum: i64 = 0;
-    let mut float_sum: f64 = 0.0;
-    // Engaged once an operand overflows the i64 fast path or is itself a
-    // bignum; from that point on every remaining operand folds through the
-    // tower instead of the i64/f64 accumulators.
-    let mut tower: Option<SemaNumber> = None;
-    for arg in values {
-        if let Some(acc) = tower.take() {
-            let n = arg.as_number().ok_or_else(|| not_a_number(arg))?;
-            tower = Some(acc.add(n));
-            continue;
-        }
-        match arg.view_ref() {
-            ValueViewRef::Int(n) => {
-                if has_float {
-                    float_sum += n as f64;
-                } else {
-                    match int_sum.checked_add(n) {
-                        Some(s) => int_sum = s,
-                        None => {
-                            tower =
-                                Some(SemaNumber::from_i64(int_sum).add(SemaNumber::from_i64(n)));
-                        }
-                    }
-                }
-            }
-            ValueViewRef::Float(f) => {
-                if !has_float {
-                    float_sum = int_sum as f64;
-                    has_float = true;
-                }
-                float_sum += f;
-            }
-            ValueViewRef::BigInt(_) => {
-                let seed = if has_float {
-                    SemaNumber::Real(float_sum)
-                } else {
-                    SemaNumber::from_i64(int_sum)
-                };
-                let n = arg.as_number().ok_or_else(|| not_a_number(arg))?;
-                tower = Some(seed.add(n));
-            }
-            _ => return Err(not_a_number(arg)),
-        }
-    }
-    if let Some(acc) = tower {
-        Ok(Value::from_number(acc))
-    } else if has_float {
-        Ok(Value::float(float_sum))
-    } else {
-        Ok(Value::int(int_sum))
-    }
+    fold_through_tower(values, 0, ADD)
 }
 
 fn not_a_number(arg: &Value) -> SemaError {
@@ -123,135 +190,12 @@ pub fn register(env: &sema_core::Env) {
                 _ => Err(not_a_number(&args[0])),
             };
         }
-        let mut has_float = false;
-        let mut result_int: i64 = 0;
-        let mut result_float: f64 = 0.0;
-        // Engaged once an operand overflows the i64 fast path or is itself a
-        // bignum; from that point on every remaining operand folds through
-        // the tower instead of the i64/f64 accumulators.
-        let mut tower: Option<SemaNumber> = None;
-        for (i, arg) in args.iter().enumerate() {
-            if let Some(acc) = tower.take() {
-                let n = arg.as_number().ok_or_else(|| not_a_number(arg))?;
-                tower = Some(acc.sub(n));
-                continue;
-            }
-            match arg.view_ref() {
-                ValueViewRef::Int(n) => {
-                    if i == 0 {
-                        if has_float {
-                            result_float = n as f64;
-                        } else {
-                            result_int = n;
-                        }
-                    } else if has_float {
-                        result_float -= n as f64;
-                    } else {
-                        match result_int.checked_sub(n) {
-                            Some(s) => result_int = s,
-                            None => {
-                                tower = Some(
-                                    SemaNumber::from_i64(result_int).sub(SemaNumber::from_i64(n)),
-                                );
-                            }
-                        }
-                    }
-                }
-                ValueViewRef::Float(f) => {
-                    if !has_float {
-                        result_float = result_int as f64;
-                        has_float = true;
-                    }
-                    if i == 0 {
-                        result_float = f;
-                    } else {
-                        result_float -= f;
-                    }
-                }
-                ValueViewRef::BigInt(_) => {
-                    let n = arg.as_number().ok_or_else(|| not_a_number(arg))?;
-                    if i == 0 {
-                        tower = Some(n);
-                    } else {
-                        let seed = if has_float {
-                            SemaNumber::Real(result_float)
-                        } else {
-                            SemaNumber::from_i64(result_int)
-                        };
-                        tower = Some(seed.sub(n));
-                    }
-                }
-                _ => return Err(not_a_number(arg)),
-            }
-        }
-        if let Some(acc) = tower {
-            Ok(Value::from_number(acc))
-        } else if has_float {
-            Ok(Value::float(result_float))
-        } else {
-            Ok(Value::int(result_int))
-        }
+        // Seed the accumulator with the first operand directly, then fold the
+        // rest with subtraction.
+        fold_through_tower(args.iter(), 0, SUB)
     });
 
-    register_fn(env, "*", |args| {
-        if args.is_empty() {
-            return Ok(Value::int(1));
-        }
-        let mut has_float = false;
-        let mut int_prod: i64 = 1;
-        let mut float_prod: f64 = 1.0;
-        // Engaged once an operand overflows the i64 fast path or is itself a
-        // bignum; from that point on every remaining operand folds through
-        // the tower instead of the i64/f64 accumulators.
-        let mut tower: Option<SemaNumber> = None;
-        for arg in args {
-            if let Some(acc) = tower.take() {
-                let n = arg.as_number().ok_or_else(|| not_a_number(arg))?;
-                tower = Some(acc.mul(n));
-                continue;
-            }
-            match arg.view_ref() {
-                ValueViewRef::Int(n) => {
-                    if has_float {
-                        float_prod *= n as f64;
-                    } else {
-                        match int_prod.checked_mul(n) {
-                            Some(p) => int_prod = p,
-                            None => {
-                                tower = Some(
-                                    SemaNumber::from_i64(int_prod).mul(SemaNumber::from_i64(n)),
-                                );
-                            }
-                        }
-                    }
-                }
-                ValueViewRef::Float(f) => {
-                    if !has_float {
-                        float_prod = int_prod as f64;
-                        has_float = true;
-                    }
-                    float_prod *= f;
-                }
-                ValueViewRef::BigInt(_) => {
-                    let seed = if has_float {
-                        SemaNumber::Real(float_prod)
-                    } else {
-                        SemaNumber::from_i64(int_prod)
-                    };
-                    let n = arg.as_number().ok_or_else(|| not_a_number(arg))?;
-                    tower = Some(seed.mul(n));
-                }
-                _ => return Err(not_a_number(arg)),
-            }
-        }
-        if let Some(acc) = tower {
-            Ok(Value::from_number(acc))
-        } else if has_float {
-            Ok(Value::float(float_prod))
-        } else {
-            Ok(Value::int(int_prod))
-        }
-    });
+    register_fn(env, "*", |args| fold_through_tower(args.iter(), 1, MUL));
 
     register_fn(env, "/", |args| {
         check_arity!(args, "/", 2..);

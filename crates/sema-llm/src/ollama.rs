@@ -53,45 +53,50 @@ fn build_ollama_messages(request: &ChatRequest) -> Vec<serde_json::Value> {
         messages.push(serde_json::json!({ "role": "system", "content": system }));
     }
     for msg in &request.messages {
-        if !msg.tool_calls.is_empty() {
-            // Assistant turn that invoked tools (Ollama takes arguments as an object).
-            let tcs: Vec<serde_json::Value> = msg
-                .tool_calls
-                .iter()
-                .map(|tc| serde_json::json!({ "function": { "name": tc.name, "arguments": tc.arguments } }))
-                .collect();
-            messages.push(serde_json::json!({
-                "role": "assistant",
-                "content": msg.content.to_text(),
-                "tool_calls": tcs,
-            }));
-            continue;
-        }
-        if msg.role == "tool" {
-            let mut m = serde_json::json!({ "role": "tool", "content": msg.content.to_text() });
-            if let Some(name) = &msg.tool_name {
-                m["tool_name"] = serde_json::json!(name);
+        match msg.kind() {
+            crate::types::MessageKind::AssistantWithToolCalls(content, tcs) => {
+                // Assistant turn that invoked tools (Ollama takes arguments as an object).
+                let tcs: Vec<serde_json::Value> = tcs
+                    .iter()
+                    .map(|tc| serde_json::json!({ "function": { "name": tc.name, "arguments": tc.arguments } }))
+                    .collect();
+                messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": content.to_text(),
+                    "tool_calls": tcs,
+                }));
             }
-            messages.push(m);
-            continue;
-        }
-        let mut m = serde_json::json!({ "role": msg.role, "content": msg.content.to_text() });
-        if let crate::types::MessageContent::Blocks(blocks) = &msg.content {
-            let images: Vec<&str> = blocks
-                .iter()
-                .filter_map(|b| {
-                    if let crate::types::ContentBlock::Image { data, .. } = b {
-                        Some(data.as_str())
-                    } else {
-                        None
+            crate::types::MessageKind::ToolResult {
+                id: _,
+                name,
+                content,
+            } => {
+                let mut m = serde_json::json!({ "role": "tool", "content": content.to_text() });
+                if let Some(name) = name {
+                    m["tool_name"] = serde_json::json!(name);
+                }
+                messages.push(m);
+            }
+            crate::types::MessageKind::Other(role, content) => {
+                let mut m = serde_json::json!({ "role": role, "content": content.to_text() });
+                if let crate::types::MessageContent::Blocks(blocks) = content {
+                    let images: Vec<&str> = blocks
+                        .iter()
+                        .filter_map(|b| {
+                            if let crate::types::ContentBlock::Image { data, .. } = b {
+                                Some(data.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !images.is_empty() {
+                        m["images"] = serde_json::json!(images);
                     }
-                })
-                .collect();
-            if !images.is_empty() {
-                m["images"] = serde_json::json!(images);
+                }
+                messages.push(m);
             }
         }
-        messages.push(m);
     }
     messages
 }

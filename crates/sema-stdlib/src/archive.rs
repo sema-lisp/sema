@@ -93,13 +93,13 @@ fn check_archive_limit(
     actual: u64,
     limit: u64,
 ) -> Result<(), SemaError> {
-    if actual > limit {
-        return Err(SemaError::eval(format!(
-            "{op}: {dimension} {actual} exceeds the quarantined limit {limit}"
-        ))
-        .with_hint("reduce or split the archive input"));
-    }
-    Ok(())
+    crate::io::check_quarantined_limit(
+        op,
+        dimension,
+        actual,
+        limit,
+        "reduce or split the archive input",
+    )
 }
 
 fn archive_path_preflight(op: &str, path: &str, bounds: ArchiveBounds) -> Result<(), SemaError> {

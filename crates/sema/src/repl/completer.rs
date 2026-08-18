@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use reedline::{Completer, Span, Suggestion};
+use reedline::{Completer, CompletionResult, Span, Suggestion};
 use sema_core::Env;
 use sema_eval::SPECIAL_FORM_NAMES;
 
@@ -88,7 +88,7 @@ fn collect_env(env: &Env, prefix: &str, out: &mut Vec<String>) {
 }
 
 impl Completer for SemaCompleter {
-    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+    fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
         let before = &line[..pos];
         // A completion "word" is anything since the last whitespace or opening
         // bracket / quote.
@@ -98,22 +98,24 @@ impl Completer for SemaCompleter {
             .unwrap_or(0);
         let prefix = &before[start..];
         if prefix.is_empty() {
-            return vec![];
+            return CompletionResult::fresh(vec![]);
         }
 
         let names = self.collect(prefix);
-        names
-            .into_iter()
-            .map(|name| Suggestion {
-                value: name,
-                description: None,
-                style: None,
-                extra: None,
-                span: Span::new(start, pos),
-                append_whitespace: false,
-                display_override: None,
-                match_indices: None,
-            })
-            .collect()
+        CompletionResult::fresh(
+            names
+                .into_iter()
+                .map(|name| Suggestion {
+                    value: name,
+                    description: None,
+                    style: None,
+                    extra: None,
+                    span: Span::new(start, pos),
+                    append_whitespace: false,
+                    display_override: None,
+                    match_indices: None,
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 }

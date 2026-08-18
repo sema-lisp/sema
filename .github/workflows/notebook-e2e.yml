@@ -62,7 +62,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version-file: .nvmrc
 
       - name: Pre-build the sema binary
         # The playwright webServer launches `cargo run --bin sema` with a 60s

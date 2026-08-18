@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-09
 **Status:** Shipped (commit `6f141e3`)
-**Extracted from:** `docs/done/plans/2026-02-17-critical-fixes.md` item 12 (the only item left open when that doc was closed)
+**Extracted from:** `docs/plans/archive/2026-02-17-critical-fixes.md` item 12 (the only item left open when that doc was closed)
 
 ## Problem
 

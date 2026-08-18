@@ -1,11 +1,7 @@
-import { devices, expect, test, type Locator, type Page } from '@playwright/test';
+import { devices, expect, test, type Locator } from '@playwright/test';
+import { waitForReady } from './helpers';
 
 test.use({ ...devices['Pixel 7'] });
-
-async function waitForReady(page: Page) {
-  await page.goto('/');
-  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
-}
 
 async function panVertically(locator: Locator, deltaY: number) {
   const { centerX, centerY } = await locator.evaluate((target: HTMLElement) => {

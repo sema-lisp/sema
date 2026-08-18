@@ -1,5 +1,6 @@
 import { test, expect, type Page, type Browser } from '@playwright/test';
 import { examples } from '../src/examples.js';
+import { waitForReady, setEditorCode } from './helpers';
 
 const EXAMPLE_NAMES = [
   'hello.sema',
@@ -44,12 +45,6 @@ const EXAMPLES = EXAMPLE_NAMES.map((name) => {
   throw new Error(`Example "${name}" not found in generated examples list`);
 });
 
-/** Wait for the WASM module to be ready. */
-async function waitForReady(page: Page) {
-  await page.goto('/');
-  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
-}
-
 async function openExample(page: Page, example: { category: string; id: string; name: string }) {
   // The examples sidebar dogfoods <sema-tree>: files are <sema-tree-item> leaves
   // keyed by data-example-id, nested under a category <sema-tree-item> that must
@@ -73,11 +68,6 @@ function isAffectedChromiumPerlin(browserName: string, browser: Browser, example
 
   const major = Number.parseInt(browser.version().split('.')[0] ?? '', 10);
   return Number.isFinite(major) && major < 147;
-}
-
-/** Type code into the editor, replacing existing content. */
-async function setEditorCode(page: Page, code: string) {
-  await page.getByTestId('editor').fill(code);
 }
 
 /** Click Run and wait for the timing line to appear. */

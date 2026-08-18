@@ -45,13 +45,13 @@ const PDF_RUNTIME_BOUNDS: PdfBounds = PdfBounds {
 };
 
 fn check_pdf_limit(op: &str, dimension: &str, actual: u64, limit: u64) -> Result<(), SemaError> {
-    if actual > limit {
-        return Err(SemaError::eval(format!(
-            "{op}: {dimension} {actual} exceeds the quarantined limit {limit}"
-        ))
-        .with_hint("reduce or split the PDF input"));
-    }
-    Ok(())
+    crate::io::check_quarantined_limit(
+        op,
+        dimension,
+        actual,
+        limit,
+        "reduce or split the PDF input",
+    )
 }
 
 #[derive(Debug)]

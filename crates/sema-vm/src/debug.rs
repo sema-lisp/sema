@@ -263,6 +263,14 @@ impl DebugState {
             }
         }
 
+        self.step_mode_would_stop(file, line, frame_depth)
+    }
+
+    /// Whether the current step mode alone (ignoring pause/breakpoint state)
+    /// would stop at `(file, line)` at `frame_depth`. Shared by `should_stop`
+    /// and `is_pure_breakpoint_stop`, which each layer their own pause/breakpoint
+    /// gating on top of this.
+    fn step_mode_would_stop(&self, file: Option<&PathBuf>, line: u32, frame_depth: usize) -> bool {
         match self.step_mode {
             StepMode::Continue => false,
             StepMode::StepInto => self.moved_since_last_stop(file, line),
@@ -303,15 +311,7 @@ impl DebugState {
         if !on_breakpoint {
             return false;
         }
-        let step_would_stop = match self.step_mode {
-            StepMode::Continue => false,
-            StepMode::StepInto => self.moved_since_last_stop(file, line),
-            StepMode::StepOver => {
-                frame_depth <= self.step_frame_depth && self.moved_since_last_stop(file, line)
-            }
-            StepMode::StepOut => frame_depth < self.step_frame_depth,
-        };
-        !step_would_stop
+        !self.step_mode_would_stop(file, line, frame_depth)
     }
 
     /// The condition expression for the breakpoint at `(file, line)`, if any.

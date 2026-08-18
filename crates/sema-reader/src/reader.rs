@@ -207,6 +207,37 @@ impl Parser {
         }
     }
 
+    /// Reject a foreign closing bracket inside `parse_list`/`parse_vector`/
+    /// `parse_map` with the standard mismatched-bracket message and the
+    /// per-opener hint. `foreign` is the closers that do not match this
+    /// opener (e.g. `]` and `}` inside a `(` list).
+    fn check_no_foreign_closer(
+        &self,
+        foreign: &[Token],
+        open_char: &str,
+        close_char: &str,
+        hint: &str,
+    ) -> Result<(), SemaError> {
+        match self.peek() {
+            Some(tok) if foreign.contains(tok) => {
+                let found = match tok {
+                    Token::RParen => "`)`",
+                    Token::RBracket => "`]`",
+                    Token::RBrace => "`}`",
+                    _ => unreachable!("foreign closers are only ) ] }}"),
+                };
+                Err(SemaError::Reader {
+                    message: format!(
+                        "mismatched bracket: expected `{close_char}` to close `{open_char}`, found {found}"
+                    ),
+                    span: self.span(),
+                }
+                .with_hint(hint))
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn parse_list(&mut self) -> Result<Value, SemaError> {
         let open_span = self.span();
         self.expect(&Token::LParen)?;
@@ -219,20 +250,12 @@ impl Parser {
                 }
                 .with_hint("add a closing `)`"));
             }
-            if self.peek() == Some(&Token::RBracket) {
-                return Err(SemaError::Reader {
-                    message: "mismatched bracket: expected `)` to close `(`, found `]`".to_string(),
-                    span: self.span(),
-                }
-                .with_hint("this list was opened with `(` — close it with `)`"));
-            }
-            if self.peek() == Some(&Token::RBrace) {
-                return Err(SemaError::Reader {
-                    message: "mismatched bracket: expected `)` to close `(`, found `}`".to_string(),
-                    span: self.span(),
-                }
-                .with_hint("this list was opened with `(` — close it with `)`"));
-            }
+            self.check_no_foreign_closer(
+                &[Token::RBracket, Token::RBrace],
+                "(",
+                ")",
+                "this list was opened with `(` — close it with `)`",
+            )?;
             // Handle dotted pairs: (a . b)
             if self.peek() == Some(&Token::Dot) {
                 self.advance(); // skip dot
@@ -262,20 +285,12 @@ impl Parser {
                 }
                 .with_hint("add a closing `]`"));
             }
-            if self.peek() == Some(&Token::RParen) {
-                return Err(SemaError::Reader {
-                    message: "mismatched bracket: expected `]` to close `[`, found `)`".to_string(),
-                    span: self.span(),
-                }
-                .with_hint("this vector was opened with `[` — close it with `]`"));
-            }
-            if self.peek() == Some(&Token::RBrace) {
-                return Err(SemaError::Reader {
-                    message: "mismatched bracket: expected `]` to close `[`, found `}`".to_string(),
-                    span: self.span(),
-                }
-                .with_hint("this vector was opened with `[` — close it with `]`"));
-            }
+            self.check_no_foreign_closer(
+                &[Token::RParen, Token::RBrace],
+                "[",
+                "]",
+                "this vector was opened with `[` — close it with `]`",
+            )?;
             items.push(self.parse_expr()?);
         }
         self.expect(&Token::RBracket)?;
@@ -298,20 +313,12 @@ impl Parser {
                 }
                 .with_hint("add a closing `}`"));
             }
-            if self.peek() == Some(&Token::RParen) {
-                return Err(SemaError::Reader {
-                    message: "mismatched bracket: expected `}` to close `{`, found `)`".to_string(),
-                    span: self.span(),
-                }
-                .with_hint("this map was opened with `{` — close it with `}`"));
-            }
-            if self.peek() == Some(&Token::RBracket) {
-                return Err(SemaError::Reader {
-                    message: "mismatched bracket: expected `}` to close `{`, found `]`".to_string(),
-                    span: self.span(),
-                }
-                .with_hint("this map was opened with `{` — close it with `}`"));
-            }
+            self.check_no_foreign_closer(
+                &[Token::RParen, Token::RBracket],
+                "{",
+                "}",
+                "this map was opened with `{` — close it with `}`",
+            )?;
             let key = self.parse_expr()?;
             if self.peek() == Some(&Token::RBrace) || self.peek().is_none() {
                 return Err(SemaError::Reader {

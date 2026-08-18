@@ -16,9 +16,10 @@ impl BackendState {
         let mut out = Vec::new();
         for wf in self.iter_workspace_files() {
             let lines = wf.lines();
-            for (name, span) in wf.symbol_spans {
+            for (name, span) in &wf.parsed.symbol_spans {
                 if name != symbol
                     || !wf
+                        .parsed
                         .scope_tree
                         .resolves_to_top_level(name, span.line, span.col)
                 {
@@ -90,11 +91,11 @@ impl BackendState {
             let Ok(target_uri) = Url::from_file_path(&resolved) else {
                 continue;
             };
-            let target_lines: Vec<&str> = cached.source.lines().collect();
+            let target_lines: Vec<&str> = cached.parsed.source.lines().collect();
             let target_defs = user_definitions_from_ast(
-                &cached.ast,
-                &cached.span_map,
-                &cached.symbol_spans,
+                &cached.parsed.ast,
+                &cached.parsed.span_map,
+                &cached.parsed.symbol_spans,
                 &target_lines,
             );
             for (name, range) in &target_defs {
@@ -117,7 +118,12 @@ impl BackendState {
         let mut locations = Vec::new();
         for wf in self.iter_workspace_files() {
             let lines = wf.lines();
-            let defs = user_definitions_from_ast(wf.ast, wf.span_map, wf.symbol_spans, &lines);
+            let defs = user_definitions_from_ast(
+                &wf.parsed.ast,
+                &wf.parsed.span_map,
+                &wf.parsed.symbol_spans,
+                &lines,
+            );
             for (name, range) in &defs {
                 if name == &symbol {
                     if let Some(range) = range {

@@ -87,8 +87,10 @@ impl WorkspaceScanner {
 
 // ── Cached parse results ─────────────────────────────────────────
 
-/// Cached parse result for an imported file.
-pub(crate) struct ImportCache {
+/// A parsed source file's cached semantic shape, shared by open documents and
+/// the import cache so a new parsed-file consumer only needs to add a field
+/// here, not in three places.
+pub(crate) struct ParsedFile {
     pub(crate) ast: Vec<sema_core::Value>,
     pub(crate) span_map: SpanMap,
     pub(crate) symbol_spans: Vec<(String, Span)>,
@@ -96,6 +98,11 @@ pub(crate) struct ImportCache {
     /// Source text, retained so cross-file ranges can be mapped from char
     /// columns to UTF-16 code units (LSP `Position`). See `span_to_range`.
     pub(crate) source: String,
+}
+
+/// Cached parse result for an imported file.
+pub(crate) struct ImportCache {
+    pub(crate) parsed: ParsedFile,
     /// Modification time when we last read the file.
     pub(crate) mtime: std::time::SystemTime,
 }
@@ -113,18 +120,6 @@ impl ImportCache {
             .map(|mtime| mtime == self.mtime)
             .unwrap_or(false)
     }
-}
-
-/// Cached parse result for an open document (updated on every didChange).
-pub(crate) struct CachedParse {
-    pub(crate) ast: Vec<sema_core::Value>,
-    pub(crate) span_map: SpanMap,
-    pub(crate) symbol_spans: Vec<(String, Span)>,
-    pub(crate) scope_tree: scope::ScopeTree,
-    /// Source text of the document at parse time, retained so ranges can be
-    /// mapped from char columns to UTF-16 code units (LSP `Position`).
-    /// Mirrors `ImportCache::source`. See `span_to_range`.
-    pub(crate) source: String,
 }
 
 // ── Semantic token legend ─────────────────────────────────────────
@@ -173,7 +168,7 @@ pub(crate) struct BackendState {
     /// Cached parse results for imported files (by absolute path).
     pub(crate) import_cache: HashMap<PathBuf, ImportCache>,
     /// Cached parse results for open documents (updated on didChange).
-    pub(crate) cached_parses: HashMap<String, CachedParse>,
+    pub(crate) cached_parses: HashMap<String, ParsedFile>,
     /// Path to the sema binary (from initializationOptions or default).
     pub(crate) sema_binary: String,
 }
@@ -309,16 +304,12 @@ pub(crate) fn quoted_string_range(lines: &[&str], form_range: &Range, path: &str
 /// [`BackendState::iter_workspace_files`].
 pub(crate) struct WorkspaceFile<'a> {
     pub(crate) uri: Url,
-    pub(crate) ast: &'a [sema_core::Value],
-    pub(crate) span_map: &'a SpanMap,
-    pub(crate) symbol_spans: &'a [(String, Span)],
-    pub(crate) scope_tree: &'a scope::ScopeTree,
-    pub(crate) source: &'a str,
+    pub(crate) parsed: &'a ParsedFile,
 }
 
 impl<'a> WorkspaceFile<'a> {
     pub(crate) fn lines(&self) -> Vec<&'a str> {
-        self.source.lines().collect()
+        self.parsed.source.lines().collect()
     }
 
     /// The file's base name without extension, for the "defined in X"
@@ -434,11 +425,13 @@ impl BackendState {
         self.import_cache.insert(
             path.clone(),
             ImportCache {
-                ast,
-                span_map,
-                symbol_spans,
-                scope_tree,
-                source: text,
+                parsed: ParsedFile {
+                    ast,
+                    span_map,
+                    symbol_spans,
+                    scope_tree,
+                    source: text,
+                },
                 mtime,
             },
         );
@@ -467,11 +460,7 @@ impl BackendState {
         let open = self.cached_parses.iter().filter_map(|(uri_str, cached)| {
             Url::parse(uri_str).ok().map(|uri| WorkspaceFile {
                 uri,
-                ast: &cached.ast,
-                span_map: &cached.span_map,
-                symbol_spans: &cached.symbol_spans,
-                scope_tree: &cached.scope_tree,
-                source: &cached.source,
+                parsed: cached,
             })
         });
 
@@ -481,11 +470,7 @@ impl BackendState {
             }
             Url::from_file_path(path).ok().map(|uri| WorkspaceFile {
                 uri,
-                ast: &ic.ast,
-                span_map: &ic.span_map,
-                symbol_spans: &ic.symbol_spans,
-                scope_tree: &ic.scope_tree,
-                source: &ic.source,
+                parsed: &ic.parsed,
             })
         });
 
@@ -507,9 +492,14 @@ impl BackendState {
                 return None;
             }
             // Names only; ranges discarded — &[] skips UTF-16 mapping.
-            let defs = user_definitions_from_ast(wf.ast, wf.span_map, wf.symbol_spans, &[]);
+            let defs = user_definitions_from_ast(
+                &wf.parsed.ast,
+                &wf.parsed.span_map,
+                &wf.parsed.symbol_spans,
+                &[],
+            );
             if defs.iter().any(|(name, _)| name == symbol) {
-                Some((wf.ast, wf.stem()))
+                Some((wf.parsed.ast.as_slice(), wf.stem()))
             } else {
                 None
             }
@@ -529,10 +519,10 @@ impl BackendState {
         for wf in self.iter_workspace_files() {
             let lines = wf.lines();
             for m in scan_definitions(
-                flatten_module_forms(wf.ast),
+                flatten_module_forms(&wf.parsed.ast),
                 SYMBOL_HEADS,
-                wf.span_map,
-                wf.symbol_spans,
+                &wf.parsed.span_map,
+                &wf.parsed.symbol_spans,
                 &lines,
             ) {
                 // A definition form with no span (reader error-recovery) has

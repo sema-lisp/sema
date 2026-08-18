@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use sema_core::{pretty_print, Env, Spur, ValueView};
 use sema_eval::{Interpreter, SPECIAL_FORM_NAMES};
 
-use crate::{colors, docs, print_error, LAST_FILE, LAST_SOURCE};
+use crate::{colors, docs, print_error, set_last_input};
 
 pub const REPL_COMMANDS: &[&str] = &[
     ",quit",
@@ -87,7 +87,7 @@ pub fn dispatch(
 
     if let Some(rest) = trimmed.strip_prefix(",inspect ") {
         let rest = rest.trim();
-        record_source(rest);
+        set_last_input(rest, None);
         match interpreter.eval_str_in_global(rest) {
             Ok(val) => {
                 if let Err(e) = super::inspector::run(val, rest) {
@@ -100,7 +100,7 @@ pub fn dispatch(
     }
 
     if let Some(expr) = trimmed.strip_prefix(",type ") {
-        record_source(expr);
+        set_last_input(expr, None);
         match interpreter.eval_str_in_global(expr) {
             Ok(val) => {
                 let type_name = match val.view() {
@@ -115,7 +115,7 @@ pub fn dispatch(
     }
 
     if let Some(expr) = trimmed.strip_prefix(",time ") {
-        record_source(expr);
+        set_last_input(expr, None);
         let start = std::time::Instant::now();
         match interpreter.eval_str_in_global(expr) {
             Ok(val) => {
@@ -158,11 +158,6 @@ fn run_gc(interpreter: &Interpreter) {
             sema_core::gc_registry_len()
         ))
     );
-}
-
-fn record_source(expr: &str) {
-    LAST_SOURCE.with(|s| *s.borrow_mut() = Some(expr.to_string()));
-    LAST_FILE.with(|f| *f.borrow_mut() = None);
 }
 
 fn doc(env: &Env, name: &str) {

@@ -1,74 +1,20 @@
 // Durability against the FILE, plus the endpoints nothing else exercises.
 //
-// `notebook-robustness.spec.ts` asserts through `GET /api/notebook`, which is
-// the server's in-memory state. That is not what survives a restart — the
+// `robustness.spec.ts` asserts through `GET /api/notebook`, which is the
+// server's in-memory state. That is not what survives a restart — the
 // `.sema-nb` file is. These tests read that file directly, so "my work is safe"
 // is verified against the artifact the user actually keeps.
 //
 // Also covers `/api/save`, `/api/eval-all`, `/api/env` and undo depth, none of
 // which had coverage.
 
-import { test, expect, APIRequestContext } from '@playwright/test';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
-
-// playwright.config.ts serves a COPY of the fixture (target/e2e-demo.sema-nb),
-// deliberately, because saving mutates it.
-const NOTEBOOK_FILE = resolve(__dirname, '../../../../target/e2e-demo.sema-nb');
-
-/** The notebook as it exists ON DISK, parsed. */
-function readNotebookFile() {
-  return JSON.parse(readFileSync(NOTEBOOK_FILE, 'utf8'));
-}
-
-async function createCell(
-  request: APIRequestContext,
-  source: string,
-  type: 'code' | 'markdown' = 'code'
-): Promise<string> {
-  const res = await request.post('/api/cells', { data: { type, source } });
-  expect(res.ok()).toBeTruthy();
-  const { id } = await res.json();
-  createdCells.push(id);
-  return id;
-}
-
-async function fetchNotebook(request: APIRequestContext) {
-  const res = await request.get('/api/notebook');
-  expect(res.ok()).toBeTruthy();
-  return res.json();
-}
-
-const createdCells: string[] = [];
-let pristineOrder: string[] = [];
-let pristineTitle = '';
-
-test.beforeAll(async ({ request }) => {
-  const nb = await fetchNotebook(request);
-  pristineOrder = nb.cells.map((c: any) => c.id);
-  pristineTitle = nb.title;
-});
+import { test, expect } from '@playwright/test';
+import { createCell, fetchNotebook, readNotebookFile, installNotebookRestore } from './helpers';
 
 // Shares one long-lived server with the other specs, which assert exact cell
 // counts and "undo is disabled initially" — so this suite must put everything
 // back, including on disk, since it saves.
-test.afterAll(async ({ request }) => {
-  for (const id of createdCells.reverse()) {
-    await request.delete(`/api/cells/${id}`).catch(() => {});
-  }
-  createdCells.length = 0;
-  await request.post('/api/title', { data: { title: pristineTitle } }).catch(() => {});
-  if (pristineOrder.length > 0) {
-    await request.post('/api/cells/reorder', { data: { cell_ids: pristineOrder } }).catch(() => {});
-  }
-  await request.post('/api/reset').catch(() => {});
-  // Leave the FILE consistent with the restored state too.
-  await request.post('/api/save').catch(() => {});
-
-  const final = await fetchNotebook(request);
-  expect(final.cells.map((c: any) => c.id)).toEqual(pristineOrder);
-  expect(final.can_undo).toBeFalsy();
-});
+installNotebookRestore(test, { restoreTitle: true, save: true });
 
 test.describe('On-disk durability', () => {
   test('a saved cell is present in the .sema-nb file', async ({ request }) => {
@@ -141,7 +87,7 @@ test.describe('On-disk durability', () => {
   });
 });
 
-test.describe('Undo', () => {
+test.describe('Undo depth', () => {
   test('undo is rejected cleanly when there is nothing to undo', async ({ request }) => {
     await request.post('/api/reset');
     const res = await request.post('/api/undo');

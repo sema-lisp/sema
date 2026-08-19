@@ -1,0 +1,121 @@
+;; changelog.sema — assemble changelog.d/ fragments into a CHANGELOG.md section.
+;;
+;; Fragments are files named <type>-<slug>.md where <type> is one of the
+;; Keep a Changelog headings. Each holds the entry body, already formatted as a
+;; markdown bullet. Adding a changelog entry means creating a new file; nothing
+;; ever edits CHANGELOG.md in place.
+;;
+;;   sema scripts/changelog.sema -- preview            render the next section
+;;   sema scripts/changelog.sema -- release 1.36.0     prepend it, drop fragments
+;;
+;; A trailing argument after those sets the repo root; only the tests pass it.
+
+;; Sections render in this order, not alphabetically.
+(define ORDER '("added" "changed" "deprecated" "removed" "fixed" "security"))
+
+(define FRAGMENT-RE
+  #"^(added|changed|deprecated|removed|fixed|security)-([a-z0-9][a-z0-9-]*)\.md$")
+
+(define (die msg)
+  (println-error (string-append "error: " msg))
+  (exit 1))
+
+;; sys/args is ("sema" "<script>" "--" ...) when invoked as `sema f.sema -- a b`.
+(define (script-args)
+  (let ((all (sys/args)))
+    (let ((i (list/index-of all "--")))
+      (if (nil? i) '() (drop (+ i 1) all)))))
+
+(define (arg-or args n fallback)
+  (if (> (length args) n) (nth args n) fallback))
+
+;; ── fragments ────────────────────────────────────────────────────────
+
+;; Returns a list of (type body) entries ordered by filename, or dies listing
+;; every filename that does not parse.
+(define (load-fragments dir)
+  (let* ((names (sort (filter (lambda (n)
+                                (and (string/ends-with? n ".md")
+                                     (not (= n "README.md"))))
+                              (file/list dir))))
+         (bad (filter (lambda (n) (nil? (regex/match FRAGMENT-RE n))) names)))
+    (when (not (null? bad))
+      (die (string-append
+            "fragment names must be <type>-<slug>.md with type in ("
+            (string/join ORDER " ") "):\n  "
+            (string/join bad "\n  "))))
+    (filter (lambda (e) (not (string/empty? (nth e 1))))
+            (map (lambda (n)
+                   (list (car (:groups (regex/match FRAGMENT-RE n)))
+                         (string/trim (file/read (path/join dir n)))))
+                 names))))
+
+;; ── rendering ────────────────────────────────────────────────────────
+
+(define (bullet body)
+  (if (string/starts-with? body "- ") body (string-append "- " body)))
+
+(define (section-lines kind entries)
+  (let ((bodies (map (lambda (e) (nth e 1))
+                     (filter (lambda (e) (= (car e) kind)) entries))))
+    (if (null? bodies)
+        '()
+        (cons (string-append "### " (string/capitalize kind) "\n")
+              (flat-map (lambda (b) (list (bullet b) "")) bodies)))))
+
+(define (render version entries)
+  (let ((parts (cons (string-append "## " version "\n")
+                     (flat-map (lambda (k) (section-lines k entries)) ORDER))))
+    (string-append (string/trim-right (string/join parts "\n")) "\n")))
+
+;; ── commands ─────────────────────────────────────────────────────────
+
+(define (do-preview entries)
+  (display (render "UNRELEASED" entries)))
+
+(define (do-release entries version changelog dir)
+  (when (not (regex/match? #"^\d+\.\d+\.\d+$" version))
+    (die (string-append "version must be X.Y.Z, got " version)))
+  (let ((old (file/read changelog)))
+    ;; Compare whole lines: equivalent to an anchored multiline match, without
+    ;; having to escape the dots in the version.
+    (when (list/contains? (string/lines old) (string-append "## " version))
+      (die (string-append "CHANGELOG.md already has a ## " version " section")))
+    (let ((nl (string/index-of old "\n")))
+      (when (nil? nl)
+        (die "CHANGELOG.md must start with a `# Changelog` title line"))
+      (let ((head (string/slice old 0 nl))
+            (rest (string/slice old (+ nl 1))))
+        (when (not (string/starts-with? head "# "))
+          (die "CHANGELOG.md must start with a `# Changelog` title line"))
+        (file/write changelog
+                    (string-append head "\n\n" (render version entries) "\n"
+                                   (string/trim-left rest)))))
+    (for-each (lambda (f)
+                (when (not (= f "README.md")) (file/delete (path/join dir f))))
+              (file/list dir))
+    (println (string-append "CHANGELOG.md: added ## " version " ("
+                            (number->string (length entries))
+                            " entries); cleared changelog.d/"))))
+
+;; ── entry point ──────────────────────────────────────────────────────
+
+(define (main)
+  (let* ((args (script-args))
+         (cmd (arg-or args 0 nil)))
+    (when (not (or (= cmd "preview") (= cmd "release")))
+      (die "usage: changelog.sema preview [root] | release X.Y.Z [root]"))
+    (when (and (= cmd "release") (< (length args) 2))
+      (die "release needs a version — `jake release.changelog-release version=X.Y.Z`"))
+    (let* ((root (if (= cmd "release") (arg-or args 2 ".") (arg-or args 1 ".")))
+           (dir (path/join root "changelog.d")))
+      (when (not (file/is-directory? dir))
+        (die (string-append "no " dir)))
+      (let ((entries (load-fragments dir)))
+        (when (null? entries)
+          (die "no fragments in changelog.d/ — nothing to release"))
+        (if (= cmd "preview")
+            (do-preview entries)
+            (do-release entries (nth args 1) (path/join root "CHANGELOG.md") dir))))))
+
+(main)

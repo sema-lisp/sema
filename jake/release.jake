@@ -21,6 +21,23 @@ task packaged-web:
 task runtime-fresh:
     ./scripts/check-web-runtime-fresh.sh
 
+# ── Changelog ────────────────────────────────────────────────────────
+# CHANGELOG.md is assembled from changelog.d/ fragments; nothing edits it in
+# place. See changelog.d/README.md for the fragment format. The assembler is
+# written in Sema (scripts/changelog.sema), so it needs an installed `sema`.
+
+@group release
+@desc "Render the next CHANGELOG section from changelog.d/ (writes nothing)"
+@needs sema "jake install"
+task changelog-preview:
+    sema scripts/changelog.sema -- preview
+
+@group release
+@desc "Assemble changelog.d/ into a ## X.Y.Z section and clear the fragments"
+@needs sema "jake install"
+task changelog-release version:
+    sema scripts/changelog.sema -- release {{version}}
+
 # ── Coverage ─────────────────────────────────────────────────────────
 
 @group release

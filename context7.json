@@ -2,11 +2,33 @@
   "$schema": "https://context7.com/schema/context7.json",
   "url": "https://context7.com/sema-lisp/sema",
   "public_key": "pk_djlUoMWP0K9cEFiNMRqiV",
-  "folders": [
-    "website/docs",
-    "crates/sema-docs/entries",
-    "packages",
-    "examples"
+  "excludeFolders": [
+    "docs/plans",
+    "docs/design",
+    "docs/bugs",
+    "docs/internals",
+    "docs/lsp",
+    "docs/benchmarks",
+    "docs/sema-postrained-model",
+    "benchmarks",
+    "fuzz",
+    "scripts",
+    "jake",
+    ".claude",
+    ".github"
+  ],
+  "excludeFiles": [
+    "AGENTS.md",
+    "CLAUDE.md",
+    "adr.md",
+    "deferred.md",
+    "limitations.md",
+    "vm-status.md",
+    "performance-roadmap.md",
+    "build-time-report.md",
+    "shell-style.md",
+    "release-signing.md",
+    "syntactic-and-architectural-review.md"
   ],
   "rules": [
     "New stdlib functions are slash-namespaced: file/read, string/split, http/get, json/encode. Legacy Scheme names (string-append, string-length, substring) still work.",

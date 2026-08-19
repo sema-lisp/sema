@@ -13,8 +13,8 @@ use crate::{builtin_docs, scope};
 // ── doc coverage gate ────────────────────────────────────────
 
 /// Every registered builtin and special form must have a doc entry in the sema-docs index
-/// (internal `__vm-*` helpers excluded). Always-on gate — if this fails, document the listed
-/// names in `crates/sema-docs/stdlib/` (or `special-forms/`) and run `jake docs`.
+/// (internal `__vm-*` helpers excluded). Always-on gate — if this fails, add an entry under
+/// `crates/sema-docs/entries/stdlib/` (or `entries/special-forms/`) and run `jake docs`.
 #[test]
 fn builtin_doc_coverage() {
     use std::collections::HashSet;
@@ -40,7 +40,10 @@ fn builtin_doc_coverage() {
     missing.sort();
     assert!(
         missing.is_empty(),
-        "{} builtins/special-forms lack docs:\n{}",
+        "{} builtins/special-forms lack docs:\n{}\n\n\
+         Fix: add an entry under crates/sema-docs/entries/stdlib/ (or entries/special-forms/), \
+         then run `jake docs` to regenerate the index and `jake docs-check` to re-verify. \
+         Do not edit crates/sema-docs/builtin_docs.generated.json — it is generated.",
         missing.len(),
         missing.join("\n")
     );

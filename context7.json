@@ -1,4 +1,18 @@
 {
+  "$schema": "https://context7.com/schema/context7.json",
   "url": "https://context7.com/sema-lisp/sema",
-  "public_key": "pk_djlUoMWP0K9cEFiNMRqiV"
+  "public_key": "pk_djlUoMWP0K9cEFiNMRqiV",
+  "folders": [
+    "website/docs",
+    "crates/sema-docs/entries",
+    "packages",
+    "examples"
+  ],
+  "rules": [
+    "New stdlib functions are slash-namespaced: file/read, string/split, http/get, json/encode. Legacy Scheme names (string-append, string-length, substring) still work.",
+    "Predicates end in ?: null?, list?, file/exists?. Arrow conversions use ->: string->symbol, keyword->string.",
+    "Sema ships as a single binary. Run a file with `sema file.sema`, evaluate with `sema -e \"(+ 1 2)\"`, start the REPL with `sema`.",
+    "LLM calls are language primitives, not an SDK. Use llm/complete, llm/with-fallback, and the agent/tool forms directly.",
+    "Use ```sema for code blocks. Outside Sema-aware renderers, ```scheme is the closest fallback."
+  ]
 }

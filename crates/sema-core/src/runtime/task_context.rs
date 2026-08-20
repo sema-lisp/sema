@@ -117,6 +117,11 @@ impl TaskContextHandle {
         self.borrow().get_rc::<T>()
     }
 
+    /// Whether `self` and `other` are handles onto the same `TaskContext`.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn inherit_for_child(&self) -> Self {
         Self(Rc::new(RefCell::new(self.borrow().inherit_for_child())))
     }

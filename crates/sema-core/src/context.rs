@@ -275,6 +275,18 @@ impl EvalContext {
             .map(|installed| installed.handle.clone())
     }
 
+    /// Whether `handle` is the task context already installed on this thread.
+    /// A pointer compare, so callers can skip a scoped reinstall (and its
+    /// extension-map refresh) when the context they would install is the one
+    /// currently live — the common case for natives invoked inside the task's
+    /// own runtime quantum.
+    pub fn task_context_installed_is(&self, handle: &TaskContextHandle) -> bool {
+        match self.task_context.borrow().as_ref() {
+            Some(installed) => installed.handle.ptr_eq(handle),
+            None => false,
+        }
+    }
+
     pub fn install_task_context(&self, handle: TaskContextHandle) -> Option<TaskContextHandle> {
         self.task_context
             .replace(Some(InstalledTaskContext::new(handle)))

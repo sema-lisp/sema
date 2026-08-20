@@ -1598,8 +1598,11 @@ pub(crate) fn admit_regular_file(_op: &str, _path: &str) -> Result<(), SemaError
 // `Value` stays in a traced continuation on the VM thread. Cancellation drops
 // that continuation (and its reader) or discards a still-running bounded read.
 
-const FILE_LINE_CHUNK_MAX_LINES: usize = 2048;
-const FILE_LINE_CHUNK_MAX_BYTES: usize = 1024 * 1024;
+// Chunk sizing: each chunk boundary parks the VM until the worker hands back
+// the next batch, so the caps trade a bounded buffer (~1 MB of line payloads
+// at the 4 MB byte cap) for fewer round-trips on large sequential reads.
+const FILE_LINE_CHUNK_MAX_LINES: usize = 16384;
+const FILE_LINE_CHUNK_MAX_BYTES: usize = 1024 * 1024 * 4;
 const FILE_LINE_READER_BUFFER_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy)]
@@ -3757,17 +3760,20 @@ mod file_line_trace_tests {
     #[test]
     fn line_chunk_is_bounded_by_line_count() {
         let path = temp_path("count");
-        let contents: String = (0..2053).map(|index| format!("line-{index}\n")).collect();
+        let extra = 5;
+        let contents: String = (0..(FILE_LINE_CHUNK_MAX_LINES + extra))
+            .map(|index| format!("line-{index}\n"))
+            .collect();
         std::fs::write(&path, contents).expect("write line fixture");
         let path_text = path.to_string_lossy();
 
         let first = read_file_line_chunk("file/fold-lines", &path_text, None, false)
             .expect("read first bounded chunk");
-        assert_eq!(first.lines.len(), 2048);
+        assert_eq!(first.lines.len(), FILE_LINE_CHUNK_MAX_LINES);
         assert!(!first.eof);
         let second = read_file_line_chunk("file/fold-lines", &path_text, Some(first.reader), false)
             .expect("read remaining lines");
-        assert_eq!(second.lines.len(), 5);
+        assert_eq!(second.lines.len(), extra);
         assert!(second.eof);
 
         std::fs::remove_file(path).expect("remove line fixture");
@@ -3776,7 +3782,9 @@ mod file_line_trace_tests {
     #[test]
     fn line_chunk_is_bounded_by_bytes() {
         let path = temp_path("bytes");
-        let line = vec![b'x'; 520 * 1024];
+        // One line just over half the byte budget: the second line cannot fit
+        // in the same chunk, so the byte bound must cut after line one.
+        let line = vec![b'x'; FILE_LINE_CHUNK_MAX_BYTES / 2 + 1024];
         let mut contents = Vec::with_capacity((line.len() + 1) * 3);
         for _ in 0..3 {
             contents.extend_from_slice(&line);

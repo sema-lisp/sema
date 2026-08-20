@@ -2385,7 +2385,15 @@ impl VM {
     ) -> Result<NativeDispatchResult, SemaError> {
         if ctx.runtime_quantum_active() {
             if let Some(handle) = ctx.task_context() {
-                let _installed = ctx.scope_task_context(handle.clone());
+                // The quantum driver installs this task's context before
+                // running; reinstalling the identical handle per native call
+                // would only refresh cached Rc clones. Skip the guard when the
+                // installed context is already this one.
+                let _installed = if ctx.task_context_installed_is(&handle) {
+                    None
+                } else {
+                    Some(ctx.scope_task_context(handle.clone()))
+                };
                 snapshot_native_escaping_args(self, func, call_args);
                 let call_env = Some(self.globals.clone());
                 let cancellation = self.quantum_cancellation.clone();
@@ -2412,8 +2420,7 @@ impl VM {
                         .pending_nested_instructions
                         .saturating_add(nested_instructions);
                 }
-                drop(_installed);
-                return Ok(match outcome? {
+                drop(_installed);                return Ok(match outcome? {
                     NativeOutcome::Return(value) => NativeDispatchResult::Value(value),
                     other => NativeDispatchResult::Pending(VmPendingOutcome::from_outcome(other)),
                 });

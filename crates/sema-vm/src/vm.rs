@@ -2420,7 +2420,8 @@ impl VM {
                         .pending_nested_instructions
                         .saturating_add(nested_instructions);
                 }
-                drop(_installed);                return Ok(match outcome? {
+                drop(_installed);
+                return Ok(match outcome? {
                     NativeOutcome::Return(value) => NativeDispatchResult::Value(value),
                     other => NativeDispatchResult::Pending(VmPendingOutcome::from_outcome(other)),
                 });

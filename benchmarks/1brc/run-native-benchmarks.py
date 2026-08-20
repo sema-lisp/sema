@@ -150,6 +150,48 @@ def normalize_output(text: str) -> str:
     return "".join(text[start : end + 1].split())
 
 
+# Per-dialect version probes, recorded into metadata.json so a results
+# directory states which runtime produced each row. Best effort: a probe
+# that fails or times out just leaves the dialect out of the map.
+VERSION_PROBES: dict[str, list[list[str]]] = {
+    "sbcl": [[brew("sbcl"), "--version"]],
+    "chez": [[brew("chez"), "--version"]],
+    "chicken": [[brew("csc"), "-version"]],
+    "gambit": [[gambit("gsc"), "-v"]],
+    "fennel": [[brew("fennel"), "--version"], [brew("luajit"), "-v"]],
+    "clojure": [[brew("clojure"), "--version"]],
+    "kawa": [[brew("kawa"), "--version"]],
+    "racket": [[brew("racket"), "--version"]],
+    "guile": [[brew("guile"), "--version"]],
+    "gauche": [[brew("gosh"), "-V"]],
+    "janet": [[brew("janet"), "-v"]],
+    "ecl": [[brew("ecl"), "--version"]],
+    "emacs": [[brew("emacs"), "--version"]],
+    "newlisp": [[brew("newlisp"), "-v"]],
+}
+
+
+def tool_versions() -> dict[str, str]:
+    versions: dict[str, str] = {}
+    for name, attempts in VERSION_PROBES.items():
+        for cmd in attempts:
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=60,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            out = " ".join(proc.stdout.split())
+            if out:
+                versions[name] = out[:200]
+                break
+    return versions
+
+
 def run_suite(label: str, benches: list[Bench], rows: int) -> list[dict[str, object]]:
     suite_dir = RESULTS / label
     suite_dir.mkdir(parents=True, exist_ok=True)
@@ -276,6 +318,7 @@ def main() -> int:
         "data_file": str(data),
         "rows": rows,
         "sema_version": sema_version,
+        "tools": tool_versions(),
         "skipped": ["picolisp"],
     }
     (RESULTS / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")

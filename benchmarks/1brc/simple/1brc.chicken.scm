@@ -3,7 +3,7 @@
 
 (import (chicken io)
         (chicken process-context)
-        (chicken time)
+        (scheme time)
         (chicken string)
         (chicken format)
         (chicken sort)
@@ -35,7 +35,7 @@
 
     (let* ((file-path (car args))
            (table (make-hash-table string=? string-hash))
-           (start-time (current-milliseconds))
+           (start-time (current-jiffy))
            (port (open-input-file file-path)))
 
       (let loop ((line (read-line port)))
@@ -68,8 +68,9 @@
                                             (format-1dp mean) "/"
                                             (format-1dp mx))))
                          names))
-             (end-time (current-milliseconds))
-             (elapsed (- end-time start-time)))
+             (end-time (current-jiffy))
+             (elapsed (quotient (* (- end-time start-time) 1000)
+                                (jiffies-per-second))))
 
         (print "{" (string-intersperse parts ", ") "}")
         (fprintf (current-error-port) "Elapsed: ~A ms~%" elapsed)))))

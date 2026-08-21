@@ -6,16 +6,16 @@ Where Sema's time goes and what can be done about it. Based on analysis of the 1
 
 The bytecode VM is the sole evaluator. (The tree-walker was eventually retired — historical numbers for it are no longer relevant.)
 
-As of the July 2026 performance campaign, **Sema is ahead of Janet on every benchmark in the suite** (PGO builds, Apple M2 Max, hyperfine, interleaved head-to-head runs):
+As of the August 2026 squeeze round, **Sema is ahead of Janet on every benchmark in the suite** (PGO builds, Apple M2 Max):
 
 | Benchmark | Janet | Sema (PGO) | Margin |
 | --- | ---: | ---: | --- |
-| tak (500× tak 18 12 6) | 1,190ms | 937ms | 1.27× ahead |
-| nqueens (500× n=8) | 1,704ms | 1,497ms | 1.14× ahead |
-| 1BRC optimized, 10M rows | 5,058ms | 3,619ms | 1.40× ahead |
-| 1BRC simple, 10M rows | 10,116ms | 6,359ms | 1.59× ahead |
+| tak (500× tak 18 12 6) | 1,190ms | 946ms | 1.26× ahead |
+| nqueens (500× n=8) | 1,704ms | 1,470ms | 1.16× ahead |
+| 1BRC optimized, 10M rows | 4,952ms | 3,462ms | 1.43× ahead |
+| 1BRC simple, 10M rows | 9,907ms | 6,278ms | 1.58× ahead |
 
-What delivered it (rough order of impact): the byte-oriented 1BRC rewrite on the `mutable-array/*` + `bytes/*` + `file/fold-lines-bytes` APIs; `TakeLocal` + the owned-args callback protocol (a fold accumulator reaches `assoc`'s COW gate with refcount 1, so idiomatic immutable-update folds mutate in place); `CallSelf` for top-level self-recursion; SmallVec native-call arg buffers; `run_inner` monomorphized over debug mode; self-tail-call on internal defines; the `string->number` fast decimal parse; `MutArrGet`/`MutArrSet` intrinsics. PGO adds a further ~10–25% on top.
+What delivered it (rough order of impact): the byte-oriented 1BRC rewrite on the `mutable-array/*` + `bytes/*` + `file/fold-lines-bytes` APIs; `TakeLocal` + the owned-args callback protocol (a fold accumulator reaches `assoc`'s COW gate with refcount 1, so idiomatic immutable-update folds mutate in place); `CallSelf` for top-level self-recursion; SmallVec native-call arg buffers; `run_inner` monomorphized over debug mode; self-tail-call on internal defines; the `string->number` fast decimal parse; `MutArrGet`/`MutArrSet` intrinsics; the non-suspending HOF direct-dispatch fast path (July); and the August 2026 fixed-overhead cuts below. PGO adds a further ~10–25% on top.
 
 Janet remains the most meaningful comparison — both are embeddable scripting languages with bytecode VMs, no JIT, no native compilation. For the cross-Lisp comparison, see `website/docs/internals/lisp-comparison.md` (numbers there predate this campaign until the multi-dialect runner is re-run).
 
@@ -166,6 +166,24 @@ Janet was ~1.6× ahead on 1BRC-optimized at the start of the July 2026 campaign;
 | Self-tail-call on internal defines | −4% nqueens | resolver |
 | Single-allocation strings (`Value::string_owned`) | −1.5–4% | core + VM + stdlib |
 
+## August 2026 Squeeze Round: Fixed Overhead in the Fold Pipeline
+
+After the unified-runtime work settled, profile attribution on both 1BRC variants (10M rows, `sample` call trees over a release-with-debug build) showed main-thread busy time dominated by fixed per-line and per-native costs, not bytecode dispatch:
+
+| Share of busy time | Where |
+| --- | --- |
+| ~23% | `VmCallbackSession::call_owned` self — per-element frame setup + quantum wrapper |
+| ~15% | `dispatch_native` self — per-native task-context reinstall, Rc churn, escaping-args scan |
+| ~7% | semaphore wait at chunk boundaries (~4700 worker round-trips per 10M rows at the old caps) |
+| ~21% | `VM::run_inner` — the dispatch loop itself |
+
+Two fixes landed (plain-release A/B, hyperfine, warmup 3):
+
+- **Chunk batching** (`crates/sema-stdlib/src/io.rs`): `FILE_LINE_CHUNK_MAX_LINES` 2048→16384 and the chunk byte budget 1MB→4MB. At 1BRC line lengths the line cap bound first (~27KB chunks), so boundary count fell ~8×. The per-line streaming limit moved to its own constant (`FILE_LINE_MAX_LINE_BYTES`, still 1 MB) so batch tuning cannot silently move that documented contract.
+- **`dispatch_native` context fast path** (`crates/sema-vm/src/vm.rs`, `sema-core/context.rs`): skip reinstalling the task context when the installed handle is already the same one (`EvalContext::task_context_installed_is`, pointer compare). The quantum driver installs it once per quantum; extension entries are never swapped within a live handle (`MacroExpansionState` is read through the handle directly), so the cached clones cannot go stale on this path.
+
+Measured: 1BRC-opt −9% (4.520→4.103 s min-of-20), 1BRC-simple −11%, tak/higher-order-fold parity. PGO end-to-end on 10M rows: optimized 3.80→3.25 s (−14%), simple 7.60→6.02 s (−19%) — both ahead of every prior Sema measurement.
+
 ## Remaining Headroom (post-campaign)
 
 Ordered by expected impact per effort, with the July 2026 profile evidence that motivates each. None of these are needed to stay ahead of Janet; they are the path toward the Chicken/Guile tier.
@@ -180,6 +198,8 @@ Ordered by expected impact per effort, with the July 2026 profile evidence that 
 | H6 | **Superinstructions** (fused local/const operand ops, compare-and-branch) | dispatch-count −30–50% on arithmetic-heavy code (estimate) | Days, opcode-append discipline |
 | H7 | ✅ **Unified `Value` clone/drop fast path** (Jul 2026): the asm check showed LLVM had *not* merged the arms — clone kept a degenerate jump table (all entries → one increment), drop kept 27 decrement blocks behind a tag-dependent indirect branch. Collapsed to one uniform RcBox-header refcount op (all heap payloads share the offset; alignment compile-asserted per type in `from_rc_ptr`, layout pinned vs a real `Rc` by test + per-boxing debug assert, Miri-clean); the typed free is out of line, entered only when the count hits zero. PGO A/B: higher-order-fold −16%, 1BRC-opt −7%, closure-storm −7%, 1BRC-simple −5%, upvalue-counter −5%, median ≈ −4%; plain-release wins are larger (median −5.5%, closure-storm −27%). **Known trade-off:** throw-catch +6% under PGO (free-on-every-iteration workloads pay an extra call + redundant decrement on the actual-free path; deliberately not `#[cold]` — that made it +11%) | clone/drop was the universal hot primitive | Shipped |
 | H8 | **Register VM** (#6), **quickening** (#14), **copy-and-patch JIT** (#15) | the tier-jump options; see their sections | Large–Very large |
+| H9 | **Lean per-element quantum entry for sync-HOF sessions**: `VmCallbackSession::call_owned`'s wrapper (frame setup, quantum prologue/epilogue, cancellation view) is now the top single profile item on fold-heavy code (~23% of 1BRC busy time) | est. 10–20% on fold-heavy workloads; needs a measured entry point that keeps budget/cancellation semantics | Week+ |
+| H10 | **Prefetch the next file chunk while the current one drains**: the chunk-cap raise (Aug 2026) cut boundary count 8×; overlapping the remaining handoff with callback execution would hide most of the rest | ~2–4% on line-folding workloads (residual wait share after the cap raise) | Days |
 
 New headroom surfaced by wave 3: the **native→VM callback boundary** — `run_nested_closure_args` runs a full prologue (incl. `base_globals`/`base_functions` `Rc` clones) per fold-callback row, the reverse of the now-cheap VM→native direction. Wave-3 cumulative vs its baseline (plain release): tak −3.7%, 1BRC-opt −3.5% (1M) / −5.8% (10M), 1BRC-simple −3.6%.
 

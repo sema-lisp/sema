@@ -174,6 +174,7 @@ VERSION_PROBES: dict[str, list[list[str]]] = {
 def tool_versions() -> dict[str, str]:
     versions: dict[str, str] = {}
     for name, attempts in VERSION_PROBES.items():
+        parts = []
         for cmd in attempts:
             try:
                 proc = subprocess.run(
@@ -187,8 +188,9 @@ def tool_versions() -> dict[str, str]:
                 continue
             out = " ".join(proc.stdout.split())
             if out:
-                versions[name] = out[:200]
-                break
+                parts.append(out[:120])
+        if parts:
+            versions[name] = " | ".join(parts)[:200]
     return versions
 
 

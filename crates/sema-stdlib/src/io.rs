@@ -3799,8 +3799,14 @@ mod file_line_trace_tests {
 
         let first = read_file_line_chunk("file/fold-lines-bytes", &path_text, None, true)
             .expect("read first byte-bounded chunk");
-        assert!(first.lines.len() >= 4, "each chunk should batch several near-limit lines");
-        assert!(first.lines.len() < 6, "the byte budget must split before all six lines");
+        assert!(
+            first.lines.len() >= 4,
+            "each chunk should batch several near-limit lines"
+        );
+        assert!(
+            first.lines.len() < 6,
+            "the byte budget must split before all six lines"
+        );
         assert!(!first.eof);
         let second = read_file_line_chunk(
             "file/fold-lines-bytes",

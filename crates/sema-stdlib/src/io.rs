@@ -1603,6 +1603,9 @@ pub(crate) fn admit_regular_file(_op: &str, _path: &str) -> Result<(), SemaError
 // at the 4 MB byte cap) for fewer round-trips on large sequential reads.
 const FILE_LINE_CHUNK_MAX_LINES: usize = 16384;
 const FILE_LINE_CHUNK_MAX_BYTES: usize = 1024 * 1024 * 4;
+/// Per-line streaming bound, independent of batch sizing: a single line over
+/// this length is rejected so one pathological row cannot balloon memory.
+const FILE_LINE_MAX_LINE_BYTES: usize = 1024 * 1024;
 const FILE_LINE_READER_BUFFER_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy)]
@@ -1675,7 +1678,7 @@ fn finish_file_line(
 
 fn oversized_file_line_error(op: &str, path: &str) -> String {
     format!(
-        "{op} {path}: line exceeds the {FILE_LINE_CHUNK_MAX_BYTES}-byte cooperative streaming limit"
+        "{op} {path}: line exceeds the {FILE_LINE_MAX_LINE_BYTES}-byte cooperative streaming limit"
     )
 }
 
@@ -1716,7 +1719,7 @@ fn read_file_line_chunk(
             };
             if available.is_empty() {
                 eof = true;
-                if state.pending_line.len() > FILE_LINE_CHUNK_MAX_BYTES {
+                if state.pending_line.len() > FILE_LINE_MAX_LINE_BYTES {
                     terminal_error = Some(oversized_file_line_error(op, path));
                 } else if !state.pending_line.is_empty() {
                     match finish_file_line(&mut state.pending_line, false, bytes, op, path) {
@@ -1736,7 +1739,7 @@ fn read_file_line_chunk(
                         state.pending_line.last() == Some(&b'\r')
                     };
                     let content_len = pending_len + newline - usize::from(trailing_cr);
-                    if content_len > FILE_LINE_CHUNK_MAX_BYTES {
+                    if content_len > FILE_LINE_MAX_LINE_BYTES {
                         terminal_error = Some(oversized_file_line_error(op, path));
                         break;
                     }
@@ -1748,9 +1751,9 @@ fn read_file_line_chunk(
                     // the next byte proves it is a CRLF terminator. EOF or any
                     // non-LF successor leaves it as oversized line content.
                     let storage_remaining =
-                        (FILE_LINE_CHUNK_MAX_BYTES + 1).saturating_sub(state.pending_line.len());
+                        (FILE_LINE_MAX_LINE_BYTES + 1).saturating_sub(state.pending_line.len());
                     if scan_len > storage_remaining
-                        || (pending_len + scan_len > FILE_LINE_CHUNK_MAX_BYTES
+                        || (pending_len + scan_len > FILE_LINE_MAX_LINE_BYTES
                             && available[scan_len - 1] != b'\r')
                     {
                         terminal_error = Some(oversized_file_line_error(op, path));
@@ -3782,11 +3785,12 @@ mod file_line_trace_tests {
     #[test]
     fn line_chunk_is_bounded_by_bytes() {
         let path = temp_path("bytes");
-        // One line just over half the byte budget: the second line cannot fit
-        // in the same chunk, so the byte bound must cut after line one.
-        let line = vec![b'x'; FILE_LINE_CHUNK_MAX_BYTES / 2 + 1024];
-        let mut contents = Vec::with_capacity((line.len() + 1) * 3);
-        for _ in 0..3 {
+        // Lines just under the per-line limit are legal, but six of them
+        // exceed the chunk byte budget, so the reader must split them across
+        // two chunks rather than buffering the whole file at once.
+        let line = vec![b'x'; FILE_LINE_MAX_LINE_BYTES - 1024];
+        let mut contents = Vec::with_capacity((line.len() + 1) * 6);
+        for _ in 0..6 {
             contents.extend_from_slice(&line);
             contents.push(b'\n');
         }
@@ -3795,7 +3799,8 @@ mod file_line_trace_tests {
 
         let first = read_file_line_chunk("file/fold-lines-bytes", &path_text, None, true)
             .expect("read first byte-bounded chunk");
-        assert_eq!(first.lines.len(), 1);
+        assert!(first.lines.len() >= 4, "each chunk should batch several near-limit lines");
+        assert!(first.lines.len() < 6, "the byte budget must split before all six lines");
         assert!(!first.eof);
         let second = read_file_line_chunk(
             "file/fold-lines-bytes",
@@ -3804,7 +3809,7 @@ mod file_line_trace_tests {
             true,
         )
         .expect("read remaining byte line");
-        assert_eq!(second.lines.len(), 2);
+        assert_eq!(first.lines.len() + second.lines.len(), 6);
         assert!(second.eof);
 
         std::fs::remove_file(path).expect("remove byte fixture");

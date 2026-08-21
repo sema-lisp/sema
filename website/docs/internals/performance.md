@@ -119,6 +119,29 @@ All benchmarks run on Apple Silicon (M-series), 10 runs + 3 warmup, via `scripts
 
 The VM achieves **2–17× speedups** across the board, with the largest gains on recursion-heavy benchmarks (tak, nqueens, bench-features, upvalue-counter) where call overhead dominates. Closure-heavy and string benchmarks show more modest ~2–3× gains.
 
+## Micro-Benchmark Suite (Aug 2026)
+
+The same suite, same runner (`scripts/bench.sh`, 10 runs + 3 warmup), re-measured on **sema 1.35.0 (PGO)** — macOS 15.6, Apple M2 Max. The tree-walker column is gone: the bytecode VM has been the sole evaluator since June 2026, so the axis here is *then vs now* within the VM. For the tree-walker comparison, see the February table above; for the data-heavy workload this suite doesn't cover, see the [Lisp Dialect Benchmark](./lisp-comparison).
+
+| Benchmark          | Feb 2026 VM    | Aug 2026 VM (PGO) | Since Feb |
+| ------------------ | -------------- | ------------------ | --------- |
+| tak                | 1,248 ms       | 919 ms             | 1.36×     |
+| nqueens            | 2,028 ms       | 1,415 ms           | 1.43×     |
+| deriv              | 887 ms         | 579 ms             | 1.53×     |
+| upvalue-counter    | 450 ms         | 348 ms             | 1.29×     |
+| closure-storm      | 1,041 ms       | 719 ms             | 1.45×     |
+| higher-order-fold  | 1,081 ms       | 312 ms             | 3.46×     |
+| hashmap-bench      | 3,645 ms       | 2,679 ms           | 1.36×     |
+| bench-features     | 1,144 ms       | 1,445 ms           | 0.79×     |
+| string-pipeline    | 613 ms         | 484 ms             | 1.27×     |
+| mandelbrot         | 212 ms         | 143 ms             | 1.49×     |
+| throw-catch        | 197 ms         | 266 ms             | 0.74×     |
+| recursive-closure-churn ¹         | —              | 81 ms              | —         |
+
+¹ Added to the suite after February; no February baseline exists.
+
+Geometric mean across the eleven comparable benchmarks: **1.36× faster than February**. The standout is `higher-order-fold` (3.46×) — the non-suspending HOF direct-dispatch fast path plus owned-args fold protocol. Two rows are honest regressions: `bench-features` (−21%) and `throw-catch` (−26%), both exercising exception/feature surfaces that gained correctness and accounting work since February; throw-catch additionally pays the documented PGO layout trade-off on free-every-iteration workloads.
+
 ## 1. Copy-on-Write Map Mutation
 
 **Problem:** Every `(assoc map key val)` call cloned the entire `BTreeMap`, even when no other reference existed. For the 1BRC accumulator (~400 weather stations), this was O(400) per row × millions of rows.

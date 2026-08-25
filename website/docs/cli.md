@@ -225,8 +225,11 @@ sema disasm --json script.semac   # structured JSON output
 Package manager for installing, publishing, and managing Sema packages. Git-based packages work out of the box. Registry commands (`search`, `info`, `publish`, `yank`, `login`) require a running registry instance — see [Self-Hosted Registry](./packages.md#self-hosted-registry). See the full [Packages](./packages.md) documentation for details.
 
 ```
-sema pkg <COMMAND>
+sema pkg [--json] <COMMAND>
 ```
+
+`--json` is global within `sema pkg` and can also follow the subcommand. It
+emits one machine-readable JSON document on standard output.
 
 | Subcommand                  | Description                                         |
 | --------------------------- | --------------------------------------------------- |

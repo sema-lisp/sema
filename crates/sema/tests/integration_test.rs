@@ -16438,3 +16438,110 @@ fn pkg_install_refuses_a_project_requiring_another_sema() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn run_pkg_json(dir: &std::path::Path, home: &std::path::Path, args: &[&str]) -> serde_json::Value {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(args)
+        .current_dir(dir)
+        .env("SEMA_HOME", home)
+        .output()
+        .expect("failed to run sema pkg command");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "stdout was not one JSON document: {error}; stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })
+}
+
+#[test]
+fn pkg_json_is_global_and_keeps_local_command_stdout_machine_readable() {
+    let dir = unique_temp_dir("pkg-json-local");
+    let home = dir.join("home");
+    let project = dir.join("project");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let before_subcommand = run_pkg_json(&project, &home, &["pkg", "--json", "list"]);
+    assert_eq!(before_subcommand, serde_json::json!({ "packages": [] }));
+
+    let init = run_pkg_json(&project, &home, &["pkg", "init", "--json"]);
+    assert_eq!(init["ok"], true);
+    assert_eq!(init["command"], "init");
+
+    let install = run_pkg_json(&project, &home, &["pkg", "install", "--json"]);
+    assert_eq!(
+        install,
+        serde_json::json!({ "ok": true, "command": "install", "locked": false })
+    );
+
+    let config = run_pkg_json(&project, &home, &["pkg", "config", "--json"]);
+    assert_eq!(config["registry"]["url"], "https://pkg.sema-lang.com");
+    assert_eq!(config["registry"]["token_set"], false);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn pkg_json_server(body: &'static str) -> String {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 2048];
+        let _ = stream.read(&mut request);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+    format!("http://{address}")
+}
+
+#[test]
+fn pkg_registry_query_json_preserves_api_response() {
+    let dir = unique_temp_dir("pkg-json-registry");
+    let home = dir.join("home");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let search_body = r#"{"packages":[{"name":"sema-json","description":"JSON helpers","created_at":"2026-01-01"}],"total":1,"page":1,"per_page":20}"#;
+    let registry = pkg_json_server(search_body);
+    let search = run_pkg_json(
+        &dir,
+        &home,
+        &["pkg", "search", "json", "--registry", &registry, "--json"],
+    );
+    assert_eq!(
+        search,
+        serde_json::from_str::<serde_json::Value>(search_body).unwrap()
+    );
+
+    let info_body = r#"{"package":{"name":"sema-json","description":"JSON helpers","repository_url":null,"created_at":"2026-01-01","readme_html":null},"versions":[],"owners":[],"total_downloads":0}"#;
+    let registry = pkg_json_server(info_body);
+    let info = run_pkg_json(
+        &dir,
+        &home,
+        &[
+            "pkg",
+            "info",
+            "sema-json",
+            "--registry",
+            &registry,
+            "--json",
+        ],
+    );
+    assert_eq!(
+        info,
+        serde_json::from_str::<serde_json::Value>(info_body).unwrap()
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

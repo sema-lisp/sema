@@ -256,6 +256,10 @@ enum Commands {
     },
     /// Sema package manager for adding, updating, and publishing dependencies
     Pkg {
+        /// Output a machine-readable JSON result
+        #[arg(long, global = true)]
+        json: bool,
+
         #[command(subcommand)]
         command: PkgCommands,
     },
@@ -1223,30 +1227,34 @@ fn main() {
                     std::process::exit(1);
                 }
             }
-            Commands::Pkg { command } => {
+            Commands::Pkg { json, command } => {
                 let result = match command {
-                    PkgCommands::Add { spec, registry } => pkg::cmd_add(&spec, registry.as_deref()),
-                    PkgCommands::Install { locked } => pkg::cmd_install(locked),
-                    PkgCommands::Update { name } => pkg::cmd_update(name.as_deref()),
-                    PkgCommands::Remove { name } => pkg::cmd_remove(&name),
-                    PkgCommands::List => pkg::cmd_list(),
-                    PkgCommands::Init => pkg::cmd_init(),
+                    PkgCommands::Add { spec, registry } => {
+                        pkg::cmd_add(&spec, registry.as_deref(), json)
+                    }
+                    PkgCommands::Install { locked } => pkg::cmd_install(locked, json),
+                    PkgCommands::Update { name } => pkg::cmd_update(name.as_deref(), json),
+                    PkgCommands::Remove { name } => pkg::cmd_remove(&name, json),
+                    PkgCommands::List => pkg::cmd_list(json),
+                    PkgCommands::Init => pkg::cmd_init(json),
                     PkgCommands::Login { token, registry } => {
-                        pkg::cmd_login(token.as_deref(), &registry)
+                        pkg::cmd_login(token.as_deref(), &registry, json)
                     }
-                    PkgCommands::Logout => pkg::cmd_logout(),
+                    PkgCommands::Logout => pkg::cmd_logout(json),
                     PkgCommands::Config { key, value } => {
-                        pkg::cmd_config(key.as_deref(), value.as_deref())
+                        pkg::cmd_config(key.as_deref(), value.as_deref(), json)
                     }
-                    PkgCommands::Publish { registry } => pkg::cmd_publish(registry.as_deref()),
+                    PkgCommands::Publish { registry } => {
+                        pkg::cmd_publish(registry.as_deref(), json)
+                    }
                     PkgCommands::Search { query, registry } => {
-                        pkg::cmd_search(&query, registry.as_deref())
+                        pkg::cmd_search(&query, registry.as_deref(), json)
                     }
                     PkgCommands::Yank { spec, registry } => {
-                        pkg::cmd_yank(&spec, registry.as_deref())
+                        pkg::cmd_yank(&spec, registry.as_deref(), json)
                     }
                     PkgCommands::Info { name, registry } => {
-                        pkg::cmd_info(&name, registry.as_deref())
+                        pkg::cmd_info(&name, registry.as_deref(), json)
                     }
                 };
                 if let Err(e) = result {

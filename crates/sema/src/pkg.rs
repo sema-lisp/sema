@@ -7,7 +7,22 @@ use sema_core::resolve::{packages_dir, validate_package_spec};
 const DEFAULT_REGISTRY: &str = "https://pkg.sema-lang.com";
 const PKG_META_FILE: &str = ".sema-pkg.json";
 
-fn ensure_sema_toml() -> Result<(), String> {
+macro_rules! human_output {
+    ($json:expr, $($arg:tt)*) => {
+        if !$json {
+            println!($($arg)*);
+        }
+    };
+}
+
+fn print_json(value: &serde_json::Value) -> Result<(), String> {
+    let output = serde_json::to_string_pretty(value)
+        .map_err(|error| format!("Failed to serialize package result: {error}"))?;
+    println!("{output}");
+    Ok(())
+}
+
+fn ensure_sema_toml(json: bool) -> Result<(), String> {
     let toml_path = Path::new("sema.toml");
     if !toml_path.exists() {
         let project_name = std::env::current_dir()
@@ -19,7 +34,7 @@ fn ensure_sema_toml() -> Result<(), String> {
         );
         std::fs::write(toml_path, content)
             .map_err(|e| format!("Failed to write sema.toml: {e}"))?;
-        println!("✓ Created sema.toml");
+        human_output!(json, "✓ Created sema.toml");
     }
     Ok(())
 }
@@ -190,17 +205,28 @@ fn collect_packages(dir: &Path, packages: &mut Vec<PathBuf>) {
     }
 }
 
-pub fn cmd_add(spec: &str, registry: Option<&str>) -> Result<(), String> {
+pub fn cmd_add(spec: &str, registry: Option<&str>, json: bool) -> Result<(), String> {
     if is_git_spec(spec) {
-        cmd_add_git(spec)
+        cmd_add_git(spec, json)?;
     } else {
-        cmd_add_registry(spec, registry)
+        cmd_add_registry(spec, registry, json)?;
     }
+    if json {
+        print_json(&serde_json::json!({
+            "ok": true,
+            "command": "add",
+            "package": spec,
+        }))?;
+    }
+    Ok(())
 }
 
 /// Install a git package and return (ref, commit_sha).
 /// Does NOT modify sema.toml or sema.lock.
-fn install_git(spec: &sema_core::resolve::PackageSpec) -> Result<(String, String), String> {
+fn install_git(
+    spec: &sema_core::resolve::PackageSpec,
+    json: bool,
+) -> Result<(String, String), String> {
     let pkg_dir = packages_dir();
     let dest = spec.dest_dir(&pkg_dir);
     let existed = dest.exists();
@@ -226,7 +252,12 @@ fn install_git(spec: &sema_core::resolve::PackageSpec) -> Result<(String, String
         }
     };
     run_git(Some(&dest), &["checkout", "--detach", &commit])?;
-    println!("✓ Installed {} → {} ({commit})", spec.path, spec.git_ref);
+    human_output!(
+        json,
+        "✓ Installed {} → {} ({commit})",
+        spec.path,
+        spec.git_ref
+    );
     let git_ref = spec.git_ref.clone();
     Ok((git_ref, commit))
 }
@@ -235,6 +266,7 @@ fn install_git(spec: &sema_core::resolve::PackageSpec) -> Result<(String, String
 fn install_git_locked(
     spec: &sema_core::resolve::PackageSpec,
     expected_commit: &str,
+    json: bool,
 ) -> Result<(), String> {
     let pkg_dir = packages_dir();
     let dest = spec.dest_dir(&pkg_dir);
@@ -268,18 +300,22 @@ fn install_git_locked(
             spec.path
         ));
     }
-    println!("✓ Installed {} → {expected_commit} (locked)", spec.path);
+    human_output!(
+        json,
+        "✓ Installed {} → {expected_commit} (locked)",
+        spec.path
+    );
     Ok(())
 }
 
-fn cmd_add_git(spec: &str) -> Result<(), String> {
+fn cmd_add_git(spec: &str, json: bool) -> Result<(), String> {
     let spec = sema_core::resolve::PackageSpec::parse(spec).map_err(|e| e.to_string())?;
-    let (git_ref, commit) = install_git(&spec)?;
+    let (git_ref, commit) = install_git(&spec, json)?;
 
-    ensure_sema_toml()?;
+    ensure_sema_toml(json)?;
     let toml_path = Path::new("sema.toml");
     match add_dep_to_toml(toml_path, spec.path.as_str(), &git_ref) {
-        Ok(true) => println!("✓ Added {} = \"{}\" to sema.toml", spec.path, git_ref),
+        Ok(true) => human_output!(json, "✓ Added {} = \"{}\" to sema.toml", spec.path, git_ref),
         Ok(false) => {}
         Err(e) => crate::print_cli_warning(format!("could not update sema.toml: {e}")),
     }
@@ -292,15 +328,15 @@ fn cmd_add_git(spec: &str) -> Result<(), String> {
             direct: true,
         },
     ) {
-        Ok(()) => println!("✓ Updated sema.lock"),
+        Ok(()) => human_output!(json, "✓ Updated sema.lock"),
         Err(e) => crate::print_cli_warning(format!("could not update sema.lock: {e}")),
     }
 
     // Pull in this package's own dependencies, if any (transitive resolution).
-    cmd_install(false)
+    cmd_install_inner(false, json)
 }
 
-fn cmd_add_registry(spec: &str, registry: Option<&str>) -> Result<(), String> {
+fn cmd_add_registry(spec: &str, registry: Option<&str>, json: bool) -> Result<(), String> {
     let (name, version) = if let Some((n, v)) = spec.rsplit_once('@') {
         (n.to_string(), Some(v.to_string()))
     } else {
@@ -320,14 +356,14 @@ fn cmd_add_registry(spec: &str, registry: Option<&str>) -> Result<(), String> {
         }
     };
 
-    println!("Installing {name}@{version} from registry...");
+    human_output!(json, "Installing {name}@{version} from registry...");
     let checksum = registry_install(&name, &version, &registry_url)?;
-    println!("✓ Installed {name}@{version}");
+    human_output!(json, "✓ Installed {name}@{version}");
 
-    ensure_sema_toml()?;
+    ensure_sema_toml(json)?;
     let toml_path = Path::new("sema.toml");
     match add_dep_to_toml(toml_path, &name, &version) {
-        Ok(true) => println!("✓ Added {name} = \"{version}\" to sema.toml"),
+        Ok(true) => human_output!(json, "✓ Added {name} = \"{version}\" to sema.toml"),
         Ok(false) => {}
         Err(e) => crate::print_cli_warning(format!("could not update sema.toml: {e}")),
     }
@@ -341,12 +377,12 @@ fn cmd_add_registry(spec: &str, registry: Option<&str>) -> Result<(), String> {
             direct: true,
         },
     ) {
-        Ok(()) => println!("✓ Updated sema.lock"),
+        Ok(()) => human_output!(json, "✓ Updated sema.lock"),
         Err(e) => crate::print_cli_warning(format!("could not update sema.lock: {e}")),
     }
 
     // Pull in this package's own dependencies, if any (transitive resolution).
-    cmd_install(false)
+    cmd_install_inner(false, json)
 }
 
 /// Parse a `[deps]`-shaped TOML table into a plain name → version/ref map.
@@ -365,11 +401,11 @@ fn parse_deps_table(
 
 /// Resolve+install a package with no usable lock entry (fresh install or a
 /// version/ref bump). Does not touch sema.toml or the lock file.
-fn resolve_and_install_one(name: &str, version: &str) -> Result<LockEntry, String> {
+fn resolve_and_install_one(name: &str, version: &str, json: bool) -> Result<LockEntry, String> {
     if is_git_spec(name) {
         let spec_str = format!("{name}@{version}");
         let spec = sema_core::resolve::PackageSpec::parse(&spec_str).map_err(|e| e.to_string())?;
-        let (git_ref, commit) = install_git(&spec)?;
+        let (git_ref, commit) = install_git(&spec, json)?;
         Ok(LockEntry::Git {
             git_ref,
             commit,
@@ -388,7 +424,7 @@ fn resolve_and_install_one(name: &str, version: &str) -> Result<LockEntry, Strin
 }
 
 /// Install (and integrity-verify) a package from an existing, matching lock entry.
-fn install_from_lock_entry(name: &str, entry: &LockEntry) -> Result<(), String> {
+fn install_from_lock_entry(name: &str, entry: &LockEntry, json: bool) -> Result<(), String> {
     match entry {
         LockEntry::Git {
             git_ref, commit, ..
@@ -396,14 +432,14 @@ fn install_from_lock_entry(name: &str, entry: &LockEntry) -> Result<(), String> 
             let spec_str = format!("{name}@{git_ref}");
             let spec =
                 sema_core::resolve::PackageSpec::parse(&spec_str).map_err(|e| e.to_string())?;
-            install_git_locked(&spec, commit)
+            install_git_locked(&spec, commit, json)
         }
         LockEntry::Registry {
             version,
             registry,
             checksum,
             ..
-        } => registry_install_locked(name, version, registry, checksum),
+        } => registry_install_locked(name, version, registry, checksum, json),
     }
 }
 
@@ -666,7 +702,7 @@ fn compute_reachable(direct_deps: &BTreeMap<String, String>) -> BTreeSet<String>
     reachable
 }
 
-fn print_resolution_note(note: &ResolutionNote) {
+fn print_resolution_note(note: &ResolutionNote, json: bool) {
     match note {
         ResolutionNote::DirectOverride {
             name,
@@ -674,7 +710,8 @@ fn print_resolution_note(note: &ResolutionNote) {
             requested_by,
             requested_version,
         } => {
-            println!(
+            human_output!(
+                json,
                 "  note: your direct pin of '{name}' ({direct_version}) overrides a transitive \
                  request for {requested_version} from '{requested_by}'"
             );
@@ -685,7 +722,8 @@ fn print_resolution_note(note: &ResolutionNote) {
             requesters,
         } => {
             let who: Vec<String> = requesters.iter().map(|(w, v)| format!("{w}@{v}")).collect();
-            println!(
+            human_output!(
+                json,
                 "  note: '{name}' resolved to {chosen_version} across multiple requesters ({})",
                 who.join(", ")
             );
@@ -711,7 +749,19 @@ fn check_locked_orphans(deps: &BTreeMap<String, String>, lock: &LockFile) -> Res
     Ok(())
 }
 
-pub fn cmd_install(locked: bool) -> Result<(), String> {
+pub fn cmd_install(locked: bool, json: bool) -> Result<(), String> {
+    cmd_install_inner(locked, json)?;
+    if json {
+        print_json(&serde_json::json!({
+            "ok": true,
+            "command": "install",
+            "locked": locked,
+        }))?;
+    }
+    Ok(())
+}
+
+fn cmd_install_inner(locked: bool, json: bool) -> Result<(), String> {
     let toml_path = Path::new("sema.toml");
     if !toml_path.exists() {
         return Err("No sema.toml found in current directory. Run `sema pkg init` first.".into());
@@ -736,7 +786,7 @@ pub fn cmd_install(locked: bool) -> Result<(), String> {
     let deps_table = match doc.get("deps").and_then(|d| d.as_table()) {
         Some(table) => table,
         None => {
-            println!("No [deps] found in sema.toml, nothing to install.");
+            human_output!(json, "No [deps] found in sema.toml, nothing to install.");
             return Ok(());
         }
     };
@@ -777,8 +827,8 @@ pub fn cmd_install(locked: bool) -> Result<(), String> {
         // Trust the lock's full flattened closure as-is (no network
         // re-derivation of the graph) and install every entry in it.
         for (name, entry) in &lock.entries {
-            println!("Installing {name} (locked)...");
-            install_from_lock_entry(name, entry)?;
+            human_output!(json, "Installing {name} (locked)...");
+            install_from_lock_entry(name, entry, json)?;
         }
 
         return Ok(());
@@ -790,12 +840,12 @@ pub fn cmd_install(locked: bool) -> Result<(), String> {
         &deps,
         &existing_lock,
         &mut |name, version| {
-            println!("Installing {name}...");
-            resolve_and_install_one(name, version)
+            human_output!(json, "Installing {name}...");
+            resolve_and_install_one(name, version, json)
         },
         &mut |name, entry| {
-            println!("Installing {name} (locked)...");
-            install_from_lock_entry(name, entry)
+            human_output!(json, "Installing {name} (locked)...");
+            install_from_lock_entry(name, entry, json)
         },
         &read_dest_manifest_deps,
     )?;
@@ -806,11 +856,11 @@ pub fn cmd_install(locked: bool) -> Result<(), String> {
         ));
     }
     for note in &notes {
-        print_resolution_note(note);
+        print_resolution_note(note, json);
     }
 
     write_lock_file(&new_lock)?;
-    println!("✓ Updated sema.lock");
+    human_output!(json, "✓ Updated sema.lock");
 
     Ok(())
 }
@@ -827,8 +877,9 @@ fn is_direct_dep(name: &str) -> bool {
         .unwrap_or(true)
 }
 
-pub fn cmd_update(name: Option<&str>) -> Result<(), String> {
+pub fn cmd_update(name: Option<&str>, json: bool) -> Result<(), String> {
     let pkg_dir = packages_dir();
+    let mut errors = Vec::new();
 
     if let Some(name) = name {
         if !is_direct_dep(name) {
@@ -841,11 +892,19 @@ pub fn cmd_update(name: Option<&str>) -> Result<(), String> {
         let dir = find_package_dir(&pkg_dir, name).ok_or_else(|| {
             format!("Package '{name}' not found. Run `sema pkg list` to see installed packages.")
         })?;
-        update_single_package(&pkg_dir, &dir)?;
+        update_single_package(&pkg_dir, &dir, json)?;
     } else {
         let packages = find_all_packages(&pkg_dir);
         if packages.is_empty() {
-            println!("No packages installed.");
+            human_output!(json, "No packages installed.");
+            if json {
+                print_json(&serde_json::json!({
+                    "ok": true,
+                    "command": "update",
+                    "package": name,
+                    "errors": [],
+                }))?;
+            }
             return Ok(());
         }
         // Only direct deps get force-bumped to latest here; transitive
@@ -857,8 +916,12 @@ pub fn cmd_update(name: Option<&str>) -> Result<(), String> {
             if !is_direct_dep(&rel_str) {
                 continue;
             }
-            if let Err(e) = update_single_package(&pkg_dir, dir) {
+            if let Err(e) = update_single_package(&pkg_dir, dir, json) {
                 crate::print_cli_error(format!("could not update {}: {e}", rel.display()));
+                errors.push(serde_json::json!({
+                    "package": rel_str,
+                    "error": e,
+                }));
             }
         }
     }
@@ -866,9 +929,17 @@ pub fn cmd_update(name: Option<&str>) -> Result<(), String> {
     // Re-resolve the whole graph so transitive requirements introduced or
     // dropped by the version bump(s) above get picked up or pruned.
     if Path::new("sema.toml").exists() {
-        cmd_install(false)?;
+        cmd_install_inner(false, json)?;
     }
 
+    if json {
+        print_json(&serde_json::json!({
+            "ok": errors.is_empty(),
+            "command": "update",
+            "package": name,
+            "errors": errors,
+        }))?;
+    }
     Ok(())
 }
 
@@ -877,7 +948,7 @@ pub fn cmd_update(name: Option<&str>) -> Result<(), String> {
 /// here is therefore `direct: true`, and `sema.toml` is only rewritten when
 /// the package is already listed there, so a transitive-only package can
 /// never get silently promoted into the root manifest.
-fn update_single_package(pkg_dir: &Path, dir: &Path) -> Result<(), String> {
+fn update_single_package(pkg_dir: &Path, dir: &Path, json: bool) -> Result<(), String> {
     let rel = dir.strip_prefix(pkg_dir).unwrap_or(dir);
     let rel_str = rel.display().to_string();
 
@@ -903,11 +974,19 @@ fn update_single_package(pkg_dir: &Path, dir: &Path) -> Result<(), String> {
         })?;
 
         if latest == current_ver {
-            println!("  {} already at latest ({current_ver})", rel.display());
+            human_output!(
+                json,
+                "  {} already at latest ({current_ver})",
+                rel.display()
+            );
         } else {
-            println!("  Updating {} {current_ver} → {latest}...", rel.display());
+            human_output!(
+                json,
+                "  Updating {} {current_ver} → {latest}...",
+                rel.display()
+            );
             let checksum = registry_install(&name, &latest, registry)?;
-            println!("✓ Updated {} → {latest}", rel.display());
+            human_output!(json, "✓ Updated {} → {latest}", rel.display());
 
             // Only rewrite sema.toml when this package is already a direct
             // dependency there.
@@ -941,7 +1020,7 @@ fn update_single_package(pkg_dir: &Path, dir: &Path) -> Result<(), String> {
         };
         let commit = resolve_and_validate_git_ref(dir, resolve_ref, &rel_str)?;
         run_git(Some(dir), &["checkout", "--detach", &commit])?;
-        println!("✓ Updated {} → {current_ref}", rel.display());
+        human_output!(json, "✓ Updated {} → {current_ref}", rel.display());
 
         let _ = update_lock_entry(
             &rel_str,
@@ -952,13 +1031,13 @@ fn update_single_package(pkg_dir: &Path, dir: &Path) -> Result<(), String> {
             },
         );
     } else {
-        println!("  {} — unknown source, skipping", rel.display());
+        human_output!(json, "  {} — unknown source, skipping", rel.display());
     }
 
     Ok(())
 }
 
-pub fn cmd_remove(name: &str) -> Result<(), String> {
+pub fn cmd_remove(name: &str, json: bool) -> Result<(), String> {
     let pkg_dir = packages_dir();
     let dir = find_package_dir(&pkg_dir, name).ok_or_else(|| {
         format!("Package '{name}' not found. Run `sema pkg list` to see installed packages.")
@@ -1007,14 +1086,26 @@ pub fn cmd_remove(name: &str) -> Result<(), String> {
             }
         }
         if removed_from_toml {
-            println!("✓ Removed {rel_path} from sema.toml");
+            human_output!(json, "✓ Removed {rel_path} from sema.toml");
         }
-        println!("Kept {rel_path} installed — still required transitively by another dependency.");
+        human_output!(
+            json,
+            "Kept {rel_path} installed — still required transitively by another dependency."
+        );
+        if json {
+            print_json(&serde_json::json!({
+                "ok": true,
+                "command": "remove",
+                "package": rel_path,
+                "removed": false,
+                "still_required": true,
+            }))?;
+        }
         return Ok(());
     }
 
     std::fs::remove_dir_all(&dir).map_err(|e| format!("Failed to remove package: {e}"))?;
-    println!("✓ Removed {rel_path}");
+    human_output!(json, "✓ Removed {rel_path}");
 
     // Clean up empty parent directories
     let mut parent = dir.parent();
@@ -1031,16 +1122,25 @@ pub fn cmd_remove(name: &str) -> Result<(), String> {
     }
 
     if removed_from_toml {
-        println!("✓ Removed {rel_path} from sema.toml");
+        human_output!(json, "✓ Removed {rel_path} from sema.toml");
     }
 
     // Remove from sema.lock if present
     match remove_lock_entry(&rel_path) {
-        Ok(true) => println!("✓ Removed {rel_path} from sema.lock"),
+        Ok(true) => human_output!(json, "✓ Removed {rel_path} from sema.lock"),
         Ok(false) => {}
         Err(e) => crate::print_cli_warning(format!("could not update sema.lock: {e}")),
     }
 
+    if json {
+        print_json(&serde_json::json!({
+            "ok": true,
+            "command": "remove",
+            "package": rel_path,
+            "removed": true,
+            "still_required": false,
+        }))?;
+    }
     Ok(())
 }
 
@@ -1104,16 +1204,20 @@ fn remove_dep_from_toml(toml_path: &Path, pkg_path: &str) -> Result<bool, String
     Ok(removed)
 }
 
-pub fn cmd_list() -> Result<(), String> {
+pub fn cmd_list(json: bool) -> Result<(), String> {
     let pkg_dir = packages_dir();
     let packages = find_all_packages(&pkg_dir);
 
     if packages.is_empty() {
+        if json {
+            return print_json(&serde_json::json!({ "packages": [] }));
+        }
         println!("No packages installed.");
         return Ok(());
     }
 
     let lock = read_lock_file().ok().flatten();
+    let mut results = Vec::with_capacity(packages.len());
 
     for dir in &packages {
         let rel = dir.strip_prefix(&pkg_dir).unwrap_or(dir);
@@ -1135,23 +1239,40 @@ pub fn cmd_list() -> Result<(), String> {
                 .get("registry")
                 .and_then(|v| v.as_str())
                 .unwrap_or("registry");
+            results.push(serde_json::json!({
+                "name": rel_str,
+                "version": version,
+                "source": "registry",
+                "registry": source,
+                "dependency_kind": kind,
+            }));
             match kind {
-                Some(k) => println!("  {} ({version}) [{source}, {k}]", rel.display()),
-                None => println!("  {} ({version}) [{source}]", rel.display()),
+                Some(k) => human_output!(json, "  {} ({version}) [{source}, {k}]", rel.display()),
+                None => human_output!(json, "  {} ({version}) [{source}]", rel.display()),
             }
         } else {
             let current = current_git_ref(dir);
+            results.push(serde_json::json!({
+                "name": rel_str,
+                "version": current,
+                "source": "git",
+                "registry": null,
+                "dependency_kind": kind,
+            }));
             match kind {
-                Some(k) => println!("  {} ({current}) [git, {k}]", rel.display()),
-                None => println!("  {} ({current}) [git]", rel.display()),
+                Some(k) => human_output!(json, "  {} ({current}) [git, {k}]", rel.display()),
+                None => human_output!(json, "  {} ({current}) [git]", rel.display()),
             }
         }
     }
 
+    if json {
+        print_json(&serde_json::json!({ "packages": results }))?;
+    }
     Ok(())
 }
 
-pub fn cmd_init() -> Result<(), String> {
+pub fn cmd_init(json: bool) -> Result<(), String> {
     let toml_path = Path::new("sema.toml");
     if toml_path.exists() {
         return Err("sema.toml already exists in current directory.".into());
@@ -1174,21 +1295,30 @@ entrypoint = "package.sema"
     );
 
     std::fs::write(toml_path, content).map_err(|e| format!("Failed to write sema.toml: {e}"))?;
-    println!("✓ Created sema.toml");
+    human_output!(json, "✓ Created sema.toml");
 
     let entry_path = Path::new("package.sema");
+    let mut created = vec!["sema.toml"];
     if !entry_path.exists() {
         let entry_content =
             ";; package entrypoint — all top-level definitions are available to importers\n";
         std::fs::write(entry_path, entry_content)
             .map_err(|e| format!("Failed to write package.sema: {e}"))?;
-        println!("✓ Created package.sema");
+        human_output!(json, "✓ Created package.sema");
+        created.push("package.sema");
     }
 
+    if json {
+        print_json(&serde_json::json!({
+            "ok": true,
+            "command": "init",
+            "created": created,
+        }))?;
+    }
     Ok(())
 }
 
-pub fn cmd_login(token: Option<&str>, registry: &str) -> Result<(), String> {
+pub fn cmd_login(token: Option<&str>, registry: &str, json: bool) -> Result<(), String> {
     let token = match token {
         Some(t) => t.to_string(),
         None => {
@@ -1226,19 +1356,36 @@ pub fn cmd_login(token: Option<&str>, registry: &str) -> Result<(), String> {
         let _ = std::fs::set_permissions(&creds_path, perms);
     }
 
-    println!("✓ Login saved to {}", creds_path.display());
-    println!("  Registry: {registry}");
+    human_output!(json, "✓ Login saved to {}", creds_path.display());
+    human_output!(json, "  Registry: {registry}");
+    if json {
+        print_json(&serde_json::json!({
+            "ok": true,
+            "command": "login",
+            "registry": registry,
+            "credentials_file": creds_path,
+        }))?;
+    }
     Ok(())
 }
 
-pub fn cmd_logout() -> Result<(), String> {
+pub fn cmd_logout(json: bool) -> Result<(), String> {
     let creds_path = credentials_path();
+    let was_logged_in = creds_path.exists();
     if creds_path.exists() {
         std::fs::remove_file(&creds_path)
             .map_err(|e| format!("Failed to remove credentials: {e}"))?;
-        println!("✓ Logged out (removed {})", creds_path.display());
+        human_output!(json, "✓ Logged out (removed {})", creds_path.display());
     } else {
-        println!("Not logged in.");
+        human_output!(json, "Not logged in.");
+    }
+    if json {
+        print_json(&serde_json::json!({
+            "ok": true,
+            "command": "logout",
+            "was_logged_in": was_logged_in,
+            "credentials_file": creds_path,
+        }))?;
     }
     Ok(())
 }
@@ -1258,12 +1405,21 @@ pub fn read_token() -> Option<String> {
         .map(|s| s.to_string())
 }
 
-pub fn cmd_config(key: Option<&str>, value: Option<&str>) -> Result<(), String> {
+pub fn cmd_config(key: Option<&str>, value: Option<&str>, json: bool) -> Result<(), String> {
     match (key, value) {
         // Show all config
         (None, _) => {
             let url = read_registry_url();
             let has_token = read_token().is_some();
+            if json {
+                return print_json(&serde_json::json!({
+                    "registry": {
+                        "url": url,
+                        "token_set": has_token,
+                    },
+                    "credentials_file": credentials_path(),
+                }));
+            }
             println!("registry.url = {url}");
             println!(
                 "registry.token = {}",
@@ -1275,7 +1431,12 @@ pub fn cmd_config(key: Option<&str>, value: Option<&str>) -> Result<(), String> 
         // Get a specific key
         (Some(key), None) => match key {
             "registry.url" | "registry" => {
-                println!("{}", read_registry_url());
+                let url = read_registry_url();
+                if json {
+                    print_json(&serde_json::json!({ "key": "registry.url", "value": url }))?;
+                } else {
+                    println!("{url}");
+                }
                 Ok(())
             }
             _ => Err(format!(
@@ -1286,7 +1447,16 @@ pub fn cmd_config(key: Option<&str>, value: Option<&str>) -> Result<(), String> 
         (Some(key), Some(value)) => match key {
             "registry.url" | "registry" => {
                 set_registry_url(value)?;
-                println!("✓ Default registry set to {value}");
+                if json {
+                    print_json(&serde_json::json!({
+                        "ok": true,
+                        "command": "config",
+                        "key": "registry.url",
+                        "value": value,
+                    }))?;
+                } else {
+                    println!("✓ Default registry set to {value}");
+                }
                 Ok(())
             }
             _ => Err(format!(
@@ -1739,6 +1909,7 @@ fn registry_install_locked(
     version: &str,
     registry_url: &str,
     expected_checksum: &str,
+    json: bool,
 ) -> Result<(), String> {
     validate_package_spec(name).map_err(|e| e.to_string())?;
     validate_registry_version(name, version, registry_url)?;
@@ -1754,7 +1925,7 @@ fn registry_install_locked(
     let dest = pkg_dir.join(name);
     install_tarball_atomic(&tarball, &dest, name, version, registry_url, &checksum)?;
 
-    println!("✓ Installed {name}@{version} (locked)");
+    human_output!(json, "✓ Installed {name}@{version} (locked)");
     Ok(())
 }
 
@@ -1965,7 +2136,7 @@ fn validate_version(version: &str) -> Result<semver::Version, String> {
     })
 }
 
-pub fn cmd_publish(registry: Option<&str>) -> Result<(), String> {
+pub fn cmd_publish(registry: Option<&str>, json: bool) -> Result<(), String> {
     let toml_path = Path::new("sema.toml");
     if !toml_path.exists() {
         return Err("No sema.toml found. Run `sema pkg init` first.".into());
@@ -2015,9 +2186,9 @@ pub fn cmd_publish(registry: Option<&str>) -> Result<(), String> {
     let base = registry_url.trim_end_matches('/');
 
     // Create tarball
-    println!("Packaging...");
+    human_output!(json, "Packaging...");
     let tarball = create_tarball(".")?;
-    println!("  {} bytes compressed", tarball.len());
+    human_output!(json, "  {} bytes compressed", tarball.len());
 
     // Build metadata
     let metadata = serde_json::json!({
@@ -2055,6 +2226,9 @@ pub fn cmd_publish(registry: Option<&str>) -> Result<(), String> {
         let body: serde_json::Value = resp
             .json()
             .map_err(|e| format!("Failed to parse response: {e}"))?;
+        if json {
+            return print_json(&body);
+        }
         let checksum = body
             .get("checksum")
             .and_then(|v| v.as_str())
@@ -2073,7 +2247,7 @@ pub fn cmd_publish(registry: Option<&str>) -> Result<(), String> {
     }
 }
 
-pub fn cmd_search(query: &str, registry: Option<&str>) -> Result<(), String> {
+pub fn cmd_search(query: &str, registry: Option<&str>, json: bool) -> Result<(), String> {
     let registry_url = effective_registry(registry);
     let base = registry_url.trim_end_matches('/');
     let url = format!("{base}/api/v1/search?q={}", urlencoded(query));
@@ -2089,6 +2263,10 @@ pub fn cmd_search(query: &str, registry: Option<&str>) -> Result<(), String> {
     let body: serde_json::Value = resp
         .json()
         .map_err(|e| format!("Failed to parse response: {e}"))?;
+
+    if json {
+        return print_json(&body);
+    }
 
     let packages = body
         .get("packages")
@@ -2123,7 +2301,7 @@ pub fn cmd_search(query: &str, registry: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-pub fn cmd_yank(spec: &str, registry: Option<&str>) -> Result<(), String> {
+pub fn cmd_yank(spec: &str, registry: Option<&str>, json: bool) -> Result<(), String> {
     let (name, version) = spec
         .rsplit_once('@')
         .ok_or("Expected format: <package>@<version> (e.g., my-package@0.1.0)")?;
@@ -2142,7 +2320,17 @@ pub fn cmd_yank(spec: &str, registry: Option<&str>) -> Result<(), String> {
     })?;
 
     if resp.status().is_success() {
-        println!("✓ Yanked {name}@{version}");
+        if json {
+            print_json(&serde_json::json!({
+                "ok": true,
+                "command": "yank",
+                "package": name,
+                "version": version,
+                "registry": registry_url,
+            }))?;
+        } else {
+            println!("✓ Yanked {name}@{version}");
+        }
         Ok(())
     } else {
         let status = resp.status();
@@ -2155,9 +2343,13 @@ pub fn cmd_yank(spec: &str, registry: Option<&str>) -> Result<(), String> {
     }
 }
 
-pub fn cmd_info(name: &str, registry: Option<&str>) -> Result<(), String> {
+pub fn cmd_info(name: &str, registry: Option<&str>, json: bool) -> Result<(), String> {
     let registry_url = effective_registry(registry);
     let info = registry_package_info(name, &registry_url)?;
+
+    if json {
+        return print_json(&info);
+    }
 
     let pkg = info.get("package").unwrap_or(&info);
     let pkg_name = pkg.get("name").and_then(|v| v.as_str()).unwrap_or(name);
@@ -2727,8 +2919,9 @@ mod tests {
         // The lock-file restore path must guard the name too, before any
         // network/filesystem work reaches `pkg_dir.join(name)`.
         for bad in ["../../etc/cron.d", "..", "/etc/passwd", "a/../../b"] {
-            let err = registry_install_locked(bad, "1.0.0", "http://localhost:0", "deadbeef")
-                .unwrap_err();
+            let err =
+                registry_install_locked(bad, "1.0.0", "http://localhost:0", "deadbeef", false)
+                    .unwrap_err();
             assert!(
                 err.contains("path traversal")
                     || err.contains("absolute paths")
@@ -2972,7 +3165,7 @@ mod tests {
 
     #[test]
     fn test_cmd_add_rejects_traversal() {
-        let result = cmd_add("github.com/../../etc/passwd", None);
+        let result = cmd_add("github.com/../../etc/passwd", None, false);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("path traversal"), "got: {err}");
@@ -2980,7 +3173,7 @@ mod tests {
 
     #[test]
     fn test_cmd_add_rejects_scheme() {
-        let result = cmd_add("https://github.com/user/repo", None);
+        let result = cmd_add("https://github.com/user/repo", None, false);
         assert!(result.is_err());
     }
 
@@ -2994,7 +3187,7 @@ mod tests {
         // Run cmd_init in the temp directory
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(&tmp).unwrap();
-        let result = cmd_init();
+        let result = cmd_init(false);
         std::env::set_current_dir(original_dir).unwrap();
 
         assert!(result.is_ok());
@@ -3296,7 +3489,7 @@ name = "myproject"
 
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(&tmp).unwrap();
-        let result = cmd_init();
+        let result = cmd_init(false);
         std::env::set_current_dir(original_dir).unwrap();
 
         assert!(result.is_err());
@@ -3362,7 +3555,7 @@ name = "myproject"
 
     #[test]
     fn test_cmd_yank_requires_at_sign() {
-        let result = cmd_yank("my-package", None);
+        let result = cmd_yank("my-package", None, false);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Expected format"));
     }
@@ -4499,7 +4692,7 @@ name = "myproject"
         )
         .unwrap();
 
-        let err = cmd_install(true).unwrap_err();
+        let err = cmd_install(true, false).unwrap_err();
         assert!(err.contains("sema.lock not found"), "got: {err}");
 
         let _ = fs::remove_dir_all(&dir);
@@ -4530,7 +4723,7 @@ name = "myproject"
         )
         .unwrap();
 
-        let err = cmd_install(true).unwrap_err();
+        let err = cmd_install(true, false).unwrap_err();
         assert!(err.contains("bar"), "got: {err}");
         assert!(err.contains("not in sema.lock"), "got: {err}");
 
@@ -4567,7 +4760,7 @@ name = "myproject"
         )
         .unwrap();
 
-        let err = cmd_install(true).unwrap_err();
+        let err = cmd_install(true, false).unwrap_err();
         assert!(err.contains("orphaned-pkg"), "got: {err}");
         assert!(err.contains("not in sema.toml"), "got: {err}");
 
@@ -4599,7 +4792,7 @@ name = "myproject"
         )
         .unwrap();
 
-        let err = cmd_install(true).unwrap_err();
+        let err = cmd_install(true, false).unwrap_err();
         assert!(err.contains("foo"), "got: {err}");
         assert!(err.contains("mismatch"), "got: {err}");
         assert!(err.contains("2.0.0"), "got: {err}");
@@ -4633,7 +4826,7 @@ name = "myproject"
         )
         .unwrap();
 
-        let err = cmd_install(true).unwrap_err();
+        let err = cmd_install(true, false).unwrap_err();
         assert!(err.contains("github.com/user/repo"), "got: {err}");
         assert!(err.contains("mismatch"), "got: {err}");
         assert!(err.contains("v2.0"), "got: {err}");
@@ -4657,7 +4850,7 @@ name = "myproject"
         // Invalid TOML in lock
         fs::write(LOCK_FILE, "this is garbage {{{").unwrap();
 
-        let err = cmd_install(true).unwrap_err();
+        let err = cmd_install(true, false).unwrap_err();
         assert!(err.contains("parse"), "got: {err}");
 
         let _ = fs::remove_dir_all(&dir);
@@ -4676,7 +4869,7 @@ name = "myproject"
         .unwrap();
 
         // Should succeed even without lock file
-        cmd_install(false).unwrap();
+        cmd_install(false, false).unwrap();
         // Lock file should be written (empty packages)
         let lock = read_lock_file().unwrap().unwrap();
         assert!(lock.entries.is_empty());
@@ -4699,7 +4892,7 @@ name = "myproject"
         fs::write(LOCK_FILE, "lock_version = 1\n\n[packages]\n").unwrap();
 
         // Empty deps + empty lock = success
-        cmd_install(true).unwrap();
+        cmd_install(true, false).unwrap();
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4743,7 +4936,7 @@ name = "myproject"
         )
         .unwrap();
 
-        cmd_remove("A").unwrap();
+        cmd_remove("A", false).unwrap();
 
         assert!(
             pkg_dir.join("A").exists(),
@@ -4796,7 +4989,7 @@ name = "myproject"
         )
         .unwrap();
 
-        cmd_remove("A").unwrap();
+        cmd_remove("A", false).unwrap();
 
         assert!(
             !pkg_dir.join("A").exists(),

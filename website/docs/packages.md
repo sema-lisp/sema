@@ -113,6 +113,16 @@ When you import a package, Sema resolves the entrypoint in this order:
 
 ## CLI Commands
 
+Every package command accepts `--json`. JSON mode writes one JSON document to
+standard output. Status messages are omitted so scripts can parse the result
+directly. The flag can appear before or after the subcommand:
+
+```bash
+sema pkg --json search http
+sema pkg info http-helpers --json
+sema pkg list --json
+```
+
 ### `sema pkg init`
 
 Initialize a new project in the current directory. Creates a `sema.toml` with the directory name as the package name.
@@ -215,6 +225,7 @@ Search the registry for packages.
 ```bash
 sema pkg search http
 sema pkg search json --registry https://my-registry.com
+sema pkg search json --json
 ```
 
 ```
@@ -231,6 +242,7 @@ Show detailed package information from the registry.
 
 ```bash
 sema pkg info http-helpers
+sema pkg info http-helpers --json
 ```
 
 ```

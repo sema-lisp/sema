@@ -680,6 +680,16 @@ mod redirect_hints {
     fn nth_swapped_args_flagged() {
         assert!(hint_of("(nth 1 (list 10 20 30))").contains("arguments are swapped"));
     }
+
+    #[test]
+    fn take_swapped_args_flagged() {
+        assert!(hint_of("(take (list 10 20 30) 2)").contains("arguments are swapped"));
+    }
+
+    #[test]
+    fn drop_swapped_args_flagged() {
+        assert!(hint_of("(drop (list 10 20 30) 2)").contains("arguments are swapped"));
+    }
 }
 
 // ============================================================

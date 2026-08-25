@@ -2383,7 +2383,16 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "take", |args| {
         check_arity!(args, "take", 2);
-        let n = args[0].as_index("take")?;
+        let n = args[0].as_index("take").map_err(|e| {
+            // A collection in the count slot almost always means swapped args.
+            if args[0].as_list().is_some() || args[0].as_vector().is_some() {
+                e.with_hint(
+                    "take: argument order is (take count collection) — looks like the arguments are swapped",
+                )
+            } else {
+                e
+            }
+        })?;
         let items = get_sequence(&args[1], "take")?;
         let end = n.min(items.len());
         Ok(Value::list(items[..end].to_vec()))
@@ -2391,7 +2400,16 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "drop", |args| {
         check_arity!(args, "drop", 2);
-        let n = args[0].as_index("drop")?;
+        let n = args[0].as_index("drop").map_err(|e| {
+            // A collection in the count slot almost always means swapped args.
+            if args[0].as_list().is_some() || args[0].as_vector().is_some() {
+                e.with_hint(
+                    "drop: argument order is (drop count collection) — looks like the arguments are swapped",
+                )
+            } else {
+                e
+            }
+        })?;
         let items = get_sequence(&args[1], "drop")?;
         let start = n.min(items.len());
         Ok(Value::list(items[start..].to_vec()))

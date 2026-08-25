@@ -603,16 +603,30 @@ pub fn register(env: &sema_core::Env) {
     });
 
     register_fn(env, "string/index-of", |args| {
-        check_arity!(args, "string/index-of", 2);
+        check_arity!(args, "string/index-of", 2..=3);
         let s = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         let sub = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        match s.find(sub) {
+        let start_char = if args.len() == 3 {
+            args[2].as_index("string/index-of")?
+        } else {
+            0
+        };
+        let char_count = s.chars().count();
+        if start_char > char_count {
+            return Ok(Value::nil());
+        }
+        let start_byte = s
+            .char_indices()
+            .nth(start_char)
+            .map(|(i, _)| i)
+            .unwrap_or(s.len());
+        match s[start_byte..].find(sub) {
             Some(byte_idx) => {
-                let char_idx = s[..byte_idx].chars().count();
+                let char_idx = s[..start_byte + byte_idx].chars().count();
                 Ok(Value::int(char_idx as i64))
             }
             None => Ok(Value::nil()),

@@ -233,6 +233,17 @@ eval_tests! {
         ]),
 }
 
+eval_tests! {
+    // A declared :default excuses the caller from supplying the key, and the
+    // handler receives the default value instead of nil.
+    deftool_default_used_when_key_absent:
+        r#"(begin (deftool greet "Greet" {:name {:type :string :default "world"}} (lambda (name) (string-append "hi " name))) (tool/invoke greet {}))"#
+        => Value::string("hi world"),
+    deftool_default_overridden_when_key_present:
+        r#"(begin (deftool greet "Greet" {:name {:type :string :default "world"}} (lambda (name) (string-append "hi " name))) (tool/invoke greet {:name "helge"}))"#
+        => Value::string("hi helge"),
+}
+
 eval_error_tests! {
     tool_invoke_invalid_args: r#"(begin (deftool calc "Add" {:x {:type :number}} (lambda (x) x)) (tool/invoke calc {}))"# => "invalid arguments for tool 'calc': missing key: x",
     tool_invoke_validate_fail: r#"(begin (deftool check "Check" {:x {:type :number :validate (lambda (v) (> v 0)) :message "must be positive"}} (lambda (x) x)) (tool/invoke check {:x -1}))"# => "invalid arguments for tool 'check': key x: must be positive",

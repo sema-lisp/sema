@@ -8,6 +8,18 @@ Define a tool that can be invoked by an LLM agent. The `name` must be a symbol. 
 
 The tool value is bound to `name` in the current environment and is also returned by the form. You can inspect a tool with `tool/name`, `tool/description`, `tool/parameters`, `tool/policy-subjects`, and test values with `tool?`. Tools are passed to agents via the `:tools` key in `defagent`.
 
+Each parameter is required by default. Add `:optional #t` to allow the caller (the LLM, or a direct `tool/invoke`) to omit it — the handler then receives `nil` for that argument. Add `:default <value>` to give it a fallback instead of `nil`; a declared `:default` also makes the parameter optional, so `:optional #t` is redundant once `:default` is set. Both keys are reflected in the generated JSON Schema sent to the LLM (`:default` becomes the schema's `default`, and the field drops out of `required`).
+
+```sema
+(deftool greet
+  "Greet someone by name."
+  {:name {:type :string :description "The person's name" :default "world"}}
+  (lambda (name) (string-append "Hello, " name "!")))
+
+(tool/invoke greet {})              ; => "Hello, world!"
+(tool/invoke greet {:name "Ada"})   ; => "Hello, Ada!"
+```
+
 An optional `options-map` may sit between `parameters-map` and `handler-expr`. Its only key is `:policy-subjects`, a list or vector of maps that declare what the tool acts on, so a `defpolicy` `:subjects` rule matches by meaning instead of by tool name. Each subject map needs a `:kind`: `:file-read`, `:file-write`, or `:file-delete` (with `:path-arg`); `:network-request` (with `:url-arg` and optional `:method`); `:command` (with `:command-arg`); or `:external-action` (with `:action` and optional `:target-arg`). Each `*-arg` value names the parameter that carries the value at call time.
 
 ```sema

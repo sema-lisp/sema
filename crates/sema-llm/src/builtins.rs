@@ -7929,11 +7929,14 @@ fn prepare_extraction_validation(
             .or_else(|| key.as_str().map(|s| s.to_string()))
             .unwrap_or_else(|| key.to_string());
 
-        // Check if field is optional (only applies to map-style field specs)
+        // Check if field is optional (only applies to map-style field specs).
+        // A declared :default also excuses the caller from supplying the key —
+        // that is the point of a default.
         let is_optional = if let Some(spec) = field_spec.as_map_rc() {
             spec.get(&Value::keyword("optional"))
                 .map(|v| v.is_truthy())
                 .unwrap_or(false)
+                || spec.get(&Value::keyword("default")).is_some()
         } else {
             false
         };
@@ -11336,8 +11339,12 @@ fn sema_value_to_json_schema(val: &Value) -> serde_json::Value {
                     .get(&Value::keyword("optional"))
                     .map(|v| v.is_truthy())
                     .unwrap_or(false);
-                if !optional {
+                let default = inner.get(&Value::keyword("default"));
+                if !optional && default.is_none() {
                     required.push(serde_json::Value::String(key.clone()));
+                }
+                if let Some(d) = default {
+                    prop_obj.insert("default".to_string(), sema_core::value_to_json_lossy(d));
                 }
                 serde_json::Value::Object(prop_obj)
             } else {
@@ -14269,16 +14276,24 @@ fn prepare_tool_call_cooperative(
 
 /// Convert JSON arguments into a list of Sema values based on handler declaration order.
 /// Falling back to the parameter map uses BTreeMap key order (alphabetical).
+/// Look up a `:default` declared on a deftool param spec, e.g.
+/// `{:name {:type "string" :default "world"}}`.
+fn param_default(params: &Value, key: &str) -> Option<Value> {
+    let inner = params.as_map_rc()?.get(&Value::keyword(key))?.as_map_rc()?;
+    inner.get(&Value::keyword("default")).cloned()
+}
+
 fn json_args_to_sema(params: &Value, arguments: &serde_json::Value, handler: &Value) -> Vec<Value> {
     if let serde_json::Value::Object(json_obj) = arguments {
         if let Some(param_names) = handler_param_names(handler) {
             return param_names
                 .iter()
                 .map(|name| {
+                    let key = resolve(*name);
                     json_obj
-                        .get(&resolve(*name))
+                        .get(&key)
                         .map(sema_core::json_to_value)
-                        .unwrap_or(Value::nil())
+                        .unwrap_or_else(|| param_default(params, &key).unwrap_or(Value::nil()))
                 })
                 .collect();
         }
@@ -14294,7 +14309,7 @@ fn json_args_to_sema(params: &Value, arguments: &serde_json::Value, handler: &Va
                     json_obj
                         .get(&key_str)
                         .map(sema_core::json_to_value)
-                        .unwrap_or(Value::nil())
+                        .unwrap_or_else(|| param_default(params, &key_str).unwrap_or(Value::nil()))
                 })
                 .collect();
         }
@@ -14344,6 +14359,23 @@ mod tests {
         assert_eq!(usage.cache_hits, 1);
         assert_eq!(usage.calls, 0);
         assert_eq!(usage.cost_usd, None);
+    }
+
+    #[test]
+    fn json_schema_default_marks_param_not_required_and_emits_default() {
+        let mut field = std::collections::BTreeMap::new();
+        field.insert(Value::keyword("type"), Value::keyword("string"));
+        field.insert(Value::keyword("default"), Value::string("world"));
+        let mut params = std::collections::BTreeMap::new();
+        params.insert(Value::keyword("name"), Value::map(field));
+
+        let schema = sema_value_to_json_schema(&Value::map(params));
+        let required = schema["required"].as_array().expect("required array");
+        assert!(
+            !required.iter().any(|v| v == "name"),
+            "a :default should excuse the param from `required`: {schema}"
+        );
+        assert_eq!(schema["properties"]["name"]["default"], json!("world"));
     }
 
     #[test]

@@ -15150,12 +15150,13 @@ fn test_eval_stdin_json() {
 
 #[test]
 fn test_eval_stdin_read_error_json_has_message() {
-    // Feed the child a *directory* as its stdin. Reading a directory fd fails
-    // with an io error (EISDIR), so `stdin().read_to_string()` errors — the
-    // stdin-read-failure early-exit path, which previously emitted
-    // `"error": null` and silently dropped the actual cause.
-    let stdin_file =
-        std::fs::File::open(std::env::temp_dir()).expect("failed to open a directory as stdin");
+    // Feed the child invalid UTF-8. `read_to_string()` reports InvalidData on
+    // every platform, so this exercises the stdin-read-failure path without
+    // depending on how the OS opens directories or inherits access modes.
+    let dir = unique_temp_dir("eval-stdin-read-error");
+    let stdin_path = dir.join("invalid-utf8-stdin");
+    std::fs::write(&stdin_path, [0xff]).expect("failed to write invalid UTF-8 stdin file");
+    let stdin_file = std::fs::File::open(&stdin_path).expect("failed to open stdin file");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
         .args(["eval", "--stdin", "--json", "--no-llm"])
         .stdin(std::process::Stdio::from(stdin_file))
@@ -15169,6 +15170,7 @@ fn test_eval_stdin_read_error_json_has_message() {
         !msg.is_empty(),
         "expected a non-null error message reporting the stdin read failure: {json}"
     );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

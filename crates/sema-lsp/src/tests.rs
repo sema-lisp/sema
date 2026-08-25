@@ -2690,10 +2690,13 @@ fn hover_finds_definition_in_scanned_workspace_file() {
 
 #[test]
 fn hover_finds_definition_in_other_open_document() {
-    let (mut state, main_uri) = parsed_state("file:///ws/main.sema", "(greet \"world\")\n");
+    let dir = unique_temp_dir("hover-open-document");
+    let main_uri = Url::from_file_path(dir.join("main.sema")).unwrap();
+    let library_uri = Url::from_file_path(dir.join("library.sema")).unwrap();
+    let (mut state, main_uri) = parsed_state(main_uri.as_str(), "(greet \"world\")\n");
     insert_parsed_doc(
         &mut state,
-        "file:///ws/library.sema",
+        library_uri.as_str(),
         "(define (greet name) name)\n",
     );
 
@@ -2714,6 +2717,7 @@ fn hover_finds_definition_in_other_open_document() {
         "got: {}",
         content.value
     );
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

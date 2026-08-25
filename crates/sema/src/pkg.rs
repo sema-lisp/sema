@@ -1318,21 +1318,92 @@ entrypoint = "package.sema"
     Ok(())
 }
 
-pub fn cmd_login(token: Option<&str>, registry: &str, json: bool) -> Result<(), String> {
-    let token = match token {
-        Some(t) => t.to_string(),
-        None => {
-            eprint!("API token: ");
-            let mut input = String::new();
-            std::io::stdin()
-                .read_line(&mut input)
-                .map_err(|e| format!("Failed to read input: {e}"))?;
-            let input = input.trim().to_string();
-            if input.is_empty() {
-                return Err("Token cannot be empty".into());
-            }
-            input
-        }
+/// Read one line from stdin with a prompt on stderr. The input echoes — same
+/// as the token prompt below; prefer flags in scripts.
+fn prompt_line(prompt: &str) -> Result<String, String> {
+    eprint!("{prompt}");
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| format!("Failed to read input: {e}"))?;
+    let input = input.trim().to_string();
+    if input.is_empty() {
+        return Err("Input cannot be empty".into());
+    }
+    Ok(input)
+}
+
+/// Exchange username+password for a freshly minted API token: log in for a
+/// session, then create a token via the registry's tokens API.
+fn token_from_password(
+    username: &str,
+    password: Option<&str>,
+    registry: &str,
+) -> Result<String, String> {
+    let password = match password {
+        Some(p) => p.to_string(),
+        None => prompt_line(&format!("Password for {username}: "))?,
+    };
+
+    let client = http_client()?;
+    let resp = send_with_retry("Login", || {
+        client
+            .post(format!("{registry}/api/v1/auth/login"))
+            .json(&serde_json::json!({"username": username, "password": password}))
+            .send()
+    })?;
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("Invalid username or password".into());
+    }
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(format!(
+            "{registry} does not support password login — use `sema pkg login --token <token>`"
+        ));
+    }
+    if !resp.status().is_success() {
+        return Err(format!("Login failed ({})", resp.status()));
+    }
+    let session = resp
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|c| c.split(';').next())
+        .map(str::trim)
+        .find(|kv| kv.starts_with("session="))
+        .map(|kv| kv.to_string())
+        .ok_or_else(|| "Login succeeded but no session cookie was returned".to_string())?;
+
+    let resp = send_with_retry("Token create", || {
+        client
+            .post(format!("{registry}/api/v1/tokens"))
+            .header("Cookie", &session)
+            .json(&serde_json::json!({"name": "sema-cli login"}))
+            .send()
+    })?;
+    if !resp.status().is_success() {
+        return Err(format!("Could not create an API token ({})", resp.status()));
+    }
+    let body: serde_json::Value = resp
+        .json()
+        .map_err(|e| format!("Invalid token response: {e}"))?;
+    body.get("token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "Token response had no token".to_string())
+}
+
+pub fn cmd_login(
+    token: Option<&str>,
+    username: Option<&str>,
+    password: Option<&str>,
+    registry: &str,
+    json: bool,
+) -> Result<(), String> {
+    let token = match (token, username) {
+        (Some(t), _) => t.to_string(),
+        (None, Some(user)) => token_from_password(user, password, registry)?,
+        (None, None) => prompt_line("API token: ")?,
     };
 
     if !token.starts_with("sema_pat_") {
@@ -1366,6 +1437,66 @@ pub fn cmd_login(token: Option<&str>, registry: &str, json: bool) -> Result<(), 
             "credentials_file": creds_path,
         }))?;
     }
+    Ok(())
+}
+
+/// `sema pkg whoami` — show which registry account the stored token belongs to.
+pub fn cmd_whoami(registry: Option<&str>, json: bool) -> Result<(), String> {
+    let registry_url = effective_registry(registry);
+    let token = read_token()
+        .ok_or_else(|| "Not logged in — run `sema pkg login --token <token>` first".to_string())?;
+
+    let client = http_client()?;
+    let url = format!("{registry_url}/api/v1/me");
+    let resp = send_with_retry("Whoami", || {
+        client
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+    })?;
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(format!(
+            "Token rejected by {registry_url} — it may be revoked; run `sema pkg login` with a fresh token"
+        ));
+    }
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Err(format!(
+            "{registry_url} does not support whoami (no /api/v1/me endpoint — registry too old)"
+        ));
+    }
+    if !status.is_success() {
+        return Err(format!("Whoami failed ({status})"));
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .map_err(|e| format!("Invalid whoami response: {e}"))?;
+    if json {
+        return print_json(&body);
+    }
+
+    let username = body.get("username").and_then(|v| v.as_str()).unwrap_or("?");
+    println!("{username}");
+    if let Some(email) = body.get("email").and_then(|v| v.as_str()) {
+        println!("  email: {email}");
+    }
+    let official = body
+        .get("is_official")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let admin = body
+        .get("is_admin")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if official {
+        println!("  official account");
+    }
+    if admin {
+        println!("  admin");
+    }
+    println!("  registry: {registry_url}");
     Ok(())
 }
 

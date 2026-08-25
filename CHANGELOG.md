@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`sema pkg whoami`.** Shows which registry account the stored token belongs
+  to (username, email, official/admin flags, registry URL) via the registry's
+  `GET /api/v1/me`. A registry without that endpoint reports "registry too
+  old"; a revoked token and a missing login each get a distinct error.
+- **`sema pkg login --username`.** Logs in with a registry username and
+  password (`--password`, or an interactive prompt) and exchanges them for a
+  freshly minted API token, which is stored exactly as `--token` would be.
+
 ## 1.35.0
 
 ### Added

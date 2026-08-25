@@ -532,8 +532,16 @@ enum PkgCommands {
     /// Authenticate with a package registry
     Login {
         /// API token (from registry account page)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "username")]
         token: Option<String>,
+
+        /// Registry username — exchanges the password for a fresh API token
+        #[arg(long)]
+        username: Option<String>,
+
+        /// Registry password (prompted when --username is given without it)
+        #[arg(long, requires = "username")]
+        password: Option<String>,
 
         /// Registry URL (default: https://pkg.sema-lang.com)
         #[arg(long, default_value = "https://pkg.sema-lang.com")]
@@ -541,6 +549,12 @@ enum PkgCommands {
     },
     /// Remove stored registry credentials
     Logout,
+    /// Show which registry account the stored token belongs to
+    Whoami {
+        /// Registry URL override
+        #[arg(long)]
+        registry: Option<String>,
+    },
     /// View or set package manager configuration
     Config {
         /// Config key (e.g., registry.url). Omit to show all config
@@ -1237,10 +1251,20 @@ fn main() {
                     PkgCommands::Remove { name } => pkg::cmd_remove(&name, json),
                     PkgCommands::List => pkg::cmd_list(json),
                     PkgCommands::Init => pkg::cmd_init(json),
-                    PkgCommands::Login { token, registry } => {
-                        pkg::cmd_login(token.as_deref(), &registry, json)
-                    }
+                    PkgCommands::Login {
+                        token,
+                        username,
+                        password,
+                        registry,
+                    } => pkg::cmd_login(
+                        token.as_deref(),
+                        username.as_deref(),
+                        password.as_deref(),
+                        &registry,
+                        json,
+                    ),
                     PkgCommands::Logout => pkg::cmd_logout(json),
+                    PkgCommands::Whoami { registry } => pkg::cmd_whoami(registry.as_deref(), json),
                     PkgCommands::Config { key, value } => {
                         pkg::cmd_config(key.as_deref(), value.as_deref(), json)
                     }

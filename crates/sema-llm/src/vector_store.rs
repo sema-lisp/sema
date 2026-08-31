@@ -168,9 +168,9 @@ fn cosine_similarity(a: &[u8], b: &[u8]) -> Option<f64> {
         return None;
     }
     let (mut dot, mut ma, mut mb) = (0.0_f64, 0.0_f64, 0.0_f64);
-    for (ca, cb) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
-        let fa = f64::from_le_bytes(ca.try_into().ok()?);
-        let fb = f64::from_le_bytes(cb.try_into().ok()?);
+    for (ca, cb) in a.as_chunks::<8>().0.iter().zip(b.as_chunks::<8>().0) {
+        let fa = f64::from_le_bytes(*ca);
+        let fb = f64::from_le_bytes(*cb);
         dot += fa * fb;
         ma += fa * fa;
         mb += fb * fb;

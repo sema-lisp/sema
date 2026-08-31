@@ -5802,9 +5802,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             let mut dot = 0.0_f64;
             let mut mag_a = 0.0_f64;
             let mut mag_b = 0.0_f64;
-            for (ca, cb) in ba.chunks_exact(8).zip(bb.chunks_exact(8)) {
-                let fa = f64::from_le_bytes(ca.try_into().unwrap());
-                let fb = f64::from_le_bytes(cb.try_into().unwrap());
+            for (ca, cb) in ba.as_chunks::<8>().0.iter().zip(bb.as_chunks::<8>().0) {
+                let fa = f64::from_le_bytes(*ca);
+                let fb = f64::from_le_bytes(*cb);
                 dot += fa * fb;
                 mag_a += fa * fa;
                 mag_b += fb * fb;
@@ -5907,11 +5907,10 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             )));
         }
         let floats: Vec<Value> = bv
-            .chunks_exact(8)
-            .map(|chunk| {
-                let bytes: [u8; 8] = chunk.try_into().unwrap();
-                Value::float(f64::from_le_bytes(bytes))
-            })
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| Value::float(f64::from_le_bytes(*chunk)))
             .collect();
         Ok(Value::list(floats))
     });
@@ -7386,11 +7385,8 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     register_fn(env, "vector/cosine-similarity", |args| {
         let (a, b) = require_matching_bytevectors("vector/cosine-similarity", args)?;
         let (mut dot, mut ma, mut mb) = (0.0_f64, 0.0_f64, 0.0_f64);
-        for (ca, cb) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
-            let (fa, fb) = (
-                f64::from_le_bytes(ca.try_into().unwrap()),
-                f64::from_le_bytes(cb.try_into().unwrap()),
-            );
+        for (ca, cb) in a.as_chunks::<8>().0.iter().zip(b.as_chunks::<8>().0) {
+            let (fa, fb) = (f64::from_le_bytes(*ca), f64::from_le_bytes(*cb));
             dot += fa * fb;
             ma += fa * fa;
             mb += fb * fb;
@@ -7405,9 +7401,8 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     register_fn(env, "vector/dot-product", |args| {
         let (a, b) = require_matching_bytevectors("vector/dot-product", args)?;
         let mut dot = 0.0_f64;
-        for (ca, cb) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
-            dot += f64::from_le_bytes(ca.try_into().unwrap())
-                * f64::from_le_bytes(cb.try_into().unwrap());
+        for (ca, cb) in a.as_chunks::<8>().0.iter().zip(b.as_chunks::<8>().0) {
+            dot += f64::from_le_bytes(*ca) * f64::from_le_bytes(*cb);
         }
         Ok(Value::float(dot))
     });
@@ -7423,8 +7418,10 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             return Err(SemaError::eval("vector/normalize: invalid bytevector"));
         }
         let floats: Vec<f64> = bv
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c))
             .collect();
         let mag: f64 = floats.iter().map(|f| f * f).sum::<f64>().sqrt();
         let out: Vec<u8> = if mag == 0.0 {
@@ -7441,9 +7438,8 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     register_fn(env, "vector/distance", |args| {
         let (a, b) = require_matching_bytevectors("vector/distance", args)?;
         let mut sum_sq = 0.0_f64;
-        for (ca, cb) in a.chunks_exact(8).zip(b.chunks_exact(8)) {
-            let d = f64::from_le_bytes(ca.try_into().unwrap())
-                - f64::from_le_bytes(cb.try_into().unwrap());
+        for (ca, cb) in a.as_chunks::<8>().0.iter().zip(b.as_chunks::<8>().0) {
+            let d = f64::from_le_bytes(*ca) - f64::from_le_bytes(*cb);
             sum_sq += d * d;
         }
         Ok(Value::float(sum_sq.sqrt()))

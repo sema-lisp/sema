@@ -2007,7 +2007,7 @@ impl Formatter {
         }
 
         let mut pairs = Vec::with_capacity(semantic.len() / 2);
-        for pair in semantic.chunks_exact(2) {
+        for pair in semantic.as_chunks::<2>().0 {
             if has_any_comments(pair[0]) || has_any_comments(pair[1]) {
                 return false;
             }

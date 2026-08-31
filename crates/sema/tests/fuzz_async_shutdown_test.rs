@@ -324,7 +324,7 @@ fn fuzz_async_shutdown_paired_roots_drive_roots_clean() {
     let cfg = Config::from_env();
     let pair_count = (cfg.count / 2).max(1);
     let programs = generate_programs(cfg.base, pair_count * 2, cfg.depth);
-    for pair in programs.chunks_exact(2) {
+    for pair in programs.as_chunks::<2>().0 {
         let (seed_a, prog_a) = &pair[0];
         let (seed_b, prog_b) = &pair[1];
         let what = format!(

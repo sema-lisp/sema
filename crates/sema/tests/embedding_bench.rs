@@ -33,8 +33,10 @@ fn extract_from_list(val: &Value) -> Vec<f64> {
 fn extract_from_bytevector(val: &Value) -> Vec<f64> {
     val.as_bytevector()
         .map(|bv| {
-            bv.chunks_exact(8)
-                .map(|chunk| f64::from_le_bytes(chunk.try_into().unwrap()))
+            bv.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|chunk| f64::from_le_bytes(*chunk))
                 .collect()
         })
         .expect("expected bytevector")
@@ -54,11 +56,11 @@ fn similarity_from_bytevector(a: &Value, b: &Value) -> f64 {
     let mut dot = 0.0_f64;
     let mut mag_a = 0.0_f64;
     let mut mag_b = 0.0_f64;
-    let chunks_a = ba.chunks_exact(8);
-    let chunks_b = bb.chunks_exact(8);
-    for (ca, cb) in chunks_a.zip(chunks_b) {
-        let fa = f64::from_le_bytes(ca.try_into().unwrap());
-        let fb = f64::from_le_bytes(cb.try_into().unwrap());
+    let chunks_a = ba.as_chunks::<8>().0;
+    let chunks_b = bb.as_chunks::<8>().0;
+    for (ca, cb) in chunks_a.iter().zip(chunks_b) {
+        let fa = f64::from_le_bytes(*ca);
+        let fb = f64::from_le_bytes(*cb);
         dot += fa * fb;
         mag_a += fa * fa;
         mag_b += fb * fb;

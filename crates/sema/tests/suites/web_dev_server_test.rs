@@ -20,19 +20,36 @@ fn spawn_dev_server(app: &str, port: u16) -> Child {
         .spawn()
         .expect("failed to spawn sema web");
 
-    std::thread::sleep(Duration::from_millis(1500));
-
-    if let Some(status) = child.try_wait().expect("query sema web process") {
-        let mut err = String::new();
-        if let Some(mut s) = child.stderr.take() {
-            let _ = s.read_to_string(&mut err);
+    // Poll until the server accepts connections (a fixed sleep is both slow
+    // and flaky on a loaded machine).
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().expect("query sema web process") {
+            let mut err = String::new();
+            if let Some(mut s) = child.stderr.take() {
+                let _ = s.read_to_string(&mut err);
+            }
+            panic!(
+                "`sema web` exited during startup with {status}: {}",
+                err.trim(),
+            );
         }
-        panic!(
-            "`sema web` exited during startup with {status}: {}",
-            err.trim(),
-        );
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return child;
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().ok();
+            let mut err = String::new();
+            if let Some(mut s) = child.stderr.take() {
+                let _ = s.read_to_string(&mut err);
+            }
+            panic!(
+                "`sema web` never listened on {port} within 15s; stderr: {}",
+                err.trim(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
-    child
 }
 
 #[test]
@@ -115,6 +132,61 @@ fn test_web_dev_server_serves_runtime_shell_and_app() {
 
     child.kill().ok();
     child.wait().ok();
+}
+
+#[test]
+#[ignore] // binds a localhost socket
+fn test_web_dev_server_serves_multi_file_app_as_archive() {
+    // A multi-file app (entry + import) is compiled to a `.vfs` archive by
+    // `__web/prepare` — from inside the server's runtime quantum, on the
+    // blocking tier — and the shell loads that instead of raw source.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("sema-web-multi-file-e2e-{nanos}"));
+    std::fs::create_dir_all(&dir).expect("create temp app dir");
+    std::fs::write(
+        dir.join("lib.sema"),
+        "(module lib (export greet) (define (greet) \"hi\"))",
+    )
+    .expect("write lib.sema");
+    std::fs::write(dir.join("app.sema"), "(import \"lib.sema\")\n(greet)").expect("write app.sema");
+
+    let port = 19932;
+    let entry = dir.join("app.sema");
+    let mut child = spawn_dev_server(entry.to_str().expect("utf-8 temp path"), port);
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let shell = client
+        .get(format!("{base}/"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("GET /")
+        .text()
+        .expect("shell body");
+    assert!(
+        shell.contains("/__build/app.vfs"),
+        "shell must load the compiled archive for a multi-file app, got: {shell}"
+    );
+
+    let vfs = client
+        .get(format!("{base}/__build/app.vfs"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("GET app.vfs");
+    assert_eq!(vfs.status(), 200, "archive should be served");
+    assert!(
+        !vfs.bytes().unwrap_or_default().is_empty(),
+        "archive should be non-empty"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

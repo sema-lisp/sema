@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`sema web` panicked at startup for any app that uses `import`.**
+  `__web/prepare` built the multi-file `.vfs` archive on the VM thread, and the
+  build constructs fresh interpreters whose prelude load is a legacy VM entry —
+  rejected inside the dev server's runtime quantum ("legacy native callback
+  cannot re-enter a VM during an active runtime quantum"). The build now runs
+  as a quarantined blocking job on the runtime's executor, off the VM thread;
+  the `{:mode ...}` result (including build errors, which still reach the error
+  overlay) resumes the parked frame. Single-file apps were unaffected.
+
 ### Added
 
 - **`sema pkg whoami`.** Shows which registry account the stored token belongs

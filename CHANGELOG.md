@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.36.0
 
 ### Fixed
 
@@ -13,8 +13,30 @@
   the `{:mode ...}` result (including build errors, which still reach the error
   overlay) resumes the parked frame. Single-file apps were unaffected.
 
+- **`deftool` `:default` was silently ignored (#85).** The JSON Schema sent to
+  the LLM never carried it, and a missing argument reached the handler as nil.
+  `:default` is now emitted into the schema, the field is excluded from
+  `required` (so `:optional #t` is no longer needed alongside it), and the
+  default value is injected at call time in both `tool/invoke` and the agent
+  loop.
+- **`take`/`drop` with swapped arguments now say so (#84).** A collection in
+  the count slot produced a bare "expected int, got list"; it now gets a hint
+  naming the likely argument swap, matching what `nth` already does.
+- **`file/fold-lines*` per-line limit is independent of chunk sizing.** The
+  1 MB documented per-line bound was the same constant as the per-chunk batch
+  budget, so raising the batch caps would have silently raised the line limit
+  too. The bounds are now separate; legal near-limit lines split across
+  chunks instead of being rejected.
+
 ### Added
 
+- **`sema pkg --json`.** Every package command accepts `--json` (before or
+  after the subcommand) and writes one JSON document to stdout with status
+  messages omitted, so scripts can parse the result directly.
+- **`string/index-of` start offset (#83).** Optional third argument: the
+  character index to start searching from, enabling find-next loops. The
+  returned index stays relative to the whole string; 2-arg calls are
+  unchanged.
 - **`sema pkg whoami`.** Shows which registry account the stored token belongs
   to (username, email, official/admin flags, registry URL) via the registry's
   `GET /api/v1/me`. A registry without that endpoint reports "registry too
@@ -22,6 +44,14 @@
 - **`sema pkg login --username`.** Logs in with a registry username and
   password (`--password`, or an interactive prompt) and exchanges them for a
   freshly minted API token, which is stored exactly as `--token` would be.
+
+### Performance
+
+- **Faster line-fold pipelines.** `file/fold-lines*` chunks now carry up to
+  16384 lines / 4 MB (was 2048 / 1 MB), cutting chunk-boundary round-trips
+  about 8× on 1BRC-shaped input, and `dispatch_native` skips reinstalling the
+  task context when the installed one is already correct (a pointer compare
+  instead of per-native-call Rc/RefCell churn).
 
 ## 1.35.0
 

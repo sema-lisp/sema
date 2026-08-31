@@ -946,116 +946,32 @@ wins rule as the CLI commands. Actor, optional approval comment, and required
 rejection reason are stored in the signed decision. A successful decision does
 not run workflow code in the viewer; resume the same run to apply it.
 
-## Macro cookbook
-
-The workflow DSL is homoiconic — agent patterns from the literature are
-macros that expand into `parallel`, `pipeline`, and `step` forms. The versions
-below are shortened for reading. `examples/workflows/cookbook.sema` holds the
-versions to load and use inside a `defworkflow` body; they are the same
-patterns with gensym-suffixed (`name#`) bindings, so a caller's own variables
-cannot be captured.
-
-### ReAct
-
-Reason → act (tool) → observe, bounded rounds.
-
-```sema
-(defmacro react (question tools max-rounds)
-  `(let loop ((round 1) (scratch ""))
-     (let ((answer (step (str "Question: " ,question "\n\n"
-                               "Reason step-by-step, call a tool when you "
-                               "need a fact, then give the final answer.\n"
-                               (if (= scratch "") ""
-                                 (str "Notes so far:\n" scratch "\n")))
-                        {:name "react" :tools ,tools})))
-       (if (or (>= round ,max-rounds)
-               (not (string/contains? (string/lower answer) "next:")))
-         answer
-         (loop (+ round 1) (str scratch "\n" answer))))))
-```
-
-### Reflexion
-
-Attempt → self-critique → retry with critique, bounded.
-
-```sema
-(defmacro reflexion (task max-tries)
-  `(let loop ((try 1) (note ""))
-     (let ((attempt (step (str ,task
-                                (if (= note "") ""
-                                  (str "\n\nPrevious critique:\n" note)))
-                       {:name "actor"})))
-       (if (>= try ,max-tries)
-         attempt
-         (let ((critique (step
-           (str "Critique this attempt. If it is good, reply exactly "
-                "\"OK\". Otherwise list concrete fixes.\n\n" attempt)
-           {:name "critic"})))
-           (if (string/starts-with? (string/trim critique) "OK")
-             attempt
-             (loop (+ try 1) critique)))))))
-```
-
-### Tree-of-Thought
-
-Fan out N candidates in parallel, score, keep the best.
-
-```sema
-(defmacro tree-of-thought (prompt n scorer)
-  `(let ((cands (filter (fn (c) (not (nil? c)))
-                  (parallel
-                    (map (fn (i)
-                           (fn () (step
-                             (str ,prompt "\n(Give one distinct candidate, "
-                                  "attempt #" i ".)")
-                             {:name "thought"})))
-                         (range ,n))
-                    ,n))))
-     (if (null? cands)
-       nil
-       (foldl (fn (best c)
-                (if (> (,scorer c) (,scorer best)) c best))
-              (first cands) (rest cands)))))
-```
-
-### Debate
-
-Two personas argue R rounds, a judge decides.
-
-```sema
-(defmacro debate (topic persona-a persona-b rounds)
-  `(let loop ((r 1) (transcript (str "TOPIC: " ,topic)))
-     (let* ((arg-a (step (str "You are " ,persona-a ". Argue your side.\n\n"
-                               transcript)
-                          {:name ,persona-a}))
-            (t1 (str transcript "\n\n" ,persona-a ": " arg-a))
-            (arg-b (step (str "You are " ,persona-b ". Rebut.\n\n" t1)
-                          {:name ,persona-b}))
-            (t2 (str t1 "\n\n" ,persona-b ": " arg-b)))
-       (if (>= r ,rounds)
-         (step (str "You are the judge. Read the debate and declare a "
-                     "winner with one sentence of reasoning.\n\n" t2)
-                {:name "judge"})
-         (loop (+ r 1) t2)))))
-```
-
 ## Examples
 
-Two complete workflow examples are in `examples/workflows/`:
+Complete, runnable workflows live in
+[`examples/workflows/`](https://github.com/sema-lisp/sema/tree/main/examples/workflows):
 
-- **`content-pipeline.sema`** — a four-phase pipeline (Topics → Write →
-  Verify → Publish) that generates short explainer articles. Uses `pipeline`
-  fan-out with typed `step` leaves and a per-item verification gate.
+- [**`content-pipeline.sema`**](https://github.com/sema-lisp/sema/blob/main/examples/workflows/content-pipeline.sema)
+  — a four-phase pipeline (Topics → Write → Verify → Publish) that generates
+  short explainer articles. Uses `pipeline` fan-out with typed `step` leaves
+  and a per-item verification gate.
 
-- **`sema-docs-pipeline.sema`** — a six-phase pipeline (Topics → Draft →
-  Review → Revise → Assemble → Publish) with journaled tool calls and a
-  fan-in synthesis step. Exercises the full dashboard.
+- [**`sema-docs-pipeline.sema`**](https://github.com/sema-lisp/sema/blob/main/examples/workflows/sema-docs-pipeline.sema)
+  — a six-phase pipeline (Topics → Draft → Review → Revise → Assemble →
+  Publish) with journaled tool calls and a fan-in synthesis step. Exercises
+  the full dashboard.
 
-- **`cookbook.sema`** — the agent-pattern macros (ReAct, Reflexion,
-  Tree-of-Thought, Debate). Load it, then use the macros inside any
-  `defworkflow` body.
+- [**`policy.sema`**](https://github.com/sema-lisp/sema/blob/main/examples/workflows/policy.sema)
+  — a least-privilege `defpolicy` with model/tool/URL/command allowlists and
+  an approval-gated `policy/without` escalation.
 
-Run them:
+- [**`cookbook.sema`**](https://github.com/sema-lisp/sema/blob/main/examples/workflows/cookbook.sema)
+  — agent patterns from the literature (ReAct, Reflexion, Tree-of-Thought,
+  Debate) as macros that expand into `parallel`, `pipeline`, and `step`
+  forms, with gensym-suffixed bindings so a caller's own variables cannot be
+  captured. Load it, then use the macros inside any `defworkflow` body.
+
+Run one:
 
 ```bash
 export OPENAI_API_KEY=...

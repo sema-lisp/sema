@@ -105,10 +105,14 @@ impl BackendState {
             "eval".to_string(),
             "--stdin".to_string(),
             "--json".to_string(),
-            "--sandbox".to_string(),
-            "strict".to_string(),
-            "--no-llm".to_string(),
         ];
+
+        let is_strict = self.run_sandbox_mode == "strict";
+        if is_strict {
+            args.push("--sandbox".to_string());
+            args.push("strict".to_string());
+            args.push("--no-llm".to_string());
+        }
 
         // Add --path if the URI is a file
         if let Ok(path) = uri.to_file_path() {
@@ -160,7 +164,13 @@ impl BackendState {
                     let error = json.get("error").and_then(|v| {
                         v.get("message")
                             .and_then(|m| m.as_str())
-                            .map(|s| s.to_string())
+                            .map(|s| {
+                                let mut msg = s.to_string();
+                                if is_strict && (msg.contains("sandbox") || msg.contains("LLM") || msg.contains("effect")) {
+                                    msg.push_str(" (Run lens sandbox is 'strict'. Change 'sema.run.sandbox' setting to 'off' to allow this.)");
+                                }
+                                msg
+                            })
                     });
                     let eval_elapsed = json
                         .get("elapsedMs")

@@ -574,6 +574,9 @@ fn proc_close_runtime(id: i64) -> NativeResult {
             });
         }
         if matches!(action, CloseAction::Noop) {
+            PROCS.with(|p| {
+                p.borrow_mut().remove(&id);
+            });
             return Ok(NativeOutcome::Return(Value::nil()));
         }
         let mut proc = take_proc("proc/close", id)?;
@@ -612,18 +615,23 @@ fn proc_close_runtime(id: i64) -> NativeResult {
     }
     match action {
         CloseAction::Busy => unreachable!("busy close returned above"),
-        CloseAction::Noop => finish_terminal_gate(
-            gate,
-            Rc::new(move |gid| {
-                PROC_GATES.with(|g| {
-                    let mut gates = g.borrow_mut();
-                    if gates.get(&id).map(ResourceGateHandle::id) == Some(gid) {
-                        gates.remove(&id);
-                    }
-                });
-            }),
-            Ok(Value::nil()),
-        ),
+        CloseAction::Noop => {
+            PROCS.with(|p| {
+                p.borrow_mut().remove(&id);
+            });
+            finish_terminal_gate(
+                gate,
+                Rc::new(move |gid| {
+                    PROC_GATES.with(|g| {
+                        let mut gates = g.borrow_mut();
+                        if gates.get(&id).map(ResourceGateHandle::id) == Some(gid) {
+                            gates.remove(&id);
+                        }
+                    });
+                }),
+                Ok(Value::nil()),
+            )
+        }
         CloseAction::Proceed => {
             PROCS.with(|p| {
                 if let Some(ProcSlot::Available(proc)) = p.borrow_mut().get_mut(&id) {

@@ -231,14 +231,18 @@ fn proc_cancelled_wait_settles_cancelled_and_registry_stays_usable() {
     let program = r#"
         (let ((h (proc/spawn (list "sh" "-c" "sleep 2; exit 0"))))
           (let ((p (async/spawn (fn () (proc/wait h)))))
+            (async/sleep 20)
             (async/cancel p)
             (let ((caught (try (async/await p) (catch e :caught))))
               (proc/close h)
-              ;; a fresh handle must still work after the cancellation
-              (let ((h2 (proc/spawn (list "sh" "-c" "exit 4"))))
-                (let ((code (proc/wait h2)))
-                  (proc/close h2)
-                  (list caught code))))))
+              (let ((closed-error
+                      (try (begin (proc/running? h) "still open")
+                        (catch e (:message e)))))
+                ;; a fresh handle must still work after the cancellation
+                (let ((h2 (proc/spawn (list "sh" "-c" "exit 4"))))
+                  (let ((code (proc/wait h2)))
+                    (proc/close h2)
+                    (list caught code closed-error)))))))
     "#;
     let result = interp
         .eval_str_compiled(program)
@@ -254,6 +258,14 @@ fn proc_cancelled_wait_settles_cancelled_and_registry_stays_usable() {
         parts[1].as_int(),
         Some(4),
         "a fresh proc handle must work after the cancellation (registry not wedged)"
+    );
+    assert!(
+        parts[2]
+            .as_str()
+            .expect("closed-handle error is a string")
+            .contains("no such handle"),
+        "proc/close must remove the cancelled wait's tombstone, got {:?}",
+        parts[2]
     );
     assert_eq!(interp.runtime_resource_gate_count(), 0);
 }

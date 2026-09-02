@@ -17,6 +17,7 @@ pub mod output_hook;
 pub mod resolve;
 pub mod sandbox;
 pub mod stack;
+pub mod testing;
 pub mod text_util;
 pub mod value;
 pub mod vfs;

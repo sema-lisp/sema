@@ -1421,13 +1421,6 @@ pub fn cmd_login(
     sema_core::fs::AtomicFile::write_private(&creds_path, content.as_bytes())
         .map_err(|e| format!("Failed to write credentials: {e}"))?;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(&creds_path, perms);
-    }
-
     human_output!(json, "✓ Login saved to {}", creds_path.display());
     human_output!(json, "  Registry: {registry}");
     if json {
@@ -1616,13 +1609,6 @@ fn set_registry_url(url: &str) -> Result<(), String> {
 
     sema_core::fs::AtomicFile::write_private(&creds_path, content.as_bytes())
         .map_err(|e| format!("Failed to write credentials: {e}"))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(&creds_path, perms);
-    }
 
     Ok(())
 }

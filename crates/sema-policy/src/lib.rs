@@ -1875,6 +1875,12 @@ fn normalize_policy_path(workspace_root: &Path, input: &str) -> Result<String, S
         return Err("absolute paths are not allowed".to_string());
     }
 
+    // The enforcement layer passes an absolute root. Resolving a relative one
+    // against `current_dir()` would make policy decisions depend on
+    // process-global state, so refuse it instead of guessing.
+    if !workspace_root.is_absolute() {
+        return Err("workspace root must be an absolute path".to_string());
+    }
     let boundary = sema_core::path::PathBoundary::new(workspace_root)
         .map_err(|error| format!("cannot resolve workspace root: {error}"))?;
     let resolved = boundary
@@ -2065,6 +2071,28 @@ fn invalid_with_hint(message: impl Into<String>, hint: impl Into<String>) -> Pol
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn policy_path_rejects_relative_workspace_root() {
+        // A relative root would be resolved against the process's current
+        // directory, which must not influence a policy decision.
+        let error = normalize_policy_path(Path::new("relative/root"), "src/main.sema").unwrap_err();
+        assert_eq!(error, "workspace root must be an absolute path");
+    }
+
+    #[test]
+    fn policy_path_resolves_below_absolute_root() {
+        let root =
+            std::env::temp_dir().join(format!("sema-policy-abs-root-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        assert_eq!(
+            normalize_policy_path(&root, "src/../lib/main.sema").unwrap(),
+            "lib/main.sema"
+        );
+        assert!(normalize_policy_path(&root, "../outside.sema").is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
 
     fn map(entries: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
         Value::map(

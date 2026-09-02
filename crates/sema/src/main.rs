@@ -3770,7 +3770,13 @@ fn check_output_not_source(
     // rather than a silent "different file".
     if source
         .is_same_destination_as(output_path)
-        .map_err(|error| format!("resolving output path {}: {error}", output_path.display()))?
+        .map_err(|error| {
+            format!(
+                "resolving {} against {}: {error}",
+                output_path.display(),
+                source.display()
+            )
+        })?
     {
         return Err(format!(
             "Output path would overwrite the source file '{}'.\n  Hint: use `-o <output>` to specify a different output path, or rename your source file to use a .sema extension.",
@@ -5861,6 +5867,8 @@ fn install_completions(shell: Shell) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// `check_output_not_source` compares identities, so an output path that
     /// merely spells the source differently (`new/../app.sema`) is refused
     /// and the source is left untouched.
@@ -5874,11 +5882,11 @@ mod tests {
         let alias = root.join("new/../app.sema");
         std::fs::write(&source, "(+ 1 2)").unwrap();
 
-        let error = super::run_build_web(
+        let error = run_build_web(
             source.to_str().unwrap(),
             Some(alias.to_str().unwrap()),
             &[],
-            super::BuildOutputOpts::default(),
+            BuildOutputOpts::default(),
         )
         .unwrap_err();
         assert!(error.contains("overwrite the source"), "{error}");
@@ -5886,8 +5894,6 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
     }
-
-    use super::*;
 
     #[cfg(unix)]
     #[test]

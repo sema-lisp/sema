@@ -6,6 +6,10 @@ use std::path::Path;
 use crate::path::PathExt as _;
 
 /// A staged replacement that is discarded unless explicitly committed.
+///
+/// Every constructor creates the destination's missing parent directories,
+/// so a write never fails because a directory was removed underneath it. A
+/// caller that must not recreate directories checks the parent first.
 pub struct AtomicFile {
     file: PlatformAtomicFile,
 }
@@ -17,6 +21,9 @@ impl AtomicFile {
     }
 
     /// Create a staged replacement with owner-only permissions on Unix.
+    ///
+    /// On Windows the file inherits the parent directory's ACL, which for a
+    /// path under the user profile is already owner-only.
     pub fn new_private(destination: &Path) -> io::Result<Self> {
         Self::create(destination, true)
     }
@@ -38,7 +45,10 @@ impl AtomicFile {
         self.file.commit()
     }
 
-    /// Atomically replace `destination` with `bytes`.
+    /// Atomically replace `destination` with `bytes`, creating missing parent
+    /// directories. The directory entry itself is replaced, so a symlink at
+    /// `destination` becomes a regular file and a hard link is broken; use
+    /// [`Self::write_through`] to keep the entry.
     pub fn write(destination: &Path, bytes: &[u8]) -> io::Result<()> {
         let mut staged = Self::new(destination)?;
         staged.write_all(bytes)?;
@@ -54,7 +64,8 @@ impl AtomicFile {
         Self::write(&destination.resolve_allow_missing()?, bytes)
     }
 
-    /// Atomically replace a sensitive file with owner-only permissions on Unix.
+    /// Atomically replace a sensitive file with owner-only permissions on Unix
+    /// (see [`Self::new_private`] for Windows).
     pub fn write_private(destination: &Path, bytes: &[u8]) -> io::Result<()> {
         let mut staged = Self::new_private(destination)?;
         staged.write_all(bytes)?;

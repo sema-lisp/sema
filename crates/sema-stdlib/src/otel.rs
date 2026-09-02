@@ -15,6 +15,7 @@ use sema_core::runtime::{
     NativeCall, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, ResumeInput,
     Trace,
 };
+use sema_core::ArgsExt;
 use sema_core::{Env, SemaError, Value};
 use sema_otel::AttrValue;
 
@@ -229,9 +230,7 @@ pub fn register(env: &Env) {
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("otel/span", "2-3", args.len()));
         }
-        let name = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let name = args.str_at(0, "otel/span")?;
         let span = sema_otel::user_span(
             name,
             sema_otel::SemaSpanKind::Internal,
@@ -266,9 +265,7 @@ pub fn register(env: &Env) {
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("otel/tool-span", "2-3", args.len()));
         }
-        let name = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let name = args.str_at(0, "otel/tool-span")?;
         let span = sema_otel::user_span(
             name,
             sema_otel::SemaSpanKind::Tool,
@@ -282,9 +279,7 @@ pub fn register(env: &Env) {
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("otel/retrieval-span", "2-3", args.len()));
         }
-        let name = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let name = args.str_at(0, "otel/retrieval-span")?;
         let span = sema_otel::user_span(
             name,
             sema_otel::SemaSpanKind::Retrieval,
@@ -377,9 +372,7 @@ pub fn register(env: &Env) {
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("otel/event", "1-2", args.len()));
         }
-        let name = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let name = args.str_at(0, "otel/event")?;
         let attrs: Vec<(String, String)> = match args.get(1).and_then(|v| v.as_map_rc()) {
             Some(m) => m
                 .iter()

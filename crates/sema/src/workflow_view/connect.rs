@@ -218,23 +218,23 @@ pub(crate) fn handle_connect(state: &Arc<ServerState>, id: &str, alias: &str) ->
     let state = Arc::clone(state);
     let opener = state.opener();
     let run_id = id.to_string();
-    tokio::task::spawn_blocking(move || {
-        run_connect_flow(
-            &state, key, workflow, run_id, persist, url, client_id, opener,
-        );
-    });
+    let flow = ConnectFlow {
+        key,
+        workflow,
+        run_id,
+        persist,
+        url,
+        client_id,
+        opener,
+    };
+    tokio::task::spawn_blocking(move || run_connect_flow(&state, flow));
 
     connecting_response()
 }
 
-/// The actual OAuth flow, run on a `spawn_blocking` thread (see the module
-/// doc's nested-runtime note). Persists to the decl's `:persist` scoped store
-/// on success (skipped for `:none` — the credential is used for this
-/// process's status only, never written to disk) and records the terminal
-/// [`FlowState`] either way.
-#[allow(clippy::too_many_arguments)]
-fn run_connect_flow(
-    state: &ServerState,
+/// Everything one `run_connect_flow` needs: the flow key plus the declared
+/// server (`url`, `client_id`, `persist`) it authenticates against.
+struct ConnectFlow {
     key: FlowKey,
     workflow: String,
     run_id: String,
@@ -242,7 +242,23 @@ fn run_connect_flow(
     url: String,
     client_id: Option<String>,
     opener: BrowserOpener,
-) {
+}
+
+/// The actual OAuth flow, run on a `spawn_blocking` thread (see the module
+/// doc's nested-runtime note). Persists to the decl's `:persist` scoped store
+/// on success (skipped for `:none` — the credential is used for this
+/// process's status only, never written to disk) and records the terminal
+/// [`FlowState`] either way.
+fn run_connect_flow(state: &ServerState, flow: ConnectFlow) {
+    let ConnectFlow {
+        key,
+        workflow,
+        run_id,
+        persist,
+        url,
+        client_id,
+        opener,
+    } = flow;
     let scoped_store = match crate::workflow_mcp::store_for(persist, &workflow, &run_id) {
         Ok(s) => s,
         Err(reason) => {

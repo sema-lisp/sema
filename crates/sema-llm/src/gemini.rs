@@ -60,19 +60,7 @@ impl GeminiProvider {
             .await
             .map_err(|e| LlmError::Http(e.to_string()))?;
 
-        let status = resp.status().as_u16();
-        if status == 429 {
-            return Err(LlmError::RateLimited {
-                retry_after_ms: crate::http::retry_after_ms(resp.headers()),
-            });
-        }
-        if status != 200 {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Api {
-                status,
-                message: text,
-            });
-        }
+        let resp = crate::http::check_status(resp).await?;
 
         let api_resp: serde_json::Value = resp
             .json()
@@ -106,24 +94,13 @@ impl GeminiProvider {
             .await
             .map_err(|e| LlmError::Http(e.to_string()))?;
 
-        let status = resp.status().as_u16();
-        if status == 429 {
-            return Err(LlmError::RateLimited {
-                retry_after_ms: crate::http::retry_after_ms(resp.headers()),
-            });
-        }
-        if status != 200 {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Api {
-                status,
-                message: text,
-            });
-        }
+        let resp = crate::http::check_status(resp).await?;
 
         let mut full_content = String::new();
-        let mut prompt_tokens = 0u32;
-        let mut completion_tokens = 0u32;
-        let mut cached_tokens = 0u32;
+        let mut usage = Usage {
+            model: model.clone(),
+            ..Default::default()
+        };
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut tool_call_idx = 0usize;
 
@@ -168,21 +145,8 @@ impl GeminiProvider {
                         }
                     }
                 }
-                // Extract usage metadata
-                if let Some(usage) = chunk.get("usageMetadata") {
-                    if let Some(pt) = usage.get("promptTokenCount").and_then(|v| v.as_u64()) {
-                        prompt_tokens = pt as u32;
-                    }
-                    if let Some(ct) = usage.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
-                        completion_tokens = ct as u32;
-                    }
-                    // cachedContentTokenCount is a SUBSET of promptTokenCount (read hits).
-                    if let Some(cc) = usage
-                        .get("cachedContentTokenCount")
-                        .and_then(|v| v.as_u64())
-                    {
-                        cached_tokens = cc as u32;
-                    }
+                if let Some(meta) = chunk.get("usageMetadata") {
+                    usage.merge_json(meta, &USAGE_FIELDS);
                 }
             }
             Ok(())
@@ -198,15 +162,9 @@ impl GeminiProvider {
         Ok(ChatResponse {
             content: full_content,
             role: "assistant".to_string(),
-            model: model.clone(),
+            model,
             tool_calls,
-            usage: Usage {
-                prompt_tokens,
-                completion_tokens,
-                model,
-                cache_read_input_tokens: cached_tokens,
-                cache_creation_input_tokens: 0,
-            },
+            usage,
             stop_reason,
         })
     }
@@ -389,23 +347,12 @@ impl GeminiProvider {
             }
         }
 
-        let mut prompt_tokens = 0u32;
-        let mut completion_tokens = 0u32;
-        let mut cached_tokens = 0u32;
-        if let Some(usage) = resp.get("usageMetadata") {
-            prompt_tokens = usage
-                .get("promptTokenCount")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            completion_tokens = usage
-                .get("candidatesTokenCount")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            // cachedContentTokenCount is a SUBSET of promptTokenCount (read hits).
-            cached_tokens = usage
-                .get("cachedContentTokenCount")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
+        let mut usage = Usage {
+            model: model.to_string(),
+            ..Default::default()
+        };
+        if let Some(meta) = resp.get("usageMetadata") {
+            usage.merge_json(meta, &USAGE_FIELDS);
         }
         // Thinking tokens are reported separately and are NOT in candidatesTokenCount —
         // when a small budget is spent entirely on reasoning, the visible output is empty.
@@ -445,17 +392,20 @@ impl GeminiProvider {
             role: "assistant".to_string(),
             model: model.to_string(),
             tool_calls,
-            usage: Usage {
-                prompt_tokens,
-                completion_tokens,
-                model: model.to_string(),
-                cache_read_input_tokens: cached_tokens,
-                cache_creation_input_tokens: 0,
-            },
+            usage,
             stop_reason,
         })
     }
 }
+
+/// `usageMetadata` layout. `cachedContentTokenCount` is a SUBSET of
+/// `promptTokenCount` (read hits); Gemini reports no cache-write counter.
+const USAGE_FIELDS: crate::types::UsageFields = crate::types::UsageFields {
+    prompt: "/promptTokenCount",
+    completion: "/candidatesTokenCount",
+    cache_read: Some("/cachedContentTokenCount"),
+    cache_write: None,
+};
 
 impl LlmProvider for GeminiProvider {
     fn name(&self) -> &str {
@@ -486,16 +436,6 @@ impl LlmProvider for GeminiProvider {
         // io_block_on drives ON THIS thread: `on_chunk` may touch non-Send Sema
         // values and must never migrate to a pool worker.
         sema_io::io_block_on(self.stream_complete_async(request, on_chunk))
-    }
-
-    fn batch_complete(&self, requests: Vec<ChatRequest>) -> Vec<Result<ChatResponse, LlmError>> {
-        sema_io::io_block_on(async {
-            let futures: Vec<_> = requests
-                .into_iter()
-                .map(|req| self.complete_async(req))
-                .collect();
-            futures::future::join_all(futures).await
-        })
     }
 }
 

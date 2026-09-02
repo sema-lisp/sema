@@ -18,7 +18,7 @@ use sema_core::runtime::{
     NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation,
     ResumeInput, SendPayload, Trace, WaitKind,
 };
-use sema_core::{check_arity, in_runtime_quantum, Caps, SemaError, Value};
+use sema_core::{check_arity, in_runtime_quantum, ArgsExt, Caps, ResultExt, SemaError, Value};
 
 use crate::register_fn;
 
@@ -817,9 +817,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     crate::register_fn_gated(env, sandbox, Caps::ENV_READ, "env", |args| {
         check_arity!(args, "env", 1);
-        let name = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let name = args.str_at(0, "env")?;
         match std::env::var(name) {
             Ok(val) => Ok(Value::string(&val)),
             Err(_) => Ok(Value::nil()),
@@ -833,9 +831,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     crate::register_runtime_fn_path_gated(env, sandbox, Caps::SHELL, "shell", &[], move |args| {
         shell_sandbox.check(Caps::PROCESS, "shell")?;
         check_arity!(args, "shell", 1..);
-        let cmd = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let cmd = args.str_at(0, "shell")?;
 
         // A trailing map is an options map (`{:cwd "path" :env {...}}`), never an
         // argv element — so the positional string-argv form is unchanged. Only
@@ -873,9 +869,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         for (k, v) in &env_vars {
             command.env(k, v);
         }
-        let output = command
-            .output()
-            .map_err(|e| SemaError::Io(format!("shell: {e}")))?;
+        let output = command.output().io_ctx("shell")?;
 
         Ok(NativeOutcome::Return(shell_output_value(
             output.status.code(),
@@ -889,9 +883,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // Pure (string→string), so ungated like other string helpers.
     register_fn(env, "shell/quote", |args| {
         check_arity!(args, "shell/quote", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "shell/quote")?;
         Ok(Value::string(&posix_shell_quote(s)))
     });
 
@@ -936,9 +928,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             "sleep",
             |args| {
                 check_arity!(args, "sleep", 1);
-                let ms = args[0]
-                    .as_int()
-                    .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
+                let ms = args.int_at(0, "sleep")?;
                 // The plain value ABI is synchronous (REPL, scripts, and nested
                 // host callbacks); the runtime ABI below performs the offload.
                 std::thread::sleep(std::time::Duration::from_millis(ms as u64));
@@ -946,9 +936,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             },
             |_ctx: &mut NativeCallContext<'_>, args: &[Value]| {
                 check_arity!(args, "sleep", 1);
-                let ms = args[0]
-                    .as_int()
-                    .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
+                let ms = args.int_at(0, "sleep")?;
                 sleep_via_executor(ms.max(0) as u64)
             },
         )),
@@ -962,7 +950,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     crate::register_fn_gated(env, sandbox, Caps::ENV_READ, "sys/cwd", |args| {
         check_arity!(args, "sys/cwd", 0);
-        let cwd = std::env::current_dir().map_err(|e| SemaError::Io(format!("sys/cwd: {e}")))?;
+        let cwd = std::env::current_dir().io_ctx("sys/cwd")?;
         Ok(Value::string(&cwd.to_string_lossy()))
     });
 
@@ -982,12 +970,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     crate::register_fn_gated(env, sandbox, Caps::ENV_WRITE, "sys/set-env", |args| {
         check_arity!(args, "sys/set-env", 2);
-        let name = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let value = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let name = args.str_at(0, "sys/set-env")?;
+        let value = args.str_at(1, "sys/set-env")?;
         // set_var mutates process-global state and is UB under concurrent getenv
         // (tokio workers, C libs) on glibc. Serialize all sets behind a lock
         // (STD-12). NOTE: still unsafe if other code reads env concurrently —
@@ -1120,9 +1104,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "sys/which", |args| {
         check_arity!(args, "sys/which", 1);
-        let name = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let name = args.str_at(0, "sys/which")?;
         let path_var = std::env::var("PATH").unwrap_or_default();
         let sep = if cfg!(windows) { ';' } else { ':' };
         // On Windows a bare name resolves by trying each PATHEXT suffix (unless
@@ -1244,9 +1226,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     {
         register_fn(env, "sys/on-signal", |args| {
             check_arity!(args, "sys/on-signal", 2);
-            let keyword = args[0]
-                .as_keyword()
-                .ok_or_else(|| SemaError::type_error("keyword", args[0].type_name()))?;
+            let keyword = args.keyword_at(0, "sys/on-signal")?;
             match keyword.as_str() {
                 "winch" | "int" | "term" => Ok(Value::nil()),
                 other => Err(SemaError::eval(format!(

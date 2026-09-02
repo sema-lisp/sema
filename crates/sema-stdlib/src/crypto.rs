@@ -10,7 +10,7 @@
 //! `uuid/v4` takes no input, so it needs no cap.
 
 use hmac::{Hmac, Mac};
-use sema_core::{check_arity, SemaError, Value};
+use sema_core::{check_arity, ArgsExt, SemaError, Value};
 use sha2::{Digest, Sha256};
 
 use crate::register_fn;
@@ -84,9 +84,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "base64/encode", |args| {
         check_arity!(args, "base64/encode", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "base64/encode")?;
         crypto_cap("base64/encode", s.len())?;
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode(s.as_bytes());
@@ -95,9 +93,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "base64/decode", |args| {
         check_arity!(args, "base64/decode", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "base64/decode")?;
         crypto_cap("base64/decode", s.len())?;
         use base64::Engine;
         let bytes = base64::engine::general_purpose::STANDARD
@@ -110,9 +106,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "base64/encode-bytes", |args| {
         check_arity!(args, "base64/encode-bytes", 1);
-        let bv = args[0]
-            .as_bytevector()
-            .ok_or_else(|| SemaError::type_error("bytevector", args[0].type_name()))?;
+        let bv = args.bytes_at(0, "base64/encode-bytes")?;
         crypto_cap("base64/encode-bytes", bv.len())?;
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode(bv);
@@ -121,9 +115,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "base64/decode-bytes", |args| {
         check_arity!(args, "base64/decode-bytes", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "base64/decode-bytes")?;
         crypto_cap("base64/decode-bytes", s.len())?;
         use base64::Engine;
         let bytes = base64::engine::general_purpose::STANDARD
@@ -134,9 +126,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "hash/md5", |args| {
         check_arity!(args, "hash/md5", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "hash/md5")?;
         crypto_cap("hash/md5", s.len())?;
         let digest = md5::compute(s.as_bytes());
         Ok(Value::string(&format!("{:x}", digest)))
@@ -144,12 +134,8 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "hash/hmac-sha256", |args| {
         check_arity!(args, "hash/hmac-sha256", 2);
-        let key = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let message = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let key = args.str_at(0, "hash/hmac-sha256")?;
+        let message = args.str_at(1, "hash/hmac-sha256")?;
         crypto_cap("hash/hmac-sha256", key.len().saturating_add(message.len()))?;
         let mut mac = HmacSha256::new_from_slice(key.as_bytes()).unwrap();
         mac.update(message.as_bytes());
@@ -159,9 +145,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "hash/sha256", |args| {
         check_arity!(args, "hash/sha256", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "hash/sha256")?;
         crypto_cap("hash/sha256", s.len())?;
         let hash = Sha256::digest(s.as_bytes());
         let hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();

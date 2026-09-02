@@ -508,6 +508,32 @@ fn register_runtime_fn_path_gated_ctx(
     );
 }
 
+/// [`register_fn_path_gated`] for the common shape where argument 1 is the
+/// only path.
+#[cfg(not(target_arch = "wasm32"))]
+fn register_fn_path_gated0(
+    env: &Env,
+    sandbox: &Sandbox,
+    cap: Caps,
+    name: &str,
+    f: impl Fn(&[Value]) -> Result<Value, sema_core::SemaError> + 'static,
+) {
+    register_fn_path_gated(env, sandbox, cap, name, &[0], f);
+}
+
+/// [`register_runtime_fn_path_gated`] for the common shape where argument 1
+/// is the only path.
+#[cfg(not(target_arch = "wasm32"))]
+fn register_runtime_fn_path_gated0(
+    env: &Env,
+    sandbox: &Sandbox,
+    cap: Caps,
+    name: &str,
+    f: impl Fn(&[Value]) -> sema_core::runtime::NativeResult + 'static,
+) {
+    register_runtime_fn_path_gated(env, sandbox, cap, name, &[0], f);
+}
+
 fn register_fn(
     env: &Env,
     name: &str,
@@ -538,7 +564,6 @@ fn register_fn_with_escaping_args(
 /// `NativeOutcome`, while the synchronous value callback unwraps a plain
 /// `Return` when no runtime quantum is active. Mirrors
 /// [`register_runtime_fn_path_gated`] without the sandbox checks.
-#[cfg(not(target_arch = "wasm32"))]
 fn register_runtime_fn(
     env: &Env,
     name: &str,
@@ -561,6 +586,24 @@ fn register_runtime_fn(
             },
             move |_ctx, args| for_runtime(args),
         )),
+    );
+}
+
+/// Register a runtime-only native: the body speaks `NativeResult` and the
+/// plain value ABI is an error, because the op needs an active runtime task
+/// context (promise and channel operations). `escaping_args` marks argument
+/// positions the runtime must snapshot before the call.
+fn register_runtime_only_fn(
+    env: &Env,
+    name: &str,
+    escaping_args: &'static [usize],
+    f: impl Fn(&[Value]) -> sema_core::runtime::NativeResult + 'static,
+) {
+    env.set(
+        sema_core::intern(name),
+        Value::native_fn(
+            sema_core::NativeFn::simple_result(name, f).with_escaping_args(escaping_args),
+        ),
     );
 }
 

@@ -310,16 +310,9 @@ pub fn default_store() -> Box<dyn TokenStore> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn temp_path() -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!(
-            "sema-mcp-store-{}-{}/mcp-auth.json",
-            std::process::id(),
-            n
-        ))
+        sema_core::testing::unique_temp_dir("mcp-store").join("mcp-auth.json")
     }
 
     fn sample(url: &str) -> StoredCredentials {

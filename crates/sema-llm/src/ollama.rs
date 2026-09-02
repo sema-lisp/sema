@@ -135,14 +135,7 @@ impl OllamaProvider {
             .await
             .map_err(|e| LlmError::Http(e.to_string()))?;
 
-        let status = resp.status().as_u16();
-        if status != 200 {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Api {
-                status,
-                message: text,
-            });
-        }
+        let resp = crate::http::check_status(resp).await?;
 
         let api_resp: serde_json::Value = resp
             .json()
@@ -166,26 +159,18 @@ impl OllamaProvider {
             "tool_use"
         };
 
-        let prompt_tokens = api_resp
-            .get("prompt_eval_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let completion_tokens = api_resp
-            .get("eval_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
+        let mut usage = Usage {
+            model: model.clone(),
+            ..Default::default()
+        };
+        usage.merge_json(&api_resp, &USAGE_FIELDS);
 
         Ok(ChatResponse {
             content,
             role: "assistant".to_string(),
-            model: model.clone(),
+            model,
             tool_calls,
-            usage: Usage {
-                prompt_tokens,
-                completion_tokens,
-                model,
-                ..Default::default()
-            },
+            usage,
             stop_reason: Some(stop_reason.to_string()),
         })
     }
@@ -209,18 +194,13 @@ impl OllamaProvider {
             .await
             .map_err(|e| LlmError::Http(e.to_string()))?;
 
-        let status = resp.status().as_u16();
-        if status != 200 {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Api {
-                status,
-                message: text,
-            });
-        }
+        let resp = crate::http::check_status(resp).await?;
 
         let mut full_content = String::new();
-        let mut prompt_tokens = 0u32;
-        let mut completion_tokens = 0u32;
+        let mut usage = Usage {
+            model: model.clone(),
+            ..Default::default()
+        };
         let mut tool_calls: Vec<ToolCall> = Vec::new();
 
         crate::ndjson::parse_ndjson_stream(resp, |json| {
@@ -234,12 +214,7 @@ impl OllamaProvider {
 
             // Check if done — final chunk has usage info and tool calls
             if let Some(true) = json.get("done").and_then(|v| v.as_bool()) {
-                prompt_tokens = json
-                    .get("prompt_eval_count")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-                completion_tokens =
-                    json.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                usage.merge_json(json, &USAGE_FIELDS);
 
                 // Tool calls appear in the final message
                 if let Some(msg) = json.get("message") {
@@ -259,18 +234,22 @@ impl OllamaProvider {
         Ok(ChatResponse {
             content: full_content,
             role: "assistant".to_string(),
-            model: model.clone(),
+            model,
             tool_calls,
-            usage: Usage {
-                prompt_tokens,
-                completion_tokens,
-                model,
-                ..Default::default()
-            },
+            usage,
             stop_reason: Some(stop_reason.to_string()),
         })
     }
 }
+
+/// Token counts sit at the top level of the final `/api/chat` object; Ollama
+/// reports no prompt-cache counters.
+const USAGE_FIELDS: crate::types::UsageFields = crate::types::UsageFields {
+    prompt: "/prompt_eval_count",
+    completion: "/eval_count",
+    cache_read: None,
+    cache_write: None,
+};
 
 impl LlmProvider for OllamaProvider {
     fn name(&self) -> &str {
@@ -301,16 +280,6 @@ impl LlmProvider for OllamaProvider {
         // io_block_on drives ON THIS thread: `on_chunk` may touch non-Send Sema
         // values and must never migrate to a pool worker.
         sema_io::io_block_on(self.stream_complete_async(request, on_chunk))
-    }
-
-    fn batch_complete(&self, requests: Vec<ChatRequest>) -> Vec<Result<ChatResponse, LlmError>> {
-        sema_io::io_block_on(async {
-            let futures: Vec<_> = requests
-                .into_iter()
-                .map(|req| self.complete_async(req))
-                .collect();
-            futures::future::join_all(futures).await
-        })
     }
 }
 

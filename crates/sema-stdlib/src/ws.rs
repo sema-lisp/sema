@@ -29,8 +29,9 @@ use sema_core::runtime::{
     ResumeInput, Trace,
 };
 use sema_core::{check_arity, Caps, SemaError, SemaStream, StreamBox, Value};
+use sema_core::{ArgsExt, ResultExt};
 
-use crate::register_fn;
+use crate::{register_fn, register_runtime_fn};
 
 const WS_COMPLETION_KIND: u64 = 0x7773_0000; // "ws\0\0"
 
@@ -257,7 +258,7 @@ fn handles_of(
 /// Encode a value as JSON text for a frame.
 fn json_text(v: &Value) -> Result<String, SemaError> {
     let json = sema_core::value_to_json_lossy(v);
-    serde_json::to_string(&json).map_err(|e| SemaError::eval(format!("ws/send: json encode: {e}")))
+    serde_json::to_string(&json).eval_ctx("ws/send: json encode")
 }
 
 /// Translate a Sema value into an outgoing frame.
@@ -829,25 +830,6 @@ fn parse_connect_opts(v: Option<&Value>) -> Result<ConnectOpts, SemaError> {
     Ok(opts)
 }
 
-/// Register a non-gated dual-ABI ws native whose body returns `NativeResult` (so
-/// its runtime-quantum branch can `NativeOutcome::Suspend`). The plain value
-/// callback unwraps the `Return` produced outside the runtime.
-fn register_runtime_fn(env: &sema_core::Env, name: &'static str, f: fn(&[Value]) -> NativeResult) {
-    env.set(
-        sema_core::intern(name),
-        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
-            name,
-            move |args| match f(args)? {
-                NativeOutcome::Return(value) => Ok(value),
-                _ => Err(SemaError::eval(format!(
-                    "{name}: native suspended outside the cooperative runtime"
-                ))),
-            },
-            move |_native_ctx, args| f(args),
-        )),
-    );
-}
-
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // Establishing a connection touches the network → gate on NETWORK. The
     // per-message ops below operate on an already-open connection (which could
@@ -855,9 +837,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // matching the server-side ws closures.
     crate::register_runtime_fn_path_gated(env, sandbox, Caps::NETWORK, "ws/connect", &[], |args| {
         check_arity!(args, "ws/connect", 1..=2);
-        let url = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let url = args.str_at(0, "ws/connect")?;
         if !(url.starts_with("ws://") || url.starts_with("wss://")) {
             return Err(
                 SemaError::eval(format!("ws/connect: not a websocket URL: {url}"))

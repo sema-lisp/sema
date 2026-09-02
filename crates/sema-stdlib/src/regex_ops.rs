@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use regex::Regex;
-use sema_core::{check_arity, SemaError, Value};
+use sema_core::{check_arity, ArgsExt, SemaError, Value};
 
 use crate::register_fn;
 
@@ -16,24 +16,16 @@ fn compile_regex(pattern: &str) -> Result<Regex, SemaError> {
 pub fn register(env: &sema_core::Env) {
     register_fn(env, "regex/match?", |args| {
         check_arity!(args, "regex/match?", 2);
-        let pattern = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let text = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let pattern = args.str_at(0, "regex/match?")?;
+        let text = args.str_at(1, "regex/match?")?;
         let re = compile_regex(pattern)?;
         Ok(Value::bool(re.is_match(text)))
     });
 
     register_fn(env, "regex/match", |args| {
         check_arity!(args, "regex/match", 2);
-        let pattern = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let text = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let pattern = args.str_at(0, "regex/match")?;
+        let text = args.str_at(1, "regex/match")?;
         let re = compile_regex(pattern)?;
         match re.captures(text) {
             None => Ok(Value::nil()),
@@ -59,12 +51,8 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "regex/find-all", |args| {
         check_arity!(args, "regex/find-all", 2);
-        let pattern = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let text = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let pattern = args.str_at(0, "regex/find-all")?;
+        let text = args.str_at(1, "regex/find-all")?;
         let re = compile_regex(pattern)?;
         let matches: Vec<Value> = re
             .find_iter(text)
@@ -75,42 +63,26 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "regex/replace", |args| {
         check_arity!(args, "regex/replace", 3);
-        let pattern = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let replacement = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        let text = args[2]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[2].type_name()))?;
+        let pattern = args.str_at(0, "regex/replace")?;
+        let replacement = args.str_at(1, "regex/replace")?;
+        let text = args.str_at(2, "regex/replace")?;
         let re = compile_regex(pattern)?;
         Ok(Value::string(&re.replace(text, replacement)))
     });
 
     register_fn(env, "regex/replace-all", |args| {
         check_arity!(args, "regex/replace-all", 3);
-        let pattern = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let replacement = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        let text = args[2]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[2].type_name()))?;
+        let pattern = args.str_at(0, "regex/replace-all")?;
+        let replacement = args.str_at(1, "regex/replace-all")?;
+        let text = args.str_at(2, "regex/replace-all")?;
         let re = compile_regex(pattern)?;
         Ok(Value::string(&re.replace_all(text, replacement)))
     });
 
     register_fn(env, "regex/split", |args| {
         check_arity!(args, "regex/split", 2);
-        let pattern = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let text = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let pattern = args.str_at(0, "regex/split")?;
+        let text = args.str_at(1, "regex/split")?;
         let re = compile_regex(pattern)?;
         let parts: Vec<Value> = re.split(text).map(Value::string).collect();
         Ok(Value::list(parts))

@@ -5,6 +5,7 @@ use std::io::Read as _;
 use std::io::Write as _;
 
 use sema_core::{check_arity, Caps, NativeFn, SemaError, Value, ValueView};
+use sema_core::{ArgsExt, ResultExt};
 
 use crate::register_fn;
 
@@ -650,14 +651,14 @@ mod legacy_csi_tests {
 mod terminal_response_tests {
     use super::*;
 
-    fn kw(m: &Value, k: &str) -> Option<Value> {
+    pub(super) fn kw(m: &Value, k: &str) -> Option<Value> {
         m.as_map_ref()
             .and_then(|mm| mm.get(&Value::keyword(k)).cloned())
     }
-    fn is_kw(m: &Value, k: &str, want: &str) -> bool {
+    pub(super) fn is_kw(m: &Value, k: &str, want: &str) -> bool {
         kw(m, k) == Some(Value::keyword(want))
     }
-    fn mods_of(m: &Value) -> Vec<String> {
+    pub(super) fn mods_of(m: &Value) -> Vec<String> {
         kw(m, "mods")
             .and_then(|v| v.as_list().map(|l| l.to_vec()))
             .unwrap_or_default()
@@ -898,7 +899,7 @@ fn write_stdout(seq: &str) -> Result<(), SemaError> {
     let mut out = std::io::stdout();
     out.write_all(seq.as_bytes())
         .and_then(|_| out.flush())
-        .map_err(|e| SemaError::Io(format!("term: {e}")))
+        .io_ctx("term")
 }
 
 /// Detect kitty-keyboard support: send the flags query `CSI ?u` followed by a
@@ -1060,9 +1061,7 @@ fn decode_runtime_key(bytes: &[u8]) -> Value {
 
 fn path_dir_impl(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "path/dir", 1);
-    let p = args[0]
-        .as_str()
-        .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+    let p = args.str_at(0, "path/dir")?;
     let dir = std::path::Path::new(p)
         .parent()
         .and_then(|d| d.to_str())
@@ -1072,9 +1071,7 @@ fn path_dir_impl(args: &[Value]) -> Result<Value, SemaError> {
 
 fn path_filename_impl(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "path/filename", 1);
-    let p = args[0]
-        .as_str()
-        .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+    let p = args.str_at(0, "path/filename")?;
     let name = std::path::Path::new(p)
         .file_name()
         .and_then(|n| n.to_str())
@@ -1084,9 +1081,7 @@ fn path_filename_impl(args: &[Value]) -> Result<Value, SemaError> {
 
 fn path_extension_impl(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "path/extension", 1);
-    let p = args[0]
-        .as_str()
-        .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+    let p = args.str_at(0, "path/extension")?;
     let ext = std::path::Path::new(p)
         .extension()
         .and_then(|e| e.to_str())
@@ -1513,6 +1508,55 @@ where
 /// path and rejects an oversized file with a Sema condition (never an unbounded
 /// worker allocation). A missing/unstattable path is NOT rejected here — the job
 /// surfaces the real I/O error, matching the synchronous path's behavior.
+/// Shared body of the whole-file readers (`file/read`, `file/read-bytes`): the
+/// VFS answers first (`from_vfs` decodes its bytes); inside a runtime quantum
+/// the file is admitted, size-capped, and `read` runs on the quarantined
+/// worker; otherwise `read` runs inline.
+fn fs_read_op<T: Send + 'static>(
+    op: &'static str,
+    args: &[Value],
+    from_vfs: fn(Vec<u8>) -> Result<T, String>,
+    read: fn(&str) -> std::io::Result<T>,
+    to_value: fn(T) -> Value,
+) -> NativeResult {
+    check_arity!(args, op, 1);
+    let path = args.str_at(0, op)?;
+    if let Some(data) = sema_core::vfs::vfs_read(path) {
+        return from_vfs(data)
+            .map(|v| NativeOutcome::Return(to_value(v)))
+            .io_ctx(format!("{op} {path}"));
+    }
+    if sema_core::in_runtime_quantum() {
+        admit_regular_file(op, path)?;
+        fs_byte_cap_check(op, path)?;
+        let path = path.to_string();
+        return fs_quarantined(op, to_value, move || {
+            read(&path).map_err(|e| format!("{op} {path}: {e}"))
+        });
+    }
+    let value = read(path).io_ctx(format!("{op} {path}"))?;
+    Ok(NativeOutcome::Return(to_value(value)))
+}
+
+/// Shared body of the whole-file writers (`file/write`, `file/write-bytes`):
+/// inside a runtime quantum the file is admitted, the payload size-capped, and
+/// the write runs on the quarantined worker; otherwise it runs inline.
+fn fs_write_op(op: &'static str, path: &str, content: &[u8]) -> NativeResult {
+    if sema_core::in_runtime_quantum() {
+        admit_regular_file(op, path)?;
+        fs_write_cap_check(op, content.len())?;
+        let path = path.to_string();
+        let content = content.to_vec();
+        return fs_quarantined(
+            op,
+            |()| Value::nil(),
+            move || std::fs::write(&path, &content).map_err(|e| format!("{op} {path}: {e}")),
+        );
+    }
+    std::fs::write(path, content).io_ctx(format!("{op} {path}"))?;
+    Ok(NativeOutcome::Return(Value::nil()))
+}
+
 fn fs_byte_cap_check(op: &str, path: &str) -> Result<(), SemaError> {
     let cap = FS_BYTE_CAP.load(AtomicOrdering::SeqCst);
     if let Ok(meta) = std::fs::metadata(path) {
@@ -2540,9 +2584,7 @@ fn terminal_query_runtime_with_timeout(kind: TerminalQueryKind, timeout: Duratio
 #[cfg(unix)]
 fn read_key_timeout_value(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "io/read-key-timeout", 1);
-    let ms = args[0]
-        .as_int()
-        .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))? as u64;
+    let ms = args.int_at(0, "io/read-key-timeout")? as u64;
 
     read_key_from_owner(Some(Duration::from_millis(ms)))
 }
@@ -2603,10 +2645,7 @@ fn register_read_key_timeout(env: &sema_core::Env) {
             |_ctx, args| {
                 if sema_core::in_runtime_quantum() {
                     check_arity!(args, "io/read-key-timeout", 1);
-                    let ms = args[0]
-                        .as_int()
-                        .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?
-                        as u64;
+                    let ms = args.int_at(0, "io/read-key-timeout")? as u64;
                     let started = std::time::Instant::now();
                     return await_runtime_until(Box::new(KeyProbe::new()), started, ms);
                 }
@@ -2674,152 +2713,70 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         Ok(Value::nil())
     });
 
-    crate::register_runtime_fn_path_gated(env, sandbox, Caps::FS_READ, "file/read", &[0], |args| {
-        check_arity!(args, "file/read", 1);
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::argument_type("file/read", 1, "string", &args[0]))?;
-        if let Some(data) = sema_core::vfs::vfs_read(path) {
-            return String::from_utf8(data)
-                .map_err(|e| SemaError::Io(format!("file/read {path}: invalid UTF-8 in VFS: {e}")))
-                .map(|s| NativeOutcome::Return(Value::string_owned(s)));
-        }
-        if sema_core::in_runtime_quantum() {
-            admit_regular_file("file/read", path)?;
-            fs_byte_cap_check("file/read", path)?;
-            let path = path.to_string();
-            return fs_quarantined("file/read", Value::string_owned, move || {
-                std::fs::read_to_string(&path).map_err(|e| format!("file/read {path}: {e}"))
-            });
-        }
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| SemaError::Io(format!("file/read {path}: {e}")))?;
-        Ok(NativeOutcome::Return(Value::string_owned(content)))
+    crate::register_runtime_fn_path_gated0(env, sandbox, Caps::FS_READ, "file/read", |args| {
+        fs_read_op(
+            "file/read",
+            args,
+            |data| String::from_utf8(data).map_err(|e| format!("invalid UTF-8 in VFS: {e}")),
+            |path| std::fs::read_to_string(path),
+            Value::string_owned,
+        )
     });
 
-    crate::register_runtime_fn_path_gated(
-        env,
-        sandbox,
-        Caps::FS_WRITE,
-        "file/write",
-        &[0],
-        |args| {
-            check_arity!(args, "file/write", 2);
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            let content = args[1]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-            if sema_core::in_runtime_quantum() {
-                admit_regular_file("file/write", path)?;
-                fs_write_cap_check("file/write", content.len())?;
-                let path = path.to_string();
-                let content = content.to_string();
-                return fs_quarantined(
-                    "file/write",
-                    |()| Value::nil(),
-                    move || {
-                        std::fs::write(&path, &content)
-                            .map_err(|e| format!("file/write {path}: {e}"))
-                    },
-                );
-            }
-            std::fs::write(path, content)
-                .map_err(|e| SemaError::Io(format!("file/write {path}: {e}")))?;
-            Ok(NativeOutcome::Return(Value::nil()))
-        },
-    );
+    crate::register_runtime_fn_path_gated0(env, sandbox, Caps::FS_WRITE, "file/write", |args| {
+        check_arity!(args, "file/write", 2);
+        let path = args.str_at(0, "file/write")?;
+        let content = args.str_at(1, "file/write")?;
+        fs_write_op("file/write", path, content.as_bytes())
+    });
 
-    crate::register_runtime_fn_path_gated(
+    crate::register_runtime_fn_path_gated0(
         env,
         sandbox,
         Caps::FS_READ,
         "file/read-bytes",
-        &[0],
         |args| {
-            check_arity!(args, "file/read-bytes", 1);
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            if let Some(data) = sema_core::vfs::vfs_read(path) {
-                return Ok(NativeOutcome::Return(Value::bytevector(data)));
-            }
-            if sema_core::in_runtime_quantum() {
-                admit_regular_file("file/read-bytes", path)?;
-                fs_byte_cap_check("file/read-bytes", path)?;
-                let path = path.to_string();
-                return fs_quarantined("file/read-bytes", Value::bytevector, move || {
-                    std::fs::read(&path).map_err(|e| format!("file/read-bytes {path}: {e}"))
-                });
-            }
-            let bytes = std::fs::read(path)
-                .map_err(|e| SemaError::Io(format!("file/read-bytes {path}: {e}")))?;
-            Ok(NativeOutcome::Return(Value::bytevector(bytes)))
+            fs_read_op(
+                "file/read-bytes",
+                args,
+                Ok,
+                |path| std::fs::read(path),
+                Value::bytevector,
+            )
         },
     );
 
-    crate::register_runtime_fn_path_gated(
+    crate::register_runtime_fn_path_gated0(
         env,
         sandbox,
         Caps::FS_WRITE,
         "file/write-bytes",
-        &[0],
         |args| {
             check_arity!(args, "file/write-bytes", 2);
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            let bv = args[1]
-                .as_bytevector()
-                .ok_or_else(|| SemaError::type_error("bytevector", args[1].type_name()))?;
-            if sema_core::in_runtime_quantum() {
-                admit_regular_file("file/write-bytes", path)?;
-                fs_write_cap_check("file/write-bytes", bv.len())?;
-                let path = path.to_string();
-                let bv = bv.to_vec();
-                return fs_quarantined(
-                    "file/write-bytes",
-                    |()| Value::nil(),
-                    move || {
-                        std::fs::write(&path, &bv)
-                            .map_err(|e| format!("file/write-bytes {path}: {e}"))
-                    },
-                );
-            }
-            std::fs::write(path, bv)
-                .map_err(|e| SemaError::Io(format!("file/write-bytes {path}: {e}")))?;
-            Ok(NativeOutcome::Return(Value::nil()))
+            let path = args.str_at(0, "file/write-bytes")?;
+            let bv = args.bytes_at(1, "file/write-bytes")?;
+            fs_write_op("file/write-bytes", path, bv)
         },
     );
 
-    crate::register_runtime_fn_path_gated(
-        env,
-        sandbox,
-        Caps::FS_READ,
-        "file/exists?",
-        &[0],
-        |args| {
-            check_arity!(args, "file/exists?", 1);
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            if let Some(exists) = sema_core::vfs::vfs_exists(path) {
-                if exists {
-                    return Ok(NativeOutcome::Return(Value::bool(true)));
-                }
+    crate::register_runtime_fn_path_gated0(env, sandbox, Caps::FS_READ, "file/exists?", |args| {
+        check_arity!(args, "file/exists?", 1);
+        let path = args.str_at(0, "file/exists?")?;
+        if let Some(exists) = sema_core::vfs::vfs_exists(path) {
+            if exists {
+                return Ok(NativeOutcome::Return(Value::bool(true)));
             }
-            if sema_core::in_runtime_quantum() {
-                let path = path.to_string();
-                return fs_quarantined("file/exists?", Value::bool, move || {
-                    Ok(std::path::Path::new(&path).exists())
-                });
-            }
-            Ok(NativeOutcome::Return(Value::bool(
-                std::path::Path::new(path).exists(),
-            )))
-        },
-    );
+        }
+        if sema_core::in_runtime_quantum() {
+            let path = path.to_string();
+            return fs_quarantined("file/exists?", Value::bool, move || {
+                Ok(std::path::Path::new(&path).exists())
+            });
+        }
+        Ok(NativeOutcome::Return(Value::bool(
+            std::path::Path::new(path).exists(),
+        )))
+    });
 
     crate::register_runtime_fn(env, "read-line", |args| {
         #[cfg(not(target_arch = "wasm32"))]
@@ -2832,17 +2789,13 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     register_fn(env, "read", |args| {
         check_arity!(args, "read", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "read")?;
         sema_reader::read(s)
     });
 
     register_fn(env, "read-many", |args| {
         check_arity!(args, "read-many", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "read-many")?;
         let exprs = sema_reader::read_many(s)?;
         Ok(Value::list(exprs))
     });
@@ -2869,14 +2822,10 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         Err(SemaError::from_thrown(args[0].clone()))
     });
 
-    crate::register_fn_path_gated(env, sandbox, Caps::FS_WRITE, "file/append", &[0], |args| {
+    crate::register_fn_path_gated0(env, sandbox, Caps::FS_WRITE, "file/append", |args| {
         check_arity!(args, "file/append", 2);
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let content = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let path = args.str_at(0, "file/append")?;
+        let content = args.str_at(1, "file/append")?;
         fn append_impl(path: &str, content: &str) -> Result<(), String> {
             use std::io::Write;
             let mut file = std::fs::OpenOptions::new()
@@ -2891,13 +2840,10 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         Ok(Value::nil())
     });
 
-    crate::register_fn_path_gated(env, sandbox, Caps::FS_WRITE, "file/delete", &[0], |args| {
+    crate::register_fn_path_gated0(env, sandbox, Caps::FS_WRITE, "file/delete", |args| {
         check_arity!(args, "file/delete", 1);
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        std::fs::remove_file(path)
-            .map_err(|e| SemaError::Io(format!("file/delete {path}: {e}")))?;
+        let path = args.str_at(0, "file/delete")?;
+        std::fs::remove_file(path).io_ctx(format!("file/delete {path}"))?;
         Ok(Value::nil())
     });
 
@@ -2909,23 +2855,16 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[0, 1],
         |args| {
             check_arity!(args, "file/rename", 2);
-            let from = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            let to = args[1]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-            std::fs::rename(from, to)
-                .map_err(|e| SemaError::Io(format!("file/rename {from} -> {to}: {e}")))?;
+            let from = args.str_at(0, "file/rename")?;
+            let to = args.str_at(1, "file/rename")?;
+            std::fs::rename(from, to).io_ctx(format!("file/rename {from} -> {to}"))?;
             Ok(Value::nil())
         },
     );
 
-    crate::register_runtime_fn_path_gated(env, sandbox, Caps::FS_READ, "file/list", &[0], |args| {
+    crate::register_runtime_fn_path_gated0(env, sandbox, Caps::FS_READ, "file/list", |args| {
         check_arity!(args, "file/list", 1);
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let path = args.str_at(0, "file/list")?;
         fn list_impl(path: &str) -> Result<Vec<String>, String> {
             let mut entries = Vec::new();
             for entry in std::fs::read_dir(path).map_err(|e| format!("file/list {path}: {e}"))? {
@@ -2965,59 +2904,34 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         )))
     });
 
-    crate::register_fn_path_gated(env, sandbox, Caps::FS_WRITE, "file/mkdir", &[0], |args| {
+    crate::register_fn_path_gated0(env, sandbox, Caps::FS_WRITE, "file/mkdir", |args| {
         check_arity!(args, "file/mkdir", 1);
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        std::fs::create_dir_all(path)
-            .map_err(|e| SemaError::Io(format!("file/mkdir {path}: {e}")))?;
+        let path = args.str_at(0, "file/mkdir")?;
+        std::fs::create_dir_all(path).io_ctx(format!("file/mkdir {path}"))?;
         Ok(Value::nil())
     });
 
-    crate::register_fn_path_gated(
-        env,
-        sandbox,
-        Caps::FS_READ,
-        "file/is-directory?",
-        &[0],
-        |args| {
-            check_arity!(args, "file/is-directory?", 1);
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            Ok(Value::bool(std::path::Path::new(path).is_dir()))
-        },
-    );
+    crate::register_fn_path_gated0(env, sandbox, Caps::FS_READ, "file/is-directory?", |args| {
+        check_arity!(args, "file/is-directory?", 1);
+        let path = args.str_at(0, "file/is-directory?")?;
+        Ok(Value::bool(std::path::Path::new(path).is_dir()))
+    });
 
-    crate::register_fn_path_gated(env, sandbox, Caps::FS_READ, "file/is-file?", &[0], |args| {
+    crate::register_fn_path_gated0(env, sandbox, Caps::FS_READ, "file/is-file?", |args| {
         check_arity!(args, "file/is-file?", 1);
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let path = args.str_at(0, "file/is-file?")?;
         Ok(Value::bool(std::path::Path::new(path).is_file()))
     });
 
-    crate::register_fn_path_gated(
-        env,
-        sandbox,
-        Caps::FS_READ,
-        "file/is-symlink?",
-        &[0],
-        |args| {
-            check_arity!(args, "file/is-symlink?", 1);
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            Ok(Value::bool(std::path::Path::new(path).is_symlink()))
-        },
-    );
+    crate::register_fn_path_gated0(env, sandbox, Caps::FS_READ, "file/is-symlink?", |args| {
+        check_arity!(args, "file/is-symlink?", 1);
+        let path = args.str_at(0, "file/is-symlink?")?;
+        Ok(Value::bool(std::path::Path::new(path).is_symlink()))
+    });
 
-    crate::register_runtime_fn_path_gated(env, sandbox, Caps::FS_READ, "file/info", &[0], |args| {
+    crate::register_runtime_fn_path_gated0(env, sandbox, Caps::FS_READ, "file/info", |args| {
         check_arity!(args, "file/info", 1);
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let path = args.str_at(0, "file/info")?;
         // (size, is_dir, is_file, modified_millis) — plain Send data extracted from
         // `std::fs::Metadata` on the worker; the `Value` map is only built back on
         // the VM thread by `decode`/below.
@@ -3066,25 +2980,19 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // path/basename is registered below as an alias of path/filename.
     // path/extension is registered below as an alias of path/ext (canonical name: path/extension).
 
-    crate::register_fn_path_gated(env, sandbox, Caps::FS_READ, "path/absolute", &[0], |args| {
+    crate::register_fn_path_gated0(env, sandbox, Caps::FS_READ, "path/absolute", |args| {
         check_arity!(args, "path/absolute", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let abs = std::fs::canonicalize(s)
-            .map_err(|e| SemaError::Io(format!("path/absolute {s}: {e}")))?;
+        let s = args.str_at(0, "path/absolute")?;
+        let abs = std::fs::canonicalize(s).io_ctx(format!("path/absolute {s}"))?;
         Ok(Value::string(&abs.to_string_lossy()))
     });
 
     crate::register_fn_gated(env, sandbox, Caps::FS_READ, "file/glob", |args| {
         check_arity!(args, "file/glob", 1);
-        let pattern = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let pattern = args.str_at(0, "file/glob")?;
         // Validate the pattern up front (sandbox-side, cheap, and the error is a
         // `SemaError::eval` not `::Io` — keep it on the VM thread in both paths).
-        glob::glob(pattern)
-            .map_err(|e| SemaError::eval(format!("file/glob: invalid pattern: {e}")))?;
+        glob::glob(pattern).eval_ctx("file/glob: invalid pattern")?;
         fn glob_impl(pattern: &str) -> Result<Vec<String>, String> {
             let paths =
                 glob::glob(pattern).map_err(|e| format!("file/glob: invalid pattern: {e}"))?;
@@ -3112,9 +3020,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     register_fn(env, "path/stem", |args| {
         check_arity!(args, "path/stem", 1);
-        let p = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let p = args.str_at(0, "path/stem")?;
         let stem = std::path::Path::new(p)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -3132,42 +3038,26 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     register_fn(env, "path/absolute?", |args| {
         check_arity!(args, "path/absolute?", 1);
-        let p = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let p = args.str_at(0, "path/absolute?")?;
         Ok(Value::bool(std::path::Path::new(p).is_absolute()))
     });
 
     // path/canonicalize — resolve symlinks + `.`/`..` to a real absolute path.
     // Errors if the path doesn't exist (that's what makes it the safe form for
     // checking where a path *actually* points).
-    crate::register_fn_path_gated(
-        env,
-        sandbox,
-        Caps::FS_READ,
-        "path/canonicalize",
-        &[0],
-        |args| {
-            check_arity!(args, "path/canonicalize", 1);
-            let s = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            let c = std::fs::canonicalize(s)
-                .map_err(|e| SemaError::Io(format!("path/canonicalize {s}: {e}")))?;
-            Ok(Value::string(&c.to_string_lossy()))
-        },
-    );
+    crate::register_fn_path_gated0(env, sandbox, Caps::FS_READ, "path/canonicalize", |args| {
+        check_arity!(args, "path/canonicalize", 1);
+        let s = args.str_at(0, "path/canonicalize")?;
+        let c = std::fs::canonicalize(s).io_ctx(format!("path/canonicalize {s}"))?;
+        Ok(Value::string(&c.to_string_lossy()))
+    });
 
     // path/relative-to — express PATH relative to BASE (pure path math, no fs).
     // (path/relative-to base path) → e.g. base "/a/b", path "/a/b/c/d" → "c/d".
     register_fn(env, "path/relative-to", |args| {
         check_arity!(args, "path/relative-to", 2);
-        let base = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let target = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let base = args.str_at(0, "path/relative-to")?;
+        let target = args.str_at(1, "path/relative-to")?;
         let base = lexical_absolute(std::path::Path::new(base));
         let target = lexical_absolute(std::path::Path::new(target));
         let bc: Vec<_> = base.components().collect();
@@ -3194,58 +3084,39 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // and symlink escapes. The cornerstone of agent path sandboxing.
     register_fn(env, "path/within?", |args| {
         check_arity!(args, "path/within?", 2);
-        let base = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let child = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let base = args.str_at(0, "path/within?")?;
+        let child = args.str_at(1, "path/within?")?;
         let base = resolved_path(base);
         let child = resolved_path(child);
         Ok(Value::bool(child.starts_with(&base)))
     });
 
-    crate::register_fn_path_gated(
-        env,
-        sandbox,
-        Caps::FS_READ,
-        "file/read-lines",
-        &[0],
-        |args| {
-            check_arity!(args, "file/read-lines", 1);
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            let content = if let Some(data) = sema_core::vfs::vfs_read(path) {
-                String::from_utf8(data).map_err(|e| {
-                    SemaError::Io(format!("file/read-lines {path}: invalid UTF-8 in VFS: {e}"))
-                })?
-            } else {
-                std::fs::read_to_string(path)
-                    .map_err(|e| SemaError::Io(format!("file/read-lines {path}: {e}")))?
-            };
-            let lines: Vec<Value> = content.lines().map(Value::string).collect();
-            Ok(Value::list(lines))
-        },
-    );
+    crate::register_fn_path_gated0(env, sandbox, Caps::FS_READ, "file/read-lines", |args| {
+        check_arity!(args, "file/read-lines", 1);
+        let path = args.str_at(0, "file/read-lines")?;
+        let content = if let Some(data) = sema_core::vfs::vfs_read(path) {
+            String::from_utf8(data)
+                .io_ctx(format!("file/read-lines {path}: invalid UTF-8 in VFS"))?
+        } else {
+            std::fs::read_to_string(path).io_ctx(format!("file/read-lines {path}"))?
+        };
+        let lines: Vec<Value> = content.lines().map(Value::string).collect();
+        Ok(Value::list(lines))
+    });
 
-    crate::register_runtime_fn_path_gated(
+    crate::register_runtime_fn_path_gated0(
         env,
         sandbox,
         Caps::FS_READ,
         "file/for-each-line",
-        &[0],
         |args| {
             check_arity!(args, "file/for-each-line", 2);
             if sema_core::in_runtime_quantum() {
                 return file_line_runtime(args, FileLineKind::ForEachText);
             }
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            let path = args.str_at(0, "file/for-each-line")?;
             let func = args[1].clone();
-            let file = std::fs::File::open(path)
-                .map_err(|e| SemaError::Io(format!("file/for-each-line {path}: {e}")))?;
+            let file = std::fs::File::open(path).io_ctx(format!("file/for-each-line {path}"))?;
             let mut reader = std::io::BufReader::new(file);
 
             sema_core::with_stdlib_ctx(|ctx| {
@@ -3254,7 +3125,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     line_buf.clear();
                     let n = reader
                         .read_line(&mut line_buf)
-                        .map_err(|e| SemaError::Io(format!("file/for-each-line {path}: {e}")))?;
+                        .io_ctx(format!("file/for-each-line {path}"))?;
                     if n == 0 {
                         break;
                     }
@@ -3271,24 +3142,20 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         },
     );
 
-    crate::register_runtime_fn_path_gated(
+    crate::register_runtime_fn_path_gated0(
         env,
         sandbox,
         Caps::FS_READ,
         "file/fold-lines",
-        &[0],
         |args| {
             check_arity!(args, "file/fold-lines", 3);
             if sema_core::in_runtime_quantum() {
                 return file_line_runtime(args, FileLineKind::FoldText);
             }
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            let path = args.str_at(0, "file/fold-lines")?;
             let func = args[1].clone();
             let mut acc = args[2].clone();
-            let file = std::fs::File::open(path)
-                .map_err(|e| SemaError::Io(format!("file/fold-lines {path}: {e}")))?;
+            let file = std::fs::File::open(path).io_ctx(format!("file/fold-lines {path}"))?;
             // 256KB buffer (vs default 8KB) improves throughput for large file reads.
             let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
 
@@ -3298,7 +3165,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     line_buf.clear();
                     let n = reader
                         .read_line(&mut line_buf)
-                        .map_err(|e| SemaError::Io(format!("file/fold-lines {path}: {e}")))?;
+                        .io_ctx(format!("file/fold-lines {path}"))?;
                     if n == 0 {
                         break;
                     }
@@ -3322,24 +3189,20 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         },
     );
 
-    crate::register_runtime_fn_path_gated(
+    crate::register_runtime_fn_path_gated0(
         env,
         sandbox,
         Caps::FS_READ,
         "file/fold-lines-bytes",
-        &[0],
         |args| {
             check_arity!(args, "file/fold-lines-bytes", 3);
             if sema_core::in_runtime_quantum() {
                 return file_line_runtime(args, FileLineKind::FoldBytes);
             }
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            let path = args.str_at(0, "file/fold-lines-bytes")?;
             let func = args[1].clone();
             let mut acc = args[2].clone();
-            let file = std::fs::File::open(path)
-                .map_err(|e| SemaError::Io(format!("file/fold-lines-bytes {path}: {e}")))?;
+            let file = std::fs::File::open(path).io_ctx(format!("file/fold-lines-bytes {path}"))?;
             // 256KB buffer (vs default 8KB) improves throughput for large file reads.
             let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
 
@@ -3354,7 +3217,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     line_buf.clear();
                     let n = reader
                         .read_until(b'\n', &mut line_buf)
-                        .map_err(|e| SemaError::Io(format!("file/fold-lines-bytes {path}: {e}")))?;
+                        .io_ctx(format!("file/fold-lines-bytes {path}"))?;
                     if n == 0 {
                         break;
                     }
@@ -3380,46 +3243,31 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         },
     );
 
-    crate::register_fn_path_gated(
-        env,
-        sandbox,
-        Caps::FS_WRITE,
-        "file/write-lines",
-        &[0],
-        |args| {
-            check_arity!(args, "file/write-lines", 2);
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            let lines = match args[1].view() {
-                ValueView::List(l) => l,
-                ValueView::Vector(v) => v,
-                _ => return Err(SemaError::type_error("list or vector", args[1].type_name())),
-            };
-            let strs: Vec<String> = lines
-                .iter()
-                .map(|v| match v.as_str() {
-                    Some(s) => s.to_string(),
-                    None => v.to_string(),
-                })
-                .collect();
-            let content = strs.join("\n");
-            std::fs::write(path, content)
-                .map_err(|e| SemaError::Io(format!("file/write-lines {path}: {e}")))?;
-            Ok(Value::nil())
-        },
-    );
+    crate::register_fn_path_gated0(env, sandbox, Caps::FS_WRITE, "file/write-lines", |args| {
+        check_arity!(args, "file/write-lines", 2);
+        let path = args.str_at(0, "file/write-lines")?;
+        let lines = match args[1].view() {
+            ValueView::List(l) => l,
+            ValueView::Vector(v) => v,
+            _ => return Err(SemaError::type_error("list or vector", args[1].type_name())),
+        };
+        let strs: Vec<String> = lines
+            .iter()
+            .map(|v| match v.as_str() {
+                Some(s) => s.to_string(),
+                None => v.to_string(),
+            })
+            .collect();
+        let content = strs.join("\n");
+        std::fs::write(path, content).io_ctx(format!("file/write-lines {path}"))?;
+        Ok(Value::nil())
+    });
 
     crate::register_fn_path_gated(env, sandbox, Caps::FS_WRITE, "file/copy", &[0, 1], |args| {
         check_arity!(args, "file/copy", 2);
-        let src = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let dest = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        std::fs::copy(src, dest)
-            .map_err(|e| SemaError::Io(format!("file/copy {src} -> {dest}: {e}")))?;
+        let src = args.str_at(0, "file/copy")?;
+        let dest = args.str_at(1, "file/copy")?;
+        std::fs::copy(src, dest).io_ctx(format!("file/copy {src} -> {dest}"))?;
         Ok(Value::nil())
     });
 
@@ -3467,9 +3315,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // io/flush — flush stdout
     register_fn(env, "io/flush", |args| {
         check_arity!(args, "io/flush", 0);
-        std::io::stdout()
-            .flush()
-            .map_err(|e| SemaError::Io(format!("io/flush: {e}")))?;
+        std::io::stdout().flush().io_ctx("io/flush")?;
         Ok(Value::nil())
     });
 
@@ -3545,9 +3391,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let restore_registry = std::rc::Rc::clone(&tty_registry);
         register_fn(env, "io/tty-restore!", move |args| {
             check_arity!(args, "io/tty-restore!", 1);
-            let id = args[0]
-                .as_int()
-                .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?;
+            let id = args.int_at(0, "io/tty-restore!")?;
             restore_registry.restore_token(id);
             Ok(Value::nil())
         });
@@ -3625,13 +3469,10 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     register_log_fn(env, "log/error", "ERROR");
     register_log_fn(env, "log/debug", "DEBUG");
 
-    crate::register_fn_path_gated(env, sandbox, Caps::FS_READ, "load", &[0], |args| {
+    crate::register_fn_path_gated0(env, sandbox, Caps::FS_READ, "load", |args| {
         check_arity!(args, "load", 1);
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| SemaError::Io(format!("load {path}: {e}")))?;
+        let path = args.str_at(0, "load")?;
+        let content = std::fs::read_to_string(path).io_ctx(format!("load {path}"))?;
         // Parse and return as a list of expressions for the caller to eval
         let exprs = sema_reader::read_many(&content)?;
         Ok(Value::list(exprs))
@@ -3893,21 +3734,7 @@ mod within_tests {
 mod input_decode_tests {
     use super::*;
 
-    fn kw(m: &Value, k: &str) -> Option<Value> {
-        m.as_map_ref()
-            .and_then(|mm| mm.get(&Value::keyword(k)).cloned())
-    }
-    fn is_kw(m: &Value, k: &str, want: &str) -> bool {
-        kw(m, k) == Some(Value::keyword(want))
-    }
-    fn mods_of(m: &Value) -> Vec<String> {
-        kw(m, "mods")
-            .and_then(|v| v.as_list().map(|l| l.to_vec()))
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|k| k.as_keyword().map(|s| s.to_string()))
-            .collect()
-    }
+    use super::terminal_response_tests::{is_kw, kw, mods_of};
 
     // ── SGR mouse ──
     #[test]

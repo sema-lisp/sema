@@ -37,7 +37,7 @@ use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};
 
 use sema_core::runtime::{NativeOutcome, NativeResult, QuarantineBound};
-use sema_core::{check_arity, Caps, SemaError, Value};
+use sema_core::{check_arity, ArgsExt, Caps, ResultExt, SemaError, Value};
 
 use crate::{register_runtime_fn, register_runtime_fn_gated};
 
@@ -194,8 +194,7 @@ impl<W: std::io::Seek> std::io::Seek for BoundedWriter<W> {
 }
 
 fn open_regular_bounded(op: &str, path: &str, limit: u64) -> Result<std::fs::File, SemaError> {
-    let metadata =
-        std::fs::metadata(path).map_err(|e| SemaError::Io(format!("{op} {path}: {e}")))?;
+    let metadata = std::fs::metadata(path).io_ctx(format!("{op} {path}"))?;
     if !metadata.is_file() {
         return Err(SemaError::eval(format!(
             "{op}: archive input must be a regular file: {path}"
@@ -210,12 +209,8 @@ fn open_regular_bounded(op: &str, path: &str, limit: u64) -> Result<std::fs::Fil
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let file = options
-        .open(path)
-        .map_err(|e| SemaError::Io(format!("{op} {path}: {e}")))?;
-    let opened_metadata = file
-        .metadata()
-        .map_err(|e| SemaError::Io(format!("{op} {path}: {e}")))?;
+    let file = options.open(path).io_ctx(format!("{op} {path}"))?;
+    let opened_metadata = file.metadata().io_ctx(format!("{op} {path}"))?;
     if !opened_metadata.is_file() {
         return Err(SemaError::eval(format!(
             "{op}: archive input must be a regular file: {path}"
@@ -230,7 +225,7 @@ fn read_path_bounded(op: &str, path: &str, limit: u64) -> Result<Vec<u8>, SemaEr
     let mut bytes = Vec::new();
     file.take(limit.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|e| SemaError::Io(format!("{op} {path}: {e}")))?;
+        .io_ctx(format!("{op} {path}"))?;
     check_archive_limit(op, "input bytes", bytes.len() as u64, limit)?;
     Ok(bytes)
 }
@@ -294,8 +289,7 @@ fn zip_create_work(
     files: &[String],
     bounds: Option<ArchiveBounds>,
 ) -> Result<i64, SemaError> {
-    let file = std::fs::File::create(out_path)
-        .map_err(|e| SemaError::Io(format!("zip/create {out_path}: {e}")))?;
+    let file = std::fs::File::create(out_path).io_ctx(format!("zip/create {out_path}"))?;
     let mut writer = zip::ZipWriter::new(BoundedWriter::new(
         file,
         bounds.map_or(u64::MAX, |bounds| bounds.output_bytes),
@@ -324,9 +318,7 @@ fn zip_create_work(
                 src,
                 bounds.input_bytes.saturating_sub(input_bytes),
             )?,
-            None => {
-                std::fs::read(src).map_err(|e| SemaError::Io(format!("zip/create {src}: {e}")))?
-            }
+            None => std::fs::read(src).io_ctx(format!("zip/create {src}"))?,
         };
         if let Some(bounds) = bounds {
             input_bytes = input_bytes
@@ -339,7 +331,7 @@ fn zip_create_work(
             .map_err(|e| SemaError::eval(format!("zip/create: {e}")))?;
         writer
             .write_all(&data)
-            .map_err(|e| SemaError::Io(format!("zip/create {src}: {e}")))?;
+            .io_ctx(format!("zip/create {src}"))?;
         count += 1;
     }
     writer
@@ -366,8 +358,7 @@ fn zip_extract_work(
             )
         }
         None => {
-            let file = std::fs::File::open(zip_path)
-                .map_err(|e| SemaError::Io(format!("zip/extract {zip_path}: {e}")))?;
+            let file = std::fs::File::open(zip_path).io_ctx(format!("zip/extract {zip_path}"))?;
             zip_extract_from_reader(file, zip_path, dest_dir, None)
         }
     }
@@ -391,8 +382,7 @@ fn zip_extract_from_reader<R: std::io::Read + std::io::Seek>(
     }
 
     let dest_root = Path::new(dest_dir);
-    std::fs::create_dir_all(dest_root)
-        .map_err(|e| SemaError::Io(format!("zip/extract {dest_dir}: {e}")))?;
+    std::fs::create_dir_all(dest_root).io_ctx(format!("zip/extract {dest_dir}"))?;
 
     let mut count = 0i64;
     let mut declared_output_bytes = 0u64;
@@ -421,8 +411,7 @@ fn zip_extract_from_reader<R: std::io::Read + std::io::Seek>(
             )?;
         }
         if entry.is_dir() || name.ends_with('/') {
-            std::fs::create_dir_all(&target)
-                .map_err(|e| SemaError::Io(format!("zip/extract {name}: {e}")))?;
+            std::fs::create_dir_all(&target).io_ctx(format!("zip/extract {name}"))?;
         } else {
             // A foreign archive can carry two file entries that map to the
             // same target; the create-side dedup doesn't protect extraction,
@@ -434,17 +423,15 @@ fn zip_extract_from_reader<R: std::io::Read + std::io::Seek>(
                 )));
             }
             if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| SemaError::Io(format!("zip/extract {name}: {e}")))?;
+                std::fs::create_dir_all(parent).io_ctx(format!("zip/extract {name}"))?;
             }
-            let out = std::fs::File::create(&target)
-                .map_err(|e| SemaError::Io(format!("zip/extract {name}: {e}")))?;
+            let out = std::fs::File::create(&target).io_ctx(format!("zip/extract {name}"))?;
             let remaining = bounds.map_or(u64::MAX, |bounds| {
                 bounds.output_bytes.saturating_sub(actual_output_bytes)
             });
             let mut out = BoundedWriter::new(out, remaining);
-            let copied = std::io::copy(&mut entry, &mut out)
-                .map_err(|e| SemaError::Io(format!("zip/extract {name}: {e}")))?;
+            let copied =
+                std::io::copy(&mut entry, &mut out).io_ctx(format!("zip/extract {name}"))?;
             actual_output_bytes = actual_output_bytes
                 .checked_add(copied)
                 .ok_or_else(|| SemaError::eval("zip/extract: output byte count overflowed"))?;
@@ -463,8 +450,7 @@ fn zip_list_work(zip_path: &str, bounds: Option<ArchiveBounds>) -> Result<Vec<St
             zip_list_from_reader(std::io::Cursor::new(bytes), zip_path, Some(bounds))
         }
         None => {
-            let file = std::fs::File::open(zip_path)
-                .map_err(|e| SemaError::Io(format!("zip/list {zip_path}: {e}")))?;
+            let file = std::fs::File::open(zip_path).io_ctx(format!("zip/list {zip_path}"))?;
             zip_list_from_reader(file, zip_path, None)
         }
     }
@@ -544,11 +530,11 @@ fn tar_add_files<W: std::io::Write>(
             header.set_mode(0o644);
             builder
                 .append_data(&mut header, name, &data[..])
-                .map_err(|e| SemaError::Io(format!("tar/create {src}: {e}")))?;
+                .io_ctx(format!("tar/create {src}"))?;
         } else {
             builder
                 .append_path_with_name(src, name)
-                .map_err(|e| SemaError::Io(format!("tar/create {src}: {e}")))?;
+                .io_ctx(format!("tar/create {src}"))?;
         }
         count += 1;
     }
@@ -562,8 +548,7 @@ fn tar_create_work(
     files: &[String],
     bounds: Option<ArchiveBounds>,
 ) -> Result<i64, SemaError> {
-    let out_file = std::fs::File::create(out_path)
-        .map_err(|e| SemaError::Io(format!("tar/create {out_path}: {e}")))?;
+    let out_file = std::fs::File::create(out_path).io_ctx(format!("tar/create {out_path}"))?;
     let out_file = BoundedWriter::new(
         out_file,
         bounds.map_or(u64::MAX, |bounds| bounds.output_bytes),
@@ -575,17 +560,13 @@ fn tar_create_work(
         let count = tar_add_files(&mut builder, files, bounds)?;
         let encoder = builder
             .into_inner()
-            .map_err(|e| SemaError::Io(format!("tar/create {out_path}: {e}")))?;
-        encoder
-            .finish()
-            .map_err(|e| SemaError::Io(format!("tar/create {out_path}: {e}")))?;
+            .io_ctx(format!("tar/create {out_path}"))?;
+        encoder.finish().io_ctx(format!("tar/create {out_path}"))?;
         Ok(count)
     } else {
         let mut builder = tar::Builder::new(out_file);
         let count = tar_add_files(&mut builder, files, bounds)?;
-        builder
-            .finish()
-            .map_err(|e| SemaError::Io(format!("tar/create {out_path}: {e}")))?;
+        builder.finish().io_ctx(format!("tar/create {out_path}"))?;
         Ok(count)
     }
 }
@@ -599,15 +580,13 @@ fn tar_extract_work(
 ) -> Result<i64, SemaError> {
     let raw = match bounds {
         Some(bounds) => read_path_bounded("tar/extract", tar_path, bounds.input_bytes)?,
-        None => std::fs::read(tar_path)
-            .map_err(|e| SemaError::Io(format!("tar/extract {tar_path}: {e}")))?,
+        None => std::fs::read(tar_path).io_ctx(format!("tar/extract {tar_path}"))?,
     };
     // gzip magic: 0x1f 0x8b. Auto-detect by extension OR magic bytes.
     let gzipped = looks_gzip(tar_path) || raw.starts_with(&[0x1f, 0x8b]);
 
     let dest_root = Path::new(dest_dir);
-    std::fs::create_dir_all(dest_root)
-        .map_err(|e| SemaError::Io(format!("tar/extract {dest_dir}: {e}")))?;
+    std::fs::create_dir_all(dest_root).io_ctx(format!("tar/extract {dest_dir}"))?;
 
     // Decompress up front (if needed) so the rest is a single tar-reading path.
     let tar_bytes: Vec<u8> = if gzipped {
@@ -686,12 +665,11 @@ fn tar_extract_work(
             )));
         }
         if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| SemaError::Io(format!("tar/extract {name}: {e}")))?;
+            std::fs::create_dir_all(parent).io_ctx(format!("tar/extract {name}"))?;
         }
         entry
             .unpack(&target)
-            .map_err(|e| SemaError::Io(format!("tar/extract {name}: {e}")))?;
+            .io_ctx(format!("tar/extract {name}"))?;
         count += 1;
     }
     Ok(count)
@@ -785,16 +763,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // (zip/create out-path files) -> entry count. Each file added under its basename.
     register_runtime_fn_gated(env, sandbox, Caps::FS_WRITE, "zip/create", |args| {
         check_arity!(args, "zip/create", 2);
-        let out_path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
-        let files = string_list_arg(
-            args[1]
-                .as_list()
-                .ok_or_else(|| SemaError::type_error("list", args[1].type_name()))?,
-            "zip/create",
-        )?;
+        let out_path = args.str_at(0, "zip/create")?.to_string();
+        let files = string_list_arg(args.list_at(1, "zip/create")?, "zip/create")?;
 
         if sema_core::in_runtime_quantum() {
             let bounds = ARCHIVE_RUNTIME_BOUNDS;
@@ -811,14 +781,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // (zip/extract zip-path dest-dir) -> count of entries extracted.
     register_runtime_fn_gated(env, sandbox, Caps::FS_WRITE, "zip/extract", |args| {
         check_arity!(args, "zip/extract", 2);
-        let zip_path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
-        let dest_dir = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-            .to_string();
+        let zip_path = args.str_at(0, "zip/extract")?.to_string();
+        let dest_dir = args.str_at(1, "zip/extract")?.to_string();
 
         if sema_core::in_runtime_quantum() {
             let bounds = ARCHIVE_RUNTIME_BOUNDS;
@@ -835,10 +799,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // (zip/list zip-path) -> list of entry-name strings.
     register_runtime_fn_gated(env, sandbox, Caps::FS_READ, "zip/list", |args| {
         check_arity!(args, "zip/list", 1);
-        let zip_path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
+        let zip_path = args.str_at(0, "zip/list")?.to_string();
 
         if sema_core::in_runtime_quantum() {
             let bounds = ARCHIVE_RUNTIME_BOUNDS;
@@ -856,16 +817,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // ends in .tar.gz / .tgz, else plain tar. Each file added under its basename.
     register_runtime_fn_gated(env, sandbox, Caps::FS_WRITE, "tar/create", |args| {
         check_arity!(args, "tar/create", 2);
-        let out_path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
-        let files = string_list_arg(
-            args[1]
-                .as_list()
-                .ok_or_else(|| SemaError::type_error("list", args[1].type_name()))?,
-            "tar/create",
-        )?;
+        let out_path = args.str_at(0, "tar/create")?.to_string();
+        let files = string_list_arg(args.list_at(1, "tar/create")?, "tar/create")?;
 
         if sema_core::in_runtime_quantum() {
             let bounds = ARCHIVE_RUNTIME_BOUNDS;
@@ -883,14 +836,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // extension or magic bytes. Guards against path traversal.
     register_runtime_fn_gated(env, sandbox, Caps::FS_WRITE, "tar/extract", |args| {
         check_arity!(args, "tar/extract", 2);
-        let tar_path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
-        let dest_dir = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-            .to_string();
+        let tar_path = args.str_at(0, "tar/extract")?.to_string();
+        let dest_dir = args.str_at(1, "tar/extract")?.to_string();
 
         if sema_core::in_runtime_quantum() {
             let bounds = ARCHIVE_RUNTIME_BOUNDS;

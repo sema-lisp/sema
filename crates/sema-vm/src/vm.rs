@@ -2046,7 +2046,14 @@ impl VM {
         });
 
         loop {
-            match debug.command_rx.recv() {
+            let cmd = match debug.command_rx.recv() {
+                Ok(cmd) => match self.debug_serve_inspection(cmd, ctx, debug) {
+                    Some(cmd) => Ok(cmd),
+                    None => continue,
+                },
+                Err(err) => Err(err),
+            };
+            match cmd {
                 Ok(crate::debug::DebugCommand::Continue) => {
                     debug.step_mode = crate::debug::StepMode::Continue;
                     return DebugStopResume::Resume;
@@ -2067,40 +2074,6 @@ impl VM {
                     return DebugStopResume::Resume;
                 }
                 Ok(crate::debug::DebugCommand::Pause) => {}
-                Ok(crate::debug::DebugCommand::SetBreakpoints {
-                    file,
-                    breakpoints,
-                    reply,
-                }) => {
-                    let ids = debug.set_breakpoints_with_conditions(&file, &breakpoints);
-                    let _ = reply.send(ids);
-                }
-                Ok(crate::debug::DebugCommand::SetExceptionBreakpoints { break_on_uncaught }) => {
-                    debug.break_on_uncaught = break_on_uncaught;
-                }
-                Ok(crate::debug::DebugCommand::GetStackTrace { reply }) => {
-                    let _ = reply.send(self.debug_stack_trace());
-                }
-                Ok(crate::debug::DebugCommand::GetScopes { frame_id, reply }) => {
-                    let _ = reply.send(self.debug_scopes(frame_id));
-                }
-                Ok(crate::debug::DebugCommand::GetVariables { reference, reply }) => {
-                    let _ = reply.send(self.debug_variables(reference));
-                }
-                Ok(crate::debug::DebugCommand::Evaluate {
-                    frame_id,
-                    expression,
-                    reply,
-                }) => {
-                    let result = sema_reader::read(&expression)
-                        .map_err(|e| e.to_string())
-                        .and_then(|expr| {
-                            self.debug_evaluate_mut(frame_id, &expr, ctx, debug)
-                                .map(|value| self.debug_value_to_variable("result", value))
-                                .map_err(|e| e.to_string())
-                        });
-                    let _ = reply.send(result);
-                }
                 Ok(crate::debug::DebugCommand::SetVariable {
                     variables_reference,
                     name,
@@ -2123,6 +2096,8 @@ impl VM {
                     debug.step_mode = crate::debug::StepMode::Continue;
                     return DebugStopResume::Resume;
                 }
+                // Inspection commands were served by `debug_serve_inspection`.
+                Ok(_) => {}
             }
         }
     }
@@ -2138,41 +2113,14 @@ impl VM {
         debug: &mut crate::debug::DebugState,
     ) {
         loop {
-            match debug.command_rx.recv() {
-                Ok(crate::debug::DebugCommand::SetBreakpoints {
-                    file,
-                    breakpoints,
-                    reply,
-                }) => {
-                    let ids = debug.set_breakpoints_with_conditions(&file, &breakpoints);
-                    let _ = reply.send(ids);
-                }
-                Ok(crate::debug::DebugCommand::SetExceptionBreakpoints { break_on_uncaught }) => {
-                    debug.break_on_uncaught = break_on_uncaught;
-                }
-                Ok(crate::debug::DebugCommand::GetStackTrace { reply }) => {
-                    let _ = reply.send(self.debug_stack_trace());
-                }
-                Ok(crate::debug::DebugCommand::GetScopes { frame_id, reply }) => {
-                    let _ = reply.send(self.debug_scopes(frame_id));
-                }
-                Ok(crate::debug::DebugCommand::GetVariables { reference, reply }) => {
-                    let _ = reply.send(self.debug_variables(reference));
-                }
-                Ok(crate::debug::DebugCommand::Evaluate {
-                    frame_id,
-                    expression,
-                    reply,
-                }) => {
-                    let result = sema_reader::read(&expression)
-                        .map_err(|e| e.to_string())
-                        .and_then(|expr| {
-                            self.debug_evaluate_mut(frame_id, &expr, ctx, debug)
-                                .map(|value| self.debug_value_to_variable("result", value))
-                                .map_err(|e| e.to_string())
-                        });
-                    let _ = reply.send(result);
-                }
+            let cmd = match debug.command_rx.recv() {
+                Ok(cmd) => match self.debug_serve_inspection(cmd, ctx, debug) {
+                    Some(cmd) => Ok(cmd),
+                    None => continue,
+                },
+                Err(err) => Err(err),
+            };
+            match cmd {
                 Ok(crate::debug::DebugCommand::SetVariable { reply, .. }) => {
                     let _ = reply.send(Err(
                         "setVariable is unavailable after an uncaught exception".to_string(),
@@ -2187,8 +2135,61 @@ impl VM {
                 | Ok(crate::debug::DebugCommand::Pause)
                 | Ok(crate::debug::DebugCommand::Disconnect)
                 | Err(_) => break,
+                // Inspection commands were served by `debug_serve_inspection`.
+                Ok(_) => {}
             }
         }
+    }
+
+    /// Serve one inspection command (breakpoints, stack trace, scopes,
+    /// variables, evaluate) while execution is stopped. Returns `None` when the
+    /// command was served, or `Some(cmd)` for a resume/step/disconnect command
+    /// the caller decides on.
+    fn debug_serve_inspection(
+        &mut self,
+        cmd: crate::debug::DebugCommand,
+        ctx: &EvalContext,
+        debug: &mut crate::debug::DebugState,
+    ) -> Option<crate::debug::DebugCommand> {
+        use crate::debug::DebugCommand;
+        match cmd {
+            DebugCommand::SetBreakpoints {
+                file,
+                breakpoints,
+                reply,
+            } => {
+                let ids = debug.set_breakpoints_with_conditions(&file, &breakpoints);
+                let _ = reply.send(ids);
+            }
+            DebugCommand::SetExceptionBreakpoints { break_on_uncaught } => {
+                debug.break_on_uncaught = break_on_uncaught;
+            }
+            DebugCommand::GetStackTrace { reply } => {
+                let _ = reply.send(self.debug_stack_trace());
+            }
+            DebugCommand::GetScopes { frame_id, reply } => {
+                let _ = reply.send(self.debug_scopes(frame_id));
+            }
+            DebugCommand::GetVariables { reference, reply } => {
+                let _ = reply.send(self.debug_variables(reference));
+            }
+            DebugCommand::Evaluate {
+                frame_id,
+                expression,
+                reply,
+            } => {
+                let result = sema_reader::read(&expression)
+                    .map_err(|e| e.to_string())
+                    .and_then(|expr| {
+                        self.debug_evaluate_mut(frame_id, &expr, ctx, debug)
+                            .map(|value| self.debug_value_to_variable("result", value))
+                            .map_err(|e| e.to_string())
+                    });
+                let _ = reply.send(result);
+            }
+            other => return Some(other),
+        }
+        None
     }
 
     /// Number of active call frames.
@@ -2561,25 +2562,7 @@ impl VM {
         let n_locals = func.chunk.n_locals as usize;
         let argc = args.len();
 
-        if has_rest {
-            if argc < arity {
-                return Err(SemaError::arity(
-                    func.name
-                        .map(resolve_spur)
-                        .unwrap_or_else(|| "<lambda>".to_string()),
-                    format!("{}+", arity),
-                    argc,
-                ));
-            }
-        } else if argc != arity {
-            return Err(SemaError::arity(
-                func.name
-                    .map(resolve_spur)
-                    .unwrap_or_else(|| "<lambda>".to_string()),
-                arity.to_string(),
-                argc,
-            ));
-        }
+        check_closure_arity(func, argc)?;
 
         self.ensure_cache_space(func);
         let base = self.stack.len();
@@ -3018,25 +3001,12 @@ impl VM {
                             Some((file, line))
                         } else if op_pc > next_span_pc {
                             // Jumped past — resync via binary search
-                            let spans = &self.frames[fi].closure.func.chunk.spans;
-                            match spans.binary_search_by_key(&op_pc, |(p, _)| *p) {
-                                Ok(i) => {
-                                    let line = spans[i].1.line as u32;
-                                    let file = self.frames[fi].closure.func.source_file.clone();
-                                    next_span_idx = i + 1;
-                                    next_span_pc = spans
-                                        .get(next_span_idx)
-                                        .map(|(p, _)| *p)
-                                        .unwrap_or(u32::MAX);
-                                    Some((file, line))
-                                }
-                                Err(i) => {
-                                    next_span_idx = i;
-                                    next_span_pc =
-                                        spans.get(i).map(|(p, _)| *p).unwrap_or(u32::MAX);
-                                    None
-                                }
-                            }
+                            resync_debug_span(
+                                &self.frames[fi],
+                                op_pc,
+                                &mut next_span_idx,
+                                &mut next_span_pc,
+                            )
                         } else if next_span_idx > 0 {
                             // Check for backward jump: op_pc is before our current
                             // span window (e.g., loop back-edge). Resync via binary search.
@@ -3044,24 +3014,12 @@ impl VM {
                             let spans = &self.frames[fi].closure.func.chunk.spans;
                             if op_pc <= spans[next_span_idx - 1].0 {
                                 dbg.resume_skip = false;
-                                match spans.binary_search_by_key(&op_pc, |(p, _)| *p) {
-                                    Ok(i) => {
-                                        let line = spans[i].1.line as u32;
-                                        let file = self.frames[fi].closure.func.source_file.clone();
-                                        next_span_idx = i + 1;
-                                        next_span_pc = spans
-                                            .get(next_span_idx)
-                                            .map(|(p, _)| *p)
-                                            .unwrap_or(u32::MAX);
-                                        Some((file, line))
-                                    }
-                                    Err(i) => {
-                                        next_span_idx = i;
-                                        next_span_pc =
-                                            spans.get(i).map(|(p, _)| *p).unwrap_or(u32::MAX);
-                                        None
-                                    }
-                                }
+                                resync_debug_span(
+                                    &self.frames[fi],
+                                    op_pc,
+                                    &mut next_span_idx,
+                                    &mut next_span_pc,
+                                )
                             } else {
                                 None
                             }
@@ -4636,25 +4594,7 @@ impl VM {
 
         // Arity check — a self-call can still be written with the wrong argument
         // count, e.g. `(let loop ((a 1) (b 2)) (loop 1))`.
-        if has_rest {
-            if argc < arity {
-                return Err(SemaError::arity(
-                    func.name
-                        .map(resolve_spur)
-                        .unwrap_or_else(|| "<lambda>".to_string()),
-                    format!("{}+", arity),
-                    argc,
-                ));
-            }
-        } else if argc != arity {
-            return Err(SemaError::arity(
-                func.name
-                    .map(resolve_spur)
-                    .unwrap_or_else(|| "<lambda>".to_string()),
-                arity.to_string(),
-                argc,
-            ));
-        }
+        check_closure_arity(func, argc)?;
 
         // Args sit directly on top of this frame's locals (no callee slot).
         let src = self.stack.len() - argc;
@@ -5440,32 +5380,7 @@ impl VM {
                 })
             }
             Some(crate::debug::ScopeKind::Upvalues(frame_id)) => {
-                let frame = self.frames.get(frame_id).ok_or_else(|| {
-                    SemaError::eval(format!("setVariable: invalid frame id {frame_id}"))
-                })?;
-                let index = if let Some(index) = name
-                    .strip_prefix("upvalue_")
-                    .and_then(|suffix| suffix.parse::<usize>().ok())
-                {
-                    index
-                } else if let Some(index) = frame
-                    .closure
-                    .func
-                    .upvalue_names
-                    .iter()
-                    .position(|spur| sema_core::resolve(*spur) == name)
-                {
-                    index
-                } else {
-                    return Err(SemaError::eval(format!(
-                        "setVariable: upvalue '{name}' not found"
-                    )));
-                };
-                let Some(cell) = frame.closure.upvalues.get(index).cloned() else {
-                    return Err(SemaError::eval(format!(
-                        "setVariable: upvalue '{name}' not found"
-                    )));
-                };
+                let cell = self.debug_upvalue_cell(frame_id, name)?;
                 if let UpvalueState::Open { frame_base, slot } = &*cell.state.borrow() {
                     if self.stack.get(*frame_base + *slot).is_none() {
                         return Err(SemaError::eval(format!(
@@ -5502,34 +5417,7 @@ impl VM {
                 self.propagate_local_store_to_tracked(frame_id, slot, &value);
             }
             DebugVariableTarget::Upvalue { cell, .. } => {
-                let wrote_tracked = {
-                    let mut state = cell.state.borrow_mut();
-                    match &mut *state {
-                        UpvalueState::Closed(slot_value) => {
-                            *slot_value = value.clone();
-                            false
-                        }
-                        UpvalueState::Tracked {
-                            value: tracked_value,
-                            ..
-                        } => {
-                            *tracked_value = value.clone();
-                            true
-                        }
-                        UpvalueState::Open { frame_base, slot } => {
-                            let Some(slot_value) = self.stack.get_mut(*frame_base + *slot) else {
-                                return Err(SemaError::eval(format!(
-                                    "setVariable: upvalue '{name}' is out of range"
-                                )));
-                            };
-                            *slot_value = value.clone();
-                            false
-                        }
-                    }
-                };
-                if wrote_tracked {
-                    self.sync_tracked_upvalues_to_stack();
-                }
+                self.debug_write_upvalue(&cell, name, &value)?;
             }
         }
         Ok(self.debug_value_to_variable(name, value))
@@ -5625,6 +5513,18 @@ impl VM {
         name: &str,
         value: Value,
     ) -> Result<crate::debug::DapVariable, SemaError> {
+        let upvalue = self.debug_upvalue_cell(frame_id, name)?;
+        self.debug_write_upvalue(&upvalue, name, &value)?;
+        Ok(self.debug_value_to_variable(name, value))
+    }
+
+    /// The upvalue cell of `frame_id` that `setVariable` names: either a
+    /// positional `upvalue_N` or the captured variable's source name.
+    fn debug_upvalue_cell(
+        &self,
+        frame_id: usize,
+        name: &str,
+    ) -> Result<Rc<UpvalueCell>, SemaError> {
         let frame = self
             .frames
             .get(frame_id)
@@ -5647,14 +5547,25 @@ impl VM {
                 "setVariable: upvalue '{name}' not found"
             )));
         };
-        let Some(upvalue) = frame.closure.upvalues.get(index) else {
-            return Err(SemaError::eval(format!(
-                "setVariable: upvalue '{name}' not found"
-            )));
-        };
+        frame
+            .closure
+            .upvalues
+            .get(index)
+            .cloned()
+            .ok_or_else(|| SemaError::eval(format!("setVariable: upvalue '{name}' not found")))
+    }
 
+    /// Write `value` into an upvalue cell for `setVariable`: a closed cell is
+    /// overwritten in place, an open cell writes through to its stack slot, and
+    /// a tracked cell is updated then re-synced to the stack it shadows.
+    fn debug_write_upvalue(
+        &mut self,
+        cell: &UpvalueCell,
+        name: &str,
+        value: &Value,
+    ) -> Result<(), SemaError> {
         let wrote_tracked = {
-            let mut state = upvalue.state.borrow_mut();
+            let mut state = cell.state.borrow_mut();
             match &mut *state {
                 UpvalueState::Closed(slot_value) => {
                     *slot_value = value.clone();
@@ -5681,8 +5592,7 @@ impl VM {
         if wrote_tracked {
             self.sync_tracked_upvalues_to_stack();
         }
-
-        Ok(self.debug_value_to_variable(name, value))
+        Ok(())
     }
 
     fn debug_value_to_variable(&mut self, name: &str, value: Value) -> crate::debug::DapVariable {
@@ -6021,6 +5931,36 @@ fn intrinsic_name(opcode: Op) -> Option<&'static str> {
 }
 
 // --- Arithmetic helpers ---
+
+/// Re-locate the debug span cursor after a jump: binary-search `op_pc` in the
+/// frame's span table, advance `next_span_idx`/`next_span_pc` past it, and
+/// return the `(file, line)` of the span that starts exactly at `op_pc`.
+#[inline(always)]
+fn resync_debug_span(
+    frame: &CallFrame,
+    op_pc: u32,
+    next_span_idx: &mut usize,
+    next_span_pc: &mut u32,
+) -> Option<(Option<std::path::PathBuf>, u32)> {
+    let spans = &frame.closure.func.chunk.spans;
+    match spans.binary_search_by_key(&op_pc, |(p, _)| *p) {
+        Ok(i) => {
+            let line = spans[i].1.line as u32;
+            let file = frame.closure.func.source_file.clone();
+            *next_span_idx = i + 1;
+            *next_span_pc = spans
+                .get(*next_span_idx)
+                .map(|(p, _)| *p)
+                .unwrap_or(u32::MAX);
+            Some((file, line))
+        }
+        Err(i) => {
+            *next_span_idx = i;
+            *next_span_pc = spans.get(i).map(|(p, _)| *p).unwrap_or(u32::MAX);
+            None
+        }
+    }
+}
 
 /// The arity error for calling `func` with `argc` arguments, if any.
 #[inline(always)]
@@ -7943,18 +7883,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_vm_eq_opcode_direct() {
-        use crate::emit::Emitter;
-        use crate::opcodes::Op;
-        let globals = Rc::new(Env::new());
-        let ctx = EvalContext::new();
-        let mut e = Emitter::new();
-        e.emit_const(Value::int(1)).unwrap();
-        e.emit_const(Value::float(1.0)).unwrap();
-        e.emit_op(Op::Eq);
-        e.emit_op(Op::Return);
-        let func = Rc::new(crate::chunk::Function {
+    /// Wrap hand-emitted bytecode in a zero-arity top-level closure.
+    fn emitted_closure(e: crate::emit::Emitter) -> Rc<Closure> {
+        let func = Rc::new(Function {
             name: None,
             chunk: e.into_chunk(),
             upvalue_descs: vec![],
@@ -7968,12 +7899,26 @@ mod tests {
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
         });
-        let closure = Rc::new(Closure {
+        Rc::new(Closure {
             func,
             upvalues: vec![],
             globals: None,
             functions: None,
-        });
+        })
+    }
+
+    #[test]
+    fn test_vm_eq_opcode_direct() {
+        use crate::emit::Emitter;
+        use crate::opcodes::Op;
+        let globals = Rc::new(Env::new());
+        let ctx = EvalContext::new();
+        let mut e = Emitter::new();
+        e.emit_const(Value::int(1)).unwrap();
+        e.emit_const(Value::float(1.0)).unwrap();
+        e.emit_op(Op::Eq);
+        e.emit_op(Op::Return);
+        let closure = emitted_closure(e);
         let mut vm = VM::new(globals, vec![], &[], 0).unwrap();
         let result = vm.execute(closure, &ctx).unwrap();
         assert_eq!(
@@ -7997,26 +7942,7 @@ mod tests {
         e.emit_u16(99); // native_id far past the (empty) table
         e.emit_u16(0); // argc
         e.emit_op(Op::Return);
-        let func = Rc::new(crate::chunk::Function {
-            name: None,
-            chunk: e.into_chunk(),
-            upvalue_descs: vec![],
-            upvalue_names: vec![],
-            arity: 0,
-            has_rest: false,
-            param_names: Vec::new().into(),
-            local_names: vec![],
-            source_file: None,
-            local_scopes: Vec::new(),
-            cache_offset: 0,
-            suspend_cache: std::cell::Cell::new(None),
-        });
-        let closure = Rc::new(Closure {
-            func,
-            upvalues: vec![],
-            globals: None,
-            functions: None,
-        });
+        let closure = emitted_closure(e);
         let mut vm = VM::new(globals, vec![], &[], 0).unwrap();
         let result = vm.execute(closure, &ctx);
         assert!(
@@ -8996,26 +8922,7 @@ mod tests {
         e.emit_op(Op::Jump);
         e.emit_i32(1000); // jump to PC 1005, but code is only ~6 bytes
         e.emit_op(Op::Return);
-        let func = Rc::new(crate::chunk::Function {
-            name: None,
-            chunk: e.into_chunk(),
-            upvalue_descs: vec![],
-            upvalue_names: vec![],
-            arity: 0,
-            has_rest: false,
-            param_names: Vec::new().into(),
-            local_names: vec![],
-            source_file: None,
-            local_scopes: Vec::new(),
-            cache_offset: 0,
-            suspend_cache: std::cell::Cell::new(None),
-        });
-        let closure = Rc::new(Closure {
-            func,
-            upvalues: vec![],
-            globals: None,
-            functions: None,
-        });
+        let closure = emitted_closure(e);
         let mut vm = VM::new(globals, vec![], &[], 0).unwrap();
         let result = vm.execute(closure, &ctx);
         assert!(
@@ -9254,26 +9161,7 @@ mod tests {
         e.emit_const(Value::int(2)).unwrap();
         e.emit_op(Op::Div);
         e.emit_op(Op::Return);
-        let func = Rc::new(crate::chunk::Function {
-            name: None,
-            chunk: e.into_chunk(),
-            upvalue_descs: vec![],
-            upvalue_names: vec![],
-            arity: 0,
-            has_rest: false,
-            param_names: Vec::new().into(),
-            local_names: vec![],
-            source_file: None,
-            local_scopes: Vec::new(),
-            cache_offset: 0,
-            suspend_cache: std::cell::Cell::new(None),
-        });
-        let closure = Rc::new(Closure {
-            func,
-            upvalues: vec![],
-            globals: None,
-            functions: None,
-        });
+        let closure = emitted_closure(e);
         let mut vm = VM::new(globals.clone(), vec![], &[], 0).unwrap();
         let result = vm.execute(closure, &ctx).unwrap();
         // R7RS: exact/exact division yields an exact rational (3/2), not a float or 1.

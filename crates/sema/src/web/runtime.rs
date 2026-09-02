@@ -269,43 +269,53 @@ fn extract_assets(
             cache_root.join(format!("{generation_stem}-{repair}"))
         };
 
-        match fs::symlink_metadata(&generation) {
-            Ok(metadata) => {
-                if metadata.file_type().is_dir() && assets_match(&generation, assets) {
-                    return Ok(generation);
-                }
-                repair = repair.checked_add(1).ok_or_else(|| {
-                    std::io::Error::other("web runtime cache repair sequence exhausted")
-                })?;
-                continue;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(cache_path_error("inspect candidate", &generation, error));
-            }
+        match accept_or_bump(&generation, assets, &mut repair)? {
+            Candidate::Ready => return Ok(generation),
+            Candidate::Rejected => continue,
+            Candidate::Missing => {}
         }
 
         let staging = StagingDir::create(cache_root)?;
         write_generation(&staging.0, assets)?;
         match fs::rename(&staging.0, &generation) {
             Ok(()) => return Ok(generation),
-            Err(rename_error) => match fs::symlink_metadata(&generation) {
-                Ok(metadata) => {
-                    if metadata.file_type().is_dir() && assets_match(&generation, assets) {
-                        return Ok(generation);
-                    }
-                    repair = repair.checked_add(1).ok_or_else(|| {
-                        std::io::Error::other("web runtime cache repair sequence exhausted")
-                    })?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(rename_error);
-                }
-                Err(error) => {
-                    return Err(cache_path_error("inspect candidate", &generation, error));
-                }
+            Err(rename_error) => match accept_or_bump(&generation, assets, &mut repair)? {
+                Candidate::Ready => return Ok(generation),
+                Candidate::Missing => return Err(rename_error),
+                Candidate::Rejected => {}
             },
         }
+    }
+}
+
+/// What `accept_or_bump` found at a generation directory candidate.
+enum Candidate {
+    /// A directory holding exactly the expected assets.
+    Ready,
+    /// Nothing at that path.
+    Missing,
+    /// Something else; `repair` was advanced so the next candidate gets a fresh
+    /// name. A wrong existing candidate is never modified.
+    Rejected,
+}
+
+fn accept_or_bump(
+    generation: &Path,
+    assets: &[RuntimeAsset],
+    repair: &mut u64,
+) -> std::io::Result<Candidate> {
+    match fs::symlink_metadata(generation) {
+        Ok(metadata) => {
+            if metadata.file_type().is_dir() && assets_match(generation, assets) {
+                return Ok(Candidate::Ready);
+            }
+            *repair = repair.checked_add(1).ok_or_else(|| {
+                std::io::Error::other("web runtime cache repair sequence exhausted")
+            })?;
+            Ok(Candidate::Rejected)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Candidate::Missing),
+        Err(error) => Err(cache_path_error("inspect candidate", generation, error)),
     }
 }
 
@@ -485,21 +495,18 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn symlinked_asset_with_correct_bytes_is_rejected() {
-        use std::os::unix::fs::symlink;
-
+    /// Plant a corrupt generation for one `sema_wasm.js` asset via
+    /// `corrupt(cache_root, generation_dir)`, then assert `extract_assets`
+    /// publishes a fresh generation holding the asset as a regular file.
+    /// Returns the cache and the corrupt generation path for extra checks.
+    fn assert_repairs(corrupt: impl FnOnce(&Path, &Path)) -> (TestDir, PathBuf) {
         let cache = TestDir::new();
         let assets = [asset("sema_wasm.js", b"expected")];
         let corrupt_generation = generation_path(cache.path(), "9.9.9", &assets);
-        std::fs::create_dir(&corrupt_generation).unwrap();
-        let external = cache.path().join("external.js");
-        std::fs::write(&external, b"expected").unwrap();
-        symlink(&external, corrupt_generation.join("sema_wasm.js")).unwrap();
+        corrupt(cache.path(), &corrupt_generation);
 
         let repaired =
-            extract_assets(cache.path(), "9.9.9", &assets).expect("repair symlinked asset");
+            extract_assets(cache.path(), "9.9.9", &assets).expect("repair corrupt generation");
 
         assert_ne!(repaired, corrupt_generation);
         assert!(std::fs::symlink_metadata(repaired.join("sema_wasm.js"))
@@ -510,6 +517,20 @@ mod tests {
             std::fs::read(repaired.join("sema_wasm.js")).unwrap(),
             b"expected"
         );
+        (cache, corrupt_generation)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_asset_with_correct_bytes_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        assert_repairs(|cache, generation| {
+            std::fs::create_dir(generation).unwrap();
+            let external = cache.join("external.js");
+            std::fs::write(&external, b"expected").unwrap();
+            symlink(&external, generation.join("sema_wasm.js")).unwrap();
+        });
     }
 
     #[cfg(unix)]
@@ -517,18 +538,12 @@ mod tests {
     fn symlinked_generation_with_correct_bytes_is_rejected() {
         use std::os::unix::fs::symlink;
 
-        let cache = TestDir::new();
-        let assets = [asset("sema_wasm.js", b"expected")];
-        let external_generation = cache.path().join("external-generation");
-        std::fs::create_dir(&external_generation).unwrap();
-        std::fs::write(external_generation.join("sema_wasm.js"), b"expected").unwrap();
-        let corrupt_generation = generation_path(cache.path(), "9.9.9", &assets);
-        symlink(&external_generation, &corrupt_generation).unwrap();
-
-        let repaired =
-            extract_assets(cache.path(), "9.9.9", &assets).expect("repair symlinked generation");
-
-        assert_ne!(repaired, corrupt_generation);
+        let (_cache, corrupt_generation) = assert_repairs(|cache, generation| {
+            let external_generation = cache.join("external-generation");
+            std::fs::create_dir(&external_generation).unwrap();
+            std::fs::write(external_generation.join("sema_wasm.js"), b"expected").unwrap();
+            symlink(&external_generation, generation).unwrap();
+        });
         assert!(
             std::fs::symlink_metadata(&corrupt_generation)
                 .unwrap()
@@ -536,31 +551,13 @@ mod tests {
                 .is_symlink(),
             "repair must not mutate a suspicious candidate"
         );
-        assert_eq!(
-            std::fs::read(repaired.join("sema_wasm.js")).unwrap(),
-            b"expected"
-        );
     }
 
     #[test]
     fn asset_directory_is_repaired_as_a_regular_file() {
-        let cache = TestDir::new();
-        let assets = [asset("sema_wasm.js", b"expected")];
-        let corrupt_generation = generation_path(cache.path(), "9.9.9", &assets);
-        std::fs::create_dir_all(corrupt_generation.join("sema_wasm.js")).unwrap();
-
-        let repaired =
-            extract_assets(cache.path(), "9.9.9", &assets).expect("repair directory asset");
-
-        assert_ne!(repaired, corrupt_generation);
-        assert!(std::fs::symlink_metadata(repaired.join("sema_wasm.js"))
-            .unwrap()
-            .file_type()
-            .is_file());
-        assert_eq!(
-            std::fs::read(repaired.join("sema_wasm.js")).unwrap(),
-            b"expected"
-        );
+        assert_repairs(|_, generation| {
+            std::fs::create_dir_all(generation.join("sema_wasm.js")).unwrap();
+        });
     }
 
     #[cfg(unix)]

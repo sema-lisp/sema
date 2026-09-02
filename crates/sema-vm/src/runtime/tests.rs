@@ -2018,28 +2018,7 @@ fn forced_deadlock_cleanup_matrix_deregisters_every_protocol_wait_kind() {
         let clock = Rc::new(FakeClock::new());
         let runtime = runtime_with_inline_executor(clock.clone());
         let events = Arc::new(Mutex::new(Vec::new()));
-        let gate_slot = Rc::new(Cell::new(None));
-        let owner = runtime
-            .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
-                sema_core::runtime::RuntimeRequest::CreateResourceGate {
-                    continuation: Box::new(GateHoldOwner {
-                        gate_slot: Rc::clone(&gate_slot),
-                        events: Arc::clone(&events),
-                        stage: 0,
-                        gate: None,
-                    }),
-                },
-            ))))
-            .expect("gate owner admitted");
-        while gate_slot.get().is_none()
-            || runtime
-                .resource_gate_owner_for_test(gate_slot.get().expect("gate created"))
-                .is_none()
-            || runtime.timer_count_for_test() == 0
-        {
-            runtime.drive(&drive_budget(1)).unwrap();
-        }
-        let gate = gate_slot.get().expect("gate created");
+        let (owner, gate) = hold_gate_with_owner(&runtime, &events);
         let blocked = runtime
             .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
                 NativeSuspend {
@@ -5589,6 +5568,36 @@ fn cancelling_external_parked_task_runs_abort_hook_at_request_time() {
     );
 }
 
+/// Submit a `GateHoldOwner` root and drive until it holds a resource gate and
+/// its hold timer is armed. Returns the owner's handle and the gate id.
+fn hold_gate_with_owner(
+    runtime: &Runtime,
+    events: &Arc<Mutex<Vec<String>>>,
+) -> (RootHandle, sema_core::runtime::ResourceGateId) {
+    let gate_slot = Rc::new(Cell::new(None));
+    let owner = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::CreateResourceGate {
+                continuation: Box::new(GateHoldOwner {
+                    gate_slot: Rc::clone(&gate_slot),
+                    events: Arc::clone(events),
+                    stage: 0,
+                    gate: None,
+                }),
+            },
+        ))))
+        .expect("gate owner admitted");
+    while gate_slot.get().is_none()
+        || runtime
+            .resource_gate_owner_for_test(gate_slot.get().expect("gate created"))
+            .is_none()
+        || runtime.timer_count_for_test() == 0
+    {
+        runtime.drive(&drive_budget(1)).unwrap();
+    }
+    (owner, gate_slot.get().expect("gate created"))
+}
+
 struct GateHoldOwner {
     gate_slot: Rc<Cell<Option<sema_core::runtime::ResourceGateId>>>,
     events: Arc<Mutex<Vec<String>>>,
@@ -5827,29 +5836,7 @@ fn command_cancellation_settles_resource_waiter_after_close_wake_is_committed() 
     let clock = Rc::new(FakeClock::new());
     let runtime = runtime_with_inline_executor(clock);
     let events = Arc::new(Mutex::new(Vec::new()));
-    let gate_slot = Rc::new(Cell::new(None));
-
-    let owner = runtime
-        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
-            sema_core::runtime::RuntimeRequest::CreateResourceGate {
-                continuation: Box::new(GateHoldOwner {
-                    gate_slot: Rc::clone(&gate_slot),
-                    events: Arc::clone(&events),
-                    stage: 0,
-                    gate: None,
-                }),
-            },
-        ))))
-        .expect("gate owner admitted");
-    while gate_slot.get().is_none()
-        || runtime
-            .resource_gate_owner_for_test(gate_slot.get().expect("gate created"))
-            .is_none()
-        || runtime.timer_count_for_test() == 0
-    {
-        runtime.drive(&drive_budget(1)).unwrap();
-    }
-    let gate = gate_slot.get().expect("gate created");
+    let (owner, gate) = hold_gate_with_owner(&runtime, &events);
 
     let waiter = runtime
         .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(
@@ -5936,28 +5923,7 @@ fn command_cancellation_settles_resource_waiter_after_close_wake_is_committed() 
 fn wrong_runtime_resource_slot_teardown_aborts_instead_of_stranding() {
     let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let gate_slot = Rc::new(Cell::new(None));
-    let owner = runtime
-        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
-            sema_core::runtime::RuntimeRequest::CreateResourceGate {
-                continuation: Box::new(GateHoldOwner {
-                    gate_slot: Rc::clone(&gate_slot),
-                    events: Arc::clone(&events),
-                    stage: 0,
-                    gate: None,
-                }),
-            },
-        ))))
-        .expect("gate owner admitted");
-    while gate_slot.get().is_none()
-        || runtime
-            .resource_gate_owner_for_test(gate_slot.get().expect("gate created"))
-            .is_none()
-        || runtime.timer_count_for_test() == 0
-    {
-        runtime.drive(&drive_budget(1)).unwrap();
-    }
-    let gate = gate_slot.get().expect("gate created");
+    let (owner, gate) = hold_gate_with_owner(&runtime, &events);
 
     let waiter = runtime
         .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Suspend(

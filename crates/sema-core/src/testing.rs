@@ -13,10 +13,7 @@ pub fn unique_temp_dir(tag: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!(
-        "sema-{tag}-{}-{n}-{nanos}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("sema-{tag}-{}-{n}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create unique temp dir");
     dir
 }

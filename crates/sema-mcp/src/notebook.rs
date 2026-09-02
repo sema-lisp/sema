@@ -361,12 +361,7 @@ mod tests {
     use std::io::Write;
 
     fn unique_dir(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!(
-            "sema_mcp_nb_{tag}_{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        sema_core::testing::unique_temp_dir(&format!("mcp-nb-{tag}"))
     }
 
     fn write_empty_notebook(path: &Path, title: &str) {

@@ -382,19 +382,7 @@ impl OpenAiProvider {
         .await
         .map_err(|e| LlmError::Http(e.to_string()))?;
 
-        let status = resp.status().as_u16();
-        if status == 429 {
-            return Err(LlmError::RateLimited {
-                retry_after_ms: crate::http::retry_after_ms(resp.headers()),
-            });
-        }
-        if status != 200 {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Api {
-                status,
-                message: text,
-            });
-        }
+        let resp = crate::http::check_status(resp).await?;
 
         let api_resp: OpenAiResponse = resp
             .json()
@@ -484,25 +472,13 @@ impl OpenAiProvider {
         .await
         .map_err(|e| LlmError::Http(e.to_string()))?;
 
-        let status = resp.status().as_u16();
-        if status == 429 {
-            return Err(LlmError::RateLimited {
-                retry_after_ms: crate::http::retry_after_ms(resp.headers()),
-            });
-        }
-        if status != 200 {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Api {
-                status,
-                message: text,
-            });
-        }
+        let resp = crate::http::check_status(resp).await?;
 
         let mut full_content = String::new();
-        let mut prompt_tokens = 0u32;
-        let mut completion_tokens = 0u32;
-        let mut cache_read_input_tokens = 0u32;
-        let mut cache_creation_input_tokens = 0u32;
+        let mut usage = Usage {
+            model: model_name.clone(),
+            ..Default::default()
+        };
         let mut finish_reason = None;
         // Streamed tool calls arrive as index-keyed fragments: the first delta for an
         // index carries `id` + `function.name`, later deltas append `function.arguments`
@@ -511,31 +487,9 @@ impl OpenAiProvider {
 
         crate::sse::parse_sse_stream(resp, |data| {
             if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) {
-                // Extract usage from final chunk
-                if let Some(usage) = chunk.get("usage") {
-                    if !usage.is_null() {
-                        prompt_tokens = usage
-                            .get("prompt_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u32;
-                        completion_tokens = usage
-                            .get("completion_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u32;
-                        // cached_tokens is a SUBSET of prompt_tokens (read hits).
-                        if let Some(details) = usage.get("prompt_tokens_details") {
-                            cache_read_input_tokens = details
-                                .get("cached_tokens")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0)
-                                as u32;
-                            cache_creation_input_tokens = details
-                                .get("cache_write_tokens")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0)
-                                as u32;
-                        }
-                    }
+                // Only the final chunk carries usage.
+                if let Some(u) = chunk.get("usage") {
+                    usage.merge_json(u, &USAGE_FIELDS);
                 }
                 // Extract content delta
                 if let Some(choices) = chunk.get("choices").and_then(|c| c.as_array()) {
@@ -598,15 +552,9 @@ impl OpenAiProvider {
         Ok(ChatResponse {
             content: full_content,
             role: "assistant".to_string(),
-            model: model_name.clone(),
+            model: model_name,
             tool_calls,
-            usage: Usage {
-                prompt_tokens,
-                completion_tokens,
-                model: model_name,
-                cache_read_input_tokens,
-                cache_creation_input_tokens,
-            },
+            usage,
             stop_reason: finish_reason,
         })
     }
@@ -741,6 +689,15 @@ struct OpenAiPromptTokensDetails {
     cache_write_tokens: u32,
 }
 
+/// Streamed `usage` layout. `cached_tokens` is a SUBSET of `prompt_tokens`
+/// (read hits).
+const USAGE_FIELDS: crate::types::UsageFields = crate::types::UsageFields {
+    prompt: "/prompt_tokens",
+    completion: "/completion_tokens",
+    cache_read: Some("/prompt_tokens_details/cached_tokens"),
+    cache_write: Some("/prompt_tokens_details/cache_write_tokens"),
+};
+
 impl LlmProvider for OpenAiProvider {
     fn name(&self) -> &str {
         &self.name
@@ -845,16 +802,6 @@ impl LlmProvider for OpenAiProvider {
             result = sema_io::io_block_on(self.stream_complete_async(request.clone(), on_chunk));
         }
         result
-    }
-
-    fn batch_complete(&self, requests: Vec<ChatRequest>) -> Vec<Result<ChatResponse, LlmError>> {
-        sema_io::io_block_on(async {
-            let futures: Vec<_> = requests
-                .into_iter()
-                .map(|req| self.complete_async(req))
-                .collect();
-            futures::future::join_all(futures).await
-        })
     }
 
     fn embed(&self, request: EmbedRequest) -> Result<EmbedResponse, LlmError> {

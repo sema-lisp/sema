@@ -56,8 +56,18 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
     ),
     (
         "sema/src/main.rs",
-        7,
-        "subcommand entry-point drivers (lsp/dap/mcp/workflow/notebook) ARE main()",
+        1,
+        "`block_on_server`: the lsp/dap stdio server drivers ARE main()",
+    ),
+    (
+        "sema/src/workflow_cli.rs",
+        2,
+        "subcommand entry-point drivers (workflow index/view) ARE main()",
+    ),
+    (
+        "sema/src/notebook_cli.rs",
+        1,
+        "subcommand entry-point driver (notebook serve) IS main()",
     ),
     (
         "sema-mcp/src/client_auth.rs",

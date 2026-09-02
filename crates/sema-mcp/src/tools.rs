@@ -2,7 +2,7 @@ use serde_json::{json, Value as JsonValue};
 use std::path::Path;
 use std::sync::OnceLock;
 
-use sema_core::{SemaError, Value, ValueViewRef};
+use sema_core::{OptionsExt, SemaError, Value, ValueViewRef};
 use sema_eval::{call_value, Interpreter};
 
 use crate::notebook::{
@@ -55,15 +55,8 @@ fn lookup_param_schema(params: &Value, name: &str) -> (Option<String>, bool) {
             continue;
         }
         if let Some(inner) = v.as_map_rc() {
-            let declared_type = inner
-                .get(&Value::keyword("type"))
-                .and_then(|t| t.as_keyword().or_else(|| t.as_str().map(|s| s.to_string())))
-                .map(|s| s.to_lowercase());
-            let optional = inner
-                .get(&Value::keyword("optional"))
-                .map(|o| o.is_truthy())
-                .unwrap_or(false);
-            return (declared_type, !optional);
+            let declared_type = inner.opt_name("type").map(|s| s.to_lowercase());
+            return (declared_type, !inner.flag("optional"));
         }
         // Bare-value param: required string (matches schema generation).
         return (None, true);
@@ -607,19 +600,11 @@ pub fn list_mcp_tools(
                 // Ignore hidden prefix "_"
                 if !td.name.starts_with('_') {
                     // Check metadata tags
-                    let mut expose = true;
-                    if let Some(map) = td.parameters.as_map_rc() {
-                        if let Some(v) = map.get(&Value::keyword("mcp/expose")) {
-                            if !v.is_truthy() {
-                                expose = false;
-                            }
-                        }
-                        if let Some(v) = map.get(&Value::keyword("private")) {
-                            if v.is_truthy() {
-                                expose = false;
-                            }
-                        }
-                    }
+                    let expose = td
+                        .parameters
+                        .opt("mcp/expose")
+                        .is_none_or(|v| v.is_truthy())
+                        && !td.parameters.flag("private");
 
                     if expose {
                         tools.push(Tool {

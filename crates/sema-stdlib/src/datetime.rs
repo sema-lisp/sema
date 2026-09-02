@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
-use sema_core::{check_arity, SemaError, Value};
+use sema_core::{check_arity, ArgsExt, SemaError, Value};
 
 use crate::register_fn;
 
@@ -15,12 +15,8 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "time/format", |args| {
         check_arity!(args, "time/format", 2);
-        let ts = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        let fmt = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let ts = args.float_at(0, "time/format")?;
+        let fmt = args.str_at(1, "time/format")?;
         let dt = timestamp_to_datetime(ts)?;
         // chrono's DelayedFormat panics inside Display::to_string on invalid
         // format specifiers; writing through fmt::Write surfaces the error.
@@ -36,12 +32,8 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "time/parse", |args| {
         check_arity!(args, "time/parse", 2);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let fmt = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let s = args.str_at(0, "time/parse")?;
+        let fmt = args.str_at(1, "time/parse")?;
         let naive = NaiveDateTime::parse_from_str(s, fmt).map_err(|e| {
             SemaError::eval(format!("time/parse: parse error: {e}")).with_hint(
                 "time/parse uses chrono format specifiers like %Y-%m-%d %H:%M:%S (see https://docs.rs/chrono/latest/chrono/format/strftime/index.html)",
@@ -58,9 +50,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "time/date-parts", |args| {
         check_arity!(args, "time/date-parts", 1);
-        let ts = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
+        let ts = args.float_at(0, "time/date-parts")?;
         let dt = timestamp_to_datetime(ts)?;
         use chrono::Datelike;
         use chrono::Timelike;
@@ -80,23 +70,15 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "time/add", |args| {
         check_arity!(args, "time/add", 2);
-        let ts = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        let secs = args[1]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[1].type_name()))?;
+        let ts = args.float_at(0, "time/add")?;
+        let secs = args.float_at(1, "time/add")?;
         Ok(Value::float(ts + secs))
     });
 
     register_fn(env, "time/diff", |args| {
         check_arity!(args, "time/diff", 2);
-        let t1 = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        let t2 = args[1]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[1].type_name()))?;
+        let t1 = args.float_at(0, "time/diff")?;
+        let t2 = args.float_at(1, "time/diff")?;
         Ok(Value::float(t1 - t2))
     });
 }

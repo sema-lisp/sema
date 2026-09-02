@@ -130,14 +130,7 @@ impl OpenAiCompatEmbeddingProvider {
             .send()
             .await
             .map_err(|e| LlmError::Http(e.to_string()))?;
-        let status = resp.status().as_u16();
-        if status != 200 {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Api {
-                status,
-                message: text,
-            });
-        }
+        let resp = crate::http::check_status(resp).await?;
         let api_resp: serde_json::Value = resp
             .json()
             .await
@@ -184,14 +177,7 @@ pub(crate) async fn openai_compat_embed(
         .await
         .map_err(|e| LlmError::Http(e.to_string()))?;
 
-    let status = resp.status().as_u16();
-    if status != 200 {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(LlmError::Api {
-            status,
-            message: text,
-        });
-    }
+    let resp = crate::http::check_status(resp).await?;
 
     let api_resp: serde_json::Value = resp
         .json()
@@ -317,14 +303,7 @@ impl CohereEmbeddingProvider {
             .await
             .map_err(|e| LlmError::Http(e.to_string()))?;
 
-        let status = resp.status().as_u16();
-        if status != 200 {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Api {
-                status,
-                message: text,
-            });
-        }
+        let resp = crate::http::check_status(resp).await?;
 
         let api_resp: serde_json::Value = resp
             .json()
@@ -376,14 +355,7 @@ impl CohereEmbeddingProvider {
             .send()
             .await
             .map_err(|e| LlmError::Http(e.to_string()))?;
-        let status = resp.status().as_u16();
-        if status != 200 {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Api {
-                status,
-                message: text,
-            });
-        }
+        let resp = crate::http::check_status(resp).await?;
         let api_resp: serde_json::Value = resp
             .json()
             .await

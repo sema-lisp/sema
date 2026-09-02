@@ -13,19 +13,16 @@ use std::rc::{Rc, Weak};
 // `ShutdownOptions` deadline works on both.
 use web_time::Instant;
 
-use sema_core::runtime::{
-    CancelReason, CancellationParent, ExecutorShutdown, LifetimeOwner, RootId, TaskId,
-    TaskRelations, TaskSettlement,
-};
+use sema_core::runtime::{CancelReason, ExecutorShutdown, RootId, TaskId, TaskSettlement};
 
 use crate::VM;
 
 use super::state::{
-    cancel_origin_root, ReturnOwner, Runtime, RuntimeFault, RuntimeState, RuntimeTask,
-    SubmitRootError, TaskPayload, TaskScopes,
+    cancel_origin_root, ReturnOwner, Runtime, RuntimeFault, RuntimeState, SubmitRootError,
+    TaskPayload, TaskScopes,
 };
 use super::wait::{CommandChannel, RuntimeCommand};
-use super::{DriveBudget, DriveState, RootRecord, RootState, TaskRecord, WaitRuntime};
+use super::{DriveBudget, DriveState, RootRecord, RootState, WaitRuntime};
 
 pub enum RootPoll {
     Pending,
@@ -211,47 +208,12 @@ impl Runtime {
     }
 
     fn submit_root_inner(&self, vm: VM) -> Result<RootHandle, SubmitRootError> {
-        let mut state = self.state.borrow_mut();
-        if state.shutting_down || state.terminal_fault.is_some() {
-            return Err(SubmitRootError::ShuttingDown);
-        }
-        if state.root_ids.is_exhausted() || state.task_ids.is_exhausted() {
-            return Err(SubmitRootError::IdExhausted);
-        }
-        let root = state
-            .root_ids
-            .allocate()
-            .map_err(|_| SubmitRootError::IdExhausted)?;
-        let task = state
-            .task_ids
-            .allocate()
-            .map_err(|_| SubmitRootError::IdExhausted)?;
-        let relations = TaskRelations {
-            origin_root: root,
-            cancellation_parent: CancellationParent::Root(root),
-            lifetime_owner: LifetimeOwner::Root(root),
-        };
-        let context = state.snapshot_dynamic_root_context();
-        state.roots.insert(root, RootRecord::new(root, task));
-        state.tasks.insert(
-            task,
-            RuntimeTask {
-                record: TaskRecord::new(task, relations),
-                payload: TaskPayload::Vm,
-                pending_resume: None,
-                suspended_owner: None,
-                vm_call: Some(vm),
-                vm_owner: Some(ReturnOwner::Root),
-                context,
-                vm_resume: None,
-                scopes: TaskScopes::capture_current(),
-            },
-        );
-        state.ready.enqueue(root, task);
-        Ok(RootHandle {
-            runtime: Rc::downgrade(&self.state),
-            id: root,
-        })
+        self.insert_root(
+            TaskPayload::Vm,
+            Some(vm),
+            Some(ReturnOwner::Root),
+            TaskScopes::capture_current(),
+        )
     }
 
     /// A `Send + Sync` handle for cancelling roots from another thread. See

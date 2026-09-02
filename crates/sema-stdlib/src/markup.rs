@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 use pulldown_cmark::{Event, HeadingLevel, Tag, TagEnd};
 use scraper::{Html, Selector};
 use sema_core::runtime::NativeOutcome;
-use sema_core::{check_arity, SemaError, Value};
+use sema_core::{check_arity, ArgsExt, SemaError, Value};
 
 use crate::{register_fn, register_runtime_fn};
 
@@ -156,9 +156,7 @@ pub fn register(env: &sema_core::Env) {
     // pre-dispatch input-byte cap bounds its VM-thread CPU.
     register_fn(env, "markdown/to-html", |args| {
         check_arity!(args, "markdown/to-html", 1);
-        let md = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let md = args.str_at(0, "markdown/to-html")?;
         if sema_core::in_runtime_quantum() {
             check_markup_limit(
                 "markdown/to-html",
@@ -175,9 +173,7 @@ pub fn register(env: &sema_core::Env) {
     // (markdown/headings md) -> list of {:level <int> :text "..."} in doc order.
     register_fn(env, "markdown/headings", |args| {
         check_arity!(args, "markdown/headings", 1);
-        let md = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let md = args.str_at(0, "markdown/headings")?;
         if sema_core::in_runtime_quantum() {
             check_markup_limit(
                 "markdown/headings",
@@ -228,9 +224,7 @@ pub fn register(env: &sema_core::Env) {
     // {:frontmatter nil :body "<original>"} when there is no leading `---` fence.
     register_fn(env, "markdown/frontmatter", |args| {
         check_arity!(args, "markdown/frontmatter", 1);
-        let md = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let md = args.str_at(0, "markdown/frontmatter")?;
         if sema_core::in_runtime_quantum() {
             check_markup_limit(
                 "markdown/frontmatter",
@@ -266,9 +260,7 @@ pub fn register(env: &sema_core::Env) {
     // dispatch and offloads onto the I/O pool via `quarantined_compute`.
     register_runtime_fn(env, "html/parse", |args| {
         check_arity!(args, "html/parse", 1);
-        let html = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let html = args.str_at(0, "html/parse")?;
         if sema_core::in_runtime_quantum() {
             check_markup_limit(
                 "html/parse",
@@ -289,12 +281,8 @@ pub fn register(env: &sema_core::Env) {
     // matched element.
     register_runtime_fn(env, "html/select", |args| {
         check_arity!(args, "html/select", 2);
-        let html = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let sel = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let html = args.str_at(0, "html/select")?;
+        let sel = args.str_at(1, "html/select")?;
         if sema_core::in_runtime_quantum() {
             check_markup_limit(
                 "html/select",
@@ -317,9 +305,7 @@ pub fn register(env: &sema_core::Env) {
     // (html/text html) -> concatenated, whitespace-collapsed visible text.
     register_runtime_fn(env, "html/text", |args| {
         check_arity!(args, "html/text", 1);
-        let html = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let html = args.str_at(0, "html/text")?;
         if sema_core::in_runtime_quantum() {
             check_markup_limit(
                 "html/text",
@@ -340,12 +326,8 @@ pub fn register(env: &sema_core::Env) {
     // matched element.
     register_runtime_fn(env, "html/select-text", |args| {
         check_arity!(args, "html/select-text", 2);
-        let html = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let sel = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let html = args.str_at(0, "html/select-text")?;
+        let sel = args.str_at(1, "html/select-text")?;
         if sema_core::in_runtime_quantum() {
             check_markup_limit(
                 "html/select-text",
@@ -402,7 +384,7 @@ fn split_closing_fence(rest: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sema_core::Env;
+    use sema_core::{Env, OptionsExt};
 
     fn test_env() -> Env {
         let env = Env::new();
@@ -436,26 +418,12 @@ mod tests {
         assert_eq!(list.len(), 2);
 
         let h0 = list[0].as_map_rc().unwrap();
-        assert_eq!(
-            h0.get(&Value::keyword("level")).and_then(|v| v.as_int()),
-            Some(1)
-        );
-        assert_eq!(
-            h0.get(&Value::keyword("text"))
-                .and_then(|v| v.as_str().map(|s| s.to_string())),
-            Some("First".to_string())
-        );
+        assert_eq!(h0.opt_int("level"), Some(1));
+        assert_eq!(h0.opt_str("text"), Some("First".to_string()));
 
         let h1 = list[1].as_map_rc().unwrap();
-        assert_eq!(
-            h1.get(&Value::keyword("level")).and_then(|v| v.as_int()),
-            Some(2)
-        );
-        assert_eq!(
-            h1.get(&Value::keyword("text"))
-                .and_then(|v| v.as_str().map(|s| s.to_string())),
-            Some("Second".to_string())
-        );
+        assert_eq!(h1.opt_int("level"), Some(2));
+        assert_eq!(h1.opt_str("text"), Some("Second".to_string()));
     }
 
     #[test]
@@ -465,29 +433,14 @@ mod tests {
         let md = "---\ntitle: Hello\n---\nBody here\n";
         let out = call(&env, "markdown/frontmatter", &[Value::string(md)]).unwrap();
         let m = out.as_map_rc().unwrap();
-        assert_eq!(
-            m.get(&Value::keyword("frontmatter"))
-                .and_then(|v| v.as_str().map(|s| s.to_string())),
-            Some("title: Hello\n".to_string())
-        );
-        assert_eq!(
-            m.get(&Value::keyword("body"))
-                .and_then(|v| v.as_str().map(|s| s.to_string())),
-            Some("Body here\n".to_string())
-        );
+        assert_eq!(m.opt_str("frontmatter"), Some("title: Hello\n".to_string()));
+        assert_eq!(m.opt_str("body"), Some("Body here\n".to_string()));
 
         let plain = "no frontmatter here";
         let out = call(&env, "markdown/frontmatter", &[Value::string(plain)]).unwrap();
         let m = out.as_map_rc().unwrap();
-        assert!(m
-            .get(&Value::keyword("frontmatter"))
-            .map(|v| v.is_nil())
-            .unwrap_or(false));
-        assert_eq!(
-            m.get(&Value::keyword("body"))
-                .and_then(|v| v.as_str().map(|s| s.to_string())),
-            Some(plain.to_string())
-        );
+        assert!(m.opt("frontmatter").is_some_and(|v| v.is_nil()));
+        assert_eq!(m.opt_str("body"), Some(plain.to_string()));
     }
 
     #[test]

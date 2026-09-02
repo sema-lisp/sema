@@ -5,8 +5,8 @@ use std::num::NonZeroUsize;
 use std::rc::{Rc, Weak};
 
 use sema_core::{
-    intern, resolve, Env, EvalContext, Macro, MultiMethod, NativeFn, SemaError, Spur, Thunk, Value,
-    ValueView,
+    intern, resolve, ArgsExt, Env, EvalContext, Macro, MultiMethod, NativeFn, SemaError, Spur,
+    Thunk, Value, ValueView,
 };
 
 use crate::special_forms;
@@ -1367,9 +1367,9 @@ fn expand_macros_in(
                 // Binding forms expand structurally so their bound names
                 // shadow macros in exactly the scopes the resolver gives them.
                 match name.as_str() {
-                    "define" => return expand_define_form(expander, env, expr, items, shadow),
+                    "define" => return expand_binder_form(expander, env, expr, items, shadow),
                     "fn" | "lambda" => {
-                        return expand_lambda_form(expander, env, expr, items, shadow)
+                        return expand_binder_form(expander, env, expr, items, shadow)
                     }
                     "let" | "let*" | "letrec" | "let-values" | "let*-values" => {
                         return expand_let_form(expander, env, expr, items, shadow, &name)
@@ -1450,40 +1450,20 @@ fn expand_macros_in(
     }
 }
 
-/// `(define name expr)` / `(define (name . params) body...)`: the head is a
-/// binding position (never expanded); the defined name and any params shadow
-/// macros in the value/body.
-fn expand_define_form(
+/// `(define target body...)` and `(fn params body...)`: the pattern in
+/// position 1 is a binding position and shadows the body.
+fn expand_binder_form(
     expander: &MacroExpander<'_>,
     env: &Env,
     expr: &Value,
     items: &[Value],
     shadow: &Shadow,
 ) -> EvalResult {
-    let Some(target) = items.get(1) else {
+    let Some(pattern) = items.get(1) else {
         return Ok(expr.clone());
     };
     let mut bound = HashSet::new();
-    collect_pattern_symbols(target, &mut bound);
-    let inner = shadow.child(bound);
-    let mut expanded: Vec<Value> = items[..2.min(items.len())].to_vec();
-    expanded.extend(expand_body(expander, env, &items[2..], &inner)?);
-    Ok(rebuilt_list(expr, items, expanded))
-}
-
-/// `(fn params body...)`: params are a binding position and shadow the body.
-fn expand_lambda_form(
-    expander: &MacroExpander<'_>,
-    env: &Env,
-    expr: &Value,
-    items: &[Value],
-    shadow: &Shadow,
-) -> EvalResult {
-    let Some(params) = items.get(1) else {
-        return Ok(expr.clone());
-    };
-    let mut bound = HashSet::new();
-    collect_pattern_symbols(params, &mut bound);
+    collect_pattern_symbols(pattern, &mut bound);
     let inner = shadow.child(bound);
     let mut expanded: Vec<Value> = items[..2.min(items.len())].to_vec();
     expanded.extend(expand_body(expander, env, &items[2..], &inner)?);
@@ -3742,9 +3722,7 @@ pub fn register_vm_delegates(env: &Rc<Env>, ctx: &Rc<EvalContext>) {
             if args.len() != 1 {
                 return Err(SemaError::arity("defmacro-form", "1", args.len()));
             }
-            let items = args[0]
-                .as_list()
-                .ok_or_else(|| SemaError::type_error("list", args[0].type_name()))?;
+            let items = args.list_at(0, "defmacro-form")?;
             let dmf_env = upgrade_delegate_env(&dmf_env)?;
             register_defmacro(items, &dmf_env)?;
             Ok(Value::nil())
@@ -3761,9 +3739,7 @@ pub fn register_vm_delegates(env: &Rc<Env>, ctx: &Rc<EvalContext>) {
             if args.len() != 1 {
                 return Err(SemaError::arity("define-syntax", "1", args.len()));
             }
-            let items = args[0]
-                .as_list()
-                .ok_or_else(|| SemaError::type_error("list", args[0].type_name()))?;
+            let items = args.list_at(0, "define-syntax")?;
             let dsf_env = upgrade_delegate_env(&dsf_env)?;
             register_define_syntax(items, &dsf_env)?;
             Ok(Value::nil())
@@ -3906,9 +3882,7 @@ pub fn register_vm_delegates(env: &Rc<Env>, ctx: &Rc<EvalContext>) {
             if args.len() != 1 {
                 return Err(SemaError::arity("__vm-prompt", "1", args.len()));
             }
-            let entries = args[0]
-                .as_list()
-                .ok_or_else(|| SemaError::type_error("list", args[0].type_name()))?;
+            let entries = args.list_at(0, "prompt")?;
             let mut messages = Vec::new();
             for entry in entries {
                 if let Some(msg) = entry.as_message_rc() {
@@ -3929,9 +3903,7 @@ pub fn register_vm_delegates(env: &Rc<Env>, ctx: &Rc<EvalContext>) {
                                 )))
                             }
                         };
-                        let parts = pair[1]
-                            .as_list()
-                            .ok_or_else(|| SemaError::type_error("list", pair[1].type_name()))?;
+                        let parts = pair.list_at(1, "prompt")?;
                         let mut content = String::new();
                         for part in parts {
                             if let Some(s) = part.as_str() {
@@ -3982,9 +3954,7 @@ pub fn register_vm_delegates(env: &Rc<Env>, ctx: &Rc<EvalContext>) {
             } else {
                 return Err(SemaError::type_error("keyword", args[0].type_name()));
             };
-            let parts = args[1]
-                .as_list()
-                .ok_or_else(|| SemaError::type_error("list", args[1].type_name()))?;
+            let parts = args.list_at(1, "message")?;
             let mut content = String::new();
             for part in parts {
                 if let Some(s) = part.as_str() {
@@ -4862,11 +4832,7 @@ mod runtime_eval_tests {
             Value::native_fn(NativeFn::with_context_result(
                 "macro-transition-burn",
                 |context, args| {
-                    let count = args
-                        .first()
-                        .and_then(Value::as_int)
-                        .ok_or_else(|| SemaError::type_error("integer", "other"))?
-                        as usize;
+                    let count = args.int_at(0, "macro-transition-burn")? as usize;
                     if count == 0 {
                         return Ok(NativeOutcome::Return(Value::nil()));
                     }

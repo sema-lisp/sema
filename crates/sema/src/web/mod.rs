@@ -267,7 +267,7 @@ fn web_prepare_send(
     if imports.is_empty() {
         return ("source".to_string(), None);
     }
-    match crate::build_web_archive(entry, &[], crate::BuildOutputOpts::default()) {
+    match crate::build::build_web_archive(entry, &[], crate::build::BuildOutputOpts::default()) {
         Ok((bytes, _)) => match std::fs::write(build_dir.join("app.vfs"), &bytes) {
             Ok(()) => ("archive".to_string(), None),
             Err(e) => ("error".to_string(), Some(format!("writing archive: {e}"))),

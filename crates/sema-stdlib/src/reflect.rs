@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 #[cfg(not(target_arch = "wasm32"))]
 use sema_core::Caps;
-use sema_core::{check_arity, SemaError, Value};
+use sema_core::{check_arity, ArgsExt, SemaError, Value};
 
 use crate::register_fn;
 
@@ -69,18 +69,14 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // `read` builtin is the legacy alias).
     register_fn(env, "read/string", |args| {
         check_arity!(args, "read/string", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "read/string")?;
         sema_reader::read(s)
     });
 
     // read/all — parse every top-level form into a list.
     register_fn(env, "read/all", |args| {
         check_arity!(args, "read/all", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "read/all")?;
         Ok(Value::list(sema_reader::read_many(s)?))
     });
 
@@ -97,9 +93,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // sema/check-string — diagnostics for a source string, as data.
     register_fn(env, "sema/check-string", |args| {
         check_arity!(args, "sema/check-string", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "sema/check-string")?;
         Ok(check_source(s))
     });
 
@@ -108,9 +102,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     #[cfg(not(target_arch = "wasm32"))]
     crate::register_fn_gated(env, sandbox, Caps::FS_READ, "sema/check-file", |args| {
         check_arity!(args, "sema/check-file", 1);
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let path = args.str_at(0, "sema/check-file")?;
         match std::fs::read_to_string(path) {
             Ok(src) => Ok(check_source(&src)),
             Err(e) => {

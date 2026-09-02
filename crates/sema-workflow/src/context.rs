@@ -33,7 +33,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use sema_core::cycle::GcEdge;
 use sema_core::runtime::{IdCounter, ScopeId, TaskContextHandle, TaskLocalValue, Trace};
-use sema_core::Value;
+use sema_core::{OptionsExt, Value};
 
 use crate::event::WorkflowEvent;
 use crate::journal::Journal;
@@ -1165,12 +1165,10 @@ pub fn set_workflow_scope(
 /// a panic.
 pub fn parse_budget(meta: &Value) -> BTreeMap<String, Value> {
     let mut out = BTreeMap::new();
-    if let Some(m) = meta.as_map_rc() {
-        if let Some(b) = m.get(&Value::keyword("budget")).and_then(|v| v.as_map_rc()) {
-            for (k, v) in b.iter() {
-                if let Some(name) = k.as_keyword() {
-                    out.insert(name, v.clone());
-                }
+    if let Some(b) = meta.opt_map("budget") {
+        for (k, v) in b.iter() {
+            if let Some(name) = k.as_keyword() {
+                out.insert(name, v.clone());
             }
         }
     }
@@ -1722,15 +1720,7 @@ mod tests {
 
     #[test]
     fn open_fresh_with_retries_past_a_colliding_id() {
-        let mut root = std::env::temp_dir();
-        root.push(format!(
-            "sema-wf-fresh-retry-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = sema_core::testing::unique_temp_dir("wf-fresh-retry");
         let root_str = root.to_string_lossy().to_string();
         // The first two candidate ids already have a JOURNAL (events.jsonl); the opener
         // must skip them (its create_new claim fails) and land on the first free id.

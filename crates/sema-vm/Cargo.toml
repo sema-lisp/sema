@@ -37,6 +37,7 @@ divan = "0.1"
 # `cargo package`, so the uploaded manifest carries neither. Local builds,
 # tests, and benches resolve through `path` exactly as before.
 sema-eval = { path = "../sema-eval" }
+sema-io = { path = "../sema-io", features = ["test-support"] }
 sema-stdlib = { path = "../sema-stdlib" }
 
 [[bench]]

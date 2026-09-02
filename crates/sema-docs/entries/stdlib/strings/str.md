@@ -4,6 +4,7 @@ module: "strings"
 section: "Scheme Compatibility Aliases"
 syntax: "(str value ...)"
 returns: "string"
+see_also: ["string/append", "format", "number/to-string"]
 ---
 
 Convert each argument to its display string and concatenate them. With one argument it is just "value → string"; with several it is a handy alternative to `string/append` that stringifies non-string args for you.

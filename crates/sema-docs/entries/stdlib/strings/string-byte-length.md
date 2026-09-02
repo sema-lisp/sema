@@ -2,6 +2,9 @@
 name: "string/byte-length"
 module: "strings"
 section: "Unicode & Encoding"
+params: [{ name: s, type: string }]
+returns: "integer"
+see_also: ["string/length", "string/width", "string/codepoints"]
 ---
 
 Return the UTF-8 byte length of a string (as opposed to character count from `string/length`). Useful for understanding the actual memory footprint — emoji and CJK characters use more bytes than ASCII.

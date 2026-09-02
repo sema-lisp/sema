@@ -3,6 +3,8 @@ name: "memory/append"
 module: "memory"
 section: "Agent Memory"
 syntax: "(memory/append handle {:role role :content text})"
+returns: "map"
+see_also: ["memory/open", "memory/messages", "agent/run"]
 ---
 
 Append one conversation turn to a memory thread. The message is pushed onto the in-process

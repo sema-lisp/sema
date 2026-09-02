@@ -2,6 +2,9 @@
 name: "bit/xor"
 module: "math"
 section: "Bitwise Operations"
+params: [{ name: a, type: int }, { name: b, type: int }]
+returns: "int"
+see_also: ["bit/and", "bit/or", "bit/not"]
 ---
 
 Bitwise XOR (set bits where the operands differ). Self-inverse: `(bit/xor x x)` is `0` and `(bit/xor x 0)` is `x`, which makes it the standard tool for toggling flags.

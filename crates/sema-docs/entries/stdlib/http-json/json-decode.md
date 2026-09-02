@@ -4,6 +4,7 @@ module: "http-json"
 section: "JSON"
 params: [{ name: json-string, type: string }]
 returns: "any"
+see_also: ["json/encode", "json/encode-pretty", "http/get"]
 ---
 
 ```

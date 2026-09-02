@@ -2,6 +2,9 @@
 name: "ceiling"
 module: "math"
 section: "Scheme Aliases"
+params: [{ name: n, type: number }]
+returns: "number"
+see_also: ["ceil", "floor", "round", "truncate"]
 ---
 
 Alias for `ceil` — the R7RS spelling. Same exactness-preserving behavior: a float rounds to a float, an exact rational rounds to an exact integer.

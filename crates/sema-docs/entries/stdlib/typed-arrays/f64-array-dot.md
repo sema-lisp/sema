@@ -2,6 +2,9 @@
 name: "f64-array/dot"
 module: "typed-arrays"
 section: "Aggregation"
+params: [{ name: a, type: f64-array }, { name: b, type: f64-array }]
+returns: "float"
+see_also: ["f64-array/sum", "f64-array/map", "vector/dot-product"]
 ---
 
 Compute the dot product of two f64 arrays (must be the same length).

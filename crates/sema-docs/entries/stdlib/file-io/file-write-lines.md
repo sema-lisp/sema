@@ -2,6 +2,9 @@
 name: "file/write-lines"
 module: "file-io"
 section: "File Operations"
+params: [{ name: path, type: string }, { name: lines, type: list }]
+returns: "nil"
+see_also: ["file/read-lines", "file/write", "file/append"]
 ---
 
 Write a list of strings to a file, one per line, separated by `\n` (no trailing newline after the last line). Overwrites any existing content.

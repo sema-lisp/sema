@@ -2,6 +2,9 @@
 name: "assv"
 module: "lists"
 section: "Association Lists"
+params: [{ name: obj, type: any }, { name: alist, type: list }]
+returns: "list or #f"
+see_also: ["assq", "assoc", "member", "list/find"]
 ---
 
 Find the first pair in an association list whose key equals `key`. In Sema this

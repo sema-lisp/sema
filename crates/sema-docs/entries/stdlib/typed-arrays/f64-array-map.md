@@ -3,6 +3,9 @@ name: "f64-array/map"
 module: "typed-arrays"
 section: "Higher-Order Functions"
 aliases: ["i64-array/map"]
+params: [{ name: f, type: function }, { name: arr, type: "f64-array | i64-array" }]
+returns: "f64-array | i64-array"
+see_also: ["f64-array/fold", "f64-array/sum", "map"]
 ---
 
 Apply a function to each element, returning a new typed array. The callback must return the matching numeric type.

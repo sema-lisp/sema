@@ -2,6 +2,9 @@
 name: "list/drop-last"
 module: "lists"
 section: "Slicing"
+params: [{ name: n, type: int }, { name: seq, type: list }]
+returns: "list"
+see_also: ["list/take-last", "drop", "list/drop-while"]
 ---
 
 Return all but the last `n` elements (drops from the tail; the counterpart to `drop`). Clamps to empty.

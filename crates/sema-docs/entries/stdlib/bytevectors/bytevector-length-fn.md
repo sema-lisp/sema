@@ -3,6 +3,7 @@ name: "bytevector-length"
 module: "bytevectors"
 params: [{ name: bv, type: bytevector }]
 returns: "int"
+see_also: ["bytevector/length", "bytes/length"]
 ---
 
 Return the number of bytes in a bytevector. Legacy Scheme name; `bytevector/length` is the namespaced alias.

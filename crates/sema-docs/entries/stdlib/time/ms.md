@@ -3,6 +3,7 @@ name: "time/ms"
 module: "time"
 params: [{ name: thunk, type: function }]
 returns: "float"
+see_also: ["time", "time-ms", "sys/elapsed"]
 ---
 
 Call a zero-argument thunk and return how long it took to run, in milliseconds (as a float). Useful for quick timing.

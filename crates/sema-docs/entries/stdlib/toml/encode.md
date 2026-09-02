@@ -3,6 +3,7 @@ name: "toml/encode"
 module: "toml"
 params: [{ name: m, type: map }]
 returns: "string"
+see_also: ["toml/decode", "json/encode"]
 ---
 
 Serialize a map to a TOML document string. The top-level value must be a map; keys are emitted as TOML keys and values are converted to their TOML equivalents.

@@ -4,6 +4,7 @@ module: "math"
 section: "Random Numbers"
 params: [{ name: lo, type: int, doc: "inclusive lower bound" }, { name: hi, type: int, doc: "inclusive upper bound" }]
 returns: "int"
+see_also: ["math/random"]
 ---
 
 Return a random integer in `[lo, hi]`, inclusive on *both* ends — `(math/random-int 1 6)` can return 6. `lo` must be `<= hi` or it errors. The generator is not seedable, so results are not reproducible across runs.

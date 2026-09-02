@@ -2,6 +2,9 @@
 name: "stream/to-bytes"
 module: "streams"
 section: "Extraction (Byte Buffers)"
+params: [{ name: stream, type: stream }]
+returns: "bytevector"
+see_also: ["stream/to-string", "stream/byte-buffer", "stream/from-bytes"]
 ---
 
 Extract the accumulated contents of a byte-buffer stream as a bytevector.

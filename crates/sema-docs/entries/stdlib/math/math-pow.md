@@ -3,6 +3,7 @@ name: "math/pow"
 module: "math"
 params: [{ name: base, type: number }, { name: exponent, type: number }]
 returns: "number"
+see_also: ["pow", "expt", "sqrt"]
 ---
 
 Raise `base` to `exponent`. With two non-negative integers the result is an integer; otherwise both operands are treated as floats and a float is returned. Namespaced form of `pow`/`expt`.

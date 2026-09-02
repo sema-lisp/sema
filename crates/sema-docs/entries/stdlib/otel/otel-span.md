@@ -2,6 +2,9 @@
 name: "otel/span"
 module: "otel"
 section: "Observability"
+params: [{ name: name, type: string }, { name: thunk, type: function }, { name: attrs, type: map, doc: "optional" }]
+returns: "any"
+see_also: ["with-span", "otel/event", "otel/set-attribute", "otel/tool-span"]
 ---
 
 Run a thunk inside a named OpenTelemetry INTERNAL span and return the thunk's value. The span ends (recording its duration) when the thunk returns, and is marked with Error status if the thunk throws. An optional attributes map is attached to the span. Any LLM/tool spans created during the thunk nest beneath it. A no-op when telemetry is disabled. The `with-span` macro is the ergonomic form: `(with-span name attrs body…)`.

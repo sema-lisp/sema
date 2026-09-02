@@ -4,6 +4,7 @@ module: "lists"
 section: "Basic Operations"
 syntax: "(range end) | (range start end) | (range start end step)"
 returns: "list"
+see_also: ["iota", "list/times", "enumerate"]
 ---
 
 Generate a list of integers. With one argument, generates 0 to N-1. With two, generates from start to end-1.

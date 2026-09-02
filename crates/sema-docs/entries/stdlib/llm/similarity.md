@@ -3,6 +3,7 @@ name: "llm/similarity"
 module: "llm"
 params: [{ name: a }, { name: b }]
 returns: "float"
+see_also: ["llm/embed", "llm/rerank"]
 ---
 
 Compute the cosine similarity between two embeddings — the standard "how related is this text?" metric for semantic search. Both arguments must be the same type: either two embedding bytevectors (from `llm/embed`) or two lists of numbers of equal length. Returns a float; 0.0 when either vector has zero magnitude.

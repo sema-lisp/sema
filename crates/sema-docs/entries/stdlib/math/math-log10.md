@@ -2,6 +2,9 @@
 name: "math/log10"
 module: "math"
 section: "Exponential & Logarithmic"
+params: [{ name: x, type: number }]
+returns: "float"
+see_also: ["log", "math/log2"]
 ---
 
 Base-10 logarithm.

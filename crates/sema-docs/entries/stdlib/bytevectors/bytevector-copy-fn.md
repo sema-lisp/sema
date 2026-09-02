@@ -3,6 +3,7 @@ name: "bytevector-copy"
 module: "bytevectors"
 params: [{ name: bv, type: bytevector }, { name: start, type: int, optional: true }, { name: end, type: int, optional: true }]
 returns: "bytevector"
+see_also: ["bytevector/copy", "bytes/slice", "bytevector-append"]
 ---
 
 Copy a bytevector, optionally restricting to the half-open range `start..end` (default `start` is `0`, `end` is the length). Signals an error if the range is out of bounds. Legacy Scheme name; `bytevector/copy` is the namespaced alias.

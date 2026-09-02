@@ -3,6 +3,8 @@ name: "*stdout*"
 module: "streams"
 section: "Standard Streams"
 returns: stream
+syntax: "*stdout*"
+see_also: ["*stdin*", "*stderr*", "stream/write-string", "println"]
 ---
 
 The standard output stream. A writable, non-readable stream of type `"stdout"`. Use with `stream/write`, `stream/write-string`, etc.

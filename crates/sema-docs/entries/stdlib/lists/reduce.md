@@ -2,6 +2,9 @@
 name: "reduce"
 module: "lists"
 section: "Higher-Order Functions"
+params: [{ name: f, type: function }, { name: seq, type: list }]
+returns: "any"
+see_also: ["foldl", "foldr", "fold", "apply"]
 ---
 
 Combine a list into a single value left-to-right. Unlike `foldl`, you give no explicit seed — `reduce` uses the **first element** as the initial accumulator and folds the rest into it.

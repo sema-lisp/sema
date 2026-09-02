@@ -3,6 +3,7 @@ name: "llm/chat"
 module: "llm"
 params: [{ name: messages }, { name: opts, type: map }]
 returns: "string"
+see_also: ["llm/complete", "llm/send", "llm/stream"]
 ---
 
 Run a multi-message chat against the default provider and return the assistant's text reply. The first argument is a sequence of messages (build them with `(message :role "...")`). The optional opts map accepts `:model`, `:max-tokens`, `:temperature`, `:system`, `:tools`, `:tool-mode` (`:auto` or `:none`), and `:max-tool-rounds` (default 10).

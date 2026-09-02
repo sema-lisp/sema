@@ -4,6 +4,7 @@ module: "strings"
 section: "Core String Operations"
 params: [{ name: text, type: string }, { name: width, type: int, doc: "max display columns per line" }]
 returns: "list"
+see_also: ["string/width", "string/lines", "string/wrap"]
 ---
 
 Word-wrap `text` to lines of at most `width` display columns, returning a list of line strings. Wraps on spaces (collapsing runs), hard-breaks any word longer than `width` on grapheme-cluster boundaries, and preserves explicit newlines as line breaks. Widths are measured with `string/width`, so wrapping is correct for non-ASCII text. (Distinct from `string/wrap`, which wraps a string in left/right delimiters.)

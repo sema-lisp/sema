@@ -2,6 +2,9 @@
 name: "hash/digest"
 module: "security"
 section: "Secrets & Redaction"
+params: [{ name: s, type: string }]
+returns: "string"
+see_also: ["hash/sha256", "secret/redact", "pii/detect"]
 ---
 
 Return the lowercase hex SHA-256 digest of a string. Handy for fingerprinting redacted values so equal secrets can be correlated across records without storing the secret itself.

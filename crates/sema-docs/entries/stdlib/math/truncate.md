@@ -2,6 +2,9 @@
 name: "truncate"
 module: "math"
 section: "Scheme Aliases"
+params: [{ name: n, type: number }]
+returns: "number"
+see_also: ["round", "floor", "ceil", "int"]
 ---
 
 Drop the fractional part, rounding toward zero (so negatives round *up*). Unlike [`round`](#round), it never inspects the fraction — `3.9` truncates to `3`. Exactness-preserving: a float input truncates to a float, an exact rational truncates to an exact integer.

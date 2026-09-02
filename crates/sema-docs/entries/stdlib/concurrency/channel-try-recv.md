@@ -2,6 +2,9 @@
 name: "channel/try-recv"
 module: "concurrency"
 section: "Channels"
+params: [{ name: ch, type: channel }]
+returns: "any or nil"
+see_also: ["channel/recv", "channel/empty?", "channel/count"]
 ---
 
 ```sema

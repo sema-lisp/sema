@@ -2,6 +2,9 @@
 name: "term/with-alt-screen"
 module: "terminal"
 section: "Screen Control"
+syntax: "(term/with-alt-screen body ...)"
+returns: "any"
+see_also: ["term/enter-alt-screen", "term/leave-alt-screen", "io/with-raw-mode", "term/with-mouse"]
 ---
 
 Guard macro: enter the alternate screen and hide the cursor, run `body`, and

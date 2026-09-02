@@ -2,6 +2,9 @@
 name: "otel/with-session"
 module: "otel"
 section: "Observability"
+syntax: "(otel/with-session id [config] thunk)"
+returns: "any"
+see_also: ["with-session", "otel/span", "otel/configure"]
 ---
 
 Run a thunk with a session scope: every span started inside (including `llm/*` and `agent/*` calls) is tagged with the session id, grouping the run in session-aware backends (Langfuse Sessions/Users). The optional config map carries `:user`. The previous scope is restored when the thunk returns. A no-op when telemetry is disabled. The `with-session` macro is the ergonomic form.

@@ -4,6 +4,7 @@ module: "system"
 section: "Shell & Process Control"
 syntax: "(shell cmd arg ... opts?)"
 returns: "map"
+see_also: ["shell/quote", "proc/run", "proc/spawn", "sys/which"]
 ---
 
 Run a shell command. Returns a map with `:stdout`, `:stderr`, and `:exit-code`.

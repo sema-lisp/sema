@@ -4,6 +4,7 @@ module: "strings"
 section: "Unicode & Encoding"
 params: [{ name: s, type: string }]
 returns: "list"
+see_also: ["string/from-codepoints", "char/to-integer", "string/byte-length"]
 ---
 
 Return a list of Unicode codepoint integers for each character in a string. This reveals the internal structure of composed characters and emoji sequences.

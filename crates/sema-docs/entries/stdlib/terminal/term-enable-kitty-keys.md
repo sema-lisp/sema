@@ -2,6 +2,9 @@
 name: "term/enable-kitty-keys!"
 module: "terminal"
 section: "Screen Control"
+params: [{ name: flags, type: int, doc: "optional; defaults to 17" }]
+returns: "nil"
+see_also: ["term/disable-kitty-keys!", "term/with-kitty-keys", "term/supports-kitty-keys?", "term/query-kitty-keys"]
 ---
 
 Opt into the kitty keyboard protocol. While enabled, `io/read-key` decodes richer key events — reliable modifier reporting (an optional `:mods` list of `:shift`/`:alt`/`:ctrl`/`:super`/`:hyper`/`:meta`/`:caps-lock`/`:num-lock`) and unambiguous key identification — normalized to the same `{:kind :char/:ctrl/:alt/:key}` shapes as the legacy path, so existing consumers keep working. Terminals without kitty support silently ignore this and keys keep arriving via the legacy encoding. Restore with `term/disable-kitty-keys!` before leaving raw mode (or use the `term/with-kitty-keys` guard).

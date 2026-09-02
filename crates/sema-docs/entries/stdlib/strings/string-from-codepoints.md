@@ -4,6 +4,7 @@ module: "strings"
 section: "Unicode & Encoding"
 params: [{ name: codepoints, type: list, doc: "list or vector of integer codepoints" }]
 returns: "string"
+see_also: ["string/codepoints", "integer/to-char", "list->string"]
 ---
 
 Construct a string from a list of Unicode codepoint integers. This is the inverse of `string/codepoints` and enables building emoji programmatically by combining codepoints.

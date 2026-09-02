@@ -2,6 +2,9 @@
 name: "vector->list"
 module: "vectors"
 section: "Conversion"
+params: [{ name: v, type: vector }]
+returns: "list"
+see_also: ["list->vector", "vector", "list"]
 ---
 
 Convert a vector to a list.

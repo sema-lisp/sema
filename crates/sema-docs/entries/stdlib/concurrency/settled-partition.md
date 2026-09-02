@@ -3,6 +3,8 @@ name: "settled-partition"
 module: "concurrency"
 section: "Promises"
 syntax: "(settled-partition results)"
+returns: "map"
+see_also: ["settled/ok?", "settled/err?", "parallel-settled", "pipeline-settled"]
 ---
 
 Macro: split a list of settled `{:ok v}` / `{:err e}` results into a map with two keys:

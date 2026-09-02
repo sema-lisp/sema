@@ -2,6 +2,9 @@
 name: "string/normalize"
 module: "strings"
 section: "Unicode & Encoding"
+params: [{ name: s, type: string }, { name: form, type: keyword, doc: "one of :nfc, :nfd, :nfkc, :nfkd (keyword or string)" }]
+returns: "string"
+see_also: ["string/foldcase", "string/codepoints", "string/length"]
 ---
 
 Normalize a string to a Unicode normalization form. Supported forms: `:nfc`, `:nfd`, `:nfkc`, `:nfkd` (as keywords or strings).

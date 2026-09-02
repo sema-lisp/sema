@@ -4,6 +4,7 @@ module: "terminal"
 section: "Combined Styles"
 syntax: "(term/style text style ...)"
 returns: "string"
+see_also: ["term/rgb", "term/strip", "term/bold", "term/red"]
 ---
 
 Apply multiple styles at once using keywords. The first argument is the text, followed by one or more style keywords.

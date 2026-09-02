@@ -4,6 +4,7 @@ module: "math"
 section: "Comparison"
 syntax: "(< num ...)"
 returns: "bool"
+see_also: ["<=", ">", ">=", "="]
 ---
 
 Less than. Variadic and chaining: `(< a b c)` is true when the arguments are in strictly ascending order (each `< ` the next). Also orders same-typed non-numbers (e.g. strings lexicographically), but errors on mixed or unorderable types — unlike `=`, which compares anything structurally and never errors.

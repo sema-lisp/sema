@@ -2,6 +2,9 @@
 name: "time/parse"
 module: "datetime"
 section: "Parsing"
+params: [{ name: s, type: string, doc: "date string" }, { name: format-string, type: string, doc: "strftime-style format" }]
+returns: "float"
+see_also: ["time/format", "time/date-parts"]
 ---
 
 Parse a date string into a UTC Unix timestamp using a [strftime](#strftime-format-directives)-style format string. The input is treated as a **UTC naive datetime** — no timezone information is expected or applied.

@@ -2,6 +2,9 @@
 name: "sort-by"
 module: "lists"
 section: "Higher-Order Functions"
+params: [{ name: key-fn, type: function }, { name: seq, type: list }]
+returns: "list"
+see_also: ["sort", "reverse", "list/group-by"]
 ---
 
 Return a new list sorted by the value the key function produces for each element, in ascending order. The key is computed once per element and the *elements* are returned (not the keys), so this is the idiomatic way to sort maps/records by a field.

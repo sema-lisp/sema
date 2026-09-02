@@ -2,6 +2,9 @@
 name: "http/stream"
 module: "web-server"
 section: "SSE Streaming"
+params: [{ name: handler, type: function, doc: "called with a send callback" }]
+returns: "map"
+see_also: ["http/websocket", "http/serve", "http/ok"]
 ---
 
 Return a Server-Sent Events stream. Takes a handler function that receives a `send` callback.

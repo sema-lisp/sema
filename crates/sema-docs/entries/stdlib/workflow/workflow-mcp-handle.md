@@ -2,6 +2,9 @@
 name: "workflow/mcp-handle"
 module: "workflow"
 section: "Dynamic Workflows"
+params: [{ name: alias, type: "symbol | keyword" }]
+returns: "connection"
+see_also: ["defworkflow", "workflow/run", "mcp/call", "mcp/tools"]
 ---
 
 The resolved MCP connection handle for a declared `:mcp` alias. `(workflow/mcp-handle alias)` takes a symbol or keyword and returns the opaque handle `workflow/run`'s implicit auth-resolution step connected for that alias, for use with `mcp/call`/`mcp/tools`/`mcp/tools->sema`. Only valid inside a workflow body, after resolution — `defworkflow` generates a `let` binding per declared `:mcp` alias that calls this for you, so most code never calls it directly. Errors (with a hint) if called outside a workflow run, for an alias not declared in the workflow's `:mcp` meta, or for an alias declared but not yet resolved.

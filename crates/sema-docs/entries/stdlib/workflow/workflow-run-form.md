@@ -3,6 +3,8 @@ name: "workflow/run-form"
 module: "workflow"
 section: "Dynamic Workflows"
 syntax: "(workflow/run-form form)"
+returns: "map"
+see_also: ["workflow/check", "defworkflow", "step"]
 ---
 
 Macro: evaluate a workflow form (or a list of top-level forms as returned by a

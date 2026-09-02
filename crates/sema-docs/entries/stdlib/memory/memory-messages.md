@@ -3,6 +3,8 @@ name: "memory/messages"
 module: "memory"
 section: "Agent Memory"
 syntax: "(memory/messages handle)"
+returns: "conversation"
+see_also: ["memory/open", "memory/append", "conversation/messages"]
 ---
 
 Return the full working set of a memory thread as a `Conversation` value — the same type

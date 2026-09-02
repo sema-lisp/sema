@@ -2,6 +2,10 @@
 name: "stream/byte-buffer"
 module: "streams"
 section: "Creating Streams"
+params: []
+returns: "stream"
+see_also: ["stream/to-bytes", "stream/to-string", "stream/from-bytes", "stream/write-string"]
+syntax: "(stream/byte-buffer)"
 ---
 
 Create a read/write in-memory buffer — the workhorse for assembling output without touching the filesystem. Writes append to the buffer; reads consume from a separate read cursor.

@@ -4,6 +4,7 @@ module: "regex"
 section: "Replacement"
 params: [{ name: pattern, type: string }, { name: replacement, type: string }, { name: text, type: string }]
 returns: "string"
+see_also: ["regex/replace", "string/replace", "regex/find-all"]
 ---
 
 Replace **all** matches of a pattern.

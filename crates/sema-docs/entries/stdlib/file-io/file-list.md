@@ -2,6 +2,9 @@
 name: "file/list"
 module: "file-io"
 section: "Directory Operations"
+params: [{ name: path, type: string }]
+returns: "list"
+see_also: ["file/glob", "file/info", "file/is-directory?"]
 ---
 
 List the entries (files and subdirectories) directly inside a directory, as bare names in no particular order.

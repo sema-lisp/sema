@@ -4,6 +4,7 @@ module: "lists"
 section: "Basic Operations"
 syntax: "(append list ...)"
 returns: "list"
+see_also: ["cons", "list", "flatten", "zip"]
 ---
 
 Concatenate lists.

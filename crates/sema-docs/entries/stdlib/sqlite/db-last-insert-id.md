@@ -2,6 +2,9 @@
 name: "db/last-insert-id"
 module: "sqlite"
 section: "Utility"
+params: [{ name: db, type: string }]
+returns: "int"
+see_also: ["db/exec", "db/query-one"]
 ---
 
 Return the rowid (integer primary key) of the most recent successful INSERT on this connection. Call it immediately after the insert to capture the generated id.

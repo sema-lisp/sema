@@ -4,6 +4,7 @@ module: "lists"
 section: "Basic Operations"
 params: [{ name: lst, type: list }]
 returns: "list"
+see_also: ["sort", "last", "append"]
 ---
 
 Reverse a list.

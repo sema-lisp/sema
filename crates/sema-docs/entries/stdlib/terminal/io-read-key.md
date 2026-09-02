@@ -2,6 +2,9 @@
 name: "io/read-key"
 module: "terminal"
 section: "Raw-Mode Input"
+syntax: "(io/read-key)"
+returns: "map or nil"
+see_also: ["io/read-key-timeout", "io/tty-raw!", "io/with-raw-mode", "term/enable-mouse"]
 ---
 
 Block until a single keypress arrives, then return a map describing it. Returns `nil` on EOF (after which `io/eof?` returns `#t`).

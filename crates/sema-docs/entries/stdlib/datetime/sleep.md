@@ -4,6 +4,7 @@ module: "datetime"
 section: "Delay"
 params: [{ name: milliseconds, type: int }]
 returns: "nil"
+see_also: ["time/now", "time-ms", "retry"]
 ---
 
 Pause execution for a given number of milliseconds. Returns `nil`.

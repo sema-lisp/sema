@@ -2,6 +2,9 @@
 name: "hash/sha256"
 module: "crypto"
 section: "Hashing"
+params: [{ name: s, type: string }]
+returns: "string"
+see_also: ["hash/md5", "hash/hmac-sha256", "hash/digest"]
 ---
 
 Compute the SHA-256 hash of a string. Returns a 64-character hex string.

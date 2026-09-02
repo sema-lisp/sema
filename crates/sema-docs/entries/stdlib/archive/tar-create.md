@@ -2,6 +2,9 @@
 name: "tar/create"
 module: "archive"
 section: "Compression & Archives"
+params: [{ name: out-path, type: string }, { name: files, type: list }]
+returns: "int"
+see_also: ["tar/extract", "zip/create", "gzip/compress"]
 ---
 
 Create a tar archive at `out-path` containing the given list of files, each added under its basename. The archive is gzip-compressed when `out-path` ends in `.tar.gz` or `.tgz`, otherwise it is an uncompressed tar. Returns the number of entries written. Requires the `fs-write` capability.

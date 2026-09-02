@@ -2,6 +2,9 @@
 name: "pdf/extract-text-pages"
 module: "pdf"
 section: "Text Extraction"
+params: [{ name: path, type: string }]
+returns: "list"
+see_also: ["pdf/extract-text", "pdf/page-count", "pdf/metadata"]
 ---
 
 Extract text from a PDF, returning a list of strings — one per page.

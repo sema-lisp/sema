@@ -3,6 +3,8 @@ name: "llm/last-usage"
 module: "llm"
 params: []
 returns: "map or nil"
+see_also: ["llm/session-usage", "llm/reset-usage", "llm/set-pricing"]
+syntax: "(llm/last-usage)"
 ---
 
 Return token usage for the most recent LLM call as a map with `:prompt-tokens`, `:completion-tokens`, `:total-tokens`, `:model`, and (when pricing is known) `:cost-usd`. Returns nil if no call has been made yet.

@@ -2,6 +2,10 @@
 name: "io/read-line"
 module: "file-io"
 section: "Console I/O"
+params: []
+returns: "string or nil"
+see_also: ["read-line", "io/read-stdin", "io/eof?"]
+syntax: "(io/read-line)"
 ---
 
 Read a line of input from stdin (trailing `\n` / `\r\n` stripped).

@@ -2,6 +2,9 @@
 name: "web/user-agent-data"
 module: "playground"
 section: "Web-Only Functions"
+syntax: "(web/user-agent-data)"
+returns: "map or nil"
+see_also: ["web/user-agent", "sys/platform"]
 ---
 
 Return structured browser information from `navigator.userAgentData`. Returns a map on Chromium-based browsers (Chrome, Edge, Opera), `nil` on Firefox and Safari.

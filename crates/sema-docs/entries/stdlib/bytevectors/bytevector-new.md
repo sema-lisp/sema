@@ -2,6 +2,9 @@
 name: "bytevector/new"
 module: "bytevectors"
 section: "Construction"
+params: [{ name: n, type: int }, { name: fill, type: int, doc: "optional; defaults to 0" }]
+returns: "bytevector"
+see_also: ["make-bytevector", "bytevector/make", "bytevector"]
 ---
 
 Create a bytevector of a given length, optionally filled with a value.

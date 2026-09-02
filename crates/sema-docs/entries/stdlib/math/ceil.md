@@ -2,6 +2,9 @@
 name: "ceil"
 module: "math"
 section: "Numeric Utilities"
+params: [{ name: n, type: number }]
+returns: "number"
+see_also: ["ceiling", "floor", "round", "truncate"]
 ---
 
 Round up toward positive infinity. For negatives this rounds *toward* zero (`-2.7` → `-2`). The mirror of `floor`; alias `ceiling`. Exactness-preserving: a float input rounds to a float, an exact rational rounds to an exact integer.

@@ -4,6 +4,7 @@ module: "predicates"
 section: "Collection Predicates"
 params: [{ name: x, type: any }]
 returns: "bool"
+see_also: ["pair?", "null?", "vector?", "empty?"]
 ---
 
 Test if a value is a list (including the empty list).

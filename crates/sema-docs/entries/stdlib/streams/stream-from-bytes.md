@@ -2,6 +2,9 @@
 name: "stream/from-bytes"
 module: "streams"
 section: "Creating Streams"
+params: [{ name: bytes, type: bytevector }]
+returns: "stream"
+see_also: ["stream/from-string", "stream/to-bytes", "stream/byte-buffer"]
 ---
 
 Create a readable stream from a bytevector.

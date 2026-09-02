@@ -2,6 +2,9 @@
 name: "pdf/extract-text"
 module: "pdf"
 section: "Text Extraction"
+params: [{ name: path, type: string }]
+returns: "string"
+see_also: ["pdf/extract-text-pages", "pdf/page-count", "pdf/metadata"]
 ---
 
 Extract all text from a PDF file, concatenated across all pages.

@@ -2,6 +2,9 @@
 name: "regex/match"
 module: "regex"
 section: "Matching"
+params: [{ name: pattern, type: string }, { name: text, type: string }]
+returns: "map or nil"
+see_also: ["regex/match?", "regex/find-all", "regex/replace"]
 ---
 
 Match a pattern and return match details as a map, or `nil` if no match.

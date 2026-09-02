@@ -2,6 +2,9 @@
 name: "db/open"
 module: "sqlite"
 section: "Opening & Closing"
+syntax: "(db/open [name] path)"
+returns: "string"
+see_also: ["db/open-memory", "db/close", "db/exec", "db/query"]
 ---
 
 Open (or create) a SQLite database file and return a string **handle** that every other `db/*` call takes as its first argument. WAL journal mode and foreign-key enforcement are enabled automatically. Call `db/close` when done.

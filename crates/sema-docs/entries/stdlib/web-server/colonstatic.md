@@ -2,6 +2,9 @@
 name: ":static"
 module: "web-server"
 section: "Static File Serving"
+syntax: "[:static prefix dir]"
+returns: "vector"
+see_also: ["http/router", "http/file", "http/serve"]
 ---
 
 Serve an entire directory of static files using the `:static` route type in `http/router`. Files are served with automatic MIME types, cache headers, and path traversal protection.

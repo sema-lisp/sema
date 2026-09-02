@@ -2,6 +2,9 @@
 name: "time/now"
 module: "datetime"
 section: "Current Time"
+syntax: "(time/now)"
+returns: "float"
+see_also: ["time-ms", "time/format", "time/date-parts"]
 ---
 
 Return the current time as a UTC Unix timestamp in seconds, with fractional milliseconds.

@@ -2,6 +2,9 @@
 name: "serial/open"
 module: "serial"
 section: "Connection Lifecycle"
+params: [{ name: path, type: string }, { name: baud, type: int }, { name: timeout-ms, type: int, doc: "optional; read timeout, default 2000" }]
+returns: "int"
+see_also: ["serial/close", "serial/list", "serial/write", "serial/read-line"]
 ---
 
 ```sema

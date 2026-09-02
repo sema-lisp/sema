@@ -2,6 +2,9 @@
 name: "f64-array/range"
 module: "typed-arrays"
 section: "Construction"
+params: [{ name: start, type: number }, { name: end, type: number }, { name: step, type: number, doc: "optional; defaults to 1" }]
+returns: "f64-array"
+see_also: ["i64-array/range", "f64-array/make", "range"]
 ---
 
 Create an f64 array from a numeric range. `(f64-array/range start end)` or `(f64-array/range start end step)`.

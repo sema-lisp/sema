@@ -3,6 +3,8 @@ name: "policy/without"
 module: "workflow"
 section: "Dynamic Workflows"
 syntax: "(policy/without reason body ...)"
+returns: "any"
+see_also: ["workflow/policy-without", "defpolicy", "defworkflow", "workflow/check"]
 ---
 
 Bypass active model and tool policies for a trusted lexical scope. `reason`

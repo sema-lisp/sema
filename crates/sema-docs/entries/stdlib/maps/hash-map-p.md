@@ -4,6 +4,7 @@ module: "maps"
 section: "Predicates"
 params: [{ name: x, type: any }]
 returns: bool
+see_also: ["map?", "hashmap/new", "type-of"]
 ---
 
 Return `#t` if `x` is an ordered map (the `{...}` / `map/new` type). Alias of `map?`. Note it returns `#f` for a `hashmap/new` value — that distinct `:hashmap` type has no dedicated predicate; test it with `(eq? (type x) :hashmap)`.

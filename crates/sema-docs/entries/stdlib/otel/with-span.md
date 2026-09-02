@@ -2,6 +2,9 @@
 name: "with-span"
 module: "otel"
 section: "Observability"
+syntax: "(with-span name attrs body ...)"
+returns: "any"
+see_also: ["otel/span", "otel/event", "otel/set-attribute", "with-session"]
 ---
 
 Macro: run the body inside a named OpenTelemetry span carrying an attributes map, and return the body's value. The span ends on exit (with Error status if the body throws). The ergonomic form of `(otel/span name thunk attrs)`. Use `{}` for no attributes. A no-op when telemetry is disabled.

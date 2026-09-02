@@ -3,6 +3,7 @@ name: "vector/dot-product"
 module: "vectors"
 params: [{ name: a, type: bytevector }, { name: b, type: bytevector }]
 returns: "float"
+see_also: ["vector/cosine-similarity", "vector/normalize", "f64-array/dot"]
 ---
 
 Compute the dot product of two embedding vectors. Each argument is a bytevector of packed little-endian f64 values (as produced by `embedding/list->embedding`). Both vectors must have the same, non-empty length that is a multiple of 8 bytes.

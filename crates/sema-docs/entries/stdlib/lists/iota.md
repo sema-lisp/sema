@@ -4,6 +4,7 @@ module: "lists"
 section: "Construction"
 syntax: "(iota count [start [step]])"
 returns: "list"
+see_also: ["range", "make-list", "list/times"]
 ---
 
 Generate a list of numbers. `(iota count)`, `(iota count start)`, or `(iota count start step)`.

@@ -4,6 +4,7 @@ module: "lists"
 section: "Searching & Testing"
 params: [{ name: pred, type: function }, { name: seq, type: "list | vector" }]
 returns: bool
+see_also: ["any?", "every?", "any", "list/find"]
 ---
 
 Return `#t` if `pred` returns truthy for at least one element of `seq`. Alias of `any` (and of `any?`).

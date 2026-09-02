@@ -3,6 +3,8 @@ name: "get-in"
 module: "maps"
 section: "Nested Map Operations"
 params: [{ name: m, type: map }, { name: path, type: "list | vector" }, { name: default, type: any }]
+returns: "any"
+see_also: ["map/get-in", "get", "assoc-in", "update-in"]
 ---
 
 Access a value at a nested key path. Returns `nil` (or `default`) if any key along the path is missing. Same as `map/get-in`.

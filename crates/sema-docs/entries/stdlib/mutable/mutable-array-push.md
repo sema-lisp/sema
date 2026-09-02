@@ -4,6 +4,7 @@ module: "mutable"
 section: "Mutable Containers"
 params: [{ name: arr, type: mutable-array }, { name: value, type: any }]
 returns: "mutable-array"
+see_also: ["mutable-array/new", "mutable-array/set!", "mutable-array/length"]
 ---
 
 Append a value to the end of a mutable array, in place. Returns the array itself, so pushes chain and work as the accumulator of a fold.

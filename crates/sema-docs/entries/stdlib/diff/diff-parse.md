@@ -4,6 +4,7 @@ module: "diff"
 section: "Diff & Patch"
 syntax: "(diff/parse patch)"
 returns: "map"
+see_also: ["diff/hunks", "diff/stat", "diff/unified"]
 ---
 
 Parse a (possibly multi-file) unified-diff string into a structured map `{:files [ {:old-path :new-path :hunks [...]} ... ]}`. File paths come from the `--- a/path` and `+++ b/path` headers (nil if absent), and each file's `:hunks` use the same shape as `diff/hunks`. A bare hunk-only patch yields a single file with nil paths.

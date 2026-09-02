@@ -4,6 +4,7 @@ module: "websocket"
 section: "WebSocket Client"
 params: [{ name: conn, type: connection }, { name: timeout-ms, type: int }]
 returns: "map"
+see_also: ["ws/recv", "ws/listen", "ws/send"]
 ---
 
 Like `ws/recv`, but returns the `:timeout` keyword if no frame arrives within `timeout-ms` milliseconds (distinct from `nil`, which means the connection closed). Native only.

@@ -3,6 +3,8 @@ name: "tools->routes"
 module: "web-server"
 section: "Routing"
 params: [{ name: tools, type: "list | vector" }]
+returns: "list"
+see_also: ["route/from-tools", "http/router", "route/prefix"]
 ---
 
 Convert a list of tool definitions (from `deftool`) into HTTP routes. Each tool gets a `POST /tools/<name>` endpoint that runs the tool handler against the request's JSON body, plus a `/tools/<name>/schema` endpoint exposing its parameter schema.

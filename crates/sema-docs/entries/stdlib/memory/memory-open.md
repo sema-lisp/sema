@@ -3,6 +3,8 @@ name: "memory/open"
 module: "memory"
 section: "Agent Memory"
 syntax: "(memory/open {:id id :namespace ns})"
+returns: "map"
+see_also: ["memory/append", "memory/messages", "agent/run"]
 ---
 
 Open (or return) a named memory thread: a persistable, append-only conversation log keyed

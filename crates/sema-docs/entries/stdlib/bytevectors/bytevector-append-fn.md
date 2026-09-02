@@ -3,6 +3,7 @@ name: "bytevector-append"
 module: "bytevectors"
 params: [{ name: bvs, type: bytevector, variadic: true }]
 returns: "bytevector"
+see_also: ["bytevector/append", "bytevector-copy", "bytevector"]
 ---
 
 Concatenate any number of bytevectors into a new bytevector. Legacy Scheme name; `bytevector/append` is the namespaced alias.

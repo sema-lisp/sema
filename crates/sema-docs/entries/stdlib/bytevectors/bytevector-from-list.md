@@ -3,6 +3,7 @@ name: "bytevector/from-list"
 module: "bytevectors"
 params: [{ name: bytes, type: list }]
 returns: "bytevector"
+see_also: ["list->bytevector", "bytevector/to-list", "bytevector"]
 ---
 
 Namespaced alias for `list->bytevector`. Convert a list of byte values into a bytevector. Each element must be an int in the range 0..255.

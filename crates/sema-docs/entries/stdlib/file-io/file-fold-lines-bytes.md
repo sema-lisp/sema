@@ -4,6 +4,7 @@ module: "file-io"
 section: "File Operations"
 params: [{ name: path, type: string }, { name: f, type: function, doc: "(acc line-bytes) -> acc" }, { name: init, type: any }]
 returns: "any"
+see_also: ["file/fold-lines", "file/for-each-line", "file/read-bytes"]
 ---
 
 Fold over the lines of a file with an accumulator, passing each line to the reducer as a **bytevector** (trailing `\n`/`\r\n` stripped, no UTF-8 validation). The byte-oriented sibling of `file/fold-lines`, for `bytes/*` pipelines that avoid per-line string decoding: `bytes/find` the separator, `bytes/parse-int10` the number, `bytes/->string` only what must become text.

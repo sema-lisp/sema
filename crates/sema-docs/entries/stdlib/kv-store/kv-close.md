@@ -2,6 +2,9 @@
 name: "kv/close"
 module: "kv-store"
 section: "Functions"
+params: [{ name: ns, type: string }]
+returns: "nil"
+see_also: ["kv/open", "kv/set"]
 ---
 
 Close a store, flushing data and freeing the handle. Returns `nil`.

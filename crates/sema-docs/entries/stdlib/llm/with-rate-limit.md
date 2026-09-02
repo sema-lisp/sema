@@ -3,6 +3,7 @@ name: "llm/with-rate-limit"
 module: "llm"
 params: [{ name: rps, type: number }, { name: thunk }]
 returns: "any"
+see_also: ["llm/with-fallback", "llm/batch", "llm/pmap"]
 ---
 
 Run a zero-argument function with a requests-per-second rate limit in effect for LLM calls. The first argument is the allowed rate (requests per second). The previous rate-limit setting is restored after the call. Returns the thunk's result.

@@ -2,6 +2,9 @@
 name: "uuid/v4"
 module: "crypto"
 section: "UUID"
+syntax: "(uuid/v4)"
+returns: "string"
+see_also: ["hash/sha256", "base64/encode"]
 ---
 
 Generate a random UUID v4 string.

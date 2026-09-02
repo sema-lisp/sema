@@ -2,6 +2,9 @@
 name: "async/cancelled?"
 module: "concurrency"
 section: "Promises"
+params: [{ name: promise, type: promise }]
+returns: "bool"
+see_also: ["async/cancel", "async/rejected?", "async/resolved?", "async/pending?"]
 ---
 
 ```sema

@@ -2,6 +2,9 @@
 name: "pdf/metadata"
 module: "pdf"
 section: "Metadata"
+params: [{ name: path, type: string }]
+returns: "map"
+see_also: ["pdf/page-count", "pdf/extract-text"]
 ---
 
 Return a map of PDF metadata fields. Always includes `:pages`; other fields (`:title`, `:author`, `:subject`, `:creator`, `:producer`) are included when present in the PDF.

@@ -2,6 +2,9 @@
 name: "async/spawn-all"
 module: "concurrency"
 section: "Promises"
+params: [{ name: thunks, type: "list | vector" }]
+returns: "list"
+see_also: ["async/spawn", "async/all", "async/map", "parallel"]
 ---
 
 ```sema

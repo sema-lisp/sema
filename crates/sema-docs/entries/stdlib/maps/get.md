@@ -4,6 +4,7 @@ module: "maps"
 section: "Maps"
 params: [{ name: m, type: map }, { name: key, type: any }, { name: default, type: any, doc: "optional value returned when key is absent (defaults to nil)" }]
 returns: "any"
+see_also: ["get-in", "contains?", "hash-ref", "hashmap/get"]
 ---
 
 Look up a value by key. Works on both maps and hashmaps. Returns `nil` for a missing key, or a third *default* argument if you supply one. For nested lookups use `get-in`.

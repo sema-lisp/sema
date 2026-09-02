@@ -2,6 +2,9 @@
 name: "html/text"
 module: "markup"
 section: "Markdown & HTML"
+params: [{ name: html, type: string }]
+returns: "string"
+see_also: ["html/select-text", "text/strip-html", "html/parse"]
 ---
 
 Extract the visible text content from an HTML string, stripping all tags. Text from every node is concatenated and whitespace-collapsed into a single trimmed string.

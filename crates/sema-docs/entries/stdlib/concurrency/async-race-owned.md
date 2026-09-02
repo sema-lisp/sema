@@ -2,6 +2,9 @@
 name: "async/race-owned"
 module: "concurrency"
 section: "Promises"
+params: [{ name: thunks, type: "list | vector" }]
+returns: "any"
+see_also: ["async/race", "async/with-timeout", "async/cancel"]
 ---
 
 ```sema

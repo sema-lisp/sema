@@ -3,6 +3,7 @@ name: "bytevector->list"
 module: "bytevectors"
 params: [{ name: bv, type: bytevector }]
 returns: "list"
+see_also: ["bytevector/to-list", "list->bytevector"]
 ---
 
 Convert a bytevector into a list of byte values (each an int in 0..255). Legacy Scheme name; `bytevector/to-list` is the namespaced alias.

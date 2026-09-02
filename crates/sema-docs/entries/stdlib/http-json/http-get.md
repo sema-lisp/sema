@@ -4,6 +4,7 @@ module: "http-json"
 section: "HTTP"
 params: [{ name: url, type: string }, { name: opts, type: map, doc: "optional :headers/:timeout/:as" }]
 returns: "map"
+see_also: ["http/post", "http/request", "json/decode"]
 ---
 
 ```

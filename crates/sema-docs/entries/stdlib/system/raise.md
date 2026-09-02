@@ -3,6 +3,8 @@ name: "raise"
 module: "system"
 section: "Errors"
 params: [{ name: obj, type: any }]
+returns: "never returns; raises the object"
+see_also: ["error", "throw", "try", "guard"]
 ---
 
 R7RS `raise`: raise an arbitrary object as an exception. Unlike `error` (which takes a message string and produces an `:eval` error), `raise` signals the object itself — any value, not just a string.

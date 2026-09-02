@@ -2,6 +2,9 @@
 name: "file/info"
 module: "file-io"
 section: "Directory Operations"
+params: [{ name: path, type: string }]
+returns: "map"
+see_also: ["file/exists?", "file/is-file?", "file/is-directory?"]
 ---
 
 Get file metadata. Returns a map with `:size` (bytes), `:modified` (Unix epoch

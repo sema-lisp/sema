@@ -4,6 +4,7 @@ module: "lists"
 section: "Slicing"
 params: [{ name: pred, type: function }, { name: seq, type: "list | vector" }]
 returns: list
+see_also: ["drop-while", "take", "filter", "list/take-while"]
 ---
 
 Return the leading elements of `seq` for which `pred` is truthy, stopping at the first element that fails. Same as `list/take-while`.

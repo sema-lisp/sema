@@ -4,6 +4,7 @@ module: "concurrency"
 section: "Promises"
 params: [{ name: promise, type: promise }]
 returns: "bool"
+see_also: ["async/resolved", "async/rejected?", "async/pending?"]
 ---
 
 `#t` if `promise` has settled into the `Resolved` state (it completed with a value), `#f` if it is still pending, rejected, or cancelled. Errors if the argument is not a promise.

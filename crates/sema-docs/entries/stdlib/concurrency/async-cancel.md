@@ -2,6 +2,9 @@
 name: "async/cancel"
 module: "concurrency"
 section: "Promises"
+params: [{ name: promise, type: promise }]
+returns: "bool"
+see_also: ["async/cancelled?", "async/with-timeout", "async/race-owned"]
 ---
 
 ```sema

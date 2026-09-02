@@ -2,6 +2,9 @@
 name: "web/user-agent"
 module: "playground"
 section: "Web-Only Functions"
+syntax: "(web/user-agent)"
+returns: "string"
+see_also: ["web/user-agent-data", "sys/platform"]
 ---
 
 Return the browser's `navigator.userAgent` string. Works in all browsers.

@@ -4,6 +4,7 @@ module: "lists"
 section: "Higher-Order Functions"
 params: [{ name: pred, type: function }, { name: seq, type: list }]
 returns: "list"
+see_also: ["list/reject", "map", "partition", "list/find"]
 ---
 
 Return a new list containing only the elements that **satisfy** `pred` (those for which it returns truthy); order is preserved and the input is untouched.

@@ -2,6 +2,9 @@
 name: "flatten-deep"
 module: "lists"
 section: "Sublists"
+params: [{ name: seq, type: list }]
+returns: "list"
+see_also: ["flatten", "flat-map", "append"]
 ---
 
 Recursively flatten all nested lists.

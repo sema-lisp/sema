@@ -4,6 +4,7 @@ module: "websocket"
 section: "WebSocket Client"
 params: [{ name: conn, type: connection }]
 returns: "map"
+see_also: ["ws/recv-timeout", "ws/listen", "ws/send"]
 ---
 
 Block until the next frame arrives, returning a tagged map for `match`: `{:text s}`, `{:binary bv}`, or `{:close {:code … :reason …}}`, and `nil` once the connection is drained. Native only — in the browser, receive via `ws/listen`.

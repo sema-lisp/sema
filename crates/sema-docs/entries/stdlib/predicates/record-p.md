@@ -2,6 +2,9 @@
 name: "record?"
 module: "predicates"
 section: "Type Predicates"
+params: [{ name: v, type: any }]
+returns: "bool"
+see_also: ["define-record-type", "type-of", "map?"]
 ---
 
 Test if a value is a record instance (any value built by a `define-record-type` constructor). Use `type-of` to recover the specific record type tag.

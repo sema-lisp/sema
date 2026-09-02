@@ -3,6 +3,8 @@ name: "llm/cache-stats"
 module: "llm"
 params: []
 returns: "map"
+see_also: ["llm/with-cache", "llm/cache-clear", "llm/cache-key"]
+syntax: "(llm/cache-stats)"
 ---
 
 Return cache statistics as a map with `:hits`, `:misses`, and `:size` (the number of entries currently in the in-memory cache).

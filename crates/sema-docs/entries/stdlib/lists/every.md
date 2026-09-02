@@ -4,6 +4,7 @@ module: "lists"
 section: "Searching"
 params: [{ name: pred, type: function }, { name: lst, type: list }]
 returns: "bool"
+see_also: ["every?", "any", "filter"]
 ---
 
 Return `#t` if `pred` is truthy for every element (and `#t` for the empty list, vacuously); `#f` otherwise. Stops at the first failure. Alias: `every?`.

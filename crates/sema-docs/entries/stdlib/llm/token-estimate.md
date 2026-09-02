@@ -3,6 +3,7 @@ name: "llm/token-estimate"
 module: "llm"
 params: [{ name: input }]
 returns: "map"
+see_also: ["llm/token-count", "llm/last-usage"]
 ---
 
 Estimate tokens for a string and return details as a map with `:tokens` (the chars/4 estimate), `:method` (`"chars/4"`), and `:chars` (the character count).

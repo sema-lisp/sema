@@ -3,6 +3,8 @@ name: "file/mkdir"
 module: "file-io"
 section: "Directory Operations"
 params: [{ name: path, type: string }]
+returns: "nil"
+see_also: ["file/is-directory?", "file/exists?", "file/write"]
 ---
 
 Create a directory, including any missing parent directories (like `mkdir -p`).

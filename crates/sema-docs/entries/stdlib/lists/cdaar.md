@@ -3,6 +3,8 @@ name: "cdaar"
 module: "lists"
 section: "Construction & Access"
 params: [{ name: x, type: list }]
+returns: "any"
+see_also: ["car", "cdr", "cadr", "nth"]
 ---
 
 Equivalent to `(cdr (car (car x)))`.

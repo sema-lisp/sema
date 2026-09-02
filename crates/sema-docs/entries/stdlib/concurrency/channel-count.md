@@ -4,6 +4,7 @@ module: "concurrency"
 section: "Channels"
 params: [{ name: ch, type: channel }]
 returns: "int"
+see_also: ["channel/empty?", "channel/full?", "channel/new"]
 ---
 
 Return the number of items currently buffered in the channel. Errors if the argument is not a channel.

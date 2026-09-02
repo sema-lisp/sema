@@ -2,6 +2,9 @@
 name: "prompt/render"
 module: "text-processing"
 section: "Prompt Templates"
+params: [{ name: template, type: string }, { name: values, type: map }]
+returns: "string"
+see_also: ["prompt/template", "prompt/fill", "format"]
 ---
 
 Render a template by substituting `{{key}}` placeholders with values from a map. Missing keys are left as-is.

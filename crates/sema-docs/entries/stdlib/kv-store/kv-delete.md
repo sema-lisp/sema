@@ -2,6 +2,9 @@
 name: "kv/delete"
 module: "kv-store"
 section: "Functions"
+params: [{ name: ns, type: string }, { name: key, type: string }]
+returns: "bool"
+see_also: ["kv/set", "kv/get", "kv/keys"]
 ---
 
 Delete a key. Returns `#t` if the key existed, `#f` otherwise. Flushes to disk immediately.

@@ -2,6 +2,9 @@
 name: "list/nth-or"
 module: "lists"
 section: "Access & Search"
+params: [{ name: seq, type: list }, { name: index, type: int }, { name: default, type: any }]
+returns: "any"
+see_also: ["nth", "first", "last", "get"]
 ---
 
 Return the element at `index`, or `default` when the index is out of bounds — the safe counterpart to `nth` (which errors).

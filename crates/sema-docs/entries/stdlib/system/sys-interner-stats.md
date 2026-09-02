@@ -3,6 +3,8 @@ name: "sys/interner-stats"
 module: "system"
 section: "System Information"
 returns: "map"
+syntax: "(sys/interner-stats)"
+see_also: ["gc/stats", "gc/collect"]
 ---
 
 Return statistics about the global symbol/string interner as a map with `:count` (number of interned strings) and `:bytes` (total bytes they occupy). Useful for diagnosing interner growth.

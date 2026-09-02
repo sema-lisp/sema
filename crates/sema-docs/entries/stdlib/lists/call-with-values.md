@@ -4,6 +4,7 @@ module: "lists"
 section: "Multiple Values"
 syntax: "(call-with-values producer consumer)"
 returns: "any"
+see_also: ["values", "apply"]
 ---
 
 Call the zero-argument `producer` thunk, then apply `consumer` to whatever it produced. If `producer` returned a bundle from `values` (zero or two-or-more values), each becomes a separate argument to `consumer`; an ordinary single value (including a plain, non-`values` return) is passed as `consumer`'s one argument.

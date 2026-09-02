@@ -3,6 +3,7 @@ name: "llm/stream"
 module: "llm"
 params: [{ name: prompt }, { name: callback }, { name: opts, type: map }]
 returns: "string"
+see_also: ["llm/complete", "llm/chat"]
 ---
 
 Stream a completion from the default provider, delivering the reply incrementally as it is generated instead of waiting for the whole thing. The first argument is a prompt string, a prompt value, or a messages sequence. An optional function argument is invoked with each text chunk as it arrives; with no callback, chunks are printed to stdout. The opts map accepts `:model`, `:max-tokens`, `:temperature`, and `:system`. Returns the **full accumulated** response string once streaming finishes.

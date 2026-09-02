@@ -3,6 +3,9 @@ name: "path/filename"
 module: "file-io"
 section: "Path Manipulation"
 aliases: ["path/basename"]
+params: [{ name: path, type: string }]
+returns: "string"
+see_also: ["path/dir", "path/stem", "path/extension"]
 ---
 
 Return the filename portion of a path. Returns `""` when there is no filename component (e.g. for `""`).

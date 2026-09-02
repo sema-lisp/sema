@@ -4,6 +4,7 @@ module: "predicates"
 section: "Numeric Predicates"
 params: [{ name: n, type: int }]
 returns: "bool"
+see_also: ["odd?", "zero?", "integer?"]
 ---
 
 Test if an integer is even. Requires an integer — passing a float raises a type error. See `odd?` for the complement.

@@ -4,6 +4,7 @@ module: "concurrency"
 section: "Channels"
 params: [{ name: ch, type: channel }]
 returns: "bool"
+see_also: ["channel/close", "channel/empty?"]
 ---
 
 `#t` if the channel has been closed with `channel/close`, `#f` otherwise. Errors if the argument is not a channel.

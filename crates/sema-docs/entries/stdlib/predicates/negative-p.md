@@ -2,6 +2,9 @@
 name: "negative?"
 module: "predicates"
 section: "Numeric Predicates"
+params: [{ name: v, type: any }]
+returns: "bool"
+see_also: ["positive?", "zero?", "number?"]
 ---
 
 Test if a number is strictly less than zero. Zero is neither negative nor positive.

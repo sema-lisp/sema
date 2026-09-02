@@ -4,6 +4,7 @@ module: "maps"
 section: "Maps"
 syntax: "(map/new key val ...)"
 returns: "map"
+see_also: ["hash-map", "hashmap/new", "map/from-entries"]
 ---
 
 Create an ordered map from alternating key/value arguments — the function form of the `{...}` literal. Requires an even number of arguments. `hash-map` is an alias; for the unordered hash-table type use `hashmap/new`.

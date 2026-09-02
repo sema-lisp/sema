@@ -2,6 +2,9 @@
 name: "html/select-text"
 module: "markup"
 section: "Markdown & HTML"
+params: [{ name: html, type: string }, { name: selector, type: string }]
+returns: "list"
+see_also: ["html/select", "html/text", "html/parse"]
 ---
 
 Run a CSS selector against an HTML string and return a list of the matched elements' text content (one whitespace-collapsed string per match), with tags stripped. Like `html/select` but yields text rather than outer HTML. An invalid selector raises an error.

@@ -4,6 +4,7 @@ module: "context"
 section: "Hidden Context"
 params: [{ name: key }, { name: value }]
 returns: "nil"
+see_also: ["context/get-hidden", "context/has-hidden?", "context/set"]
 ---
 
 Store a value in the hidden context under `key`. Hidden entries are not returned by `context/all`

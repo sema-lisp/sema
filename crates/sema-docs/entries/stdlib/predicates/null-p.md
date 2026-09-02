@@ -4,6 +4,7 @@ module: "predicates"
 section: "Emptiness Predicates"
 params: [{ name: x, type: any }]
 returns: "bool"
+see_also: ["nil?", "empty?", "list?", "pair?"]
 ---
 
 Test if a value is the empty list or `nil`.

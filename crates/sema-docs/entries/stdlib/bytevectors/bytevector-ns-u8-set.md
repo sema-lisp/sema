@@ -3,6 +3,7 @@ name: "bytevector/u8-set!"
 module: "bytevectors"
 params: [{ name: bv, type: bytevector }, { name: index, type: int }, { name: byte, type: int }]
 returns: "bytevector"
+see_also: ["bytevector/set!", "bytevector/u8-ref"]
 ---
 
 Namespaced alias for `bytevector-u8-set!`. Return a new bytevector with the byte at `index` set to `byte` (0..255). Uses copy-on-write — the original bytevector is unchanged. Signals an error if `index` is out of range or `byte` is outside 0..255.

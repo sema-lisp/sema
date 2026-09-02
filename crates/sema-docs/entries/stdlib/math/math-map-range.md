@@ -2,6 +2,9 @@
 name: "math/map-range"
 module: "math"
 section: "Interpolation & Clamping"
+params: [{ name: value, type: number }, { name: in-min, type: number }, { name: in-max, type: number }, { name: out-min, type: number }, { name: out-max, type: number }]
+returns: "number"
+see_also: ["math/lerp", "math/clamp"]
 ---
 
 Linearly rescale `value` from the input range `[in-min, in-max]` to the output range `[out-min, out-max]`, preserving its relative position. `(math/map-range value in-min in-max out-min out-max)`. Like [`math/lerp`](#math-lerp), it does not clamp — inputs outside the source range map outside the target range.

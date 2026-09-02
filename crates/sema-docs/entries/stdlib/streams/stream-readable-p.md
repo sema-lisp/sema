@@ -3,6 +3,9 @@ name: "stream/readable?"
 module: "streams"
 section: "Introspection"
 aliases: ["stream/writable?"]
+params: [{ name: stream, type: stream }]
+returns: "bool"
+see_also: ["stream/available?", "stream/type", "stream?"]
 ---
 
 Check the direction of a stream.

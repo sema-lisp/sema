@@ -4,6 +4,7 @@ module: "websocket"
 section: "WebSocket Client"
 params: [{ name: conn, type: connection }, { name: message, type: any }]
 returns: "nil"
+see_also: ["ws/recv", "ws/ping", "ws/connect"]
 ---
 
 Send a message over a WebSocket connection. A string sends a text frame, a bytevector a binary frame, a map is sent as JSON text, and explicit framing selects the type.

@@ -2,6 +2,9 @@
 name: "math/sinh"
 module: "math"
 section: "Hyperbolic Functions"
+params: [{ name: x, type: number }]
+returns: "float"
+see_also: ["math/cosh", "math/tanh", "sin"]
 ---
 
 Hyperbolic sine.

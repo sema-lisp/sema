@@ -4,6 +4,7 @@ module: "math"
 section: "Numeric Utilities"
 params: [{ name: n, type: number }]
 returns: "number"
+see_also: ["floor", "ceil", "truncate", "math/round-to"]
 ---
 
 Round to the nearest integer, with ties (`.5`) rounded to the nearest *even* integer (banker's rounding, per R7RS) rather than away from zero. `round` is also exactness-preserving: a float input rounds to a float, an exact rational rounds to an exact integer. For decimal-place rounding use [`math/round-to`](#math-round-to); to drop the fraction toward zero use [`truncate`](#truncate).

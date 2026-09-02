@@ -2,6 +2,9 @@
 name: "string/title-case"
 module: "strings"
 section: "Core String Operations"
+params: [{ name: s, type: string }]
+returns: "string"
+see_also: ["string/snake-case", "string/kebab-case", "string/camel-case", "string/pascal-case"]
 ---
 
 Capitalize the first character of each whitespace-separated word, leaving the rest untouched. It splits on spaces only — underscores, hyphens, and camelCase humps are *not* word boundaries.

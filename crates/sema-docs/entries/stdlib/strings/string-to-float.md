@@ -5,6 +5,7 @@ section: "Type Conversions"
 aliases: ["string/to-float"]
 params: [{ name: x, type: "string | number" }]
 returns: "float"
+see_also: ["string/to-number", "string/number?", "number/to-string"]
 ---
 
 Parse a string as a float. Integers and floats are accepted directly and returned as a float. Raises an error when a string cannot be parsed.

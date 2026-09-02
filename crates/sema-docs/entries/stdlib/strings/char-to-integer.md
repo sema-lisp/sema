@@ -5,6 +5,7 @@ section: "Characters"
 aliases: ["char->integer"]
 params: [{ name: c, type: char }]
 returns: "int"
+see_also: ["integer/to-char", "string/codepoints", "char/to-string"]
 ---
 
 Convert a character to its Unicode code point. The inverse is `integer/to-char`.

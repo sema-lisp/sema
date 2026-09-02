@@ -2,6 +2,9 @@
 name: "otel/configure"
 module: "otel"
 section: "Observability"
+params: [{ name: config, type: map }]
+returns: "bool"
+see_also: ["otel/span", "otel/with-session", "otel/llm-span"]
 ---
 
 Point Sema at a tracing backend **from code**, so environment variables aren't the only way to turn telemetry on. Installs an OpenTelemetry provider on the first call and returns `#t` when this call turned tracing on, or `#f` when nothing was configured or telemetry was already active (from the environment at startup, or an earlier `otel/configure`). Only the first call installs a provider — one per process. Call it once, early, before any `llm/*`/`agent/*` work. A no-op on wasm.

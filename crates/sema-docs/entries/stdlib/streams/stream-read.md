@@ -2,6 +2,9 @@
 name: "stream/read"
 module: "streams"
 section: "Reading"
+params: [{ name: stream, type: stream }, { name: n, type: int }]
+returns: "bytevector"
+see_also: ["stream/read-all", "stream/read-byte", "stream/read-line", "stream/write"]
 ---
 
 Read up to `n` bytes, returning a bytevector. Returns fewer bytes at EOF.

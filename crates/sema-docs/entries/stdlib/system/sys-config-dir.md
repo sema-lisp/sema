@@ -4,6 +4,7 @@ module: "system"
 section: "System Information"
 syntax: "(sys/config-dir)"
 returns: "string"
+see_also: ["sys/home-dir", "sys/sema-home", "sys/temp-dir"]
 ---
 
 Return the platform-appropriate base directory for user configuration, so apps can locate their config without branching on the operating system.

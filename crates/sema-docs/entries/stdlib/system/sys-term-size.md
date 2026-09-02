@@ -2,6 +2,9 @@
 name: "sys/term-size"
 module: "system"
 section: "Terminal"
+syntax: "(sys/term-size)"
+returns: "map or nil"
+see_also: ["sys/tty", "sys/interactive?", "sys/on-signal"]
 ---
 
 Return the terminal's current size as a map `{:rows N :cols M}`, or `nil` when no controlling TTY is attached (e.g., when stdout is redirected to a file). Queries `ioctl(TIOCGWINSZ)` against stdout, then stderr, then stdin.

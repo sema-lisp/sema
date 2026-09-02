@@ -4,6 +4,7 @@ module: "lists"
 section: "Higher-Order Functions"
 params: [{ name: f, type: function, doc: "called as (f acc elem)" }, { name: init, type: any }, { name: list, type: list }]
 returns: "any"
+see_also: ["foldr", "fold", "reduce", "map"]
 ---
 
 Left fold: reduce a list to a single value by threading an accumulator from left to right. `(foldl f init list)` starts with `init` and calls `(f acc elem)` for each element, feeding each result back in as the next `acc`.

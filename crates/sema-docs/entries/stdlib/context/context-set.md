@@ -2,6 +2,9 @@
 name: "context/set"
 module: "context"
 section: "Core Functions"
+params: [{ name: key, type: keyword }, { name: value, type: any }]
+returns: "nil"
+see_also: ["context/get", "context/merge", "context/remove"]
 ---
 
 Set a key-value pair in the current context frame.

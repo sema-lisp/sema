@@ -4,6 +4,7 @@ module: "predicates"
 section: "Equality"
 params: [{ name: a, type: any }, { name: b, type: any }]
 returns: "bool"
+see_also: ["equal?", "=", "not"]
 ---
 
 Test structural (deep) equality. `equal?` is an alias.

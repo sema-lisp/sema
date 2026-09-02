@@ -2,6 +2,9 @@
 name: "math/tan"
 module: "math"
 section: "Trigonometry"
+params: [{ name: x, type: number, doc: "angle in radians" }]
+returns: "float"
+see_also: ["sin", "cos", "math/atan"]
 ---
 
 Tangent (argument in radians).

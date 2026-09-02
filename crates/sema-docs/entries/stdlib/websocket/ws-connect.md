@@ -4,6 +4,7 @@ module: "websocket"
 section: "WebSocket Client"
 params: [{ name: url, type: string }, { name: opts, type: map, doc: "optional :headers/:subprotocols/:timeout/:retries/:retry-backoff-ms" }]
 returns: "connection"
+see_also: ["ws/send", "ws/recv", "ws/close", "ws/listen"]
 ---
 
 Open a WebSocket connection to a `ws://` or `wss://` server and return a connection handle.

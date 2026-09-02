@@ -3,6 +3,7 @@ name: "vector/normalize"
 module: "vectors"
 params: [{ name: v, type: bytevector }]
 returns: "bytevector"
+see_also: ["vector/dot-product", "vector/cosine-similarity", "vector/distance"]
 ---
 
 Return a unit-length copy of an embedding vector (each component divided by the vector's magnitude). The argument is a bytevector of packed little-endian f64 values (as produced by `embedding/list->embedding`), non-empty with a length that is a multiple of 8 bytes. A zero vector is returned unchanged (all zeros).

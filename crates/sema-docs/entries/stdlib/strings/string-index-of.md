@@ -2,6 +2,9 @@
 name: "string/index-of"
 module: "strings"
 section: "Core String Operations"
+params: [{ name: s, type: string }, { name: sub, type: string }, { name: start, type: integer, doc: "optional; character index to start searching from, defaults to 0" }]
+returns: "integer or nil"
+see_also: ["string/last-index-of", "string/contains?", "string/slice"]
 ---
 
 Return the character index of the first occurrence of a substring, or `nil` if not found. The index counts characters, so check for `nil` rather than treating the result as a boolean (index `0` is a valid match and is falsey-looking but not `nil`). Use `string/last-index-of` to search from the end.

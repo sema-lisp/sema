@@ -4,6 +4,7 @@ module: "file-io"
 section: "Console I/O"
 params: [{ name: x, type: any }]
 returns: nil
+see_also: ["print", "println", "display"]
 ---
 
 Pretty-print a value to standard output (followed by a newline), wrapping nested structures to roughly 80 columns. Returns `nil`.

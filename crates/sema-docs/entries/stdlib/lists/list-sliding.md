@@ -2,6 +2,9 @@
 name: "list/sliding"
 module: "lists"
 section: "Windowing"
+params: [{ name: seq, type: list }, { name: n, type: int }, { name: step, type: int, doc: "optional; defaults to 1" }]
+returns: "list"
+see_also: ["list/chunk", "list/page", "zip"]
 ---
 
 Create a sliding window over a list. Optional step parameter.

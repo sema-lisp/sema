@@ -3,6 +3,8 @@ name: "phase"
 module: "workflow"
 section: "Dynamic Workflows"
 syntax: "(phase label)"
+returns: "nil"
+see_also: ["defworkflow", "workflow/phase", "checkpoint"]
 ---
 
 Macro: a journaled phase **marker** inside a workflow body (Claude Code `workflow.js`

@@ -2,6 +2,9 @@
 name: "context/with"
 module: "context"
 section: "Scoped Overrides"
+params: [{ name: frame, type: map, doc: "bindings for the temporary frame" }, { name: thunk, type: function }]
+returns: "any"
+see_also: ["context/set", "context/merge", "context/all"]
 ---
 
 Push a temporary context frame for the duration of a thunk. The frame is automatically popped when the thunk completes — even if it raises an error.

@@ -4,6 +4,7 @@ module: "lists"
 section: "Construction & Access"
 params: [{ name: lst, type: list }]
 returns: "list"
+see_also: ["first", "cdr", "drop"]
 ---
 
 Alias for `cdr`. Return everything after the first element. **Preserves type** — list in, list out; vector in, vector out.

@@ -2,6 +2,9 @@
 name: "file/fold-lines"
 module: "file-io"
 section: "File Operations"
+params: [{ name: path, type: string }, { name: f, type: function, doc: "(acc line) -> acc" }, { name: init, type: any }]
+returns: "any"
+see_also: ["file/fold-lines-bytes", "file/for-each-line", "file/read-lines"]
 ---
 
 Fold over the lines of a file with an accumulator, streaming one line at a time. The reducer receives `(acc line)` — accumulator first, then the current line (newline already stripped) — and returns the next accumulator.

@@ -4,6 +4,7 @@ module: "maps"
 section: "Maps"
 syntax: "(assoc map key val ...)"
 returns: "map"
+see_also: ["dissoc", "get", "assoc-in", "hashmap/assoc"]
 ---
 
 Add or update key-value pairs, returning a **new** map; the original is never mutated.

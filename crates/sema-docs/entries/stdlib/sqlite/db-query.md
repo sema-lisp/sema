@@ -2,6 +2,9 @@
 name: "db/query"
 module: "sqlite"
 section: "Querying"
+syntax: "(db/query db sql param ...)"
+returns: "list"
+see_also: ["db/query-one", "db/exec", "db/tables"]
 ---
 
 Run a SELECT and return **all** matching rows as a list of maps, one map per row, with column names as keyword keys. Returns the empty list `()` when nothing matches. Use `db/query-one` when you only need the first row.

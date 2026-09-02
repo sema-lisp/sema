@@ -3,6 +3,7 @@ name: "llm/pmap"
 module: "llm"
 params: [{ name: fn }, { name: collection }, { name: opts, type: map }]
 returns: "list"
+see_also: ["llm/batch", "llm/complete", "llm/with-rate-limit"]
 ---
 
 Map a function over a collection to build prompt strings, then send them all to the default provider in parallel and return the completions in **input order**. Each item is passed to `fn`, which must return the prompt string for that item. The opts map accepts `:model`, `:max-tokens`, `:temperature`, and `:system`.

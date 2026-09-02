@@ -2,6 +2,9 @@
 name: "workflow/checkpoint"
 module: "workflow"
 section: "Dynamic Workflows"
+syntax: "(workflow/checkpoint key [thunk])"
+returns: "any"
+see_also: ["checkpoint", "workflow/run", "workflow/phase"]
 ---
 
 Record or read a keyed checkpoint in the active workflow context. With two

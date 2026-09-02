@@ -2,6 +2,9 @@
 name: "time/diff"
 module: "datetime"
 section: "Arithmetic"
+params: [{ name: t1, type: number }, { name: t2, type: number }]
+returns: "number"
+see_also: ["time/add", "time/now"]
 ---
 
 Compute the difference between two timestamps in seconds. Returns `t1 - t2` (the first argument minus the second). The result can be negative.

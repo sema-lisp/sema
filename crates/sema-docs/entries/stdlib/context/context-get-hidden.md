@@ -3,6 +3,8 @@ name: "context/get-hidden"
 module: "context"
 section: "Hidden Context"
 params: [{ name: key }]
+returns: "any or nil"
+see_also: ["context/set-hidden", "context/has-hidden?", "context/get"]
 ---
 
 Look up a value previously stored with `context/set-hidden`. Returns nil if the key is absent.

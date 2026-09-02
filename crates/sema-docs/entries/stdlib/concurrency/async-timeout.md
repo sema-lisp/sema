@@ -2,6 +2,9 @@
 name: "async/timeout"
 module: "concurrency"
 section: "Promises"
+params: [{ name: ms, type: number }, { name: promise, type: promise }]
+returns: "any"
+see_also: ["async/with-timeout", "async/cancel", "async/sleep"]
 ---
 
 ```sema

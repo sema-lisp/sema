@@ -2,6 +2,9 @@
 name: "pii/detect"
 module: "security"
 section: "Secrets & Redaction"
+params: [{ name: text, type: string }]
+returns: "list"
+see_also: ["secret/detect", "redact/spans", "secret/redact"]
 ---
 
 Scan text for personally-identifying data and return a list of maps, one per match, each with `:type`, `:match`, `:start`, and `:end`. Detects email addresses (`:type "email"`), IPv4 addresses (`:type "ipv4"`), and US-style phone numbers (`:type "phone"`). Pair the returned spans with `redact/spans` to scrub the original text.

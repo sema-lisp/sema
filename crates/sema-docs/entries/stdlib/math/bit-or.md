@@ -4,6 +4,7 @@ module: "math"
 section: "Bitwise Operations"
 params: [{ name: a, type: int }, { name: b, type: int }]
 returns: "int"
+see_also: ["bit/and", "bit/xor", "bit/not"]
 ---
 
 Bitwise OR.

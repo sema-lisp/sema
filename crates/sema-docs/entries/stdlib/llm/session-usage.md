@@ -3,6 +3,8 @@ name: "llm/session-usage"
 module: "llm"
 params: []
 returns: "map"
+see_also: ["llm/last-usage", "llm/reset-usage", "llm/budget-remaining"]
+syntax: "(llm/session-usage)"
 ---
 
 Return cumulative token usage for the whole session as a map with `:prompt-tokens`, `:completion-tokens`, `:total-tokens`, and `:cost-usd`. The totals accumulate across all LLM calls until reset with `llm/reset-usage`.

@@ -2,6 +2,9 @@
 name: "otel/llm-span"
 module: "otel"
 section: "Observability"
+params: [{ name: config, type: map }, { name: thunk, type: function }]
+returns: "any"
+see_also: ["otel/llm-usage", "otel/span", "otel/tool-span"]
 ---
 
 Run a thunk inside a typed **LLM/generation** span for an LLM call you make yourself (a provider Sema doesn't natively support). The config map supplies `:model`, `:provider`, and `:operation` (default `"chat"`); any other keys become span attributes. Sets the `gen_ai.*` request attributes and, when `SEMA_OTEL_COMPAT` is set, the backend-native span-kind — so the call renders as a first-class generation in Phoenix/Traceloop/Langfuse. Account tokens with `otel/llm-usage` inside the thunk. A no-op when telemetry is disabled.

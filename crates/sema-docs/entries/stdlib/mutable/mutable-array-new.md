@@ -4,6 +4,7 @@ module: "mutable"
 section: "Mutable Containers"
 params: [{ name: cap-or-n, type: int, doc: "capacity hint (1-arg) or element count (2-arg)", optional: true }, { name: fill, type: any, doc: "fill value for the 2-arg form", optional: true }]
 returns: "mutable-array"
+see_also: ["mutable-array/push!", "mutable-array/get", "mutable-array/->vector", "mutable-cell/new"]
 ---
 
 Create a mutable array — an in-place mutable container for imperative hot loops, unlike the persistent (copy-on-write) `vector`. With no arguments it is empty; with one argument the array is still empty but pre-allocates capacity for that many pushes; with two arguments it holds `n` copies of `fill`, ready for indexed `mutable-array/set!`.

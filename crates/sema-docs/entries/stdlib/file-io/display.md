@@ -4,6 +4,7 @@ module: "file-io"
 section: "Console I/O"
 syntax: "(display value ...)"
 returns: "nil"
+see_also: ["print", "println", "newline", "io/flush"]
 ---
 
 Print a value in human-readable form (no quotes around strings) without a trailing newline.

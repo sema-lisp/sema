@@ -3,6 +3,9 @@ name: "f64-array/sum"
 module: "typed-arrays"
 section: "Aggregation"
 aliases: ["i64-array/sum"]
+params: [{ name: arr, type: "f64-array | i64-array" }]
+returns: "number"
+see_also: ["f64-array/dot", "f64-array/fold", "list/sum"]
 ---
 
 Sum all elements. Runs in a tight Rust loop with no boxing overhead.

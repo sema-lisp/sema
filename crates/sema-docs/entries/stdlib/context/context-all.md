@@ -2,6 +2,9 @@
 name: "context/all"
 module: "context"
 section: "Core Functions"
+syntax: "(context/all)"
+returns: "map"
+see_also: ["context/get", "context/set", "context/clear"]
 ---
 
 Get all context as a merged map.

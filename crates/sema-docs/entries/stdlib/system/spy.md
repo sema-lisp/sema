@@ -3,6 +3,8 @@ name: "spy"
 module: "system"
 section: "Debugging"
 params: [{ name: label, type: string }, { name: value, type: any }]
+returns: "any"
+see_also: ["log/debug", "print", "time"]
 ---
 
 Print `[label] value` to standard error and return `value` unchanged. Because it returns its second argument untouched, you can wrap any subexpression in `(spy "label" ...)` to peek at it without restructuring the surrounding code.

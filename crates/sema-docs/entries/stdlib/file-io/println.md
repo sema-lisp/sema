@@ -4,6 +4,7 @@ module: "file-io"
 section: "Console I/O"
 syntax: "(println value ...)"
 returns: "nil"
+see_also: ["display", "print", "newline"]
 ---
 
 Print a value in human-readable form (like `display`) followed by a newline. Strings are not quoted.

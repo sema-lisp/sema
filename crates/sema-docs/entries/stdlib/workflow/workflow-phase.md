@@ -2,6 +2,9 @@
 name: "workflow/phase"
 module: "workflow"
 section: "Dynamic Workflows"
+params: [{ name: label, type: string }]
+returns: "nil"
+see_also: ["phase", "workflow/run", "checkpoint"]
 ---
 
 Open a journaled phase **marker** inside a workflow body (not a wrapper, not control

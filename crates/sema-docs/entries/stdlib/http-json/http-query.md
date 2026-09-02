@@ -2,6 +2,9 @@
 name: "http/query"
 module: "http-json"
 section: "HTTP"
+params: [{ name: url, type: string }, { name: body, type: any, doc: "map (JSON), string, or bytevector" }, { name: opts, type: map, doc: "optional :headers/:timeout/:as" }]
+returns: "map"
+see_also: ["http/get", "http/post", "http/request"]
 ---
 
 ```

@@ -2,6 +2,9 @@
 name: "serial/send"
 module: "serial"
 section: "I/O"
+params: [{ name: handle, type: int }, { name: command, type: string }]
+returns: "any or nil"
+see_also: ["serial/write", "serial/read-line", "json/decode"]
 ---
 
 ```sema

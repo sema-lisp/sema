@@ -2,6 +2,9 @@
 name: "http/router"
 module: "web-server"
 section: "Routing"
+params: [{ name: routes, type: "list | vector" }]
+returns: "function"
+see_also: ["http/serve", "route/prefix", ":static", "tools->routes"]
 ---
 
 Create a handler function from a list of route definitions. Each route is a vector of `[method pattern handler]`.

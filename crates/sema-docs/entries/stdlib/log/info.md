@@ -3,6 +3,7 @@ name: "log/info"
 module: "log"
 params: [{ name: args }]
 returns: "nil"
+see_also: ["log/debug", "log/warn", "log/error", "spy"]
 ---
 
 Write an `[INFO]` log line to stderr for normal operational events. Accepts one or more values, joined by spaces (strings as-is, others stringified). Any active logging context is appended.

@@ -2,6 +2,9 @@
 name: "string/headline"
 module: "strings"
 section: "Case Conversion"
+params: [{ name: s, type: string }]
+returns: "string"
+see_also: ["string/snake-case", "string/kebab-case", "string/camel-case", "string/pascal-case"]
 ---
 
 Convert any identifier or sentence to a spaced Title Case headline. It treats whitespace, underscores, hyphens, and camelCase humps all as word boundaries, then capitalizes each word.

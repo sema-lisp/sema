@@ -3,6 +3,8 @@ name: "async/sleep"
 module: "concurrency"
 section: "Promises"
 params: [{ name: ms, type: number }]
+returns: "nil"
+see_also: ["async/spawn", "async/timeout", "async/run"]
 ---
 
 ```sema

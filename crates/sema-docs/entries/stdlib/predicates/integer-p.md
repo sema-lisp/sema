@@ -2,6 +2,9 @@
 name: "integer?"
 module: "predicates"
 section: "Numeric Predicates"
+params: [{ name: v, type: any }]
+returns: "bool"
+see_also: ["float?", "number?", "exact-integer?", "even?"]
 ---
 
 Test if a value is an integer. This is R7RS *value-based*: any number with no fractional part is an integer regardless of representation — an integer-valued float like `3.0` counts, and so do bignums (arbitrary-precision integers beyond machine-word range).

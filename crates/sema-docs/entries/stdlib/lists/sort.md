@@ -4,6 +4,7 @@ module: "lists"
 section: "Higher-Order Functions"
 params: [{ name: lst, type: list }, { name: cmp, type: function, doc: "optional comparator" }]
 returns: "list"
+see_also: ["sort-by", "reverse", "list/unique"]
 ---
 
 Return a new list sorted in ascending order. The input is left unchanged. Pass an optional two-argument comparator to control the order (e.g. `>` for descending).

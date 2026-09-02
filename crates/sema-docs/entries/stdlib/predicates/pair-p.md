@@ -4,6 +4,7 @@ module: "predicates"
 section: "Collection Predicates"
 params: [{ name: x, type: any }]
 returns: "bool"
+see_also: ["list?", "null?", "cons"]
 ---
 
 Test if a value is a non-empty list (Scheme compatibility).

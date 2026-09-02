@@ -2,6 +2,9 @@
 name: "otel/set-attributes"
 module: "otel"
 section: "Observability"
+params: [{ name: attrs, type: map }]
+returns: "nil"
+see_also: ["otel/set-attribute", "otel/set-status", "otel/event"]
 ---
 
 Set many attributes on the innermost active span from a map. Keys are keywords or strings; values keep their type (number/bool/string). Equivalent to calling `otel/set-attribute` for each entry. A no-op when telemetry is disabled or there is no active span.

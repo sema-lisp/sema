@@ -2,6 +2,9 @@
 name: "map/from-entries"
 module: "maps"
 section: "Maps"
+params: [{ name: entries, type: "list | vector" }]
+returns: "map"
+see_also: ["map/entries", "map/zip", "hash-map"]
 ---
 
 Build a map from a sequence of `(key value)` pairs — the inverse of `map/entries`. Each pair may be a list or a vector. On duplicate keys, the last pair wins.

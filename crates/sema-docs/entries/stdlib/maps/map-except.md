@@ -2,6 +2,9 @@
 name: "map/except"
 module: "maps"
 section: "HashMaps"
+params: [{ name: m, type: map }, { name: keys, type: "list | vector" }]
+returns: "map"
+see_also: ["map/select-keys", "dissoc", "map/filter"]
 ---
 
 Remove specified keys from a map (inverse of `map/select-keys`).

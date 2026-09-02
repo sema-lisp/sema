@@ -3,6 +3,9 @@ name: "path/extension"
 module: "file-io"
 section: "Path Manipulation"
 aliases: ["path/ext"]
+params: [{ name: path, type: string }]
+returns: "string"
+see_also: ["path/stem", "path/filename"]
 ---
 
 Return the file extension (without the dot). Returns `""` when the path has no extension.

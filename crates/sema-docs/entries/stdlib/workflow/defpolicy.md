@@ -3,6 +3,8 @@ name: "defpolicy"
 module: "workflow"
 section: "Dynamic Workflows"
 syntax: "(defpolicy name policy-map)"
+returns: "map"
+see_also: ["defworkflow", "step", "policy/without", "workflow/check"]
 ---
 
 Define a reusable model and tool policy. Model rules match exact

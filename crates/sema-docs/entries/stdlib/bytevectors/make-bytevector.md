@@ -3,6 +3,7 @@ name: "make-bytevector"
 module: "bytevectors"
 params: [{ name: size, type: int }, { name: fill, type: int, optional: true }]
 returns: "bytevector"
+see_also: ["bytevector/new", "bytevector/make", "bytevector"]
 ---
 
 Create a bytevector of `size` bytes, each initialized to `fill` (default `0`). `size` must be non-negative and `fill` must be in the range 0..255.

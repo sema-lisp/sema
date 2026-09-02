@@ -3,6 +3,7 @@ name: "llm/extract"
 module: "llm"
 params: [{ name: schema }, { name: text, type: string }, { name: opts, type: map }]
 returns: "map"
+see_also: ["llm/extract-from-image", "llm/classify", "llm/complete"]
 ---
 
 Extract structured data from unstructured text into a value matching a schema you describe as a Sema map. The model is told to return JSON only; the response is parsed and (by default) validated against the schema, retrying on failure. Returns the extracted value (a map keyed like the schema).

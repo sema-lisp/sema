@@ -2,6 +2,9 @@
 name: "json/encode-pretty"
 module: "http-json"
 section: "JSON"
+params: [{ name: value, type: any, doc: "any JSON-encodable Sema value" }]
+returns: "string"
+see_also: ["json/encode", "json/decode", "pprint"]
 ---
 
 ```

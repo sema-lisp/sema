@@ -2,6 +2,9 @@
 name: "math/cosh"
 module: "math"
 section: "Hyperbolic Functions"
+params: [{ name: x, type: number }]
+returns: "float"
+see_also: ["math/sinh", "math/tanh", "cos"]
 ---
 
 Hyperbolic cosine.

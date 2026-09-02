@@ -4,6 +4,7 @@ module: "lists"
 section: "Basic Operations"
 params: [{ name: list, type: list }]
 returns: "int"
+see_also: ["count", "empty?", "list/pad"]
 ---
 
 Return the number of elements in a collection. Works on lists, vectors, strings, maps, bytevectors, and typed arrays. See also `count`, which additionally treats `nil` as `0`.

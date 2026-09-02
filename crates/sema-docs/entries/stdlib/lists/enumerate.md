@@ -4,6 +4,7 @@ module: "lists"
 section: "Higher-Order Functions"
 syntax: "(enumerate seq)"
 returns: "list"
+see_also: ["map-indexed", "zip", "range"]
 ---
 
 Pair each element of `seq` with its 0-based index, returning a list of `(index element)` lists. Accepts a list or vector; the input is never mutated and the result is always a list.

@@ -2,6 +2,9 @@
 name: "list/find"
 module: "lists"
 section: "Filtering"
+params: [{ name: pred, type: function }, { name: seq, type: list }]
+returns: "any or nil"
+see_also: ["filter", "list/sole", "list/index-of", "any"]
 ---
 
 Return the first element that satisfies a predicate, or `nil` if none found.

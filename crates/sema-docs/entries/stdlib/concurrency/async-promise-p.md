@@ -4,6 +4,7 @@ module: "concurrency"
 section: "Promises"
 params: [{ name: value }]
 returns: "bool"
+see_also: ["async/spawn", "async/resolved", "channel?"]
 ---
 
 `#t` if `value` is an async promise (e.g. one returned by `async/spawn`, `async/resolved`, or `async/rejected`), `#f` otherwise.

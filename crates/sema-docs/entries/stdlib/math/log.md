@@ -4,6 +4,7 @@ module: "math"
 section: "Numeric Utilities"
 params: [{ name: x, type: number }]
 returns: "float"
+see_also: ["math/exp", "math/log10", "math/log2"]
 ---
 
 Natural logarithm (base *e*). Single-argument only — for other bases use `math/log10`, `math/log2`, or divide: `log(x) / log(b)`. Inputs of `0` give `-inf` and negatives give `NaN` rather than erroring.

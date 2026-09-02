@@ -3,6 +3,7 @@ name: "bytevector/u8-ref"
 module: "bytevectors"
 params: [{ name: bv, type: bytevector }, { name: index, type: int }]
 returns: "int"
+see_also: ["bytevector/ref", "bytevector/u8-set!", "bytes/ref"]
 ---
 
 Namespaced alias for `bytevector-u8-ref`. Return the byte (0..255) at `index` in a bytevector. Signals an error if `index` is out of range.

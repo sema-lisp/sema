@@ -3,6 +3,8 @@ name: "pipeline-settled"
 module: "concurrency"
 section: "Promises"
 syntax: "(pipeline-settled items stage ...)"
+returns: "list"
+see_also: ["pipeline", "parallel-settled", "settled-partition"]
 ---
 
 Macro: like `pipeline`, but a stage that throws yields `{:err e}` for that item (instead of

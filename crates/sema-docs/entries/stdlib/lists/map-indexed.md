@@ -4,6 +4,7 @@ module: "lists"
 section: "Higher-Order Functions"
 syntax: "(map-indexed f seq)"
 returns: "list"
+see_also: ["map", "enumerate", "for-each"]
 ---
 
 Apply `f` to each element of `seq` along with its 0-based index, collecting the results into a new list. `f` is called as `(f index element)`. Accepts a list or vector; the input is never mutated and the result is always a list.

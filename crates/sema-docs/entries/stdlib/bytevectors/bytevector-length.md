@@ -4,6 +4,7 @@ module: "bytevectors"
 section: "Access & Mutation"
 params: [{ name: bv, type: bytevector }]
 returns: "int"
+see_also: ["bytevector-length", "bytes/length", "bytevector/ref"]
 ---
 
 Return the length of a bytevector.

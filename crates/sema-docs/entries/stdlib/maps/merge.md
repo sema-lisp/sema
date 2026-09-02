@@ -4,6 +4,7 @@ module: "maps"
 section: "Maps"
 syntax: "(merge map ...)"
 returns: "map"
+see_also: ["deep-merge", "assoc", "map/zip"]
 ---
 
 Merge multiple maps together, returning a new map. For keys present in more than one map, the **last** map wins. Works on both maps and hashmaps — the result type matches the first argument.

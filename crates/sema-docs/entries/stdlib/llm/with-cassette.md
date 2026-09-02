@@ -3,6 +3,7 @@ name: "llm/with-cassette"
 module: "llm"
 params: [{ name: path, type: string }, { name: opts, type: map }, { name: thunk }]
 returns: "any"
+see_also: ["llm/cassette-load", "llm/cassette-save", "llm/cassette-eject"]
 ---
 
 Record or replay LLM calls against a tape file for the duration of a zero-argument function — for deterministic, keyless tests and reproducible demos. `:mode` is `:auto` (default — replay if recorded, else record), `:record`, or `:replay` (a miss is a hard error). The opts map is optional. The response cache is disabled for the scope, and the tape is flushed when the function exits. A task spawned inside the function retains the cassette after that exit; later recordings flush when the final task using the captured scope finishes. Covers `llm/complete`, `llm/chat`, `llm/embed`, `llm/stream`, and agent loops. Returns the thunk's result.

@@ -2,6 +2,9 @@
 name: "io/with-raw-mode"
 module: "terminal"
 section: "Screen Control"
+syntax: "(io/with-raw-mode body ...)"
+returns: "any"
+see_also: ["io/tty-raw!", "io/tty-restore!", "term/with-alt-screen", "term/with-mouse"]
 ---
 
 Guard macro: put the controlling TTY into raw mode (via `io/tty-raw!`), run

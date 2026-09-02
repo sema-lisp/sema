@@ -10,7 +10,7 @@ Internally, `delay` creates a parameterless closure that captures the current en
 
 ```sema
 (define p (delay (+ 1 2)))
-p                                       ; => a promise object
+p                                       ; => <promise>
 (force p)                               ; => 3
 ```
 

@@ -4,6 +4,7 @@ module: "regex"
 section: "Matching"
 params: [{ name: pattern, type: string }, { name: text, type: string }]
 returns: "list"
+see_also: ["regex/match", "regex/split", "regex/replace-all"]
 ---
 
 Find all non-overlapping matches of a pattern. Returns a list of the **full matched substrings** (not capture groups), or `()` when nothing matches.

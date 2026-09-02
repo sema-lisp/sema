@@ -2,6 +2,9 @@
 name: "async/map"
 module: "concurrency"
 section: "Promises"
+params: [{ name: f, type: function }, { name: items, type: "list | vector" }]
+returns: "list"
+see_also: ["async/pool-map", "async/spawn-all", "async/all", "pipeline"]
 ---
 
 ```sema

@@ -4,6 +4,7 @@ module: "concurrency"
 section: "Channels"
 params: [{ name: ch, type: channel }]
 returns: "any"
+see_also: ["channel/try-recv", "channel/send", "channel/close"]
 ---
 
 ```sema

@@ -2,6 +2,9 @@
 name: "stream/write"
 module: "streams"
 section: "Writing"
+params: [{ name: stream, type: stream }, { name: bytes, type: bytevector }]
+returns: "int"
+see_also: ["stream/write-string", "stream/write-byte", "stream/read", "stream/flush"]
 ---
 
 Write a bytevector. Returns the number of bytes written.

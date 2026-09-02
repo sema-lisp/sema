@@ -2,6 +2,9 @@
 name: "async/resolved"
 module: "concurrency"
 section: "Promises"
+params: [{ name: value, type: any }]
+returns: "promise"
+see_also: ["async/rejected", "async/resolved?", "async/await"]
 ---
 
 ```sema

@@ -2,6 +2,9 @@
 name: "vals"
 module: "maps"
 section: "Maps"
+params: [{ name: m, type: "map | hashmap" }]
+returns: "list"
+see_also: ["keys", "map/entries", "count"]
 ---
 
 Return the values of a map as a list, in the same order as `keys` returns the corresponding keys (sorted by key for an ordered map).

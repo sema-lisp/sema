@@ -3,6 +3,8 @@ name: "gc/stats"
 module: "system"
 section: "Memory"
 returns: "map"
+syntax: "(gc/stats)"
+see_also: ["gc/collect", "sys/interner-stats"]
 ---
 
 Return the cycle collector's stats without collecting: the last completed collection's `:candidates`, `:traced`, `:collected`, and `:pruned` counts (all zero before the first collection), plus `:registry-size` — the current number of registered cycle candidates awaiting the next collection. Useful for diagnosing memory growth in long-running sessions.

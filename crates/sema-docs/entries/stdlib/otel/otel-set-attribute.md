@@ -2,6 +2,9 @@
 name: "otel/set-attribute"
 module: "otel"
 section: "Observability"
+params: [{ name: key, type: "keyword | string" }, { name: value, type: any }]
+returns: "nil"
+see_also: ["otel/set-attributes", "otel/set-status", "otel/event"]
 ---
 
 Set one attribute on the innermost active span (the current `otel/span`, `agent/run`, or `llm/*` span). The key is a keyword or string; the value keeps its type — integers, floats, and booleans render as numbers/bools in the backend, not strings. A no-op when telemetry is disabled or there is no active span.

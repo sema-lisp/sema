@@ -3,6 +3,8 @@ name: "error"
 module: "system"
 section: "Errors"
 params: [{ name: message, type: any }]
+returns: "never returns; raises an error"
+see_also: ["raise", "throw", "try", "assert"]
 ---
 
 Raise an error (a catchable exception) with the given message. Non-string arguments are stringified.

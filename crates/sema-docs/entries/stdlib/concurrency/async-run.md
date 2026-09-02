@@ -2,6 +2,9 @@
 name: "async/run"
 module: "concurrency"
 section: "Promises"
+syntax: "(async/run)"
+returns: "nil"
+see_also: ["async/spawn", "async/await", "async/all"]
 ---
 
 ```sema

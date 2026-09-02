@@ -2,6 +2,9 @@
 name: "stream/copy"
 module: "streams"
 section: "Control"
+params: [{ name: src, type: stream }, { name: dst, type: stream }, { name: max-bytes, type: int, doc: "optional; caps the number of bytes copied" }]
+returns: "int"
+see_also: ["stream/read-all", "stream/read", "stream/write"]
 ---
 
 Copy bytes from a readable stream to a writable one and return the total copied.

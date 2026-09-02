@@ -2,6 +2,9 @@
 name: "markdown/to-html"
 module: "markup"
 section: "Markdown & HTML"
+params: [{ name: markdown, type: string }]
+returns: "string"
+see_also: ["markdown/headings", "markdown/frontmatter", "html/text"]
 ---
 
 Render a CommonMark Markdown string to an HTML string. Uses `pulldown-cmark` for standards-compliant parsing, covering headings, emphasis, lists, links, code spans, and fenced code blocks.

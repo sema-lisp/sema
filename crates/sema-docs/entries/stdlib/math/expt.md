@@ -4,6 +4,7 @@ module: "math"
 section: "Scheme Aliases"
 params: [{ name: base, type: number }, { name: exp, type: number }]
 returns: "number"
+see_also: ["pow", "math/pow", "sqrt"]
 ---
 
 Raise a base to a power, `(expt base exponent)`. The Scheme name for `pow`. An exact integer base with an exact integer exponent stays exact: a non-negative exponent gives an exact integer (bignum if it overflows a machine word), and a negative exponent gives the exact reciprocal as a rational. A fractional exponent gives a float (so `(expt x 0.5)` is a square root).

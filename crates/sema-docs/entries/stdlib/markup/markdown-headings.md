@@ -2,6 +2,9 @@
 name: "markdown/headings"
 module: "markup"
 section: "Markdown & HTML"
+params: [{ name: markdown, type: string }]
+returns: "list"
+see_also: ["markdown/to-html", "markdown/frontmatter"]
 ---
 
 Extract the headings from a Markdown document in document order. Returns a list of maps, each with a `:level` integer (1 through 6) and a `:text` string holding the heading's plain text content.

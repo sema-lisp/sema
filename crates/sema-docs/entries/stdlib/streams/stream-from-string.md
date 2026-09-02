@@ -2,6 +2,9 @@
 name: "stream/from-string"
 module: "streams"
 section: "Creating Streams"
+params: [{ name: s, type: string }]
+returns: "stream"
+see_also: ["stream/from-bytes", "stream/to-string", "stream/read-all"]
 ---
 
 Create a read-only stream from a string's UTF-8 bytes.

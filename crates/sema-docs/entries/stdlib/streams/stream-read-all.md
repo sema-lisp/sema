@@ -2,6 +2,9 @@
 name: "stream/read-all"
 module: "streams"
 section: "Reading"
+params: [{ name: stream, type: stream }, { name: max-bytes, type: int, doc: "optional; caps the number of bytes read" }]
+returns: "bytevector"
+see_also: ["stream/read", "stream/read-line", "stream/to-string", "stream/copy"]
 ---
 
 Read the stream into a bytevector, up to `max-bytes`. The optional limit

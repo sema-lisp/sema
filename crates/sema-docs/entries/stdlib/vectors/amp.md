@@ -2,6 +2,8 @@
 name: "&"
 module: "vectors"
 section: "Destructuring"
+syntax: "[a b & rest]"
+see_also: ["let", "define", "fn", "match"]
 ---
 
 ```sema

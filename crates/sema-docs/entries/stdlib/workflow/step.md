@@ -3,6 +3,8 @@ name: "step"
 module: "workflow"
 section: "Dynamic Workflows"
 syntax: "(step prompt [opts])"
+returns: "any"
+see_also: ["agent", "workflow/step", "pipeline", "parallel", "defworkflow"]
 ---
 
 Macro: a journaled **step** — a workflow's atomic orchestration unit (Claude Code

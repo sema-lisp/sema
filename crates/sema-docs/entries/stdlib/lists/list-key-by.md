@@ -2,6 +2,9 @@
 name: "list/key-by"
 module: "lists"
 section: "Extraction"
+params: [{ name: f, type: function }, { name: seq, type: list }]
+returns: "map"
+see_also: ["list/group-by", "map/from-entries", "list/pluck"]
 ---
 
 Index a list into a map, keyed by the result of calling the function on each element. The value is the element itself — perfect for building an id-to-record lookup.

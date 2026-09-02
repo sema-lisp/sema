@@ -2,6 +2,9 @@
 name: "http/serve"
 module: "web-server"
 section: "Serving"
+syntax: "(http/serve handler [opts])"
+returns: "nil"
+see_also: ["http/router", "http/ok", "http/websocket", "http/stream"]
 ---
 
 Start an HTTP server. Takes a handler function and an optional options map. The handler receives a request map and returns a response map. This function blocks — it becomes the server's run loop.

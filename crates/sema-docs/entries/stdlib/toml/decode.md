@@ -3,6 +3,7 @@ name: "toml/decode"
 module: "toml"
 params: [{ name: s, type: string }]
 returns: "map"
+see_also: ["toml/encode", "json/decode", "markdown/frontmatter"]
 ---
 
 Parse a TOML document string into a map. Table keys become keywords; nested tables (`[section]`) become nested maps and TOML arrays become lists.

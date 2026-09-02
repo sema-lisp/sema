@@ -4,6 +4,7 @@ module: "lists"
 section: "Higher-Order Functions"
 syntax: "(map f lst ...)"
 returns: "list"
+see_also: ["filter", "foldl", "for-each", "map-indexed", "flat-map"]
 ---
 
 Apply a function to each element of a list, collecting the results into a new list. The input is never mutated.

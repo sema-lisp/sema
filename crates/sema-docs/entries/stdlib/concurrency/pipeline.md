@@ -3,6 +3,8 @@ name: "pipeline"
 module: "concurrency"
 section: "Promises"
 syntax: "(pipeline items stage ...)"
+returns: "list"
+see_also: ["pipeline-settled", "parallel", "async/map"]
 ---
 
 Macro: thread each of `items` through **all** stage functions independently — with **no

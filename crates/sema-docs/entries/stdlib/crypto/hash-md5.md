@@ -2,6 +2,9 @@
 name: "hash/md5"
 module: "crypto"
 section: "Hashing"
+params: [{ name: s, type: string }]
+returns: "string"
+see_also: ["hash/sha256", "hash/hmac-sha256", "hash/digest"]
 ---
 
 Compute the MD5 hash of a string. Returns a 32-character hex string.

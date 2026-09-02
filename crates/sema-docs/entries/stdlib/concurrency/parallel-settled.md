@@ -3,6 +3,8 @@ name: "parallel-settled"
 module: "concurrency"
 section: "Promises"
 syntax: "(parallel-settled thunks [n])"
+returns: "list"
+see_also: ["parallel", "pipeline-settled", "settled-partition", "settled/ok?"]
 ---
 
 Macro: like `parallel`, but each slot carries the **raw settled result** —

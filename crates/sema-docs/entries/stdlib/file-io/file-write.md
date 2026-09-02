@@ -4,6 +4,7 @@ module: "file-io"
 section: "File Operations"
 params: [{ name: path, type: string }, { name: content, type: string }]
 returns: "nil"
+see_also: ["file/read", "file/append", "file/write-lines", "file/write-bytes"]
 ---
 
 Write a string to a file, overwriting any existing content (creating the file if it does not exist).

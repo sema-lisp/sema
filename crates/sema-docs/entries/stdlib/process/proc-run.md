@@ -2,6 +2,9 @@
 name: "proc/run"
 module: "process"
 section: "Processes"
+params: [{ name: argv, type: "list | vector" }, { name: opts, type: map, doc: "optional; keys :cwd and :env" }]
+returns: "int"
+see_also: ["proc/spawn", "shell", "io/with-raw-mode"]
 ---
 
 Run a child on the parent's terminal and block until it exits, returning its exit code (`-1` if killed by a signal). The child inherits stdin, stdout, and stderr unchanged and stays in the parent's foreground process group, so it can read the keyboard and draw on the screen: this is the primitive for handing the terminal to `$EDITOR`, a pager, or any other interactive program.

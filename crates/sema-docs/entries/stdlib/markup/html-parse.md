@@ -2,6 +2,9 @@
 name: "html/parse"
 module: "markup"
 section: "Markdown & HTML"
+params: [{ name: html, type: string }]
+returns: "string"
+see_also: ["html/select", "html/text", "html/select-text"]
 ---
 
 Parse and normalize an HTML document, returning the normalized HTML as a string. The returned string is the handle accepted by `html/select`, `html/text`, and `html/select-text`, which re-parse it internally. Parsing is lenient (html5ever), so malformed markup is repaired rather than rejected.

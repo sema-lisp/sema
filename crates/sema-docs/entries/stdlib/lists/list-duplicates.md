@@ -2,6 +2,9 @@
 name: "list/duplicates"
 module: "lists"
 section: "Set Operations"
+params: [{ name: seq, type: list }]
+returns: "list"
+see_also: ["list/unique", "list/dedupe", "frequencies"]
 ---
 
 Return the distinct values that appear more than once in a list. Each repeated value is listed only once, no matter how many times it occurs.

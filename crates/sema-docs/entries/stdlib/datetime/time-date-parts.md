@@ -2,6 +2,9 @@
 name: "time/date-parts"
 module: "datetime"
 section: "Date Decomposition"
+params: [{ name: timestamp, type: number, doc: "UTC Unix timestamp" }]
+returns: "map"
+see_also: ["time/format", "time/parse", "time/now"]
 ---
 
 Decompose a UTC Unix timestamp into a map of date/time components.

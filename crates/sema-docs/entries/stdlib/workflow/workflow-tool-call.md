@@ -2,6 +2,9 @@
 name: "workflow/tool-call"
 module: "workflow"
 section: "Dynamic Workflows"
+params: [{ name: tool-name, type: "keyword | string" }, { name: args, type: any, doc: "optional; a descriptor string or the tool's argument map; omitted records the \"gated\" sentinel" }]
+returns: "nil"
+see_also: ["workflow/tool-result", "workflow/step", "step"]
 ---
 
 Journal a tool call made by the step currently executing. `(workflow/tool-call tool-name [args])` emits an `agent.tool_call` event attributed to the enclosing [`workflow/step`], so the dashboard renders it as a tool twig in that step's drill-in. `args` is an opaque/gated descriptor string (omit it for the `"gated"` sentinel — content is not captured). It is a no-op (returns `nil`) outside a `workflow/step`. Use it to make a leaf's tool usage visible in the run journal.

@@ -4,6 +4,7 @@ module: "file-io"
 section: "Console I/O"
 params: [{ name: source, type: string }]
 returns: "list"
+see_also: ["read-many", "read", "io/read-line"]
 ---
 
 Parse a string of Sema source into a list of every top-level datum it contains (alias of `read-many`). Unlike `io/read-line`, this does not touch stdin — it runs the reader over the given string and returns the parsed S-expressions.

@@ -2,6 +2,9 @@
 name: "time/add"
 module: "datetime"
 section: "Arithmetic"
+params: [{ name: timestamp, type: number, doc: "UTC Unix timestamp" }, { name: seconds, type: number }]
+returns: "number"
+see_also: ["time/diff", "time/now", "time/format"]
 ---
 
 Add seconds to a timestamp. Returns a new timestamp. Use negative values to subtract.

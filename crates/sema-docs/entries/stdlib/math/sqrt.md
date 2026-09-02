@@ -4,6 +4,7 @@ module: "math"
 section: "Numeric Utilities"
 params: [{ name: n, type: number }]
 returns: "number"
+see_also: ["pow", "expt", "math/exp"]
 ---
 
 Square root. An exact perfect square returns an exact integer result rather than a float; other non-negative inputs return a float. A negative input returns a complex number rather than `NaN` or raising.

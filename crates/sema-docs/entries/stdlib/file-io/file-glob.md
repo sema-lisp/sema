@@ -2,6 +2,9 @@
 name: "file/glob"
 module: "file-io"
 section: "Directory Operations"
+params: [{ name: pattern, type: string }]
+returns: "list"
+see_also: ["file/list", "file/is-file?", "file/info"]
 ---
 
 Find files matching a glob pattern, returning their paths. `*` matches within one path segment, `?` matches a single character, and `**` matches across directories (recursive).

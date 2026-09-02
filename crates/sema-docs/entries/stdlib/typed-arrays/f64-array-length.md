@@ -3,6 +3,9 @@ name: "f64-array/length"
 module: "typed-arrays"
 section: "Access & Mutation"
 aliases: ["i64-array/length"]
+params: [{ name: arr, type: "f64-array | i64-array" }]
+returns: "int"
+see_also: ["f64-array/ref", "f64-array/make", "length"]
 ---
 
 Return the number of elements.

@@ -4,6 +4,7 @@ module: "predicates"
 section: "Numeric Predicates"
 params: [{ name: n, type: number }]
 returns: "bool"
+see_also: ["negative?", "zero?", "number?"]
 ---
 
 Test if a number is strictly greater than zero. Zero is neither positive nor negative.

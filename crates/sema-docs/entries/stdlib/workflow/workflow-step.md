@@ -2,6 +2,9 @@
 name: "workflow/step"
 module: "workflow"
 section: "Dynamic Workflows"
+params: [{ name: role, type: "map | string" }, { name: thunk, type: function }]
+returns: "any"
+see_also: ["step", "pipeline", "workflow/run", "checkpoint"]
 ---
 
 Run a leaf as a journaled **step**: `(workflow/step role thunk)` emits an

@@ -4,6 +4,7 @@ module: "lists"
 section: "Higher-Order Functions"
 syntax: "(apply f arg ... lst)"
 returns: "any"
+see_also: ["map", "fold", "values", "call-with-values"]
 ---
 
 Call a function with the elements of a list spread out as its arguments. `(apply f xs)` is `(f x1 x2 ...)` — the bridge between "I have a list of values" and "this function takes separate arguments".

@@ -3,6 +3,8 @@ name: "llm/budget-remaining"
 module: "llm"
 params: []
 returns: "map or nil"
+see_also: ["llm/set-budget", "llm/clear-budget", "llm/with-budget", "llm/session-usage"]
+syntax: "(llm/budget-remaining)"
 ---
 
 Return the current budget status, or nil if no budget is set. When a cost budget is active the map includes `:limit`, `:spent`, and `:remaining` (USD); when a token budget is active it includes `:token-limit`, `:tokens-spent`, and `:tokens-remaining`.

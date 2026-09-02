@@ -2,6 +2,9 @@
 name: "db/exec"
 module: "sqlite"
 section: "Executing SQL"
+syntax: "(db/exec db sql param ...)"
+returns: "int"
+see_also: ["db/query", "db/exec-batch", "db/last-insert-id"]
 ---
 
 Run a SQL statement that changes the database (INSERT, UPDATE, DELETE, CREATE TABLE, …) and return the number of rows affected as an integer (0 for DDL like CREATE).

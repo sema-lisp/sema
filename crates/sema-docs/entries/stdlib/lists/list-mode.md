@@ -2,6 +2,9 @@
 name: "list/mode"
 module: "lists"
 section: "Statistics"
+params: [{ name: seq, type: list }]
+returns: "any or list"
+see_also: ["frequencies", "list/median", "list/avg"]
 ---
 
 Return the most frequent value. If tied, returns a list.

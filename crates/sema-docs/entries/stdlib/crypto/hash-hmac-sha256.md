@@ -2,6 +2,9 @@
 name: "hash/hmac-sha256"
 module: "crypto"
 section: "Hashing"
+params: [{ name: key, type: string }, { name: message, type: string }]
+returns: "string"
+see_also: ["hash/sha256", "hash/md5", "base64/encode"]
 ---
 
 Compute an HMAC-SHA256 message authentication code. Returns a 64-character hex string.

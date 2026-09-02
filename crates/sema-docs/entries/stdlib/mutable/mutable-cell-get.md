@@ -4,6 +4,7 @@ module: "mutable"
 section: "Mutable Containers"
 params: [{ name: cell, type: mutable-cell }]
 returns: "any"
+see_also: ["mutable-cell/set!", "mutable-cell/new"]
 ---
 
 Read the current contents of a mutable cell.

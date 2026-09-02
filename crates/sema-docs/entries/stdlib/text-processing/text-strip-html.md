@@ -2,6 +2,9 @@
 name: "text/strip-html"
 module: "text-processing"
 section: "Text Cleaning"
+params: [{ name: text, type: string }]
+returns: "string"
+see_also: ["html/text", "text/clean-whitespace", "markdown/to-html"]
 ---
 
 Remove HTML tags and decode common entities (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&#39;`, `&apos;`, `&nbsp;`).

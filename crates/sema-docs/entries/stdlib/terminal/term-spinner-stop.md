@@ -2,6 +2,9 @@
 name: "term/spinner-stop"
 module: "terminal"
 section: "Spinners"
+params: [{ name: id, type: int }, { name: opts, type: map, doc: "optional; keys :symbol and :text" }]
+returns: "nil"
+see_also: ["term/spinner-start", "term/spinner-update"]
 ---
 
 Stop a running spinner and optionally display a final status line. The spinner line is cleared from the terminal before the final status is printed.

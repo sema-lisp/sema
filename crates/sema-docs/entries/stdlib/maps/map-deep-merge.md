@@ -2,6 +2,9 @@
 name: "map/deep-merge"
 module: "maps"
 section: "Nested Map Operations"
+syntax: "(map/deep-merge map ...)"
+returns: "map"
+see_also: ["deep-merge", "merge"]
 ---
 
 Recursively merge maps. Nested maps are merged rather than replaced. Non-map values in the overlay override the base.

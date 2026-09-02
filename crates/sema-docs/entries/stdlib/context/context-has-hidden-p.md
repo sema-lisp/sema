@@ -4,6 +4,7 @@ module: "context"
 section: "Hidden Context"
 params: [{ name: key }]
 returns: "bool"
+see_also: ["context/get-hidden", "context/set-hidden", "context/has?"]
 ---
 
 Return `#t` if a hidden context entry exists for `key`, else `#f`.

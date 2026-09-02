@@ -2,6 +2,9 @@
 name: "regex/split"
 module: "regex"
 section: "Splitting"
+params: [{ name: pattern, type: string }, { name: text, type: string }]
+returns: "list"
+see_also: ["string/split", "regex/find-all", "string/lines"]
 ---
 
 Split a string by a regex delimiter.

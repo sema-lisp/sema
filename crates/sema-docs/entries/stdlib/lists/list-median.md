@@ -2,6 +2,9 @@
 name: "list/median"
 module: "lists"
 section: "Statistics"
+params: [{ name: seq, type: list }]
+returns: "number"
+see_also: ["list/avg", "list/mode", "list/sum"]
 ---
 
 Return the statistical median.

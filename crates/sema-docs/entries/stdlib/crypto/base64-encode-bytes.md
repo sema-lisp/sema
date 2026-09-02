@@ -2,6 +2,9 @@
 name: "base64/encode-bytes"
 module: "crypto"
 section: "Base64 Encoding"
+params: [{ name: bytes, type: bytevector }]
+returns: "string"
+see_also: ["base64/decode-bytes", "base64/encode", "string/to-utf8"]
 ---
 
 Encode a bytevector to Base64.

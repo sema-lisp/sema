@@ -4,6 +4,7 @@ module: "lists"
 section: "Multiple Values"
 syntax: "(values expr ...)"
 returns: "any"
+see_also: ["call-with-values", "apply"]
 ---
 
 Produce zero or more values from a single expression, for use with `call-with-values`, `let-values`, `let*-values`, or `define-values`. This is R7RS's mechanism for a producer to return more than one value without packing them into a list.

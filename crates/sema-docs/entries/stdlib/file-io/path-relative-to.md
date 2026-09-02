@@ -4,6 +4,7 @@ module: "file-io"
 section: "Path Manipulation"
 syntax: "(path/relative-to base path)"
 returns: "string"
+see_also: ["path/join", "path/within?", "path/absolute"]
 ---
 
 Express `path` relative to `base` using pure path math (no filesystem access, so it works for paths that do not exist). Inserts `..` segments when `path` is outside `base`.

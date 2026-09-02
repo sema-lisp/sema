@@ -12,7 +12,7 @@ Construct a complex number from polar coordinates: magnitude `r` and angle `θ` 
 ```sema
 (make-polar 2 0)                  ; => 2.0+0.0i
 (make-polar 5 (math/atan2 3 4))   ; => 4.0+3.0i   ; magnitude 5 at atan2(3,4)
-(make-polar 1 pi)                 ; => -1.0+0.00000000000000012246467991473532i
+(make-polar 1 pi)                 ; => -1.0+1.2246467991473532e-16i
 ```
 
 The tiny `1.22e-16` imaginary part in the last example is genuine floating-point

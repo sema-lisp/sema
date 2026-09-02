@@ -4,6 +4,7 @@ module: "lists"
 section: "Grouping"
 params: [{ name: sep, type: any }, { name: list, type: list }]
 returns: "list"
+see_also: ["list/join", "list/interleave", "string/join"]
 ---
 
 Return a new list with `sep` inserted *between* each pair of elements (not at the ends). A common precursor to joining: `interpose` then `apply string-append`.

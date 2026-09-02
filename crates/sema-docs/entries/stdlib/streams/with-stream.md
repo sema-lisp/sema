@@ -2,6 +2,9 @@
 name: "with-stream"
 module: "streams"
 section: "Resource Management"
+syntax: "(with-stream (name expr) body ...)"
+returns: "any"
+see_also: ["with-open", "stream/close", "stream/open-input", "stream/open-output"]
 ---
 
 Macro that binds a stream, executes the body, and automatically closes the stream on exit — even if an error is thrown.

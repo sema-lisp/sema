@@ -2,6 +2,9 @@
 name: "list/interleave"
 module: "lists"
 section: "Grouping"
+syntax: "(list/interleave seq1 seq2 ...)"
+returns: "list"
+see_also: ["zip", "interpose", "list/cross-join"]
 ---
 
 Interleave elements from two lists.

@@ -2,6 +2,9 @@
 name: "otel/tool-span"
 module: "otel"
 section: "Observability"
+params: [{ name: name, type: string }, { name: thunk, type: function }, { name: attrs, type: map, doc: "optional" }]
+returns: "any"
+see_also: ["otel/span", "otel/llm-span", "otel/retrieval-span"]
 ---
 
 Run a thunk inside a typed **TOOL** span for a tool you invoke yourself. Sets `gen_ai.operation.name` = `execute_tool`, `gen_ai.tool.name` = `name`, and (when `SEMA_OTEL_COMPAT` is set) the backend-native TOOL span-kind, so it classifies like the built-in tool spans. Optional third arg is an attributes map. A no-op when telemetry is disabled.

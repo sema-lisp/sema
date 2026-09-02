@@ -4,6 +4,7 @@ module: "predicates"
 section: "Equality"
 syntax: "(= a b ...)"
 returns: "bool"
+see_also: ["eq?", "equal?", "zero?"]
 ---
 
 Equality. For numbers this is **numeric** equality, so `(= 1 1.0)` is `#t`

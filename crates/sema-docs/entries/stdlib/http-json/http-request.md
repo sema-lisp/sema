@@ -2,6 +2,9 @@
 name: "http/request"
 module: "http-json"
 section: "HTTP"
+params: [{ name: method, type: string }, { name: url, type: string }, { name: opts, type: map, doc: "optional :headers/:timeout/:as/:multipart" }, { name: body, type: any, doc: "optional; map (JSON), string, or bytevector" }]
+returns: "map"
+see_also: ["http/get", "http/post", "http/put", "http/delete"]
 ---
 
 ```

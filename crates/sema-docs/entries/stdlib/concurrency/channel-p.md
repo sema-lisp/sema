@@ -4,6 +4,7 @@ module: "concurrency"
 section: "Channels"
 params: [{ name: value }]
 returns: "bool"
+see_also: ["channel/new", "async/promise?"]
 ---
 
 `#t` if `value` is a channel (e.g. one created by `channel/new`), `#f` otherwise.

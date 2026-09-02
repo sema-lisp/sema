@@ -3,6 +3,7 @@ name: "llm/rerank"
 module: "llm"
 params: [{ name: query, type: string }, { name: documents, type: list }, { name: opts, type: map }]
 returns: "list"
+see_also: ["llm/embed", "llm/similarity"]
 ---
 
 Reorder `documents` (a list of strings) by their cross-encoder relevance to `query`, using a hosted reranking provider (Cohere, Jina, or Voyage — the same **API key** you use for embeddings, e.g. `COHERE_API_KEY` / `JINA_API_KEY` / `VOYAGE_API_KEY`). Unlike cosine similarity over embeddings, a reranker reads the query and each document *together*, so it is far more precise — the standard RAG move is to retrieve many candidates by vector search, then rerank to the best few.

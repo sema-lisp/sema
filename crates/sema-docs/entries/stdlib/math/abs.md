@@ -4,6 +4,7 @@ module: "math"
 section: "Numeric Utilities"
 params: [{ name: n, type: number }]
 returns: "number"
+see_also: ["math/sign", "math/clamp", "magnitude"]
 ---
 
 Absolute value.

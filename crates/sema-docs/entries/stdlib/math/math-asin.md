@@ -2,6 +2,9 @@
 name: "math/asin"
 module: "math"
 section: "Trigonometry"
+params: [{ name: x, type: number }]
+returns: "float"
+see_also: ["sin", "math/acos", "math/atan"]
 ---
 
 Inverse sine. Returns radians.

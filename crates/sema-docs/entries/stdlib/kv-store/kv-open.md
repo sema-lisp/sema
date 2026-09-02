@@ -2,6 +2,9 @@
 name: "kv/open"
 module: "kv-store"
 section: "Functions"
+params: [{ name: name, type: string }, { name: path, type: string }]
+returns: "string"
+see_also: ["kv/close", "kv/get", "kv/set"]
 ---
 
 Open (or create) a named KV store backed by a JSON file. If the file exists, its contents are loaded. Returns the store name.

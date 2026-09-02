@@ -2,6 +2,9 @@
 name: "async/all"
 module: "concurrency"
 section: "Promises"
+params: [{ name: promises, type: "list | vector" }]
+returns: "list"
+see_also: ["async/race", "async/spawn", "async/spawn-all", "async/await"]
 ---
 
 ```sema

@@ -2,6 +2,9 @@
 name: "bytevector/set!"
 module: "bytevectors"
 section: "Access & Mutation"
+params: [{ name: bv, type: bytevector }, { name: index, type: int }, { name: byte, type: int }]
+returns: "bytevector"
+see_also: ["bytevector-u8-set!", "bytevector/u8-set!", "bytevector/ref"]
 ---
 
 Return a new bytevector with the byte at `index` replaced by `byte` (0..255).

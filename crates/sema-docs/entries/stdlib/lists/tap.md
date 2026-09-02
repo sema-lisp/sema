@@ -2,6 +2,9 @@
 name: "tap"
 module: "lists"
 section: "Utility"
+params: [{ name: value, type: any }, { name: f, type: function }]
+returns: "any"
+see_also: ["for-each", "->", "map"]
 ---
 
 Run a side-effecting function on a value, then return the **original value** unchanged — whatever the function returns is discarded. The value comes first, the function second: `(tap value f)`.

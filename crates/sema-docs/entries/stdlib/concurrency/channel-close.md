@@ -2,6 +2,9 @@
 name: "channel/close"
 module: "concurrency"
 section: "Channels"
+params: [{ name: ch, type: channel }]
+returns: "nil"
+see_also: ["channel/new", "channel/closed?", "channel/recv", "channel/send"]
 ---
 
 ```sema

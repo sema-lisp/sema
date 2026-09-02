@@ -2,6 +2,9 @@
 name: "sys/os"
 module: "system"
 section: "System Information"
+syntax: "(sys/os)"
+returns: "string"
+see_also: ["sys/platform", "sys/arch"]
 ---
 
 Return the raw operating system name from the Rust target (`std::env::consts::OS`).

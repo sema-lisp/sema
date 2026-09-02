@@ -2,6 +2,9 @@
 name: "list/unique"
 module: "lists"
 section: "Searching"
+params: [{ name: seq, type: list }]
+returns: "list"
+see_also: ["list/dedupe", "list/duplicates", "list/diff"]
 ---
 
 Remove duplicate elements, keeping the **first** occurrence of each value so the original order is preserved (unlike `sort` + dedupe, which would reorder).

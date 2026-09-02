@@ -3,6 +3,8 @@ name: "llm/pricing-status"
 module: "llm"
 params: []
 returns: "map"
+see_also: ["llm/set-pricing", "llm/last-usage", "llm/session-usage"]
+syntax: "(llm/pricing-status)"
 ---
 
 Return the status of the pricing table used for cost estimates: a map with `:source` (a symbol indicating where pricing came from) and, when available, `:updated-at` (a date string).

@@ -4,6 +4,7 @@ module: "bytevectors"
 section: "Access & Mutation"
 params: [{ name: bv, type: bytevector }, { name: index, type: int }]
 returns: "int"
+see_also: ["bytevector/u8-ref", "bytevector/set!", "bytes/ref"]
 ---
 
 Return the byte at a given index.

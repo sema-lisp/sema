@@ -2,6 +2,9 @@
 name: "list/group-by"
 module: "lists"
 section: "Grouping"
+params: [{ name: f, type: function }, { name: seq, type: list }]
+returns: "map"
+see_also: ["list/key-by", "frequencies", "partition"]
 ---
 
 Bucket elements into a map keyed by the result of calling the function on each one. Every element lands in exactly one bucket, and within each bucket the original order is preserved.

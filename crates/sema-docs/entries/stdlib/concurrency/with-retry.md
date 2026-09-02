@@ -3,6 +3,8 @@ name: "with-retry"
 module: "concurrency"
 section: "Promises"
 syntax: "(with-retry opts thunk)"
+returns: "any"
+see_also: ["parallel-settled", "pipeline-settled", "async/with-timeout"]
 ---
 
 Macro: run a zero-arg `thunk` with bounded exponential backoff on failure. Returns the

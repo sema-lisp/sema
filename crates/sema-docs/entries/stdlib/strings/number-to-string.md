@@ -4,6 +4,7 @@ module: "strings"
 section: "Type Conversions"
 params: [{ name: n, type: number }]
 returns: "string"
+see_also: ["string/to-number", "str", "format"]
 ---
 
 Convert a number to a string. The inverse is `string->number`.

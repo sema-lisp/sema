@@ -2,6 +2,9 @@
 name: "otel/llm-usage"
 module: "otel"
 section: "Observability"
+params: [{ name: usage, type: map }]
+returns: "nil"
+see_also: ["otel/llm-span", "llm/last-usage"]
 ---
 
 Record LLM token usage and cost on the innermost active span (typically inside an `otel/llm-span`). Emits the same `gen_ai.usage.*` keys as the built-in `llm/*` path plus the active backend's compat aliases, so a custom-provider call accounts identically. Map keys: `:input-tokens`, `:output-tokens`, `:cost-usd`. A no-op when telemetry is disabled or there is no active span.

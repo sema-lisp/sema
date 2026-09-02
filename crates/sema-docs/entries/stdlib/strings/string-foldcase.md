@@ -2,6 +2,9 @@
 name: "string/foldcase"
 module: "strings"
 section: "Unicode & Encoding"
+params: [{ name: s, type: string }]
+returns: "string"
+see_also: ["string-ci=?", "string/lower", "string/normalize"]
 ---
 
 Apply full Unicode case folding (CaseFolding.txt C+F mappings) to a string. Useful for case-insensitive comparisons and normalization.

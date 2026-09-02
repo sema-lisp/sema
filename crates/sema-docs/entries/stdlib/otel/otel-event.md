@@ -2,6 +2,9 @@
 name: "otel/event"
 module: "otel"
 section: "Observability"
+params: [{ name: name, type: string }, { name: attrs, type: map, doc: "optional; attribute values are stringified" }]
+returns: "nil"
+see_also: ["otel/span", "otel/set-attribute", "with-span"]
 ---
 
 Add an event (with optional attributes) to the current OpenTelemetry span. Attribute values are stringified. Returns nil. A no-op when telemetry is disabled or when there is no active span.

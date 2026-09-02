@@ -2,6 +2,9 @@
 name: "list/max"
 module: "lists"
 section: "Aggregation"
+params: [{ name: seq, type: list }]
+returns: "number"
+see_also: ["list/min", "max", "list/sum", "list/avg"]
 ---
 
 Return the largest value in a list. Errors on an empty list (there is no maximum to return), so guard or default empty input yourself.

@@ -4,6 +4,7 @@ module: "math"
 section: "Numeric Utilities"
 syntax: "(max num ...)"
 returns: "number"
+see_also: ["min", "math/clamp"]
 ---
 
 Return the largest of 1 or more numbers (the no-arg case errors). Mixed integers and floats compare by value; the chosen argument keeps its own type.

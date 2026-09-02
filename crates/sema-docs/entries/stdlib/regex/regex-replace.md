@@ -2,6 +2,9 @@
 name: "regex/replace"
 module: "regex"
 section: "Replacement"
+params: [{ name: pattern, type: string }, { name: replacement, type: string }, { name: text, type: string }]
+returns: "string"
+see_also: ["regex/replace-all", "string/replace-first", "regex/match"]
 ---
 
 Replace the **first** match of a pattern.

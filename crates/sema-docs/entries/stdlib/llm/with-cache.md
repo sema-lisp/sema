@@ -3,6 +3,7 @@ name: "llm/with-cache"
 module: "llm"
 params: [{ name: opts, type: map }, { name: thunk }]
 returns: "any"
+see_also: ["llm/cache-stats", "llm/cache-clear", "llm/cache-key"]
 ---
 
 Run a zero-argument function with LLM response caching enabled for its duration, so identical requests (same prompt + model + temperature + system) reuse the first response instead of calling the provider again. With two arguments the first is an opts map accepting `:ttl` (cache time-to-live in seconds, default 3600); with one argument it is just the thunk. The previous cache settings are restored on exit. Returns the thunk's result.

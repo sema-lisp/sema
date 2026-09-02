@@ -4,6 +4,7 @@ module: "file-io"
 section: "Console I/O"
 syntax: "(print value ...)"
 returns: "nil"
+see_also: ["display", "println", "pprint"]
 ---
 
 Write values in read-syntax form (strings are quoted) like Scheme's `write`. No trailing newline. Use `display` for human-readable output without quotes.

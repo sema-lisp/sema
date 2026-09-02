@@ -4,6 +4,7 @@ module: "lists"
 section: "Construction & Access"
 syntax: "(list item ...)"
 returns: "list"
+see_also: ["cons", "append", "make-list", "vector"]
 ---
 
 Create a new list.

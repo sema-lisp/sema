@@ -2,6 +2,9 @@
 name: "async/spawn"
 module: "concurrency"
 section: "Promises"
+params: [{ name: thunk, type: function }]
+returns: "promise"
+see_also: ["async/await", "async/all", "async/cancel", "async/run"]
 ---
 
 ```sema

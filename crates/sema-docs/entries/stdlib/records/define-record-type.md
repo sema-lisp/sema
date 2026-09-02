@@ -3,6 +3,8 @@ name: "define-record-type"
 module: "records"
 section: "Defining Record Types"
 syntax: "(define-record-type type (constructor field ...) predicate (field accessor) ...)"
+returns: "nil"
+see_also: ["record?", "type-of", "type"]
 ---
 
 Define a new record type, generating a constructor, predicate, and one accessor per field.

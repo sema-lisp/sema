@@ -4,6 +4,7 @@ module: "math"
 section: "Interpolation & Clamping"
 params: [{ name: n, type: number }]
 returns: "number"
+see_also: ["abs", "math/clamp"]
 ---
 
 Return the sign of a number: -1, 0, or 1.

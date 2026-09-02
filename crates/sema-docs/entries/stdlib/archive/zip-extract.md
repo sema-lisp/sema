@@ -2,6 +2,9 @@
 name: "zip/extract"
 module: "archive"
 section: "Compression & Archives"
+params: [{ name: zip-path, type: string }, { name: dest-dir, type: string }]
+returns: "int"
+see_also: ["zip/create", "zip/list", "tar/extract"]
 ---
 
 Extract every entry of the ZIP archive at `zip-path` into `dest-dir`, creating directories as needed. Entries whose paths would escape the destination (zip-slip via `..` or absolute roots) are skipped for safety. Returns the number of entries extracted. Requires the `fs-write` capability.

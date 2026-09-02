@@ -3,6 +3,7 @@ name: "llm/embed"
 module: "llm"
 params: [{ name: input }, { name: opts, type: map }]
 returns: "bytevector or list"
+see_also: ["llm/similarity", "llm/rerank", "llm/configure-embeddings"]
 ---
 
 Compute embeddings — dense vectors that place semantically similar text near each other — using the configured embedding provider. A single string returns one embedding as a bytevector (f64 little-endian floats); a list of strings returns a list of bytevectors, one per input. The opts map accepts `:model`.

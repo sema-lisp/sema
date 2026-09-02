@@ -3,6 +3,7 @@ name: "llm/batch"
 module: "llm"
 params: [{ name: prompts }, { name: opts, type: map }]
 returns: "list"
+see_also: ["llm/pmap", "llm/complete", "llm/with-rate-limit"]
 ---
 
 Send a list of prompt strings to the default provider in parallel and return a list of completion strings in **input order** (result `i` answers prompt `i`). The opts map accepts `:model`, `:max-tokens`, `:temperature`, and `:system`.

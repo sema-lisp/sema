@@ -3,6 +3,8 @@ name: "settled/ok?"
 module: "concurrency"
 section: "Promises"
 syntax: "(settled/ok? result)"
+returns: "bool"
+see_also: ["settled/err?", "settled-partition", "parallel-settled"]
 ---
 
 Predicate: returns `#t` when `result` is a settled success — i.e. the map contains an

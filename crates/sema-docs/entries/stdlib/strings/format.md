@@ -4,6 +4,7 @@ module: "strings"
 section: "Scheme Compatibility Aliases"
 syntax: "(format fmt arg ...)"
 returns: "string"
+see_also: ["str", "format/form", "number/to-string"]
 ---
 
 Format a string, substituting each `~a` placeholder with the next argument's display form (the same plain rendering `str` produces). Use `~s` instead when you want the *readable* form — strings come back quoted and escaped.

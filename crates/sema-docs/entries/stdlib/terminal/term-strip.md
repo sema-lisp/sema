@@ -2,6 +2,9 @@
 name: "term/strip"
 module: "terminal"
 section: "Stripping ANSI Codes"
+params: [{ name: s, type: string }]
+returns: "string"
+see_also: ["term/style", "term/rgb", "term/bold"]
 ---
 
 Remove all ANSI escape sequences from a string, returning plain text.

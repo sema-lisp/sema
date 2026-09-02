@@ -2,6 +2,9 @@
 name: "term/rgb"
 module: "terminal"
 section: "True Color"
+params: [{ name: text, type: string }, { name: r, type: int }, { name: g, type: int }, { name: b, type: int }]
+returns: "string"
+see_also: ["term/style", "term/strip", "term/red"]
 ---
 
 Apply 24-bit true color to text. Takes the text followed by red, green, and blue values (integers 0–255).

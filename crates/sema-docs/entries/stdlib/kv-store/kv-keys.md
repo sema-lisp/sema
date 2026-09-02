@@ -2,6 +2,9 @@
 name: "kv/keys"
 module: "kv-store"
 section: "Functions"
+params: [{ name: ns, type: string }]
+returns: "list"
+see_also: ["kv/get", "kv/set", "kv/delete"]
 ---
 
 List all keys in the store. Returns a list of strings.

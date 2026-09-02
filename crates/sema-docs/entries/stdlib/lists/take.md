@@ -4,6 +4,7 @@ module: "lists"
 section: "Sublists"
 params: [{ name: n, type: int }, { name: lst, type: list }]
 returns: "list"
+see_also: ["drop", "take-while", "list/take-last", "first"]
 ---
 
 Take the first N elements (the count comes first: `(take n seq)`). Asking for more than exist is clamped to the whole list rather than erroring.

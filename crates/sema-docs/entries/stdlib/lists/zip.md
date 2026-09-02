@@ -2,6 +2,9 @@
 name: "zip"
 module: "lists"
 section: "Sublists"
+syntax: "(zip seq1 seq2 ...)"
+returns: "list"
+see_also: ["list/interleave", "map", "enumerate", "list/cross-join", "map/zip"]
 ---
 
 Combine corresponding elements from two lists into pairs.

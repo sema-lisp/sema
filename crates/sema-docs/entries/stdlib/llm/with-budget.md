@@ -3,6 +3,7 @@ name: "llm/with-budget"
 module: "llm"
 params: [{ name: opts, type: map }, { name: thunk }]
 returns: "any"
+see_also: ["llm/set-budget", "llm/budget-remaining", "llm/clear-budget"]
 ---
 
 Run a zero-argument function under a scoped spending cap. The opts map requires at least `:max-cost-usd` and/or `:max-tokens`; the scope is pushed before the thunk runs and restored on exit (even on error). LLM calls inside the thunk accumulate against the limit, and the call that would exceed it **raises an error** rather than silently truncating. Returns the thunk's result.

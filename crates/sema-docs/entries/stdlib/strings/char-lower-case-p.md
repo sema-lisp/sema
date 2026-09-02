@@ -5,6 +5,7 @@ section: "Characters"
 aliases: ["char/lower-case?"]
 params: [{ name: c, type: char }]
 returns: "bool"
+see_also: ["char/upper-case?", "char/downcase", "char/alphabetic?"]
 ---
 
 Test if a character is lowercase.

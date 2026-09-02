@@ -2,6 +2,9 @@
 name: "sys/check-signals"
 module: "system"
 section: "Signals"
+syntax: "(sys/check-signals)"
+returns: "nil"
+see_also: ["sys/on-signal", "io/read-key", "io/read-key-timeout"]
 ---
 
 Dispatch any pending signal callbacks. Call this from your event loop (typically right after `io/read-key` / `io/read-key-timeout` returns) so handlers run in a predictable place rather than asynchronously interrupting Sema code.

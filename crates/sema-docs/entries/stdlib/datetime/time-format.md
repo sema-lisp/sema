@@ -4,6 +4,7 @@ module: "datetime"
 section: "Formatting"
 params: [{ name: timestamp, type: number, doc: "UTC Unix timestamp" }, { name: format-string, type: string, doc: "strftime-style format" }]
 returns: "string"
+see_also: ["time/parse", "time/date-parts", "time/now"]
 ---
 
 Format a UTC Unix timestamp using a [strftime](#strftime-format-directives)-style format string.

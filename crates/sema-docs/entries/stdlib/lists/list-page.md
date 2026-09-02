@@ -2,6 +2,9 @@
 name: "list/page"
 module: "lists"
 section: "Windowing"
+params: [{ name: seq, type: list }, { name: page, type: int }, { name: per-page, type: int }]
+returns: "list"
+see_also: ["list/chunk", "take", "drop", "list/sliding"]
 ---
 
 Paginate a list. `(list/page items page per-page)` — 1-indexed pages.

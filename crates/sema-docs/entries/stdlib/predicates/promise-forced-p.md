@@ -2,6 +2,9 @@
 name: "promise-forced?"
 module: "predicates"
 section: "Promise Predicates"
+params: [{ name: p, type: promise }]
+returns: "bool"
+see_also: ["promise?", "force", "delay"]
 ---
 
 Test if a promise has been forced (evaluated).

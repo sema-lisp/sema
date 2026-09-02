@@ -2,6 +2,9 @@
 name: "csv/parse-maps"
 module: "csv"
 section: "CSV"
+params: [{ name: csv-string, type: string }]
+returns: "list"
+see_also: ["csv/parse", "csv/encode"]
 ---
 
 Parse a CSV string into a list of maps. The first row is used as headers, which become keyword keys in each map.

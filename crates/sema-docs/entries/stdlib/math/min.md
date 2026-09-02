@@ -4,6 +4,7 @@ module: "math"
 section: "Numeric Utilities"
 syntax: "(min num ...)"
 returns: "number"
+see_also: ["max", "math/clamp"]
 ---
 
 Return the smallest of 1 or more numbers (the no-arg case errors). Mixed integers and floats compare by value; the chosen argument keeps its own type.

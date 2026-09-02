@@ -3,6 +3,8 @@ name: "agent"
 module: "workflow"
 section: "Dynamic Workflows"
 syntax: "(agent opts)"
+returns: "agent"
+see_also: ["defagent", "agent/run", "agent/name", "step"]
 ---
 
 Build an anonymous, reusable **actor** value from an options map: a configured brain with

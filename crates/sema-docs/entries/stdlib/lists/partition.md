@@ -2,6 +2,9 @@
 name: "partition"
 module: "lists"
 section: "Sublists"
+params: [{ name: pred, type: function }, { name: seq, type: list }]
+returns: "list"
+see_also: ["filter", "list/reject", "list/group-by", "list/split-at"]
 ---
 
 Split a list into two lists in a single pass: the elements that satisfy the predicate, then the elements that don't. Returns a list of exactly two lists, each preserving the original order.

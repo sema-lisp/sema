@@ -4,6 +4,7 @@ module: "terminal"
 section: "Screen Control"
 syntax: "(term/move-to row col)"
 returns: "nil"
+see_also: ["term/write-at", "term/cursor-home", "term/save-cursor"]
 ---
 
 Move the cursor to a 1-based `row` and `col`. Coordinates below 1 are clamped to 1.

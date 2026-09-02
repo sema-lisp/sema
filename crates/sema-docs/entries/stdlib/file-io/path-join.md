@@ -4,6 +4,7 @@ module: "file-io"
 section: "Path Manipulation"
 syntax: "(path/join part ...)"
 returns: "string"
+see_also: ["path/dir", "path/filename", "path/relative-to"]
 ---
 
 Join two or more path components with the platform separator, collapsing redundant slashes. Prefer this over string concatenation so you do not double or miss separators.

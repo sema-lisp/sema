@@ -2,6 +2,9 @@
 name: "member"
 module: "lists"
 section: "Searching"
+params: [{ name: value, type: any }, { name: seq, type: list }]
+returns: "list or #f"
+see_also: ["list/contains?", "list/index-of", "assq", "list/find"]
 ---
 
 Return the **tail** of the list starting at the first element equal to the value, or `#f` if absent. This is the Scheme convention: a non-`#f` result is the sublist, not the position.

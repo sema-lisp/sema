@@ -3,6 +3,8 @@ name: "workflow/tool-result"
 module: "workflow"
 section: "Dynamic Workflows"
 syntax: "(workflow/tool-result tool-name)"
+returns: "nil"
+see_also: ["workflow/tool-call", "workflow/step", "step"]
 ---
 
 Journal a successful tool completion for the step currently executing.

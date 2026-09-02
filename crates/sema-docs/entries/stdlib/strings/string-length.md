@@ -5,6 +5,7 @@ section: "Scheme Compatibility Aliases"
 aliases: ["string-length"]
 params: [{ name: s, type: string }]
 returns: "int"
+see_also: ["string/byte-length", "string/width", "string/empty?"]
 ---
 
 Return the number of characters in a string.

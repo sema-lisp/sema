@@ -4,6 +4,7 @@ module: "file-io"
 section: "File Operations"
 params: [{ name: path, type: string }]
 returns: "string"
+see_also: ["file/read-bytes", "file/read-lines", "file/write"]
 ---
 
 Read the entire contents of a file as a string. Errors if the file is missing or is not valid UTF-8 — guard with `file/exists?`, or use `file/read-bytes` for binary data.

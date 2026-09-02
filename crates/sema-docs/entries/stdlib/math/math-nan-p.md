@@ -2,6 +2,9 @@
 name: "math/nan?"
 module: "math"
 section: "Numeric Predicates"
+params: [{ name: x, type: any }]
+returns: "bool"
+see_also: ["math/infinite?", "math/nan"]
 ---
 
 Test whether a value is NaN ("not a number"). This is the *only* reliable NaN check: NaN is never equal to anything, including itself, so `(= x math/nan)` is always `#f`. NaN arises from undefined float operations like `(/ 0.0 0.0)`.

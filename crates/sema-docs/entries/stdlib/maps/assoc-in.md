@@ -4,6 +4,7 @@ module: "maps"
 section: "Nested Map Operations"
 params: [{ name: m, type: map }, { name: path, type: "list | vector" }, { name: value, type: any }]
 returns: map
+see_also: ["map/assoc-in", "get-in", "update-in", "assoc"]
 ---
 
 Return a copy of `m` with `value` set at the nested key `path`, creating intermediate maps as needed. Same as `map/assoc-in`.

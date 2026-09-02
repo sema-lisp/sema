@@ -4,6 +4,7 @@ module: "math"
 section: "Interpolation & Clamping"
 params: [{ name: x, type: number }, { name: lo, type: number }, { name: hi, type: number }]
 returns: "number"
+see_also: ["math/lerp", "min", "max"]
 ---
 
 Clamp a value to a range.

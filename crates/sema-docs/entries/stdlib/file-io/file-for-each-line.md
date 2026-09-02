@@ -2,6 +2,9 @@
 name: "file/for-each-line"
 module: "file-io"
 section: "File Operations"
+params: [{ name: path, type: string }, { name: f, type: function, doc: "called with each line" }]
+returns: "nil"
+see_also: ["file/read-lines", "file/fold-lines"]
 ---
 
 Iterate over the lines of a file, calling a function on each line (newline stripped) for its side effects. Streams one line at a time, so it stays memory-efficient on files too large to hold in RAM — unlike `(for-each f (file/read-lines path))`, which builds the full list first.

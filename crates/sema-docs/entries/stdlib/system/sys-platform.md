@@ -2,6 +2,9 @@
 name: "sys/platform"
 module: "system"
 section: "System Information"
+syntax: "(sys/platform)"
+returns: "string"
+see_also: ["sys/os", "sys/arch"]
 ---
 
 Return a normalized platform name, always one of the **closed set**

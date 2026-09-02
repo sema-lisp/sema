@@ -3,6 +3,8 @@ name: "assert="
 module: "system"
 section: "Errors"
 params: [{ name: expected, type: any }, { name: actual, type: any }]
+returns: "bool"
+see_also: ["assert", "error", "raise"]
 ---
 
 Raise an error if `expected` and `actual` are not equal, with a message showing both values. Returns `#t` when they match. Equality is structural, so lists and maps compare by contents.

@@ -2,6 +2,9 @@
 name: "flat-map"
 module: "lists"
 section: "Higher-Order Functions"
+params: [{ name: f, type: function }, { name: seq, type: list }]
+returns: "list"
+see_also: ["map", "flatten", "filter"]
 ---
 
 Map `f` over a list, then splice the results together — `f` returns a list per element and `flat-map` concatenates them (flattening one level). Use it when each input expands to zero, one, or many outputs.

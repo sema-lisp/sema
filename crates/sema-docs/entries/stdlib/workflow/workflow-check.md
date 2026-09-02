@@ -3,6 +3,8 @@ name: "workflow/check"
 module: "workflow"
 section: "Dynamic Workflows"
 syntax: "(workflow/check src)"
+returns: "list"
+see_also: ["workflow/run-form", "defworkflow", "defpolicy", "policy/without"]
 ---
 
 Static-analyse a workflow source string (or any value, which is pretty-printed to source)

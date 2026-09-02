@@ -4,6 +4,7 @@ module: "math"
 section: "Bitwise Operations"
 params: [{ name: a, type: int }, { name: b, type: int }]
 returns: "int"
+see_also: ["bit/or", "bit/xor", "bit/not"]
 ---
 
 Bitwise AND (1 only where both operands have a 1 bit). Commonly used as a mask to keep just the low bits or test a flag: `(bit/and x 255)` isolates the low 8 bits.

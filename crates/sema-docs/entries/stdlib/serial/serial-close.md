@@ -2,6 +2,9 @@
 name: "serial/close"
 module: "serial"
 section: "Connection Lifecycle"
+params: [{ name: handle, type: int }]
+returns: "nil"
+see_also: ["serial/open", "serial/list"]
 ---
 
 ```sema

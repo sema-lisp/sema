@@ -4,6 +4,7 @@ module: "predicates"
 section: "Type Predicates"
 params: [{ name: x, type: any }]
 returns: keyword
+see_also: ["string?", "number?", "list?", "map?", "record?"]
 ---
 
 Return the type of `x` as a keyword. Alias of `type`. For records, returns the record's type tag.

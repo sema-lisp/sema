@@ -2,6 +2,9 @@
 name: "list/shuffle"
 module: "lists"
 section: "Random"
+params: [{ name: seq, type: list }]
+returns: "list"
+see_also: ["list/pick", "sort", "list/unique"]
 ---
 
 Return a randomly shuffled copy of a list.

@@ -4,6 +4,7 @@ module: "lists"
 section: "Construction & Access"
 params: [{ name: lst, type: list }]
 returns: "list"
+see_also: ["car", "rest", "cddr", "cadr"]
 ---
 
 Return the rest of a list (everything after the first element).

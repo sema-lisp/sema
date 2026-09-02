@@ -2,6 +2,9 @@
 name: "cos"
 module: "math"
 section: "Trigonometry"
+params: [{ name: x, type: number, doc: "angle in radians" }]
+returns: "float"
+see_also: ["sin", "math/tan", "math/acos"]
 ---
 
 Cosine (argument in radians).

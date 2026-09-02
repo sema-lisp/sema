@@ -2,6 +2,9 @@
 name: "f64-array/make"
 module: "typed-arrays"
 section: "Construction"
+params: [{ name: n, type: int }, { name: fill, type: number, doc: "optional; defaults to 0.0" }]
+returns: "f64-array"
+see_also: ["i64-array/make", "f64-array", "f64-array/range"]
 ---
 
 Create an f64 array of a given length, optionally filled with a value (default `0.0`).

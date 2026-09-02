@@ -2,6 +2,9 @@
 name: "text/excerpt"
 module: "text-processing"
 section: "Text Cleaning"
+params: [{ name: text, type: string }, { name: query, type: string }, { name: opts, type: map, doc: "optional; {:radius n :omission str}" }]
+returns: "string or nil"
+see_also: ["text/truncate", "string/index-of", "string/between"]
 ---
 
 Extract a snippet around a search term with omission markers. Case-insensitive search. Returns `nil` if query not found.

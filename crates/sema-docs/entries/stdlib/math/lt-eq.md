@@ -4,6 +4,7 @@ module: "math"
 section: "Comparison"
 syntax: "(<= num ...)"
 returns: "bool"
+see_also: ["<", ">=", ">", "="]
 ---
 
 Less than or equal. Variadic: `(<= a b c)` is true when arguments are in non-decreasing order.

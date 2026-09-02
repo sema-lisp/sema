@@ -4,6 +4,7 @@ module: "bytevectors"
 section: "Construction"
 syntax: "(bytevector byte ...)"
 returns: "bytevector"
+see_also: ["make-bytevector", "bytevector/from-list", "bytevector/append"]
 ---
 
 Create a bytevector from byte values.

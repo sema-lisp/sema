@@ -4,6 +4,7 @@ module: "strings"
 section: "Core String Operations"
 syntax: "(string/truncate-width s width [ellipsis])"
 returns: "string"
+see_also: ["string/width", "string/take", "string/word-wrap"]
 ---
 
 Clamp a string to a target **display width**, in columns — the truncation counterpart to `string/width`. Splits on grapheme-cluster boundaries, so wide characters (CJK, most emoji) are never cut in half. A string already at or under the width is returned unchanged; like `string/pad-left`/`string/pad-right` only pad, this only shrinks.

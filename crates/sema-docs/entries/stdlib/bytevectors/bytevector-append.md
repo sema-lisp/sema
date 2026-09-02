@@ -2,6 +2,9 @@
 name: "bytevector/append"
 module: "bytevectors"
 section: "Copy & Append"
+syntax: "(bytevector/append bv ...)"
+returns: "bytevector"
+see_also: ["bytevector-append", "bytevector/copy", "bytevector"]
 ---
 
 Concatenate bytevectors.

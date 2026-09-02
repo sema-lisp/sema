@@ -4,6 +4,7 @@ module: "lists"
 section: "Transformation"
 params: [{ name: f, type: function }, { name: seq, type: "list | vector" }]
 returns: list
+see_also: ["map", "for-each"]
 ---
 
 Apply `f` to each element of `seq`, returning a list of results. Alias of `map`.

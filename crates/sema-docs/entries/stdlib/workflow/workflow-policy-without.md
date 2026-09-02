@@ -3,6 +3,8 @@ name: "workflow/policy-without"
 module: "workflow"
 section: "Dynamic Workflows"
 syntax: "(workflow/policy-without reason thunk)"
+returns: "any"
+see_also: ["policy/without", "defpolicy", "workflow/run"]
 ---
 
 Run `thunk` with active model and tool policies bypassed, and emit a

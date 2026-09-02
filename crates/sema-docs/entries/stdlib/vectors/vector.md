@@ -4,6 +4,7 @@ module: "vectors"
 section: "Construction"
 syntax: "(vector x ...)"
 returns: "vector"
+see_also: ["list->vector", "vector->list", "vector?", "list"]
 ---
 
 Create a vector from its arguments.

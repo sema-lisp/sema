@@ -4,6 +4,7 @@ module: "strings"
 section: "Core String Operations"
 params: [{ name: s, type: string }]
 returns: "int"
+see_also: ["string/length", "string/truncate-width", "string/word-wrap"]
 ---
 
 Terminal **display width** of a string, in columns. Unlike `string-length` (which counts Unicode scalar values), this counts how many columns the string occupies when printed: wide characters (CJK, most emoji) count as 2, combining marks as 0, and ANSI escape sequences (colors, cursor moves) as 0. Use it for TUI layout, padding, and alignment, where character count is wrong for non-ASCII or styled text.

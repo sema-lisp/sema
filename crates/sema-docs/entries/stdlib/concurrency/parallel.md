@@ -3,6 +3,8 @@ name: "parallel"
 module: "concurrency"
 section: "Promises"
 syntax: "(parallel thunks [n])"
+returns: "list"
+see_also: ["parallel-settled", "pipeline", "async/pool-map", "async/spawn-all"]
 ---
 
 Macro: run a list of zero-arg `thunks` concurrently and await them **all** before

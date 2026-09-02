@@ -3,6 +3,7 @@ name: "route/prefix"
 module: "route"
 params: [{ name: prefix, type: string }, { name: routes }]
 returns: "list"
+see_also: ["http/router", "route/from-tools", "http/serve"]
 ---
 
 Prepend a path prefix to every route's pattern in the given list, returning a new list of routes. Each route is a `[method pattern handler ...]` vector; a trailing slash on the prefix is trimmed.

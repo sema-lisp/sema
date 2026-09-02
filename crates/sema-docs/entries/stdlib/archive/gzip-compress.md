@@ -2,6 +2,9 @@
 name: "gzip/compress"
 module: "archive"
 section: "Compression & Archives"
+params: [{ name: data, type: "bytevector | string" }]
+returns: "bytevector"
+see_also: ["gzip/decompress", "file/read-bytes", "file/write-bytes"]
 ---
 
 Compress bytes with gzip, returning a gzip-compressed bytevector. Accepts either a bytevector or a string (its UTF-8 bytes are compressed). Pairs with `gzip/decompress` for a lossless round-trip.

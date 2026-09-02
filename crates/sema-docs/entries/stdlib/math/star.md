@@ -4,6 +4,7 @@ module: "math"
 section: "Basic Arithmetic"
 syntax: "(* num ...)"
 returns: "number"
+see_also: ["+", "-", "/"]
 ---
 
 Multiply numbers together.

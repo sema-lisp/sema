@@ -2,6 +2,9 @@
 name: "math/atan2"
 module: "math"
 section: "Trigonometry"
+params: [{ name: y, type: number }, { name: x, type: number }]
+returns: "float"
+see_also: ["math/atan", "math/tan", "angle"]
 ---
 
 Two-argument inverse tangent: `(math/atan2 y x)`. Returns the angle in radians

@@ -3,6 +3,7 @@ name: "llm/with-fallback"
 module: "llm"
 params: [{ name: providers }, { name: thunk }]
 returns: "any"
+see_also: ["llm/with-rate-limit", "llm/list-providers", "llm/complete"]
 ---
 
 Run a zero-argument function with a fallback provider chain in effect: if a call to the active provider fails, the next provider in the list is tried, and so on. The first argument is a list of provider keywords/strings to attempt in order. The previous chain is restored on exit. Returns the thunk's result.

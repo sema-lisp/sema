@@ -4,6 +4,7 @@ module: "lists"
 section: "Higher-Order Functions"
 params: [{ name: f, type: function, doc: "called as (f elem acc)" }, { name: init, type: any }, { name: list, type: list }]
 returns: "any"
+see_also: ["foldl", "fold", "reduce"]
 ---
 
 Right fold: reduce a list by threading an accumulator from right to left. `(foldr f init list)` calls `(f elem acc)` on the last element first (with `acc` = `init`), then works back toward the head.

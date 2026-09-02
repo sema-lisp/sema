@@ -2,6 +2,9 @@
 name: "list/take-while"
 module: "lists"
 section: "Splitting"
+params: [{ name: pred, type: function }, { name: seq, type: list }]
+returns: "list"
+see_also: ["take-while", "list/drop-while", "take"]
 ---
 
 Take elements from the front while a predicate holds.

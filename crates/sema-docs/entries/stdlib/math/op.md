@@ -4,6 +4,7 @@ module: "math"
 section: "Basic Arithmetic"
 syntax: "(- num ...)"
 returns: "number"
+see_also: ["+", "*", "/", "abs"]
 ---
 
 Subtract numbers. With one argument, negates. With multiple, subtracts left to right.

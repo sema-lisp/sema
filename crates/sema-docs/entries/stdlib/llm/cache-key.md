@@ -3,6 +3,7 @@ name: "llm/cache-key"
 module: "llm"
 params: [{ name: prompt, type: string }, { name: opts, type: map }]
 returns: "string"
+see_also: ["llm/with-cache", "llm/cache-stats", "llm/cache-clear"]
 ---
 
 Compute the cache key (a hex digest) that the response cache would use for a given prompt and options. The opts map accepts `:model`, `:temperature`, and `:system`. Useful for inspecting or pre-seeding the cache.

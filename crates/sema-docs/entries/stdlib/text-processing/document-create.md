@@ -2,6 +2,9 @@
 name: "document/create"
 module: "text-processing"
 section: "Documents"
+params: [{ name: text, type: string }, { name: metadata, type: map }]
+returns: "map"
+see_also: ["document/text", "document/metadata", "document/chunk"]
 ---
 
 Create a document map with `:text` and `:metadata`.

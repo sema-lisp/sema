@@ -3,6 +3,9 @@ name: "f64-array/set!"
 module: "typed-arrays"
 section: "Access & Mutation"
 aliases: ["i64-array/set!"]
+params: [{ name: arr, type: "f64-array | i64-array" }, { name: index, type: int }, { name: value, type: number }]
+returns: "f64-array | i64-array"
+see_also: ["f64-array/ref", "f64-array/make"]
 ---
 
 Set the element at a given index, returning the (possibly new) array. The store is copy-on-write: it mutates the backing buffer in place only when this is the array's *sole* reference; otherwise it copies first so other holders of the same array don't see the change.

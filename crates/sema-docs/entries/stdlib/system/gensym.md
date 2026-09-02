@@ -4,6 +4,7 @@ module: "system"
 section: "Metaprogramming"
 params: [{ name: prefix, type: string }]
 returns: symbol
+see_also: ["macroexpand", "str"]
 ---
 
 Generate a fresh, unique symbol. The optional `prefix` (default `"g"`) is prepended to a global counter so each call yields a distinct name (`tmp__0`, `tmp__1`, ...) that cannot collide with anything in user code.

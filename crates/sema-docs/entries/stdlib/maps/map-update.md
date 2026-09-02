@@ -2,6 +2,9 @@
 name: "map/update"
 module: "maps"
 section: "Higher-Order Map Operations"
+params: [{ name: m, type: map }, { name: key, type: any }, { name: f, type: function }]
+returns: "map"
+see_also: ["map/update-in", "assoc", "map/map-vals", "get"]
 ---
 
 Return a new map with the value at `key` replaced by `(f current)`, where `current` is the existing value. This is the read-modify-write shortcut for `(assoc m k (f (get m k)))`.

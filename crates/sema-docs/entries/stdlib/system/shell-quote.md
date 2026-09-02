@@ -4,6 +4,7 @@ module: "system"
 section: "Shell & Process Control"
 syntax: "(shell/quote s)"
 returns: "string"
+see_also: ["shell", "proc/run"]
 ---
 
 POSIX single-quote a string so it survives a POSIX shell (e.g. `sh -c`) as one literal word —

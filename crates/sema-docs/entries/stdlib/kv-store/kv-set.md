@@ -2,6 +2,9 @@
 name: "kv/set"
 module: "kv-store"
 section: "Functions"
+params: [{ name: ns, type: string }, { name: key, type: string }, { name: value, type: any }]
+returns: "any"
+see_also: ["kv/get", "kv/delete", "kv/keys"]
 ---
 
 Set a key-value pair. The value is serialized as JSON. Returns the value. Flushes to disk immediately.

@@ -46,16 +46,8 @@ impl GeminiProvider {
         })
     }
 
-    fn resolve_model(&self, model: &str) -> String {
-        if model.is_empty() {
-            self.default_model.clone()
-        } else {
-            model.to_string()
-        }
-    }
-
     async fn complete_async(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
-        let model = self.resolve_model(&request.model);
+        let model = crate::provider::resolve_model(&request.model, &self.default_model);
         let url = build_url(&self.base_url, &model, "generateContent")?;
 
         let body = self.build_request_body(&request);
@@ -95,7 +87,7 @@ impl GeminiProvider {
         request: ChatRequest,
         on_chunk: &mut dyn FnMut(&str) -> Result<(), LlmError>,
     ) -> Result<ChatResponse, LlmError> {
-        let model = self.resolve_model(&request.model);
+        let model = crate::provider::resolve_model(&request.model, &self.default_model);
         let url = format!(
             "{}?alt=sse",
             build_url(&self.base_url, &model, "streamGenerateContent")?

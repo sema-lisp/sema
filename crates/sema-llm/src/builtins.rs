@@ -2613,47 +2613,6 @@ fn get_opt_str_map(opts: &BTreeMap<Value, Value>, key: &str) -> Vec<(String, Str
         .collect()
 }
 
-/// Substitute `{{key}}` placeholders in a template string using a vars map.
-/// Keys are looked up as keywords in the map. Unfilled slots are left as-is.
-fn fill_template(template: &str, vars: &BTreeMap<Value, Value>) -> String {
-    let mut result = String::with_capacity(template.len());
-    let mut chars = template.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '{' && chars.peek() == Some(&'{') {
-            chars.next();
-            let mut var_name = String::new();
-            let mut found_close = false;
-            while let Some(c) = chars.next() {
-                if c == '}' && chars.peek() == Some(&'}') {
-                    chars.next();
-                    found_close = true;
-                    break;
-                }
-                var_name.push(c);
-            }
-            if found_close {
-                if let Some(val) = vars.get(&Value::keyword(&var_name)) {
-                    if let Some(s) = val.as_str() {
-                        result.push_str(s);
-                    } else {
-                        result.push_str(&val.to_string());
-                    }
-                } else {
-                    result.push_str("{{");
-                    result.push_str(&var_name);
-                    result.push_str("}}");
-                }
-            } else {
-                result.push_str("{{");
-                result.push_str(&var_name);
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    result
-}
-
 /// Parse a message role keyword (`:system`/`:user`/`:assistant`/`:tool`) for the
 /// conversation-surgery builtins, erroring with `who` in the message on anything else.
 fn parse_role(v: &Value, who: &str) -> Result<Role, SemaError> {
@@ -4378,25 +4337,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         // history append) happens here, AFTER the response lands (on the VM
         // thread in the async case), never inside the offload.
         let finalize = move |response: ChatResponse| -> Result<Value, SemaError> {
-            let mut new_messages = conv.messages.clone();
-            new_messages.push(Message {
-                role: Role::User,
-                content: user_msg,
-                images: Vec::new(),
-            });
-            new_messages.push(Message {
-                role: Role::Assistant,
-                content: response.content,
-                images: Vec::new(),
-            });
-
-            let mut metadata = conv.metadata.clone();
-            accumulate_usage(&mut metadata, &response.usage);
-            Ok(Value::conversation(Conversation {
-                messages: new_messages,
-                model: conv.model.clone(),
-                metadata,
-            }))
+            Ok(conversation_with_exchange(&conv, user_msg, response))
         };
 
         // Runtime roots and spawned tasks suspend on an External wait; only a
@@ -6349,25 +6290,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         // mutation (the history append) happens here, AFTER the response lands
         // (on the VM thread in the async case), never inside the offload.
         let finalize = move |response: ChatResponse| -> Result<Value, SemaError> {
-            let mut new_messages = conv.messages.clone();
-            new_messages.push(Message {
-                role: Role::User,
-                content: user_msg,
-                images: Vec::new(),
-            });
-            new_messages.push(Message {
-                role: Role::Assistant,
-                content: response.content,
-                images: Vec::new(),
-            });
-
-            let mut metadata = conv.metadata.clone();
-            accumulate_usage(&mut metadata, &response.usage);
-            Ok(Value::conversation(Conversation {
-                messages: new_messages,
-                model: conv.model.clone(),
-                metadata,
-            }))
+            Ok(conversation_with_exchange(&conv, user_msg, response))
         };
 
         // Runtime roots and spawned tasks suspend on an External wait; only a
@@ -6437,7 +6360,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             .messages
             .iter()
             .map(|m| {
-                let filled = fill_template(&m.content, &vars);
+                let filled = sema_core::text_util::render_template(&m.content, &vars);
                 Message {
                     role: m.role.clone(),
                     content: filled,
@@ -8667,42 +8590,7 @@ fn complete_offload_prep(mut request: ChatRequest) -> Result<CompletePrep, SemaE
     // Capture the retry-backoff base on the VM thread so each native provider
     // attempt honors it (pool workers have their own RETRY_BASE_MS TLS copies).
     let retry_base_ms = RETRY_BASE_MS.with(|c| c.get());
-    let fallback = FALLBACK_CHAIN.with(|c| c.borrow().clone());
-    let explicit_fallback = fallback.as_ref().is_some_and(|entries| !entries.is_empty());
-    let chain: Vec<ResolvedProvider> = PROVIDER_REGISTRY.with(|reg| {
-        let reg = reg.borrow();
-        match fallback {
-            Some(entries) if !entries.is_empty() => entries
-                .iter()
-                .map(|e| {
-                    reg.get(&e.provider)
-                        .map(|p| ResolvedProvider {
-                            provider: p,
-                            name: e.provider.clone(),
-                            model: e.model.clone(),
-                        })
-                        .ok_or_else(|| {
-                            SemaError::Llm(format!("fallback provider '{}' not found", e.provider))
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>(),
-            _ => {
-                let p = reg.default_provider().ok_or_else(|| {
-                    SemaError::Llm(
-                        "no LLM provider configured. Use (llm/configure :anthropic \
-                         {:api-key ...}) first"
-                            .to_string(),
-                    )
-                })?;
-                let name = p.name().to_string();
-                Ok(vec![ResolvedProvider {
-                    provider: p,
-                    name,
-                    model: None,
-                }])
-            }
-        }
-    })?;
+    let (chain, explicit_fallback) = resolve_stream_chain()?;
 
     let request_for_messages = request.clone();
     Ok(CompletePrep::Offload(Box::new(CompleteOffloadPlan {
@@ -11244,7 +11132,7 @@ fn build_tool_schemas(tools: &[Value]) -> Result<Vec<ToolSchema>, SemaError> {
         let td = tool
             .as_tool_def_rc()
             .ok_or_else(|| SemaError::type_error("tool", tool.type_name()))?;
-        let params_json = sema_value_to_json_schema(&td.parameters);
+        let params_json = sema_core::value_to_json_schema(&td.parameters);
         schemas.push(ToolSchema {
             name: td.name.clone(),
             description: td.description.clone(),
@@ -11286,77 +11174,6 @@ fn tool_policy_subject_to_value(subject: &sema_core::ToolPolicySubject) -> Value
         }
     }
     Value::map(map)
-}
-
-/// Convert a Sema schema map into a JSON Schema object for the LLM API.
-fn sema_value_to_json_schema(val: &Value) -> serde_json::Value {
-    if let Some(map) = val.as_map_rc() {
-        let mut properties = serde_json::Map::new();
-        let mut required = Vec::new();
-        for (k, v) in map.iter() {
-            let key = k
-                .as_keyword()
-                .or_else(|| k.as_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| k.to_string());
-            let prop = if let Some(inner) = v.as_map_rc() {
-                let mut prop_obj = serde_json::Map::new();
-                if let Some(t) = inner.get(&Value::keyword("type")) {
-                    let type_str = t
-                        .as_keyword()
-                        .or_else(|| t.as_str().map(|s| s.to_string()))
-                        .unwrap_or_else(|| "string".to_string());
-                    prop_obj.insert("type".to_string(), serde_json::Value::String(type_str));
-                }
-                if let Some(d) = inner.get(&Value::keyword("description")) {
-                    let desc = d
-                        .as_str()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| d.to_string());
-                    prop_obj.insert("description".to_string(), serde_json::Value::String(desc));
-                }
-                if let Some(e) = inner.get(&Value::keyword("enum")) {
-                    if let Some(items) = e.as_seq() {
-                        let vals: Vec<serde_json::Value> = items
-                            .iter()
-                            .map(|v| {
-                                serde_json::Value::String(
-                                    v.as_str()
-                                        .map(|s| s.to_string())
-                                        .or_else(|| v.as_keyword())
-                                        .unwrap_or_else(|| v.to_string()),
-                                )
-                            })
-                            .collect();
-                        prop_obj.insert("enum".to_string(), serde_json::Value::Array(vals));
-                    }
-                }
-                // Mark as required unless :optional #t
-                let optional = inner
-                    .get(&Value::keyword("optional"))
-                    .map(|v| v.is_truthy())
-                    .unwrap_or(false);
-                let default = inner.get(&Value::keyword("default"));
-                if !optional && default.is_none() {
-                    required.push(serde_json::Value::String(key.clone()));
-                }
-                if let Some(d) = default {
-                    prop_obj.insert("default".to_string(), sema_core::value_to_json_lossy(d));
-                }
-                serde_json::Value::Object(prop_obj)
-            } else {
-                required.push(serde_json::Value::String(key.clone()));
-                serde_json::json!({"type": "string"})
-            };
-            properties.insert(key, prop);
-        }
-        serde_json::json!({
-            "type": "object",
-            "properties": properties,
-            "required": required
-        })
-    } else {
-        serde_json::json!({"type": "object", "properties": {}})
-    }
 }
 
 fn sema_list_to_chat_messages(val: &Value) -> Result<Vec<ChatMessage>, SemaError> {
@@ -12948,6 +12765,34 @@ fn stream_wire_attempt(
     stream_wire_walk(std::slice::from_ref(entry), request, emit);
 }
 
+/// The conversation after one exchange: `conv` plus the user turn and the
+/// assistant reply, with the reply's usage folded into the metadata. Runs on
+/// the VM thread after the response lands, never inside an offload.
+fn conversation_with_exchange(
+    conv: &Conversation,
+    user_msg: String,
+    response: ChatResponse,
+) -> Value {
+    let mut messages = conv.messages.clone();
+    messages.push(Message {
+        role: Role::User,
+        content: user_msg,
+        images: Vec::new(),
+    });
+    messages.push(Message {
+        role: Role::Assistant,
+        content: response.content,
+        images: Vec::new(),
+    });
+    let mut metadata = conv.metadata.clone();
+    accumulate_usage(&mut metadata, &response.usage);
+    Value::conversation(Conversation {
+        messages,
+        model: conv.model.clone(),
+        metadata,
+    })
+}
+
 /// Resolve the active fallback chain (or the default provider) into owned `Arc`
 /// clones on the VM thread. The boolean records whether the chain was explicit,
 /// so the offloaded wire walk touches no thread-locals.
@@ -14355,23 +14200,6 @@ mod tests {
         assert_eq!(usage.cache_hits, 1);
         assert_eq!(usage.calls, 0);
         assert_eq!(usage.cost_usd, None);
-    }
-
-    #[test]
-    fn json_schema_default_marks_param_not_required_and_emits_default() {
-        let mut field = std::collections::BTreeMap::new();
-        field.insert(Value::keyword("type"), Value::keyword("string"));
-        field.insert(Value::keyword("default"), Value::string("world"));
-        let mut params = std::collections::BTreeMap::new();
-        params.insert(Value::keyword("name"), Value::map(field));
-
-        let schema = sema_value_to_json_schema(&Value::map(params));
-        let required = schema["required"].as_array().expect("required array");
-        assert!(
-            !required.iter().any(|v| v == "name"),
-            "a :default should excuse the param from `required`: {schema}"
-        );
-        assert_eq!(schema["properties"]["name"]["default"], json!("world"));
     }
 
     #[test]

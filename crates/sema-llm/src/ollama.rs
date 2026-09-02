@@ -120,59 +120,11 @@ impl OllamaProvider {
         })
     }
 
-    fn resolve_model(&self, model: &str) -> String {
-        if model.is_empty() {
-            self.default_model.clone()
-        } else {
-            model.to_string()
-        }
-    }
-
     async fn complete_async(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
-        let model = self.resolve_model(&request.model);
+        let model = crate::provider::resolve_model(&request.model, &self.default_model);
         let url = format!("{}/api/chat", self.host);
 
-        let messages = build_ollama_messages(&request);
-
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "stream": false,
-        });
-
-        // Add tools if provided
-        if !request.tools.is_empty() {
-            body["tools"] = build_tools_json(&request.tools);
-        }
-
-        // Options
-        let mut options = serde_json::Map::new();
-        if let Some(max_tokens) = request.max_tokens {
-            options.insert("num_predict".to_string(), serde_json::json!(max_tokens));
-        }
-        if let Some(temp) = request.temperature {
-            options.insert("temperature".to_string(), serde_json::json!(temp));
-        }
-        // Canonical `ChatRequest` fields Ollama does support, and was silently
-        // dropping. Per the one-canonical-request rule these must be translated
-        // here rather than being no-ops the caller cannot see.
-        if !request.stop_sequences.is_empty() {
-            options.insert(
-                "stop".to_string(),
-                serde_json::json!(request.stop_sequences),
-            );
-        }
-        if !options.is_empty() {
-            body["options"] = serde_json::Value::Object(options);
-        }
-        if request.json_mode {
-            body["format"] = serde_json::json!("json");
-        }
-        if let Some(ref effort) = request.reasoning_effort {
-            // Ollama exposes reasoning as a boolean switch, so map the tiers:
-            // "none" turns thinking off, anything else turns it on.
-            body["think"] = serde_json::json!(effort != "none");
-        }
+        let body = chat_body(&request, &model, false);
 
         let resp = self
             .client
@@ -243,49 +195,10 @@ impl OllamaProvider {
         request: ChatRequest,
         on_chunk: &mut dyn FnMut(&str) -> Result<(), LlmError>,
     ) -> Result<ChatResponse, LlmError> {
-        let model = self.resolve_model(&request.model);
+        let model = crate::provider::resolve_model(&request.model, &self.default_model);
         let url = format!("{}/api/chat", self.host);
 
-        let messages = build_ollama_messages(&request);
-
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "stream": true,
-        });
-
-        // Add tools if provided
-        if !request.tools.is_empty() {
-            body["tools"] = build_tools_json(&request.tools);
-        }
-
-        let mut options = serde_json::Map::new();
-        if let Some(max_tokens) = request.max_tokens {
-            options.insert("num_predict".to_string(), serde_json::json!(max_tokens));
-        }
-        if let Some(temp) = request.temperature {
-            options.insert("temperature".to_string(), serde_json::json!(temp));
-        }
-        // Canonical `ChatRequest` fields Ollama does support, and was silently
-        // dropping. Per the one-canonical-request rule these must be translated
-        // here rather than being no-ops the caller cannot see.
-        if !request.stop_sequences.is_empty() {
-            options.insert(
-                "stop".to_string(),
-                serde_json::json!(request.stop_sequences),
-            );
-        }
-        if !options.is_empty() {
-            body["options"] = serde_json::Value::Object(options);
-        }
-        if request.json_mode {
-            body["format"] = serde_json::json!("json");
-        }
-        if let Some(ref effort) = request.reasoning_effort {
-            // Ollama exposes reasoning as a boolean switch, so map the tiers:
-            // "none" turns thinking off, anything else turns it on.
-            body["think"] = serde_json::json!(effort != "none");
-        }
+        let body = chat_body(&request, &model, true);
 
         let resp = self
             .client
@@ -399,4 +312,51 @@ impl LlmProvider for OllamaProvider {
             futures::future::join_all(futures).await
         })
     }
+}
+
+/// The `/api/chat` request body for `request`, in Ollama's wire format.
+/// Shared by the blocking and streaming paths so the two cannot drift.
+fn chat_body(request: &ChatRequest, model: &str, stream: bool) -> serde_json::Value {
+    let messages = build_ollama_messages(request);
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+    });
+
+    // Add tools if provided
+    if !request.tools.is_empty() {
+        body["tools"] = build_tools_json(&request.tools);
+    }
+
+    // Options
+    let mut options = serde_json::Map::new();
+    if let Some(max_tokens) = request.max_tokens {
+        options.insert("num_predict".to_string(), serde_json::json!(max_tokens));
+    }
+    if let Some(temp) = request.temperature {
+        options.insert("temperature".to_string(), serde_json::json!(temp));
+    }
+    // Canonical `ChatRequest` fields Ollama does support, and was silently
+    // dropping. Per the one-canonical-request rule these must be translated
+    // here rather than being no-ops the caller cannot see.
+    if !request.stop_sequences.is_empty() {
+        options.insert(
+            "stop".to_string(),
+            serde_json::json!(request.stop_sequences),
+        );
+    }
+    if !options.is_empty() {
+        body["options"] = serde_json::Value::Object(options);
+    }
+    if request.json_mode {
+        body["format"] = serde_json::json!("json");
+    }
+    if let Some(ref effort) = request.reasoning_effort {
+        // Ollama exposes reasoning as a boolean switch, so map the tiers:
+        // "none" turns thinking off, anything else turns it on.
+        body["think"] = serde_json::json!(effort != "none");
+    }
+    body
 }

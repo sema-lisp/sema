@@ -18,16 +18,8 @@ impl AnthropicProvider {
         })
     }
 
-    fn resolve_model(&self, model: &str) -> String {
-        if model.is_empty() {
-            self.default_model.clone()
-        } else {
-            model.to_string()
-        }
-    }
-
     fn build_request_body(&self, request: &ChatRequest) -> AnthropicRequest {
-        let model = self.resolve_model(&request.model);
+        let model = crate::provider::resolve_model(&request.model, &self.default_model);
         // NOT a 1:1 map over messages: Anthropic requires every `tool_result`
         // answering one assistant turn to sit in the SINGLE message
         // immediately following it. The agent loop pushes one

@@ -4491,45 +4491,30 @@ impl VM {
     /// Push a new CallFrame for a VM closure called via CALL_GLOBAL.
     /// No function value is on the stack — only args. `base = stack.len() - argc`.
     /// Args are already in place; we just extend the stack for remaining locals.
+    /// Refuse to push another frame past `MAX_FRAMES`.
+    #[inline(always)]
+    fn check_call_depth(&self) -> Result<(), SemaError> {
+        if self.frames.len() >= MAX_FRAMES {
+            return Err(SemaError::eval("stack overflow: maximum call depth exceeded").with_hint(
+                "this usually means unbounded recursion; ensure recursive calls are in tail position for TCO, or use 'do' for iteration",
+            ));
+        }
+        Ok(())
+    }
+
     fn call_vm_closure_direct(
         &mut self,
         closure: Rc<Closure>,
         argc: usize,
     ) -> Result<(), SemaError> {
-        if self.frames.len() >= MAX_FRAMES {
-            return Err(SemaError::eval(
-                "stack overflow: maximum call depth exceeded",
-            )
-            .with_hint(
-                "this usually means unbounded recursion; ensure recursive calls are in tail position for TCO, or use 'do' for iteration",
-            ));
-        }
+        self.check_call_depth()?;
         self.ensure_cache_space(&closure.func);
         let func = &closure.func;
         let arity = func.arity as usize;
         let has_rest = func.has_rest;
         let n_locals = func.chunk.n_locals as usize;
 
-        // Arity check
-        if has_rest {
-            if argc < arity {
-                return Err(SemaError::arity(
-                    func.name
-                        .map(resolve_spur)
-                        .unwrap_or_else(|| "<lambda>".to_string()),
-                    format!("{}+", arity),
-                    argc,
-                ));
-            }
-        } else if argc != arity {
-            return Err(SemaError::arity(
-                func.name
-                    .map(resolve_spur)
-                    .unwrap_or_else(|| "<lambda>".to_string()),
-                arity.to_string(),
-                argc,
-            ));
-        }
+        check_closure_arity(func, argc)?;
 
         // Args are already at stack[base..base+argc] in the right order.
         // base = stack.len() - argc
@@ -4560,40 +4545,14 @@ impl VM {
     /// Caller must set `self.functions` before calling this.
     /// Takes ownership of the Rc to avoid an extra clone.
     fn call_vm_closure(&mut self, closure: Rc<Closure>, argc: usize) -> Result<(), SemaError> {
-        if self.frames.len() >= MAX_FRAMES {
-            return Err(SemaError::eval(
-                "stack overflow: maximum call depth exceeded",
-            )
-            .with_hint(
-                "this usually means unbounded recursion; ensure recursive calls are in tail position for TCO, or use 'do' for iteration",
-            ));
-        }
+        self.check_call_depth()?;
         self.ensure_cache_space(&closure.func);
         let func = &closure.func;
         let arity = func.arity as usize;
         let has_rest = func.has_rest;
         let n_locals = func.chunk.n_locals as usize;
 
-        // Arity check
-        if has_rest {
-            if argc < arity {
-                return Err(SemaError::arity(
-                    func.name
-                        .map(resolve_spur)
-                        .unwrap_or_else(|| "<lambda>".to_string()),
-                    format!("{}+", arity),
-                    argc,
-                ));
-            }
-        } else if argc != arity {
-            return Err(SemaError::arity(
-                func.name
-                    .map(resolve_spur)
-                    .unwrap_or_else(|| "<lambda>".to_string()),
-                arity.to_string(),
-                argc,
-            ));
-        }
+        check_closure_arity(func, argc)?;
 
         // Copy args directly from stack into new locals — no Vec allocation
         let func_idx = self.stack.len() - 1 - argc;
@@ -4627,26 +4586,7 @@ impl VM {
         let has_rest = func.has_rest;
         let n_locals = func.chunk.n_locals as usize;
 
-        // Arity check
-        if has_rest {
-            if argc < arity {
-                return Err(SemaError::arity(
-                    func.name
-                        .map(resolve_spur)
-                        .unwrap_or_else(|| "<lambda>".to_string()),
-                    format!("{}+", arity),
-                    argc,
-                ));
-            }
-        } else if argc != arity {
-            return Err(SemaError::arity(
-                func.name
-                    .map(resolve_spur)
-                    .unwrap_or_else(|| "<lambda>".to_string()),
-                arity.to_string(),
-                argc,
-            ));
-        }
+        check_closure_arity(func, argc)?;
 
         // Copy args directly into current frame's base — no Vec allocation
         let func_idx = self.stack.len() - 1 - argc;
@@ -6081,6 +6021,30 @@ fn intrinsic_name(opcode: Op) -> Option<&'static str> {
 }
 
 // --- Arithmetic helpers ---
+
+/// The arity error for calling `func` with `argc` arguments, if any.
+#[inline(always)]
+fn check_closure_arity(func: &Function, argc: usize) -> Result<(), SemaError> {
+    let arity = func.arity as usize;
+    let ok = if func.has_rest {
+        argc >= arity
+    } else {
+        argc == arity
+    };
+    if ok {
+        return Ok(());
+    }
+    let name = func
+        .name
+        .map(resolve_spur)
+        .unwrap_or_else(|| "<lambda>".to_string());
+    let expected = if func.has_rest {
+        format!("{arity}+")
+    } else {
+        arity.to_string()
+    };
+    Err(SemaError::arity(name, expected, argc))
+}
 
 #[inline(always)]
 /// Hint for `get`/`contains?` called on the wrong collection type. These work

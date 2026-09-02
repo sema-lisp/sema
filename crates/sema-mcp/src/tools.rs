@@ -17,101 +17,6 @@ pub fn get_builtin_doc(symbol: &str) -> Option<&'static String> {
     map.get(symbol)
 }
 
-/// Helper to parse a Sema parameters map into JSON-Schema.
-pub fn sema_value_to_json_schema(val: &Value) -> serde_json::Value {
-    if let Some(map) = val.as_map_rc() {
-        let mut properties = serde_json::Map::new();
-        let mut required = Vec::new();
-        for (k, v) in map.iter() {
-            let key = k
-                .as_keyword()
-                .or_else(|| k.as_str().map(|s| s.to_string()))
-                .unwrap_or_else(|| k.to_string());
-
-            // Skip metadata parameters
-            if key == "mcp/expose" || key == "private" || key.starts_with("mcp/") {
-                continue;
-            }
-
-            let prop = if let Some(inner) = v.as_map_rc() {
-                let mut prop_obj = serde_json::Map::new();
-                if let Some(t) = inner.get(&Value::keyword("type")) {
-                    let type_str = t
-                        .as_keyword()
-                        .or_else(|| t.as_str().map(|s| s.to_string()))
-                        .unwrap_or_else(|| "string".to_string());
-                    // Sema type keywords → JSON Schema draft 2020-12 type names.
-                    // LLM providers validate tool schemas strictly and reject the
-                    // ENTIRE request over one bad name — `:list` leaking through as
-                    // "list" broke every turn of an MCP client session.
-                    let json_type = match type_str.as_str() {
-                        "str" => "string",
-                        "int" => "integer",
-                        "float" | "double" => "number",
-                        "bool" => "boolean",
-                        "list" | "vector" | "array" => "array",
-                        "map" | "dict" => "object",
-                        "nil" => "null",
-                        other => other,
-                    };
-                    prop_obj.insert(
-                        "type".to_string(),
-                        serde_json::Value::String(json_type.to_string()),
-                    );
-                } else {
-                    prop_obj.insert(
-                        "type".to_string(),
-                        serde_json::Value::String("string".to_string()),
-                    );
-                }
-                if let Some(d) = inner.get(&Value::keyword("description")) {
-                    let desc = d
-                        .as_str()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| d.to_string());
-                    prop_obj.insert("description".to_string(), serde_json::Value::String(desc));
-                }
-                if let Some(e) = inner.get(&Value::keyword("enum")) {
-                    if let Some(items) = e.as_seq() {
-                        let vals: Vec<serde_json::Value> = items
-                            .iter()
-                            .map(|v| {
-                                serde_json::Value::String(
-                                    v.as_str()
-                                        .map(|s| s.to_string())
-                                        .or_else(|| v.as_keyword())
-                                        .unwrap_or_else(|| v.to_string()),
-                                )
-                            })
-                            .collect();
-                        prop_obj.insert("enum".to_string(), serde_json::Value::Array(vals));
-                    }
-                }
-                // Mark as required unless :optional #t
-                let optional = inner
-                    .get(&Value::keyword("optional"))
-                    .map(|v| v.is_truthy())
-                    .unwrap_or(false);
-                if !optional {
-                    required.push(serde_json::Value::String(key.clone()));
-                }
-                serde_json::Value::Object(prop_obj)
-            } else {
-                required.push(serde_json::Value::String(key.clone()));
-                serde_json::json!({"type": "string"})
-            };
-            properties.insert(key, prop);
-        }
-        serde_json::json!({
-            "type": "object",
-            "properties": properties,
-            "required": required
-        })
-    } else {
-        serde_json::json!({"type": "object", "properties": {}})
-    }
-}
-
 /// One declared parameter of a `deftool` handler, in positional order.
 struct ParamSpec {
     /// The parameter's name (as it appears in the JSON arguments object).
@@ -525,54 +430,6 @@ where
     }
 }
 
-/// Run compiled bytecode on the VM
-pub fn run_bytecode_bytes(
-    interpreter: &Interpreter,
-    bytes: &[u8],
-) -> Result<sema_core::Value, SemaError> {
-    let result = sema_vm::deserialize_from_bytes(bytes)?;
-
-    let functions: Vec<std::rc::Rc<sema_vm::Function>> =
-        result.functions.into_iter().map(std::rc::Rc::new).collect();
-    let main_cache_slots = result.chunk.n_global_cache_slots;
-    let closure = std::rc::Rc::new(sema_vm::Closure {
-        func: std::rc::Rc::new(sema_vm::Function {
-            name: None,
-            chunk: result.chunk,
-            upvalue_descs: Vec::new(),
-            upvalue_names: Vec::new(),
-            arity: 0,
-            has_rest: false,
-            param_names: Vec::new().into(),
-            local_names: Vec::new(),
-            local_scopes: Vec::new(),
-            source_file: None,
-            cache_offset: 0,
-            suspend_cache: std::cell::Cell::new(None),
-        }),
-        upvalues: Vec::new(),
-        // Top-level main closure: uses the VM's own globals and function table.
-        globals: None,
-        functions: None,
-    });
-
-    let mut vm = sema_vm::VM::new(
-        interpreter.global_env.clone(),
-        functions,
-        &[],
-        main_cache_slots,
-    )?;
-    // Drive the `.semac` program on the interpreter's unified cooperative
-    // runtime, the sole async engine, so async/await, channels, and timers work
-    // when an MCP `run_file` executes a `.semac` program. A `.semac` carries no
-    // native table (the format is process-local), and bytecode compiled with
-    // `known_natives=None` uses CallGlobal rather than CallNative, so task VMs
-    // resolve natives via the shared global env — the empty native table passed
-    // to `VM::new` is correct here.
-    vm.seed_main_frame(closure);
-    interpreter.drive_vm_on_runtime(vm)
-}
-
 /// Lists all default, notebook, and user-defined tools matching CLI filters
 pub fn list_mcp_tools(
     interpreter: &Interpreter,
@@ -768,7 +625,7 @@ pub fn list_mcp_tools(
                         tools.push(Tool {
                             name: td.name.clone(),
                             description: td.description.clone(),
-                            input_schema: sema_value_to_json_schema(&td.parameters),
+                            input_schema: sema_core::value_to_json_schema(&td.parameters),
                         });
                     }
                 }
@@ -962,7 +819,7 @@ fn call_mcp_tool_inner(
 
             let (res, stdout) = eval_with_capture(|| {
                 if sema_vm::is_bytecode_file(&bytes) {
-                    run_bytecode_bytes(interpreter, &bytes)
+                    interpreter.run_bytecode_bytes(&bytes)
                 } else {
                     let source =
                         std::str::from_utf8(&bytes).map_err(|e| SemaError::eval(e.to_string()))?;
@@ -1590,7 +1447,7 @@ mod schema_tests {
         spec.insert(Value::keyword("type"), Value::keyword(param_type));
         let mut params = BTreeMap::new();
         params.insert(Value::keyword("x"), Value::map(spec));
-        sema_value_to_json_schema(&Value::map(params))
+        sema_core::value_to_json_schema(&Value::map(params))
     }
 
     /// Providers validate tool schemas against JSON Schema draft 2020-12 and

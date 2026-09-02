@@ -170,16 +170,8 @@ impl OpenAiProvider {
         })
     }
 
-    fn resolve_model(&self, model: &str) -> String {
-        if model.is_empty() {
-            self.default_model.clone()
-        } else {
-            model.to_string()
-        }
-    }
-
     fn build_request_body(&self, request: &ChatRequest) -> OpenAiRequest {
-        let model = self.resolve_model(&request.model);
+        let model = crate::provider::resolve_model(&request.model, &self.default_model);
         let mut messages: Vec<OpenAiMessage> = Vec::new();
 
         // Prepend system message if provided
@@ -335,7 +327,7 @@ impl OpenAiProvider {
         if !is_official_openai_url(&self.base_url) {
             return None;
         }
-        let model = self.resolve_model(&request.model);
+        let model = crate::provider::resolve_model(&request.model, &self.default_model);
 
         // Custom temperature rejected (reasoning models).
         if request.temperature.is_some() && mentions_unsupported_temperature(message) {
@@ -623,69 +615,14 @@ impl OpenAiProvider {
         let model = request
             .model
             .unwrap_or_else(|| "text-embedding-3-small".to_string());
-
-        let body = serde_json::json!({
-            "input": request.texts,
-            "model": model,
-        });
-
-        let resp = self
-            .client
-            .post(format!("{}/embeddings", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LlmError::Http(e.to_string()))?;
-
-        let status = resp.status().as_u16();
-        if status != 200 {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Api {
-                status,
-                message: text,
-            });
-        }
-
-        let api_resp: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| LlmError::Parse(e.to_string()))?;
-
-        let resp_model = api_resp
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or(&model)
-            .to_string();
-
-        let embeddings = api_resp
-            .get("data")
-            .and_then(|d| d.as_array())
-            .ok_or_else(|| LlmError::Parse("missing data in embedding response".to_string()))?
-            .iter()
-            .filter_map(|item| {
-                item.get("embedding")
-                    .and_then(|e| e.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect::<Vec<f64>>())
-            })
-            .collect::<Vec<Vec<f64>>>();
-
-        let usage = api_resp
-            .get("usage")
-            .map(|u| Usage {
-                prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-                completion_tokens: 0,
-                model: resp_model.clone(),
-                ..Default::default()
-            })
-            .unwrap_or_default();
-
-        Ok(EmbedResponse {
-            embeddings,
-            model: resp_model,
-            usage,
-        })
+        crate::embeddings::openai_compat_embed(
+            &self.client,
+            &self.base_url,
+            &self.api_key,
+            model,
+            request.texts,
+        )
+        .await
     }
 }
 

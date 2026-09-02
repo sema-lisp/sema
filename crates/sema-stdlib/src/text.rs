@@ -151,7 +151,9 @@ pub fn register(env: &sema_core::Env) {
         let vars = args[1]
             .as_map_rc()
             .ok_or_else(|| SemaError::type_error("map", args[1].type_name()))?;
-        Ok(Value::string(&render_template(template, &vars)))
+        Ok(Value::string(&sema_core::text_util::render_template(
+            template, &vars,
+        )))
     });
 
     // --- Task 15: Document Metadata ---
@@ -474,42 +476,3 @@ fn strip_leading_whitespace(line: &str, count: usize) -> &str {
 }
 
 // --- Template helpers ---
-
-fn render_template(template: &str, vars: &std::collections::BTreeMap<Value, Value>) -> String {
-    let mut result = String::with_capacity(template.len());
-    let mut chars = template.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '{' && chars.peek() == Some(&'{') {
-            chars.next();
-            let mut var_name = String::new();
-            let mut found_close = false;
-            while let Some(c) = chars.next() {
-                if c == '}' && chars.peek() == Some(&'}') {
-                    chars.next();
-                    found_close = true;
-                    break;
-                }
-                var_name.push(c);
-            }
-            if found_close {
-                if let Some(val) = vars.get(&Value::keyword(&var_name)) {
-                    if let Some(s) = val.as_str() {
-                        result.push_str(s);
-                    } else {
-                        result.push_str(&val.to_string());
-                    }
-                } else {
-                    result.push_str("{{");
-                    result.push_str(&var_name);
-                    result.push_str("}}");
-                }
-            } else {
-                result.push_str("{{");
-                result.push_str(&var_name);
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    result
-}

@@ -623,6 +623,48 @@ impl Interpreter {
         self.runtime().command_handle()
     }
 
+    /// Run a `.semac` program from its bytes on this interpreter's runtime.
+    /// Shared by the CLI (`sema file.semac`, embedded executables) and the MCP
+    /// `run_file` tool.
+    pub fn run_bytecode_bytes(&self, bytes: &[u8]) -> EvalResult {
+        let result = sema_vm::deserialize_from_bytes(bytes)?;
+
+        let functions: Vec<std::rc::Rc<sema_vm::Function>> =
+            result.functions.into_iter().map(std::rc::Rc::new).collect();
+        let main_cache_slots = result.chunk.n_global_cache_slots;
+        let closure = std::rc::Rc::new(sema_vm::Closure {
+            func: std::rc::Rc::new(sema_vm::Function {
+                name: None,
+                chunk: result.chunk,
+                upvalue_descs: Vec::new(),
+                upvalue_names: Vec::new(),
+                arity: 0,
+                has_rest: false,
+                param_names: Vec::new().into(),
+                local_names: Vec::new(),
+                local_scopes: Vec::new(),
+                source_file: None,
+                cache_offset: 0,
+                suspend_cache: std::cell::Cell::new(None),
+            }),
+            upvalues: Vec::new(),
+            // Top-level main closure: uses the VM's own globals and function table.
+            globals: None,
+            functions: None,
+        });
+
+        let mut vm = sema_vm::VM::new(self.global_env.clone(), functions, &[], main_cache_slots)?;
+        // Drive the `.semac` program on the interpreter's unified cooperative
+        // runtime, the sole async engine, so async/await, channels, and timers work
+        // in compiled bytecode (top-level or inside a `(load ...)`). A `.semac`
+        // carries no native table (the format is process-local), and bytecode
+        // compiled with `known_natives=None` uses CallGlobal rather than CallNative,
+        // so task VMs resolve natives via the shared global env — the empty native
+        // table passed to `VM::new` is correct here.
+        vm.seed_main_frame(closure);
+        self.drive_vm_on_runtime(vm)
+    }
+
     pub fn drive_vm_on_runtime(&self, vm: sema_vm::VM) -> EvalResult {
         // Submit as a fresh ROOT to the interpreter's single persistent runtime
         // (constructed once over THIS interpreter's context, so the VM's

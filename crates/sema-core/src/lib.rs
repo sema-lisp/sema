@@ -56,7 +56,9 @@ pub use io_backend::{
     io_backend, io_block_on, io_spawn, io_spawn_blocking, set_io_backend, AbortHook, BoxIoFuture,
     IoBackend,
 };
-pub use json::{json_to_value, key_to_string, value_to_json, value_to_json_lossy};
+pub use json::{
+    json_to_value, key_to_string, value_to_json, value_to_json_lossy, value_to_json_schema,
+};
 pub use lasso::Spur;
 pub use mcp_cassette::{
     clear_mcp_cassette_hook, mcp_cassette_decide, set_mcp_cassette_hook, McpCassetteDecision,

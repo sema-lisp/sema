@@ -1583,7 +1583,7 @@ fn main() {
         // Auto-detect .semac bytecode files
         if let Ok(bytes) = std::fs::read(path) {
             if sema_vm::is_bytecode_file(&bytes) {
-                match run_bytecode_bytes(&interpreter, &bytes) {
+                match interpreter.run_bytecode_bytes(&bytes) {
                     Ok(_) => {
                         drain_async_scheduler(&interpreter);
                     }
@@ -3546,7 +3546,7 @@ fn try_run_embedded() -> Option<i32> {
         });
         let tool_timeout = resolve_mcp_tool_timeout(timeout_ms);
 
-        if let Err(e) = run_bytecode_bytes(&interpreter, &bytecode) {
+        if let Err(e) = interpreter.run_bytecode_bytes(&bytecode) {
             print_error(&e);
             return Some(1);
         }
@@ -3560,7 +3560,7 @@ fn try_run_embedded() -> Option<i32> {
         }
         Some(0)
     } else {
-        match run_bytecode_bytes(&interpreter, &bytecode) {
+        match interpreter.run_bytecode_bytes(&bytecode) {
             Ok(_) => Some(0),
             Err(e) => {
                 print_error(&e);
@@ -4956,53 +4956,6 @@ fn chunk_to_json(chunk: &sema_vm::Chunk, name: &str) -> serde_json::Value {
     })
 }
 
-fn run_bytecode_bytes(
-    interpreter: &Interpreter,
-    bytes: &[u8],
-) -> Result<sema_core::Value, SemaError> {
-    let result = sema_vm::deserialize_from_bytes(bytes)?;
-
-    let functions: Vec<std::rc::Rc<sema_vm::Function>> =
-        result.functions.into_iter().map(std::rc::Rc::new).collect();
-    let main_cache_slots = result.chunk.n_global_cache_slots;
-    let closure = std::rc::Rc::new(sema_vm::Closure {
-        func: std::rc::Rc::new(sema_vm::Function {
-            name: None,
-            chunk: result.chunk,
-            upvalue_descs: Vec::new(),
-            upvalue_names: Vec::new(),
-            arity: 0,
-            has_rest: false,
-            param_names: Vec::new().into(),
-            local_names: Vec::new(),
-            local_scopes: Vec::new(),
-            source_file: None,
-            cache_offset: 0,
-            suspend_cache: std::cell::Cell::new(None),
-        }),
-        upvalues: Vec::new(),
-        // Top-level main closure: uses the VM's own globals and function table.
-        globals: None,
-        functions: None,
-    });
-
-    let mut vm = sema_vm::VM::new(
-        interpreter.global_env.clone(),
-        functions,
-        &[],
-        main_cache_slots,
-    )?;
-    // Drive the `.semac` program on the interpreter's unified cooperative
-    // runtime, the sole async engine, so async/await, channels, and timers work
-    // in compiled bytecode (top-level or inside a `(load ...)`). A `.semac`
-    // carries no native table (the format is process-local), and bytecode
-    // compiled with `known_natives=None` uses CallGlobal rather than CallNative,
-    // so task VMs resolve natives via the shared global env — the empty native
-    // table passed to `VM::new` is correct here.
-    vm.seed_main_frame(closure);
-    interpreter.drive_vm_on_runtime(vm)
-}
-
 fn run_fmt(
     patterns: &[String],
     check: bool,
@@ -6107,7 +6060,7 @@ mod tests {
         assert!(script.contains("_sema__subcmd__notebook_commands"));
     }
 
-    use super::{compile_source_to_bytecode, run_bytecode_bytes};
+    use super::compile_source_to_bytecode;
     use sema_core::{intern, NativeFn, Sandbox, Value};
     use sema_eval::Interpreter;
 
@@ -6129,7 +6082,9 @@ mod tests {
             })),
         );
 
-        run_bytecode_bytes(&interp, &bytes).expect("compiled program should execute");
+        interp
+            .run_bytecode_bytes(&bytes)
+            .expect("compiled program should execute");
 
         let counter_view = interp
             .global_env
@@ -6164,7 +6119,9 @@ mod tests {
             })),
         );
 
-        run_bytecode_bytes(&interp, &bytes).expect("compiled program should execute");
+        interp
+            .run_bytecode_bytes(&bytes)
+            .expect("compiled program should execute");
 
         let doubled = interp
             .global_env

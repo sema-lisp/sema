@@ -2021,39 +2021,7 @@ impl WasmInterpreter {
         OUTPUT.with(|o| o.borrow_mut().clear());
         LINE_BUF.with(|b| b.borrow_mut().clear());
 
-        let json_str = match self.inner.eval_str_in_global(code) {
-            Ok(val) => {
-                let output = take_output();
-                let val_str = if val.is_nil() {
-                    "null".to_string()
-                } else {
-                    format!("\"{}\"", escape_json(&pretty_print(&val, 80)))
-                };
-                format!(
-                    "{{\"value\":{},\"output\":[{}],\"error\":null}}",
-                    val_str,
-                    output
-                        .iter()
-                        .map(|s| format!("\"{}\"", escape_json(s)))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                )
-            }
-            Err(e) => {
-                let output = take_output();
-                let err_str = e.format_plain();
-                format!(
-                    "{{\"value\":null,\"output\":[{}],\"error\":\"{}\"}}",
-                    output
-                        .iter()
-                        .map(|s| format!("\"{}\"", escape_json(s)))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    escape_json(&err_str)
-                )
-            }
-        };
-        js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
+        eval_result_envelope(self.inner.eval_str_in_global(code))
     }
 
     /// Evaluate code via the bytecode VM, returns same JSON format as eval_global
@@ -2062,39 +2030,7 @@ impl WasmInterpreter {
         OUTPUT.with(|o| o.borrow_mut().clear());
         LINE_BUF.with(|b| b.borrow_mut().clear());
 
-        let json_str = match self.inner.eval_str_compiled(code) {
-            Ok(val) => {
-                let output = take_output();
-                let val_str = if val.is_nil() {
-                    "null".to_string()
-                } else {
-                    format!("\"{}\"", escape_json(&pretty_print(&val, 80)))
-                };
-                format!(
-                    "{{\"value\":{},\"output\":[{}],\"error\":null}}",
-                    val_str,
-                    output
-                        .iter()
-                        .map(|s| format!("\"{}\"", escape_json(s)))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                )
-            }
-            Err(e) => {
-                let output = take_output();
-                let err_str = e.format_plain();
-                format!(
-                    "{{\"value\":null,\"output\":[{}],\"error\":\"{}\"}}",
-                    output
-                        .iter()
-                        .map(|s| format!("\"{}\"", escape_json(s)))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                    escape_json(&err_str)
-                )
-            }
-        };
-        js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
+        eval_result_envelope(self.inner.eval_str_compiled(code))
     }
 
     /// Evaluate code with real (single-execution) async HTTP/sleep support in
@@ -3753,6 +3689,33 @@ pub fn format_code(code: &str, width: usize, indent: usize, align: bool) -> JsVa
             js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
         }
     }
+}
+
+/// The `{value, output, error}` JSON object `evalGlobal`/`evalVM` hand to JS:
+/// the pretty-printed value (or `null`), the captured output lines, and the
+/// plain-text error (or `null`).
+fn eval_result_envelope(result: Result<Value, SemaError>) -> JsValue {
+    let output = take_output();
+    let output_json = output
+        .iter()
+        .map(|s| format!("\"{}\"", escape_json(s)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let json_str = match result {
+        Ok(val) => {
+            let val_str = if val.is_nil() {
+                "null".to_string()
+            } else {
+                format!("\"{}\"", escape_json(&pretty_print(&val, 80)))
+            };
+            format!("{{\"value\":{val_str},\"output\":[{output_json}],\"error\":null}}")
+        }
+        Err(e) => format!(
+            "{{\"value\":null,\"output\":[{output_json}],\"error\":\"{}\"}}",
+            escape_json(&e.format_plain())
+        ),
+    };
+    js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
 }
 
 fn escape_json(s: &str) -> String {

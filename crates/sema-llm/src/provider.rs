@@ -200,3 +200,13 @@ impl Default for ProviderRegistry {
         Self::new()
     }
 }
+
+/// The model a request runs on: the requested name, or the provider's default
+/// when the request leaves it empty.
+pub(crate) fn resolve_model(requested: &str, default: &str) -> String {
+    if requested.is_empty() {
+        default.to_string()
+    } else {
+        requested.to_string()
+    }
+}

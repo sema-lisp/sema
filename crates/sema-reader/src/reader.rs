@@ -113,6 +113,25 @@ impl Parser {
         result
     }
 
+    /// Parse the operand of a prefix reader form (`'`, `` ` ``, `,`, `,@`, `@`).
+    /// A missing operand reports `what`; a malformed operand keeps its own
+    /// error so `'(1 . 2 3)` says what is wrong with the list, not the quote.
+    fn parse_prefix_operand(
+        &mut self,
+        what: &str,
+        hint: &str,
+        span: Span,
+    ) -> Result<Value, SemaError> {
+        if self.peek().is_none() {
+            return Err(SemaError::Reader {
+                message: format!("{what} requires an expression after it"),
+                span,
+            }
+            .with_hint(hint));
+        }
+        self.parse_expr()
+    }
+
     fn parse_expr_inner(&mut self) -> Result<Value, SemaError> {
         let span = self.span();
         match self.peek() {
@@ -125,58 +144,36 @@ impl Parser {
             Some(Token::LBrace) => self.parse_map(),
             Some(Token::Quote) => {
                 self.advance();
-                let inner = self.parse_expr().map_err(|_| {
-                    SemaError::Reader {
-                        message: "quote (') requires an expression after it".to_string(),
-                        span,
-                    }
-                    .with_hint("e.g. '(1 2 3) or 'foo")
-                })?;
+                let inner =
+                    self.parse_prefix_operand("quote (')", "e.g. '(1 2 3) or 'foo", span)?;
                 self.make_list_with_span(vec![Value::symbol("quote"), inner], span)
             }
             Some(Token::Quasiquote) => {
                 self.advance();
-                let inner = self.parse_expr().map_err(|_| {
-                    SemaError::Reader {
-                        message: "quasiquote (`) requires an expression after it".to_string(),
-                        span,
-                    }
-                    .with_hint("e.g. `(list ,x)")
-                })?;
+                let inner = self.parse_prefix_operand("quasiquote (`)", "e.g. `(list ,x)", span)?;
                 self.make_list_with_span(vec![Value::symbol("quasiquote"), inner], span)
             }
             Some(Token::Unquote) => {
                 self.advance();
-                let inner = self.parse_expr().map_err(|_| {
-                    SemaError::Reader {
-                        message: "unquote (,) requires an expression after it".to_string(),
-                        span,
-                    }
-                    .with_hint("use inside quasiquote, e.g. `(list ,x)")
-                })?;
+                let inner = self.parse_prefix_operand(
+                    "unquote (,)",
+                    "use inside quasiquote, e.g. `(list ,x)",
+                    span,
+                )?;
                 self.make_list_with_span(vec![Value::symbol("unquote"), inner], span)
             }
             Some(Token::UnquoteSplice) => {
                 self.advance();
-                let inner = self.parse_expr().map_err(|_| {
-                    SemaError::Reader {
-                        message: "unquote-splicing (,@) requires an expression after it"
-                            .to_string(),
-                        span,
-                    }
-                    .with_hint("use inside quasiquote, e.g. `(list ,@xs)")
-                })?;
+                let inner = self.parse_prefix_operand(
+                    "unquote-splicing (,@)",
+                    "use inside quasiquote, e.g. `(list ,@xs)",
+                    span,
+                )?;
                 self.make_list_with_span(vec![Value::symbol("unquote-splicing"), inner], span)
             }
             Some(Token::Deref) => {
                 self.advance();
-                let inner = self.parse_expr().map_err(|_| {
-                    SemaError::Reader {
-                        message: "deref (@) requires an expression after it".to_string(),
-                        span,
-                    }
-                    .with_hint("e.g. @x or @(atom)")
-                })?;
+                let inner = self.parse_prefix_operand("deref (@)", "e.g. @x or @(atom)", span)?;
                 self.make_list_with_span(vec![Value::symbol("deref"), inner], span)
             }
             Some(Token::BytevectorStart) => self.parse_bytevector(),

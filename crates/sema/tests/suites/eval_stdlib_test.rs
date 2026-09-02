@@ -523,10 +523,10 @@ eval_tests! {
         "(list/sum (list 10000000000000000000000 1))"
         => common::eval("10000000000000000000001"),
 
-    // The guard disagreed with the thing it guards, so the idiomatic
-    // `(if (string/number? s) (string->number s) fb)` returned #f for "+5".
+    // The guard must agree with the thing it guards, so the idiomatic
+    // `(if (string/number? s) (string->number s) fb)` works for "+5".
     string_number_p_agrees_with_conversion_on_leading_plus:
-        r#"(string/number? "+5")"# => Value::bool(false),
+        r#"(string/number? "+5")"# => Value::bool(true),
     string_number_p_accepts_rationals_like_the_reader:
         r#"(string/number? "1/2")"# => Value::bool(true),
 

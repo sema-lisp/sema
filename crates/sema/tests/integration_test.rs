@@ -1849,8 +1849,46 @@ fn test_arity_errors() {
     assert_arity_error("(string-length)");
 }
 
+/// The `as_index` hint names the real function, not a nonexistent `string/pad`.
 #[test]
-#[ignore = "arity call-form note deferred — separate from stack traces"]
+fn test_string_pad_hint_names_real_function() {
+    let err = eval_err(r#"(string/pad-left "x" "no")"#);
+    assert_eq!(
+        err.hint(),
+        Some("string/pad-left: argument must be an integer")
+    );
+    let err = eval_err(r#"(string/pad-right "x" "no")"#);
+    assert_eq!(
+        err.hint(),
+        Some("string/pad-right: argument must be an integer")
+    );
+}
+
+/// A malformed binding form is reported with the form's own source span.
+/// The macro expander must keep the bindings list's Rc identity (spans are
+/// keyed by pointer) or every `let`/`do` shape error loses its location.
+#[test]
+fn test_malformed_let_error_has_span() {
+    for src in [
+        "(let ((x)) x)",
+        "(let (x 1) x)",
+        "(let* ((x)) x)",
+        "(let loop ((x)) x)",
+        "(do (i) ((= i 3) i))",
+    ] {
+        let err = eval_err(src);
+        let trace = err
+            .stack_trace()
+            .unwrap_or_else(|| panic!("{src}: error should carry a stack trace: {err}"));
+        assert!(
+            trace.0.iter().any(|f| f.span.is_some()),
+            "{src}: no frame carries a span: {err}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "arity call-form note deferred — see docs/deferred.md (ERR-1); the source snippet under `-->` already shows the call"]
 fn test_arity_error_shows_call_form() {
     // Lambda arity error should include the call form in a note
     let err = eval_err("(define (f x) x) (f 1 2 3)");

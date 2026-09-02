@@ -1723,13 +1723,15 @@ eval_tests! {
 // differential suite across that boundary — each expected literal is the
 // output of the reader-backed path, so fast-path and fallback answers must
 // coincide exactly (including the deliberate rejections: the lexer reads
-// `+5`, `.5`, `5.`, `1e`, and `1_000` as symbols or multiple tokens).
+// `.5` as a symbol and rejects `5.`, `1e`, and `1_000` as malformed numbers;
+// an explicit `+` sign is accepted).
 eval_tests! {
     str2num_int: r#"(string->number "42")"# => Value::int(42),
     str2num_negative_int: r#"(string->number "-5")"# => Value::int(-5),
     str2num_leading_zeros: r#"(string->number "007")"# => Value::int(7),
     str2num_negative_zero_int: r#"(string->number "-0")"# => Value::int(0),
-    str2num_plus_prefix_rejected: r#"(string->number "+5")"# => Value::bool(false),
+    str2num_plus_prefix_accepted: r#"(string->number "+5")"# => Value::int(5),
+    str2num_plus_float_accepted: r#"(string->number "+1.5")"# => Value::float(1.5),
     str2num_underscores_rejected: r#"(string->number "1_000")"# => Value::bool(false),
     str2num_float: r#"(string->number "12.5")"# => Value::float(12.5),
     str2num_neg_float: r#"(string->number "-12.5")"# => Value::float(-12.5),
@@ -3111,4 +3113,101 @@ eval_tests! {
     shell_quote_empty: r#"(shell/quote "")"# => Value::string("''"),
     shell_quote_single_quote: r#"(shell/quote "a'b")"# => Value::string(r#"'a'\''b'"#),
     shell_quote_metachars: r#"(shell/quote "$x; rm -rf /")"# => Value::string("'$x; rm -rf /'"),
+}
+
+// Reader: R7RS long booleans, explicit `+` sign, and numbers that must end
+// at a delimiter (a number glued to letters used to lex as two tokens).
+eval_tests! {
+    reader_true_long_form: "#true" => Value::bool(true),
+    reader_false_long_form: "(list #false #f)" => common::eval("(list #f #f)"),
+    reader_plus_int: "+42" => Value::int(42),
+    reader_plus_float: "(+ +1.5 1)" => Value::float(2.5),
+    reader_plus_string_to_number: "(string->number \"+42\")" => Value::int(42),
+    reader_plus_alone_is_symbol: "(+)" => Value::int(0),
+}
+
+eval_error_tests! {
+    reader_bool_prefix_rejected: "#tx" => "invalid literal: #tx",
+    reader_number_glued_exponent: "1.5e" => "invalid number literal: 1.5e",
+    reader_number_glued_letters: "(list 1abc)" => "invalid number literal: 1abc",
+    reader_number_hex_prefix: "0x1F" => "invalid number literal: 0x1F",
+    reader_number_digit_separator: "1_000" => "invalid number literal: 1_000",
+    // A malformed dotted list reports its own error, not the quote's.
+    reader_dotted_list_error_not_quote: "'(1 . 2 3)" => "expected `)`",
+    reader_quote_without_operand: "'" => "quote (') requires an expression",
+}
+
+// Eager bulk constructors raise instead of aborting the process on an
+// absurd element count (limitation #35).
+eval_error_tests! {
+    bulk_range_capped: "(range 0 5277777779992)" => "range: 5277777779992 elements exceeds the limit",
+    bulk_iota_capped: "(iota 100000000000)" => "iota: 100000000000 elements exceeds the limit",
+    bulk_list_repeat_capped: "(list/repeat 100000000000 1)" => "list/repeat: 100000000000 elements exceeds the limit",
+    bulk_string_repeat_capped: "(string/repeat \"ab\" 100000000000)" => "string/repeat: 200000000000 elements exceeds the limit",
+    bulk_list_times_capped: "(list/times 100000000000 (lambda (i) i))" => "list/times: 100000000000 elements exceeds the limit",
+}
+
+eval_tests! {
+    bulk_range_below_cap: "(length (range 0 1000))" => Value::int(1000),
+    bulk_range_negative_step: "(range 5 0 -1)" => common::eval("'(5 4 3 2 1)"),
+    bulk_range_empty: "(range 5 1)" => common::eval("'()"),
+}
+
+// `set!` mutates an existing binding; it never defines one.
+eval_tests! {
+    set_global_existing: "(define x 1) (set! x 2) x" => Value::int(2),
+    set_local_existing: "(let ((y 1)) (set! y 5) y)" => Value::int(5),
+    set_unbound_is_catchable: "(try (set! nope 1) (catch e (:type e)))" => Value::keyword("unbound"),
+}
+
+eval_error_tests! {
+    set_unbound_global_raises: "(set! undefined-var 1)" => "Unbound variable: undefined-var",
+    set_unbound_inside_fn_raises: "(define (f) (set! zz 1)) (f)" => "Unbound variable: zz",
+}
+
+// `throw` of a string keeps the plain text as `:message`; other values use
+// their printed form. `:value` always holds the original.
+eval_tests! {
+    throw_string_message_unquoted: "(try (throw \"boom\") (catch e (:message e)))" => Value::string("boom"),
+    throw_map_message_printed: "(try (throw {:code 1}) (catch e (:message e)))" => Value::string("{:code 1}"),
+    throw_string_value_kept: "(try (throw \"boom\") (catch e (:value e)))" => Value::string("boom"),
+}
+
+// Keyword in operator position: `(:k m)` and `(:k m default)`.
+eval_tests! {
+    keyword_call_found: "(:a {:a 1} :missing)" => Value::int(1),
+    keyword_call_default: "(:b {:a 1} :missing)" => Value::keyword("missing"),
+    keyword_call_missing_nil: "(:b {:a 1})" => Value::nil(),
+    keyword_call_via_map: "(map :a (list {:a 1} {:b 2}))" => common::eval("(list 1 nil)"),
+    keyword_call_default_hashmap: "(:b (hashmap/assoc (hashmap/new) :a 1) 0)" => Value::int(0),
+}
+
+eval_error_tests! {
+    keyword_call_too_many_args: "(:a {:a 1} 1 2)" => ":a expects 1 or 2 arguments, got 3",
+    keyword_call_on_nil: "(:a nil)" => "expected map or hashmap, got nil",
+}
+
+eval_tests! {
+    // R7RS: a char whose case mapping is not a single char is returned as-is.
+    char_upcase_sharp_s: "(char-upcase #\\ß)" => Value::char('ß'),
+    char_upcase_ascii: "(char-upcase #\\a)" => Value::char('A'),
+    char_downcase_ascii: "(char-downcase #\\A)" => Value::char('a'),
+    // An out-of-range JSON float decodes as infinity, not nil.
+    json_decode_out_of_range_float: "(json/decode \"1e400\")" => Value::float(f64::INFINITY),
+    json_decode_negative_out_of_range: "(json/decode \"-1e400\")" => Value::float(f64::NEG_INFINITY),
+    json_decode_plain_float: "(json/decode \"1.5\")" => Value::float(1.5),
+}
+
+// Float display: exponent form beyond the JavaScript thresholds, `.0` for
+// integral values below them, and every spelling reads back to the same float.
+eval_tests! {
+    float_display_huge: "(str 1e300)" => Value::string("1e300"),
+    float_display_threshold_high: "(str 1e21)" => Value::string("1e21"),
+    float_display_below_threshold: "(str 1e20)" => Value::string("100000000000000000000.0"),
+    float_display_tiny: "(str 1e-8)" => Value::string("1e-8"),
+    float_display_threshold_low: "(str 1e-7)" => Value::string("0.0000001"),
+    float_display_negative_huge: "(str (- 0 1e25))" => Value::string("-1e25"),
+    float_display_mantissa: "(str (* 1.0 12345678901234567890123))" => Value::string("1.2345678901234568e22"),
+    float_display_roundtrip: "(= 1e300 (string->number (number->string 1e300)))" => Value::bool(true),
+    float_display_integral_keeps_dot: "(str 100.0)" => Value::string("100.0"),
 }

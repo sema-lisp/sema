@@ -62,10 +62,6 @@ SKIP_FILES=(
   # configure, which hit a provider (e.g. Ollama
   # at localhost:11434). Passes only where a
   # provider is reachable; must not gate CI.
-  "examples/llm/async-stress-live.sema" # LIVE async/streaming stress against
-  # real provider APIs (real spend, minutes of
-  # network). Manual verification gate for the
-  # true-async work — run via `jake llm-stress`.
 )
 
 is_skipped() {
@@ -74,9 +70,14 @@ is_skipped() {
   return 1
 }
 
-# Directories of runnable examples. (ai-tools/llm/providers need network+keys,
-# pi-sema is hardware, benchmarks need a generated data file, fixtures/
-# sema-web-app/notebook are not standalone programs — all excluded by omission.)
+# Directories of runnable examples. Everything else is excluded by omission:
+# - ai-tools/, llm/, providers/, workflows/, mcp/: need network + API keys
+#   (llm/async-stress-live.sema is real spend — run via `jake llm-stress`)
+# - pi-sema/: Raspberry Pi hardware
+# - benchmarks/: need a generated data file
+# - web/, web-demo/, sema-web-app/: sema-web apps that run in a browser
+#   (`sema web`), not standalone programs; web-demo has its own Playwright suite
+# - fixtures/, notebook/: not standalone programs
 GLOBS=(examples/*.sema examples/stdlib/*.sema)
 
 passed=0

@@ -3212,13 +3212,7 @@ impl fmt::Display for Value {
             ValueViewRef::Complex(c) => {
                 write!(f, "{}", SemaNumber::Complex(Box::new((*c).clone())))
             }
-            ValueViewRef::Float(n) => {
-                if n.fract() == 0.0 {
-                    write!(f, "{n:.1}")
-                } else {
-                    write!(f, "{n}")
-                }
-            }
+            ValueViewRef::Float(n) => crate::number::fmt_float(n, f),
             ValueViewRef::String(s) => {
                 write!(f, "\"")?;
                 for c in s.chars() {

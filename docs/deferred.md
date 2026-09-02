@@ -20,6 +20,21 @@ Also noted from the PR #59 merge review as low-priority, not-yet-done: capping t
 ---
 
 
+## ERR-1 — Arity errors do not carry an `in: (f 1 2 3)` note
+
+**Today:** an arity error prints the source snippet under `-->` and the
+`at f (<file>:line:col)` frame, which already shows the call. The test
+`test_arity_error_shows_call_form` (`crates/sema/tests/integration_test.rs`)
+additionally expects a `note()` of the form `in: (f 1 2 3)` and is `#[ignore]`d.
+
+**Why deferred:** the VM raises the arity error with a span but without the
+source text; reconstructing the call form would need the reader's source map at
+runtime. The snippet under `-->` gives the same information, so the note is
+low value. Revisit if error reports move to a structured format where a note
+is cheaper than a snippet.
+
+---
+
 ## D5 — Typed `try`/`catch` form
 
 **Today:** `(try expr (catch e ...))` catches *every* error type, including `:unbound`, `:arity`, `:type-error` — the kind of errors that usually mean a typo. The docs (`website/docs/language/special-forms.md` near "Re-throw errors you don't intend to handle") explicitly warn about this.
@@ -98,7 +113,7 @@ What's left:
 
 ## A note on the truly long-term language design items
 
-These are not deferred — they're design questions that need a deliberate decision before any code lands. They're tracked in `docs/wip.md` (the "Wave 6c" cluster), not here.
+These are not deferred — they're design questions that need a deliberate decision before any code lands. They were tracked in `docs/wip.md` (the "Wave 6c" cluster), which is now archived at `docs/plans/archive/wip.md`.
 
 ---
 
@@ -136,7 +151,10 @@ These are not deferred — they're design questions that need a deliberate decis
 - Add operator controls: pause/resume/cancel run, cancel/restart agent, inspect prompt/result/tool-transcript, export report.
 - Prefer SSE over WebSockets for the first live local dashboard stream.
 
-## Notebook: per-cell + per-session LLM cost tracking (status bar)
+## Notebook: per-cell + per-session LLM cost tracking (status bar) — SHIPPED in 1.35.0
+
+Shipped as #68 (see CHANGELOG 1.35.0). The scoping notes below are kept for
+the record only.
 
 Accumulate LLM spend for a notebook session and attribute it per cell / per
 run, surfaced as a per-cell badge and a session-cumulative status bar. Scoped

@@ -5122,6 +5122,23 @@ fn run_fmt(
                         std::process::exit(1);
                     }
                 }
+            } else if std::path::Path::new(pattern).is_dir() {
+                // A directory means every .sema file under it (`sema fmt .`).
+                let dir_glob = format!("{}/**/*.sema", pattern.trim_end_matches(['/', '\\']));
+                match glob::glob_with(&dir_glob, match_opts) {
+                    Ok(paths) => {
+                        for path in paths.filter_map(|p| p.ok()) {
+                            let path = path.to_string_lossy().to_string();
+                            if !is_ignored(&path) {
+                                all_files.push(path);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        print_cli_error(format!("invalid glob pattern '{dir_glob}': {e}"));
+                        std::process::exit(1);
+                    }
+                }
             } else {
                 // An explicitly named file always formats, ignore list or not
                 all_files.push(pattern.clone());

@@ -1862,6 +1862,7 @@ fn sort_runtime(args: &[Value]) -> NativeResult {
 fn repeat_impl(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "list/repeat", 2);
     let n = args[0].as_index("list/repeat")?;
+    crate::check_bulk_len("list/repeat", n)?;
     let val = args[1].clone();
     Ok(Value::list(vec![val; n]))
 }
@@ -2256,6 +2257,10 @@ pub fn register(env: &sema_core::Env) {
         };
         if step == 0 {
             return Err(SemaError::eval("range: step cannot be 0"));
+        }
+        let span = (end as i128 - start as i128) / step as i128;
+        if span > 0 {
+            crate::check_bulk_len("range", span as usize)?;
         }
         let mut result = Vec::new();
         let mut i = start;
@@ -3066,7 +3071,9 @@ pub fn register(env: &sema_core::Env) {
                 (c, s, st)
             }
         };
-        let mut result = Vec::with_capacity(count.max(0) as usize);
+        let count = count.max(0) as usize;
+        crate::check_bulk_len("iota", count)?;
+        let mut result = Vec::with_capacity(count);
         let mut val = start;
         for _ in 0..count {
             result.push(Value::int(val));
@@ -3280,6 +3287,7 @@ pub fn register(env: &sema_core::Env) {
         |args| {
             check_arity!(args, "list/times", 2);
             let n = args[0].as_index("list/times")?;
+            crate::check_bulk_len("list/times", n)?;
             let mut result = Vec::with_capacity(n);
             for i in 0..n {
                 result.push(call_function(&args[1], &[Value::int(i as i64)])?);
@@ -3289,6 +3297,7 @@ pub fn register(env: &sema_core::Env) {
         |args| {
             check_arity!(args, "list/times", 2);
             let n = args[0].as_index("list/times")?;
+            crate::check_bulk_len("list/times", n)?;
             Ok(collect_range_call(
                 &args[1],
                 n,

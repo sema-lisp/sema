@@ -242,9 +242,11 @@ A program compiled as one unit bakes calls to *known builtins* into `CallNative`
 
 This worked on the retired tree-walker (late name resolution). On the VM, avoid shadowing a builtin name from an imported/loaded module (rename it, e.g. `truncate-str`), or `define` the override at top level in the same program. A general fix (conservatively disabling `CallNative` for programs containing `import`/`load`) was rejected for the per-call perf cost. The same compilation-unit boundary applies in the other direction to the intrinsic opcodes and the constant folder: a top-level `(define not ...)` (or any foldable/intrinsic name — `+`, `car`, `=` …) in one unit is invisible to code compiled in a *different* unit (a `(load ...)`ed file, a later REPL line), which still dispatches to — or folds with — the builtin.
 
-### 35. Eager bulk allocators can exhaust memory (resource DoS, found by fuzzing)
+### ~~35. Eager bulk allocators can exhaust memory (resource DoS, found by fuzzing)~~ → RESOLVED (2026-09-01)
 
-`(range 0 5277777779992)` and similar eager bulk-allocating builtins try to materialize the entire result up front, so a single call with an absurd size exhausts memory and aborts the process — the per-eval step limit doesn't help because it's one native call, not a loop the VM counts. Surfaced by the `fuzz_eval` VM fuzzer (an out-of-memory artifact, not a panic/UB — the VM itself stayed memory-safe across the run). This is a denial-of-service concern for untrusted input / sandboxed embedding, not a soundness bug. Possible fixes (deferred): a configurable element/allocation cap that errors instead of OOMing, or lazy ranges. Until then, validate sizes before calling `range` on untrusted input.
+**Resolved.** `range`, `iota`, `list/repeat`/`make-list`, `list/times`, and `string/repeat` reject a result above `MAX_BULK_ELEMENTS` (100M elements or bytes, `crates/sema-stdlib/src/lib.rs`) with a catchable `SemaError` instead of allocating. Regression tests: `bulk_*` in `crates/sema/tests/suites/eval_test.rs`.
+
+Original report: `(range 0 5277777779992)` and similar eager bulk-allocating builtins try to materialize the entire result up front, so a single call with an absurd size exhausts memory and aborts the process — the per-eval step limit doesn't help because it's one native call, not a loop the VM counts. Surfaced by the `fuzz_eval` VM fuzzer (an out-of-memory artifact, not a panic/UB — the VM itself stayed memory-safe across the run). This is a denial-of-service concern for untrusted input / sandboxed embedding, not a soundness bug. Possible fixes (deferred): a configurable element/allocation cap that errors instead of OOMing, or lazy ranges. Until then, validate sizes before calling `range` on untrusted input.
 
 ---
 
@@ -273,6 +275,23 @@ The last line is the footgun: `and` in head position is the special form, not th
 **What remains:** `ws/send` and `ws/close` are still synchronous. `ws/send` can block the VM thread, but only when that connection's 256-slot outgoing queue is already full — i.e. a client that stopped reading while the handler keeps writing. A handler that pushes unbounded data at a stalled client will stall its siblings; one that sends in response to received messages will not.
 
 **Also unconverted:** an SSE stream handler is still invoked via `call_callback`, which suspends `in_runtime_quantum()` for the call's duration. A cooperative op inside an SSE handler body silently falls back to its blocking path rather than parking. Sending from SSE handlers works normally; suspending inside one does not.
+
+---
+
+### 39. `do` loop closures share one binding per variable
+
+R7RS `do` rebinds its variables on every iteration, so a closure created in the
+body captures that iteration's value. Sema's `do` lowers to `set!` on one
+binding per variable, so every closure sees the final value:
+
+```sema
+(do ((i 0 (+ i 1)) (fs '() (cons (lambda () i) fs)))
+    ((= i 3) (map (lambda (f) (f)) fs)))
+; => (3 3 3)   ; R7RS: (2 1 0)
+```
+
+Named `let` and `map` over `range` create fresh bindings and are the
+workaround. Changing `do` would cost an allocation per iteration; deferred.
 
 ---
 

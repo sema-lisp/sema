@@ -213,21 +213,30 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                 let token_start = i;
                 if i + 1 < chars.len() {
                     match chars[i + 1] {
-                        't' => {
-                            i += 2;
-                            col += 2;
+                        't' | 'f' => {
+                            // `#t` / `#f`, plus the R7RS long forms `#true` /
+                            // `#false`. The literal must end at a delimiter so
+                            // `#true` never lexes as `#t` + symbol `rue`.
+                            let mut end = i + 1;
+                            while end < chars.len() && is_symbol_char(chars[end]) {
+                                end += 1;
+                            }
+                            let word: String = chars[i + 1..end].iter().collect();
+                            let value = match word.as_str() {
+                                "t" | "true" => true,
+                                "f" | "false" => false,
+                                _ => {
+                                    return Err(SemaError::Reader {
+                                        message: format!("invalid literal: #{word}"),
+                                        span: span.with_end(line, col + (end - i)),
+                                    }
+                                    .with_hint("booleans are #t/#f (or #true/#false)"));
+                                }
+                            };
+                            col += end - i;
+                            i = end;
                             tokens.push(SpannedToken {
-                                token: Token::Bool(true),
-                                span: span.with_end(line, col),
-                                byte_start: byte_offsets[token_start],
-                                byte_end: byte_offsets[i],
-                            });
-                        }
-                        'f' => {
-                            i += 2;
-                            col += 2;
-                            tokens.push(SpannedToken {
-                                token: Token::Bool(false),
+                                token: Token::Bool(value),
                                 span: span.with_end(line, col),
                                 byte_start: byte_offsets[token_start],
                                 byte_end: byte_offsets[i],
@@ -513,21 +522,35 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                         byte_start: byte_offsets[token_start],
                         byte_end: byte_offsets[i],
                     });
-                } else if ch == '-' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
-                    // Negative number
+                } else if ch.is_ascii_digit()
+                    || ((ch == '-' || ch == '+')
+                        && i + 1 < chars.len()
+                        && chars[i + 1].is_ascii_digit())
+                {
+                    // Number, optionally signed. An explicit `+` is dropped
+                    // before `read_number` (it only understands a leading `-`).
                     let token_start = i;
-                    let (tok, len) = read_number(&chars[i..], &span)?;
-                    i += len;
-                    col += len;
-                    tokens.push(SpannedToken {
-                        token: tok,
-                        span: span.with_end(line, col),
-                        byte_start: byte_offsets[token_start],
-                        byte_end: byte_offsets[i],
-                    });
-                } else if ch.is_ascii_digit() {
-                    let token_start = i;
-                    let (tok, len) = read_number(&chars[i..], &span)?;
+                    let body_start = if ch == '+' { i + 1 } else { i };
+                    let (tok, len) = read_number(&chars[body_start..], &span)?;
+                    let end = body_start + len;
+                    // A number must end at a delimiter. Otherwise `1.5e`,
+                    // `1abc`, `0x1F` or `1_000` would silently lex as a number
+                    // followed by a symbol.
+                    if !is_delimiter_at(&chars, end) {
+                        let mut stop = end;
+                        while !is_delimiter_at(&chars, stop) {
+                            stop += 1;
+                        }
+                        let text: String = chars[token_start..stop].iter().collect();
+                        return Err(SemaError::Reader {
+                            message: format!("invalid number literal: {text}"),
+                            span: span.with_end(line, col + (stop - token_start)),
+                        }
+                        .with_hint(
+                            "a number must be followed by whitespace or a bracket; Sema has no 0x/0b prefixes or digit separators (use #x1F, #b101)",
+                        ));
+                    }
+                    let len = end - token_start;
                     i += len;
                     col += len;
                     tokens.push(SpannedToken {
@@ -889,8 +912,8 @@ fn read_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaError>
         i += 1;
     }
     let mut is_float = false;
-    // Fraction: a `.` followed by at least one digit (a trailing `.` is left to the
-    // symbol lexer, preserving the existing `1.` behavior).
+    // Fraction: a `.` followed by at least one digit (a trailing `.` is not
+    // consumed, so `1.` fails the delimiter check in the caller).
     if i < chars.len() && chars[i] == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
         i += 1; // skip dot
         while i < chars.len() && chars[i].is_ascii_digit() {
@@ -957,7 +980,7 @@ fn read_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaError>
     let s: String = chars[..i].iter().collect();
     // Complex Case A: the leading real is the imaginary magnitude — `<real>i<delim>`
     // (e.g. `2i`, `1.5i`). A trailing `i` only counts when a delimiter follows,
-    // so `3ix` stays `Int(3)` + symbol `ix`.
+    // so `3ix` is not a complex number (the caller then rejects it).
     if i < chars.len() && chars[i] == 'i' && is_delimiter_at(chars, i + 1) {
         let im = parse_real_component(&s, is_float, span)?;
         return Ok((Token::Complex(SemaNumber::from_i64(0), im), i + 1));
@@ -1210,15 +1233,81 @@ mod tests {
                 Token::RParen,
             ]
         );
-        // Guards: an `e`/`E` not followed by (sign+)digits is NOT consumed — `1e`
-        // is Int(1) plus a separate symbol, and a bare `e19` identifier stays a
-        // symbol, so existing code using `e…` names is unaffected.
-        assert_eq!(first("1e"), Token::Int(1));
-        assert_eq!(toks("1e").len(), 2);
-        assert!(matches!(&toks("1e")[1], Token::Symbol(s) if s == "e"));
-        assert_eq!(first("1e+"), Token::Int(1));
-        assert!(matches!(&toks("1e+")[1], Token::Symbol(_))); // leftover `e+` is a symbol
+        // Guards: an `e`/`E` not followed by (sign+)digits is NOT part of the
+        // number, and a number must end at a delimiter, so `1e` / `1e+` are
+        // reader errors rather than Int(1) plus a stray symbol. A bare `e19`
+        // identifier stays a symbol, so code using `e…` names is unaffected.
+        assert!(tokenize("1e").is_err());
+        assert!(tokenize("1e+").is_err());
         assert!(matches!(first("e19"), Token::Symbol(s) if s == "e19"));
+    }
+
+    #[test]
+    fn test_number_must_end_at_delimiter() {
+        let first = |src: &str| tokenize(src).unwrap().into_iter().next().unwrap().token;
+        let toks = |src: &str| -> Vec<Token> {
+            tokenize(src)
+                .unwrap()
+                .into_iter()
+                .map(|t| t.token)
+                .collect()
+        };
+        for bad in [
+            "1.5e", "1abc", "0x1F", "0b101", "1_000", "1.", "3ix", "12foo)",
+        ] {
+            let err = tokenize(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid number literal"),
+                "{bad}: expected invalid-number error, got {err}"
+            );
+        }
+        assert_eq!(
+            toks("(1)"),
+            vec![Token::LParen, Token::Int(1), Token::RParen]
+        );
+        assert_eq!(first("1;c"), Token::Int(1));
+        assert_eq!(first("1\"s\""), Token::Int(1));
+    }
+
+    #[test]
+    fn test_explicit_plus_sign_numbers() {
+        let first = |src: &str| tokenize(src).unwrap().into_iter().next().unwrap().token;
+        assert_eq!(first("+42"), Token::Int(42));
+        assert_eq!(first("+1.5"), Token::Float(1.5));
+        assert_eq!(first("+1e3"), Token::Float(1e3));
+        assert!(matches!(first("+1/2"), Token::Rational(_)));
+        assert!(matches!(first("+2i"), Token::Complex(_, _)));
+        // `+` alone, and `+` followed by a non-digit, stay symbols.
+        assert!(matches!(first("+"), Token::Symbol(s) if s == "+"));
+        assert!(matches!(first("+foo"), Token::Symbol(s) if s == "+foo"));
+    }
+
+    #[test]
+    fn test_boolean_long_forms() {
+        let first = |src: &str| tokenize(src).unwrap().into_iter().next().unwrap().token;
+        let toks = |src: &str| -> Vec<Token> {
+            tokenize(src)
+                .unwrap()
+                .into_iter()
+                .map(|t| t.token)
+                .collect()
+        };
+        assert_eq!(first("#true"), Token::Bool(true));
+        assert_eq!(first("#false"), Token::Bool(false));
+        assert_eq!(
+            toks("(#t #f)"),
+            vec![
+                Token::LParen,
+                Token::Bool(true),
+                Token::Bool(false),
+                Token::RParen
+            ]
+        );
+        assert!(tokenize("#tx")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid literal: #tx"));
+        assert!(tokenize("#fals").is_err());
     }
 
     #[test]

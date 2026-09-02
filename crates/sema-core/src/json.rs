@@ -109,6 +109,17 @@ fn bignum_to_json_number(digits: String) -> Result<serde_json::Value, SemaError>
     Ok(serde_json::Value::Number(n))
 }
 
+/// A JSON number that is not an integer. `as_f64` returns `None` for a
+/// literal outside the f64 range (`1e400`); Rust's parser maps that to
+/// infinity, the same as `(string->number "1e400")`, so use it rather than
+/// silently decoding the number as nil.
+fn json_number_to_float(n: &serde_json::Number) -> Value {
+    match n.as_f64().or_else(|| n.as_str().parse::<f64>().ok()) {
+        Some(f) => Value::float(f),
+        None => Value::nil(),
+    }
+}
+
 /// Convert a JSON value to a Sema Value.
 pub fn json_to_value(json: &serde_json::Value) -> Value {
     match json {
@@ -123,12 +134,10 @@ pub fn json_to_value(json: &serde_json::Value) -> Value {
                 // feature) into a bignum instead of losing precision to f64.
                 match SemaNumber::parse_int_radix(n.as_str(), 10) {
                     Some(SemaNumber::Integer(big)) => Value::from_bigint(big),
-                    _ => n.as_f64().map(Value::float).unwrap_or_else(Value::nil),
+                    _ => json_number_to_float(n),
                 }
-            } else if let Some(f) = n.as_f64() {
-                Value::float(f)
             } else {
-                Value::nil()
+                json_number_to_float(n)
             }
         }
         serde_json::Value::String(s) => Value::string(s),

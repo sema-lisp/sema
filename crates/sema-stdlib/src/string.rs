@@ -648,6 +648,7 @@ pub fn register(env: &sema_core::Env) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         let n = args[1].as_index("string/repeat")?;
+        crate::check_bulk_len("string/repeat", s.len().saturating_mul(n))?;
         if s.len().checked_mul(n).is_none() {
             return Err(
                 SemaError::eval("string/repeat: result length overflows usize").with_hint(format!(
@@ -699,7 +700,7 @@ pub fn register(env: &sema_core::Env) {
         let s = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let width = args[1].as_index("string/pad")?;
+        let width = args[1].as_index("string/pad-left")?;
         let pad_char = if args.len() == 3 {
             let p = args[2]
                 .as_str()
@@ -716,7 +717,7 @@ pub fn register(env: &sema_core::Env) {
         let s = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let width = args[1].as_index("string/pad")?;
+        let width = args[1].as_index("string/pad-right")?;
         let pad_char = if args.len() == 3 {
             let p = args[2]
                 .as_str()
@@ -864,12 +865,22 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::bool(c.is_lowercase()))
     });
 
+    /// R7RS `char-upcase`/`char-downcase` return the argument unchanged when
+    /// the Unicode mapping is not a single char (`ß` → `SS`), rather than the
+    /// first char of the expansion.
+    fn single_char_case(c: char, mut mapped: impl Iterator<Item = char>) -> char {
+        match (mapped.next(), mapped.next()) {
+            (Some(m), None) => m,
+            _ => c,
+        }
+    }
+
     register_fn(env, "char-upcase", |args| {
         check_arity!(args, "char-upcase", 1);
         let c = args[0]
             .as_char()
             .ok_or_else(|| SemaError::type_error("char", args[0].type_name()))?;
-        Ok(Value::char(c.to_uppercase().next().unwrap_or(c)))
+        Ok(Value::char(single_char_case(c, c.to_uppercase())))
     });
 
     register_fn(env, "char-downcase", |args| {
@@ -877,7 +888,7 @@ pub fn register(env: &sema_core::Env) {
         let c = args[0]
             .as_char()
             .ok_or_else(|| SemaError::type_error("char", args[0].type_name()))?;
-        Ok(Value::char(c.to_lowercase().next().unwrap_or(c)))
+        Ok(Value::char(single_char_case(c, c.to_lowercase())))
     });
 
     register_fn(env, "char->string", |args| {
@@ -1357,12 +1368,10 @@ pub fn register(env: &sema_core::Env) {
                 if !current.is_empty() && (!prev_was_upper || prev_was_sep) {
                     words.push(current.clone());
                     current.clear();
-                } else if !current.is_empty() && prev_was_upper && current.len() > 1 {
-                    // Handle acronyms like "HTMLParser" -> ["HTML", "Parser"]
-                    // We need to peek ahead — but since we don't have peek here,
-                    // we'll handle it simply: consecutive uppercase stays together
-                    // until a lowercase follows
                 }
+                // Consecutive uppercase stays together (an acronym such as
+                // "HTML" in "HTMLParser"); the split happens when a lowercase
+                // char follows, in the branch below.
                 current.push(ch);
                 prev_was_upper = true;
                 prev_was_sep = false;

@@ -2638,8 +2638,8 @@ impl VM {
         // for $code. The in-process emitter (sema-vm/src/lower.rs) emits complete
         // instructions where every opcode is followed by its full operand bytes.
         // Deserialized bytecode is validated by advance_pc in serialize.rs, which
-        // rejects truncated chunks. See FIXME(C11) above pop_unchecked for the
-        // known gap with hand-crafted .semac files.
+        // rejects truncated chunks. See limitation #32 in docs/limitations.md
+        // for the trust model around hand-crafted .semac files.
         macro_rules! read_u16 {
             ($code:expr, $pc:expr) => {{
                 let v = unsafe { u16::from_le_bytes([*$code.add($pc), *$code.add($pc + 1)]) };
@@ -3278,8 +3278,13 @@ impl VM {
                         let bits = read_u32!(code, pc);
                         let spur = bits_to_spur(bits);
                         let val = unsafe { pop_unchecked(&mut self.stack) };
-                        if !self.globals.set_existing(spur, val.clone()) {
-                            self.globals.set(spur, val);
+                        // `set!` mutates an existing binding only; it never
+                        // defines one (that is `define`).
+                        if !self.globals.set_existing(spur, val) {
+                            let err = unbound_global_error(spur, &self.globals).with_hint(
+                                "set! needs an existing binding; use define to create one",
+                            );
+                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP_U32, 'dispatch);
                         }
                     }
                     op::DEFINE_GLOBAL => {
@@ -4346,20 +4351,10 @@ impl VM {
             self.stash_native_dispatch(dispatch);
             Ok(())
         } else if let Some(kw) = self.stack[func_idx].as_keyword_spur() {
-            // Keyword as function: (kw map) -> map[kw]
-            if argc != 1 {
-                return Err(SemaError::arity(resolve_spur(kw), "1", argc));
-            }
-            let arg = self.stack.pop().unwrap();
+            // Keyword as function: (kw map) -> map[kw], (kw map default)
+            let args: SmallVec<[Value; 8]> = self.stack.drain(func_idx + 1..).collect();
             self.stack.pop(); // pop keyword
-            let kw_val = Value::keyword_from_spur(kw);
-            let result = if let Some(m) = arg.as_map_rc() {
-                m.get(&kw_val).cloned().unwrap_or(Value::nil())
-            } else if let Some(m) = arg.as_hashmap_rc() {
-                m.get(&kw_val).cloned().unwrap_or(Value::nil())
-            } else {
-                return Err(SemaError::type_error("map or hashmap", arg.type_name()));
-            };
+            let result = keyword_lookup(kw, &args)?;
             self.stack.push(result);
             Ok(())
         } else {
@@ -4459,18 +4454,9 @@ impl VM {
             self.stash_native_dispatch(dispatch);
             Ok(())
         } else if let Some(kw) = func_val.as_keyword_spur() {
-            if argc != 1 {
-                return Err(SemaError::arity(resolve_spur(kw), "1", argc));
-            }
-            let arg = self.stack.pop().unwrap();
-            let kw_val = Value::keyword_from_spur(kw);
-            let result = if let Some(m) = arg.as_map_rc() {
-                m.get(&kw_val).cloned().unwrap_or(Value::nil())
-            } else if let Some(m) = arg.as_hashmap_rc() {
-                m.get(&kw_val).cloned().unwrap_or(Value::nil())
-            } else {
-                return Err(SemaError::type_error("map or hashmap", arg.type_name()));
-            };
+            let args_start = self.stack.len() - argc;
+            let args: SmallVec<[Value; 8]> = self.stack.drain(args_start..).collect();
+            let result = keyword_lookup(kw, &args)?;
             self.stack.push(result);
             Ok(())
         } else {
@@ -5909,7 +5895,13 @@ fn error_to_value(err: &SemaError) -> Value {
         }
         SemaError::UserException(val) => {
             map.insert(Value::keyword("type"), Value::keyword("user"));
-            map.insert(Value::keyword("message"), Value::string(&val.to_string()));
+            // A thrown string is the message itself; anything else uses its
+            // printed form. `:value` keeps the original either way.
+            let message = match val.as_str() {
+                Some(s) => s.to_string(),
+                None => val.to_string(),
+            };
+            map.insert(Value::keyword("message"), Value::string(&message));
             map.insert(Value::keyword("value"), val.clone());
         }
         SemaError::Io(msg) => {
@@ -6094,6 +6086,27 @@ fn intrinsic_name(opcode: Op) -> Option<&'static str> {
 /// Hint for `get`/`contains?` called on the wrong collection type. These work
 /// on maps only; users from Clojure expect them to index vectors too, so when
 /// the collection is a list/vector we redirect them to `nth`.
+/// `(:key map)` and `(:key map default)`: a keyword in operator position
+/// looks itself up in a map, like `get`.
+fn keyword_lookup(kw: Spur, args: &[Value]) -> Result<Value, SemaError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(SemaError::arity(
+            format!(":{}", resolve_spur(kw)),
+            "1 or 2",
+            args.len(),
+        ));
+    }
+    let kw_val = Value::keyword_from_spur(kw);
+    let found = if let Some(m) = args[0].as_map_rc() {
+        m.get(&kw_val).cloned()
+    } else if let Some(m) = args[0].as_hashmap_rc() {
+        m.get(&kw_val).cloned()
+    } else {
+        return Err(SemaError::type_error("map or hashmap", args[0].type_name()));
+    };
+    Ok(found.unwrap_or_else(|| args.get(1).cloned().unwrap_or(Value::nil())))
+}
+
 fn map_access_hint(func: &str, coll: &Value) -> String {
     if coll.as_list().is_some() || coll.as_vector().is_some() {
         format!("{func} works on maps; use (nth coll i) to index a list or vector")

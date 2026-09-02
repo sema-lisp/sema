@@ -508,8 +508,9 @@ fn collect_query_rows(
     let mut stmt = conn.prepare(sql).map_err(DbOpError::Sqlite)?;
     let col_count = stmt.column_count();
     let col_names: Vec<String> = (0..col_count)
-        .map(|i| stmt.column_name(i).unwrap().to_string())
-        .collect();
+        .map(|i| stmt.column_name(i).map(str::to_string))
+        .collect::<Result<_, _>>()
+        .map_err(DbOpError::Sqlite)?;
     let mut rows = stmt
         .query_map(params_from_iter(params.iter()), |row| {
             let mut r = Vec::with_capacity(col_count);
@@ -556,8 +557,9 @@ fn collect_first_query_row(
     let mut stmt = conn.prepare(sql).map_err(DbOpError::Sqlite)?;
     let col_count = stmt.column_count();
     let col_names: Vec<String> = (0..col_count)
-        .map(|i| stmt.column_name(i).unwrap().to_string())
-        .collect();
+        .map(|i| stmt.column_name(i).map(str::to_string))
+        .collect::<Result<_, _>>()
+        .map_err(DbOpError::Sqlite)?;
     let mut rows = stmt
         .query_map(params_from_iter(params.iter()), |row| {
             let mut r = Vec::with_capacity(col_count);

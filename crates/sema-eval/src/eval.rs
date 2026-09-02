@@ -1527,7 +1527,14 @@ fn expand_let_form(
 
     let body_scope = shadow.child(bound);
     let mut expanded: Vec<Value> = items[..bindings_idx].to_vec();
-    expanded.push(Value::list(new_pairs));
+    // Keep the bindings list's Rc identity when nothing expanded, so the
+    // whole `let` form keeps its span and a malformed binding is reported
+    // with a source location.
+    expanded.push(if bindings_form.as_list().is_some() {
+        rebuilt_list(bindings_form, &pairs, new_pairs)
+    } else {
+        Value::list(new_pairs)
+    });
     expanded.extend(expand_body(
         expander,
         env,
@@ -1576,7 +1583,11 @@ fn expand_do_form(
         }
         new_specs.push(rebuilt_list(spec, spec_items, new_spec));
     }
-    let mut expanded: Vec<Value> = vec![items[0].clone(), Value::list(new_specs)];
+    let specs_form = &items[1];
+    let mut expanded: Vec<Value> = vec![
+        items[0].clone(),
+        rebuilt_list(specs_form, &specs, new_specs),
+    ];
     for item in items.iter().skip(2) {
         expanded.push(expand_macros_in(expander, env, item, &inner)?);
     }

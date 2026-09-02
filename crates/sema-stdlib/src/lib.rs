@@ -185,6 +185,23 @@ use sema_core::{Env, Sandbox, Value};
 /// Strip ANSI escape sequences from `s`: full CSI (`ESC[ … final-byte`), OSC
 /// (`ESC] … BEL|ST`), and other two-char escapes. Shared by `term/strip`,
 /// `string/width`, and `string/wrap` so display-width math ignores styling.
+/// Upper bound on the element count an eager bulk constructor (`range`,
+/// `iota`, `list/repeat`, `string/repeat`, ...) will allocate in one call.
+/// Without it `(range 0 5000000000000)` aborts the whole process with an
+/// out-of-memory error instead of raising a catchable `SemaError`.
+pub(crate) const MAX_BULK_ELEMENTS: usize = 100_000_000;
+
+/// Reject a bulk allocation of `count` elements above `MAX_BULK_ELEMENTS`.
+pub(crate) fn check_bulk_len(func: &str, count: usize) -> Result<(), sema_core::SemaError> {
+    if count > MAX_BULK_ELEMENTS {
+        return Err(sema_core::SemaError::eval(format!(
+            "{func}: {count} elements exceeds the limit of {MAX_BULK_ELEMENTS}"
+        ))
+        .with_hint("build large sequences lazily (stream/*) or in chunks"));
+    }
+    Ok(())
+}
+
 pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();

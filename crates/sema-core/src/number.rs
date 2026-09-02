@@ -454,19 +454,28 @@ impl SemaNumber {
     }
 }
 
+/// Print a float the way Sema displays it: integral values keep a `.0`, and
+/// magnitudes beyond the JavaScript `Number#toString` thresholds use exponent
+/// form so `1e300` does not print as 300 digits. The reader parses every
+/// spelling produced here back to the same float.
+pub fn fmt_float(v: f64, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    let mag = v.abs();
+    if v.is_finite() && (mag >= 1e21 || (mag > 0.0 && mag < 1e-7)) {
+        write!(f, "{v:e}")
+    } else if v.fract() == 0.0 && v.is_finite() {
+        write!(f, "{v:.1}")
+    } else {
+        write!(f, "{v}")
+    }
+}
+
 /// Format a real component the way Sema prints floats/ints (shared by the
 /// complex arm so `2.0+0.5i` matches standalone `2.0`/`0.5`).
 fn fmt_real(n: &SemaNumber, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match n {
         SemaNumber::Integer(v) => write!(f, "{v}"),
         SemaNumber::Rational(r) => write!(f, "{}/{}", r.numer(), r.denom()),
-        SemaNumber::Real(v) => {
-            if v.fract() == 0.0 && v.is_finite() {
-                write!(f, "{v:.1}")
-            } else {
-                write!(f, "{v}")
-            }
-        }
+        SemaNumber::Real(v) => fmt_float(*v, f),
         SemaNumber::Complex(_) => unreachable!("complex component is never complex"),
     }
 }

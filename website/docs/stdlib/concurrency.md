@@ -118,9 +118,11 @@ A `ms = 0` (or very short) timeout still lets work that is **synchronously ready
 (async/cancel promise) → bool
 ```
 
-Request cancellation of a spawned task. Returns `#t` if the call actually transitioned the promise into the `Cancelled` state, `#f` if there was nothing to cancel — the promise was already terminal (resolved, rejected, previously cancelled) or was never spawned in the first place (e.g. created via `async/resolved`).
+Request cancellation of a spawned task. Returns `#t` when this call records the first cancellation request for a still-pending spawned task, `#f` if there was nothing to cancel — the promise was already terminal (resolved, rejected, previously cancelled) or was never spawned in the first place (e.g. created via `async/resolved`).
 
-Cancellation is best-effort and never errors. The next time the task hits a yield point it transitions to `Cancelled`; subsequent `(await p)` raises `"async/await: task was cancelled"` (distinct from a normal rejection).
+Cancellation is a request, not a synchronous transition. A task that has not started yet settles as `Cancelled` immediately; a task already parked on a wait (a timer, a channel operation, an offloaded blocking call) settles when the runtime tears its wait down, which happens after this call returns. So `(async/cancelled? p)` read immediately after a successful `(async/cancel p)` can still be `#f` for a parked task. Await the promise (under `try` — awaiting a cancelled promise raises the `:cancelled` condition) to synchronize; after the promise settles, `async/cancelled?` is deterministic.
+
+Cancellation is best-effort and never errors. Subsequent `(await p)` raises the `:cancelled` condition (distinct from a normal rejection).
 
 **What actually gets aborted.** If the cancelled task is parked on offloaded I/O, the underlying work is aborted where the runtime allows it:
 

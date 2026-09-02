@@ -185,6 +185,7 @@ export default defineConfig({
             { text: 'SQLite Database', link: '/docs/stdlib/sqlite' },
             { text: 'Key-Value Store', link: '/docs/stdlib/kv-store' },
             { text: 'Serial Ports', link: '/docs/stdlib/serial' },
+            { text: 'PIO Assembler', link: '/docs/stdlib/pio' },
             { text: 'Regex Engine', link: '/docs/stdlib/regex' },
             { text: 'Crypto & Encoding', link: '/docs/stdlib/crypto' },
             { text: 'Secrets & Redaction', link: '/docs/stdlib/secret' },

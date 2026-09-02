@@ -210,10 +210,13 @@ Right fold. `(foldr f init list)` — accumulates from right to left.
 
 ### `reduce`
 
-Like `foldl` but uses the first element as the initial value.
+Like `foldl` but uses the first element as the initial value. It takes exactly
+two arguments; there is no `(reduce f init xs)` form — use `fold`/`foldl` when
+you need an initial value. An empty list is an error.
 
 ```sema
 (reduce + '(1 2 3 4 5))   ; => 15
+(foldl + 0 '())            ; => 0
 ```
 
 ### `for-each`
@@ -323,10 +326,11 @@ Combine corresponding elements from two lists into pairs.
 
 ### `partition`
 
-Split a list into two lists based on a predicate. Returns a list of two lists: elements that satisfy the predicate and those that don't.
+Split a list into two lists based on a predicate. Returns a list of two lists: elements that satisfy the predicate and those that don't. To split into fixed-size groups (Clojure's `partition`), use `list/chunk` or `list/sliding`.
 
 ```sema
 (partition even? '(1 2 3 4 5))   ; => ((2 4) (1 3 5))
+(list/chunk 2 '(1 2 3 4 5))      ; => ((1 2) (3 4) (5))
 ```
 
 ## Searching

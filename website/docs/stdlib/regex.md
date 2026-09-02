@@ -94,6 +94,11 @@ Replace the **first** match of a pattern.
 
 **Signature:** `(regex/replace pattern replacement text) → string`
 
+Note the argument order: the pattern comes first and the text last, the
+opposite of `string/replace` (`text from to`). `string/replace` and
+`string/split` treat a regex literal as plain text — use `regex/replace-all`
+and `regex/split` for pattern matching.
+
 ```sema
 (regex/replace #"\d+" "X" "a1b2c3")    ; => "aXb2c3"
 ```

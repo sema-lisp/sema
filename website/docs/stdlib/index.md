@@ -373,6 +373,76 @@ short canonical names — predicates always stay un-namespaced.
 | `toml/decode`                   | Decode TOML to Sema  |
 | `toml/encode`                   | Encode Sema to TOML  |
 
+### [Archives](./archive)
+
+| Function                                | Description |
+| --------------------------------------- | ----------- |
+| `gzip/compress`, `gzip/decompress`      | Gzip |
+| `tar/create`, `tar/extract`             | Tar archives |
+| `zip/create`, `zip/extract`, `zip/list` | Zip archives |
+
+### [Crypto & Encoding](./crypto)
+
+| Function                                                                       | Description |
+| ------------------------------------------------------------------------------ | ----------- |
+| `hash/sha256`, `hash/md5`, `hash/hmac-sha256`                                  | Hashing |
+| `base64/encode`, `base64/decode`, `base64/encode-bytes`, `base64/decode-bytes` | Base64 |
+| `uuid/v4`                                                                      | UUIDs |
+
+### [Diff & Patch](./diff)
+
+| Function                                                | Description |
+| ------------------------------------------------------- | ----------- |
+| `diff/unified`, `diff/parse`, `diff/hunks`, `diff/stat` | Unified diffs |
+| `diff/apply`, `patch/apply-file`                        | Applying patches |
+
+### [Git (read-only)](./git)
+
+| Function                                                              | Description |
+| --------------------------------------------------------------------- | ----------- |
+| `git/root`, `git/current-branch`, `git/status`                        | Repository state |
+| `git/diff`, `git/diff-files`, `git/changed-files`, `git/recent-files` | Changes |
+| `git/ignore-matches?`                                                 | Ignore rules |
+
+### [Markdown & HTML](./markup)
+
+| Function                                                        | Description |
+| --------------------------------------------------------------- | ----------- |
+| `html/parse`, `html/select`, `html/select-text`, `html/text`    | HTML |
+| `markdown/to-html`, `markdown/headings`, `markdown/frontmatter` | Markdown |
+
+### [Processes & PTYs](./process)
+
+| Function                                                                                | Description |
+| --------------------------------------------------------------------------------------- | ----------- |
+| `proc/run`                                                                              | Run a command interactively |
+| `proc/spawn`, `proc/wait`, `proc/kill`, `proc/close`, `proc/exit-code`, `proc/running?` | Child processes |
+| `proc/read-stdout`, `proc/read-stderr`, `proc/write-stdin`, `proc/close-stdin`          | Pipes |
+| `pty/spawn`, `pty/read`, `pty/write`, `pty/resize`, `pty/wait`, `pty/kill`, `pty/close` | Pseudo-terminals |
+
+### [Reflection & Diagnostics](./reflect)
+
+| Function                                 | Description |
+| ---------------------------------------- | ----------- |
+| `read/string`, `read/all`, `format/form` | Read and print forms |
+| `sema/check-string`, `sema/check-file`   | Static checks |
+
+### [Secrets & Redaction](./secret)
+
+| Function                         | Description |
+| -------------------------------- | ----------- |
+| `secret/detect`, `secret/redact` | Secrets |
+| `pii/detect`, `redact/spans`     | PII and spans |
+| `hash/digest`                    | Digests |
+
+### [PIO Assembler](./pio)
+
+| Function | Description |
+| -------- | ----------- |
+| `pio/assemble` | Resolve labels and pack a program into 16-bit words |
+| `pio/jmp`, `pio/wait`, `pio/in`, `pio/out`, `pio/push`, `pio/pull`, `pio/mov`, `pio/irq`, `pio/set`, `pio/nop` | RP2040 PIO instruction builders |
+| `pio/delay`, `pio/side` | Attach a delay or side-set value to an instruction |
+
 ### [Playground & WASM](./playground)
 
 | Function              | Description                                            |

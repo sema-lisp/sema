@@ -23,7 +23,11 @@ With no arguments, `sema fmt` formats all `.sema` files in the current directory
 | `--width <N>` | Max line width (default: `80`) |
 | `--indent <N>` | Indentation width for body forms (default: `2`) |
 | `--align` | Align consecutive similar forms (defines, cond clauses, let bindings) |
+| `--max-blank-lines <N>` | Max consecutive blank lines to keep (default: `1`) |
 | `--json` | Emit read-only NDJSON results for editor integrations |
+
+A file argument formats that file, a directory argument formats every `.sema` file under it, a glob pattern
+(`src/**/*.sema`) expands, and `-` reads from stdin and writes to stdout.
 
 ### Examples
 
@@ -86,14 +90,22 @@ align = false
 | `width` | integer | `80` | Maximum line width |
 | `indent` | integer | `2` | Number of spaces for body indentation |
 | `align` | boolean | `false` | Enable decorative column alignment |
+| `max-blank-lines` | integer | `1` | Maximum consecutive blank lines to keep |
+| `ignore` | list of strings | `[]` | Paths to skip. A glob (`vendor/**`) matches as a glob; anything else is a literal file or directory prefix (`vendor/`). A file named explicitly on the command line is formatted even when it matches. |
+
+```toml
+[fmt]
+width = 100
+ignore = ["vendor/", "generated/**"]
+```
 
 ### Precedence
 
 Settings are merged in this order (later wins):
 
-1. **Defaults** — `width=80`, `indent=2`, `align=false`
+1. **Defaults** — `width=80`, `indent=2`, `align=false`, `max-blank-lines=1`
 2. **`sema.toml`** — project-level configuration
-3. **CLI flags** — `--width`, `--indent`, `--align` override everything
+3. **CLI flags** — `--width`, `--indent`, `--align`, `--max-blank-lines` override everything
 
 ```bash
 # sema.toml sets width=100, but CLI overrides to 120

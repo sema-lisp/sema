@@ -12,10 +12,9 @@ JSON-RPC protocol.
 sema lsp
 ```
 
-::: warning VS Code users
-The VS Code extension for Sema currently provides **syntax highlighting only** and does not yet wire up the language
-server. The features documented below are available today in any editor that speaks LSP directly (Neovim, Helix, Emacs
-`eglot`/`lsp-mode`, Zed, Sublime LSP). VS Code LSP integration is planned.
+::: tip Editor plugins
+The VS Code, Zed, IntelliJ, Neovim, Emacs, Helix, and Sublime plugins start `sema lsp` for you. See
+[Editors](/docs/editors) for the plugin list and what each one wires up.
 :::
 
 ## Features
@@ -175,8 +174,9 @@ the [Zed documentation](https://zed.dev/docs/languages) for configuring custom l
 
 ### VS Code
 
-The VS Code extension does not yet include LSP integration. For now, the extension provides syntax highlighting only.
-LSP support is planned.
+The [vscode-sema](https://github.com/sema-lisp/vscode-sema) extension starts the language server automatically when
+`sema` is on your `PATH`, and also wires up the debugger (`sema dap`). Set `sema.path` in the extension settings to point
+at a different binary.
 
 ## Architecture
 

@@ -31,12 +31,19 @@ Create a map from key-value pairs.
 
 ### `get`
 
-Look up a value by key. Works on both maps and hashmaps.
+Look up a value by key. Works on both maps and hashmaps. A third argument is the
+default for a missing key. Keywords in operator position do the same lookup:
+`(:a m)` and `(:a m default)`.
 
 ```sema
-(get {:a 1 :b 2} :a)   ; => 1
-(get {:a 1 :b 2} :z)   ; => nil
+(get {:a 1 :b 2} :a)          ; => 1
+(get {:a 1 :b 2} :z)          ; => nil
+(get {:a 1 :b 2} :z 0)        ; => 0
+(:b {:a 1 :b 2})              ; => 2
 ```
+
+`get`, `assoc`, `dissoc`, and `merge` accept maps only: `(get nil :a)` and
+`(get '(1 2) 0)` are type errors. Index a list or vector with `nth`.
 
 ### `assoc`
 

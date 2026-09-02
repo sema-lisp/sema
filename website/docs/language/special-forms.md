@@ -195,6 +195,10 @@ Bind a value and branch on nil/non-nil.
   (compute-fresh-value))
 ```
 
+Both forms take exactly one binding, written `(name value)` or `[name value]` —
+not the doubled `((name value))` of `let`. The doubled form is reported as a
+`let` binding error.
+
 ## Short Lambda
 
 ### `#(...)`
@@ -218,6 +222,9 @@ Parallel bindings — all init expressions are evaluated before any binding is c
 (let ((x 10) (y 20))
   (+ x y))
 ```
+
+Each binding is its own list: `((x 10) (y 20))`. The flat Clojure spelling
+`(let [x 10 y 20] ...)` is not accepted.
 
 ### `let*`
 
@@ -731,6 +738,10 @@ Catch errors with structured error maps.
 ::: warning
 `try`/`catch` catches **all** error types — not just user exceptions thrown with `throw`. This includes internal errors like `:unbound` (typos in variable names), `:permission-denied`, and `:arity` (wrong number of arguments). Catching everything can silently mask bugs. **Re-throw errors you don't intend to handle.**
 :::
+
+There is no `finally` clause; the last form must be `(catch e ...)`. For cleanup
+that must run on both paths, catch, clean up, and re-throw, or use
+[`guard`](#guard).
 
 #### Error map fields
 

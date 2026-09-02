@@ -66,9 +66,21 @@ Floating-point numbers, written with a decimal point and/or a scientific
 ```
 
 A literal whose magnitude exceeds `f64` range follows IEEE-754 (`1e400` → `inf`,
-`1e-400` → `0.0`). Note that an `e`/`E` not immediately followed by (an optional
-sign and) digits is *not* part of a number — `1e` reads as the integer `1` and a
-separate symbol `e` — so identifiers like `e` or `exp` are never mis-parsed.
+`1e-400` → `0.0`). Floats print in exponent form when the magnitude is at least
+`1e21` or below `1e-7` (`1e300` prints as `1e300`, not 300 digits); every printed
+form reads back to the same value.
+
+#### Number literal rules
+
+- An explicit sign is allowed: `+42`, `-7`, `+1.5`.
+- A number must end at whitespace or a bracket. `1abc`, `1.5e`, `0x1F`, and
+  `1_000` are reader errors (`invalid number literal`), not a number followed by
+  a symbol. Identifiers such as `e` or `exp` are unaffected.
+- Hex, octal, and binary use the Scheme prefixes `#x1F`, `#o17`, `#b101`; there
+  is no `0x` prefix and no `_` digit separator.
+- A leading or trailing dot is not a number: `.5` reads as a symbol and `1.` is
+  an error. Write `0.5` and `1.0`.
+- Rationals are `1/2`; complex numbers are `3+4i`.
 
 ### String
 
@@ -144,6 +156,10 @@ Character literals with `#\` prefix. Named characters are supported.
 #\tab
 ```
 
+There is no hex form for character literals (`#\x41` is an error). Use
+`(integer->char #x41)` for a character by code point, or write the character
+itself (`#\λ`).
+
 ## Collections
 
 ### List
@@ -159,6 +175,11 @@ These names come from the [IBM 704](http://bitsavers.informatik.uni-stuttgart.de
 (+ a b)
 '(hello world)
 ```
+
+Lists are proper lists only; there is no pair type. Dotted syntax is meaningful
+in parameter lists (`(lambda (a . rest) ...)`) but in a quoted list the `.` is
+read as an ordinary symbol: `'(1 . 2)` is a three-element list, so
+`(length '(1 . 2))` is `3` and `(cdr '(1 . 2))` is `(. 2)`.
 
 ### Vector
 

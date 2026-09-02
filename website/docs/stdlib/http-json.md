@@ -322,6 +322,11 @@ Functions for encoding Sema values to JSON strings and decoding JSON strings bac
 | array     | list      | `[1, 2]` → `(1 2)`                             |
 | object    | map       | Keys become keywords: `{"a": 1}` → `{:a 1}`   |
 
+Every object key becomes a keyword, including keys that are not valid keyword
+syntax: `{"a b": 1}` decodes to a map whose key prints as `:a b`. Read such keys
+with `(get m (string->keyword "a b"))`. A number outside the `f64` range
+(`1e400`) decodes as `inf`.
+
 ### `json/encode`
 
 ```

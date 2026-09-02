@@ -19,10 +19,11 @@ sema [OPTIONS] [FILE] [-- SCRIPT_ARGS...]
 | `-i, --interactive`  | Enter REPL after running file or eval        |
 | `--no-llm`           | Disable LLM features (skip provider auto-configuration) |
 | `--chat-model <NAME>`       | Set default chat model                |
-| `--chat-provider <NAME>`    | Set chat provider                     |
+| `--chat-provider <NAME>`    | Set chat provider (`anthropic`, `openai`, `gemini`, `groq`, `xai`, `mistral`, `moonshot`, `ollama`) |
 | `--embedding-model <NAME>`  | Set embedding model                   |
 | `--embedding-provider <NAME>` | Set embedding provider              |
 | `--sandbox <MODE>`   | Restrict dangerous operations (see below)    |
+| `--allowed-paths <DIRS>` | Restrict file operations to these directories (see below) |
 | `-V, --version`      | Print version                                |
 | `-h, --help`         | Print help                                   |
 
@@ -140,7 +141,7 @@ sema script.semac
 
 # Validate a bytecode file
 sema compile --check script.semac
-# ✓ script.semac: valid (format v1, sema 1.6.2, 3 functions, 847 bytes)
+# ✓ script.semac: valid (format v1, sema 1.36.0, 3 functions, 847 bytes)
 ```
 
 ### `sema build`
@@ -155,10 +156,12 @@ sema build [OPTIONS] [FILE]
 | ------------------------ | --------------------------------------------------------- |
 | `-o, --output <PATH>`   | Output executable path (default: filename without extension) |
 | `--include <PATH>...`   | Additional files or directories to bundle (repeatable)    |
-| `--runtime <PATH>`      | Sema binary to use as runtime base (default: current exe) |
-| `--target <TARGET>`     | Target platform triple or alias (e.g. `linux`, `macos`, `windows`, or a full triple like `x86_64-unknown-linux-gnu`). Use `all` to build for all supported targets. |
+| `--runtime <SEMA_BINARY>` | A `sema` executable to embed the program into, instead of the running one or the release binary `--target` downloads. The output inherits its platform and version, so a Windows `sema.exe` cross-builds without a download. Conflicts with `--target`. |
+| `--target <TARGET>`     | Target platform triple or alias (`linux`, `macos`, `windows`, `web`, or a full triple like `x86_64-unknown-linux-gnu`). Use `all` to build for all supported targets. |
 | `--list-targets`        | Show all supported target platforms and aliases            |
 | `--no-cache`            | Force re-download of cached runtime binaries              |
+| `-v, --verbose`         | Show per-step build detail and runtime cache/checksum info |
+| `--json`                | Print a machine-readable build manifest to stdout (paths, sizes, sha256, per-target status) |
 
 ```bash
 # Build a standalone executable
@@ -243,8 +246,9 @@ emits one machine-readable JSON document on standard output.
 | `search <query> [--registry]` | Search the registry for packages                 |
 | `info <name> [--registry]`  | Show package info from the registry                 |
 | `yank <name@version> [--registry]` | Yank a published version                     |
-| `login [--token] [--registry]` | Authenticate with a registry                     |
+| `login [--token] [--username [--password]] [--registry]` | Authenticate with a registry: paste an API token, or give a username (password prompted) to exchange for a fresh token |
 | `logout`                    | Remove stored registry credentials                  |
+| `whoami`                    | Show which registry account the stored token belongs to |
 | `config [key] [value]`      | View or set package manager configuration           |
 
 ```bash
@@ -304,7 +308,10 @@ sema fmt [OPTIONS] [FILES...]
 | `--width <N>` | Max line width (default: `80`) |
 | `--indent <N>` | Indentation width (default: `2`) |
 | `--align` | Align consecutive similar forms |
+| `--max-blank-lines <N>` | Max consecutive blank lines to keep (default: `1`) |
 | `--json` | Emit read-only NDJSON results for editor integrations |
+
+`FILES` may be files, directories (formatted recursively), glob patterns, or `-` for stdin.
 
 ```bash
 # Format all .sema files recursively
@@ -410,6 +417,87 @@ sema lsp
 ```
 
 Provides diagnostics, completion, hover, go-to-definition, and code lenses. See the [LSP documentation](/docs/lsp) for full feature details and editor setup instructions.
+
+### `sema dap`
+
+Start the Debug Adapter Protocol (DAP) server over stdio. Editor plugins use it for breakpoints, stepping, and variable inspection.
+
+```
+sema dap
+```
+
+See the [DAP documentation](/docs/dap) for editor setup.
+
+### `sema doc`
+
+Browse the built-in documentation from the terminal. The same index backs LSP hover, the REPL's `,doc` and `,apropos`, and the MCP `docs` tools.
+
+```
+sema doc [SYMBOL]                 # show one symbol (implicit `show`)
+sema doc show <SYMBOL>
+sema doc search <QUERY...>        # natural-language search over all entries
+sema doc apropos <PATTERN>        # match symbol names by prefix, substring, and fuzzy match
+```
+
+| Flag         | Description                                              |
+| ------------ | -------------------------------------------------------- |
+| `--pager`    | Show docs in a pager even when the output fits on one screen |
+| `--no-pager` | Print directly without invoking a pager                  |
+
+```bash
+sema doc string/split
+sema doc search "parse json from a string"
+sema doc apropos regex
+```
+
+### `sema web`
+
+Serve a [sema-web](/docs/web/getting-started) app in the browser, with a native LLM proxy so the page can call providers with the keys in your environment.
+
+```
+sema web [OPTIONS] <FILE>
+```
+
+| Flag              | Description                                                                 |
+| ----------------- | --------------------------------------------------------------------------- |
+| `--host <HOST>`   | Host to bind (default `127.0.0.1`). A non-loopback host exposes the unauthenticated LLM proxy to the network. |
+| `-p, --port <N>`  | Port to listen on (default `3000`; advances to the next free port if taken) |
+| `--no-open`       | Don't open a browser automatically                                          |
+| `--no-llm`        | Disable the built-in LLM proxy                                              |
+
+See the [dev server documentation](/docs/web/dev-server).
+
+### `sema workflow`
+
+Run journaled workflows and inspect their runs.
+
+```
+sema workflow run <FILE>            # run a workflow file, journaling a frozen run directory
+sema workflow check <FILE>          # validate a workflow file statically, without running it
+sema workflow approvals <RUN_ID>    # list approval requests and decisions for one run
+sema workflow approve <RUN_ID> <APPROVAL_ID> --signing-key-file <KEY>   # approve one pending request
+sema workflow reject  <RUN_ID> <APPROVAL_ID> --signing-key-file <KEY>   # reject one pending request
+sema workflow approval-keygen       # generate an Ed25519 approval authority key pair
+sema workflow index                 # backfill the cross-run SQLite index
+sema workflow export <RUN>          # export a deterministic evidence bundle
+sema workflow view <DIR>            # open the web viewer for a run directory
+```
+
+Each subcommand has its own `--help`. See the [workflows documentation](/docs/llm/workflows) for the run-directory layout, approvals, and resume.
+
+### `sema update`
+
+Update `sema` itself to the latest released version.
+
+```
+sema update [OPTIONS]
+```
+
+| Flag                  | Description                                                |
+| --------------------- | ---------------------------------------------------------- |
+| `--check`             | Check for an available update without installing it        |
+| `--version <VERSION>` | Install a specific version instead of the latest (e.g. `1.30.0`) |
+| `-y, --yes`           | Skip the confirmation prompt                               |
 
 ### `sema mcp`
 
@@ -578,6 +666,13 @@ sema --sandbox=no-shell,no-network --allowed-paths=./data script.sema
 | `SEMA_REGISTRY_URL`  | Override default package registry URL                 |
 | `SEMA_RUNTIME_BASE_URL` | Override base URL for cross-compilation runtime downloads |
 | `SEMA_MCP_TOKEN_STORE` | MCP client token backend: `file` (0600 file) or `keychain` (OS keychain). Default: keychain when available, else file. |
+| `SEMA_MCP_AUTH_KEY`  | 64-hex-char key that encrypts the file-backed MCP token store; when unset the key comes from the OS keyring |
+| `SEMA_MCP_EVAL_TIMEOUT_MS` | Default `--timeout-ms` for the MCP server           |
+| `SEMA_NOTEBOOK_TIMEOUT_MS` | Per-cell evaluation timeout for `sema notebook` (milliseconds) |
+| `SEMA_WORKFLOW_RUN_ID` | Explicit run id for `sema workflow run` (required to resume a run) |
+| `SEMA_APPROVAL_ACTOR` | Actor recorded by `sema workflow approve`/`reject` (default: `$USER`) |
+| `SEMA_LLM_CASSETTE`  | Path of an LLM cassette to record/replay provider calls; `SEMA_LLM_CASSETTE_MODE` selects `record`, `replay`, or `auto` (default) |
+| `SEMA_UPDATE_BASE_URL` | Override the release download base URL for `sema update` |
 | `NO_COLOR`           | Disable colored output when set                       |
 
 
@@ -586,13 +681,19 @@ sema --sandbox=no-shell,no-network --allowed-paths=./data script.sema
 
 | Command        | Description                          |
 | -------------- | ------------------------------------ |
-| `,quit` / `,q` | Exit the REPL                        |
+| `,quit` / `,q` / `,exit` | Exit the REPL (bare `quit`, `exit`, and `:q` also work) |
 | `,help` / `,h` | Show help                            |
 | `,env`         | Show user-defined bindings           |
 | `,builtins`    | List all built-in functions          |
+| `,gc`          | Run a cycle collection and show its stats |
 | `,type EXPR`   | Evaluate expression and show its type |
 | `,time EXPR`   | Evaluate expression and show elapsed time |
 | `,doc NAME`    | Show info about a binding or special form |
+| `,apropos PAT` | Search names by pattern (substring and fuzzy) |
+| `,disasm EXPR` | Compile `EXPR` and print its bytecode |
+| `,inspect EXPR` | Open an arrow-key inspector for a value |
+
+The last three results are bound to `*1`, `*2`, and `*3` (most recent first), and the last error message to `*e`.
 
 ```
 sema> ,type 42
@@ -624,7 +725,7 @@ The REPL supports tab completion for:
 - All built-in function names (e.g., `string/tr` → `string/trim`)
 - Special forms (`def` → `define`, `defun`, `defmacro`, ...)
 - User-defined bindings
-- REPL commands (`,` → `,quit`, `,help`, `,env`, `,builtins`, `,type`, `,time`, `,doc`)
+- REPL commands (`,` → `,quit`, `,help`, `,env`, `,builtins`, `,gc`, `,type`, `,time`, `,doc`, `,apropos`, `,disasm`, `,inspect`)
 
 ### Multiline Input
 

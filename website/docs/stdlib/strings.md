@@ -438,7 +438,13 @@ Format a string with `~a` placeholders.
 ```sema
 (format "~a is ~a" "Sema" "great")   ; => "Sema is great"
 (format "~a + ~a = ~a" 1 2 3)        ; => "1 + 2 = 3"
+(format "~s" "quoted")               ; => "\"quoted\""
 ```
+
+The directives are `~a` (display), `~s` (write, strings keep their quotes),
+`~%` (newline), and `~~` (literal tilde). Any other `~x` sequence is kept as
+is, and a placeholder without a matching argument renders as empty text. For
+number formatting use `number->string` (with a radix) or an f-string.
 
 ## Characters
 

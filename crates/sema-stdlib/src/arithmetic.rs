@@ -102,7 +102,9 @@ fn fold_through_tower<'a>(
                     float_acc = (fold.float)(float_acc, f);
                 }
             }
-            ValueViewRef::BigInt(_) => {
+            // Any exact or complex operand beyond the i64/f64 fast paths
+            // switches the fold onto the tower for the rest of the operands.
+            ValueViewRef::BigInt(_) | ValueViewRef::Rational(_) | ValueViewRef::Complex(_) => {
                 let n = arg.as_number().ok_or_else(|| not_a_number(arg))?;
                 if first {
                     tower = Some(n);
@@ -183,7 +185,7 @@ pub fn register(env: &sema_core::Env) {
                     None => Ok(Value::from_number(SemaNumber::from_i64(n).neg())),
                 },
                 ValueViewRef::Float(f) => Ok(Value::float(-f)),
-                ValueViewRef::BigInt(_) => {
+                ValueViewRef::BigInt(_) | ValueViewRef::Rational(_) | ValueViewRef::Complex(_) => {
                     let n = args[0].as_number().ok_or_else(|| not_a_number(&args[0]))?;
                     Ok(Value::from_number(n.neg()))
                 }

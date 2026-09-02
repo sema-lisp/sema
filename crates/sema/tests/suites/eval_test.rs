@@ -3211,3 +3211,15 @@ eval_tests! {
     float_display_roundtrip: "(= 1e300 (string->number (number->string 1e300)))" => Value::bool(true),
     float_display_integral_keeps_dot: "(str 100.0)" => Value::string("100.0"),
 }
+
+// The shared arithmetic fold promotes rationals and complex numbers, not only
+// bignums, so `list/sum`, `apply +`, and unary `-` agree with the operators.
+eval_tests! {
+    list_sum_rationals: "(list/sum (list 1/2 1/2))" => Value::int(1),
+    list_sum_mixed_rational: "(list/sum (list 1 1/2))" => common::eval("3/2"),
+    apply_plus_rationals: "(apply + (list 1/2 1/2))" => Value::int(1),
+    apply_times_rational: "(apply * (list 1/2 4))" => Value::int(2),
+    apply_plus_complex: "(apply + (list 1+2i 1))" => common::eval("2+2i"),
+    apply_minus_rational: "(apply - (list 1 1/2))" => common::eval("1/2"),
+    unary_minus_rational: "(apply - (list 1/2))" => common::eval("-1/2"),
+}

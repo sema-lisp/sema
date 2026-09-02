@@ -4018,7 +4018,7 @@
       "name": "path/absolute",
       "module": "file-io",
       "section": "Path Manipulation",
-      "summary": "Return the absolute path.",
+      "summary": "Resolve `path` against the current working directory and return the canonical absolute form: symlinks are followed and `.`/`..` segments are removed. The path **must exist**; a missing file or directory raises an I/O error. This is the same resolution as `path/canonicalize`.",
       "params": [
         {
           "name": "path",
@@ -4032,9 +4032,9 @@
         "path/join"
       ],
       "examples": [
-        "(path/absolute \".\")   ; => \"/full/path/to/current/dir\""
+        "(path/absolute \".\")             ; => \"/full/path/to/current/dir\"\n(path/absolute \"src/../src\")    ; => \".../src\" (the `..` is resolved)\n(path/absolute \"does-not-exist\")   ; => error: I/O error: path/absolute does-not-exist: No such file or directory\n(path/absolute? \"/etc/hosts\")   ; => #t"
       ],
-      "body": "Return the absolute path.\n\n```sema\n(path/absolute \".\")   ; => \"/full/path/to/current/dir\"\n```"
+      "body": "Resolve `path` against the current working directory and return the\ncanonical absolute form: symlinks are followed and `.`/`..` segments are\nremoved. The path **must exist**; a missing file or directory raises an I/O\nerror. This is the same resolution as `path/canonicalize`.\n\nFor a purely textual absolute path that does not touch the filesystem, join\nthe working directory yourself: `(path/join (sys/cwd) path)`. Use\n`path/absolute?` to test whether a string already starts at the root.\n\nRequires the `fs-read` capability and, under `--allowed-paths`, a path inside\nan allowed directory.\n\n```sema\n(path/absolute \".\")             ; => \"/full/path/to/current/dir\"\n(path/absolute \"src/../src\")    ; => \".../src\" (the `..` is resolved)\n(path/absolute \"does-not-exist\")   ; => error: I/O error: path/absolute does-not-exist: No such file or directory\n(path/absolute? \"/etc/hosts\")   ; => #t\n```"
     },
     {
       "name": "path/absolute?",
@@ -5113,7 +5113,7 @@
       "name": "assq",
       "module": "lists",
       "section": "Association Lists",
-      "summary": "Like `assoc` but uses `eq?` comparison (pointer/symbol equality).",
+      "summary": "Look up `obj` in an association list, a list whose elements are lists whose first item is the key. Returns the first matching entry (the whole inner list), or `#f` when no key matches. Entries that are not lists are skipped.",
       "params": [
         {
           "name": "obj",
@@ -5132,9 +5132,9 @@
         "list/find"
       ],
       "examples": [
-        "(assq 'b '((a 1) (b 2)))   ; => (b 2)"
+        "(assq 'b '((a 1) (b 2)))        ; => (b 2)\n(assq 'z '((a 1) (b 2)))        ; => #f\n(assq \"b\" '((\"a\" 1) (\"b\" 2)))   ; => (\"b\" 2)\n(cadr (assq 'b '((a 1) (b 2)))) ; => 2"
       ],
-      "body": "Like `assoc` but uses `eq?` comparison (pointer/symbol equality).\n\n```sema\n(assq 'b '((a 1) (b 2)))   ; => (b 2)\n```"
+      "body": "Look up `obj` in an association list, a list whose elements are lists whose\nfirst item is the key. Returns the first matching entry (the whole inner list),\nor `#f` when no key matches. Entries that are not lists are skipped.\n\nIn R7RS `assq`, `assv`, and `assoc` differ only in the equality they use\n(`eq?`, `eqv?`, `equal?`). Sema compares keys structurally in all three, so\nthey are interchangeable: a string or list key matches by value, not by\nidentity. The three names exist for Scheme compatibility.\n\nThe result is the entry itself, so take its second element for the value. An\nentry written as a dotted pair `(a . 1)` is read as a three-element list\n(`.` is a symbol), which is why `(b . 2)` prints back the same way.\n\n```sema\n(assq 'b '((a 1) (b 2)))        ; => (b 2)\n(assq 'z '((a 1) (b 2)))        ; => #f\n(assq \"b\" '((\"a\" 1) (\"b\" 2)))   ; => (\"b\" 2)\n(cadr (assq 'b '((a 1) (b 2)))) ; => 2\n```\n\nFor keyed data that is looked up often, a map (`{:a 1 :b 2}` with `get`) is\nO(1) and usually clearer."
     },
     {
       "name": "assv",
@@ -5943,14 +5943,14 @@
       "name": "last",
       "module": "lists",
       "section": "Construction & Access",
-      "summary": "Return the last element of a list.",
+      "summary": "Return the final element of a list or vector. An empty sequence gives `nil` rather than an error, so a call on possibly-empty input needs no guard; use `(empty? xs)` first when `nil` is also a legitimate element.",
       "params": [
         {
-          "name": "list",
-          "type": "list"
+          "name": "seq",
+          "type": "list | vector"
         }
       ],
-      "returns": "any",
+      "returns": "any or nil",
       "see_also": [
         "first",
         "list/take-last",
@@ -5958,9 +5958,9 @@
         "car"
       ],
       "examples": [
-        "(last '(1 2 3))    ; => 3"
+        "(last '(1 2 3))            ; => 3\n(last [1 2])               ; => 2\n(last '())                 ; => nil\n(list/take-last 2 '(1 2 3 4))   ; => (3 4)"
       ],
-      "body": "Return the last element of a list.\n\n```sema\n(last '(1 2 3))    ; => 3\n```"
+      "body": "Return the final element of a list or vector. An empty sequence gives `nil`\nrather than an error, so a call on possibly-empty input needs no guard; use\n`(empty? xs)` first when `nil` is also a legitimate element.\n\nLists are linked, so `last` walks the whole list (O(n)); `first` is O(1).\nFor the last *n* elements use `list/take-last`.\n\n```sema\n(last '(1 2 3))            ; => 3\n(last [1 2])               ; => 2\n(last '())                 ; => nil\n(list/take-last 2 '(1 2 3 4))   ; => (3 4)\n```"
     },
     {
       "name": "length",
@@ -6183,7 +6183,7 @@
       "name": "list/drop-while",
       "module": "lists",
       "section": "Splitting",
-      "summary": "Drop elements from the front while a predicate holds.",
+      "summary": "Return `seq` without its longest prefix of elements that satisfy `pred`. The first element for which `pred` returns `#f` starts the result, and everything after it is kept unchanged, including later elements that would satisfy the predicate. Compare `list/reject`, which removes matching elements anywhere.",
       "params": [
         {
           "name": "pred",
@@ -6201,9 +6201,10 @@
         "drop"
       ],
       "examples": [
-        "(list/drop-while (fn (x) (< x 4)) '(1 2 3 4 5))   ; => (4 5)"
+        "(list/drop-while even? '(2 4 5 6))                 ; => (5 6)\n(list/drop-while (fn (x) (< x 4)) '(1 2 3 4 5))    ; => (4 5)\n(list/drop-while even? '(1 2))                     ; => (1 2)\n(list/reject even? '(2 4 5 6))                     ; => (5)",
+        ";; Skip leading blank lines of a document.\n(list/drop-while string/empty? '(\"\" \"\" \"title\" \"\" \"body\"))\n; => (\"title\" \"\" \"body\")"
       ],
-      "body": "Drop elements from the front while a predicate holds.\n\n```sema\n(list/drop-while (fn (x) (< x 4)) '(1 2 3 4 5))   ; => (4 5)\n```"
+      "body": "Return `seq` without its longest prefix of elements that satisfy `pred`. The\nfirst element for which `pred` returns `#f` starts the result, and everything\nafter it is kept unchanged, including later elements that would satisfy the\npredicate. Compare `list/reject`, which removes matching elements anywhere.\n\n`drop-while` is the same function under its Scheme name. Pair it with\n`list/take-while` to split at the first non-matching element.\n\n```sema\n(list/drop-while even? '(2 4 5 6))                 ; => (5 6)\n(list/drop-while (fn (x) (< x 4)) '(1 2 3 4 5))    ; => (4 5)\n(list/drop-while even? '(1 2))                     ; => (1 2)\n(list/reject even? '(2 4 5 6))                     ; => (5)\n```\n\n```sema\n;; Skip leading blank lines of a document.\n(list/drop-while string/empty? '(\"\" \"\" \"title\" \"\" \"body\"))\n; => (\"title\" \"\" \"body\")\n```"
     },
     {
       "name": "list/duplicates",
@@ -6311,7 +6312,7 @@
       "name": "list/interleave",
       "module": "lists",
       "section": "Grouping",
-      "summary": "Interleave elements from two lists.",
+      "summary": "Merge sequences by taking one element from each in turn: the first element of every input, then the second of every input, and so on. Output stops when the **shortest** input runs out, so the result length is the shortest length times the number of inputs.",
       "returns": "list",
       "see_also": [
         "zip",
@@ -6319,9 +6320,9 @@
         "list/cross-join"
       ],
       "examples": [
-        "(list/interleave '(1 2 3) '(a b c))   ; => (1 a 2 b 3 c)"
+        "(list/interleave '(1 2 3) '(a b c))      ; => (1 a 2 b 3 c)\n(list/interleave '(1 2 3) '(a))          ; => (1 a)\n(list/interleave '(1 2) '(a b) '(x y))   ; => (1 a x 2 b y)\n(zip '(1 2) '(a b))                      ; => ((1 a) (2 b))"
       ],
-      "body": "Interleave elements from two lists.\n\n```sema\n(list/interleave '(1 2 3) '(a b c))   ; => (1 a 2 b 3 c)\n```",
+      "body": "Merge sequences by taking one element from each in turn: the first element of\nevery input, then the second of every input, and so on. Output stops when the\n**shortest** input runs out, so the result length is the shortest length\ntimes the number of inputs.\n\nThe difference from `zip` is the shape: `zip` groups the elements into\nsub-lists, `list/interleave` flattens them into one list. Use `interpose` to\nput a single separator value between elements instead.\n\n```sema\n(list/interleave '(1 2 3) '(a b c))      ; => (1 a 2 b 3 c)\n(list/interleave '(1 2 3) '(a))          ; => (1 a)\n(list/interleave '(1 2) '(a b) '(x y))   ; => (1 a x 2 b y)\n(zip '(1 2) '(a b))                      ; => ((1 a) (2 b))\n```",
       "syntax": "(list/interleave seq1 seq2 ...)"
     },
     {
@@ -6695,7 +6696,7 @@
       "name": "list/shuffle",
       "module": "lists",
       "section": "Random",
-      "summary": "Return a randomly shuffled copy of a list.",
+      "summary": "Return a new list with the elements of `seq` in uniformly random order (a Fisher-Yates shuffle from the process's random generator). The input is not modified, every element appears exactly once, and an empty sequence gives `()`.",
       "params": [
         {
           "name": "seq",
@@ -6709,9 +6710,9 @@
         "list/unique"
       ],
       "examples": [
-        "(list/shuffle '(1 2 3 4 5))   ; => (3 1 5 2 4) (varies)"
+        "(list/shuffle '(1 2 3 4 5))              ; => varies, e.g. (3 1 5 2 4)\n(sort (list/shuffle '(3 1 2)))           ; => (1 2 3)\n(length (list/shuffle '(1 2 3 4)))       ; => 4\n(list/shuffle '())                       ; => ()\n(take 2 (list/shuffle (quote (a b c d))))   ; => varies: two distinct elements"
       ],
-      "body": "Return a randomly shuffled copy of a list.\n\n```sema\n(list/shuffle '(1 2 3 4 5))   ; => (3 1 5 2 4) (varies)\n```"
+      "body": "Return a new list with the elements of `seq` in uniformly random order (a\nFisher-Yates shuffle from the process's random generator). The input is not\nmodified, every element appears exactly once, and an empty sequence gives\n`()`.\n\nThe order is not seedable from Sema code, so a test should assert on\nproperties of the result (length, membership, sorted form) rather than on a\nparticular order. To pick a single random element use `list/pick`; to pick\n`n` distinct elements, take from a shuffle.\n\n```sema\n(list/shuffle '(1 2 3 4 5))              ; => varies, e.g. (3 1 5 2 4)\n(sort (list/shuffle '(3 1 2)))           ; => (1 2 3)\n(length (list/shuffle '(1 2 3 4)))       ; => 4\n(list/shuffle '())                       ; => ()\n(take 2 (list/shuffle (quote (a b c d))))   ; => varies: two distinct elements\n```"
     },
     {
       "name": "list/sliding",
@@ -6801,11 +6802,11 @@
       "name": "list/sum",
       "module": "lists",
       "section": "Aggregation",
-      "summary": "Sum all numbers in a list.",
+      "summary": "Add every number in the sequence. An empty sequence sums to `0`. The addition runs through the same numeric tower as `+`, so the result type follows the inputs: integers stay exact and promote to bignums past 64 bits, a rational operand gives an exact rational, and any float makes the result a float. A non-number element is a type error.",
       "params": [
         {
           "name": "seq",
-          "type": "list"
+          "type": "list | vector"
         }
       ],
       "returns": "number",
@@ -6816,9 +6817,9 @@
         "foldl"
       ],
       "examples": [
-        "(list/sum '(1 2 3 4 5))   ; => 15"
+        "(list/sum '(1 2 3 4 5))       ; => 15\n(list/sum '())                ; => 0\n(list/sum '(1 2.5))           ; => 3.5\n(list/sum (list 1/2 1/2))     ; => 1\n(list/sum [1 2])              ; => 3\n(list/sum (map :price (list {:price 2} {:price 3})))   ; => 5"
       ],
-      "body": "Sum all numbers in a list.\n\n```sema\n(list/sum '(1 2 3 4 5))   ; => 15\n```"
+      "body": "Add every number in the sequence. An empty sequence sums to `0`. The addition\nruns through the same numeric tower as `+`, so the result type follows the\ninputs: integers stay exact and promote to bignums past 64 bits, a rational\noperand gives an exact rational, and any float makes the result a float. A\nnon-number element is a type error.\n\n`(list/sum xs)` is `(apply + xs)` with a name that reads better in a\npipeline. For an average see `list/avg`; to sum a derived quantity, `map`\nfirst.\n\n```sema\n(list/sum '(1 2 3 4 5))       ; => 15\n(list/sum '())                ; => 0\n(list/sum '(1 2.5))           ; => 3.5\n(list/sum (list 1/2 1/2))     ; => 1\n(list/sum [1 2])              ; => 3\n(list/sum (map :price (list {:price 2} {:price 3})))   ; => 5\n```"
     },
     {
       "name": "list/take-last",
@@ -6850,7 +6851,7 @@
       "name": "list/take-while",
       "module": "lists",
       "section": "Splitting",
-      "summary": "Take elements from the front while a predicate holds.",
+      "summary": "Return the longest prefix of `seq` whose elements all satisfy `pred`. The walk stops at the first element for which `pred` returns `#f`; elements after that point are not examined even if they would satisfy the predicate. This is different from `filter`, which keeps every matching element anywhere in the sequence.",
       "params": [
         {
           "name": "pred",
@@ -6868,9 +6869,9 @@
         "take"
       ],
       "examples": [
-        "(list/take-while (fn (x) (< x 4)) '(1 2 3 4 5))   ; => (1 2 3)"
+        "(list/take-while even? '(2 4 5 6))                 ; => (2 4)\n(list/take-while (fn (x) (< x 4)) '(1 2 3 4 5))    ; => (1 2 3)\n(list/take-while even? '())                        ; => ()\n(filter even? '(2 4 5 6))                          ; => (2 4 6)"
       ],
-      "body": "Take elements from the front while a predicate holds.\n\n```sema\n(list/take-while (fn (x) (< x 4)) '(1 2 3 4 5))   ; => (1 2 3)\n```"
+      "body": "Return the longest prefix of `seq` whose elements all satisfy `pred`. The walk\nstops at the first element for which `pred` returns `#f`; elements after that\npoint are not examined even if they would satisfy the predicate. This is\ndifferent from `filter`, which keeps every matching element anywhere in the\nsequence.\n\n`take-while` is the same function under its Scheme name. The complement is\n`list/drop-while`, and together they split a sequence at the first\nnon-matching element without scanning it twice.\n\n```sema\n(list/take-while even? '(2 4 5 6))                 ; => (2 4)\n(list/take-while (fn (x) (< x 4)) '(1 2 3 4 5))    ; => (1 2 3)\n(list/take-while even? '())                        ; => ()\n(filter even? '(2 4 5 6))                          ; => (2 4 6)\n```"
     },
     {
       "name": "list/times",
@@ -6925,7 +6926,7 @@
       "name": "make-list",
       "module": "lists",
       "section": "Construction",
-      "summary": "Alias for `list/repeat`.",
+      "summary": "Build a list of `n` copies of `value`. This is the R7RS name for `list/repeat`; both names run the same code. `n` must be a non-negative integer, and `0` gives the empty list.",
       "params": [
         {
           "name": "n",
@@ -6943,9 +6944,9 @@
         "list"
       ],
       "examples": [
-        "(make-list 3 0)   ; => (0 0 0)"
+        "(make-list 3 0)          ; => (0 0 0)\n(make-list 0 'x)         ; => ()\n(make-list 2 (list 1))   ; => ((1) (1))\n(list/times 2 (fn (i) (list i)))   ; => ((0) (1))"
       ],
-      "body": "Alias for `list/repeat`.\n\n```sema\n(make-list 3 0)   ; => (0 0 0)\n```"
+      "body": "Build a list of `n` copies of `value`. This is the R7RS name for\n`list/repeat`; both names run the same code. `n` must be a non-negative\ninteger, and `0` gives the empty list.\n\nEvery element is the *same* value, not a copy. For an immutable value that\ndoes not matter; for a mutable container such as a `mutable-array`, all `n`\nslots point at one container, so mutating through one slot is visible in all\nof them. Use `list/times` with a constructor when each element must be fresh.\n\n```sema\n(make-list 3 0)          ; => (0 0 0)\n(make-list 0 'x)         ; => ()\n(make-list 2 (list 1))   ; => ((1) (1))\n(list/times 2 (fn (i) (list i)))   ; => ((0) (1))\n```\n\nA count above the bulk-allocation limit (100 million elements) raises an\nerror instead of exhausting memory."
     },
     {
       "name": "map",
@@ -7162,23 +7163,24 @@
       "name": "reverse",
       "module": "lists",
       "section": "Basic Operations",
-      "summary": "Reverse a list.",
+      "summary": "Return a new sequence with the elements in the opposite order. The input is not modified. A list comes back as a list and a vector as a vector; strings are not sequences here, so use `string/reverse` for text.",
       "params": [
         {
-          "name": "lst",
-          "type": "list"
+          "name": "seq",
+          "type": "list | vector"
         }
       ],
-      "returns": "list",
+      "returns": "list or vector",
       "see_also": [
         "sort",
         "last",
         "append"
       ],
       "examples": [
-        "(reverse '(1 2 3))   ; => (3 2 1)"
+        "(reverse '(1 2 3))    ; => (3 2 1)\n(reverse [1 2 3])     ; => [3 2 1]\n(reverse '())         ; => ()",
+        ";; Build a list front-to-back with cons, then fix the order once.\n(define (squares n)\n  (let loop ((i 1) (acc '()))\n    (if (> i n)\n        (reverse acc)\n        (loop (+ i 1) (cons (* i i) acc)))))\n(squares 4)   ; => (1 4 9 16)"
       ],
-      "body": "Reverse a list.\n\n```sema\n(reverse '(1 2 3))   ; => (3 2 1)\n```"
+      "body": "Return a new sequence with the elements in the opposite order. The input is\nnot modified. A list comes back as a list and a vector as a vector; strings\nare not sequences here, so use `string/reverse` for text.\n\n`reverse` walks the whole input once, so it is O(n). It is often the last\nstep of an accumulator loop that builds a list by consing onto the front,\nwhich produces the elements back to front.\n\n```sema\n(reverse '(1 2 3))    ; => (3 2 1)\n(reverse [1 2 3])     ; => [3 2 1]\n(reverse '())         ; => ()\n```\n\n```sema\n;; Build a list front-to-back with cons, then fix the order once.\n(define (squares n)\n  (let loop ((i 1) (acc '()))\n    (if (> i n)\n        (reverse acc)\n        (loop (+ i 1) (cons (* i i) acc)))))\n(squares 4)   ; => (1 4 9 16)\n```"
     },
     {
       "name": "some?",
@@ -7361,7 +7363,7 @@
       "name": "zip",
       "module": "lists",
       "section": "Sublists",
-      "summary": "Combine corresponding elements from two lists into pairs.",
+      "summary": "Combine the sequences element-wise: the result's first element is a list of every input's first element, and so on. With two inputs this makes pairs; with three or more it makes triples and longer tuples. The result is as long as the **shortest** input; extra elements of longer inputs are dropped.",
       "returns": "list",
       "see_also": [
         "list/interleave",
@@ -7371,9 +7373,10 @@
         "map/zip"
       ],
       "examples": [
-        "(zip '(1 2 3) '(\"a\" \"b\" \"c\"))   ; => ((1 \"a\") (2 \"b\") (3 \"c\"))"
+        "(zip '(1 2 3) '(\"a\" \"b\" \"c\"))     ; => ((1 \"a\") (2 \"b\") (3 \"c\"))\n(zip '(1 2 3) '(a b))             ; => ((1 a) (2 b))\n(zip '(1 2) '(a b) '(x y))        ; => ((1 a x) (2 b y))",
+        ";; Pair up and combine.\n(map (fn (p) (apply + p)) (zip '(1 2) '(10 20)))   ; => (11 22)\n\n;; Unzip: transpose the pairs back into two lists.\n(apply zip '((1 a) (2 b)))   ; => ((1 2) (a b))"
       ],
-      "body": "Combine corresponding elements from two lists into pairs.\n\n```sema\n(zip '(1 2 3) '(\"a\" \"b\" \"c\"))   ; => ((1 \"a\") (2 \"b\") (3 \"c\"))\n```",
+      "body": "Combine the sequences element-wise: the result's first element is a list of\nevery input's first element, and so on. With two inputs this makes pairs;\nwith three or more it makes triples and longer tuples. The result is as long\nas the **shortest** input; extra elements of longer inputs are dropped.\n\n`zip` is the usual way to walk two lists in lockstep with `map` or `for-each`,\nor to build an association list from a key list and a value list. Its inverse\nfor pairs is `(apply zip pairs)`.\n\n```sema\n(zip '(1 2 3) '(\"a\" \"b\" \"c\"))     ; => ((1 \"a\") (2 \"b\") (3 \"c\"))\n(zip '(1 2 3) '(a b))             ; => ((1 a) (2 b))\n(zip '(1 2) '(a b) '(x y))        ; => ((1 a x) (2 b y))\n```\n\n```sema\n;; Pair up and combine.\n(map (fn (p) (apply + p)) (zip '(1 2) '(10 20)))   ; => (11 22)\n\n;; Unzip: transpose the pairs back into two lists.\n(apply zip '((1 a) (2 b)))   ; => ((1 2) (a b))\n```",
       "syntax": "(zip seq1 seq2 ...)"
     },
     {
@@ -16200,7 +16203,7 @@
       "name": "stream/write",
       "module": "streams",
       "section": "Writing",
-      "summary": "Write a bytevector. Returns the number of bytes written.",
+      "summary": "Write the bytes of `bytes` to an output stream and return the number of bytes written. The argument must be a bytevector; for text use `stream/write-string`, which encodes a string as UTF-8, or convert first with `string->utf8`. A single byte goes through `stream/write-byte`.",
       "params": [
         {
           "name": "stream",
@@ -16219,9 +16222,10 @@
         "stream/flush"
       ],
       "examples": [
-        "(stream/write s (bytevector 72 101 108 108 111))  ;; => 5"
+        "(define s (stream/byte-buffer))\n(stream/write s (bytevector 72 105))     ; => 2\n(stream/write s (string->utf8 \"!\"))      ; => 1\n(stream/to-string s)                     ; => \"Hi!\"",
+        ";; Copy a file in fixed-size chunks.\n(with-stream (in (stream/open-input \"in.bin\"))\n  (with-stream (out (stream/open-output \"out.bin\"))\n    (let loop ()\n      (let ((chunk (stream/read in 65536)))\n        (when chunk\n          (stream/write out chunk)\n          (loop))))))"
       ],
-      "body": "Write a bytevector. Returns the number of bytes written.\n\n```sema\n(stream/write s (bytevector 72 101 108 108 111))  ;; => 5\n```"
+      "body": "Write the bytes of `bytes` to an output stream and return the number of bytes\nwritten. The argument must be a bytevector; for text use `stream/write-string`,\nwhich encodes a string as UTF-8, or convert first with `string->utf8`. A\nsingle byte goes through `stream/write-byte`.\n\nOutput may be buffered by the stream; call `stream/flush` before another\nprocess reads the data, or close the stream (`with-stream` does this for\nyou). Writing to an input-only stream is an error.\n\n```sema\n(define s (stream/byte-buffer))\n(stream/write s (bytevector 72 105))     ; => 2\n(stream/write s (string->utf8 \"!\"))      ; => 1\n(stream/to-string s)                     ; => \"Hi!\"\n```\n\n```sema\n;; Copy a file in fixed-size chunks.\n(with-stream (in (stream/open-input \"in.bin\"))\n  (with-stream (out (stream/open-output \"out.bin\"))\n    (let loop ()\n      (let ((chunk (stream/read in 65536)))\n        (when chunk\n          (stream/write out chunk)\n          (loop))))))\n```"
     },
     {
       "name": "stream/write-byte",
@@ -18296,7 +18300,7 @@
       ],
       "module": "strings",
       "section": "Type Conversions",
-      "summary": "Convert a string to a list of characters.",
+      "summary": "Split a string into a list of its characters (Unicode scalar values, not bytes). Multi-byte characters such as `é` are single elements. The inverse is `list->string`, which joins a list of chars back into a string.",
       "params": [
         {
           "name": "s",
@@ -18310,9 +18314,9 @@
         "string/to-char"
       ],
       "examples": [
-        "(string/to-list \"abc\")   ; => (#\\a #\\b #\\c)"
+        "(string/to-list \"abc\")                        ; => (#\\a #\\b #\\c)\n(string/to-list \"héllo\")                      ; => (#\\h #\\é #\\l #\\l #\\o)\n(list->string (string/to-list \"ab\"))          ; => \"ab\"\n(map char-upcase (string/to-list \"ab\"))       ; => (#\\A #\\B)\n(list->string (reverse (string/to-list \"abc\")))   ; => \"cba\""
       ],
-      "body": "Convert a string to a list of characters.\n\n```sema\n(string/to-list \"abc\")   ; => (#\\a #\\b #\\c)\n```"
+      "body": "Split a string into a list of its characters (Unicode scalar values, not\nbytes). Multi-byte characters such as `é` are single elements. The inverse is\n`list->string`, which joins a list of chars back into a string.\n\nUse it when an algorithm wants to walk or transform characters one at a time\nwith the list functions (`map`, `filter`, `reverse`). `string/chars` is the\nsame operation under its slash-namespaced name. For a list of one-character\n*strings* rather than chars, use `(string/split s \"\")`.\n\n```sema\n(string/to-list \"abc\")                        ; => (#\\a #\\b #\\c)\n(string/to-list \"héllo\")                      ; => (#\\h #\\é #\\l #\\l #\\o)\n(list->string (string/to-list \"ab\"))          ; => \"ab\"\n(map char-upcase (string/to-list \"ab\"))       ; => (#\\A #\\B)\n(list->string (reverse (string/to-list \"abc\")))   ; => \"cba\"\n```"
     },
     {
       "name": "string/to-number",
@@ -18930,16 +18934,16 @@
       "name": "sys/args",
       "module": "system",
       "section": "System Information",
-      "summary": "Return the command-line arguments as a list.",
+      "summary": "Return the process's full argument vector as a list of strings: the executable path first, then every argument as the shell passed it, including the script path and any `--` separator. It is the raw `argv`, not just the script's own arguments.",
       "returns": "list",
       "see_also": [
         "env",
         "exit"
       ],
       "examples": [
-        "(sys/args)   ; => (\"sema\" \"script.sema\" \"--flag\")"
+        ";; sema app.sema -- --verbose out.txt\n(sys/args)   ; => (\"sema\" \"app.sema\" \"--\" \"--verbose\" \"out.txt\")\n\n;; The script's own arguments: everything after \"--\".\n(define (script-args)\n  (let ((rest (list/drop-while (fn (a) (not (equal? a \"--\"))) (sys/args))))\n    (if (null? rest) '() (cdr rest))))"
       ],
-      "body": "Return the command-line arguments as a list.\n\n```sema\n(sys/args)   ; => (\"sema\" \"script.sema\" \"--flag\")\n```",
+      "body": "Return the process's full argument vector as a list of strings: the\nexecutable path first, then every argument as the shell passed it, including\nthe script path and any `--` separator. It is the raw `argv`, not just the\nscript's own arguments.\n\nThe `sema` CLI forwards arguments to a script only after `--`, so\n`sema app.sema -- --verbose out.txt` gives `(\"sema\" \"app.sema\" \"--\"\n\"--verbose\" \"out.txt\")`. Drop everything up to and including `--` to get the\nscript's arguments; a standalone executable built with `sema build` sees its\narguments directly after the program path.\n\n```sema\n;; sema app.sema -- --verbose out.txt\n(sys/args)   ; => (\"sema\" \"app.sema\" \"--\" \"--verbose\" \"out.txt\")\n\n;; The script's own arguments: everything after \"--\".\n(define (script-args)\n  (let ((rest (list/drop-while (fn (a) (not (equal? a \"--\"))) (sys/args))))\n    (if (null? rest) '() (cdr rest))))\n```\n\nEnvironment variables are read with `env`, not from the argument list.",
       "syntax": "(sys/args)"
     },
     {
@@ -18996,7 +19000,7 @@
       "name": "sys/elapsed",
       "module": "system",
       "section": "Process Information",
-      "summary": "Return nanoseconds elapsed since the process started.",
+      "summary": "Return the time since the process started, in **nanoseconds**, as an integer. It reads a monotonic clock, so the value never goes backwards and is not affected by clock adjustments; that makes two readings safe to subtract for timing a section of code. Divide by 1000000 for milliseconds.",
       "returns": "int",
       "see_also": [
         "time-ms",
@@ -19004,9 +19008,9 @@
         "time"
       ],
       "examples": [
-        "(sys/elapsed)   ; => 482937100"
+        "(sys/elapsed)   ; => varies, e.g. 482937100\n\n;; Time a section by subtracting two readings.\n(define start (sys/elapsed))\n(list/sum (range 0 100000))\n(define ms (/ (- (sys/elapsed) start) 1000000.0))"
       ],
-      "body": "Return nanoseconds elapsed since the process started.\n\n```sema\n(sys/elapsed)   ; => 482937100\n```",
+      "body": "Return the time since the process started, in **nanoseconds**, as an integer.\nIt reads a monotonic clock, so the value never goes backwards and is not\naffected by clock adjustments; that makes two readings safe to subtract for\ntiming a section of code. Divide by 1000000 for milliseconds.\n\nPrefer `time` to time a single expression, and `time/now` when you need a\nwall-clock timestamp rather than a duration.\n\n```sema\n(sys/elapsed)   ; => varies, e.g. 482937100\n\n;; Time a section by subtracting two readings.\n(define start (sys/elapsed))\n(list/sum (range 0 100000))\n(define ms (/ (- (sys/elapsed) start) 1000000.0))\n```",
       "syntax": "(sys/elapsed)"
     },
     {
@@ -20602,7 +20606,7 @@
       "name": "prompt/template",
       "module": "text-processing",
       "section": "Prompt Templates",
-      "summary": "Create a template string for use with `prompt/render`.",
+      "summary": "Mark a string as a prompt template. The function returns its argument unchanged: templates are plain strings, and the call exists so that a template definition reads as one at the definition site. The placeholders are `{{name}}` with no spaces inside the braces; `prompt/render` replaces each one with the value of the matching key in a map.",
       "params": [
         {
           "name": "text",
@@ -20616,9 +20620,9 @@
         "format"
       ],
       "examples": [
-        "(define tmpl (prompt/template \"Hello {{name}}, welcome to {{place}}.\"))"
+        "(define greeting (prompt/template \"Hello {{name}}, welcome to {{place}}.\"))\n(prompt/render greeting {:name \"Ada\" :place \"Sema\"})\n; => \"Hello Ada, welcome to Sema.\"\n\n(prompt/render \"Hi {{a}} {{b}}\" {:a 1})     ; => \"Hi 1 {{b}}\"\n(prompt/render \"{{x}}\" {:x (list 1 2)})     ; => \"(1 2)\""
       ],
-      "body": "Create a template string for use with `prompt/render`.\n\n```sema\n(define tmpl (prompt/template \"Hello {{name}}, welcome to {{place}}.\"))\n```"
+      "body": "Mark a string as a prompt template. The function returns its argument\nunchanged: templates are plain strings, and the call exists so that a\ntemplate definition reads as one at the definition site. The placeholders\nare `{{name}}` with no spaces inside the braces; `prompt/render` replaces\neach one with the value of the matching key in a map.\n\nRendering rules that matter in practice: a placeholder with no matching key\nis left as is (so a typo is visible in the output rather than silently\nblank), values that are not strings are printed with `str`, and `{{ name }}`\nwith inner spaces is not recognized.\n\n```sema\n(define greeting (prompt/template \"Hello {{name}}, welcome to {{place}}.\"))\n(prompt/render greeting {:name \"Ada\" :place \"Sema\"})\n; => \"Hello Ada, welcome to Sema.\"\n\n(prompt/render \"Hi {{a}} {{b}}\" {:a 1})     ; => \"Hi 1 {{b}}\"\n(prompt/render \"{{x}}\" {:x (list 1 2)})     ; => \"(1 2)\"\n```\n\n`prompt/fill` does the same substitution on a structured prompt value; the\n`prompt/*` builders (`prompt/set-system`, `prompt/append`, `prompt/concat`)\ncompose prompts from several parts."
     },
     {
       "name": "text/chunk",
@@ -20752,7 +20756,7 @@
       "name": "text/split-sentences",
       "module": "text-processing",
       "section": "Text Chunking",
-      "summary": "Split text into sentences at `.`, `!`, `?` boundaries.",
+      "summary": "Split `text` into a list of sentences. A sentence ends at a `.`, `!`, or `?` that is followed by whitespace, and the terminator stays attached to its sentence. Surrounding whitespace is trimmed from each piece; an empty string gives an empty list.",
       "params": [
         {
           "name": "text",
@@ -20766,9 +20770,9 @@
         "string/words"
       ],
       "examples": [
-        "(text/split-sentences \"Hello world. How are you? Fine.\")\n; => (\"Hello world.\" \"How are you?\" \"Fine.\")"
+        "(text/split-sentences \"Hello world. How are you? Fine!\")\n; => (\"Hello world.\" \"How are you?\" \"Fine!\")\n\n(text/split-sentences \"Dr. Smith went home. Then slept.\")\n; => (\"Dr.\" \"Smith went home.\" \"Then slept.\")\n\n(text/split-sentences \"\")   ; => ()\n(length (text/split-sentences \"One. Two. Three.\"))   ; => 3"
       ],
-      "body": "Split text into sentences at `.`, `!`, `?` boundaries.\n\n```sema\n(text/split-sentences \"Hello world. How are you? Fine.\")\n; => (\"Hello world.\" \"How are you?\" \"Fine.\")\n```"
+      "body": "Split `text` into a list of sentences. A sentence ends at a `.`, `!`, or `?`\nthat is followed by whitespace, and the terminator stays attached to its\nsentence. Surrounding whitespace is trimmed from each piece; an empty string\ngives an empty list.\n\nThe rule is deliberately simple and has no abbreviation dictionary, so\n`\"Dr. Smith\"` splits after `\"Dr.\"`, and a period followed directly by a\nnewline or by text without a space does not split. It is good enough for\nchunking prose for embeddings or for counting sentences; for linguistically\nexact segmentation use a dedicated tool.\n\n```sema\n(text/split-sentences \"Hello world. How are you? Fine!\")\n; => (\"Hello world.\" \"How are you?\" \"Fine!\")\n\n(text/split-sentences \"Dr. Smith went home. Then slept.\")\n; => (\"Dr.\" \"Smith went home.\" \"Then slept.\")\n\n(text/split-sentences \"\")   ; => ()\n(length (text/split-sentences \"One. Two. Three.\"))   ; => 3\n```\n\nCombine with `text/chunk` to keep embedding chunks on sentence boundaries."
     },
     {
       "name": "text/strip-html",
@@ -21853,7 +21857,7 @@
       "name": "http/html",
       "module": "web-server",
       "section": "Response Helpers",
-      "summary": "Return 200 with `Content-Type: text/html`.",
+      "summary": "Build a `200 OK` response whose body is `html` sent as `text/html`. Response constructors return a plain map with `:status`, `:headers`, and `:body`, so a handler may also adjust the map (`assoc` a header) before returning it.",
       "params": [
         {
           "name": "html",
@@ -21867,9 +21871,9 @@
         "http/file"
       ],
       "examples": [
-        "(http/html \"<h1>Hello</h1><p>Welcome to Sema.</p>\")"
+        "(http/html \"<h1>Hello</h1>\")\n; => {:body \"<h1>Hello</h1>\" :headers {\"content-type\" \"text/html\"} :status 200}\n\n(define (escape-html s)\n  (-> s\n    (string/replace \"&\" \"&amp;\")\n    (string/replace \"<\" \"&lt;\")\n    (string/replace \">\" \"&gt;\")))\n\n(define (handle-home req)\n  (http/html (string-append \"<h1>Hello, \" (escape-html (:name (:query req))) \"</h1>\")))\n\n;; Add a header to the map the constructor built.\n(assoc-in (http/html \"<p>x</p>\") [:headers \"cache-control\"] \"no-store\")"
       ],
-      "body": "Return 200 with `Content-Type: text/html`.\n\n```sema\n(http/html \"<h1>Hello</h1><p>Welcome to Sema.</p>\")\n```"
+      "body": "Build a `200 OK` response whose body is `html` sent as `text/html`. Response\nconstructors return a plain map with `:status`, `:headers`, and `:body`, so a\nhandler may also adjust the map (`assoc` a header) before returning it.\n\nThe string is sent as is; nothing is escaped or templated. Interpolate values\nwith `string-append` or an f-string, and escape user-supplied text yourself\nbefore putting it into markup. For JSON use `http/ok`, for plain text\n`http/text`, and for a file on disk `http/file`.\n\n```sema\n(http/html \"<h1>Hello</h1>\")\n; => {:body \"<h1>Hello</h1>\" :headers {\"content-type\" \"text/html\"} :status 200}\n\n(define (escape-html s)\n  (-> s\n    (string/replace \"&\" \"&amp;\")\n    (string/replace \"<\" \"&lt;\")\n    (string/replace \">\" \"&gt;\")))\n\n(define (handle-home req)\n  (http/html (string-append \"<h1>Hello, \" (escape-html (:name (:query req))) \"</h1>\")))\n\n;; Add a header to the map the constructor built.\n(assoc-in (http/html \"<p>x</p>\") [:headers \"cache-control\"] \"no-store\")\n```"
     },
     {
       "name": "http/no-content",
@@ -21892,7 +21896,7 @@
       "name": "http/not-found",
       "module": "web-server",
       "section": "Response Helpers",
-      "summary": "Return 404 with a JSON-encoded body.",
+      "summary": "Build a `404 Not Found` response. `body` is JSON-encoded, with `Content-Type: application/json`, so a map gives a structured error object and a string gives a JSON string literal (with quotes). The argument is required; pass `nil` for `null`.",
       "params": [
         {
           "name": "body",
@@ -21907,9 +21911,9 @@
         "http/redirect"
       ],
       "examples": [
-        "(http/not-found {:error \"User not found\"})"
+        "(http/not-found {:error \"User not found\"})\n; => {:body \"{\\\"error\\\":\\\"User not found\\\"}\" :headers {\"content-type\" \"application/json\"} :status 404}\n\n(define (handle-user req)\n  (let ((user (find-user (:id (:params req)))))\n    (if user\n        (http/ok user)\n        (http/not-found {:error \"User not found\" :id (:id (:params req))}))))"
       ],
-      "body": "Return 404 with a JSON-encoded body.\n\n```sema\n(http/not-found {:error \"User not found\"})\n```"
+      "body": "Build a `404 Not Found` response. `body` is JSON-encoded, with\n`Content-Type: application/json`, so a map gives a structured error object\nand a string gives a JSON string literal (with quotes). The argument is\nrequired; pass `nil` for `null`.\n\nUse it from a handler when a looked-up resource does not exist. Requests that\nmatch no route at all are answered by `http/router` on its own. `http/error`\nis the general form for any status code with a JSON body.\n\n```sema\n(http/not-found {:error \"User not found\"})\n; => {:body \"{\\\"error\\\":\\\"User not found\\\"}\" :headers {\"content-type\" \"application/json\"} :status 404}\n\n(define (handle-user req)\n  (let ((user (find-user (:id (:params req)))))\n    (if user\n        (http/ok user)\n        (http/not-found {:error \"User not found\" :id (:id (:params req))}))))\n```"
     },
     {
       "name": "http/ok",
@@ -21939,7 +21943,7 @@
       "name": "http/redirect",
       "module": "web-server",
       "section": "Response Helpers",
-      "summary": "Return a 302 redirect to a URL.",
+      "summary": "Build a `302 Found` response with a `Location` header pointing at `url` and an empty body. The browser follows it with a `GET`, which is what a handler wants after processing a form submission (the post/redirect/get pattern) or when sending an unauthenticated visitor to a login page.",
       "params": [
         {
           "name": "url",
@@ -21953,9 +21957,9 @@
         "http/router"
       ],
       "examples": [
-        "(http/redirect \"https://example.com/login\")"
+        "(http/redirect \"/login\")\n; => {:body \"\" :headers {\"location\" \"/login\"} :status 302}\n\n(define (handle-submit req)\n  (save-form! (:form req))\n  (http/redirect \"/thanks\"))\n\n;; A permanent redirect: same shape, different status.\n(assoc (http/redirect \"https://example.com/new\") :status 301)"
       ],
-      "body": "Return a 302 redirect to a URL.\n\n```sema\n(http/redirect \"https://example.com/login\")\n```"
+      "body": "Build a `302 Found` response with a `Location` header pointing at `url` and\nan empty body. The browser follows it with a `GET`, which is what a handler\nwants after processing a form submission (the post/redirect/get pattern) or\nwhen sending an unauthenticated visitor to a login page.\n\n`url` may be absolute or a path on the same origin. Only `302` is built here;\nfor a permanent redirect or another status, return the map with `:status`\nchanged, as shown below.\n\n```sema\n(http/redirect \"/login\")\n; => {:body \"\" :headers {\"location\" \"/login\"} :status 302}\n\n(define (handle-submit req)\n  (save-form! (:form req))\n  (http/redirect \"/thanks\"))\n\n;; A permanent redirect: same shape, different status.\n(assoc (http/redirect \"https://example.com/new\") :status 301)\n```"
     },
     {
       "name": "http/router",

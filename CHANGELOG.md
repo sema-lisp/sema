@@ -46,6 +46,10 @@
   instead of hundreds of digits; every printed form reads back to the same
   value. `number->string` and `str` follow.
 
+- `list/sum`, `apply +`/`*`/`-`, and unary `-` rejected rationals and complex
+  numbers ("expected number, got rational"); the shared arithmetic fold now
+  promotes them like bignums.
+
 ### sema-web and `sema web`
 
 - **A Sema error inside a `ws/listen` handler was lost** (it escaped into
@@ -80,6 +84,12 @@
   multi-line forms, strips trailing comments from expected values, treats an
   evaluation error as a failure, and accepts `; => error: ...` expectations.
   996 examples are verified; the entries it flagged were corrected.
+- Twenty thin builtin entries were rewritten with full explanations, edge
+  cases, and verified examples: `reverse`, `last`, `make-list`, `zip`, `assq`,
+  `list/interleave`, `list/take-while`, `list/drop-while`, `list/sum`,
+  `list/shuffle`, `string/to-list`, `path/absolute`, `sys/args`,
+  `sys/elapsed`, `http/html`, `http/redirect`, `http/not-found`,
+  `stream/write`, `prompt/template`, `text/split-sentences`.
 - Builtin entries gained `params`, `returns`, and `see_also` metadata across
   the stdlib (LSP signature help, `sema doc`, and MCP `docs_search` use them),
   and the stub entries for `proc/*`, `pty/*`, `fs/*`, `reflect`, `event/*`,

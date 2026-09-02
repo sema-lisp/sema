@@ -1,5 +1,6 @@
 #![allow(clippy::mutable_key_type)]
 pub mod archive;
+pub mod args;
 pub mod async_signal;
 pub mod context;
 pub mod cycle;
@@ -20,6 +21,7 @@ pub mod text_util;
 pub mod value;
 pub mod vfs;
 
+pub use args::{ArgsExt, OptionsExt, ResultExt};
 pub use async_signal::{
     blocking_sleep_ms, check_interrupt, clear_blocking_sleep_callback, clear_interrupt_callback,
     current_conversation_scope_boxed, current_llm_scope_boxed, current_task_id,

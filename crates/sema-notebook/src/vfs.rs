@@ -17,29 +17,11 @@ pub struct FileEntry {
 /// Resolve a relative path within the VFS root, rejecting traversal.
 fn resolve_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
     let relative = relative.trim_start_matches('/');
-    let resolved = root.join(relative);
-
-    // Canonicalize both to prevent traversal attacks
-    let canonical_root = root
-        .canonicalize()
-        .map_err(|e| format!("VFS root error: {e}"))?;
-    let canonical = resolved.canonicalize().or_else(|_| {
-        // For writes, the file may not exist yet — check the parent
-        if let Some(parent) = resolved.parent() {
-            let p = parent
-                .canonicalize()
-                .map_err(|e| format!("Path error: {e}"))?;
-            Ok(p.join(resolved.file_name().unwrap_or_default()))
-        } else {
-            Err("Invalid path".to_string())
-        }
-    })?;
-
-    if !canonical.starts_with(&canonical_root) {
-        return Err("Path traversal denied".to_string());
-    }
-
-    Ok(canonical)
+    let boundary = sema_core::path::PathBoundary::new(root)
+        .map_err(|error| format!("VFS root error: {error}"))?;
+    boundary
+        .resolve(&root.join(relative))
+        .map_err(|error| format!("Path traversal denied: {error}"))
 }
 
 /// Read a file within the VFS root.

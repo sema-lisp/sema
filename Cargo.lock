@@ -164,6 +164,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "atomic-write-file"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ae67d5c03ee972c101a1d8db3ddbf8a9c819ad1ea9d6fd9cd385605547b60edb"
+dependencies = [
+ "nix 0.31.3",
+ "rand 0.10.2",
+]
+
+[[package]]
 name = "auto_impl"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2732,6 +2742,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
+name = "proc-canonicalize"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39e8ce98d2141039e100a63f7ab04ee0dec503608d72dd6dbc9d56d7532da3ec"
+
+[[package]]
 name = "proc-macro2"
 version = "1.0.107"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3366,6 +3382,7 @@ dependencies = [
 name = "sema-core"
 version = "1.36.0"
 dependencies = [
+ "atomic-write-file",
  "crc32fast",
  "hashbrown 0.17.1",
  "lasso",
@@ -3373,11 +3390,15 @@ dependencies = [
  "num-integer",
  "num-rational",
  "num-traits",
+ "same-file",
  "serde_json",
+ "soft-canonicalize",
  "stacker",
+ "tempfile",
  "thiserror 2.0.20",
  "toml",
  "web-time",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4039,6 +4060,15 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "soft-canonicalize"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80111c43bbe801bcec3679d2ccba588a4618c11de4024abbd028ff50e33436dd"
+dependencies = [
+ "proc-canonicalize",
 ]
 
 [[package]]

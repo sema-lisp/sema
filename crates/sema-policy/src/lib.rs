@@ -12,7 +12,7 @@ use regex::Regex;
 use sema_core::{suggest_similar, FileAccess, ToolPolicySubject, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 use thiserror::Error;
 use url::{Host, Url};
 
@@ -1875,18 +1875,13 @@ fn normalize_policy_path(workspace_root: &Path, input: &str) -> Result<String, S
         return Err("absolute paths are not allowed".to_string());
     }
 
-    let root = absolute_lexical(workspace_root)?;
-    let joined = normalize_lexical(&root.join(input_path));
-    if !joined.starts_with(&root) {
-        return Err("path escapes the workflow root".to_string());
-    }
-    let canonical_root = canonical_or_lexical(&root);
-    let resolved = canonicalize_existing_prefix(&joined);
-    if !resolved.starts_with(&canonical_root) {
-        return Err("path resolves outside the workflow root".to_string());
-    }
+    let boundary = sema_core::path::PathBoundary::new(workspace_root)
+        .map_err(|error| format!("cannot resolve workspace root: {error}"))?;
+    let resolved = boundary
+        .resolve(&boundary.root().join(input_path))
+        .map_err(|error| format!("cannot resolve policy path: {error}"))?;
     let relative = resolved
-        .strip_prefix(&canonical_root)
+        .strip_prefix(boundary.root())
         .map_err(|_| "path cannot be made root-relative".to_string())?;
     Ok(relative
         .components()
@@ -1896,53 +1891,6 @@ fn normalize_policy_path(workspace_root: &Path, input: &str) -> Result<String, S
         })
         .collect::<Vec<_>>()
         .join("/"))
-}
-
-fn absolute_lexical(path: &Path) -> Result<PathBuf, String> {
-    if path.is_absolute() {
-        return Ok(normalize_lexical(path));
-    }
-    // The workspace root should always be provided as an absolute path by the enforcement
-    // layer. Resolving a relative path with `current_dir()` introduces CWD-dependent
-    // non-determinism, so we canonicalize it instead of accepting process-global state.
-    std::fs::canonicalize(path).map_err(|error| format!("cannot resolve workspace root: {error}"))
-}
-
-fn canonical_or_lexical(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| normalize_lexical(path))
-}
-
-fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
-    let mut existing = path.to_path_buf();
-    let mut suffix = Vec::new();
-    while !existing.exists() {
-        let Some(name) = existing.file_name().map(|name| name.to_os_string()) else {
-            break;
-        };
-        suffix.push(name);
-        if !existing.pop() {
-            break;
-        }
-    }
-    let mut resolved = canonical_or_lexical(&existing);
-    for component in suffix.into_iter().rev() {
-        resolved.push(component);
-    }
-    normalize_lexical(&resolved)
-}
-
-fn normalize_lexical(path: &Path) -> PathBuf {
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                result.pop();
-            }
-            Component::CurDir => {}
-            other => result.push(other.as_os_str()),
-        }
-    }
-    result
 }
 
 fn fingerprint(value: &Value, name: &str) -> String {

@@ -4,6 +4,7 @@ use std::io::BufRead;
 use std::io::Read as _;
 use std::io::Write as _;
 
+use sema_core::path::PathExt as _;
 use sema_core::{check_arity, Caps, NativeFn, SemaError, Value, ValueView};
 
 use crate::register_fn;
@@ -1099,24 +1100,8 @@ fn path_extension_impl(args: &[Value]) -> Result<Value, SemaError> {
 /// to write). Symlinks are NOT resolved here; use `path/canonicalize` when the
 /// path exists and symlink resolution matters.
 fn lexical_absolute(p: &std::path::Path) -> std::path::PathBuf {
-    use std::path::Component;
-    let mut out = if p.is_absolute() {
-        std::path::PathBuf::new()
-    } else {
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-    };
-    for comp in p.components() {
-        match comp {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::RootDir => out.push(std::path::MAIN_SEPARATOR.to_string()),
-            Component::Prefix(pre) => out.push(pre.as_os_str()),
-            Component::Normal(seg) => out.push(seg),
-        }
-    }
-    out
+    let base = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    p.absolute_from(&base).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Best-effort absolute, real-path form for containment checks.
@@ -1132,29 +1117,9 @@ fn lexical_absolute(p: &std::path::Path) -> std::path::PathBuf {
 /// negative (e.g. macOS `/var` → `/private/var`), since base and child now have
 /// their existing prefixes canonicalized the same way.
 fn resolved_path(p: &str) -> std::path::PathBuf {
-    let path = std::path::Path::new(p);
-    if let Ok(real) = std::fs::canonicalize(path) {
-        return real;
-    }
-    let abs = lexical_absolute(path);
-    let mut ancestor = abs.as_path();
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    loop {
-        if let Ok(mut real) = std::fs::canonicalize(ancestor) {
-            for seg in tail.iter().rev() {
-                real.push(seg);
-            }
-            return real;
-        }
-        match (ancestor.parent(), ancestor.file_name()) {
-            (Some(parent), Some(name)) => {
-                tail.push(name.to_os_string());
-                ancestor = parent;
-            }
-            // Reached a root that doesn't canonicalize (unusual); best-effort.
-            _ => return abs,
-        }
-    }
+    std::path::Path::new(p)
+        .resolve_allow_missing()
+        .unwrap_or_else(|_| lexical_absolute(std::path::Path::new(p)))
 }
 
 // ─── Canonical quarantined-bounded external file operations (Task 05 R08A) ───

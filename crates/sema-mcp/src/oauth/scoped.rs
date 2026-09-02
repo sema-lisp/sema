@@ -149,34 +149,6 @@ fn ensure_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Write `bytes` to `path` atomically: a sibling temp file created `0600`
-/// (never a world-readable window), then an atomic rename over the target —
-/// which also fixes an existing wrongly-permissioned file. On Windows we rely
-/// on the user profile ACL and just write in place.
-#[cfg(unix)]
-fn atomic_write_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let tmp = path.with_extension("json.tmp");
-    let mut file = std::fs::OpenOptions::new()
-        .mode(0o600)
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&tmp)
-        .map_err(|e| format!("failed to open temp token file: {e}"))?;
-    file.write_all(bytes)
-        .map_err(|e| format!("failed to write token file: {e}"))?;
-    file.sync_all().ok();
-    drop(file);
-    std::fs::rename(&tmp, path).map_err(|e| format!("failed to replace token file: {e}"))
-}
-
-#[cfg(not(unix))]
-fn atomic_write_0600(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    std::fs::write(path, bytes).map_err(|e| format!("failed to write token file: {e}"))
-}
-
 // ---------------------------------------------------------------------------
 // Git-ignore guard (plan §4: a token file must never be committable)
 // ---------------------------------------------------------------------------
@@ -349,7 +321,8 @@ impl TokenStore for ScopedFileStore {
         };
         let json = serde_json::to_vec(&envelope)
             .map_err(|e| format!("failed to encode token envelope: {e}"))?;
-        atomic_write_0600(&self.file_path(&creds.server_url), &json)
+        sema_core::fs::AtomicFile::write_private(&self.file_path(&creds.server_url), &json)
+            .map_err(|e| format!("failed to replace token file: {e}"))
     }
 
     fn delete(&self, server_url: &str) -> Result<(), String> {

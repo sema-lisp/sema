@@ -134,9 +134,9 @@ pub fn export(
     let evidence_markdown = output_directory.join("evidence.md");
     let manifest_json = output_directory.join("manifest.json");
     let json_bytes = serde_json::to_vec_pretty(&evidence).map_err(io::Error::other)?;
-    fs::write(&evidence_json, &json_bytes)?;
+    sema_core::fs::AtomicFile::write(&evidence_json, &json_bytes)?;
     let markdown = render_markdown(&evidence);
-    fs::write(&evidence_markdown, markdown.as_bytes())?;
+    sema_core::fs::AtomicFile::write(&evidence_markdown, markdown.as_bytes())?;
 
     let mut manifest_sources = vec![
         run_directory.join("metadata.json"),
@@ -161,9 +161,9 @@ pub fn export(
         run_id: run_id.to_string(),
         files,
     };
-    fs::write(
+    sema_core::fs::AtomicFile::write(
         &manifest_json,
-        serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?,
+        &serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?,
     )?;
 
     Ok(ExportedEvidence {

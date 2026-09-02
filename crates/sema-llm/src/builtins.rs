@@ -7347,10 +7347,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     )
                 })?;
             let data = store.to_json().map_err(SemaError::Io)?;
-            let tmp = format!("{path}.tmp");
-            std::fs::write(&tmp, &data)
-                .map_err(|e| SemaError::Io(format!("vector-store/save: {e}")))?;
-            std::fs::rename(&tmp, path)
+            sema_core::fs::AtomicFile::write(std::path::Path::new(path), &data)
                 .map_err(|e| SemaError::Io(format!("vector-store/save: {e}")))?;
             Ok(Value::string(path))
         })
@@ -8119,7 +8116,7 @@ fn persist_cache_file_off_quantum(path: std::path::PathBuf, json: String) {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(&path, json);
+        let _ = sema_core::fs::AtomicFile::write(&path, json.as_bytes());
     };
     #[cfg(not(target_arch = "wasm32"))]
     {

@@ -32,7 +32,7 @@ fn ensure_sema_toml(json: bool) -> Result<(), String> {
         let content = format!(
             "[package]\nname = \"{project_name}\"\nversion = \"0.1.0\"\ndescription = \"\"\nentrypoint = \"package.sema\"\n\n[deps]\n"
         );
-        std::fs::write(toml_path, content)
+        sema_core::fs::AtomicFile::write_through(toml_path, content.as_bytes())
             .map_err(|e| format!("Failed to write sema.toml: {e}"))?;
         human_output!(json, "✓ Created sema.toml");
     }
@@ -1176,7 +1176,7 @@ fn add_dep_to_toml(toml_path: &Path, pkg_path: &str, git_ref: &str) -> Result<bo
 
     deps[pkg_path] = toml_edit::value(git_ref);
 
-    std::fs::write(toml_path, doc.to_string())
+    sema_core::fs::AtomicFile::write_through(toml_path, doc.to_string().as_bytes())
         .map_err(|e| format!("Failed to write sema.toml: {e}"))?;
     Ok(true)
 }
@@ -1197,7 +1197,7 @@ fn remove_dep_from_toml(toml_path: &Path, pkg_path: &str) -> Result<bool, String
     };
 
     if removed {
-        std::fs::write(toml_path, doc.to_string())
+        sema_core::fs::AtomicFile::write_through(toml_path, doc.to_string().as_bytes())
             .map_err(|e| format!("Failed to write sema.toml: {e}"))?;
     }
 
@@ -1294,7 +1294,8 @@ entrypoint = "package.sema"
 "#
     );
 
-    std::fs::write(toml_path, content).map_err(|e| format!("Failed to write sema.toml: {e}"))?;
+    sema_core::fs::AtomicFile::write_through(toml_path, content.as_bytes())
+        .map_err(|e| format!("Failed to write sema.toml: {e}"))?;
     human_output!(json, "✓ Created sema.toml");
 
     let entry_path = Path::new("package.sema");
@@ -1302,7 +1303,7 @@ entrypoint = "package.sema"
     if !entry_path.exists() {
         let entry_content =
             ";; package entrypoint — all top-level definitions are available to importers\n";
-        std::fs::write(entry_path, entry_content)
+        sema_core::fs::AtomicFile::write_through(entry_path, entry_content.as_bytes())
             .map_err(|e| format!("Failed to write package.sema: {e}"))?;
         human_output!(json, "✓ Created package.sema");
         created.push("package.sema");
@@ -1417,7 +1418,7 @@ pub fn cmd_login(
     }
 
     let content = format!("[registry]\ntoken = \"{token}\"\nurl = \"{registry}\"\n");
-    std::fs::write(&creds_path, &content)
+    sema_core::fs::AtomicFile::write_private(&creds_path, content.as_bytes())
         .map_err(|e| format!("Failed to write credentials: {e}"))?;
 
     #[cfg(unix)]
@@ -1613,7 +1614,7 @@ fn set_registry_url(url: &str) -> Result<(), String> {
         format!("[registry]\ntoken = \"{token}\"\nurl = \"{url}\"\n")
     };
 
-    std::fs::write(&creds_path, &content)
+    sema_core::fs::AtomicFile::write_private(&creds_path, content.as_bytes())
         .map_err(|e| format!("Failed to write credentials: {e}"))?;
 
     #[cfg(unix)]
@@ -1681,8 +1682,11 @@ fn write_pkg_meta(
         "checksum": checksum,
     });
     let path = dir.join(PKG_META_FILE);
-    std::fs::write(&path, serde_json::to_string_pretty(&meta).unwrap())
-        .map_err(|e| format!("Failed to write package metadata: {e}"))
+    sema_core::fs::AtomicFile::write_through(
+        &path,
+        serde_json::to_string_pretty(&meta).unwrap().as_bytes(),
+    )
+    .map_err(|e| format!("Failed to write package metadata: {e}"))
 }
 
 /// Read registry package metadata from `.sema-pkg.json`, if present.
@@ -2754,7 +2758,7 @@ fn write_lock_file(lock: &LockFile) -> Result<(), String> {
 
     doc["packages"] = toml_edit::Item::Table(packages);
 
-    std::fs::write(LOCK_FILE, doc.to_string())
+    sema_core::fs::AtomicFile::write_through(Path::new(LOCK_FILE), doc.to_string().as_bytes())
         .map_err(|e| format!("Failed to write sema.lock: {e}"))
 }
 

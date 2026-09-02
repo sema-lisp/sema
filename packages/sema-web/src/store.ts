@@ -30,80 +30,92 @@ interface SemaInterpreterLike {
  * Values are always serialized as JSON on set and parsed from JSON on get.
  */
 export function registerStoreBindings(interp: SemaInterpreterLike, ctx: SemaWebContext): void {
+  // Storage throws (SecurityError, QuotaExceededError) when the browser blocks
+  // it, e.g. private mode or a sandboxed iframe. Every binding reports through
+  // `ctx.onerror` and returns `fallback` instead of throwing into Sema code.
+  const guarded = <T>(context: string, fallback: T, run: () => T): T => {
+    try {
+      return run();
+    } catch (e) {
+      ctx.onerror(e instanceof Error ? e : new Error(String(e)), context);
+      return fallback;
+    }
+  };
+
   // --- localStorage ---
 
-  interp.registerFunction("store/get", (key: string) => {
-    try {
+  interp.registerFunction("store/get", (key: string) =>
+    guarded(`store/get:${key}`, null, () => {
       const val = localStorage.getItem(key);
       if (val === null) return null;
       return JSON.parse(val);
-    } catch (e) {
-      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `store/get:${key}`);
-      return null;
-    }
-  });
+    }),
+  );
 
-  interp.registerFunction("store/set!", (key: string, value: any) => {
-    try {
+  interp.registerFunction("store/set!", (key: string, value: any) =>
+    guarded(`store/set!:${key}`, null, () => {
       localStorage.setItem(key, JSON.stringify(value));
-    } catch (e) {
-      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `store/set!:${key}`);
-    }
-    return null;
-  });
+      return null;
+    }),
+  );
 
-  interp.registerFunction("store/remove!", (key: string) => {
-    localStorage.removeItem(key);
-    return null;
-  });
+  interp.registerFunction("store/remove!", (key: string) =>
+    guarded(`store/remove!:${key}`, null, () => {
+      localStorage.removeItem(key);
+      return null;
+    }),
+  );
 
-  interp.registerFunction("store/clear!", () => {
-    localStorage.clear();
-    return null;
-  });
+  interp.registerFunction("store/clear!", () =>
+    guarded("store/clear!", null, () => {
+      localStorage.clear();
+      return null;
+    }),
+  );
 
-  interp.registerFunction("store/keys", () => {
-    const keys: string[] = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (key !== null) keys.push(key);
-    }
-    return keys;
-  });
+  interp.registerFunction("store/keys", () =>
+    guarded("store/keys", [] as string[], () => {
+      const keys: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key !== null) keys.push(key);
+      }
+      return keys;
+    }),
+  );
 
-  interp.registerFunction("store/has?", (key: string) => {
-    return localStorage.getItem(key) !== null;
-  });
+  interp.registerFunction("store/has?", (key: string) =>
+    guarded(`store/has?:${key}`, false, () => localStorage.getItem(key) !== null),
+  );
 
   // --- sessionStorage ---
 
-  interp.registerFunction("store/session-get", (key: string) => {
-    try {
+  interp.registerFunction("store/session-get", (key: string) =>
+    guarded(`store/session-get:${key}`, null, () => {
       const val = sessionStorage.getItem(key);
       if (val === null) return null;
       return JSON.parse(val);
-    } catch (e) {
-      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `store/session-get:${key}`);
-      return null;
-    }
-  });
+    }),
+  );
 
-  interp.registerFunction("store/session-set!", (key: string, value: any) => {
-    try {
+  interp.registerFunction("store/session-set!", (key: string, value: any) =>
+    guarded(`store/session-set!:${key}`, null, () => {
       sessionStorage.setItem(key, JSON.stringify(value));
-    } catch (e) {
-      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `store/session-set!:${key}`);
-    }
-    return null;
-  });
+      return null;
+    }),
+  );
 
-  interp.registerFunction("store/session-remove!", (key: string) => {
-    sessionStorage.removeItem(key);
-    return null;
-  });
+  interp.registerFunction("store/session-remove!", (key: string) =>
+    guarded(`store/session-remove!:${key}`, null, () => {
+      sessionStorage.removeItem(key);
+      return null;
+    }),
+  );
 
-  interp.registerFunction("store/session-clear!", () => {
-    sessionStorage.clear();
-    return null;
-  });
+  interp.registerFunction("store/session-clear!", () =>
+    guarded("store/session-clear!", null, () => {
+      sessionStorage.clear();
+      return null;
+    }),
+  );
 }

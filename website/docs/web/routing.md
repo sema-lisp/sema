@@ -114,9 +114,9 @@ A repeated key collects its values into a list, matching how `dom/form-data` rep
 
 ## Links
 
-### `(router/link path label attrs)` -> SIP
+### `(router/link path [label] [attrs])` -> SIP
 
-Returns SIP data for an accessible anchor whose clicks are intercepted, so navigation never reloads the page:
+Returns SIP data for an accessible anchor whose clicks are intercepted, so navigation never reloads the page. `label` defaults to the path and `attrs` to no extra attributes:
 
 ```sema
 [:nav

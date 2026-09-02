@@ -164,6 +164,11 @@ export function registerHttpBindings(interp: SemaInterpreterLike, ctx: SemaWebCo
       kind: "event-source",
       close: managedStream.close,
     });
+    // Anything that escapes the SSE pump (a throwing callback in `finally`)
+    // is reported, not left as an unhandled rejection with no attribution.
+    managedStream.done.catch((e) => {
+      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `event-source:${id}`);
+    });
 
     const owner = getActiveComponent(ctx);
     if (owner) owner.ownedStreamIds.add(id);

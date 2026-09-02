@@ -48,6 +48,15 @@ pub fn run(entry: &str, host: &str, port: u16, open: bool, llm: bool) -> Result<
         .map_err(|e| format!("no free port near {host}:{port}: {e}"))?;
     drop(probe);
 
+    // The LLM proxy forwards to providers with the server's API keys and has
+    // no authentication, so binding it to a reachable interface exposes those
+    // keys to the network. Say so; `--no-llm` keeps the app reachable without it.
+    if llm && !sema_core::net::is_loopback_host(host) {
+        crate::print_cli_warning(format!(
+            "--host {host} is not loopback: the unauthenticated LLM proxy is reachable from the network (pass --no-llm to disable it)"
+        ));
+    }
+
     // Auto-open only when attached to a terminal — never pop a browser from a
     // non-interactive run (CI, a pipe, or a test that forgot `--no-open`).
     if open && std::io::stdout().is_terminal() {
@@ -238,13 +247,21 @@ fn web_prepare_send(
     entry: &std::path::Path,
     build_dir: &std::path::Path,
 ) -> (String, Option<String>) {
-    let imports = match crate::import_tracer::trace_imports(entry) {
-        Ok(m) => m,
+    // Strict tracing: the browser has no filesystem to fall back to, so an
+    // import that does not resolve now can never resolve at runtime. Report it
+    // as a build error instead of letting the page fail with a puzzling
+    // "operation not supported on this platform".
+    let imports = match crate::import_tracer::trace_imports_strict(entry) {
+        Ok(snapshot) => snapshot.files,
         Err(e) => {
+            let e = e.replace(
+                " cannot be resolved for approval binding",
+                " does not exist; a browser app has no filesystem, so every import must resolve at build time",
+            );
             return (
                 "error".to_string(),
                 Some(format!("import tracing failed: {e}")),
-            )
+            );
         }
     };
     if imports.is_empty() {
@@ -280,7 +297,7 @@ fn spawn_browser_opener(host: String, port: u16) {
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        let url = format!("http://{host}:{port}");
+        let url = format!("http://{}", sema_core::net::format_host_port(&host, port));
         let _ = open_url(&url);
     });
 }

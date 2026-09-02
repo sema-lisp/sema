@@ -99,6 +99,7 @@ component cannot satisfy an assertion by accident.
 
 ```js
 screen.html();            // innerHTML of the container
+screen.html("ul");        // innerHTML of the first match
 screen.text("button");    // textContent of the first match
 screen.find("li");        // first match, raising with the current markup if absent
 screen.query("li");       // first match or null
@@ -116,6 +117,8 @@ screen.click("button");             // runs activation behaviour, as a browser d
 screen.fill("input", "hello");      // sets the value and fires `input`
 screen.select("select", "b");       // sets the value and fires `change`
 screen.check("input");              // clicks a checkbox only if it is not already checked
+screen.check("input", false);       // ...or unchecks it
+screen.mount("todo-list", {});      // mount another component into the container
 screen.submit();                    // fires `submit` on the form (default selector "form")
 screen.press("input", "Enter");     // fires `keydown` carrying the key
 screen.fire("div", "focusin");      // any bubbling, cancelable event

@@ -165,8 +165,9 @@
 
     try {
       const web = await SemaWeb.init({
-        // Point this to your LLM proxy backend
-        llmProxy: "http://localhost:3001/api/llm",
+        // Point this to your LLM proxy backend (@sema-lang/llm-proxy). The
+        // dev server (`sema web llm-chat.sema`) provides one on its own origin.
+        llmProxy: "http://localhost:3002",
       });
       console.log(`Sema Web v${web.version()} initialized with LLM proxy`);
     } catch (e) {

@@ -6,7 +6,24 @@
 //! `tokio::net::TcpListener::from_std` after `set_nonblocking(true)`.
 
 use std::io;
-use std::net::TcpListener;
+use std::net::{IpAddr, TcpListener};
+
+/// True for `localhost` and any loopback IP literal (`127.x.x.x`, `::1`).
+pub fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+/// `host:port` as a URL authority; a bare IPv6 literal is bracketed.
+pub fn format_host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
 
 /// Bind a TCP listener to `host:start_port`, advancing to the next port on
 /// `AddrInUse` up to `max_tries` attempts. Returns the bound listener together

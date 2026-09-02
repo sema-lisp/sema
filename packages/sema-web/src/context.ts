@@ -187,7 +187,7 @@ export interface IntervalRegistration {
 }
 
 export interface StreamRegistration {
-  kind: "event-source" | "llm-stream" | "resource";
+  kind: "event-source" | "llm-stream" | "resource" | "websocket";
   close: () => void;
 }
 
@@ -221,6 +221,11 @@ export interface SocketRegistration {
   socket: WebSocket;
   /** Sema callbacks wired via `ws/listen`, released on close/dispose. */
   callbacks: SemaCallback[];
+  /**
+   * Stream id the socket is registered under when a component opened it, so
+   * unmounting that component closes the socket like any other owned stream.
+   */
+  streamId?: number;
 }
 
 /** Error handler callback type. */

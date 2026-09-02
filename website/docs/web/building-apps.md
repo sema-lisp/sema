@@ -73,7 +73,7 @@ sema build --target web app.sema -o public/app.vfs
 Then switch the script tag from source to the compiled artifact:
 
 ```html
-<script type="text/sema" src="/public/app.vfs"></script>
+<script type="text/sema" src="/app.vfs"></script>
 <script type="module">
   import { SemaWeb } from "@sema-lang/sema-web";
   await SemaWeb.init();

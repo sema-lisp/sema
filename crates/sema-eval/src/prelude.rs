@@ -1094,7 +1094,17 @@ pub const PRELUDE: &str = r#"
 ;; native picks its own runtime implementation — but the direct call keeps
 ;; the dispatch obvious and is what the acceptance tests pin.
 (defn http/serve (handler . opts)
-  (let ((factory (fn (h req responder) (async/spawn (fn () (responder (h req)))))))
+  (let ((factory (fn (h req responder)
+                   (async/spawn
+                     (fn ()
+                       ;; A handler that raises never calls the responder, so the
+                       ;; server answers with a bounded 500. Log the cause here:
+                       ;; without this the error is invisible to the developer.
+                       (try (responder (h req))
+                         (catch e
+                           (println-error (str "http/serve: handler for "
+                                               (:method req) " " (:path req)
+                                               " raised: " (:message e))))))))))
     (if (null? opts)
         (__http-serve-run handler factory)
         (__http-serve-run handler factory (car opts)))))

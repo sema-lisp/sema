@@ -21,7 +21,7 @@
 (define (format-message msg)
   [:div
    {:class (string-append "message " (get msg :role))
-    :data-testid (string-append "msg-" (get msg :role))}
+    :data-testid (if (equal? (get msg :role) "user") "msg-user" "msg-assistant")}
    [:strong (string-append (get msg :role) ": ")]
    [:span (get msg :content)]])
 
@@ -39,8 +39,7 @@
           (put! current-stream nil)
           [:span])
         [:div
-         {:class "message assistant streaming"
-          :data-testid "msg-assistant-streaming"}
+         {:class "message assistant streaming" :data-testid "streaming-msg"}
          [:strong "assistant: "]
          [:span (get val :text)]]))
     [:span]))
@@ -48,7 +47,7 @@
 (define (chat-view)
   [:div
    {:class "chat-container" :data-testid "chat-container"}
-   [:h2 "Sema AI Chat"]
+   [:h2 {:data-testid "chat-title"} "Sema AI Chat"]
    [:div
     {:class "messages" :id "message-list"}
     (map format-message @messages)

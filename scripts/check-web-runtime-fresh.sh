@@ -55,9 +55,14 @@ fi
 # matches NOTHING in `git ls-files` (it wants files, not directory prefixes), so
 # omitting it silently reduces the fingerprint and the check quietly stops
 # covering the code. SANITY_FILES below fails loudly if that ever happens again.
+# package-lock.json and jake/wasm.jake are inputs too: the vendor step copies
+# @preact/signals-core and morphdom out of node_modules, so a dependency bump
+# or a change to the copy list must invalidate the lock.
 INPUT_PATHSPECS="$WASM_CRATE_SPECS
 Cargo.toml
 Cargo.lock
+package-lock.json
+jake/wasm.jake
 packages/sema/src/*
 packages/sema-web/src/*
 .cargo/config.toml

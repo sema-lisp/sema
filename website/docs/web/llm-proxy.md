@@ -132,6 +132,12 @@ interface ProxyConfig {
   /** CORS origin. Default: "*". */
   cors?: string;
 
+  /** Extra request headers to allow in the CORS preflight. */
+  corsAllowedHeaders?: string[];
+
+  /** Upstream provider call timeout in milliseconds. Default: 30000. */
+  upstreamTimeoutMs?: number;
+
   /** Max request body size in bytes. Default: 1MB. */
   maxBodySize?: number;
 
@@ -272,8 +278,10 @@ All errors return a structured JSON body:
 | `AUTH_FAILED` | 401 | Missing or invalid authorization |
 | `RATE_LIMITED` | 429 | Too many requests in the current window |
 | `BODY_TOO_LARGE` | 413 | Request body exceeds `maxBodySize` |
+| `INVALID_REQUEST` | 400 | Body validation failed (missing or mistyped field) |
 | `INVALID_REQUEST` | 404 | Unknown endpoint path |
 | `PROVIDER_ERROR` | 502 | The upstream LLM provider returned an error |
+| `TIMEOUT` | 504 | The upstream call exceeded `upstreamTimeoutMs` |
 
 ## SSE Streaming Protocol
 

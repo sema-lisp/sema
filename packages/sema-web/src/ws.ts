@@ -18,7 +18,13 @@
  * @module
  */
 
-import type { SemaWebContext, SocketRegistration } from "./context.js";
+import {
+  getCurrentOwnerId,
+  registerStream,
+  unregisterStream,
+  type SemaWebContext,
+  type SocketRegistration,
+} from "./context.js";
 import { toInvokableCallback, releaseCallback, type SemaCallback } from "./callbacks.js";
 
 interface SemaInterpreterLike {
@@ -44,6 +50,41 @@ function stripColonKeys(obj: any): any {
 function mapGet(obj: any, key: string): any {
   if (!obj || typeof obj !== "object") return undefined;
   return `:${key}` in obj ? obj[`:${key}`] : obj[key];
+}
+
+/** Drop a socket's registry entry and release the callbacks it holds. */
+function forgetSocket(ctx: SemaWebContext, handle: number, reg: SocketRegistration): void {
+  ctx.sockets.delete(handle);
+  if (reg.streamId !== undefined) unregisterStream(ctx, reg.streamId);
+  for (const cb of reg.callbacks) releaseCallback(cb);
+  reg.callbacks.length = 0;
+}
+
+/**
+ * Close a socket, keeping a wired `:on-close` so a client-initiated close
+ * still surfaces to the listen handlers (as in the native client). Without one,
+ * a cleanup-only handler releases the registration when the close event lands.
+ */
+function closeSocket(
+  ctx: SemaWebContext,
+  handle: number,
+  reg: SocketRegistration,
+  code?: number,
+  reason?: string,
+): void {
+  const { socket } = reg;
+  socket.onopen = null;
+  socket.onmessage = null;
+  socket.onerror = null;
+  if (!socket.onclose) {
+    socket.onclose = () => forgetSocket(ctx, handle, reg);
+  }
+  try {
+    if (typeof code === "number") socket.close(code, reason);
+    else socket.close();
+  } catch (e) {
+    ctx.onerror(e instanceof Error ? e : new Error(String(e)), "ws/close");
+  }
 }
 
 function getReg(ctx: SemaWebContext, handle: unknown): SocketRegistration {
@@ -107,7 +148,21 @@ export function registerWsBindings(interp: SemaInterpreterLike, ctx: SemaWebCont
         : new WebSocket(url);
     socket.binaryType = "arraybuffer";
     const handle = ctx.nextSocketId++;
-    ctx.sockets.set(handle, { socket, callbacks: [] });
+    const reg: SocketRegistration = { socket, callbacks: [] };
+    ctx.sockets.set(handle, reg);
+    // A socket opened during a component's render or lifecycle hook belongs to
+    // that component: unmounting it closes the socket, like `http/event-source`.
+    const ownerId = getCurrentOwnerId(ctx);
+    const owner = ownerId != null ? ctx.mountedComponentsById.get(ownerId) : undefined;
+    if (owner) {
+      const streamId = ctx.nextSignalId++;
+      reg.streamId = streamId;
+      registerStream(ctx, streamId, {
+        kind: "websocket",
+        close: () => closeSocket(ctx, handle, reg),
+      });
+      owner.ownedStreamIds.add(streamId);
+    }
     return handle;
   });
 
@@ -136,22 +191,7 @@ export function registerWsBindings(interp: SemaInterpreterLike, ctx: SemaWebCont
   interp.registerFunction("ws/close", (handle: unknown, code?: number, reason?: string) => {
     const reg = typeof handle === "number" ? ctx.sockets.get(handle) : undefined;
     if (!reg) return null;
-    const { socket } = reg;
-    socket.onopen = null;
-    socket.onmessage = null;
-    socket.onerror = null;
-    if (!socket.onclose) {
-      socket.onclose = () => {
-        if (typeof handle === "number") ctx.sockets.delete(handle);
-        for (const cb of reg.callbacks) releaseCallback(cb);
-      };
-    }
-    try {
-      if (typeof code === "number") socket.close(code, reason);
-      else socket.close();
-    } catch (e) {
-      ctx.onerror(e instanceof Error ? e : new Error(String(e)), "ws/close");
-    }
+    closeSocket(ctx, handle as number, reg, code, reason);
     return null;
   });
 
@@ -184,39 +224,46 @@ export function registerWsBindings(interp: SemaInterpreterLike, ctx: SemaWebCont
       const onClose = wire(onCloseV, "on-close");
       const onError = wire(onErrorV, "on-error");
       const { socket } = reg;
-
-    if (onOpen) {
-      // If already open (connect resolved before listen), fire immediately.
-      if (socket.readyState === WebSocket.OPEN) {
+      // Every handler runs inside browser event dispatch, where a throw would
+      // vanish into the event loop; route it to the app's error handler.
+      const guarded = (label: string, run: () => void) => {
         try {
-          onOpen(handle);
+          run();
         } catch (e) {
-          ctx.onerror(e instanceof Error ? e : new Error(String(e)), "ws/listen on-open");
+          ctx.onerror(e instanceof Error ? e : new Error(String(e)), `ws/listen ${label}`);
         }
-      } else {
-        socket.onopen = () => onOpen(handle);
-      }
-    }
-    if (onMessage) {
-      socket.onmessage = (ev: MessageEvent) => {
-        const data =
-          ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : ev.data;
-        onMessage(handle, data);
       };
-    }
-    socket.onclose = (ev: CloseEvent) => {
-      if (onClose) {
-        onClose(handle, { ":code": ev.code, ":reason": ev.reason });
+
+      if (onOpen) {
+        // If already open (connect resolved before listen), fire immediately.
+        if (socket.readyState === WebSocket.OPEN) {
+          guarded("on-open", () => onOpen(handle));
+        } else {
+          socket.onopen = () => guarded("on-open", () => onOpen(handle));
+        }
       }
-      // The socket is done; drop it from the registry.
-      if (typeof handle === "number") ctx.sockets.delete(handle);
-      for (const cb of reg.callbacks) releaseCallback(cb);
-    };
-    if (onError) {
-      socket.onerror = () => onError(handle, "websocket error");
-    }
-    return handle;
-  });
+      if (onMessage) {
+        socket.onmessage = (ev: MessageEvent) => {
+          const data = ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : ev.data;
+          guarded("on-message", () => onMessage(handle, data));
+        };
+      }
+      socket.onclose = (ev: CloseEvent) => {
+        try {
+          if (onClose) {
+            guarded("on-close", () => onClose(handle, { ":code": ev.code, ":reason": ev.reason }));
+          }
+        } finally {
+          // The socket is done; drop it from the registry even if on-close threw.
+          forgetSocket(ctx, handle as number, reg);
+        }
+      };
+      if (onError) {
+        socket.onerror = () => guarded("on-error", () => onError(handle, "websocket error"));
+      }
+      return handle;
+    },
+  );
 
   // Sema wrapper for ws/listen: pulls the handlers out of the map (where they
   // are still real Sema lambdas) and hands them to __ws/listen as top-level

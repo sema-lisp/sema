@@ -4,7 +4,7 @@
 ;;   sema build --target web examples/sema-web-app/app.sema -o examples/sema-web-app/dist/app.vfs
 ;;
 ;; Run from the repository root:
-;;   make sema-web-example
+;;   jake wasm.sema-web-example
 
 ;; --- Routing ---------------------------------------------------------------
 
@@ -496,7 +496,7 @@
       [:p
        {:class section-copy-class}
        "This repository example uses "
-       [:span {:class code-pill-class} "make sema-web-example"]
+       [:span {:class code-pill-class} "jake wasm.sema-web-example"]
        " to build the archive and serve it locally."]]
      (if (= (length @visible-tasks) 0)
        [:div

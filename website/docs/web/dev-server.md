@@ -23,10 +23,14 @@ That's it — the browser opens to your running app.
   are embedded in the `sema` binary and served under `/__sema/`, wired up with a
   generated `<script type="importmap">`. No `node_modules` at runtime.
 - **Serves your app.** Your entry `.sema` (and anything next to it) is served
-  from `/app/`. The browser fetches the source and the WASM VM evaluates it — the
-  server never compiles your code.
-- **Hot reloads.** The server watches your app directory. When a file changes,
-  the page reloads and fetches the new source.
+  from `/app/`. A single-file app is fetched as source and evaluated by the WASM
+  VM in the browser. An app that uses `import` is compiled to a `.vfs` archive on
+  the server (the browser has no filesystem to resolve imports against) and
+  served from `/__build/app.vfs`; an import that does not resolve is a build
+  error shown in the page.
+- **Hot reloads.** The server watches your app directory. The page polls
+  `/__dev/poll`; when a file changes, the page reloads and fetches the new
+  source (or a rebuilt archive).
 - **Proxies `llm/*`.** Browser `llm/*` calls are answered by the dev server using
   the API keys in your environment (see [LLM proxy](#llm-proxy)).
 
@@ -38,9 +42,9 @@ sema web app.sema [OPTIONS]
 
 | Option        | Default       | Description                                            |
 | ------------- | ------------- | ------------------------------------------------------ |
-| `--port <n>`  | `3000`        | Port to serve on. Advances to the next free port if taken. |
-| `--host <h>`  | `127.0.0.1`   | Address to bind. A non-loopback host exposes the LLM proxy to the network. |
-| `--no-open`   | —             | Don't open a browser automatically.                    |
+| `-p, --port <n>` | `3000`     | Port to serve on. Advances to the next free port if taken. |
+| `--host <h>`  | `127.0.0.1`   | Address to bind. A non-loopback host exposes the unauthenticated LLM proxy to the network; the server prints a warning. |
+| `--no-open`   | —             | Don't open a browser automatically. The browser is also not opened when stdout is not a terminal. |
 | `--no-llm`    | —             | Disable the built-in LLM proxy.                        |
 
 ## Hot reload
@@ -67,6 +71,13 @@ differs. In dev, it's wired to the dev server automatically.
 
 Keys come from your environment, exactly as with the `sema` CLI
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …). Disable the proxy with `--no-llm`.
+
+The dev proxy has no authentication, rate limiting, or CORS configuration; it
+is meant for a loopback address on your own machine. Use
+[`@sema-lang/llm-proxy`](/docs/web/llm-proxy) for anything reachable by others.
+Two small differences from that package: a malformed body is answered with
+`400 {"error": ...}` without a code field, and `GET /models` returns the
+configured provider names rather than model names.
 
 Streaming (`llm/chat-stream`) delivers tokens **progressively** — they render as
 they arrive from the provider.

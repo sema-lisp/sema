@@ -216,4 +216,91 @@ describe("registerWsBindings", () => {
     expect(ctx.sockets.size).toBe(0);
     void h;
   });
+  // --- handler errors are routed to ctx.onerror, never lost in event dispatch ---
+
+  const captureErrors = () => {
+    const errors: string[] = [];
+    ctx.onerror = (e, context) => {
+      errors.push(`${context}: ${e.message}`);
+    };
+    return errors;
+  };
+
+  it("__ws/listen routes a throwing on-message handler to ctx.onerror", () => {
+    const h = connect();
+    const errors = captureErrors();
+    listen(h, {
+      message: () => {
+        throw new Error("boom");
+      },
+    });
+    expect(() => sock().fireMessage("x")).not.toThrow();
+    expect(errors).toEqual(["ws/listen on-message: boom"]);
+  });
+
+  it("__ws/listen routes a throwing deferred on-open handler to ctx.onerror", () => {
+    const h = connect();
+    sock().readyState = MockWebSocket.CONNECTING;
+    const errors = captureErrors();
+    listen(h, {
+      open: () => {
+        throw new Error("open failed");
+      },
+    });
+    expect(() => sock().onopen?.()).not.toThrow();
+    expect(errors).toEqual(["ws/listen on-open: open failed"]);
+  });
+
+  it("__ws/listen routes a throwing on-error handler to ctx.onerror", () => {
+    const h = connect();
+    const errors = captureErrors();
+    listen(h, {
+      error: () => {
+        throw new Error("handler broke");
+      },
+    });
+    expect(() => sock().onerror?.()).not.toThrow();
+    expect(errors).toEqual(["ws/listen on-error: handler broke"]);
+  });
+
+  it("a throwing on-close still releases the socket and its callbacks", () => {
+    const h = connect();
+    const errors = captureErrors();
+    listen(h, {
+      close: () => {
+        throw new Error("close handler broke");
+      },
+    });
+    expect(() => sock().fireClose(1000, "")).not.toThrow();
+    expect(errors).toEqual(["ws/listen on-close: close handler broke"]);
+    expect(ctx.sockets.has(h)).toBe(false);
+  });
+
+  // --- component ownership: unmount closes the socket ---
+
+  it("ws/connect inside a component registers an owned stream that closes the socket", () => {
+    const component = {
+      instanceId: 7,
+      ownedStreamIds: new Set<number>(),
+    };
+    ctx.mountedComponentsById.set(component.instanceId, component as any);
+    ctx.ownerStack.push(component.instanceId);
+    const h = connect();
+    ctx.ownerStack.pop();
+
+    expect(component.ownedStreamIds.size).toBe(1);
+    const [streamId] = component.ownedStreamIds;
+    const registration = ctx.streams.get(streamId);
+    expect(registration?.kind).toBe("websocket");
+
+    registration!.close();
+    expect(sock().closed).toBe(true);
+    expect(ctx.sockets.has(h)).toBe(false);
+    expect(ctx.streams.has(streamId)).toBe(false);
+  });
+
+  it("ws/connect outside a component registers no stream", () => {
+    connect();
+    expect(ctx.streams.size).toBe(0);
+  });
 });

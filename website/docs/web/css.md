@@ -6,7 +6,7 @@ The `css` function generates unique class names and injects scoped CSS rules int
 
 ### `(css props)` -> string
 
-Pass a map of CSS properties. Returns a generated class name (e.g., `"sema-1"`) that you can use in SIP markup:
+Pass a map of CSS properties. Returns a generated class name (e.g., `"sema-k3x9p2qa-1"`: a per-page random namespace plus a counter) that you can use in SIP markup:
 
 ```sema
 (def card-class
@@ -48,10 +48,10 @@ Use the `&` prefix to define nested pseudo-selectors and modifiers:
 This generates:
 
 ```css
-.sema-1 { padding: 8px 16px; background: #3b82f6; color: #fff; border: none; border-radius: 4px; cursor: pointer }
-.sema-1:hover { background: #2563eb }
-.sema-1:active { background: #1d4ed8 }
-.sema-1:disabled { opacity: 0.5; cursor: not-allowed }
+.sema-k3x9p2qa-1 { padding: 8px 16px; background: #3b82f6; color: #fff; border: none; border-radius: 4px; cursor: pointer }
+.sema-k3x9p2qa-1:hover { background: #2563eb }
+.sema-k3x9p2qa-1:active { background: #1d4ed8 }
+.sema-k3x9p2qa-1:disabled { opacity: 0.5; cursor: not-allowed }
 ```
 
 ## CamelCase Conversion
@@ -91,4 +91,4 @@ You can also write property names in kebab-case directly -- both forms work.
 
 ## How It Works
 
-Each call to `css` increments a counter and generates a class name like `sema-1`, `sema-2`, etc. The CSS rules are inserted into a single `<style>` element using `CSSStyleSheet.insertRule`. Rules persist for the lifetime of the page.
+Each call to `css` increments a counter and generates a class name like `sema-<namespace>-1`, `sema-<namespace>-2`, where `<namespace>` is eight random characters chosen once per page load, so classes from two embedded apps never collide. Do not hardcode the generated names in stylesheets; use the returned value. The CSS rules are inserted into a single `<style>` element using `CSSStyleSheet.insertRule`. Rules persist for the lifetime of the page.

@@ -654,3 +654,37 @@ RETRACTED HYPOTHESIS (recorded because it cost real time and a reader should not
 CRITICAL CAVEAT ON ALL E2E OBSERVATIONS: another agent was mutating this working tree throughout my session. Mid-run, e2e/tests/zzadv.spec.ts + its fixtures were DELETED and e2e/tests/zzq4res.spec.ts + tests/zzq4res-probe.test.ts APPEARED. That is what produced Playwright's "Test not found in the worker process. Make sure test title does not change." for zzprobe.spec.ts (a spec file rewritten between the list and run phases). It also means the unit suite now reports 13 failures, ALL of them in the other agent's in-flight tests/zzq4res-probe.test.ts — that is their WIP, not a finding, and I have excluded it. The zzadv-derived lifecycle failures I saw (a shared on-unmount handle across two instances erroring `Unknown callback handle: 1` and losing the second teardown; `component/unmount!` from inside an effect body leaving mountedComponentsById = [1,2,3] with the cleanup never run; zombie re-renders continuing after unmount) looked like genuine product bugs and their probe emitted real internal runtime errors rather than mere assertion mismatches — but I am NOT reporting them as findings because the probes were deleted under me and I cannot re-run them. Someone should re-derive them deliberately.
 
 NOT FIXED ANYTHING (report-only phase). TREE LEFT AS FOUND: I created exactly three throwaway files (e2e/fixtures/tmpdist.html, e2e/fixtures/scripts/init-tmpdist.ts, e2e/tests/tmpdist.spec.ts) and deleted all three; `find` for *tmpdist* now returns nothing. I regenerated dist/ (npm run build) and packages/sema-wasm/pkg/ — both are fully gitignored and regenerable, and the other agent rebuilt dist/ after me anyway. test-results/ is gitignored Playwright output. No git add/commit/push.
+
+---
+
+## 2026-09-01 sweep — additional findings
+
+A second pass over `packages/sema-web`, the `sema web` dev server, and the
+web docs. Each item is fixed unless marked otherwise.
+
+| # | Finding | Fix |
+|---|---|---|
+| 38 | A Sema error thrown inside a `ws/listen` handler (`:on-open` when deferred, `:on-message`, `:on-close`, `:on-error`) escaped into WebSocket event dispatch and never reached `onerror`; a throwing `:on-close` also skipped the registry cleanup, leaking the socket and its callbacks. | All four handlers run through one guard that routes to `ctx.onerror`; cleanup runs in `finally`. Tests in `tests/ws.test.ts`. |
+| 39 | `ws/connect` inside a component was not owned by it: unmounting left the socket open. | The socket registers as an owned `websocket` stream (`SocketRegistration.streamId`), closed by the normal unmount drain. Test in `tests/ws.test.ts`. |
+| 40 | `store/remove!`, `store/clear!`, `store/keys`, `store/has?` and the `session-*` variants threw when storage is blocked, contradicting `store.md`. | Every binding is guarded and returns a fallback. Test in `tests/store.test.ts`. |
+| 41 | `http/event-source`'s completion promise was never `.catch`ed, so a throw from the SSE pump's `finally` became an unhandled rejection with no attribution. | Routed to `ctx.onerror` as `event-source:<id>`. |
+| 42 | `llmProxy.timeout` was documented with a default but never read. | Documented as reserved; removed from the examples. |
+| 43 | Dev server: an import that does not exist was traced in non-strict mode, so the page failed at runtime with "import nope: operation not supported on this platform". | `web_prepare_send` uses strict tracing and shows a build error naming the import. |
+| 44 | Dev server: build-error text and the entry name were interpolated into the shell HTML unescaped. | `html-escape` in `dev_server.sema`. |
+| 45 | Dev server: the LLM proxy handlers read fields off any JSON body, so a missing field surfaced as a type error from `llm/*`. | `with-body` validates the shape and required fields; `400 {"error": ...}`. |
+| 46 | Dev server: `--host 0.0.0.0` exposed the unauthenticated proxy silently. | A startup warning names the risk and `--no-llm`. `is_loopback_host`/`format_host_port` moved to `sema_core::net` and shared with the workflow viewer; the auto-open URL brackets IPv6 hosts. |
+| 47 | `http/serve`: a handler that raises produced the bounded 500 with the cause logged nowhere. | The prelude wrapper logs `http/serve: handler for <method> <path> raised: <message>` to stderr; the 500 body contract is unchanged. |
+| 48 | `examples/web-demo/chat.sema` had drifted from the e2e fixture copy the tests run. | Synced; `tests/web-demo-fixtures.test.ts` fails on any future drift. |
+| 49 | `examples/sema-web-app/app.sema` told users (in the rendered UI) to run `make sema-web-example`; there is no Makefile. | `jake wasm.sema-web-example`. |
+| 50 | `examples/web/counter.sema` read `sema-counter` from storage but never wrote it, and would have applied `string->number` to a decoded number. | Persists on every change and restores the number directly. |
+| 51 | Docs: the Todo and Streaming Chat samples in `examples.md`/`llm.md` used `string=?`, which does not exist. | `equal?`. Also fixed: `/public/app.vfs` path, `css` class-name format, the `reactive: false` override claim, `message` described as a map helper, `INVALID_REQUEST`/`TIMEOUT` statuses, missing `ProxyConfig` fields, `router/link` optional args, `dom/get-style` inline-only, two-arg `http/event-source`, `put!` return value, `mount!` symbol form, `defcomponent` props default. |
+| 52 | `publish-npm.yml` re-pinned `@sema-lang/sema-wasm` for `@sema-lang/sema` but not `@sema-lang/sema` for `@sema-lang/sema-web`. | Same `node -e` re-pin step. |
+| 53 | `scripts/check-web-runtime-fresh.sh` did not fingerprint `package-lock.json` or `jake/wasm.jake`, so a bump of the vendored `@preact/signals-core`/`morphdom` never invalidated the lock. | Both added to `INPUT_PATHSPECS`. |
+
+Not changed, recorded:
+
+- `{:routes "oops"}` in `router/init!` still registers the route `/routes` (residual of #28): keyword colons are stripped at the WASM boundary, so the string value cannot be told apart from a bare table whose pattern is spelled `routes`, and a test pins that reading.
+- `sse.ts` calls its TS-level `onEvent`/`onError`/`onClose` callbacks unguarded; every in-tree caller only sets a signal, so a throw there is a runtime bug, not app code.
+- `releaseHandlesForSubtree` is linear in the number of live handles per removed node; a large list teardown is quadratic. No report of it being felt.
+- The `jake test.web-e2e` dev-server Playwright suite is still not part of any CI workflow (it needs a browser and the `sema` binary).
+

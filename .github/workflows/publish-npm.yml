@@ -208,6 +208,12 @@ jobs:
         working-directory: packages/sema-web
         run: |
           npm version "${{ steps.version.outputs.version }}" --no-git-tag-version --allow-same-version
+          # Lock the runtime dependency to this release, as @sema-lang/sema does for sema-wasm.
+          node -e "
+            const pkg = require('./package.json');
+            pkg.dependencies['@sema-lang/sema'] = '^${{ steps.version.outputs.version }}';
+            require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
           npm install
           npm run build
           npm publish --provenance --access public || echo "Already published, skipping"

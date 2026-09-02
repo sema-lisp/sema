@@ -548,7 +548,7 @@ await SemaWeb.create({
   llmProxy: {
     url: "https://api.example.com/llm",
     token: "user-session-jwt",
-    timeout: 30000,
+    headers: { "X-Client": "my-app" },
   },
 });
 ```
@@ -578,6 +578,11 @@ const web = await SemaWeb.create({
   // Register component/mount system (default: true)
   // Automatically enables reactive + sip
   components: true,
+  router: true,       // router/* namespace
+  css: true,          // css/* scoped styles
+  http: true,         // http/event-source (SSE)
+  resources: true,    // resource, resource/refresh!, resource/cancel!
+  websocket: true,    // ws/* namespace
 
   // LLM proxy — enables llm/* functions in the browser
   // Simple: just the URL
@@ -586,7 +591,7 @@ const web = await SemaWeb.create({
   // llmProxy: {
   //   url: "https://api.example.com/llm",
   //   token: "user-session-token",
-  //   timeout: 30000,
+  //   headers: { "X-Client": "my-app" },
   // },
 
   // Custom WASM URL (for CDN deployment)

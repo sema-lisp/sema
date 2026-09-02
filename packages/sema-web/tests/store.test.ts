@@ -136,4 +136,58 @@ describe("registerStoreBindings", () => {
     expect(onerrorSpy).toHaveBeenCalledWith(expect.any(TypeError), "store/session-set!:circular");
     expect(sessionStorage.getItem("circular")).toBeNull();
   });
+  // --- storage that throws (private mode, sandboxed iframe) is reported, not thrown ---
+
+  it("every store/* binding reports a throwing storage to ctx.onerror and returns a fallback", () => {
+    const errors: string[] = [];
+    ctx.onerror = (_e, context) => {
+      errors.push(context);
+    };
+    const blocked = () => {
+      throw new Error("SecurityError: storage disabled");
+    };
+    vi.stubGlobal("localStorage", {
+      getItem: blocked,
+      setItem: blocked,
+      removeItem: blocked,
+      clear: blocked,
+      key: blocked,
+      get length() {
+        return blocked();
+      },
+    });
+    vi.stubGlobal("sessionStorage", {
+      getItem: blocked,
+      setItem: blocked,
+      removeItem: blocked,
+      clear: blocked,
+    });
+    try {
+      const call = (name: string, ...args: any[]) => interp.getFunction(name)!(...args);
+      expect(call("store/get", "k")).toBeNull();
+      expect(call("store/set!", "k", 1)).toBeNull();
+      expect(call("store/remove!", "k")).toBeNull();
+      expect(call("store/clear!")).toBeNull();
+      expect(call("store/keys")).toEqual([]);
+      expect(call("store/has?", "k")).toBe(false);
+      expect(call("store/session-get", "k")).toBeNull();
+      expect(call("store/session-set!", "k", 1)).toBeNull();
+      expect(call("store/session-remove!", "k")).toBeNull();
+      expect(call("store/session-clear!")).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(errors).toEqual([
+      "store/get:k",
+      "store/set!:k",
+      "store/remove!:k",
+      "store/clear!",
+      "store/keys",
+      "store/has?:k",
+      "store/session-get:k",
+      "store/session-set!:k",
+      "store/session-remove!:k",
+      "store/session-clear!",
+    ]);
+  });
 });

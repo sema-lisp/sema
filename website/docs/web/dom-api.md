@@ -144,7 +144,8 @@ Set a CSS style property. Use kebab-case property names.
 
 ### `(dom/get-style handle property)` -> string
 
-Get a CSS style property value.
+Get an **inline** style property value (the element's `style` attribute). A
+value set by a stylesheet or by `css` is not visible here and reads as `""`.
 
 ```sema
 (dom/get-style el "color")
@@ -295,6 +296,27 @@ The callback receives a numeric event handle as its argument.
 
 The event handle is automatically released after the callback returns.
 
+### `(dom/stop-propagation! event-handle)` -> nil
+
+Stop the event from bubbling to ancestor elements, including delegated SIP
+handlers (`{:on-click ...}`) on ancestors.
+
+### `(dom/event-target-closest event-handle selector)` -> handle | nil
+
+Return the closest ancestor of the event target (including the target itself)
+that matches `selector`, as an element handle. Useful in a delegated handler on
+a list to find which row was clicked.
+
+```sema
+(define (handle-row-click ev)
+  (when-let (row (dom/event-target-closest ev "tr[data-id]"))
+    (println (dom/get-attribute row "data-id"))))
+```
+
+### `(dom/focus! handle)` -> nil
+
+Move keyboard focus to the element.
+
 ### `(dom/off! handle event callback)` -> nil
 
 Remove a previously registered event listener.
@@ -353,3 +375,24 @@ Render SIP data into the element matching `selector`, replacing existing content
 - All handles are numeric IDs managed by an internal handle map. They reference DOM elements, text nodes, or events.
 - `dom/on!` accepts either a function value or a callback-name string. `dom/off!` must be given the same callback identity that was used when registering the listener.
 - When using `dom/on!` on elements inside a component rendered with morphdom, be aware that morphdom may replace DOM nodes, orphaning your listeners. Prefer SIP `on-*` attributes for components that re-render.
+
+## Console
+
+Thin wrappers over the browser console. Every function accepts any values and
+returns `nil`.
+
+| Function | Browser call |
+| --- | --- |
+| `(console/log ...)` | `console.log` |
+| `(console/info ...)` | `console.info` |
+| `(console/warn ...)` | `console.warn` |
+| `(console/error ...)` | `console.error` |
+| `(console/debug ...)` | `console.debug` |
+| `(console/clear)` | `console.clear` |
+| `(console/time label)` / `(console/time-end label)` | `console.time` / `console.timeEnd` |
+
+```sema
+(console/time "render")
+(render-board)
+(console/time-end "render")   ; render: 3.2ms
+```

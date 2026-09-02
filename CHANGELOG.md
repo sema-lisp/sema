@@ -1,5 +1,103 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Reader: `#true`/`#false` lexed as `#t`/`#f` plus a stray symbol** (`Unbound
+  variable: rue`). Both long forms now read as booleans, and `#tx` is a reader
+  error.
+- **Reader: an explicit `+` sign was not accepted on number literals.** `+42`
+  and `+1.5` read as numbers; `(string->number "+5")` returns `5` and
+  `(string/number? "+5")` agrees.
+- **Reader: a number glued to letters lexed as two tokens.** `1.5e` evaluated
+  to Euler's `e`, and `1abc`, `0x1F`, `1_000`, `1.` split into a number and a
+  symbol. A number must now end at a delimiter; these are reader errors
+  (`invalid number literal`) with a hint pointing at `#x`/`#b` prefixes.
+- **Reader: a malformed dotted list under a quote was reported as "quote
+  requires an expression after it".** The inner error is reported instead.
+- **`set!` on an unbound global silently defined it.** It now raises
+  `:unbound` (with a did-you-mean suggestion), as the doc entry always said.
+- **`throw` of a string put the write form (with quotes) in `:message`.**
+  `(throw "x")` now gives `:message "x"`; `:value` keeps the original for every
+  thrown value.
+- **Eager bulk constructors aborted the process on an absurd size**
+  (limitation #35). `range`, `iota`, `list/repeat`/`make-list`, `list/times`,
+  and `string/repeat` raise a catchable error above 100M elements.
+- **Malformed `let`/`let*`/`letrec`/named-`let`/`do` forms had no source
+  location in their error.** The macro expander rebuilt the bindings list and
+  lost the span-map identity; the rebuilt list is now kept when nothing changed.
+- **`(:key m)` with two arguments reported `a expects 1 argument`.** The
+  keyword-call arity error names the keyword (`:a`), and a second argument is
+  now the default for a missing key: `(:b m 0)`.
+- `json/decode` returned `nil` for a float outside the `f64` range (`1e400`);
+  it now decodes as `inf`.
+- `char-upcase`/`char-downcase` truncated a multi-char mapping (`#\ß` → `#\S`);
+  the char is returned unchanged, per R7RS.
+- `string/pad-left`/`string/pad-right` hints named a nonexistent `string/pad`.
+- `sqlite/*` could panic on a non-UTF-8 column alias in user SQL.
+- `sema fmt <dir>` failed with "Is a directory"; a directory argument now
+  formats every `.sema` file under it.
+
+### Changed
+
+- **Float display uses exponent form beyond the JavaScript thresholds.**
+  A float with magnitude `>= 1e21` or `< 1e-7` prints as `1e300` / `1e-8`
+  instead of hundreds of digits; every printed form reads back to the same
+  value. `number->string` and `str` follow.
+
+### sema-web and `sema web`
+
+- **A Sema error inside a `ws/listen` handler was lost** (it escaped into
+  browser event dispatch), and a throwing `:on-close` leaked the socket. All
+  handlers now route to `onerror`; cleanup always runs.
+- **A WebSocket opened inside a component now closes when the component
+  unmounts**, like `http/event-source` streams.
+- **Every `store/*` function tolerates blocked storage** (private mode,
+  sandboxed iframes): the error goes to `onerror` and a fallback is returned,
+  as `store.md` always said. Previously only `get`/`set!` were guarded.
+- `http/event-source`: a throw from the SSE pump's cleanup is reported instead
+  of becoming an unhandled rejection.
+- `sema web`: an `import` that does not exist is a build error shown in the
+  page (was a runtime "operation not supported on this platform"); build-error
+  text is HTML-escaped; the LLM proxy validates request bodies (`400`) and
+  warns at startup when bound to a non-loopback host; the auto-open URL is
+  correct for IPv6 hosts.
+- `http/serve`: a handler that raises now logs the cause to stderr (the
+  response stays the bounded 500).
+- Examples: `examples/web/README.md` explains how to run the browser examples;
+  `counter.sema` persists its count; `examples/web-demo/chat.sema` is back in
+  sync with the e2e fixture (a test now pins that); `sema-web-app` no longer
+  tells users to run `make`.
+- Docs: the Todo and Streaming Chat samples used a nonexistent `string=?`;
+  many smaller corrections across `website/docs/web` (see
+  `docs/bugs/2026-07-28-sema-web-adversarial-findings.md`, findings 38–53).
+
+### Documentation
+
+- The builtin doc-example checker
+  (`crates/sema/tests/suites/doc_examples_test.rs`) now runs in CI: it handles
+  multi-line forms, strips trailing comments from expected values, treats an
+  evaluation error as a failure, and accepts `; => error: ...` expectations.
+  996 examples are verified; the entries it flagged were corrected.
+- Builtin entries gained `params`, `returns`, and `see_also` metadata across
+  the stdlib (LSP signature help, `sema doc`, and MCP `docs_search` use them),
+  and the stub entries for `proc/*`, `pty/*`, `fs/*`, `reflect`, `event/*`,
+  the `term/*` emitters, and `workflow/approval` now have full descriptions
+  and examples.
+- Website: `cli.md` documents `sema doc`, `sema update`, `sema web`,
+  `sema workflow`, `sema dap`, `--allowed-paths`, the `build`/`fmt`/`pkg`
+  flags that were missing, all 14 REPL commands and the `*1`/`*e` history
+  variables, and more environment variables. `formatter.md` documents
+  `--max-blank-lines`, `max-blank-lines`, and `ignore`. `lsp.md` no longer
+  says the VS Code extension lacks LSP support. New `stdlib/pio.md` page;
+  eight stdlib pages are now linked from the stdlib index. Language docs
+  explain number-literal rules, that `(1 . 2)` is not a pair, `let` vs
+  `if-let` binding shapes, that `try` has no `finally`, `reduce`/`partition`/
+  `get`/`format` argument conventions, the `regex/replace` argument order, and
+  JSON key decoding. `docs/limitations.md` records `do`-loop closure capture
+  (#39) and closes #35.
+
 ## 1.36.0
 
 ### Fixed

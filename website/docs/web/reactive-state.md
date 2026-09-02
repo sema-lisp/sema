@@ -40,7 +40,7 @@ The `@` reader macro dereferences a signal, returning its current value. Inside 
 
 ### `(put! x val)` -- Set Value
 
-Replaces the signal's value. Triggers re-renders for any subscribed components or computed values.
+Replaces the signal's value and returns it. Triggers re-renders for any subscribed components or computed values.
 
 ```sema
 (def count (state 0))
@@ -111,7 +111,7 @@ Use `batch` when updating multiple related signals to avoid intermediate renders
 
 ### `(watch x fn)` -- Side Effects
 
-Observes a signal and calls a function whenever the value changes. The function receives the old and new values as arguments.
+Observes a signal and calls a function whenever the value changes. The function receives the old and new values as arguments. `fn` may also be the name of a top-level function as a string.
 
 `watch` returns a numeric watch handle. Call `unwatch!` with that handle to stop observing.
 
@@ -223,7 +223,7 @@ Disposes a watch created by `watch`.
 
 ;; Persist to localStorage
 (watch todos (fn (old new)
-  (store/set "todos" (json/encode new))))
+  (store/set! "todos" (json/encode new))))
 ```
 
 ## Auto-tracking: How It Works

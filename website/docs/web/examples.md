@@ -52,15 +52,15 @@ Complete Sema Web examples using the current `state` / SIP / component APIs.
   (put! input-text (dom/event-value ev)))
 
 (define (maybe-add-todo ev)
-  (when (string=? (dom/event-key ev) "Enter")
+  (when (equal? (dom/event-key ev) "Enter")
     (add-todo ev)))
 
 (define (add-todo ev)
   (let ((text @input-text))
-    (when (not (string=? text ""))
+    (when (not (equal? text ""))
       (let ((id @next-id))
         (update! todos (fn (items)
-          (append items (list {:id id :text text :done false}))))
+          (append items (list {:id id :text text :done #f}))))
         (update! next-id (fn (n) (+ n 1)))
         (put! input-text "")))))
 
@@ -94,12 +94,12 @@ Requires a deployed [LLM proxy](./llm-proxy).
   (put! input-text (dom/event-value ev)))
 
 (define (maybe-send ev)
-  (when (string=? (dom/event-key ev) "Enter")
+  (when (equal? (dom/event-key ev) "Enter")
     (send-message ev)))
 
 (define (send-message ev)
   (let ((text @input-text))
-    (when (not (string=? text ""))
+    (when (not (equal? text ""))
       (let ((next-messages (append @messages (list {:role "user" :content text}))))
         (put! messages next-messages)
         (put! input-text "")

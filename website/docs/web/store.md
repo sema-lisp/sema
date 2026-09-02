@@ -118,4 +118,4 @@ Values are stored as JSON, so the following types round-trip correctly:
 
 ## Error Handling
 
-Storage operations can fail (e.g., quota exceeded, storage disabled in private browsing). Errors are reported to the context's `onerror` handler and the function returns `nil` rather than throwing.
+Storage operations can fail (e.g., quota exceeded, storage disabled in private browsing). Every `store/*` function reports the error to the context's `onerror` handler and returns a fallback (`nil`, `#f` for `store/has?`, `()` for `store/keys`) rather than throwing.

@@ -113,15 +113,18 @@ const web = await SemaWeb.create({
   router: true,       // router/* namespace (hash-based SPA routing)
   css: true,          // css/* namespace (scoped styles)
   http: true,         // http/* namespace (fetch, SSE)
+  resources: true,    // resource, resource/refresh!, resource/cancel!
+  websocket: true,    // ws/* namespace
   console: true,      // console/* namespace
+  dev: false,         // record a bounded diagnostics timeline (see Diagnostics)
 
   // LLM proxy — forward llm/* calls to a backend server
   llmProxy: "https://api.example.com/llm",
   // or with full options:
   llmProxy: {
     url: "https://api.example.com/llm",
-    token: "user-session-token",
-    timeout: 30000,
+    token: "user-session-token",          // sent as Authorization: Bearer
+    headers: { "X-Client": "my-app" },    // extra headers on every proxy request
   },
 });
 ```
@@ -134,7 +137,7 @@ Every binding module can be individually disabled. This is useful for:
 - **Bundle size** -- tree-shaking removes unused modules
 - **Testing** -- isolate reactive logic without DOM side effects
 
-Enabling `components` automatically enables `reactive` and `sip` (components depend on both). You can still explicitly disable them with `reactive: false`, which overrides the auto-enable.
+Enabling `components` (the default) also registers `reactive` and `sip`, because components depend on both. `reactive: false` or `sip: false` only takes effect together with `components: false`; on their own they are ignored.
 
 ```js
 // Minimal: only reactive state, no DOM/components

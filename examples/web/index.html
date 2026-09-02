@@ -97,8 +97,9 @@
     and evaluates all <script type="text/sema"> tags.
   -->
   <script type="module">
-    // In production, import from "@sema-lang/sema-web"
-    // For this demo, we use a relative path to the built package
+    // A bare specifier: this page needs a bundler (Vite) or an import map that
+    // resolves @sema-lang/sema-web. To run counter.sema with no setup, use the
+    // dev server instead: `sema web counter.sema`.
     import { SemaWeb } from "@sema-lang/sema-web";
 
     try {

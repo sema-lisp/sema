@@ -80,8 +80,8 @@ export interface LlmProxyOptions {
   headers?: Record<string, string>;
 
   /**
-   * Request timeout in milliseconds.
-   * Default: 60000 (60 seconds).
+   * Reserved. Proxy requests run through the interpreter's `http/post`, which
+   * has no per-request timeout in the browser, so this value is not applied.
    */
   timeout?: number;
 }

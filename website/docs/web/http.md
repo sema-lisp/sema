@@ -10,13 +10,13 @@ Use `evalAsync()` from JavaScript when your top-level Sema code performs HTTP re
 
 ## Event Streams
 
-### `(http/event-source url-or-opts)` -> signal
+### `(http/event-source url-or-opts [opts])` -> signal
 
 Open a streaming HTTP connection and return a reactive signal. Unlike the browser's native `EventSource`, Sema Web uses a fetch-based SSE client so you can send headers, credentials, and POST bodies.
 
 The first argument may be either:
 
-- a URL string
+- a URL string, optionally followed by an options map
 - an options map with `:url`, `:method`, `:headers`, `:body`, and `:with-credentials`
 
 ```sema

@@ -58,7 +58,8 @@
 ;; ─── Event Handlers ────────────────────────────────────
 
 (define (update-display! evt)
-  (dom/set-text! display-el (number->string count)))
+  (dom/set-text! display-el (number->string count))
+  (store/set! "sema-counter" count))
 
 (define (on-increment evt)
   (set! count (+ count 1))
@@ -80,8 +81,8 @@
 
 ;; ─── Persist to localStorage ───────────────────────────
 
-;; Restore saved count on load
+;; Restore saved count on load (store/get returns the decoded JSON value)
 (let ((saved (store/get "sema-counter")))
-  (when saved
-    (set! count (string->number saved))
+  (when (number? saved)
+    (set! count saved)
     (update-display! nil)))

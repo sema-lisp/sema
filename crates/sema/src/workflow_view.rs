@@ -36,7 +36,9 @@
 //! the binary already pulls in (the notebook uses axum; a handful of routes does
 //! not need it).
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
+
+use sema_core::net::{format_host_port, is_loopback_host};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -616,13 +618,6 @@ fn unique_form_field(body: &[u8], wanted: &str) -> Option<String> {
     found
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
-}
-
 fn allowed_host_authorities(host: &str, listener_addr: SocketAddr) -> Vec<String> {
     if !is_loopback_host(host) {
         return Vec::new();
@@ -633,14 +628,6 @@ fn allowed_host_authorities(host: &str, listener_addr: SocketAddr) -> Vec<String
         authorities.push(bound);
     }
     authorities
-}
-
-fn format_host_port(host: &str, port: u16) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
 }
 
 /// JSON array of run-ids: immediate child dirs of `run_dir` that contain an

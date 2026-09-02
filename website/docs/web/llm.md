@@ -176,19 +176,31 @@ List available models from the configured provider.
 
 **Returns:** map with `:models` (list of model name strings)
 
+::: tip Dev server
+Against `sema web`'s built-in proxy, `/models` answers with the configured
+**provider** names (`(llm/list-providers)` on the server), not model names.
+:::
+
+### `(llm/send prompt-or-messages . opts)`
+
+Send either a prompt string or a list of messages through `/chat` and return
+the reply text. Convenience wrapper over `llm/chat`.
+
+### `(llm/proxy-url)`
+
+Return the proxy base URL the runtime was configured with (the `llmProxy`
+option), for building requests to sibling endpoints yourself.
+
 ### `(message role content)`
 
-Helper function for building chat message maps.
+`message` is the core language's special form for chat messages, available in
+the browser unchanged. It produces a message value (not a plain map), which
+`llm/chat` and `llm/chat-stream` serialize for the proxy.
 
 ```sema
 (message :user "Hello!")
-;; => {:role "user" :content "Hello!"}
-
 (message :system "You are a pirate.")
-;; => {:role "system" :content "You are a pirate."}
-
 (message :assistant "Ahoy!")
-;; => {:role "assistant" :content "Ahoy!"}
 ```
 
 **Parameters:**
@@ -210,12 +222,12 @@ Here is a complete example that builds a chat interface with progressive token d
   (put! input-text (dom/event-value ev)))
 
 (define (maybe-send ev)
-  (when (string=? (dom/event-key ev) "Enter")
+  (when (equal? (dom/event-key ev) "Enter")
     (send-message ev)))
 
 (define (send-message ev)
   (let ((text @input-text))
-    (when (not (string=? text ""))
+    (when (not (equal? text ""))
       (let ((next-messages (append @messages (list {:role "user" :content text}))))
         (put! messages next-messages)
         (put! input-text "")

@@ -31,6 +31,10 @@ Defines a component. This is a macro that expands to a regular `define` -- compo
   (fn () [:p @count]))
 ```
 
+A component with a parameter list expands to a function that accepts an
+optional props map and defaults it to `{}`, so `(greeting)` and
+`(greeting {:name "Ada"})` are both valid calls.
+
 ### `(mount! selector component-fn)`
 
 Mounts a component to a DOM element identified by a CSS selector. The component renders immediately and re-renders automatically when its signal dependencies change.
@@ -42,13 +46,17 @@ Mounts a component to a DOM element identified by a CSS selector. The component 
 (mount! "#app" "app")
 ```
 
-The second argument is the **name** of the component function as a string, not the function itself. This is how the runtime calls back into the Sema interpreter.
+The second argument names the component function; a string or a bare symbol
+(`(mount! "#app" app)`) both work, and the macro converts a symbol to its name.
+The name is how the runtime calls back into the Sema interpreter, so pass the
+name of a top-level definition, not a lambda value. The lower-level
+`component/mount!` accepts only the string form.
 
 If a component is already mounted at the given selector, it is unmounted first.
 
-::: warning
-`mount!` takes a **string** name: `(mount! "#app" "app")`, not `(mount! "#app" app)`.
-:::
+
+`mount!` is an alias for `(component/mount! selector name props)`. The optional
+third argument is a map of props passed to the component function.
 
 ### `(local name initial)` -- Component-Scoped State
 

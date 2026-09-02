@@ -32,6 +32,15 @@
 
 (define llm-enabled (:llm config))
 
+;; Text interpolated into the shell page (the entry name and build errors)
+;; must not be able to inject markup.
+(define (html-escape s)
+  (-> s
+    (string/replace "&" "&amp;")
+    (string/replace "<" "&lt;")
+    (string/replace ">" "&gt;")
+    (string/replace "\"" "&quot;")))
+
 ;; The tag that loads the app: raw source for single-file apps, the compiled
 ;; .vfs for multi-file, or a visible build error. Generation cache-busts it.
 (define (app-script-tag)
@@ -41,7 +50,7 @@
         "<pre style=\"margin:1rem;padding:1rem;background:#7f1d1d;color:#fee2e2;"
         "border-radius:8px;white-space:pre-wrap;font:13px/1.5 ui-monospace,monospace\">"
         "Build error:\n"
-        (or app-error "")
+        (html-escape (or app-error ""))
         "</pre>\n"))
     ((equal? app-mode "archive")
       (string-append "<script type=\"text/sema\" src=\"/__build/app.vfs?g="
@@ -66,7 +75,7 @@
 ;; crates/sema/src/web/shell.html.
 (define (shell-html)
   (-> shell-template
-    (string/replace "{{TITLE}}" entry)
+    (string/replace "{{TITLE}}" (html-escape entry))
     (string/replace "{{APP}}" (app-script-tag))
     (string/replace "{{INIT}}" (init-js))))
 
@@ -95,25 +104,39 @@
   (map (fn (m) (message (string->keyword (:role m)) (:content m)))
     (:messages b)))
 
-(define (handle-complete req)
+;; A request body must be a JSON object carrying the fields the handler reads;
+;; anything else is answered with 400 instead of a type error from llm/*.
+(define (bad-request msg)
+  (http/error 400 {:error msg}))
+
+(define (with-body req required handler)
   (let ((b (:json req)))
-    (http/ok {:content (llm/complete (:prompt b) b)})))
+    (cond
+      ((not (map? b)) (bad-request "request body must be a JSON object"))
+      ((not (every? (fn (k) (contains? b k)) required))
+        (bad-request (string-append "missing field(s): "
+          (string/join (map keyword->string required) ", "))))
+      (else (handler b)))))
+
+(define (handle-complete req)
+  (with-body req [:prompt]
+    (fn (b) (http/ok {:content (llm/complete (:prompt b) b)}))))
 
 (define (handle-chat req)
-  (let ((b (:json req)))
-    (http/ok {:content (llm/chat (->messages b) b)})))
+  (with-body req [:messages]
+    (fn (b) (http/ok {:content (llm/chat (->messages b) b)}))))
 
 (define (handle-extract req)
-  (let ((b (:json req)))
-    (http/ok (llm/extract (:schema b) (:text b) b))))
+  (with-body req [:schema :text]
+    (fn (b) (http/ok (llm/extract (:schema b) (:text b) b)))))
 
 (define (handle-classify req)
-  (let ((b (:json req)))
-    (http/ok {:category (llm/classify (:categories b) (:text b) b)})))
+  (with-body req [:categories :text]
+    (fn (b) (http/ok {:category (llm/classify (:categories b) (:text b) b)}))))
 
 (define (handle-embed req)
-  (let ((b (:json req)))
-    (http/ok {:embedding (llm/embed (:text b) b)})))
+  (with-body req [:text]
+    (fn (b) (http/ok {:embedding (llm/embed (:text b) b)}))))
 
 (define (handle-models req)
   (http/ok {:models (llm/list-providers)}))
@@ -127,13 +150,14 @@
 ;; requests queue behind it (head-of-line blocking — the deferred M2 concurrency
 ;; work). Fine for a single-user dev loop.
 (define (handle-stream req)
-  (let ((b (:json req)))
-    (http/stream
-      (fn (send)
-        (llm/stream (->messages b)
-          (fn (chunk) (send (json/encode {:type "token" :text chunk})))
-          b)
-        (send (json/encode {:type "done"}))))))
+  (with-body req [:messages]
+    (fn (b)
+      (http/stream
+        (fn (send)
+          (llm/stream (->messages b)
+            (fn (chunk) (send (json/encode {:type "token" :text chunk})))
+            b)
+          (send (json/encode {:type "done"})))))))
 
 ;; /__sema/*    → embedded runtime (WASM + JS bundle), served with real MIME types.
 ;; /app/*       → the app's source directory (raw .sema + any assets).

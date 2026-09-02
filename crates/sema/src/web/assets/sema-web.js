@@ -1277,69 +1277,87 @@ function registerDomBindings(interp, ctx) {
 
 // src/store.ts
 function registerStoreBindings(interp, ctx) {
-  interp.registerFunction("store/get", (key) => {
+  const guarded = (context, fallback, run) => {
     try {
+      return run();
+    } catch (e) {
+      ctx.onerror(e instanceof Error ? e : new Error(String(e)), context);
+      return fallback;
+    }
+  };
+  interp.registerFunction(
+    "store/get",
+    (key) => guarded(`store/get:${key}`, null, () => {
       const val = localStorage.getItem(key);
       if (val === null) return null;
       return JSON.parse(val);
-    } catch (e) {
-      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `store/get:${key}`);
-      return null;
-    }
-  });
-  interp.registerFunction("store/set!", (key, value) => {
-    try {
+    })
+  );
+  interp.registerFunction(
+    "store/set!",
+    (key, value) => guarded(`store/set!:${key}`, null, () => {
       localStorage.setItem(key, JSON.stringify(value));
-    } catch (e) {
-      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `store/set!:${key}`);
-    }
-    return null;
-  });
-  interp.registerFunction("store/remove!", (key) => {
-    localStorage.removeItem(key);
-    return null;
-  });
-  interp.registerFunction("store/clear!", () => {
-    localStorage.clear();
-    return null;
-  });
-  interp.registerFunction("store/keys", () => {
-    const keys = [];
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (key !== null) keys.push(key);
-    }
-    return keys;
-  });
-  interp.registerFunction("store/has?", (key) => {
-    return localStorage.getItem(key) !== null;
-  });
-  interp.registerFunction("store/session-get", (key) => {
-    try {
+      return null;
+    })
+  );
+  interp.registerFunction(
+    "store/remove!",
+    (key) => guarded(`store/remove!:${key}`, null, () => {
+      localStorage.removeItem(key);
+      return null;
+    })
+  );
+  interp.registerFunction(
+    "store/clear!",
+    () => guarded("store/clear!", null, () => {
+      localStorage.clear();
+      return null;
+    })
+  );
+  interp.registerFunction(
+    "store/keys",
+    () => guarded("store/keys", [], () => {
+      const keys = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key !== null) keys.push(key);
+      }
+      return keys;
+    })
+  );
+  interp.registerFunction(
+    "store/has?",
+    (key) => guarded(`store/has?:${key}`, false, () => localStorage.getItem(key) !== null)
+  );
+  interp.registerFunction(
+    "store/session-get",
+    (key) => guarded(`store/session-get:${key}`, null, () => {
       const val = sessionStorage.getItem(key);
       if (val === null) return null;
       return JSON.parse(val);
-    } catch (e) {
-      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `store/session-get:${key}`);
-      return null;
-    }
-  });
-  interp.registerFunction("store/session-set!", (key, value) => {
-    try {
+    })
+  );
+  interp.registerFunction(
+    "store/session-set!",
+    (key, value) => guarded(`store/session-set!:${key}`, null, () => {
       sessionStorage.setItem(key, JSON.stringify(value));
-    } catch (e) {
-      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `store/session-set!:${key}`);
-    }
-    return null;
-  });
-  interp.registerFunction("store/session-remove!", (key) => {
-    sessionStorage.removeItem(key);
-    return null;
-  });
-  interp.registerFunction("store/session-clear!", () => {
-    sessionStorage.clear();
-    return null;
-  });
+      return null;
+    })
+  );
+  interp.registerFunction(
+    "store/session-remove!",
+    (key) => guarded(`store/session-remove!:${key}`, null, () => {
+      sessionStorage.removeItem(key);
+      return null;
+    })
+  );
+  interp.registerFunction(
+    "store/session-clear!",
+    () => guarded("store/session-clear!", null, () => {
+      sessionStorage.clear();
+      return null;
+    })
+  );
 }
 
 // src/reactive.ts
@@ -3506,6 +3524,9 @@ function registerHttpBindings(interp, ctx) {
       kind: "event-source",
       close: managedStream.close
     });
+    managedStream.done.catch((e) => {
+      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `event-source:${id}`);
+    });
     const owner = getActiveComponent2(ctx);
     if (owner) owner.ownedStreamIds.add(id);
     return id;
@@ -3894,6 +3915,27 @@ function mapGet(obj, key) {
   if (!obj || typeof obj !== "object") return void 0;
   return `:${key}` in obj ? obj[`:${key}`] : obj[key];
 }
+function forgetSocket(ctx, handle, reg) {
+  ctx.sockets.delete(handle);
+  if (reg.streamId !== void 0) unregisterStream(ctx, reg.streamId);
+  for (const cb of reg.callbacks) releaseCallback(cb);
+  reg.callbacks.length = 0;
+}
+function closeSocket(ctx, handle, reg, code, reason) {
+  const { socket } = reg;
+  socket.onopen = null;
+  socket.onmessage = null;
+  socket.onerror = null;
+  if (!socket.onclose) {
+    socket.onclose = () => forgetSocket(ctx, handle, reg);
+  }
+  try {
+    if (typeof code === "number") socket.close(code, reason);
+    else socket.close();
+  } catch (e) {
+    ctx.onerror(e instanceof Error ? e : new Error(String(e)), "ws/close");
+  }
+}
 function getReg(ctx, handle) {
   const reg = typeof handle === "number" ? ctx.sockets.get(handle) : void 0;
   if (!reg) throw new Error("ws: invalid or closed connection handle");
@@ -3935,7 +3977,19 @@ function registerWsBindings(interp, ctx) {
     const socket = subprotocols !== void 0 ? new WebSocket(url, subprotocols) : new WebSocket(url);
     socket.binaryType = "arraybuffer";
     const handle = ctx.nextSocketId++;
-    ctx.sockets.set(handle, { socket, callbacks: [] });
+    const reg = { socket, callbacks: [] };
+    ctx.sockets.set(handle, reg);
+    const ownerId = getCurrentOwnerId(ctx);
+    const owner = ownerId != null ? ctx.mountedComponentsById.get(ownerId) : void 0;
+    if (owner) {
+      const streamId = ctx.nextSignalId++;
+      reg.streamId = streamId;
+      registerStream(ctx, streamId, {
+        kind: "websocket",
+        close: () => closeSocket(ctx, handle, reg)
+      });
+      owner.ownedStreamIds.add(streamId);
+    }
     return handle;
   });
   interp.registerFunction("ws/send", (handle, msg) => {
@@ -3953,22 +4007,7 @@ function registerWsBindings(interp, ctx) {
   interp.registerFunction("ws/close", (handle, code, reason) => {
     const reg = typeof handle === "number" ? ctx.sockets.get(handle) : void 0;
     if (!reg) return null;
-    const { socket } = reg;
-    socket.onopen = null;
-    socket.onmessage = null;
-    socket.onerror = null;
-    if (!socket.onclose) {
-      socket.onclose = () => {
-        if (typeof handle === "number") ctx.sockets.delete(handle);
-        for (const cb of reg.callbacks) releaseCallback(cb);
-      };
-    }
-    try {
-      if (typeof code === "number") socket.close(code, reason);
-      else socket.close();
-    } catch (e) {
-      ctx.onerror(e instanceof Error ? e : new Error(String(e)), "ws/close");
-    }
+    closeSocket(ctx, handle, reg, code, reason);
     return null;
   });
   interp.registerFunction(
@@ -3986,32 +4025,37 @@ function registerWsBindings(interp, ctx) {
       const onClose = wire(onCloseV, "on-close");
       const onError = wire(onErrorV, "on-error");
       const { socket } = reg;
+      const guarded = (label, run) => {
+        try {
+          run();
+        } catch (e) {
+          ctx.onerror(e instanceof Error ? e : new Error(String(e)), `ws/listen ${label}`);
+        }
+      };
       if (onOpen) {
         if (socket.readyState === WebSocket.OPEN) {
-          try {
-            onOpen(handle);
-          } catch (e) {
-            ctx.onerror(e instanceof Error ? e : new Error(String(e)), "ws/listen on-open");
-          }
+          guarded("on-open", () => onOpen(handle));
         } else {
-          socket.onopen = () => onOpen(handle);
+          socket.onopen = () => guarded("on-open", () => onOpen(handle));
         }
       }
       if (onMessage) {
         socket.onmessage = (ev) => {
           const data = ev.data instanceof ArrayBuffer ? new Uint8Array(ev.data) : ev.data;
-          onMessage(handle, data);
+          guarded("on-message", () => onMessage(handle, data));
         };
       }
       socket.onclose = (ev) => {
-        if (onClose) {
-          onClose(handle, { ":code": ev.code, ":reason": ev.reason });
+        try {
+          if (onClose) {
+            guarded("on-close", () => onClose(handle, { ":code": ev.code, ":reason": ev.reason }));
+          }
+        } finally {
+          forgetSocket(ctx, handle, reg);
         }
-        if (typeof handle === "number") ctx.sockets.delete(handle);
-        for (const cb of reg.callbacks) releaseCallback(cb);
       };
       if (onError) {
-        socket.onerror = () => onError(handle, "websocket error");
+        socket.onerror = () => guarded("on-error", () => onError(handle, "websocket error"));
       }
       return handle;
     }

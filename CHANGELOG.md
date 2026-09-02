@@ -50,6 +50,24 @@
   numbers ("expected number, got rational"); the shared arithmetic fold now
   promotes them like bignums.
 
+### Refactoring
+
+- Shared `sema_core::{ArgsExt, OptionsExt, ResultExt}` helpers replace
+  ~500 hand-written argument type checks, option-map lookups, and error
+  mappings; every migrated type error now names the function and argument.
+- `value_to_json_schema` is one implementation in `sema-core`. The
+  `sema-llm` copy emitted Sema type names (`"list"`) that providers reject
+  and the MCP copy lacked `:default` handling; the merged version has both.
+- `sema-llm/src/builtins.rs` (15k lines) is split into 22 modules under
+  `builtins/`; the CLI's `main.rs` (6.2k lines) into nine modules. Public
+  APIs are unchanged.
+- Provider HTTP status handling is one `check_status`; the six
+  embeddings/Ollama call sites that turned a 429 into a non-retryable error
+  now get the normal retry loop.
+- `sema pkg search` no longer drops the registry's error body.
+- 28 higher-order stdlib functions derive their host-only arm from the
+  runtime arm instead of carrying a hand-written copy.
+
 ### sema-web and `sema web`
 
 - **A Sema error inside a `ws/listen` handler was lost** (it escaped into

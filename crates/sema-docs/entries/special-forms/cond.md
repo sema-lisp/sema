@@ -4,7 +4,7 @@ module: "special-forms"
 syntax: "(cond (test body ...) ... [(else body ...)])"
 ---
 
-Multi-branch conditional that evaluates tests in order until one is truthy, then evaluates the corresponding body and returns the last body's value. Each clause is a list where the first element is a test expression and the remaining elements are body expressions. The `else` clause, if present, acts as a catch-all and must be the last clause.
+Multi-branch conditional that evaluates tests in order until one is truthy, then evaluates the corresponding body and returns the last body's value. Each clause is a list where the first element is a test expression and the remaining elements are body expressions. An `else` clause acts as a catch-all. Put it last: the evaluator accepts an earlier `else`, but ignores every clause after it.
 
 If a clause contains only a test with no body (e.g., `(predicate)`), `cond` returns `#t` when that test is truthy. If no clause matches and there is no `else`, `cond` returns `nil`. Like `if`, `cond` is a special form and evaluates only the selected branch.
 

@@ -4,212 +4,241 @@ outline: [2, 3]
 
 # Data Types
 
-Sema has a rich set of built-in data types covering numbers, text, collections, and LLM primitives.
+Sema values include exact and inexact numbers, text, immutable collections,
+explicit mutable containers, executable values, asynchronous values, and LLM
+objects. `(type value)` returns a keyword that identifies the runtime type.
 
-## Type Table
+## Literal Types
 
-| Type         | Syntax               | Examples                                                           |
-| ------------ | -------------------- | ------------------------------------------------------------------ |
-| Integer      | digits               | `42`, `-7`, `0`                                                    |
-| Float        | `.` or exponent      | `3.14`, `-0.5`, `0.001`, `6.022e23`, `1e-9`                        |
-| String       | double-quoted        | `"hello"`, `"line\nbreak"`, `"\x1B;"`                              |
-| F-String     | `f"...${expr}..."` | `f"Hello ${name}"`, `f"${(+ 1 2)}"`                               |
-| Boolean      | `#t` / `#f`          | `#t`, `#f`                                                         |
-| Nil          | `nil`                | `nil`                                                              |
-| Symbol       | bare identifier      | `foo`, `my-var`, `+`                                               |
-| Keyword      | colon-prefixed       | `:name`, `:type`, `:ok`                                            |
-| Character    | `#\` prefix          | `#\a`, `#\space`, `#\newline`                                      |
-| List         | parenthesized        | `(1 2 3)`, `(+ a b)`                                               |
-| Vector       | bracketed            | `[1 2 3]`, `["a" "b"]`                                             |
-| Map          | curly-braced         | `{:name "Ada" :age 36}`                                            |
-| HashMap      | `(hashmap/new ...)`  | `(hashmap/new :a 1 :b 2)`                                          |
-| Prompt       | `(prompt ...)`       | LLM prompt (see [Prompts](../llm/prompts.md))                      |
-| Message      | `(message ...)`      | LLM message (see [Prompts](../llm/prompts.md))                     |
-| Conversation | `(conversation/new)` | LLM conversation (see [Conversations](../llm/conversations.md))    |
-| Tool         | `(deftool ...)`      | LLM tool definition (see [Tools & Agents](../llm/tools-agents.md)) |
-| Agent        | `(defagent ...)`     | LLM agent (see [Tools & Agents](../llm/tools-agents.md))           |
-| Promise      | `(delay expr)`       | Lazy evaluation                                                    |
-| Record       | `define-record-type` | `(define-record-type point ...)`                                   |
-| Bytevector   | `#u8(...)` literal   | `#u8(1 2 3)`, `#u8()`                                              |
-| Async Promise | `(async expr)` or `(async/resolved val)` | An async task result (pending, resolved, or rejected) |
-| Channel      | `(channel/new)` or `(channel/new capacity)` | Bounded FIFO channel for inter-task communication |
+| Type | Literal syntax | Examples | `type` result |
+| --- | --- | --- | --- |
+| Nil | `nil` | `nil` | `:nil` |
+| Boolean | `#t`, `#f` | `#t` | `:bool` |
+| Integer | decimal or Scheme radix prefix | `42`, `#x2a`, `#b101010` | `:int` |
+| Rational | integer `/` integer | `1/3`, `-7/2` | `:rational` |
+| Float | decimal point or exponent | `3.14`, `1e-9` | `:float` |
+| Complex | real and imaginary parts | `3+4i`, `-2i` | `:complex` |
+| Character | `#\` prefix | `#\a`, `#\space` | `:char` |
+| String | double quotes | `"hello"`, `"line\nbreak"` | `:string` |
+| Symbol | identifier, quoted when used as data | `'foo`, `'my-var` | `:symbol` |
+| Keyword | `:` prefix | `:name`, `:ok` | `:keyword` |
+| List | quote or `list` | `'(1 2 3)`, `(list 1 2 3)` | `:list` |
+| Vector | brackets | `[1 2 3]` | `:vector` |
+| Map | braces | `{:name "Ada" :age 36}` | `:map` |
+| Bytevector | `#u8(...)` | `#u8(1 2 3)` | `:bytevector` |
 
-## Scalars
+Parenthesized input is normally code, not a list literal. `(1 2 3)` attempts to
+call `1`. Quote a list or construct it with `list` when the list is data. Bare
+symbols also evaluate as variable references, so quote a symbol when its name
+is the value you want.
+
+## Numbers
+
+Sema's numeric tower is integer ⊂ rational ⊂ real ⊂ complex. Integers have
+arbitrary precision. Integers and rationals are exact; floats use IEEE 754
+double precision and are inexact. Arithmetic keeps an exact result when all
+inputs and the result can be represented exactly.
+
+```sema
+(+ 9223372036854775807 1) ; => 9223372036854775808
+(/ 1 3)                   ; => 1/3
+(+ 1/2 1/3)               ; => 5/6
+(+ 1/2 0.5)               ; => 1.0
+(sqrt -1)                 ; => 0+1i
+```
+
+See [Math](../stdlib/math.md#the-numeric-tower) for coercion, comparison, complex
+arithmetic, and the complete numeric API.
 
 ### Integer
 
-Whole numbers. Standard arithmetic applies.
+Integers may be decimal or use the Scheme radix prefixes `#b`, `#o`, and `#x`.
+There is no `0x` prefix and no `_` digit separator.
 
 ```sema
 42
 -7
-0
+#b101010
+#o52
+#x2a
 ```
+
+### Rational
+
+A rational contains an integer numerator and a nonzero integer denominator.
+Rationals are normalized and remain exact.
+
+```sema
+1/3
+-7/2
+(+ 1/6 1/3) ; => 1/2
+```
+
+Exact division produces a rational when the result is not an integer.
 
 ### Float
 
-Floating-point numbers, written with a decimal point and/or a scientific
-(exponent) suffix `e`/`E`:
+Floats use a decimal point, an exponent suffix, or both.
 
 ```sema
 3.14
 -0.5
-0.001
-
-;; Scientific notation — <mantissa>e<exponent>, with an optional sign on the
-;; exponent. The mantissa may be a bare integer (no decimal point required).
-6.022e23     ;; Avogadro's number  → 6.022 × 10²³
-1.0e19       ;; 10000000000000000000.0
-1e-9         ;; one nano  → 0.000000001
--2.5E6       ;; uppercase E works too → -2500000.0
-(* 2 3e2)    ;; usable anywhere a number is → 600.0
+6.022e23
+1e-9
+-2.5E6
 ```
 
-A literal whose magnitude exceeds `f64` range follows IEEE-754 (`1e400` → `inf`,
-`1e-400` → `0.0`). Floats print in exponent form when the magnitude is at least
-`1e21` or below `1e-7` (`1e300` prints as `1e300`, not 300 digits); every printed
-form reads back to the same value.
+A magnitude outside the finite `f64` range follows IEEE 754: `1e400` becomes
+`inf`, and `1e-400` becomes `0.0`. Printed finite floats round-trip through the
+reader.
 
-#### Number literal rules
+### Complex
 
-- An explicit sign is allowed: `+42`, `-7`, `+1.5`.
-- A number must end at whitespace or a bracket. `1abc`, `1.5e`, `0x1F`, and
-  `1_000` are reader errors (`invalid number literal`), not a number followed by
-  a symbol. Identifiers such as `e` or `exp` are unaffected.
-- Hex, octal, and binary use the Scheme prefixes `#x1F`, `#o17`, `#b101`; there
-  is no `0x` prefix and no `_` digit separator.
-- A leading or trailing dot is not a number: `.5` reads as a symbol and `1.` is
-  an error. Write `0.5` and `1.0`.
-- Rationals are `1/2`; complex numbers are `3+4i`.
-
-### String
-
-Double-quoted text with escape sequences.
+Complex literals use `i` for the imaginary part. Rectangular and pure-imaginary
+forms are supported.
 
 ```sema
-"hello"
-"line\nbreak"
-"\x1B;"
+3+4i
+3-4i
+2i
+-2i
 ```
 
-### F-String (Interpolated String)
+An exact complex number with a zero imaginary part simplifies to its real
+component.
 
-String interpolation with embedded expressions. `f"..."` reads as a `(str ...)` call (i.e. `f"Hello ${name}"` is the same as `(str "Hello " name)`).
+### Number Literal Rules
+
+- An explicit sign is allowed: `+42`, `-7`, `+1.5`.
+- A number must end at whitespace or a bracket. Inputs such as `1abc`, `1.5e`,
+  `0x1F`, and `1_000` are reader errors.
+- A leading or trailing dot is not a decimal literal. Write `0.5` and `1.0`, not
+  `.5` and `1.`.
+
+## Text and Names
+
+### String and F-String
+
+Strings are Unicode text. An f-string evaluates each `${...}` expression and
+concatenates its printed string value with the surrounding text.
 
 ```sema
 (define name "Alice")
-f"Hello ${name}"                ; => "Hello Alice"
-f"2 + 2 = ${(+ 2 2)}"           ; => "2 + 2 = 4"
-f"${(:name user)} is ${(:age user)} years old"
+f"Hello ${name}"       ; => "Hello Alice"
+f"2 + 2 = ${(+ 2 2)}" ; => "2 + 2 = 4"
 ```
 
-Use `\$` to include a literal dollar sign: `f"costs \$5"`.
-
-### Boolean
-
-`#t` for true, `#f` for false.
-
-```sema
-#t
-#f
-```
-
-### Nil
-
-The empty/null value.
-
-```sema
-nil
-```
+Use `\$` for a literal dollar sign in an f-string: `f"costs \$5"`.
 
 ### Symbol
 
-Bare identifiers used as variable names and in quoted data.
+Symbols name variables, functions, and syntactic forms. A bare symbol is looked
+up during evaluation. Quote it to use the symbol itself as data.
 
 ```sema
-foo
-my-var
-+
+(define answer 42)
+answer         ; => 42
+'answer        ; => answer
+(type 'answer) ; => :symbol
 ```
 
 ### Keyword
 
-Colon-prefixed identifiers. Keywords are self-evaluating and can be used as accessor functions on maps.
+Keywords are self-evaluating values commonly used as map keys and tags. A
+keyword can also look itself up in a map.
 
 ```sema
 :name
-:type
-:ok
-
-;; Keywords as functions
-(:name {:name "Ada" :age 36})  ; => "Ada"
+(:name {:name "Ada" :age 36}) ; => "Ada"
+(:missing {:name "Ada"})      ; => nil
 ```
 
 ### Character
 
-Character literals with `#\` prefix. Named characters are supported.
+Character literals use the `#\` prefix. Named characters include `#\space`,
+`#\newline`, and `#\tab`.
 
 ```sema
 #\a
 #\space
-#\newline
-#\tab
+#\λ
+(integer->char #x41) ; => #\A
 ```
 
-There is no hex form for character literals (`#\x41` is an error). Use
-`(integer->char #x41)` for a character by code point, or write the character
-itself (`#\λ`).
+There is no hexadecimal character-literal form. `#\x41` is an error; convert a
+code point with `integer->char` instead.
+
+## Nil, Empty Collections, and Truth
+
+`nil` is a distinct value. It is not the empty list. The empty list is `'()`.
+Both satisfy `empty?`, but their type and equality differ.
+
+```sema
+(type nil)       ; => :nil
+(type '())       ; => :list
+(equal? nil '()) ; => #f
+(nil? nil)       ; => #t
+(null? '())      ; => #t
+```
+
+Only `#f` and `nil` are false in a condition. Empty strings and empty
+collections are true.
+
+```sema
+(if '() :true :false) ; => :true
+(if [] :true :false)  ; => :true
+```
 
 ## Collections
 
+Lists, vectors, maps, and hash maps are immutable values. Operations such as
+`cons`, `append`, and `assoc` return updated values instead of changing the
+input. Use the types in [Mutable State](../stdlib/mutable.md) when shared mutable
+storage is required.
+
 ### List
 
-Parenthesized sequences. Lists are the fundamental data structure in Sema. Access the first element with `car` (or `first`) and the rest with `cdr` (or `rest`).
-
-::: details Why `car`/`cdr`?
-These names come from the [IBM 704](http://bitsavers.informatik.uni-stuttgart.de/pdf/ibm/704/24-6661-2_704_Manual_1955.pdf) (1955), the machine Lisp was born on. The 704 stored each cons cell in a single 36-bit word: `car` ("Contents of the Address Register") extracted one 15-bit pointer field, `cdr` ("Contents of the Decrement Register") extracted the other. They were single hardware instructions. Sema also provides `first`/`rest` as aliases.
-:::
+Lists are sequential values with `car`/`first` and `cdr`/`rest` access.
 
 ```sema
-(1 2 3)
-(+ a b)
-'(hello world)
+'(1 2 3)
+(list 1 2 3)
+(first '(1 2 3)) ; => 1
+(rest '(1 2 3))  ; => (2 3)
 ```
 
-Lists are proper lists only; there is no pair type. Dotted syntax is meaningful
-in parameter lists (`(lambda (a . rest) ...)`) but in a quoted list the `.` is
-read as an ordinary symbol: `'(1 . 2)` is a three-element list, so
-`(length '(1 . 2))` is `3` and `(cdr '(1 . 2))` is `(. 2)`.
+Lists are proper lists only; Sema has no pair type. A dot has special meaning in
+parameter lists, such as `(lambda (first . rest) ...)`. In quoted list data it
+is an ordinary symbol: `'(1 . 2)` has three elements.
 
 ### Vector
 
-Bracketed sequences with O(1) indexed access.
+Vectors provide constant-time indexed access.
 
 ```sema
 [1 2 3]
-["a" "b"]
+(vector/ref [10 20 30] 1) ; => 20
 ```
 
-### Map
+### Map and HashMap
 
-Curly-braced key-value pairs with deterministic (sorted) ordering. Maps support [destructuring](./special-forms.md#map-destructuring) in `let`, `define`, `lambda`, and [`match`](./special-forms.md#match) patterns.
+A map literal creates a sorted map with deterministic iteration order. A hash
+map uses hashing for average constant-time lookup; its iteration order is not
+part of the API. Both support keyword lookup and the usual map operations.
 
 ```sema
 {:name "Ada" :age 36}
-{:a 1 :b 2 :c 3}
+(get {:a 1 :b 2} :b) ; => 2
+(hashmap/new :a 1 :b 2)
 ```
 
-### HashMap
-
-Hash-based maps for O(1) lookup performance with many keys.
-
-```sema
-(hashmap/new :a 1 :b 2 :c 3)
-```
+Maps support [destructuring](./special-forms.md#map-destructuring) in bindings
+and [`match`](./special-forms.md#match) patterns.
 
 ### Bytevector
 
-Byte arrays with `#u8(...)` literal syntax.
+A bytevector stores integers from 0 through 255. Literal and constructor values
+have the same type.
 
 ```sema
 #u8(1 2 3)
@@ -218,21 +247,45 @@ Byte arrays with `#u8(...)` literal syntax.
 (bytevector/new 4)
 ```
 
-## Special Types
+## Constructed and Runtime Types
 
-### Promise
+| Type | Common constructor | `type` result | Documentation |
+| --- | --- | --- | --- |
+| Function | `(fn (x) x)` | `:lambda` | [Functions](./special-forms.md#functions) |
+| Procedural or pattern macro | `defmacro`, `define-syntax` | `:macro` | [Macros](./macros-modules.md) |
+| Record | `define-record-type` | record's type tag | [Records](../stdlib/records.md) |
+| Lazy promise | `(delay expr)` | `:promise` | [`delay`](./special-forms.md#delay) |
+| Async promise | `(async/resolved value)` | `:async-promise` | [Concurrency](../stdlib/concurrency.md) |
+| Channel | `(channel/new)` | `:channel` | [Concurrency](../stdlib/concurrency.md) |
+| Stream | stream constructors | `:stream` | [Streams](../stdlib/streams.md) |
+| Typed array | `f64-array`, `i64-array` | `:f64-array`, `:i64-array` | [Typed Arrays](../stdlib/typed-arrays.md) |
+| Mutable container | `mutable-array/new`, `mutable-cell/new` | `:mutable-array`, `:mutable-cell` | [Mutable State](../stdlib/mutable.md) |
+| Prompt, message, conversation | LLM constructors | `:prompt`, `:message`, `:conversation` | [Prompts](../llm/prompts.md) |
+| Tool, agent | `deftool`, `defagent` | `:tool`, `:agent` | [Tools & Agents](../llm/tools-agents.md) |
 
-Lazy evaluation via `delay`/`force`. The expression is not evaluated until forced, and the result is memoized.
+Native functions such as `+` report `:native-fn`; functions created with `fn`
+report `:lambda`. A record is the exception to the general `type` rule: it
+returns the record's declared tag, such as `:point`, rather than `:record`.
+
+### Lazy and Async Promises
+
+The two promise types serve different purposes. `delay` creates a synchronous
+lazy computation. `force` evaluates it at most once and memoizes the result.
+`async` and `async/resolved` create asynchronous task results consumed with
+`await`.
 
 ```sema
 (define p (delay (+ 1 2)))
-(force p)       ; => 3
-(promise? p)    ; => #t
+(type p)     ; => :promise
+(promise? p) ; => #t
+(force p)    ; => 3
 ```
+
+`promise?` tests lazy promises. Use `async/promise?` for asynchronous promises.
 
 ### Record
 
-User-defined record types with constructors, predicates, and field accessors.
+Records define a type-specific constructor, predicate, and accessors.
 
 ```sema
 (define-record-type point
@@ -242,70 +295,76 @@ User-defined record types with constructors, predicates, and field accessors.
   (y point-y))
 
 (define p (make-point 3 4))
-(point-x p)    ; => 3
+(type p)    ; => :point
+(point-x p) ; => 3
 ```
 
 ## String Escape Sequences
 
-| Escape       | Description                          | Example               |
-| ------------ | ------------------------------------ | --------------------- |
-| `\n`         | Newline                              | `"line\nbreak"`       |
-| `\t`         | Tab                                  | `"col1\tcol2"`        |
-| `\r`         | Carriage return                      | `"text\r"`            |
-| `\\`         | Backslash                            | `"path\\file"`        |
-| `\"`         | Double quote                         | `"say \"hi\""`        |
-| `\0`         | Null character                       | `"\0"`                |
-| `\x<hex>;`   | Unicode scalar (R7RS, 1+ hex digits) | `"\x1B;"`, `"\x3BB;"` |
-| `\uNNNN`     | Unicode code point (4 hex digits)    | `"\u03BB"` (λ)        |
-| `\UNNNNNNNN` | Unicode code point (8 hex digits)    | `"\U0001F600"` (😀)   |
-| `\$`         | Literal dollar sign (in f-strings)   | `f"costs \$5"`        |
+| Escape | Description | Example |
+| --- | --- | --- |
+| `\n` | Newline | `"line\nbreak"` |
+| `\t` | Tab | `"col1\tcol2"` |
+| `\r` | Carriage return | `"text\r"` |
+| `\\` | Backslash | `"path\\file"` |
+| `\"` | Double quote | `"say \"hi\""` |
+| `\0` | Null character | `"\0"` |
+| `\x<hex>;` | Unicode scalar, one or more hex digits | `"\x3BB;"` |
+| `\uNNNN` | Unicode code point, four hex digits | `"\u03BB"` |
+| `\UNNNNNNNN` | Unicode code point, eight hex digits | `"\U0001F600"` |
+| `\$` | Literal dollar sign in an f-string | `f"costs \$5"` |
 
-## Type Predicates
+## Type Tests and Equality
+
+Common predicates include:
 
 ```sema
-(null? '())        (nil? nil)         (empty? "")
-(list? '(1))       (vector? [1])      (map? {:a 1})
-(pair? '(1 2))     ; #t (non-empty list, Scheme compat)
-(number? 42)       (integer? 42)      (float? 3.14)
-(string? "hi")     (symbol? 'x)       (keyword? :k)
-(char? #\a)        (record? r)        (bytevector? #u8())
-(promise? (delay 1))  (promise-forced? p)
-(bool? #t)         (fn? car)
-(zero? 0)          (even? 4)          (odd? 3)
-(positive? 1)      (negative? -1)
-(eq? 'a 'a)        (= 1 1)
-
-;; Scheme aliases: boolean? = bool?, procedure? = fn?
-;; eq? and equal? are the same function in Sema — both do structural
-;; equality without numeric coercion. Use = for numeric comparison
-;; (e.g. (= 1 1.0) is #t, but (eq? 1 1.0) is #f).
-
-;; LLM type predicates
-(prompt? p)        (message? m)       (conversation? c)
-(tool? t)          (agent? a)
+(nil? nil)            ; => #t
+(null? '())           ; => #t
+(list? '(1))          ; => #t
+(vector? [1])         ; => #t
+(map? {:a 1})         ; => #t
+(number? 1/2)         ; => #t
+(integer? 42)         ; => #t
+(float? 3.14)         ; => #t
+(string? "hi")       ; => #t
+(symbol? 'x)          ; => #t
+(keyword? :x)         ; => #t
+(char? #\a)           ; => #t
+(bytevector? #u8())   ; => #t
+(fn? (fn (x) x))      ; => #t
 ```
+
+`eq?` and `equal?` are aliases for exact structural equality. They do not
+coerce numeric types. `=` compares numbers with numeric coercion and also
+accepts structurally equal nonnumeric values.
+
+```sema
+(equal? 1 1.0)   ; => #f
+(= 1 1.0)        ; => #t
+(equal? [1] [1]) ; => #t
+```
+
+`boolean?` is an alias for `bool?`, and `procedure?` is an alias for `fn?`.
 
 ## Type Conversions
 
 ```sema
-(str 42)                    ; => "42" (any value to string)
-(string/to-number "42")       ; => 42
+(str 42)                      ; => "42"
+(string/to-number "42")      ; => 42
 (number/to-string 42)         ; => "42"
-(string/to-symbol "foo")      ; => foo
+(string/to-symbol "foo")     ; => foo
 (symbol/to-string 'foo)       ; => "foo"
-(string/to-keyword "name")    ; => :name
+(string/to-keyword "name")   ; => :name
 (keyword/to-string :name)     ; => "name"
 (char/to-integer #\A)         ; => 65
 (integer/to-char 65)          ; => #\A
-(char/to-string #\a)          ; => "a"
-(string/to-char "a")          ; => #\a
-(string/to-list "abc")        ; => (#\a #\b #\c)
-(list->string '(#\h #\i))   ; => "hi"
-(vector->list [1 2 3])      ; => (1 2 3)
-(list->vector '(1 2 3))     ; => [1 2 3]
-(bytevector/to-list #u8(65))   ; => (65)
-(list/to-bytevector '(1 2 3))  ; => #u8(1 2 3)
-(utf8/to-string #u8(104 105))  ; => "hi"
-(string/to-utf8 "hi")          ; => #u8(104 105)
-(type 42)                    ; => :int
+(string/to-list "abc")       ; => (#\a #\b #\c)
+(list->string '(#\h #\i))    ; => "hi"
+(vector->list [1 2 3])        ; => (1 2 3)
+(list->vector '(1 2 3))       ; => [1 2 3]
+(bytevector/to-list #u8(65))  ; => (65)
+(list/to-bytevector '(1 2 3)) ; => #u8(1 2 3)
+(utf8/to-string #u8(104 105)) ; => "hi"
+(string/to-utf8 "hi")        ; => #u8(104 105)
 ```

@@ -4,7 +4,7 @@ module: "special-forms"
 syntax: "(import \"path\" sym1 sym2 ...)"
 ---
 
-Load a module from a file or package and make its exported bindings available in the current environment. Unlike `load`, `import` uses the module system: only bindings declared with `export` inside a `module` form become visible. Non-exported bindings remain private.
+Load a module from a file or package and make its exported bindings available in the current environment. An explicit `module` form restricts the result to names in its `export` clause. A file without a `module` declaration exports all of its top-level bindings. Unlike `load`, the imported file is evaluated in an isolated module environment; exported functions retain access to private definitions in that environment.
 
 The first argument is evaluated to a string path. It may be a relative path (resolved against the current file's directory), an absolute path, or a package identifier such as `github.com/user/repo`. The evaluator checks the virtual file system first (used by bundled executables), then falls back to the real filesystem.
 

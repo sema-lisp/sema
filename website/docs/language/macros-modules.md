@@ -4,76 +4,106 @@ outline: [2, 3]
 
 # Macros & Modules
 
-## Macros
+Sema has two macro systems and a file-based module system. Macros transform
+forms before evaluation. Modules control which top-level bindings an imported
+file exposes.
 
-Sema supports two macro systems: procedural `defmacro`-style macros with quasiquoting, unquoting, and splicing, and R7RS pattern-based [`define-syntax` / `syntax-rules`](#define-syntax-syntax-rules) macros with automatic hygiene.
+## Macro Expansion
+
+When the evaluator sees a macro call, it passes the argument forms to the macro
+without evaluating them. The macro returns a new form, which Sema expands again
+and then evaluates. This recursive expansion means that one macro may produce a
+call to another macro.
+
+Macro definitions that must affect later forms in the same source unit belong
+at the top level, or inside a top-level `begin`. A definition inside a function
+or `let` is not available while sibling forms are compiled.
+
+## Procedural Macros
 
 ### `defmacro`
 
-Define a macro that transforms code at expansion time.
+`defmacro` defines a transformer with ordinary Sema code. Its parameters bind
+to unevaluated forms. The body may inspect those forms, compute a result, and
+return the form to evaluate.
 
 ```sema
 (defmacro unless2 (test . body)
   `(if ,test nil (begin ,@body)))
 
-(unless2 #f (println "runs!"))
+(unless2 #f (+ 20 22)) ; => 42
 ```
+
+The parameter list supports fixed and rest parameters. A procedural macro does
+not capture the lexical environment where it was defined. Names used while
+building or evaluating its expansion resolve in the environment of the call.
+
+Quasiquote is the usual way to construct an expansion:
+
+- `` `form `` quotes a template.
+- `,expr` inserts one computed form.
+- `,@expr` inserts every item from a computed list.
 
 ### `macroexpand`
 
-Inspect the expansion of a macro call without evaluating it.
+`macroexpand` expands one outer macro call without evaluating the result. Quote
+the input so that the call itself is passed as data.
 
 ```sema
-(macroexpand '(unless2 #f (println "x")))
+(defmacro twice (x) (list '+ x x))
+(macroexpand '(twice 4)) ; => (+ 4 4)
+(twice 4)                ; => 8
 ```
+
+If the outer form is not a macro call, `macroexpand` returns it unchanged. It
+does not recursively expand macro calls inside the returned form.
 
 ### `gensym`
 
-Generate a unique symbol manually. For most macro use cases, prefer [auto-gensym (`foo#`)](#auto-gensym-foo) instead.
+`gensym` creates a symbol that cannot collide with a source-level name.
 
 ```sema
-(gensym "tmp")   ; => tmp__42 (unique each call)
+(symbol? (gensym "tmp")) ; => #t
 ```
 
-### Auto-gensym (`foo#`)
+The printed suffix is intentionally unspecified. Use `gensym` when generated
+names must be created by arbitrary macro logic. In quasiquote templates,
+auto-gensym is shorter and less error-prone.
 
-Inside a quasiquote template, any symbol ending with `#` is automatically replaced with a unique generated symbol. All occurrences of the same `foo#` within a single quasiquote resolve to the same gensym, ensuring consistency.
+### Auto-gensym (`name#`)
 
-This prevents **variable capture** — a common bug where macro-introduced bindings accidentally shadow user variables.
+Inside a quasiquote template, a symbol ending in `#` becomes a fresh generated
+symbol. Repeated uses of the same spelling in one quasiquote use the same
+generated symbol. A later evaluation of that quasiquote creates a new symbol.
 
 ```sema
-;; Without auto-gensym — BUG if user has a variable named "tmp"
-(defmacro bad-inc (x)
-  `(let ((tmp 1)) (+ tmp ,x)))
-
-(let ((tmp 100))
-  (bad-inc tmp))   ; => 2, not 101! the macro's "tmp" captures the user's "tmp"
-
-;; With auto-gensym — always correct
 (defmacro good-inc (x)
   `(let ((tmp# 1)) (+ tmp# ,x)))
 
 (let ((tmp 100))
-  (good-inc tmp))  ; => 101 ✓
+  (good-inc tmp)) ; => 101
 ```
 
-**Rules:**
-- Same `foo#` in one quasiquote → same generated symbol
-- Each quasiquote evaluation → fresh symbols (no cross-expansion collisions)
-- Outside quasiquote, `foo#` is a regular symbol (no magic)
-
-**Best practice:** Always use auto-gensym for bindings introduced by macros:
+Without a generated binding, a macro can capture a name from its caller:
 
 ```sema
-(defmacro swap! (a b)
-  `(let ((tmp# ,a))
-     (set! ,a ,b)
-     (set! ,b tmp#)))
+(defmacro bad-inc (x)
+  `(let ((tmp 1)) (+ tmp ,x)))
+
+(let ((tmp 100))
+  (bad-inc tmp)) ; => 2
 ```
 
-### `define-syntax` / `syntax-rules`
+Outside quasiquote, a name such as `tmp#` is an ordinary symbol. Use
+auto-gensym for every temporary binding introduced by a procedural macro.
 
-R7RS pattern-based macros. Instead of computing an expansion with quasiquote, you declare rewrite rules — each a `(pattern template)` pair. Rules are tried in order and the first matching pattern wins; `...` (ellipsis) matches a sequence of forms.
+## Pattern Macros
+
+### `define-syntax` and `syntax-rules`
+
+`syntax-rules` defines ordered rewrite rules. Each rule has a pattern and a
+template. The first matching pattern supplies the expansion. `_` is a wildcard,
+and `...` matches or emits a sequence of forms.
 
 ```sema
 (define-syntax my-or
@@ -83,10 +113,11 @@ R7RS pattern-based macros. Instead of computing an expansion with quasiquote, yo
     ((_ e1 e2 ...)
      (let ((t e1)) (if t t (my-or e2 ...))))))
 
-(my-or #f #f 7)   ; => 7
+(my-or #f #f 7) ; => 7
 ```
 
-The first argument to `syntax-rules` is a list of **literal identifiers** — symbols that must appear verbatim in the call rather than binding a pattern variable:
+The first argument to `syntax-rules` lists literal identifiers. A literal must
+appear exactly in that position instead of binding a pattern variable.
 
 ```sema
 (define-syntax go
@@ -94,24 +125,27 @@ The first argument to `syntax-rules` is a list of **literal identifiers** — sy
     ((_ to x) (list :to x))
     ((_ x)    (list :plain x))))
 
-(go to 1)   ; => (:to 1)
-(go 2)      ; => (:plain 2)
+(go to 1) ; => (:to 1)
+(go 2)    ; => (:plain 2)
 ```
 
-Nested ellipsis in patterns lets you destructure binding-list shapes:
+Nested ellipses support nested input shapes when the template uses each pattern
+variable at the same ellipsis depth.
 
 ```sema
-(define-syntax my-let
+(define-syntax rows
   (syntax-rules ()
-    ((_ ((name val) ...) body)
-     ((lambda (name ...) body) val ...))))
+    ((_ ((x ...) ...))
+     (list (list x ...) ...))))
 
-(my-let ((a 1) (b 2)) (+ a b))   ; => 3
+(rows ((1 2) (3 4))) ; => ((1 2) (3 4))
 ```
 
-#### Hygiene
+### Hygiene
 
-`syntax-rules` templates are hygienic without manual gensyms. Hygiene is **binder-directed**: identifiers the template introduces *as binders* (the variables of a template's `let`, `let*`, `letrec`, `lambda`, `define`, `do`, or named `let`) are automatically alpha-renamed to a fresh symbol on every expansion — so they can never capture a user variable of the same name:
+Sema applies binder-directed hygiene to `syntax-rules` templates. Names that a
+template introduces as binders in `let`, `let*`, `letrec`, `lambda`, `define`,
+`do`, or named `let` are renamed for each expansion.
 
 ```sema
 (define-syntax swap!
@@ -122,119 +156,116 @@ Nested ellipsis in patterns lets you destructure binding-list shapes:
 (define tmp 1)
 (define x 2)
 (swap! tmp x)
-(list tmp x)   ; => (2 1) — the template's tmp did not capture the user's tmp
+(list tmp x) ; => (2 1)
 ```
 
-Every *other* template identifier — free references to user-defined globals, builtins, and the macro's own name for recursion — is kept verbatim and resolves at the use site at runtime:
+This is not full R7RS referential transparency. Free identifiers in a template
+are kept as written and resolve at the use site. A caller can therefore shadow
+a function or special form referenced by the template. Sema rejects a template
+that uses a pattern variable at a deeper ellipsis level than its pattern.
+`syntax-case` is not supported.
 
-```sema
-(define (double n) (* 2 n))
-(define-syntax d (syntax-rules () ((_ x) (double x))))
-(d 21)   ; => 42
-```
+### Choosing a Macro System
 
-`macroexpand` works on `syntax-rules` macros too and shows the renaming:
+Use `syntax-rules` for structural rewrites. It provides automatic hygiene for
+introduced binders and makes the accepted syntax explicit. Use `defmacro` when
+the transformer must run general Sema code or construct forms dynamically. Use
+auto-gensym for bindings introduced by `defmacro` expansions.
 
-```sema
-(macroexpand '(swap! x y))
-;; => (let ((tmp__0 x)) (set! x y) (set! y tmp__0))
-```
+## Built-in Macros
 
-**Caveats** (the hygiene is an approximation, not full R7RS referential transparency):
+The prelude loads macros before user code runs. The main groups are:
 
-- Only template-introduced *binders* are renamed. The other direction isn't covered: if the use site shadows a global or special form that the template references freely, the template sees the shadowing binding.
-- A template may use nested ellipsis (`x ... ...`) when the pattern binds the variable at the same depth — e.g. pattern `((x ...) ...)` with template `(list (list x ...) ...)`. Using more levels than the pattern provides is rejected with `syntax-rules: unsupported nested ellipsis depth in template` rather than mis-expanded.
-- Like `defmacro`, `define-syntax` must appear at the top level (or inside a top-level `begin`) to be visible to sibling forms — one nested inside a lambda or `let` body is not.
-- `syntax-case` is not supported.
+| Purpose | Macros |
+| --- | --- |
+| Data flow | `->`, `->>`, `as->`, `some->` |
+| Conditional binding and loops | `when-let`, `if-let`, `dotimes`, `for-range` |
+| Resource and error handling | `with-open`, `with-stream`, `guard` |
+| Concurrency | `parallel`, `pipeline`, `parallel-settled`, `pipeline-settled`, `settled-partition`, `async/map`, `async/pool-map`, `async/spawn-all`, `with-retry` |
+| Observability | `with-span`, `with-session` |
+| Policies and workflows | `defpolicy`, `policy/without`, `defworkflow`, `phase`, `step`, `approval`, `checkpoint` |
 
-#### `defmacro` or `syntax-rules`?
+See [Special Forms](./special-forms.md), [Streams](../stdlib/streams.md),
+[Concurrency](../stdlib/concurrency.md), [Observability](../llm/observability.md),
+and [Workflows](../llm/workflows.md) for their evaluation rules and examples.
 
-- **`syntax-rules`** — reach for it when the macro is a structural rewrite: it's declarative, hygiene is automatic, and the definition is portable R7RS.
-- **`defmacro`** — reach for it when the expansion needs real computation (inspecting arguments, generating different shapes, calling functions at expansion time): the whole language is available. Use [auto-gensym (`foo#`)](#auto-gensym-foo) for any bindings the expansion introduces.
-
-### Built-in Macros
-
-Sema includes several macros that are auto-loaded at startup. These don't need to be defined or imported:
-
-- `->`, `->>`, `as->`, `some->` — [Threading macros](./special-forms.html#threading-macros)
-- `when-let`, `if-let` — [Conditional binding](./special-forms.html#when-let)
-
-See [Special Forms](./special-forms.html) for full documentation.
-
-## Metaprogramming
+## Code as Data
 
 ### `eval`
 
-Evaluate data as code.
+`eval` evaluates a value as code in the current environment.
 
 ```sema
-(eval '(+ 1 2))   ; => 3
+(eval '(+ 1 2)) ; => 3
 ```
 
-### `read`
+### `read` and `io/read-many`
 
-Parse a string into a Sema value.
-
-```sema
-(read "(+ 1 2)")   ; => (+ 1 2) as a list value
-```
-
-### `io/read-many`
-
-Parse a string containing multiple forms.
+`read` parses one form from a string. `io/read-many` parses all forms in a
+string and returns them as a list. Neither function evaluates the parsed forms.
 
 ```sema
-(io/read-many "(+ 1 2) (* 3 4)")   ; => ((+ 1 2) (* 3 4))
-```
-
-### `type`
-
-Return the type of a value as a keyword.
-
-```sema
-(type 42)              ; => :int
-(type 3.14)            ; => :float
-(type "hi")            ; => :string
-(type :foo)            ; => :keyword
-(type 'foo)            ; => :symbol
-(type '(1 2 3))        ; => :list
-(type [1 2 3])         ; => :vector
-(type {:a 1})          ; => :map
-```
-
-For records, `type` returns the record type tag as a keyword (e.g. `:point`).
-
-### Type Conversion Functions
-
-```sema
-(string/to-symbol "foo")       ; => foo
-(keyword/to-string :bar)       ; => "bar"
-(string/to-keyword "name")     ; => :name
-(symbol/to-string 'foo)        ; => "foo"
+(read "(+ 1 2)") ; => (+ 1 2)
+(io/read-many "(+ 1 2) (* 3 4)") ; => ((+ 1 2) (* 3 4))
 ```
 
 ## Modules
 
-### `module`
+An imported file is evaluated in a module environment that can read global and
+prelude bindings but not the caller's local variables. After evaluation,
+`import` copies the file's exports into the caller. An explicit `module` form
+can keep other definitions private, while exported functions retain access to
+those private helpers.
 
-Define a module with explicit exports.
+### Declaring Exports with `module`
+
+`module` takes a symbolic name, an `export` clause, and body expressions. The
+name describes the module; imports bind the exported names directly and do not
+add a namespace prefix.
 
 ```sema
 ;; math-utils.sema
 (module math-utils
   (export square cube)
-  (define (square x) (* x x))
-  (define (cube x) (* x x x))
-  (define (internal-helper x) x))      ; not exported
+  (define (private-mul x y) (* x y))
+  (define (square x) (private-mul x x))
+  (define (cube x) (private-mul x (private-mul x x))))
 ```
 
-### `import`
+The export list may be empty. `(export)` makes every definition in the module
+private. Use one module declaration per file; a later declaration replaces the
+file's active export list rather than creating a second namespace.
 
-Import a module from a file. Only exported bindings become available.
+A file without a `module` declaration exports all of its top-level bindings.
+This is convenient for small scripts, but an explicit export list gives a
+stable public interface.
+
+### Importing a File or Package
+
+The first argument to `import` is evaluated and must produce a string. Relative
+paths are resolved from the importing source file. Absolute paths and package
+identifiers are also supported.
 
 ```sema
 ;; main.sema
 (import "math-utils.sema")
-(square 5)   ; => 25
-(cube 3)     ; => 27
+(square 5) ; => 25
+(cube 3)   ; => 27
 ```
+
+List bare names after the path to import only those exports:
+
+```sema
+(import "math-utils.sema" square)
+```
+
+A selective import fails if the file does not export a requested name. Without
+a name list, all exports are added to the current environment.
+
+Sema caches an imported module by its resolved path. Importing it again in the
+same interpreter does not evaluate the file again. Cyclic imports return an
+error. File-system imports also obey the active sandbox's read permissions.
+
+Use [`load`](./special-forms.md#load) when the goal is different: `load`
+evaluates a file directly in the current environment and does not apply module
+export boundaries.

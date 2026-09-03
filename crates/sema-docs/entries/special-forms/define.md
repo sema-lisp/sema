@@ -8,6 +8,15 @@ Bind a value, function, or destructuring pattern in the current environment. `de
 
 When the first argument is a symbol, the second argument is evaluated and bound to that name. When the first argument is a list starting with a symbol, `define` treats it as a function shorthand: `(define (f x) body)` is equivalent to `(define f (lambda (x) body))`. When the first argument is a vector or map pattern, the value is destructured and multiple bindings are created at once.
 
+The function-signature shorthand accepts only symbol parameters. To destructure
+a function argument, bind an explicit `lambda` or `fn` whose parameter list
+contains the pattern:
+
+```sema
+(define sum-pair (fn ([a b]) (+ a b)))
+(sum-pair '(3 4))  ; => 7
+```
+
 In interactive mode, redefining a builtin native function prints a warning to stderr.
 
 ```sema

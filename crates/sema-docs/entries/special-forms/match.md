@@ -8,6 +8,11 @@ Pattern-match a value against a series of clauses. Each clause consists of a pat
 
 Patterns can be literals (numbers, strings, keywords, symbols), vectors (matching lists or vectors by structure), maps (matching maps by keys), or binding patterns (symbols that capture the matched value). The wildcard `_` matches any value without binding it. Nested patterns are fully supported, allowing deep structural matching in a single clause. Guards add arbitrary boolean conditions after a pattern match using `when`.
 
+Explicit map entries such as `{:type :ok}` require the key to exist and its
+value to match. The `{:keys [name]}` shorthand extracts keyword keys instead;
+a missing key binds the corresponding symbol to `nil` and does not make the
+clause fail.
+
 ```sema
 (match status
   (:ok "success")

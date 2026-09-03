@@ -1,10 +1,9 @@
-//! Doctest runner for the structured builtin docs: evaluates the `; =>`-annotated example lines in
-//! `sema_docs::builtin_index()` and checks the printed result matches.
+//! Doctest runner for structured builtin docs and selected website reference pages. It evaluates
+//! `; =>`-annotated examples and checks that the printed result matches.
 //!
-//! Conservative by design — it only checks single-line `<expr> ; => <expected>` assertions (with
-//! preceding single-line setup statements sharing one interpreter), and skips anything
-//! side-effecting or nondeterministic (I/O, LLM, time, randomness, channels, …). Multi-line
-//! expressions and unparseable lines are skipped, not failed.
+//! Conservative by design: it checks expressions with `; => <expected>` assertions, carries
+//! preceding setup statements in the same block, and skips side-effecting or nondeterministic
+//! examples (I/O, LLM, time, randomness, channels, …). Multi-line expressions are supported.
 //!
 //! Runs in CI. Every `; =>` assertion in a doc entry is verified here unless the
 //! expression matches `SKIP_MARKERS`; an expected value of `error: ...` asserts
@@ -93,127 +92,119 @@ fn skip(expr: &str) -> bool {
     SKIP_MARKERS.iter().any(|m| expr.contains(m))
 }
 
-#[test]
-fn builtin_doc_examples_evaluate() {
-    let index = sema_docs::builtin_index();
-    let mut checked = 0usize;
-    let mut skipped = 0usize;
-    let mut failures: Vec<String> = Vec::new();
-
-    for entry in &index.entries {
-        for example in &entry.examples {
-            let interp = Interpreter::new();
-            // Accumulate lines until the parens balance, so a multi-line
-            // `define`/`defmacro` runs as one setup form and a `; =>` on the
-            // closing line of a multi-line form asserts on the whole form.
-            let mut pending = String::new();
-            let mut pending_expected: Option<String> = None;
-            for line in example.lines() {
-                let line = line.trim();
-                if line.is_empty() || (pending.is_empty() && line.starts_with(';')) {
-                    continue;
+fn check_example(
+    name: &str,
+    example: &str,
+    checked: &mut usize,
+    skipped: &mut usize,
+    failures: &mut Vec<String>,
+) {
+    let interp = Interpreter::new();
+    // Accumulate lines until the delimiters balance, so a multi-line form runs as one setup or
+    // assertion. The expected result may be attached to the closing line.
+    let mut pending = String::new();
+    let mut pending_expected: Option<String> = None;
+    for line in example.lines() {
+        let line = line.trim();
+        if line.is_empty() || (pending.is_empty() && line.starts_with(';')) {
+            continue;
+        }
+        let (code, expected) = match line.split_once("; =>") {
+            Some((code, expected)) => {
+                // Text after a second semicolon is a note, not part of the expected value.
+                let expected = expected.split(';').next().unwrap_or("").trim();
+                (code.trim(), Some(expected.to_string()))
+            }
+            None => (line.split(';').next().unwrap_or("").trim(), None),
+        };
+        if !pending.is_empty() {
+            pending.push('\n');
+        }
+        pending.push_str(code);
+        if expected.is_some() {
+            pending_expected = expected;
+        }
+        let balanced = pending.matches('(').count() <= pending.matches(')').count()
+            && pending.matches('[').count() <= pending.matches(']').count();
+        if !balanced {
+            continue;
+        }
+        let expr = std::mem::take(&mut pending);
+        let expr = expr.trim();
+        let Some(expected) = pending_expected.take() else {
+            if !skip(expr) {
+                let _ = interp.eval_str(expr);
+            }
+            continue;
+        };
+        let inexact = expected.contains('~')
+            || expected.contains("...")
+            || expected.contains("varies")
+            || expected.contains(" (")
+            || expected.contains('\\');
+        let looks_evaluable = expr.chars().any(|c| c.is_alphanumeric() || c == '(');
+        if expr.is_empty() || !looks_evaluable || skip(expr) || inexact {
+            *skipped += 1;
+            continue;
+        }
+        let expects_error = expected.starts_with("error");
+        match interp.eval_str(expr) {
+            Ok(v) if expects_error => {
+                *checked += 1;
+                failures.push(format!(
+                    "{name}: `{expr}` => `{v}` (expected an error: `{expected}`)"
+                ));
+            }
+            Ok(v) => {
+                *checked += 1;
+                let got = format!("{v}");
+                if got.trim() != expected {
+                    failures.push(format!(
+                        "{name}: `{expr}` => `{got}` (expected `{expected}`)"
+                    ));
                 }
-                let (code, expected) = match line.split_once("; =>") {
-                    Some((code, expected)) => {
-                        // A trailing `; note` after the expected value is prose,
-                        // not part of the oracle: `; => 7    ; single element`.
-                        let expected = expected.split(';').next().unwrap_or("").trim();
-                        (code.trim(), Some(expected.to_string()))
-                    }
-                    None => (line.split(';').next().unwrap_or("").trim(), None),
-                };
-                if !pending.is_empty() {
-                    pending.push('\n');
+            }
+            Err(e) if expects_error => {
+                *checked += 1;
+                let want = expected
+                    .trim_start_matches("error")
+                    .trim_start_matches(':')
+                    .trim();
+                let msg = e.to_string();
+                if !want.is_empty() && !msg.contains(want) {
+                    failures.push(format!(
+                        "{name}: `{expr}` errored with `{}` (expected `{expected}`)",
+                        msg.lines().next().unwrap_or("")
+                    ));
                 }
-                pending.push_str(code);
-                if expected.is_some() {
-                    pending_expected = expected;
-                }
-                let balanced = pending.matches('(').count() <= pending.matches(')').count()
-                    && pending.matches('[').count() <= pending.matches(']').count();
-                if !balanced {
-                    continue;
-                }
-                let expr = std::mem::take(&mut pending);
-                let expr = expr.trim();
-                let Some(expected) = pending_expected.take() else {
-                    // Setup statement (e.g. `(define x 1)`) — eval to build shared state.
-                    if !skip(expr) {
-                        let _ = interp.eval_str(expr);
-                    }
-                    continue;
-                };
-                // Skip side-effecting exprs, and expecteds that aren't a single literal value:
-                // approximations (`~`, `...`), nondeterministic notes (`varies`), or any
-                // parenthetical annotation like `nil (not visible)` / escaped-quote strings.
-                let inexact = expected.contains('~')
-                    || expected.contains("...")
-                    || expected.contains("varies")
-                    || expected.contains(" (")
-                    || expected.contains('\\');
-                let looks_evaluable = expr.chars().any(|c| c.is_alphanumeric() || c == '(');
-                if expr.is_empty() || !looks_evaluable || skip(expr) || inexact {
-                    skipped += 1;
-                    continue;
-                }
-                // `; => error: <message>` asserts that evaluation fails.
-                let expects_error = expected.starts_with("error");
-                match interp.eval_str(expr) {
-                    Ok(v) if expects_error => {
-                        checked += 1;
-                        failures.push(format!(
-                            "{}: `{expr}` => `{v}` (expected an error: `{expected}`)",
-                            entry.name
-                        ));
-                    }
-                    Ok(v) => {
-                        checked += 1;
-                        let got = format!("{v}");
-                        if got.trim() != expected {
-                            failures.push(format!(
-                                "{}: `{expr}` => `{got}` (expected `{expected}`)",
-                                entry.name
-                            ));
-                        }
-                    }
-                    Err(e) if expects_error => {
-                        checked += 1;
-                        let want = expected
-                            .trim_start_matches("error")
-                            .trim_start_matches(':')
-                            .trim();
-                        let msg = e.to_string();
-                        if !want.is_empty() && !msg.contains(want) {
-                            failures.push(format!(
-                                "{}: `{expr}` errored with `{}` (expected `{expected}`)",
-                                entry.name,
-                                msg.lines().next().unwrap_or("")
-                            ));
-                        }
-                    }
-                    Err(e) => {
-                        // An example that errors is a broken example. Only a
-                        // form that depends on state the checker could not
-                        // build is skipped; that shows up as an unbound variable.
-                        let msg = e.to_string();
-                        if msg.contains("Unbound variable") {
-                            skipped += 1;
-                        } else {
-                            checked += 1;
-                            failures.push(format!(
-                                "{}: `{expr}` errored: {}",
-                                entry.name,
-                                msg.lines().next().unwrap_or("")
-                            ));
-                        }
-                    }
+            }
+            Err(e) => {
+                // A form may depend on setup that this conservative checker skipped.
+                let msg = e.to_string();
+                if msg.contains("Unbound variable") {
+                    *skipped += 1;
+                } else {
+                    *checked += 1;
+                    failures.push(format!(
+                        "{name}: `{expr}` errored: {}",
+                        msg.lines().next().unwrap_or("")
+                    ));
                 }
             }
         }
     }
+}
+
+fn assert_examples<'a>(label: &str, examples: impl IntoIterator<Item = (&'a str, &'a str)>) {
+    let mut checked = 0usize;
+    let mut skipped = 0usize;
+    let mut failures = Vec::new();
+    for (name, example) in examples {
+        check_example(name, example, &mut checked, &mut skipped, &mut failures);
+    }
 
     eprintln!(
-        "doc examples: {checked} checked, {} failed, {skipped} skipped",
+        "{label}: {checked} checked, {} failed, {skipped} skipped",
         failures.len()
     );
     for f in &failures {
@@ -223,5 +214,145 @@ fn builtin_doc_examples_evaluate() {
         failures.is_empty(),
         "{} doc example(s) do not match their `; =>` value (see MISMATCH lines above)",
         failures.len()
+    );
+}
+
+fn sema_code_blocks(page: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current = None;
+    for line in page.lines() {
+        if line.trim() == "```sema" {
+            current = Some(String::new());
+        } else if line.trim() == "```" {
+            if let Some(block) = current.take() {
+                blocks.push(block);
+            }
+        } else if let Some(block) = &mut current {
+            block.push_str(line);
+            block.push('\n');
+        }
+    }
+    blocks
+}
+
+fn assert_page_examples(label: &str, page: &str) {
+    let blocks = sema_code_blocks(page);
+    assert_examples(label, blocks.iter().map(|block| (label, block.as_str())));
+}
+
+#[test]
+fn builtin_doc_examples_evaluate() {
+    let index = sema_docs::builtin_index();
+    let examples = index.entries.iter().flat_map(|entry| {
+        entry
+            .examples
+            .iter()
+            .map(move |example| (entry.name.as_str(), example.as_str()))
+    });
+    assert_examples("builtin doc examples", examples);
+}
+
+#[test]
+fn special_forms_page_examples_evaluate() {
+    const PAGE: &str = include_str!("../../../../website/docs/language/special-forms.md");
+    for name in sema_eval::SPECIAL_FORM_NAMES {
+        assert!(
+            PAGE.contains(&format!("`{name}`")),
+            "special-forms page does not mention evaluator form `{name}`"
+        );
+    }
+
+    assert_page_examples("special-forms page examples", PAGE);
+}
+
+#[test]
+fn macros_modules_page_examples_evaluate() {
+    const PAGE: &str = include_str!("../../../../website/docs/language/macros-modules.md");
+    assert_page_examples("macros-modules page examples", PAGE);
+}
+
+#[test]
+fn data_types_page_examples_evaluate() {
+    const PAGE: &str = include_str!("../../../../website/docs/language/data-types.md");
+    assert_page_examples("data-types page examples", PAGE);
+}
+
+#[test]
+fn special_forms_documented_edge_cases() {
+    let interp = Interpreter::new();
+
+    assert_eq!(interp.eval_str("(and nil)").unwrap().to_string(), "nil");
+    assert_eq!(interp.eval_str("(or nil)").unwrap().to_string(), "nil");
+    assert_eq!(interp.eval_str("(if #f 1)").unwrap().to_string(), "nil");
+    assert_eq!(
+        interp
+            .eval_str("(letrec (([a b] '(1 2))) (+ a b))")
+            .unwrap()
+            .to_string(),
+        "3"
+    );
+    assert_eq!(
+        interp
+            .eval_str("(match {} ({:missing x} :explicit) ({:keys [missing]} missing))")
+            .unwrap()
+            .to_string(),
+        "nil"
+    );
+    assert_eq!(
+        interp.eval_str("(let ((and 5)) and)").unwrap().to_string(),
+        "5"
+    );
+    assert_eq!(
+        interp
+            .eval_str("(let ((and (fn (a b) (* a b)))) (and 3 4))")
+            .unwrap()
+            .to_string(),
+        "4"
+    );
+
+    let err = interp
+        .eval_str("(define (sum-pair [a b]) (+ a b))")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("define: expected a symbol"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn macros_and_data_types_documented_edge_cases() {
+    let interp = Interpreter::new();
+
+    assert_eq!(
+        interp
+            .eval_str(
+                "(begin (defmacro outer (x) (list 'inner x)) \
+                 (defmacro inner (x) (list '+ x 1)) \
+                 (macroexpand '(outer 4)))",
+            )
+            .unwrap()
+            .to_string(),
+        "(inner 4)"
+    );
+    assert_eq!(
+        interp
+            .eval_str("(list (type 1/2) (type 3+4i) (type nil) (type '()))")
+            .unwrap()
+            .to_string(),
+        "(:rational :complex :nil :list)"
+    );
+    assert_eq!(
+        interp
+            .eval_str("(list (equal? nil '()) (if '() :true :false))")
+            .unwrap()
+            .to_string(),
+        "(#f :true)"
+    );
+    assert_eq!(
+        interp
+            .eval_str("(list (type (delay 1)) (type (async/resolved 1)))")
+            .unwrap()
+            .to_string(),
+        "(:promise :async-promise)"
     );
 }

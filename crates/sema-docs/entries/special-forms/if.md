@@ -1,7 +1,7 @@
 ---
 name: "if"
 module: "special-forms"
-syntax: "(if condition then-expr else-expr)"
+syntax: "(if condition then-expr [else-expr])"
 ---
 
 Two-branch conditional special form. Evaluates `condition`, and if it is truthy evaluates `then-expr`; otherwise evaluates `else-expr`. Only the selected branch is evaluated — the other is never touched. In Sema, only `nil` and `#f` are falsy; every other value (including `0`, empty strings, and empty lists) is truthy.

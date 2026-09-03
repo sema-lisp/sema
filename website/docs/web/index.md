@@ -153,24 +153,24 @@ Re-rendering uses morphdom for efficient DOM patching -- only changed nodes are 
 
 | Module | Namespace | Purpose |
 | --- | --- | --- |
-| [Reactive State](./reactive-state) | `state`, `put!`, `update!`, `computed`, `batch`, `watch` | Signal-based reactivity |
-| [Components](./components) | `defcomponent`, `mount!`, `component/render`, `local`, `effect`, `on-unmount` | Reactive UI components, composition, lifecycle |
-| [SIP Markup](./sip-markup) | `sip/*` | Declarative DOM rendering |
-| [DOM API](./dom-api) | `dom/*` | Low-level DOM manipulation |
-| [Store](./store) | `store/*` | localStorage / sessionStorage |
-| [Routing](./routing) | `router/*` | SPA routing: params, query strings, links, hash or history mode |
-| [Scoped CSS](./css) | `css/*` | Dynamic style injection |
-| [HTTP & Streams](./http) | `http/*` | Browser fetch integration and SSE streams |
-| [LLM](./llm) | `llm/*` | AI completions via proxy |
-| [Async Resources](./resources) | `resource`, `resource/refresh!`, `resource/cancel!` | Component-owned async data with loading/error state |
-| [Diagnostics](./diagnostics) | `onerror`, `dev` | Error hook and a bounded dev-mode timeline |
-| [Testing](./testing) | `renderSema` | Mount and drive components from a test |
+| [Reactive State](/docs/web/reactive-state) | `state`, `put!`, `update!`, `computed`, `batch`, `watch` | Signal-based reactivity |
+| [Components](/docs/web/components) | `defcomponent`, `mount!`, `component/render`, `local`, `effect`, `on-unmount` | Reactive UI components, composition, lifecycle |
+| [SIP Markup](/docs/web/sip-markup) | `sip/*` | Declarative DOM rendering |
+| [DOM API](/docs/web/dom-api) | `dom/*` | Low-level DOM manipulation |
+| [Store](/docs/web/store) | `store/*` | localStorage / sessionStorage |
+| [Routing](/docs/web/routing) | `router/*` | SPA routing: params, query strings, links, hash or history mode |
+| [Scoped CSS](/docs/web/css) | `css/*` | Dynamic style injection |
+| [HTTP & Streams](/docs/web/http) | `http/*` | Browser fetch integration and SSE streams |
+| [LLM](/docs/web/llm) | `llm/*` | AI completions via proxy |
+| [Async Resources](/docs/web/resources) | `resource`, `resource/refresh!`, `resource/cancel!` | Component-owned async data with loading/error state |
+| [Diagnostics](/docs/web/diagnostics) | `onerror`, `dev` | Error hook and a bounded dev-mode timeline |
+| [Testing](/docs/web/testing) | `renderSema` | Mount and drive components from a test |
 
 ## Next Steps
 
-- [Getting Started](./getting-started) -- install, set up a page, evaluate code
-- [Building a Sema Web App](./building-apps) -- recommended project layout and compiled-archive workflow
-- [Reactive State](./reactive-state) -- the core programming model
-- [Components](./components) -- building interactive UIs
-- [Async Resources](./resources) -- loading data without wiring loading/error state by hand
-- [Diagnostics & Dev Mode](./diagnostics) -- seeing what the runtime is doing
+- [Getting Started](/docs/web/getting-started) -- install, set up a page, evaluate code
+- [Building a Sema Web App](/docs/web/building-apps) -- recommended project layout and compiled-archive workflow
+- [Reactive State](/docs/web/reactive-state) -- the core programming model
+- [Components](/docs/web/components) -- building interactive UIs
+- [Async Resources](/docs/web/resources) -- loading data without wiring loading/error state by hand
+- [Diagnostics & Dev Mode](/docs/web/diagnostics) -- seeing what the runtime is doing

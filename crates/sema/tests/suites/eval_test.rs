@@ -1802,6 +1802,9 @@ eval_tests! {
     int_float_eq_exact_above_2p53: "(= 9007199254740993 9007199254740992.0)" => Value::bool(false),
     int_float_gt_exact_above_2p53: "(> 9007199254740993 9007199254740992.0)" => Value::bool(true),
     int_float_eq_still_equal: "(= 1 1.0)" => Value::bool(true),
+    variadic_equal_uses_structural_equality: r#"(= "same" "same" "same")"# => Value::bool(true),
+    variadic_equal_mixed_types_is_false: r#"(= 1 "1" 1)"# => Value::bool(false),
+    redefined_equal_uses_structural_equality: r#"(begin (define compare =) (compare '(1 2) '(1 2)))"# => Value::bool(true),
     // A computed -0.0 is the same map key as +0.0 (Ord no longer splits them).
     neg_zero_map_key_retrievable: "(get (assoc {} (- 0.0) \"x\") 0.0)" => Value::string("x"),
     // Padding is by display width, not codepoint count: "日本語" is already 6

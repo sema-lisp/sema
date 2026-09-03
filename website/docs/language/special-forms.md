@@ -4,13 +4,51 @@ outline: [2, 3]
 
 # Special Forms
 
-Special forms are built into the evaluator — they control evaluation order and cannot be redefined.
+Special forms are recognized by the evaluator when their name appears first in
+a list. Unlike function calls, they can choose which operands to evaluate,
+introduce bindings, or change control flow.
+
+Special-form names can be bound and used as values. They cannot currently be
+overridden in operator position: in `(if ...)`, `if` is always the special form,
+even if a local binding has the same name. See
+[Special-form names in operator position](https://github.com/sema-lisp/sema/blob/main/docs/limitations.md#36-special-form-names-win-over-local-bindings-in-operator-position).
+
+Only `nil` and `#f` are falsy. All other values, including `0`, `""`, and empty
+collections, are truthy.
+
+This page also covers closely related syntax and prelude macros. The label on
+each group states which constructs are evaluator special forms and which are
+not.
+
+## Complete Index
+
+| Category | Names |
+|---|---|
+| Definitions and functions | [`define`](#define) (`def`), [`defun`](#defun) (`defn`), [`set!`](#set), [`lambda`](#lambda) (`fn`) |
+| Conditionals and logic | [`if`](#if), [`cond`](#cond), [`case`](#case), [`when`](#when), [`unless`](#unless), [`and`](#and), [`or`](#or) |
+| Bindings and sequencing | [`let`](#let), [`let*`](#let-1), [`letrec`](#letrec), [`begin`](#begin) (`progn`), [`do`](#do), [`while`](#while) |
+| Quoting and macros | [`quote`](#quote), [`quasiquote`](#quasiquote), [`defmacro`](./macros-modules.md#defmacro), [`define-syntax`](./macros-modules.md#define-syntax-syntax-rules), [`macroexpand`](./macros-modules.md#macroexpand) |
+| Data dispatch | [`match`](#match), [`match*`](#match-lenient-variant), [`define-record-type`](#define-record-type), [`defmulti`](#defmulti), [`defmethod`](#defmethod) |
+| Multiple values | [`let-values`](#let-values), [`let*-values`](#let-values-1), [`define-values`](#define-values) |
+| Errors and evaluation | [`throw`](#throw), [`try`](#try-catch), [`eval`](#eval) |
+| Files and modules | [`load`](#load), [`module`](./macros-modules.md#module), [`export`](./macros-modules.md#module), [`import`](./macros-modules.md#import) |
+| Lazy and async evaluation | [`delay`](#delay), [`force`](#force), [`async`](#async), [`await`](#await) |
+| LLM values | [`prompt`](../llm/prompts.md#prompt), [`message`](../llm/prompts.md#message), [`deftool`](../llm/tools-agents.md#deftool), [`defagent`](../llm/tools-agents.md#defagent) |
+
+Aliases in parentheses are separate evaluator-recognized names with identical
+behavior. Threading, conditional-binding, `guard`, `parameterize`, `dotimes`,
+and `for-range` are prelude macros. `#(...)` is reader syntax. `values`,
+`call-with-values`, `make-parameter`, `raise`, and the promise predicates are
+ordinary callable values.
 
 ## Definitions & Assignment
 
 ### `define`
 
-Bind a name to a value. Given a signature list rather than a bare symbol, it binds the name to a function.
+Evaluate a value and bind it in the current environment. Given a signature list
+rather than a bare symbol, `define` creates a named function whose body runs in
+the lexical environment of the definition. A vector or map in binding position
+destructures the value. `define` returns `nil`.
 
 ```sema
 (define x 42)                          ; bind a value
@@ -23,7 +61,8 @@ Bind a name to a value. Given a signature list rather than a bare symbol, it bin
 
 ### `set!`
 
-Mutate an existing binding.
+Evaluate `value`, then replace an existing lexical or global binding. It is an
+error if the name is unbound. `set!` returns `nil`.
 
 ```sema
 (set! x 99)
@@ -36,14 +75,16 @@ Mutate an existing binding.
 Return the argument without evaluating it. The reader shorthand `'x` desugars to `(quote x)`.
 
 ```sema
-(quote (+ 1 2))                        ; => (+ 1 2) as a list
+(quote (+ 1 2))                        ; => (+ 1 2) ; list data
 '(+ 1 2)                               ; same thing
 'foo                                   ; => foo (the symbol, not its value)
 ```
 
 ### `quasiquote`
 
-Template with selective evaluation. Use `` ` `` as shorthand. Inside a quasiquote, `,expr` (unquote) evaluates `expr` and splices the result, while `,@expr` (unquote-splicing) evaluates `expr` and splices each element.
+Template with selective evaluation. Use `` ` `` as shorthand. Inside a
+quasiquote, `,expr` (unquote) evaluates and inserts one value, while `,@expr`
+(unquote-splicing) evaluates a list or vector and inserts each of its elements.
 
 ```sema
 (define x 42)
@@ -57,7 +98,9 @@ Quasiquote is essential for writing macros — see [Macros](./macros-modules.md#
 
 ### `lambda`
 
-Create an anonymous function.
+Create an anonymous function that closes over its lexical environment. The
+parameter specification can be a list or vector. Dotted list notation captures
+rest arguments. The body is evaluated in order and returns its last value.
 
 ```sema
 (lambda (x y) (+ x y))
@@ -74,7 +117,10 @@ Alias for `lambda`.
 
 ### `defun`
 
-Define a named function (equivalent to `(define (name params...) body...)`).
+Define a named function, equivalent to `(define (name params...) body...)`.
+Parameters must be symbols, with optional dotted rest notation. The body is
+evaluated in order and its last expression is in tail position. `defun` returns
+`nil`.
 
 ```sema
 (defun square (x) (* x x))
@@ -89,15 +135,27 @@ Define a named function (equivalent to `(define (name params...) body...)`).
 
 ### `if`
 
-Two-branch conditional.
+Evaluate `condition`, then evaluate and return exactly one branch. Only `nil`
+and `#f` are falsy. Every other value, including `0`, `""`, and the empty list
+`()`, is truthy. `nil` and `()` are distinct values.
+
+The else expression is optional. If it is absent and the condition is falsy,
+`if` returns `nil`:
 
 ```sema
 (if (> x 0) "positive" "non-positive")
+(if nil "yes" "no")                    ; => "no"
+(if #f "unreachable")                  ; => nil
+(if '() "yes" "no")                    ; => "yes"
+(if #t (println "selected") (error "not evaluated"))
 ```
 
 ### `cond`
 
-Multi-branch conditional with `else` fallback.
+Evaluate clause tests from left to right and evaluate only the first selected
+body. A test-only clause returns `#t` when selected. If no clause matches,
+return `nil`. An `else` clause is a catch-all; put it last because later clauses
+are ignored.
 
 ```sema
 (cond
@@ -108,7 +166,9 @@ Multi-branch conditional with `else` fallback.
 
 ### `case`
 
-Match a value against literal alternatives.
+Evaluate the discriminant once, then compare it with each clause's quoted
+datums. Evaluate only the first matching body. Return `nil` if nothing matches
+and there is no `else` clause.
 
 ```sema
 (case (:status response)
@@ -119,7 +179,8 @@ Match a value against literal alternatives.
 
 ### `when`
 
-Execute body only if condition is true. Returns `nil` otherwise.
+Evaluate the body in order only when the condition is truthy, and return the
+last body value. Return `nil` when the condition is falsy.
 
 ```sema
 (when (> x 0) (println "positive"))
@@ -127,7 +188,8 @@ Execute body only if condition is true. Returns `nil` otherwise.
 
 ### `unless`
 
-Execute body only if condition is false.
+Evaluate the body in order only when the condition is falsy, and return the
+last body value. Return `nil` when the condition is truthy.
 
 ```sema
 (unless (> x 0) (println "not positive"))
@@ -135,7 +197,8 @@ Execute body only if condition is false.
 
 ## Threading Macros
 
-Built-in macros for pipeline-style code. Available automatically — no import needed.
+Prelude macros for pipeline-style code. They expand before evaluation and are
+available automatically; no import is needed.
 
 ### `->`
 
@@ -176,6 +239,8 @@ Nil-safe thread-first: stops and returns `nil` if any step produces `nil`.
 
 ## Conditional Binding
 
+These are prelude macros, not evaluator special forms.
+
 ### `when-let`
 
 Bind a value and execute body only if non-nil.
@@ -203,7 +268,8 @@ not the doubled `((name value))` of `let`. The doubled form is reported as a
 
 ### `#(...)`
 
-Concise anonymous functions. `%` (or `%1`) is the first argument, `%2` the second, etc.
+Reader syntax for concise anonymous functions. `%` (or `%1`) is the first
+argument, `%2` the second, and so on. The reader expands this syntax to `fn`.
 
 ```sema
 (map #(+ % 1) '(1 2 3))               ; => (2 3 4)
@@ -258,7 +324,9 @@ Loop construct with tail-call optimization.
 
 ## Destructuring
 
-`let`, `let*`, `define`, and `lambda` all support destructuring patterns in binding positions.
+`let`, `let*`, `letrec`, `define`, and `lambda` all support destructuring
+patterns in binding positions. In a function, a pattern occupies one parameter
+position, so it must appear inside the parameter list.
 
 ### Vector Destructuring
 
@@ -291,6 +359,9 @@ Explicit key-pattern pairs:
   val)                                  ; => 42
 ```
 
+Missing map keys bind `nil`. Vector patterns are strict: without `& rest`, the
+input must have exactly the same number of elements as the pattern.
+
 ### Destructuring in `define`
 
 ```sema
@@ -301,14 +372,19 @@ Explicit key-pattern pairs:
 ### Destructuring in Function Parameters
 
 ```sema
-(define (sum-pair [a b])
-  (+ a b))
+(define sum-pair
+  (fn ([a b]) (+ a b)))
 (sum-pair '(3 4))                       ; => 7
 
-(define (greet {:keys [name title]})
-  (format "Hello ~a ~a" title name))
+(define greet
+  (fn ({:keys [name title]})
+    (format "Hello ~a ~a" title name)))
 (greet {:name "Smith" :title "Dr."})    ; => "Hello Dr. Smith"
 ```
+
+The function-signature shorthand `(define (name params ...) body ...)` and
+`defun`/`defn` currently require plain symbol parameters. Use `fn` or `lambda`
+as above when a parameter needs destructuring.
 
 Nested patterns are supported:
 
@@ -379,7 +455,8 @@ Symbols bind the matched value. `_` is a wildcard.
 
 #### Map Patterns
 
-Structural matching — keys must exist in the value:
+Explicit key-pattern pairs are structural: each explicit key must exist in the
+value or the clause does not match.
 
 ```sema
 (match response
@@ -394,6 +471,9 @@ With `{:keys [...]}` shorthand:
 (match config
   ({:keys [host port]} (connect host port)))
 ```
+
+Unlike an explicit key-pattern pair, `:keys` extraction does not require a key
+to exist. A missing key binds its symbol to `nil`.
 
 #### Guards
 
@@ -440,8 +520,8 @@ The lower-level primitive: call a zero-argument `producer` thunk, then apply `co
 ```sema
 (call-with-values (lambda () (values 1 2)) +)           ; => 3
 (call-with-values (lambda () (values 1 2 3)) list)      ; => (1 2 3)
-(call-with-values (lambda () 42) list)                  ; => (42)  single value, not spread
-(call-with-values (lambda () (values)) (lambda () 99))  ; => 99    zero values
+(call-with-values (lambda () 42) list)                  ; => (42) ; single value, not spread
+(call-with-values (lambda () (values)) (lambda () 99))  ; => 99   ; zero values
 ```
 
 If the number of produced values doesn't match the consumer's arity, the call fails with the ordinary arity error (R7RS's "wrong number of values"). Note that producer/consumer are invoked through the same native dispatch as `apply`, so a call across this boundary is not a true VM tail call — deep recursion written through `call-with-values` won't get the same tail-call optimization as a plain named `let`.
@@ -513,6 +593,9 @@ Calling a parameter with one argument mutates it directly (SRFI-39 style) — bu
 
 ### `parameterize`
 
+`parameterize` is a prelude macro that uses parameter builtins and
+`try`/`catch` to restore prior values.
+
 Evaluate each value, convert it through the parameter's converter, install the converted values, run `body`, and always restore every parameter to its **prior** value before returning — even if `body` raises (the condition is re-raised after restoration).
 
 ```sema
@@ -531,7 +614,7 @@ Restoration also happens on a non-local exit via `raise`:
 
 (guard (e (else (mode)))
   (parameterize ((mode :debug))
-    (raise "boom")))                   ; => :normal — restored before the guard ran
+    (raise "boom")))                   ; => :normal ; restored before the guard ran
 ```
 
 `parameterize` forms nest — an inner form restores back to the outer one's value, not the original:
@@ -553,7 +636,8 @@ Restoration is unwind-on-error only (Sema has no `call/cc`). If a `parameterize`
 
 ### `begin`
 
-Evaluate expressions in order, return the last result.
+Evaluate expressions in order and return the last result. An empty `begin`
+returns `nil`.
 
 ```sema
 (begin expr1 expr2 ... exprN)
@@ -565,25 +649,37 @@ Evaluate expressions in order, return the last result.
 
 ### `and`
 
-Short-circuit logical AND. Returns the last truthy value or `#f`.
+Evaluate expressions from left to right. Return the first falsy value, or the
+last value if all are truthy. With no arguments, return `#t`.
 
 ```sema
 (and a b c)
+(and #t 42)                            ; => 42
+(and #t nil)                           ; => nil
+(and)                                  ; => #t
 ```
 
 ### `or`
 
-Short-circuit logical OR. Returns the first truthy value or `#f`.
+Evaluate expressions from left to right. Return the first truthy value, or the
+last falsy value if none are truthy. With no arguments, return `#f`.
 
 ```sema
 (or a b c)
+(or nil 42)                            ; => 42
+(or nil)                               ; => nil
+(or)                                   ; => #f
 ```
 
 ## Iteration
 
+`while` and `do` are evaluator special forms. `dotimes` and `for-range` are
+prelude macros that expand to `do`.
+
 ### `while`
 
-Loop while a condition is truthy. Returns `nil`. Use `set!` to mutate loop state.
+Evaluate the condition before each iteration and run the body while it remains
+truthy. Return `nil`. Use `set!` to mutate loop state.
 
 ```sema
 (let ((n 0))
@@ -597,7 +693,10 @@ Loop while a condition is truthy. Returns `nil`. Use `set!` to mutate loop state
 
 ### `do`
 
-Scheme `do` loop with variable bindings, step expressions, and a termination test.
+Scheme `do` loop with variable bindings, step expressions, and a termination
+test. Initial values are evaluated before the loop. After each body execution,
+the step expressions compute the next bindings in parallel. When the test is
+truthy, return the last result expression, or `nil` if none is present.
 
 ```sema
 ;; (do ((var init step) ...) (test result ...) body ...)
@@ -614,11 +713,32 @@ With a body for side effects:
   (println i))                         ; prints 0..4
 ```
 
+### `dotimes`
+
+Evaluate a body `count` times with `var` bound to integers from `0` through
+`count - 1`. Return `nil`. A zero or negative count skips the body.
+
+```sema
+(dotimes (i 3)
+  (println i))                         ; prints 0, 1, 2
+```
+
+### `for-range`
+
+Iterate from an inclusive start to an exclusive end. The optional positive
+step defaults to `1`. Backward iteration is not supported.
+
+```sema
+(for-range (i 0 6 2)
+  (println i))                         ; prints 0, 2, 4
+```
+
 ## Lazy Evaluation
 
 ### `delay`
 
-Create a promise — the expression is not evaluated until forced.
+Create a lazy promise without evaluating the expression. The promise captures
+the current lexical environment.
 
 ```sema
 (define p (delay (+ 1 2)))
@@ -626,7 +746,8 @@ Create a promise — the expression is not evaluated until forced.
 
 ### `force`
 
-Evaluate a promise and memoize the result. Non-promise values pass through.
+Evaluate a lazy promise at most once and memoize its result. Later calls return
+the stored value. Non-promise values pass through unchanged.
 
 ```sema
 (force p)                              ; => 3 (evaluate and memoize)
@@ -678,7 +799,9 @@ Clojure-style polymorphic dispatch based on a user-defined dispatch function.
 
 ### `defmulti`
 
-Define a multimethod with a name and a dispatch function. The dispatch function is called with the arguments to determine which method to invoke.
+Evaluate a dispatch function and bind a new multimethod to `name`. Each call to
+the multimethod passes all call arguments to the dispatch function, then uses
+its result to select a method. `defmulti` returns `nil`.
 
 ```sema
 (defmulti area (fn (shape) (get shape :type)))
@@ -686,7 +809,9 @@ Define a multimethod with a name and a dispatch function. The dispatch function 
 
 ### `defmethod`
 
-Add a method implementation for a specific dispatch value. Use `:default` as the dispatch value for a fallback handler.
+Evaluate the dispatch value and handler, then add the handler to an existing
+multimethod. Use `:default` as the dispatch value for a fallback handler. It is
+an error if the named binding is not a multimethod. `defmethod` returns `nil`.
 
 ```sema
 (defmethod area :circle
@@ -706,7 +831,10 @@ Add a method implementation for a specific dispatch value. Use `:default` as the
 
 ### `load`
 
-Load and execute a Sema source file in the current environment. Unlike `import`, `load` does not use the module system — all top-level definitions become available in the current scope.
+Evaluate the path, load the Sema source file, and execute it in the current
+environment. Unlike `import`, `load` does not use module exports: top-level
+definitions become available in the current scope. The path is resolved
+relative to the current source file when possible.
 
 ```sema
 (load "helpers.sema")                  ; execute file, bindings available here
@@ -714,7 +842,8 @@ Load and execute a Sema source file in the current environment. Unlike `import`,
 
 ### `eval`
 
-Evaluate a data structure as code. See [Metaprogramming](./macros-modules.md#eval).
+Evaluate one data structure as code in the current environment. See
+[Metaprogramming](./macros-modules.md#eval).
 
 ```sema
 (eval '(+ 1 2))                        ; => 3
@@ -798,7 +927,8 @@ Unlike `error` (which takes a message string), `raise` signals the object itself
 
 ### `guard`
 
-R7RS structured exception handling.
+R7RS structured exception handling. `guard` is a prelude macro built from
+`try`/`catch` and `cond`, not an evaluator special form.
 
 ```sema
 (guard (var clause ...) body ...)
@@ -840,7 +970,7 @@ This makes `guard` safer than a catch-all `try`/`catch`: conditions you didn't a
 
 ### `async`
 
-Create an async task that evaluates `body` concurrently and returns a promise.
+Create an async task that evaluates `body` cooperatively and returns a promise.
 
 ```
 (async body ...)

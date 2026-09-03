@@ -182,7 +182,7 @@ This page defines the technical vocabulary used across Sema's documentation — 
 
 **Quote desugaring** — the reader's rewriting of quote syntax into real lists before evaluation: `'x` → `(quote x)`, `` `x `` → `(quasiquote x)`, `,x` → `(unquote x)`, `,@x` → `(unquote-splicing x)`. The syntax is reader-level; the semantics are evaluator-level. Sema has no user-extensible reader macros/readtables.
 
-**Rc reference counting** — Sema's single-threaded memory model: every `Value` is `Rc` (non-atomic reference counting), giving deterministic destruction with no garbage collector. `Rc` (not `Arc`) avoids atomic increments and makes `Value`s non-`Send`/`Sync`. Cannot collect cycles, but Lisp closures tend to be tree-shaped; a future tracing GC is the named next runtime step.
+**Rc reference counting** — Sema's single-threaded memory model: heap-backed `Value`s use `Rc` (non-atomic reference counting), which gives deterministic destruction for acyclic values. `Rc` (not `Arc`) avoids atomic increments and makes values non-`Send`/`Sync`. A synchronous Bacon–Rajan cycle collector reclaims unreachable reference cycles at safe points.
 
 **Reader** — Sema's front end (`sema-reader`): a two-phase pipeline where a lexer tokenizes source into `SpannedToken`s and a recursive-descent parser produces `Value` nodes directly — no separate AST type, since code is data. Quote sugar, f-strings, regex literals, short lambdas, and dotted pairs are desugared here. Reader errors are syntax/parse errors (`:reader`). Also `(read "...")` parses a string into a `Value`.
 

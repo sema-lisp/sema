@@ -233,12 +233,12 @@ curl -fsSL https://sema-lang.com/docs/for-agents.md >> AGENTS.md
 ln -s AGENTS.md CLAUDE.md     # Claude Code, Cursor, etc. read this
 ```
 
-[`for-agents.md`](https://sema-lang.com/docs/for-agents) is a single terse page —
-*everything that differs from other Lisps* — written for an LLM that already knows a
-Lisp. It links to [`/llms.txt`](https://sema-lang.com/llms.txt), a machine index of every
-doc page so the agent can fetch just the page it needs (e.g. `/docs/llm/tools-agents.md`)
-on demand, instead of loading the whole manual. Every doc URL also serves raw Markdown —
-append `.md` to any `sema-lang.com/docs/...` link and your agent gets the source, not HTML.
+[`for-agents.md`](https://sema-lang.com/docs/for-agents) is a compact working guide for
+an LLM that already knows a Lisp. It covers the rules most likely to cause incorrect
+generated code and links to [`/llms.txt`](https://sema-lang.com/llms.txt), a machine index
+of every doc page. The agent can fetch only the page it needs (for example,
+`/docs/llm/tools-agents.md`) instead of loading the whole manual. Every doc URL also
+serves raw Markdown: append `.md` to a `sema-lang.com/docs/...` link to get the source.
 
 ## Installation
 

@@ -1,6 +1,6 @@
 # Sema Playground
 
-> Browser-based Sema editor, evaluator, debugger, examples library, and virtual filesystem. Sema is a Scheme-like Lisp with first-class LLM and agent primitives. The playground runs locally in WebAssembly; it does not send source code to a Sema server.
+> Browser-based Sema editor, evaluator, debugger, examples library, and virtual filesystem. Prompts, messages, conversations, tools, and agents have distinct runtime types. The playground runs locally in WebAssembly; it does not send source code to a Sema server.
 
 The playground at https://sema.run exposes an experimental WebMCP tool surface in supported Chrome builds. An agent can read, replace, and format the editor; run or stop code; inspect paged output; find and load examples; manage text files in the virtual filesystem; and drive the breakpoint debugger. Mutating tools reject conflicting operations while the evaluator or debugger is busy. File access is limited to the playground's virtual filesystem.
 

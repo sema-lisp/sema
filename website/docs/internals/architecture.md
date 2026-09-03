@@ -1,8 +1,8 @@
 # Architecture Overview
 
-Sema is a Lisp with first-class LLM primitives, implemented in Rust. All code runs on a single evaluator: a [bytecode VM](./bytecode-vm.md). The runtime is single-threaded (`Rc`, not `Arc`), with deterministic destruction via reference counting instead of a garbage collector.
+Sema is a Lisp with distinct runtime types for prompts, messages, conversations, tools, and agents, implemented in Rust. All code runs on a single evaluator: a [bytecode VM](./bytecode-vm.md). The runtime is single-threaded (`Rc`, not `Arc`). Reference counting destroys acyclic values deterministically, and a synchronous cycle collector reclaims unreachable reference cycles.
 
-The entire implementation is ~180k lines of Rust across 17 crates, each with a clear responsibility and strict dependency ordering.
+The implementation is split into workspace crates with clear responsibilities and strict dependency ordering.
 
 ## Crate Map
 
@@ -56,12 +56,14 @@ This is discussed in detail in [The Circular Dependency Problem](#the-circular-d
 | Crate           | Role                            | Key types                                                                                                                                 |
 | --------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | **sema-core**   | Shared types                    | `Value` (NaN-boxed 8-byte), `Env`, `SemaError`, string interner, `NativeFn`, `Lambda`, `Macro`, `Record`, LLM types                       |
+| **sema-io**     | Cooperative I/O                 | Runtime-aware filesystem, network, process, and stream operations                                                                          |
 | **sema-reader** | Parsing                         | `Lexer` (24 token types) + recursive descent `Parser` → `Value` AST + `SpanMap`                                                           |
 | **sema-vm**     | Bytecode VM (the evaluator)     | `CoreExpr`, `ResolvedExpr`, `Op`, `Chunk`, `Emitter` — lowering, resolution, compilation, VM dispatch                                     |
 | **sema-eval**   | Macro expansion + module loading | Macro expander (VM-native), module system (`import`/`load`), prelude, eval/call callback wiring; drives the VM. _Not_ a standalone evaluator — the VM is the sole evaluator |
 | **sema-stdlib** | Standard library                | Native functions across a comprehensive standard library                                                                                  |
 | **sema-llm**    | LLM integration                 | `LlmProvider` trait, native providers (Anthropic, OpenAI, Gemini, Ollama), OpenAI-compatible shim, embedding providers, cost tracking     |
 | **sema-otel**   | Observability                   | OpenTelemetry facade (spans/metrics for LLM, agent, tool, and notebook runs); depends only on `sema-core`; native-only (no-op on wasm32)   |
+| **sema-policy** | Capability policy               | Filesystem, network, shell, process, environment, LLM, and serial access rules                                                              |
 | **sema-lsp**    | Language Server              | LSP via tower-lsp: completions, hover, go-to-definition, references, rename, semantic tokens, diagnostics                                  |
 | **sema-dap**    | Debug Adapter                | DAP server: breakpoints, stepping, stack traces, variable inspection via VM debug hooks                                                    |
 | **sema-fmt**    | Formatter                       | Code formatter for `.sema` files (`sema fmt`)                                                                                             |
@@ -109,7 +111,10 @@ Several design choices here are worth examining.
 
 Sema is single-threaded. `Arc` adds an atomic increment/decrement on every clone/drop — unnecessary overhead when there's no cross-thread sharing. `Rc` uses ordinary (non-atomic) reference counting, which is cheaper and also means the compiler can catch accidental `Send`/`Sync` usage at compile time.
 
-The trade-off versus a tracing garbage collector: reference counting gives deterministic destruction (values are freed the instant their last reference drops), but cannot collect cycles. In practice this is rarely a problem — Lisp closures tend to create tree-shaped reference graphs, not cycles. A lambda captures its enclosing environment, which may capture its own enclosing environment, forming a chain. Cycles are theoretically possible (e.g., named lambdas bind themselves in their own environment, and `Thunk` uses `RefCell` which could close over itself), but they don't arise in typical Sema programs. If they did, the leaked memory would be bounded by the closure's captured environment — not a growing leak.
+Reference counting alone cannot collect cycles. Sema therefore runs a synchronous
+Bacon–Rajan cycle collector at safe points. Acyclic values still have deterministic
+destruction, while unreachable cycles formed by environments, closures, and mutable
+containers are reclaimed without a separate tracing heap.
 
 Sema uses NaN-boxing — encoding values in the unused bits of IEEE 754 NaN representations to fit a tagged value in 8 bytes, the same technique used by Janet. This makes `Value` the same size as a `f64` or a pointer, meaning the value stack and constant pool have excellent cache locality. Heap types like `List`, `Map`, and `Lambda` add one level of `Rc` pointer indirection, with the pointer stored in the 45-bit payload field (using the 8-byte alignment guarantee to shift the pointer right by 3 bits). Small integers (±17.5 trillion), symbols, keywords, characters, booleans, and nil are all stored entirely within the 8-byte NaN-box with zero heap allocation.
 

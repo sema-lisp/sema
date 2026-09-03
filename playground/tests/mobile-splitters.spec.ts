@@ -36,6 +36,32 @@ async function blockSize(locator: Locator) {
   return locator.evaluate((element: HTMLElement) => element.getBoundingClientRect().height);
 }
 
+test('mobile editor, output, and file preview keep native text selection enabled', async ({ page }) => {
+  await waitForReady(page);
+
+  await expect(page.getByTestId('output')).toHaveCSS('user-select', 'text');
+  await expect(page.getByTestId('file-viewer')).toHaveCSS('user-select', 'text');
+
+  const editorSelection = await page.locator('#editor').evaluate((editor) => {
+    const textarea = editor.shadowRoot?.querySelector('textarea');
+    if (!(textarea instanceof HTMLTextAreaElement)) return null;
+    textarea.value = 'selectable';
+    textarea.setSelectionRange(0, 6);
+    const style = getComputedStyle(textarea);
+    return {
+      userSelect: style.userSelect,
+      webkitUserSelect: style.getPropertyValue('-webkit-user-select'),
+      selectionLength: textarea.selectionEnd - textarea.selectionStart,
+    };
+  });
+
+  expect(editorSelection).toEqual({
+    userSelect: 'text',
+    webkitUserSelect: 'text',
+    selectionLength: 6,
+  });
+});
+
 test('mobile splitters resize all stacked panes by touch and persist their sizes', async ({ page }) => {
   await waitForReady(page);
 
@@ -90,6 +116,7 @@ test('mobile splitters resize all stacked panes by touch and persist their sizes
   for (const resizeCase of cases) {
     const before = await blockSize(resizeCase.pane);
     await panVertically(resizeCase.splitter, resizeCase.deltaY);
+    await expect(page.locator('body')).not.toHaveCSS('user-select', 'none');
     const after = await blockSize(resizeCase.pane);
 
     expect(after).toBeCloseTo(before + resizeCase.expectedDelta, 0);

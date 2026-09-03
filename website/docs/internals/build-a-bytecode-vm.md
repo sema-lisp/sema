@@ -193,7 +193,7 @@ To stay on one screen, our toy left out the genuinely harder parts of a real lan
 
 - **Functions & closures.** Calling a function means pushing a *call frame* and jumping; a closure that captures a variable needs **upvalues**. Sema uses the Lua-style "open upvalue" model — see [Bytecode VM](./bytecode-vm.md) and `vm.rs`.
 - **Tail calls.** Sema reuses the current frame for a call in tail position, so deep recursion doesn't grow the native stack — see [Evaluator & TCO](./evaluator.md).
-- **Memory.** We leaned on Sema's own reference counting. Sema's `Value` is reference-counted (`Rc`) with deterministic destruction — no garbage collector — see [Architecture](./architecture.md#why-rc-not-arc).
+- **Memory.** We leaned on Sema's own reference counting. Sema's heap-backed values use `Rc` for deterministic destruction, with a synchronous cycle collector for unreachable cycles — see [Architecture](./architecture.md#why-rc-not-arc).
 - **Macros.** Sema expands macros *before* compilation, producing more AST that goes through the same pipeline you just built.
 
 ## The punchline

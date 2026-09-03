@@ -65,8 +65,8 @@ pub fn register(env: &sema_core::Env) {
                         return Ok(Value::bool(false));
                     }
                 }
-                (None, _) => return Err(SemaError::type_error("number", pair[0].type_name())),
-                (_, None) => return Err(SemaError::type_error("number", pair[1].type_name())),
+                _ if pair[0] != pair[1] => return Ok(Value::bool(false)),
+                _ => {}
             }
         }
         Ok(Value::bool(true))

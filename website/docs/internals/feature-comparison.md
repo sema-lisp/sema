@@ -62,7 +62,9 @@ How does Sema stack up against other Lisps and Lisp-adjacent languages as a prac
 
 ## LLM & AI
 
-This is Sema's primary differentiator. No other Lisp has LLM primitives as first-class language features.
+Sema provides these features in its standard runtime. Other Lisps can provide
+similar behavior through libraries; this table compares the default language
+distributions and commonly documented tooling listed here.
 
 | Feature | Sema | Janet | Racket | Clojure | Fennel | Guile | SBCL |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -116,11 +118,17 @@ This is Sema's primary differentiator. No other Lisp has LLM primitives as first
 
 ## Summary
 
-Sema is not trying to be the fastest Lisp or the most theoretically pure. Its niche is **practical scripting with LLM primitives built into the language** — no other Lisp has `deftool`, `defagent`, `llm/extract`, or multi-provider conversations as first-class constructs.
+Sema is not trying to be the fastest Lisp or the most theoretically pure. It is
+designed for **practical scripting with an integrated LLM runtime**. `deftool`,
+`defagent`, `llm/extract`, provider translation, budgets, replay, and tracing ship
+together and use the same value model.
 
 If you need the **fastest execution**, use SBCL or Chez Scheme. If you need the **JVM ecosystem**, use Clojure. If you need **academic rigor and DSL tooling**, use Racket. If you need a **tiny embeddable C scripting engine**, use Janet.
 
-If you want to **build AI agents, extract structured data from LLMs, or prototype LLM-powered tools** in a language that treats prompts as data — Sema is the only Lisp built for that.
+Choose Sema when you want to **build agents, extract structured data from model
+output, or prototype LLM tools** with those facilities in the standard runtime.
+Choose an existing Lisp plus libraries when its ecosystem and compatibility are
+more important than Sema's integrated toolchain.
 
 <script setup>
 import { onMounted } from 'vue'

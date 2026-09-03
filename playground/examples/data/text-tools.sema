@@ -8,7 +8,7 @@
 (println "=== 1. Text Chunking ===")
 
 (define article
-  "Sema is a Lisp with first-class LLM primitives. It combines a Scheme core with Clojure-style keywords and map literals. Prompts are s-expressions, conversations are persistent data structures, and LLM calls are just another form of evaluation.
+  "Sema is a Lisp with runtime types for prompts, messages, conversations, tools, and agents. It combines a Scheme core with Clojure-style keywords and map literals. Prompts are s-expressions, conversations are persistent data structures, and LLM calls are just another form of evaluation.
 
 The language includes 350+ built-in functions across 19 modules. It supports tail-call optimization, macros, modules, error handling, HTTP, file I/O, regex, JSON, and much more.
 

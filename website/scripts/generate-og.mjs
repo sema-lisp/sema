@@ -120,7 +120,7 @@ function paramsForPage(relPath, md) {
   return {
     variant: 'docs',
     title: title || 'Sema',
-    subtitle: description || 'A Lisp with first-class LLM primitives, implemented in Rust.',
+    subtitle: description || 'A Lisp with runtime types for prompts, conversations, tools, and agents, implemented in Rust.',
     category: categoryFor(relPath),
     badge: BADGE,
   }
@@ -147,7 +147,7 @@ const SPECIAL = [
       variant: 'homepage',
       titleHtml: 'Sema <span>Playground</span>',
       subtitle:
-        'Try Sema in your browser — a Lisp with first-class LLM primitives. No install, runs entirely in WebAssembly.',
+        'Try Sema in your browser — prompts, conversations, tools, and agents are runtime values. No install; runs entirely in WebAssembly.',
       domain: 'sema.run',
     },
   },

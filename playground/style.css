@@ -222,6 +222,15 @@
     line-height: 1.65;
     scrollbar-width: thin;
     scrollbar-color: var(--border) transparent;
+    user-select: text;
+    -webkit-user-select: text;
+    -webkit-touch-callout: default;
+  }
+
+  sema-editor::part(textarea) {
+    user-select: text;
+    -webkit-user-select: text;
+    -webkit-touch-callout: default;
   }
 
   .output-line { color: var(--text-secondary); white-space: pre; }
@@ -287,6 +296,9 @@
     color: var(--text-secondary);
     scrollbar-width: thin;
     scrollbar-color: var(--border) transparent;
+    user-select: text;
+    -webkit-user-select: text;
+    -webkit-touch-callout: default;
   }
   .viewer-placeholder {
     color: var(--text-tertiary);

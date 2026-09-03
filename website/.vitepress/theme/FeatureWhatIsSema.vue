@@ -1,5 +1,7 @@
 <script setup>
 import CustomPageLayout from './CustomPageLayout.vue'
+
+const versionLabel = __SEMA_VERSION__ ? `v${__SEMA_VERSION__} · ` : ''
 </script>
 
 <template>
@@ -32,7 +34,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <button class="copy" @click="copyText('i1', $event)">copy</button>
           </span>
         </div>
-        <p class="req">v1.33.0 · MIT · Rust 2021 · 17 crates</p>
+        <p class="req">{{ versionLabel }}MIT · Rust 2021</p>
       </div>
     </header>
 
@@ -42,8 +44,8 @@ import CustomPageLayout from './CustomPageLayout.vue'
         <p class="kicker">The language</p>
         <h2>A Lisp you can hold in your head.</h2>
         <p class="sub">
-          One syntax rule: everything is an s-expression. The surface borrows
-          from Clojure — keywords, maps, vectors, short lambdas, f-strings —
+          Function calls and special forms use s-expressions. The surface also
+          has Clojure-style keywords, maps, vectors, short lambdas, and f-strings,
           while the semantics stay Scheme at the core: tail-call optimization,
           quasiquote macros, <code>define</code>/<code>set!</code>, lexical scope.
         </p>
@@ -65,8 +67,8 @@ import CustomPageLayout from './CustomPageLayout.vue'
 (<span class="c-kwd">:name</span> person)              <span class="c-com">; keyword as getter</span>
 (<span class="c-kw">map</span> #(* % %) (range 1 6))  <span class="c-com">; short lambda</span>
 (<span class="c-kw">match</span> (:status res)
-  <span class="c-kwd">:ok</span>    (:data res)
-  <span class="c-kwd">:error</span> (<span class="c-kw">throw</span> (:message res)))</pre>
+  (<span class="c-kwd">:ok</span>    (:data res))
+  (<span class="c-kwd">:error</span> (<span class="c-kw">throw</span> (:message res))))</pre>
           </div>
 
           <div class="lang-features">
@@ -101,9 +103,9 @@ import CustomPageLayout from './CustomPageLayout.vue'
         <p class="kicker">Data types</p>
         <h2>Classic types, plus LLM as first-class.</h2>
         <p class="sub">
-          Prompts, messages, conversations, tools, and agents are values —
-          the same as integers and strings. They can be bound, passed, inspected,
-          and stored. That's the defining difference.
+          Prompts, messages, conversations, tools, and agents have distinct
+          runtime types. They can be bound, passed, inspected, transformed, and
+          stored in in-memory collections.
         </p>
 
         <div class="types-grid">
@@ -326,7 +328,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <div class="diff-from">No LLM types</div>
             <div class="diff-to">LLM as first-class</div>
             <div class="diff-body">
-              <p>Prompt, Message, Conversation, Tool, Agent are values — alongside integers and strings. This is why Sema exists.</p>
+              <p>Prompt, Message, Conversation, Tool, and Agent are inspectable runtime values. Provider calls and controls use the same evaluator and toolchain.</p>
             </div>
           </div>
         </div>
@@ -349,7 +351,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <ul class="feature-list">
               <li><strong>Single-threaded.</strong> <code>Rc</code>-based values, no cross-thread sharing. Async work runs on a deterministic cooperative scheduler.</li>
               <li><strong>Reference-counted.</strong> Acyclic values are destroyed when their last reference drops. A synchronous Bacon–Rajan collector reclaims reference cycles.</li>
-              <li><strong>17 crates.</strong> Strict dependency ordering: <code>sema-core ← sema-reader ← sema-vm ← sema-eval ← sema</code>. Stdlib and LLM depend on core, not eval — dependency inversion via callbacks.</li>
+              <li><strong>Strict crate ordering.</strong> <code>sema-core ← sema-reader ← sema-vm ← sema-eval ← sema</code>. Stdlib and LLM depend on core, not eval — dependency inversion via callbacks.</li>
               <li><strong>Bytecode format.</strong> <code>.semac</code> files with a 24-byte header, string table, function table, main chunk. <code>sema build</code> embeds the runtime + bytecode into a standalone binary.</li>
             </ul>
             <p class="sub" style="margin-top:18px">

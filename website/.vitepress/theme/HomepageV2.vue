@@ -57,12 +57,12 @@ const versionLabel = __SEMA_VERSION__ ? `v${__SEMA_VERSION__} · ` : ''
       <div class="wrap">
         <div class="feature-row">
           <div class="feature-text">
-            <p class="kicker">The defining difference</p>
+            <p class="kicker">Agents and tools</p>
             <h2 id="agent-title">The whole agent fits on one screen.</h2>
             <p class="sub">
-              Model calls, tools, conversations, and agents are language values.
-              The runtime owns the repetitive work around them, so the source
-              stays focused on the program you meant to write.
+              Model calls, tools, conversations, and agents have distinct runtime
+              types. Sema handles provider requests, tool-result correlation, and
+              turn limits so the program can state the work and its controls.
             </p>
             <ul class="feature-list">
               <li>

@@ -1,0 +1,365 @@
+;; Collect a short, read-only macOS battery and charger report.
+;;
+;; Usage:
+;;   sema examples/macos/mac-power-report.sema
+;;   sema examples/macos/mac-power-report.sema -- --quick
+;;   sema examples/macos/mac-power-report.sema -- --json
+;;   NO_COLOR=1 sema examples/macos/mac-power-report.sema
+
+(define argv    (sys/args))
+(define json?   (any #(= % "--json") argv))
+(define quick?  (any #(= % "--quick") argv))
+(define no-color?
+  (or (any #(= % "--no-color") argv) (not (nil? (env "NO_COLOR")))))
+(define help? (any #(or (= % "--help") (= % "-h")) argv))
+
+(when help?
+  (println "Usage: sema mac-power-report.sema -- [--quick] [--json]")
+  (println "")
+  (println "Collect macOS battery health, charger negotiation, thermal state,")
+  (println "and top CPU consumers. The command is read-only.")
+  (println "")
+  (println "  --quick  Take one power sample instead of five")
+  (println "  --json   Print structured JSON")
+  (println "  --no-color  Disable ANSI colors")
+  (exit 0))
+
+(unless (= (sys/platform) "macos")
+  (eprintln "mac-power-report: macOS is required")
+  (exit 2))
+
+(defun checked-output (result label)
+  (unless (= (:exit-code result) 0)
+    (error f"${label} failed: ${(string/trim (:stderr result))}"))
+  (:stdout result))
+
+(defun record-named (records name)
+  (first (filter #(= (get % :_name "") name) records)))
+
+(defun truthy-string? (value)
+  (or (= value #t) (= value "TRUE") (= value "true") (= value "Yes")))
+
+(defun number-from-text (value)
+  (cond
+    ((number? value) value)
+    ((not (string? value)) nil)
+    (else
+      (let ((matches (regex/find-all #"-?\d+(?:\.\d+)?" value)))
+        (if (null? matches) nil (string/to-number (first matches)))))))
+
+(defun parse-scalar (value)
+  (cond
+    ((= value "")            nil)
+    ((= value "true")        #t)
+    ((= value "false")       #f)
+    ((string/number? value)  (string/to-number value))
+    (else                    value)))
+
+(defun parse-pair-line (line)
+  (let ((parts (string/split line "\t")))
+    [(string->keyword  (first parts))
+     (parse-scalar     (nth parts 1))]))
+
+(define sample-program
+  (string/append "sample_file=$(/usr/bin/mktemp -t mac-power-report)\n"
+    "cleanup_sample() { /bin/unlink \"$sample_file\"; }\n"
+    "trap cleanup_sample EXIT\n"
+    "trap 'exit 130' HUP INT TERM\n"
+    "/usr/sbin/ioreg -r -c AppleSmartBattery -a > \"$sample_file\" || exit 1\n"
+    "for field_name in CurrentCapacity IsCharging ExternalConnected AppleRawExternalConnected Amperage Voltage Temperature AdapterDetails.Watts AdapterDetails.AdapterVoltage AdapterDetails.Current ChargerData.NotChargingReason ChargerData.SlowChargingReason ChargerData.ChargingCurrent BatteryData.SystemPower BatteryData.AdapterPower PowerTelemetryData.SystemPowerIn PowerTelemetryData.BatteryPower; do\n"
+    "  if field_value=$(/usr/bin/plutil -extract \"0.$field_name\" raw -o - \"$sample_file\" 2>/dev/null); then\n"
+    "    :\n"
+    "  else\n"
+    "    field_value=\n"
+    "  fi\n"
+    "  /usr/bin/printf '%s\\t%s\\n' \"$field_name\" \"$field_value\"\n"
+    "done\n"))
+
+(defun take-power-sample ()
+  (let* ((result  (shell "/bin/sh" "-c" sample-program))
+         (text    (checked-output result "ioreg battery sample"))
+         (lines   (filter #(not (= % "")) (string/lines text))))
+    (assoc (map/from-entries (map parse-pair-line lines))
+      :sampled-at (time/now))))
+
+(defun collect-samples (count)
+  (map
+    (fn (index)
+      (when (> index 0) (sleep 1000))
+      (take-power-sample))
+    (range count)))
+
+(defun parse-process (line)
+  (let ((match (regex/match #"^\s*(\d+)\s+([\d.]+)\s+(\S+)\s+(.+)$" line)))
+    (when match
+      (let ((groups (:groups match)))
+        {:pid          (string/to-number (nth groups 0))
+         :cpu-percent  (string/to-number (nth groups 1))
+         :elapsed      (nth groups 2)
+         :command      (nth groups 3)}))))
+
+(defun sample-values (samples key)
+  (filter number? (map #(get % key nil) samples)))
+
+(defun sample-bools (samples key)
+  (filter boolean? (map #(get % key nil) samples)))
+
+(define profile-result
+  (shell "/usr/sbin/system_profiler"
+    "SPPowerDataType"
+    "SPHardwareDataType"
+    "-json"))
+(define profile (json/decode (checked-output profile-result "system_profiler")))
+(define power-records    (:SPPowerDataType profile))
+(define hardware-record  (first (:SPHardwareDataType profile)))
+(define battery-record   (record-named power-records "spbattery_information"))
+(define charger-record
+  (or (record-named power-records "sppower_ac_charger_information") {}))
+(unless battery-record
+  (eprintln "mac-power-report: no internal battery was found")
+  (exit 3))
+(define health (get battery-record :sppower_battery_health_info {}))
+(define charge (get battery-record :sppower_battery_charge_info {}))
+(define profile-connected?
+  (truthy-string? (get charger-record :sppower_battery_charger_connected #f)))
+
+(define sample-count  (if quick? 1 5))
+(define samples       (collect-samples sample-count))
+(define adapter-watts
+  (list/unique (sample-values samples :AdapterDetails.Watts)))
+(define amperages        (sample-values samples :Amperage))
+(define charging-states  (sample-bools samples :IsCharging))
+(define raw-connected-states
+  (list/unique (sample-bools samples :AppleRawExternalConnected)))
+(define not-charging-reasons
+  (list/unique (sample-values samples :ChargerData.NotChargingReason)))
+(define charge-percent
+  (get charge
+    :sppower_battery_state_of_charge
+    (get (first samples) :CurrentCapacity nil)))
+(define charging-samples     (count (filter #(= % #t) charging-states)))
+(define discharging-samples  (count (filter #(< % 0) amperages)))
+(define negotiation-unstable?
+  (or (> (count adapter-watts) 1)
+    (> (count raw-connected-states) 1)
+    (and profile-connected?
+      (not (null? raw-connected-states))
+      (any #(= % #f) raw-connected-states))))
+(define draining? (> discharging-samples 0))
+
+(define model-id (get hardware-record :machine_model "unknown"))
+(define recommended-watts
+  ;; Mac14,6 is the 16-inch 2023 MacBook Pro. Apple supplied it with 140 W.
+  (if (= model-id "Mac14,6") 140 nil))
+(define reported-watts
+  (number-from-text (get charger-record :sppower_ac_charger_watts nil)))
+
+(define ps-result (shell "/bin/ps" "-Ao" "pid=,pcpu=,etime=,comm="))
+(define parsed-processes
+  (->> (string/lines (checked-output ps-result "ps"))
+    (map parse-process)
+    (filter #(not (nil? %)))))
+(define processes
+  (take 10
+    (sort parsed-processes
+      (fn (a b) (> (:cpu-percent a) (:cpu-percent b))))))
+
+(define logical-cpus
+  (number-from-text
+    (string/trim
+      (checked-output (shell "/usr/sbin/sysctl" "-n" "hw.logicalcpu") "sysctl"))))
+(define load-averages
+  (map string/to-number
+    (regex/find-all #"\d+(?:\.\d+)?"
+      (checked-output (shell "/usr/sbin/sysctl" "-n" "vm.loadavg") "sysctl"))))
+(define uptime (string/trim (checked-output (shell "/usr/bin/uptime") "uptime")))
+(define thermal
+  (string/trim
+    (checked-output (shell "/usr/bin/pmset" "-g" "therm") "pmset therm")))
+(define pmset-battery
+  (string/trim
+    (checked-output (shell "/usr/bin/pmset" "-g" "batt") "pmset battery")))
+(define macos-version
+  (string/trim
+    (checked-output (shell "/usr/bin/sw_vers" "-productVersion") "sw_vers")))
+
+(define severity
+  (cond
+    ((and charge-percent (<= charge-percent 5) draining?)  :critical)
+    ((or draining? negotiation-unstable?)                  :warning)
+    (else                                                  :ok)))
+
+(define summary
+  (cond
+    ((not profile-connected?) "No external power source was detected.")
+    ((and negotiation-unstable? draining?)
+      "The charger contract is unstable and the battery is supplying the power shortfall.")
+    (draining?
+      "External power is attached, but the battery is still supplying power.")
+    (negotiation-unstable? "The charger contract changed during sampling.")
+    ((> charging-samples 0) "The battery is charging during the sample window.")
+    (else "No clear charging fault was observed during the sample window.")))
+
+(define report
+  {:generated-at (time/format (time/now) "%Y-%m-%dT%H:%M:%SZ")
+   :severity severity
+   :summary summary
+   :hardware {:name          (get hardware-record :machine_name "unknown")
+    :model         model-id
+    :chip          (get hardware-record :chip_type "unknown")
+    :logical-cpus  logical-cpus
+    :macos         macos-version}
+   :battery {:charge-percent charge-percent
+    :charging (truthy-string? (get charge :sppower_battery_is_charging #f))
+    :condition (get health :sppower_battery_health "unknown")
+    :maximum-capacity-percent (number-from-text (get health :sppower_battery_health_maximum_capacity nil))
+    :cycle-count (get health :sppower_battery_cycle_count nil)}
+   :adapter {:connected               profile-connected?
+    :system-profiler-watts   reported-watts
+    :sampled-contract-watts  adapter-watts
+    :recommended-watts       recommended-watts
+    :raw-connection-states   raw-connected-states
+    :not-charging-reasons    not-charging-reasons
+    :negotiation-unstable    negotiation-unstable?}
+   :sample-summary {:count                sample-count
+    :charging-samples     charging-samples
+    :discharging-samples  discharging-samples
+    :amperage-ma          amperages}
+   :samples samples
+   :load {:averages  load-averages
+    :uptime    uptime
+    :thermal   thermal
+    :top-cpu   processes}
+   :pmset pmset-battery})
+
+(defun yes-no (value)
+  (if value "yes" "no"))
+
+(defun display-value (value suffix)
+  (if (nil? value) "unknown" (string/append (str value) suffix)))
+
+(define color? (and (not no-color?) (not (nil? (sys/tty)))))
+
+(defun accent (text)
+  (if color? (term/style text :bold :cyan) text))
+
+(defun muted (text)
+  (if color? (term/style text :dim :gray) text))
+
+(defun status-badge (level)
+  (cond
+    ((= level :critical)
+      (if color? (term/style "✖ CRITICAL" :bold :red) "✖ CRITICAL"))
+    ((= level :warning)
+      (if color? (term/style "▲ WARNING" :bold :yellow) "▲ WARNING"))
+    (else (if color? (term/style "● HEALTHY" :bold :green) "● HEALTHY"))))
+
+(defun cpu-cell (cpu)
+  (let ((text (string/pad-left (string/append (math/format-fixed cpu 1) "%") 7)))
+    (cond
+      ((and color? (>= cpu 90))  (term/style text :bold :red))
+      ((and color? (>= cpu 50))  (term/style text :yellow))
+      (else                      text))))
+
+(defun section (title)
+  (println "")
+  (println (accent (string/append "  " title))))
+
+(defun field (label value)
+  (let ((indented-value
+          (string/join (string/lines (str value))
+            (string-append "\n" (string/repeat " " 24)))))
+    (println
+      (string-append "  "
+        (muted (string/pad-right label 22))
+        indented-value))))
+
+(define terminal-size  (or (sys/term-size) {}))
+(define table-width    (max 64 (min 118 (- (get terminal-size :cols 100) 2))))
+(define command-width  (- table-width 39))
+
+(defun table-rule (left middle right)
+  (muted
+    (string-append "  "
+      left
+      (string/repeat "─" 9)
+      middle
+      (string/repeat "─" 9)
+      middle
+      (string/repeat "─" 14)
+      middle
+      (string/repeat "─" (+ command-width 2))
+      right)))
+
+(defun table-row (cpu pid elapsed command)
+  (println
+    (string-append "  "
+      (muted "│ ")
+      cpu
+      (muted " │ ")
+      (string/pad-left (str pid) 7)
+      (muted " │ ")
+      (string/pad-right (string/truncate-width (str elapsed) 12 "…") 12)
+      (muted " │ ")
+      (string/pad-right
+        (string/truncate-width (str command) command-width "…")
+        command-width)
+      (muted " │"))))
+
+(if json?
+  (println (json/encode-pretty report))
+  (begin
+    (println "")
+    (println (accent "  macOS POWER REPORT"))
+    (println
+      (muted
+        f"  ${(:generated-at report)}  ·  ${model-id}  ·  macOS ${macos-version}"))
+    (println "")
+    (println (string-append "  " (status-badge severity) "  " summary))
+
+    (section "SYSTEM")
+    (field "Model" f"${(get-in report [:hardware :name])} (${model-id})")
+    (field "Chip" (get-in report [:hardware :chip]))
+    (field "Logical CPUs" logical-cpus)
+    (field "Load averages" (string/join load-averages "  ·  "))
+    (field "Thermal state" thermal)
+
+    (section "BATTERY & ADAPTER")
+    (field "Charge" (display-value charge-percent "%"))
+    (field "Battery health"
+      f"${(display-value (get-in report [:battery :maximum-capacity-percent]) "%")}  ·  ${(get-in report [:battery :cycle-count])} cycles  ·  ${(get-in report [:battery :condition])}")
+    (field "External power" (yes-no (get-in report [:adapter :connected])))
+    (field "Reported adapter" (display-value reported-watts " W"))
+    (field "Sampled contracts"
+      f"${(if (null? adapter-watts) "none" (string/join adapter-watts ", "))} W")
+    (when recommended-watts
+      (field "Model reference" f"${recommended-watts} W supplied by Apple"))
+    (field "Sample window"
+      f"${sample-count} sample(s)  ·  ${charging-samples} charging  ·  ${discharging-samples} discharging")
+    (field "Negotiation" (if negotiation-unstable? "unstable" "stable"))
+    (field "Not charging codes"
+      (if (null? not-charging-reasons)
+        "none"
+        (string/join not-charging-reasons ", ")))
+
+    (section "TOP CPU CONSUMERS")
+    (println (table-rule "┌" "┬" "┐"))
+    (table-row (muted (string/pad-right "CPU" 7))
+      (muted (string/pad-left "PID" 7))
+      (muted (string/pad-right "ELAPSED" 12))
+      (muted (string/pad-right "COMMAND" command-width)))
+    (println (table-rule "├" "┼" "┤"))
+    (for-each
+      #(table-row (cpu-cell (:cpu-percent %))
+        (:pid %)
+        (:elapsed %)
+        (:command %))
+      processes)
+    (println (table-rule "└" "┴" "┘"))
+
+    (section "RAW POWER SOURCE")
+    (println
+      (muted
+        (string-append "  "
+          (string/join (string/lines pmset-battery) "\n  "))))
+    (println "")))

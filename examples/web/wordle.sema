@@ -1,0 +1,633 @@
+;; LISPLE — a Wordle-style game written as a single-file Sema Web app.
+;;
+;; Run with:
+;;   sema web examples/web/wordle.sema --no-llm
+;;
+;; Demonstrates reactive rendering, batched updates, scoped CSS,
+;; delegated keyboard/click events, localStorage, and immutable data transforms.
+
+(define WORD-SIZE    5)
+(define MAX-GUESSES  6)
+(define STATS-KEY    "lisple-stats")
+
+;; Every answer is five letters. Definitions are revealed after each game.
+(define WORDS
+  (list {:word "macro" :note "Code that transforms code before evaluation."}
+    {:word "quote" :note "Return syntax as data instead of evaluating it."}
+    {:word "sexpr" :note "The parenthesized data notation at Lisp's core."}
+    {:word "recur" :note "Call again, often in tail position."}
+    {:word "apply" :note "Call a function with arguments from a sequence."}
+    {:word "scope" :note "The region where a binding is visible."}
+    {:word "thunk" :note "A zero-argument function used to delay work."}
+    {:word "alist" :note "An association list of key-value pairs."}
+    {:word "plist" :note "A property list with alternating keys and values."}
+    {:word "emacs" :note "The programmable editor with a Lisp at its center."}
+    {:word "slime"
+     :note "The classic Common Lisp development environment for Emacs."}
+    {:word "guile" :note "GNU's extension language and Scheme implementation."}
+    {:word "clisp" :note "A portable Common Lisp implementation."}
+    {:word "elisp" :note "The Lisp dialect used to extend Emacs."}
+    {:word "defun" :note "The traditional form for defining a named function."}
+    {:word "progn" :note "Evaluate forms in order and return the final value."}
+    {:word "begin"
+     :note "Scheme's form for evaluating expressions in sequence."}
+    {:word "foldl" :note "Reduce a sequence from the left."}
+    {:word "foldr" :note "Reduce a sequence from the right."}
+    {:word "caddr" :note "Compose cdr, cdr, and car to reach the third item."}
+    {:word "cdddr" :note "Apply cdr three times."}
+    {:word "assoc" :note "Find or add a key-value association."}
+    {:word "parse" :note "Turn source text into structured data."}
+    {:word "lexer" :note "Split source text into tokens."}
+    {:word "token" :note "One classified unit produced by a lexer."}
+    {:word "forms" :note "Lisp expressions represented as code or data."}
+    {:word "value" :note "A runtime datum that evaluation can produce."}
+    {:word "stack" :note "Storage for values, calls, or continuations."}
+    {:word "frame" :note "The state associated with one active call."}
+    {:word "typed" :note "Checked or classified by a type system."}
+    {:word "curry"
+     :note "Turn a multi-argument function into nested functions."}
+    {:word "monad" :note "A composable structure for sequencing computations."}
+    {:word "eager" :note "Evaluate an expression before its value is needed."}
+    {:word "pairs"
+     :note "Two-part structures used to build classic Lisp lists."}
+    {:word "exact" :note "A number represented without rounding error."}
+    {:word "infix" :note "Operator syntax placed between its operands."}
+    {:word "evals" :note "Evaluates code or data as an expression."}
+    {:word "lists"
+     :note "Ordered sequences and Lisp's best-known data structure."}
+    {:word "atoms" :note "Values that are not decomposed as list structure."}
+    {:word "binds" :note "Associates names with values."}
+    {:word "calls" :note "Applies functions to arguments."}
+    {:word "chars" :note "Character values used to construct text."}
+    {:word "bytes" :note "Small integers used for binary data and I/O."}
+    {:word "ports"
+     :note "Traditional Lisp interfaces to input and output streams."}
+    {:word "error"
+     :note "A value or condition that interrupts normal evaluation."}
+    {:word "raise" :note "Signal an exception to the nearest handler."}
+    {:word "catch" :note "Handle a matching error or non-local transfer."}
+    {:word "throw" :note "Signal a value or transfer control to a catcher."}
+    {:word "match" :note "Select a branch by destructuring a value."}
+    {:word "logic"
+     :note "Rules for combining and reasoning about truth values."}
+    {:word "false" :note "The boolean value that fails a condition."}
+    {:word "truth" :note "The property tested by a conditional."}
+    {:word "datum" :note "One piece of readable Lisp data."}
+    {:word "lisps" :note "Languages in the Lisp family."}
+    {:word "tails" :note "The remaining sequence after its first element."}
+    {:word "cells" :note "Small mutable or pair-like storage locations."}
+    {:word "boxed" :note "Stored behind an allocated wrapper or reference."}))
+
+(define ANSWERS (map :word WORDS))
+
+(define (fresh-stats)
+  {:played 0 :wins 0 :streak 0 :best 0})
+
+(define answer      (state (list/pick ANSWERS)))
+(define guesses     (state (list)))
+(define current     (state ""))
+(define game-state  (state "playing"))
+(define message     (state "Type a five-letter word, then press Enter."))
+(define stats       (state (or (store/get STATS-KEY) (fresh-stats))))
+
+(define (char-at word index)
+  (char/to-string (string/ref word index)))
+
+(define (exact-at? guess secret index)
+  (equal? (char-at guess index) (char-at secret index)))
+
+;; Count answer copies that were not already consumed by exact matches.
+(define (available-copies guess secret letter)
+  (count
+    (filter
+      (fn (index)
+        (and (equal? (char-at secret index) letter)
+          (not (exact-at? guess secret index))))
+      (range WORD-SIZE))))
+
+;; Count earlier non-exact copies of the same guessed letter. This gives Wordle
+;; scoring for repeated letters without mutable scratch arrays.
+(define (earlier-copies guess secret letter before-index)
+  (count
+    (filter
+      (fn (index)
+        (and (equal? (char-at guess index) letter)
+          (not (exact-at? guess secret index))))
+      (range before-index))))
+
+(define (score-letter guess secret index)
+  (let ((letter (char-at guess index)))
+    (cond
+      ((exact-at? guess secret index) :correct)
+      ((< (earlier-copies guess secret letter index)
+         (available-copies guess secret letter))
+        :present)
+      (else :absent))))
+
+(define (score-guess guess secret)
+  (map (fn (index) (score-letter guess secret index)) (range WORD-SIZE)))
+
+(define (answer-note word)
+  (:note (first (filter (fn (entry) (equal? (:word entry) word)) WORDS))))
+
+(define (contains-status? statuses wanted)
+  (any (fn (status) (equal? status wanted)) statuses))
+
+(define (letter-status letter)
+  (let ((statuses
+          (flat-map
+            (fn (guess)
+              (let ((score (score-guess guess @answer)))
+                (map-indexed
+                  (fn (index guessed-char)
+                    (if (equal? (char/to-string guessed-char) letter)
+                      (nth score index)
+                      nil))
+                  (string/chars guess))))
+            @guesses)))
+    (cond
+      ((contains-status? statuses :correct)  :correct)
+      ((contains-status? statuses :present)  :present)
+      ((contains-status? statuses :absent)   :absent)
+      (else                                  :unused))))
+
+(define (record-result! won?)
+  (let* ((old @stats)
+         (next-streak (if won? (+ (:streak old) 1) 0))
+         (next
+           {:played  (+ (:played old) 1)
+            :wins    (+ (:wins old) (if won? 1 0))
+            :streak  next-streak
+            :best    (max (:best old) next-streak)}))
+    (put! stats next)
+    (store/set! STATS-KEY next)))
+
+(define (submit-guess!)
+  (when (equal? @game-state "playing")
+    (cond
+      ((< (string-length @current) WORD-SIZE)
+        (put! message
+          f"${(- WORD-SIZE (string-length @current))} more letter(s)."))
+      ((not (regex/match? #"^[a-z]{5}$" @current))
+        (put! message "Use five letters from A to Z."))
+      (else
+        (let* ((guess @current)
+               (next-guesses (append @guesses (list guess)))
+               (won? (equal? guess @answer))
+               (lost? (and (not won?) (>= (length next-guesses) MAX-GUESSES))))
+          (batch (put! guesses next-guesses)
+            (put! current "")
+            (cond
+              (won? (put! game-state "won")
+                (put! message "Beautiful recursion. You found the form!")
+                (record-result! #t))
+              (lost? (put! game-state "lost")
+                (put! message f"The answer was ${(string/upper @answer)}.")
+                (record-result! #f))
+              (else
+                (put! message
+                  f"${(- MAX-GUESSES (length next-guesses))} guess(es) left.")))))))))
+
+(define (add-letter! letter)
+  (when
+    (and (equal? @game-state "playing") (< (string-length @current) WORD-SIZE))
+    (put! current (string/append @current (string/lower letter)))
+    (put! message "")))
+
+(define (remove-letter!)
+  (when (and (equal? @game-state "playing") (> (string-length @current) 0))
+    (put! current (string/slice @current 0 (- (string-length @current) 1)))
+    (put! message "")))
+
+(define (handle-key key)
+  (cond
+    ((equal? key "enter")           (submit-guess!))
+    ((equal? key "backspace")       (remove-letter!))
+    ((regex/match? #"^[a-z]$" key)  (add-letter! key))
+    (else                           nil)))
+
+(define (handle-keydown ev)
+  (let ((key (string/lower (dom/event-key ev))))
+    (when
+      (or (equal? key "enter")
+        (equal? key "backspace")
+        (regex/match? #"^[a-z]$" key))
+      (dom/prevent-default! ev)
+      (handle-key key))))
+
+(define (handle-key-click ev)
+  (when-let (target (dom/event-target-closest ev "[data-key]"))
+    (handle-key (dom/get-attribute target "data-key"))))
+
+(define (new-game ev)
+  (let* ((choices      (filter (fn (word) (not (equal? word @answer))) ANSWERS))
+         (next-answer  (list/pick choices)))
+    (batch (put! answer next-answer)
+      (put! guesses (list))
+      (put! current "")
+      (put! game-state "playing")
+      (put! message "A fresh form awaits."))
+    (when-let (root (dom/query "#lisple"))
+      (dom/focus! root))))
+
+;; ── Scoped styles ──────────────────────────────────────────────────
+
+(define app-style
+  (css
+    {:min-height "100vh"
+     :box-sizing "border-box"
+     :padding "clamp(20px, 5vw, 52px) 18px"
+     :background "radial-gradient(circle at 50% -10%, #30264f 0%, #171426 42%, #0d0c14 100%)"
+     :color "#f4f0ff"
+     :font-family "Inter, ui-sans-serif, system-ui, -apple-system, sans-serif"
+     :outline "none"
+     "&:focus-visible" {:outline "2px solid #a78bfa" :outline-offset "-4px"}}))
+
+(define shell-style
+  (css
+    {:width           "min(100%, 560px)"
+     :margin          "0 auto"
+     :display         "flex"
+     :flex-direction  "column"
+     :align-items     "center"}))
+
+(define header-style
+  (css
+    {:width            "100%"
+     :display          "flex"
+     :align-items      "center"
+     :justify-content  "space-between"
+     :padding-bottom   "14px"
+     :border-bottom    "1px solid rgba(255,255,255,.12)"}))
+
+(define title-wrap-style (css {:text-align "left"}))
+
+(define eyebrow-style
+  (css
+    {:margin          "0 0 3px"
+     :color           "#a99abd"
+     :font-family     "ui-monospace, SFMono-Regular, Menlo, monospace"
+     :font-size       "11px"
+     :font-weight     "700"
+     :letter-spacing  ".2em"
+     :text-transform  "uppercase"}))
+
+(define title-style
+  (css
+    {:margin          "0"
+     :font-family     "ui-monospace, SFMono-Regular, Menlo, monospace"
+     :font-size       "clamp(26px, 7vw, 38px)"
+     :font-weight     "850"
+     :letter-spacing  "-.06em"
+     :color           "#f7f2ff"}))
+
+(define reset-style
+  (css
+    {:width "42px"
+     :height "42px"
+     :border "1px solid rgba(255,255,255,.16)"
+     :border-radius "12px"
+     :background "rgba(255,255,255,.06)"
+     :color "#d9d0e7"
+     :font-size "20px"
+     :cursor "pointer"
+     :transition "transform .15s ease, background .15s ease"
+     "&:hover" {:background "rgba(255,255,255,.12)" :transform "rotate(15deg)"}
+     "&:focus-visible" {:outline "3px solid #a78bfa" :outline-offset "2px"}}))
+
+(define meta-style
+  (css
+    {:width                  "100%"
+     :display                "grid"
+     :grid-template-columns  "repeat(4, 1fr)"
+     :gap                    "8px"
+     :margin                 "16px 0 18px"}))
+
+(define stat-style
+  (css
+    {:padding        "10px 6px"
+     :border         "1px solid rgba(255,255,255,.09)"
+     :border-radius  "12px"
+     :background     "rgba(255,255,255,.035)"
+     :text-align     "center"}))
+
+(define stat-number-style
+  (css
+    {:display      "block"
+     :font-family  "ui-monospace, SFMono-Regular, Menlo, monospace"
+     :font-size    "18px"
+     :font-weight  "800"
+     :color        "#f7f2ff"}))
+
+(define stat-label-style
+  (css
+    {:display         "block"
+     :margin-top      "2px"
+     :font-size       "9px"
+     :font-weight     "700"
+     :letter-spacing  ".12em"
+     :text-transform  "uppercase"
+     :color           "#887d99"}))
+
+(define board-style
+  (css
+    {:display         "flex"
+     :flex-direction  "column"
+     :gap             "7px"
+     :margin          "2px 0 16px"}))
+
+(define row-style
+  (css
+    {:display                "grid"
+     :grid-template-columns  "repeat(5, clamp(48px, 12vw, 64px))"
+     :gap                    "7px"}))
+
+(define tile-style
+  (css
+    {:aspect-ratio "1"
+     :display "grid"
+     :place-items "center"
+     :box-sizing "border-box"
+     :border "2px solid #3b3547"
+     :border-radius "11px"
+     :background "rgba(255,255,255,.025)"
+     :font-family "ui-monospace, SFMono-Regular, Menlo, monospace"
+     :font-size "clamp(25px, 7vw, 35px)"
+     :font-weight "900"
+     :text-transform "uppercase"
+     :box-shadow "inset 0 1px 0 rgba(255,255,255,.04)"
+     :transition "transform .15s ease, border-color .15s ease, background .2s ease"}))
+
+(define tile-filled-style
+  (css
+    {:border-color  "#8b79a4"
+     :background    "rgba(139,121,164,.09)"
+     :transform     "scale(1.025)"}))
+
+(define correct-style
+  (css
+    {:border-color  "#4ca978"
+     :background    "#34765a"
+     :color         "#ffffff"
+     :box-shadow    "0 7px 18px rgba(52,118,90,.22)"}))
+
+(define present-style
+  (css
+    {:border-color  "#c99b42"
+     :background    "#9a6f27"
+     :color         "#ffffff"
+     :box-shadow    "0 7px 18px rgba(154,111,39,.2)"}))
+
+(define absent-style
+  (css
+    {:border-color  "#4c4657"
+     :background    "#403b49"
+     :color         "#d4cfda"}))
+
+(define message-style
+  (css
+    {:min-height  "24px"
+     :margin      "0 0 15px"
+     :text-align  "center"
+     :font-size   "14px"
+     :color       "#cfc5db"}))
+
+(define result-style
+  (css
+    {:width          "100%"
+     :box-sizing     "border-box"
+     :margin         "0 0 16px"
+     :padding        "14px 16px"
+     :border         "1px solid rgba(167,139,250,.3)"
+     :border-radius  "14px"
+     :background     "rgba(110,82,164,.14)"
+     :color          "#ddd4e9"
+     :font-size      "13px"
+     :line-height    "1.5"}))
+
+(define result-word-style
+  (css
+    {:font-family     "ui-monospace, SFMono-Regular, Menlo, monospace"
+     :font-weight     "900"
+     :letter-spacing  ".12em"
+     :color           "#c4b5fd"}))
+
+(define keyboard-style
+  (css
+    {:width           "100%"
+     :display         "flex"
+     :flex-direction  "column"
+     :gap             "7px"}))
+
+(define keyboard-row-style
+  (css
+    {:display          "flex"
+     :justify-content  "center"
+     :gap              "clamp(3px, 1vw, 6px)"}))
+
+(define key-style
+  (css
+    {:height            "clamp(44px, 11vw, 54px)"
+     :min-width         "0"
+     :flex              "1 1 0"
+     :max-width         "48px"
+     :padding           "0 2px"
+     :border            "0"
+     :border-radius     "8px"
+     :background        "#625b6d"
+     :color             "#ffffff"
+     :font-family       "ui-monospace, SFMono-Regular, Menlo, monospace"
+     :font-size         "clamp(12px, 3.5vw, 15px)"
+     :font-weight       "800"
+     :text-transform    "uppercase"
+     :cursor            "pointer"
+     :transition        "transform .08s ease, filter .12s ease"
+     "&:hover"          {:filter "brightness(1.12)"}
+     "&:active"         {:transform "translateY(2px) scale(.97)"}
+     "&:focus-visible"  {:outline "3px solid #a78bfa" :outline-offset "2px"}}))
+
+(define key-wide-style
+  (css
+    {:max-width       "72px"
+     :font-size       "11px"
+     :letter-spacing  ".02em"}))
+
+(define footer-style
+  (css
+    {:margin       "22px 0 0"
+     :color        "#756c83"
+     :font-family  "ui-monospace, SFMono-Regular, Menlo, monospace"
+     :font-size    "11px"
+     :text-align   "center"}))
+
+;; ── Rendering ──────────────────────────────────────────────────────
+
+(define KEYBOARD
+  (list (list "q" "w" "e" "r" "t" "y" "u" "i" "o" "p")
+    (list "a" "s" "d" "f" "g" "h" "j" "k" "l")
+    (list "enter" "z" "x" "c" "v" "b" "n" "m" "backspace")))
+
+(define (tile-class status filled?)
+  (string-append tile-style
+    " "
+    (cond
+      ((equal? status :correct)  correct-style)
+      ((equal? status :present)  present-style)
+      ((equal? status :absent)   absent-style)
+      (filled?                   tile-filled-style)
+      (else                      ""))))
+
+(define (render-tile letter status filled? row-index column-index)
+  [:div
+   {:class (tile-class status filled?)
+    :key f"${row-index}-${column-index}"
+    :role "gridcell"
+    :data-testid "letter-tile"
+    :aria-label (if (equal? letter "")
+      "empty"
+      f"${letter}, ${(keyword->string status)}")}
+   (string/upper letter)])
+
+(define (render-row row-index)
+  (let ((completed (length @guesses)))
+    (cond
+      ((< row-index completed)
+        (let* ((guess (nth @guesses row-index))
+               (score (score-guess guess @answer)))
+          [:div
+           {:class        row-style
+            :key          f"row-${row-index}"
+            :role         "row"
+            :data-testid  "guess-row"}
+           (map
+             (fn (column-index)
+               (render-tile (char-at guess column-index)
+                 (nth score column-index)
+                 #t
+                 row-index
+                 column-index))
+             (range WORD-SIZE))]))
+      ((= row-index completed)
+        [:div
+         {:class        row-style
+          :key          f"row-${row-index}"
+          :role         "row"
+          :data-testid  "guess-row"}
+         (map
+           (fn (column-index)
+             (let ((filled? (< column-index (string-length @current))))
+               (render-tile (if filled? (char-at @current column-index) "")
+                 :unused
+                 filled?
+                 row-index
+                 column-index)))
+           (range WORD-SIZE))])
+      (else
+        [:div
+         {:class        row-style
+          :key          f"row-${row-index}"
+          :role         "row"
+          :data-testid  "guess-row"}
+         (map
+           (fn (column-index)
+             (render-tile "" :unused #f row-index column-index))
+           (range WORD-SIZE))]))))
+
+(define (key-class key)
+  (let ((status
+          (if (or (equal? key "enter") (equal? key "backspace"))
+            :unused
+            (letter-status key))))
+    (string-append key-style
+      " "
+      (if (or (equal? key "enter") (equal? key "backspace")) key-wide-style "")
+      " "
+      (cond
+        ((equal? status :correct)  correct-style)
+        ((equal? status :present)  present-style)
+        ((equal? status :absent)   absent-style)
+        (else                      "")))))
+
+(define (key-label key)
+  (cond
+    ((equal? key "backspace")  "⌫")
+    ((equal? key "enter")      "enter")
+    (else                      key)))
+
+(define (render-key key)
+  [:button
+   {:class        (key-class key)
+    :key          key
+    :data-key     key
+    :data-testid  f"key-${key}"
+    :on-click     "handle-key-click"
+    :aria-label   (if (equal? key "backspace") "Backspace" key)}
+   (key-label key)])
+
+(define (render-keyboard-row keys index)
+  [:div
+   {:class keyboard-row-style :key f"keys-${index}"}
+   (map render-key keys)])
+
+(define (stat value label)
+  [:div
+   {:class stat-style}
+   [:span {:class stat-number-style} (str value)]
+   [:span {:class stat-label-style} label]])
+
+(defcomponent lisple
+  ()
+  (on-mount
+    (fn ()
+      (when-let (root (dom/query "#lisple"))
+        (dom/focus! root))))
+
+  [:main
+   {:id          "lisple"
+    :class       app-style
+    :tabindex    "0"
+    :on-keydown  "handle-keydown"}
+   [:div
+    {:class shell-style}
+    [:header
+     {:class header-style}
+     [:div
+      {:class title-wrap-style}
+      [:p {:class eyebrow-style} "a small game in a small lisp"]
+      [:h1 {:class title-style} "(( LISPLE ))"]]
+     [:button
+      {:class       reset-style
+       :on-click    "new-game"
+       :title       "New game"
+       :aria-label  "Start a new game"}
+      "↻"]]
+
+    [:div
+     {:class meta-style :role "group" :aria-label "Game statistics"}
+     (stat (:played @stats) "played")
+     (stat (:wins @stats) "wins")
+     (stat (:streak @stats) "streak")
+     (stat (:best @stats) "best")]
+
+    [:div
+     {:class board-style :role "grid" :aria-label "Guess board"}
+     (map render-row (range MAX-GUESSES))]
+
+    [:p {:class message-style :role "status" :data-testid "message"} @message]
+
+    (when (not (equal? @game-state "playing"))
+      [:div
+       {:class result-style :data-testid "answer-note"}
+       [:span {:class result-word-style} (string/upper @answer)]
+       " — "
+       (answer-note @answer)])
+
+    [:div
+     {:class keyboard-style :role "group" :aria-label "On-screen keyboard"}
+     (map-indexed (fn (index keys) (render-keyboard-row keys index)) KEYBOARD)]
+
+    [:p
+     {:class footer-style}
+     f"${(length ANSWERS)} five-letter forms · built with Sema Web"]]])
+
+(mount! "#app" "lisple")

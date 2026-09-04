@@ -1,11 +1,13 @@
 # Browser examples
 
-Each `.sema` file here is a complete sema-web app. Run one with the dev
-server, which serves the runtime, opens a browser, and reloads on save:
+Each `.sema` file here is a complete sema-web app. From this directory, run one
+with the dev server. It serves the runtime, opens a browser, and reloads on
+save:
 
 ```bash
 sema web counter.sema            # imperative dom/* API + localStorage
 sema web counter-reactive.sema   # state / update! / hiccup / mount!
+sema web wordle.sema             # responsive Lisp-themed word game
 sema web llm-chat.sema           # streaming chat through the built-in LLM proxy
 sema web hello.sema
 ```

@@ -708,15 +708,7 @@ fn eval_err(input: &str) -> SemaError {
     interp.eval_str(input).unwrap_err()
 }
 
-fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("sema-{prefix}-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("failed to create temp dir");
-    dir
-}
+use sema_core::testing::unique_temp_dir;
 
 fn lisp_path(path: &std::path::Path) -> String {
     path.to_string_lossy()

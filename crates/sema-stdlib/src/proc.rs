@@ -44,6 +44,7 @@ use std::thread::JoinHandle;
 
 use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateHandle};
 use sema_core::{check_arity, in_runtime_quantum, Caps, SemaError, Value};
+use sema_core::{ArgsExt, ResultExt};
 
 use crate::runtime_offload::{
     checkout_external, finish_terminal_gate, group_sigkill_abort, prepare_terminal_gate,
@@ -721,9 +722,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         |args| {
             check_arity!(args, "proc/write-stdin", 2);
             let id = handle(args, 0)?;
-            let text = args[1]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+            let text = args.str_at(1, "proc/write-stdin")?;
             if in_runtime_quantum() {
                 return proc_write_stdin_runtime(id, text.as_bytes().to_vec());
             }
@@ -731,7 +730,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 Some(sin) => {
                     sin.write_all(text.as_bytes())
                         .and_then(|_| sin.flush())
-                        .map_err(|e| SemaError::Io(format!("proc/write-stdin: {e}")))?;
+                        .io_ctx("proc/write-stdin")?;
                     Ok(Value::nil())
                 }
                 None => Err(SemaError::eval("proc/write-stdin: stdin already closed")),
@@ -792,7 +791,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             let _ = t.join();
         }
         PROCS.with(|p| p.borrow_mut().insert(id, ProcSlot::Available(pr)));
-        let status = status.map_err(|e| SemaError::Io(format!("proc/wait: {e}")))?;
+        let status = status.io_ctx("proc/wait")?;
         Ok(NativeOutcome::Return(Value::int(
             status.code().unwrap_or(-1) as i64,
         )))
@@ -803,11 +802,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         check_arity!(args, "proc/exit-code", 1);
         let id = handle(args, 0)?;
         with_proc("proc/exit-code", id, |pr| {
-            match pr
-                .child
-                .try_wait()
-                .map_err(|e| SemaError::Io(format!("proc/exit-code: {e}")))?
-            {
+            match pr.child.try_wait().io_ctx("proc/exit-code")? {
                 Some(status) => Ok(Value::int(status.code().unwrap_or(-1) as i64)),
                 None => Ok(Value::nil()),
             }
@@ -818,11 +813,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         check_arity!(args, "proc/running?", 1);
         let id = handle(args, 0)?;
         with_proc("proc/running?", id, |pr| {
-            let running = pr
-                .child
-                .try_wait()
-                .map_err(|e| SemaError::Io(format!("proc/running?: {e}")))?
-                .is_none();
+            let running = pr.child.try_wait().io_ctx("proc/running?")?.is_none();
             Ok(Value::bool(running))
         })
     });

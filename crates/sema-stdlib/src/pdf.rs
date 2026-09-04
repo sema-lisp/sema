@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::io::Read as _;
 
 use sema_core::runtime::NativeOutcome;
-use sema_core::{check_arity, Caps, SemaError, Value};
+use sema_core::{check_arity, ArgsExt, Caps, ResultExt, SemaError, Value};
 
 const PDF_INPUT_BYTE_CAP: u64 = 256 * 1024 * 1024;
 const PDF_TEXT_OUTPUT_BYTE_CAP: u64 = 256 * 1024 * 1024;
@@ -65,8 +65,7 @@ fn open_pdf_runtime_input(
     path: &str,
     bounds: PdfBounds,
 ) -> Result<PdfRuntimeInput, SemaError> {
-    let metadata =
-        std::fs::metadata(path).map_err(|e| SemaError::Io(format!("{op} {path}: {e}")))?;
+    let metadata = std::fs::metadata(path).io_ctx(format!("{op} {path}"))?;
     if !metadata.is_file() {
         return Err(SemaError::eval(format!(
             "{op}: PDF input must be a regular file: {path}"
@@ -80,12 +79,8 @@ fn open_pdf_runtime_input(
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let file = options
-        .open(path)
-        .map_err(|e| SemaError::Io(format!("{op} {path}: {e}")))?;
-    let opened = file
-        .metadata()
-        .map_err(|e| SemaError::Io(format!("{op} {path}: {e}")))?;
+    let file = options.open(path).io_ctx(format!("{op} {path}"))?;
+    let opened = file.metadata().io_ctx(format!("{op} {path}"))?;
     if !opened.is_file() {
         return Err(SemaError::eval(format!(
             "{op}: PDF input must be a regular file: {path}"
@@ -104,7 +99,7 @@ fn read_pdf_bounded(
     let mut bytes = Vec::new();
     file.take(bounds.input_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|e| SemaError::Io(format!("{op} {path}: {e}")))?;
+        .io_ctx(format!("{op} {path}"))?;
     check_pdf_limit(op, "input bytes", bytes.len() as u64, bounds.input_bytes)?;
     Ok((bytes, bounds))
 }
@@ -164,14 +159,12 @@ fn page_count_work(path: &str, input: Option<PdfRuntimeInput>) -> Result<i64, Se
     let (doc, bounds) = if let Some(input) = input {
         let (bytes, bounds) = read_pdf_bounded("pdf/page-count", path, input)?;
         (
-            lopdf::Document::load_mem(&bytes)
-                .map_err(|e| SemaError::Io(format!("pdf/page-count {path}: {e}")))?,
+            lopdf::Document::load_mem(&bytes).io_ctx(format!("pdf/page-count {path}"))?,
             Some(bounds),
         )
     } else {
         (
-            lopdf::Document::load(path)
-                .map_err(|e| SemaError::Io(format!("pdf/page-count {path}: {e}")))?,
+            lopdf::Document::load(path).io_ctx(format!("pdf/page-count {path}"))?,
             None,
         )
     };
@@ -199,14 +192,12 @@ fn metadata_work(path: &str, input: Option<PdfRuntimeInput>) -> Result<PdfMetada
     let (doc, bounds) = if let Some(input) = input {
         let (bytes, bounds) = read_pdf_bounded("pdf/metadata", path, input)?;
         (
-            lopdf::Document::load_mem(&bytes)
-                .map_err(|e| SemaError::Io(format!("pdf/metadata {path}: {e}")))?,
+            lopdf::Document::load_mem(&bytes).io_ctx(format!("pdf/metadata {path}"))?,
             Some(bounds),
         )
     } else {
         (
-            lopdf::Document::load(path)
-                .map_err(|e| SemaError::Io(format!("pdf/metadata {path}: {e}")))?,
+            lopdf::Document::load(path).io_ctx(format!("pdf/metadata {path}"))?,
             None,
         )
     };
@@ -296,10 +287,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[0],
         |args| {
             check_arity!(args, "pdf/extract-text", 1);
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                .to_string();
+            let path = args.str_at(0, "pdf/extract-text")?.to_string();
 
             if sema_core::in_runtime_quantum() {
                 let input = open_pdf_runtime_input("pdf/extract-text", &path, PDF_RUNTIME_BOUNDS)?;
@@ -323,10 +311,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[0],
         |args| {
             check_arity!(args, "pdf/extract-text-pages", 1);
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                .to_string();
+            let path = args.str_at(0, "pdf/extract-text-pages")?.to_string();
 
             if sema_core::in_runtime_quantum() {
                 let input =
@@ -351,10 +336,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[0],
         |args| {
             check_arity!(args, "pdf/page-count", 1);
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                .to_string();
+            let path = args.str_at(0, "pdf/page-count")?.to_string();
 
             if sema_core::in_runtime_quantum() {
                 let bounds = PDF_RUNTIME_BOUNDS;
@@ -377,10 +359,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[0],
         |args| {
             check_arity!(args, "pdf/metadata", 1);
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                .to_string();
+            let path = args.str_at(0, "pdf/metadata")?.to_string();
 
             if sema_core::in_runtime_quantum() {
                 let bounds = PDF_RUNTIME_BOUNDS;

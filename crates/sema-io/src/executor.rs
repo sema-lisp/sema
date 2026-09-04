@@ -315,72 +315,10 @@ mod process_executor_tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    use sema_core::cycle::GcEdge;
-    use sema_core::runtime::{
-        CancelDisposition, CancelHook, CancelHookError, CompletionDecoder, CompletionDelivery,
-        CompletionKind, CompletionRegistrar, CompletionSender, DecodedCompletion,
-        ExternalCompletion, ExternalFailure, InterruptibleResource, IoExecutor, NativeCallContext,
-        PreparedExternalOperation, SendPayload, Trace,
-    };
-    use sema_core::Value;
+    use sema_core::runtime::{CompletionKind, CompletionRegistrar, IoExecutor};
 
     use super::ProcessIoExecutor;
-
-    struct ChannelSender(Mutex<std::sync::mpsc::Sender<ExternalCompletion>>);
-
-    impl CompletionSender for ChannelSender {
-        fn send(&self, completion: ExternalCompletion) -> CompletionDelivery {
-            self.0
-                .lock()
-                .unwrap()
-                .send(completion)
-                .map(|()| CompletionDelivery::Delivered)
-                .unwrap_or(CompletionDelivery::InboxClosed)
-        }
-    }
-
-    struct NilDecoder;
-    impl Trace for NilDecoder {
-        fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
-            true
-        }
-    }
-    impl CompletionDecoder for NilDecoder {
-        fn decode(
-            self: Box<Self>,
-            _context: &mut NativeCallContext<'_>,
-            _result: Result<SendPayload, ExternalFailure>,
-        ) -> DecodedCompletion {
-            Ok(Value::nil())
-        }
-    }
-
-    struct NoopHook;
-    impl Trace for NoopHook {
-        fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
-            true
-        }
-    }
-    impl CancelHook for NoopHook {
-        fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
-            Ok(CancelDisposition::Reaped)
-        }
-        fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
-            Ok(CancelDisposition::Reaped)
-        }
-    }
-
-    fn blocking_sleep_op(ms: u64) -> PreparedExternalOperation {
-        PreparedExternalOperation::interruptible_blocking(
-            CompletionKind::try_from_raw(1).unwrap(),
-            Box::new(NilDecoder),
-            InterruptibleResource::new("sleep", Box::new(NoopHook)),
-            move || {
-                std::thread::sleep(Duration::from_millis(ms));
-                Ok(Box::new(()) as SendPayload)
-            },
-        )
-    }
+    use crate::test_support::{blocking_sleep_op, ChannelSender};
 
     /// Two blocking jobs submitted together overlap on the pool's blocking tier:
     /// both completions arrive in ~one sleep, not two.

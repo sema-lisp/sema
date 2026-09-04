@@ -57,7 +57,7 @@ use std::io::Read as _;
 use std::rc::Rc;
 
 use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateHandle};
-use sema_core::{check_arity, in_runtime_quantum, SemaError, Value};
+use sema_core::{check_arity, in_runtime_quantum, ArgsExt, ResultExt, SemaError, Value};
 
 use crate::runtime_offload::{
     checkout_external, finish_terminal_gate, prepare_terminal_gate, CheckoutOp,
@@ -379,7 +379,7 @@ fn read_or_init_store(
     let mut content = String::new();
     file.take(bounds.max_store_bytes.saturating_add(1))
         .read_to_string(&mut content)
-        .map_err(|e| SemaError::Io(format!("kv/open: {e}")))?;
+        .io_ctx("kv/open")?;
     if content.len() as u64 > bounds.max_store_bytes {
         return Err(store_bytes_cap_err(
             "kv/open",
@@ -389,7 +389,7 @@ fn read_or_init_store(
         ));
     }
     serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&content)
-        .map_err(|e| SemaError::Io(format!("kv/open: malformed JSON in {path}: {e}")))
+        .io_ctx(format!("kv/open: malformed JSON in {path}"))
 }
 
 /// Offload one `kv/set`/`kv/delete` mutation+flush on the store named `name`
@@ -478,14 +478,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             // interpreter-teardown hook (idempotent) on the VM thread before the
             // (possibly offloaded) read dispatches — the async decoder has no `ctx`.
             ensure_teardown_hook(ctx);
-            let name = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                .to_string();
-            let path = args[1]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-                .to_string();
+            let name = args.str_at(0, "kv/open")?.to_string();
+            let path = args.str_at(1, "kv/open")?.to_string();
 
             let bounds = effective_bounds();
 
@@ -538,12 +532,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     crate::register_fn(env, "kv/get", |args| {
         check_arity!(args, "kv/get", 2);
-        let name = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let key = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let name = args.str_at(0, "kv/get")?;
+        let key = args.str_at(1, "kv/get")?;
         with_store("kv/get", name, |store| match store.data.get(key) {
             Some(v) => Ok(sema_core::json_to_value(v)),
             None => Ok(Value::nil()),
@@ -565,14 +555,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[],
         |args| {
             check_arity!(args, "kv/set", 3);
-            let name = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                .to_string();
-            let key = args[1]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-                .to_string();
+            let name = args.str_at(0, "kv/set")?.to_string();
+            let key = args.str_at(1, "kv/set")?.to_string();
             let val = sema_core::value_to_json_lossy(&args[2]);
 
             let bounds = effective_bounds();
@@ -622,14 +606,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[],
         |args| {
             check_arity!(args, "kv/delete", 2);
-            let name = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                .to_string();
-            let key = args[1]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-                .to_string();
+            let name = args.str_at(0, "kv/delete")?.to_string();
+            let key = args.str_at(1, "kv/delete")?.to_string();
 
             let bounds = effective_bounds();
 
@@ -657,9 +635,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     crate::register_fn(env, "kv/keys", |args| {
         check_arity!(args, "kv/keys", 1);
-        let name = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let name = args.str_at(0, "kv/keys")?;
         with_store("kv/keys", name, |store| {
             Ok(Value::list(
                 store.data.keys().map(|k| Value::string(k)).collect(),
@@ -675,10 +651,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // gate means CheckedOut, which errors above), so no waiter is stranded.
     crate::register_runtime_fn(env, "kv/close", |args| {
         check_arity!(args, "kv/close", 1);
-        let name = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
+        let name = args.str_at(0, "kv/close")?.to_string();
         let gate = KV_GATES.with(|g| g.borrow().get(&name).cloned());
         if KV_STORES.with(|s| matches!(s.borrow().get(&name), Some(KvSlot::CheckedOut))) {
             return Err(busy_err("kv/close", &name));
@@ -717,8 +690,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 /// pre-dispatch value/item admission normally rejects first; this is the backstop
 /// against accumulation across many in-cap writes).
 fn flush_store(store: &KvStore, bounds: KvBounds) -> Result<(), SemaError> {
-    let json = serde_json::to_string_pretty(&store.data)
-        .map_err(|e| SemaError::Io(format!("kv/flush: {e}")))?;
+    let json = serde_json::to_string_pretty(&store.data).io_ctx("kv/flush")?;
     if json.len() as u64 > bounds.max_store_bytes {
         return Err(store_bytes_cap_err(
             "kv/flush",
@@ -727,7 +699,7 @@ fn flush_store(store: &KvStore, bounds: KvBounds) -> Result<(), SemaError> {
             bounds.max_store_bytes,
         ));
     }
-    std::fs::write(&store.path, json).map_err(|e| SemaError::Io(format!("kv/flush: {e}")))?;
+    std::fs::write(&store.path, json).io_ctx("kv/flush")?;
     Ok(())
 }
 

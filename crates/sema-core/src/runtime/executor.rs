@@ -1102,6 +1102,30 @@ mod tests {
         Pin::new(future).poll(&mut context)
     }
 
+    /// Dispatch an async job and poll it once, asserting that any panic raised
+    /// by the future (in `poll` or in its `Drop`) is contained by the dispatch.
+    #[cfg(panic = "unwind")]
+    fn poll_once_contained<F, Fut>(job: F) -> Arc<RecordingSender>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = JobResult> + Send + 'static,
+    {
+        let prepared = PreparedExternalOperation::interruptible_async(
+            kind(1),
+            decoder(),
+            interruptible(),
+            job,
+        );
+        let (sender, _runtime, submission, _) =
+            registration(prepared, kind(1), CompletionDelivery::Delivered);
+        let ExecutorDispatch::Async(dispatch) = submission.into_dispatch() else {
+            unreachable!()
+        };
+        let mut future = dispatch.into_future();
+        assert!(catch_unwind(AssertUnwindSafe(|| poll_once(&mut future))).is_ok());
+        sender
+    }
+
     #[test]
     fn send_halves_are_send_while_decoder_and_resource_accept_rc() {
         fn assert_send<T: Send>() {}
@@ -1804,19 +1828,7 @@ mod tests {
             }
         }
 
-        let prepared = PreparedExternalOperation::interruptible_async(
-            kind(1),
-            decoder(),
-            interruptible(),
-            || HostileFuture,
-        );
-        let (sender, _runtime, submission, _) =
-            registration(prepared, kind(1), CompletionDelivery::Delivered);
-        let ExecutorDispatch::Async(dispatch) = submission.into_dispatch() else {
-            unreachable!()
-        };
-        let mut future = dispatch.into_future();
-        assert!(catch_unwind(AssertUnwindSafe(|| poll_once(&mut future))).is_ok());
+        let sender = poll_once_contained(|| HostileFuture);
         assert_eq!(sender.attempts.load(Ordering::Relaxed), 1);
         assert!(sender.take().result.is_ok());
     }
@@ -1837,19 +1849,7 @@ mod tests {
             }
         }
 
-        let prepared = PreparedExternalOperation::interruptible_async(
-            kind(1),
-            decoder(),
-            interruptible(),
-            || HostileFuture,
-        );
-        let (sender, _runtime, submission, _) =
-            registration(prepared, kind(1), CompletionDelivery::Delivered);
-        let ExecutorDispatch::Async(dispatch) = submission.into_dispatch() else {
-            unreachable!()
-        };
-        let mut future = dispatch.into_future();
-        assert!(catch_unwind(AssertUnwindSafe(|| poll_once(&mut future))).is_ok());
+        let sender = poll_once_contained(|| HostileFuture);
         assert_eq!(sender.attempts.load(Ordering::Relaxed), 1);
         assert_eq!(
             sender.take().result.unwrap_err().code(),
@@ -1967,26 +1967,32 @@ mod tests {
                 panic!("hostile queued async job drop");
             }
         }
-        let hostile = HostileDrop;
-        let prepared = PreparedExternalOperation::interruptible_async(
-            kind(1),
-            decoder(),
-            interruptible(),
-            move || {
-                drop(hostile);
-                std::future::ready(Ok(Box::new(1_u8) as SendPayload))
-            },
-        );
-        let (sender, runtime, submission, _) =
-            registration(prepared, kind(1), CompletionDelivery::Delivered);
-        let (_, _, cancel) = runtime.into_parts();
-        assert_eq!(
-            cancel.cancel_before_start(),
-            CancelBeforeStart::CancelledQueued
-        );
-        let ExecutorDispatch::Async(dispatch) = submission.into_dispatch() else {
-            unreachable!()
-        };
+        // An async job whose closure owns a panicking-on-drop value, cancelled
+        // while still queued.
+        fn cancelled_queued_hostile_dispatch() -> (Arc<RecordingSender>, AsyncExecutorDispatch) {
+            let hostile = HostileDrop;
+            let prepared = PreparedExternalOperation::interruptible_async(
+                kind(1),
+                decoder(),
+                interruptible(),
+                move || {
+                    drop(hostile);
+                    std::future::ready(Ok(Box::new(1_u8) as SendPayload))
+                },
+            );
+            let (sender, runtime, submission, _) =
+                registration(prepared, kind(1), CompletionDelivery::Delivered);
+            let (_, _, cancel) = runtime.into_parts();
+            assert_eq!(
+                cancel.cancel_before_start(),
+                CancelBeforeStart::CancelledQueued
+            );
+            let ExecutorDispatch::Async(dispatch) = submission.into_dispatch() else {
+                unreachable!()
+            };
+            (sender, dispatch)
+        }
+        let (sender, dispatch) = cancelled_queued_hostile_dispatch();
         let mut future = dispatch.into_future();
         let report = catch_unwind(AssertUnwindSafe(|| poll_once(&mut future)))
             .expect("single destructor panic is contained");
@@ -1999,26 +2005,7 @@ mod tests {
         );
         assert_eq!(sender.attempts.load(Ordering::Relaxed), 1);
 
-        let hostile = HostileDrop;
-        let prepared = PreparedExternalOperation::interruptible_async(
-            kind(1),
-            decoder(),
-            interruptible(),
-            move || {
-                drop(hostile);
-                std::future::ready(Ok(Box::new(1_u8) as SendPayload))
-            },
-        );
-        let (sender, runtime, submission, _) =
-            registration(prepared, kind(1), CompletionDelivery::Delivered);
-        let (_, _, cancel) = runtime.into_parts();
-        assert_eq!(
-            cancel.cancel_before_start(),
-            CancelBeforeStart::CancelledQueued
-        );
-        let ExecutorDispatch::Async(dispatch) = submission.into_dispatch() else {
-            unreachable!()
-        };
+        let (sender, dispatch) = cancelled_queued_hostile_dispatch();
         let future = dispatch.into_future();
         assert!(catch_unwind(AssertUnwindSafe(|| drop(future))).is_ok());
         assert_eq!(sender.attempts.load(Ordering::Relaxed), 1);

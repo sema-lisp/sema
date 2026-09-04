@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use sema_core::runtime::NativeOutcome;
 use sema_core::{check_arity, value_to_json_lossy, SemaError, Value};
+use sema_core::{ArgsExt, ResultExt};
 
 use crate::register_fn;
 
@@ -309,8 +310,7 @@ impl Drop for HandlerFinishedLease {
 /// Build a JSON response map: {:status N :headers {"content-type" "application/json"} :body json-string}
 fn json_response(status: i64, val: &Value) -> Result<Value, SemaError> {
     let json = sema_core::value_to_json_lossy(val);
-    let body = serde_json::to_string(&json)
-        .map_err(|e| SemaError::eval(format!("http response: json encode: {e}")))?;
+    let body = serde_json::to_string(&json).eval_ctx("http response: json encode")?;
     Ok(raw_response(
         status,
         &[("content-type", "application/json")],
@@ -362,35 +362,27 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     register_fn(env, "http/redirect", |args| {
         check_arity!(args, "http/redirect", 1);
-        let url = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let url = args.str_at(0, "http/redirect")?;
 
         Ok(raw_response(302, &[("location", url)], ""))
     });
 
     register_fn(env, "http/error", |args| {
         check_arity!(args, "http/error", 2);
-        let status = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?;
+        let status = args.int_at(0, "http/error")?;
         json_response(status, &args[1])
     });
 
     register_fn(env, "http/html", |args| {
         check_arity!(args, "http/html", 1);
-        let content = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let content = args.str_at(0, "http/html")?;
 
         Ok(raw_response(200, &[("content-type", "text/html")], content))
     });
 
     register_fn(env, "http/text", |args| {
         check_arity!(args, "http/text", 1);
-        let content = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let content = args.str_at(0, "http/text")?;
 
         Ok(raw_response(
             200,
@@ -409,29 +401,20 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             if args.is_empty() || args.len() > 2 {
                 return Err(SemaError::arity("http/file", "1-2", args.len()));
             }
-            let file_path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            let file_path = args.str_at(0, "http/text")?;
 
             // Resolve to absolute path
             let path = std::path::Path::new(file_path);
             let abs_path = if path.is_absolute() {
                 path.to_path_buf()
             } else {
-                std::env::current_dir()
-                    .map_err(|e| SemaError::eval(format!("http/file: {e}")))?
-                    .join(path)
+                std::env::current_dir().eval_ctx("http/file")?.join(path)
             };
 
             // Explicit content-type override (checked eagerly so a bad-type arg
             // still errors identically whether or not we end up offloading).
             let content_type_override = if args.len() == 2 {
-                Some(
-                    args[1]
-                        .as_str()
-                        .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-                        .to_string(),
-                )
+                Some(args.str_at(1, "http/text")?.to_string())
             } else {
                 None
             };
@@ -489,10 +472,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // (route/prefix "/api" routes) — prepend prefix to all route patterns
     register_fn(env, "route/prefix", |args| {
         check_arity!(args, "route/prefix", 2);
-        let prefix = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
+        let prefix = args.str_at(0, "route/prefix")?.to_string();
         let routes: Vec<Value> = if let Some(items) = args[1].as_list() {
             items.to_vec()
         } else if let Some(items) = args[1].as_vector_rc() {
@@ -773,9 +753,7 @@ fn router_body(args: &[Value]) -> sema_core::runtime::NativeResult {
             let abs_dir = if dir.is_absolute() {
                 dir.to_path_buf()
             } else {
-                std::env::current_dir()
-                    .map_err(|e| SemaError::eval(format!("http/router: {e}")))?
-                    .join(dir)
+                std::env::current_dir().eval_ctx("http/router")?.join(dir)
             };
 
             // Ensure the pattern has a wildcard suffix for matching
@@ -1553,9 +1531,7 @@ fn make_sse_send_fn(sse_tx: tokio::sync::mpsc::UnboundedSender<String>) -> Value
     use sema_core::NativeFn;
     Value::native_fn(NativeFn::simple("http/stream/send", move |args| {
         check_arity!(args, "http/stream/send", 1);
-        let msg = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let msg = args.str_at(0, "http/stream/send")?;
         // Err only when the receiver dropped (client disconnected) — preserves
         // the "SSE stream closed" contract.
         sse_tx

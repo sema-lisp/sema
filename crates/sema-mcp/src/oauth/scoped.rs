@@ -489,18 +489,12 @@ mod tests {
     use super::super::store::{ClientInfo, StoredCredentials, TokenSet, TokenStore};
     use super::{store_encryption_key, Envelope, MemoryStore, PersistScope, ScopedFileStore};
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     const KEY_A: [u8; 32] = [7; 32];
     const KEY_B: [u8; 32] = [9; 32];
 
     fn temp_root() -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir =
-            std::env::temp_dir().join(format!("sema-mcp-scoped-{}-{}", std::process::id(), n));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        sema_core::testing::unique_temp_dir("mcp-scoped")
     }
 
     fn sample(url: &str) -> StoredCredentials {

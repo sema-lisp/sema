@@ -14,10 +14,10 @@
 use std::collections::HashSet;
 use std::io::{self, BufRead, Read};
 
-use sema_core::{intern, pretty_print, Spur, Value};
+use sema_core::Spur;
 use sema_eval::Interpreter;
 
-use crate::{drain_async_scheduler, print_error, set_last_input};
+use crate::set_last_input;
 
 use super::commands::{self, CommandOutcome};
 use super::validator::is_input_complete;
@@ -165,20 +165,6 @@ fn run_with_line_source(
 
         set_last_input(&submitted, None);
 
-        match interpreter.eval_str_in_global(&submitted) {
-            Ok(val) => {
-                drain_async_scheduler(interpreter);
-                super::rotate_result_slots(env, val.clone());
-                if !val.is_nil() {
-                    println!("{}", pretty_print(&val, 80));
-                } else if let Some(name) = super::top_level_define_name(&submitted) {
-                    println!("{}", crate::colors::dim(&format!("; defined {name}")));
-                }
-            }
-            Err(e) => {
-                env.set(intern("*e"), Value::string(&e.to_string()));
-                print_error(&e);
-            }
-        }
+        super::eval_and_report(interpreter, env, &submitted);
     }
 }

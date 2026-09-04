@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult};
 use sema_core::{check_arity, Caps, SemaError, Value, ValueView};
+use sema_core::{ArgsExt, OptionsExt, ResultExt};
 
 /// Completion tag for an offloaded HTTP request. It only needs to be consistent
 /// between the issued identity and the prepared op (it is not a uniqueness key),
@@ -55,14 +56,8 @@ enum HttpBody {
 
 /// Whether the caller requested a raw-bytes response body (`{:as :bytes}`).
 fn opts_want_bytes(opts: Option<&Value>) -> bool {
-    opts.and_then(|o| o.as_map_rc())
-        .and_then(|m| m.get(&Value::keyword("as")).cloned())
-        .map(|v| match v.view() {
-            ValueView::Keyword(s) => sema_core::resolve(s) == "bytes",
-            ValueView::String(s) => s.as_ref() == "bytes",
-            _ => false,
-        })
-        .unwrap_or(false)
+    opts.and_then(|o| o.opt_name("as"))
+        .is_some_and(|v| v == "bytes")
 }
 
 /// The response facts that cross the thread boundary back from the I/O pool
@@ -116,7 +111,7 @@ fn build_multipart(val: &Value) -> Result<reqwest::multipart::Form, SemaError> {
         {
             part = part
                 .mime_str(ct)
-                .map_err(|e| SemaError::eval(format!("http: invalid :content-type '{ct}': {e}")))?;
+                .eval_ctx(format!("http: invalid :content-type '{ct}'"))?;
         }
         form = form.part(name, part);
     }
@@ -194,8 +189,7 @@ fn build_request(
             builder = builder.body(s.to_string());
         } else if body_val.as_map_rc().is_some() {
             let json = sema_core::value_to_json_lossy(body_val);
-            let json_str = serde_json::to_string(&json)
-                .map_err(|e| SemaError::eval(format!("http: json encode: {e}")))?;
+            let json_str = serde_json::to_string(&json).eval_ctx("http: json encode")?;
             builder = builder
                 .header("Content-Type", "application/json")
                 .body(json_str);
@@ -276,7 +270,7 @@ fn http_request(
         let response = builder
             .send()
             .await
-            .map_err(|e| SemaError::Io(format!("http {method} {url}: {e}")))?;
+            .io_ctx(format!("http {method} {url}"))?;
 
         let status = response.status().as_u16();
         let mut headers = Vec::new();
@@ -366,18 +360,14 @@ fn http_request_runtime(
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     crate::register_runtime_fn_path_gated(env, sandbox, Caps::NETWORK, "http/get", &[], |args| {
         check_arity!(args, "http/get", 1..=2);
-        let url = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let url = args.str_at(0, "http/get")?;
         let opts = args.get(1);
         http_request("GET", url, None, opts)
     });
 
     crate::register_runtime_fn_path_gated(env, sandbox, Caps::NETWORK, "http/post", &[], |args| {
         check_arity!(args, "http/post", 2..=3);
-        let url = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let url = args.str_at(0, "http/post")?;
         let body = &args[1];
         let opts = args.get(2);
         http_request("POST", url, Some(body), opts)
@@ -385,9 +375,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     crate::register_runtime_fn_path_gated(env, sandbox, Caps::NETWORK, "http/put", &[], |args| {
         check_arity!(args, "http/put", 2..=3);
-        let url = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let url = args.str_at(0, "http/put")?;
         let body = &args[1];
         let opts = args.get(2);
         http_request("PUT", url, Some(body), opts)
@@ -397,9 +385,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // like POST — for queries too large or structured for the URL.
     crate::register_runtime_fn_path_gated(env, sandbox, Caps::NETWORK, "http/query", &[], |args| {
         check_arity!(args, "http/query", 2..=3);
-        let url = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let url = args.str_at(0, "http/query")?;
         let body = &args[1];
         let opts = args.get(2);
         http_request("QUERY", url, Some(body), opts)
@@ -413,9 +399,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[],
         |args| {
             check_arity!(args, "http/delete", 1..=2);
-            let url = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            let url = args.str_at(0, "http/delete")?;
             let opts = args.get(1);
             http_request("DELETE", url, None, opts)
         },
@@ -429,13 +413,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[],
         |args| {
             check_arity!(args, "http/request", 2..=4);
-            let method = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                .to_uppercase();
-            let url = args[1]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+            let method = args.str_at(0, "http/request")?.to_uppercase();
+            let url = args.str_at(1, "http/request")?;
             let opts = args.get(2);
             let body = args.get(3);
             http_request(&method, url, body, opts)

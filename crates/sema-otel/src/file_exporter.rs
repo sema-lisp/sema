@@ -201,7 +201,7 @@ fn kind_str(k: &SpanKind) -> &'static str {
     }
 }
 
-fn value_to_json(v: &Value) -> serde_json::Value {
+fn otel_value_to_json(v: &Value) -> serde_json::Value {
     use serde_json::Value as J;
     match v {
         Value::Bool(b) => J::Bool(*b),
@@ -222,7 +222,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
 fn attrs_to_json(attrs: &[KeyValue]) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for kv in attrs {
-        map.insert(kv.key.to_string(), value_to_json(&kv.value));
+        map.insert(kv.key.to_string(), otel_value_to_json(&kv.value));
     }
     serde_json::Value::Object(map)
 }

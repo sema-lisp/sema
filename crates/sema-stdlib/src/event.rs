@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+use sema_core::ArgsExt;
 use sema_core::{check_arity, SemaError, Value};
 
 use crate::register_fn;
@@ -191,9 +192,7 @@ pub fn register(env: &sema_core::Env) {
     // time/tick — a reusable timer source for event/select: (time/tick 16).
     register_fn(env, "time/tick", |args| {
         check_arity!(args, "time/tick", 1);
-        let ms = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?;
+        let ms = args.int_at(0, "time/tick")?;
         let mut m = BTreeMap::new();
         m.insert(kw("type"), kw("timer"));
         m.insert(kw("ms"), Value::int(ms.max(0)));

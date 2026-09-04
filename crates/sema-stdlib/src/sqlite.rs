@@ -68,7 +68,7 @@ use std::time::Duration;
 
 use rusqlite::{params_from_iter, types::Value as SqlValue, Connection, InterruptHandle};
 use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateHandle};
-use sema_core::{check_arity, in_runtime_quantum, SemaError, Value};
+use sema_core::{check_arity, in_runtime_quantum, ArgsExt, SemaError, Value};
 
 use crate::runtime_offload::{
     checkout_external, finish_terminal_gate, prepare_terminal_gate, CheckoutOp,
@@ -645,18 +645,12 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             ensure_teardown_hook(ctx);
             let (key, path) = match args.len() {
                 1 => {
-                    let path = args[0]
-                        .as_str()
-                        .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+                    let path = args.str_at(0, "db/open")?;
                     (path.to_string(), path.to_string())
                 }
                 2 => {
-                    let name = args[0]
-                        .as_str()
-                        .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-                    let path = args[1]
-                        .as_str()
-                        .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+                    let name = args.str_at(0, "db/open")?;
+                    let path = args.str_at(1, "db/open")?;
                     (name.to_string(), path.to_string())
                 }
                 _ => return Err(SemaError::arity("db/open", "1 or 2", args.len())),
@@ -700,10 +694,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             let name = if args.is_empty() {
                 ":memory:".to_string()
             } else if args.len() == 1 {
-                args[0]
-                    .as_str()
-                    .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                    .to_string()
+                args.str_at(0, "db/open-memory")?.to_string()
             } else {
                 return Err(SemaError::arity("db/open-memory", "0 or 1", args.len()));
             };
@@ -746,14 +737,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             if args.len() < 2 {
                 return Err(SemaError::arity("db/exec", "2+", args.len()));
             }
-            let handle = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                .to_string();
-            let sql = args[1]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-                .to_string();
+            let handle = args.str_at(0, "db/exec")?.to_string();
+            let sql = args.str_at(1, "db/exec")?.to_string();
             let params: Vec<SqlValue> = args[2..].iter().map(sema_to_sql).collect();
 
             if in_runtime_quantum() {
@@ -789,14 +774,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[],
         |args| {
             check_arity!(args, "db/exec-batch", 2);
-            let handle = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                .to_string();
-            let sql = args[1]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-                .to_string();
+            let handle = args.str_at(0, "db/exec-batch")?.to_string();
+            let sql = args.str_at(1, "db/exec-batch")?.to_string();
 
             if in_runtime_quantum() {
                 return checkout_runtime(
@@ -827,14 +806,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             if args.len() < 2 {
                 return Err(SemaError::arity("db/query", "2+", args.len()));
             }
-            let handle = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                .to_string();
-            let sql = args[1]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-                .to_string();
+            let handle = args.str_at(0, "db/exec-batch")?.to_string();
+            let sql = args.str_at(1, "db/exec-batch")?.to_string();
             let params: Vec<SqlValue> = args[2..].iter().map(sema_to_sql).collect();
             // Resolve the result caps pre-dispatch on the VM thread; the
             // offloaded op captures the (Copy) caps and enforces them.
@@ -869,14 +842,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             if args.len() < 2 {
                 return Err(SemaError::arity("db/query-one", "2+", args.len()));
             }
-            let handle = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                .to_string();
-            let sql = args[1]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-                .to_string();
+            let handle = args.str_at(0, "db/exec-batch")?.to_string();
+            let sql = args.str_at(1, "db/exec-batch")?.to_string();
             let params: Vec<SqlValue> = args[2..].iter().map(sema_to_sql).collect();
 
             if in_runtime_quantum() {
@@ -910,9 +877,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         "db/last-insert-id",
         |args| {
             check_arity!(args, "db/last-insert-id", 1);
-            let handle = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            let handle = args.str_at(0, "db/last-insert-id")?;
             with_conn("db/last-insert-id", handle, |conn| {
                 Ok(Value::int(conn.last_insert_rowid()))
             })
@@ -928,10 +893,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[],
         |args| {
             check_arity!(args, "db/tables", 1);
-            let handle = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                .to_string();
+            let handle = args.str_at(0, "db/tables")?.to_string();
             let caps = effective_result_caps();
 
             if in_runtime_quantum() {
@@ -962,10 +924,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // means CheckedOut, which errors above), so no waiter can be stranded.
     crate::register_runtime_fn(env, "db/close", |args| {
         check_arity!(args, "db/close", 1);
-        let handle = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
+        let handle = args.str_at(0, "db/close")?.to_string();
         let gate = DB_GATES.with(|g| g.borrow().get(&handle).cloned());
         if DB_CONNECTIONS.with(|c| matches!(c.borrow().get(&handle), Some(DbSlot::CheckedOut))) {
             return Err(busy_err("db/close", &handle));

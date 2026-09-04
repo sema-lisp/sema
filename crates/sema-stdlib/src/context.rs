@@ -5,13 +5,11 @@ use sema_core::runtime::{
     DynamicTaskState, NativeCall, NativeCallContext, NativeContinuation, NativeOutcome,
     NativeResult, ResumeInput, ScopeId, Trace,
 };
-use sema_core::{check_arity, EvalContext, NativeFn, SemaError, Value};
+use sema_core::{check_arity, ArgsExt, EvalContext, NativeFn, SemaError, Value};
 
 fn context_with_args(args: &[Value]) -> Result<(BTreeMap<Value, Value>, Value), SemaError> {
     check_arity!(args, "context/with", 2);
-    let bindings = args[0]
-        .as_map_rc()
-        .ok_or_else(|| SemaError::type_error("map", args[0].type_name()))?;
+    let bindings = args.map_at(0, "context/with")?;
     let thunk = &args[1];
     if thunk.as_lambda_rc().is_none() && thunk.as_native_fn_rc().is_none() {
         return Err(SemaError::type_error("function", thunk.type_name()));
@@ -154,9 +152,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn_ctx_with_escaping_args(env, "context/merge", &[0], |ctx, args| {
         check_arity!(args, "context/merge", 1);
-        let map = args[0]
-            .as_map_rc()
-            .ok_or_else(|| SemaError::type_error("map", args[0].type_name()))?;
+        let map = args.map_at(0, "context/merge")?;
         for (k, v) in map.iter() {
             ctx.context_set(k.clone(), v.clone());
         }

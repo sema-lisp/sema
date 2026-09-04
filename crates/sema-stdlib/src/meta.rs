@@ -5,6 +5,7 @@ use sema_core::runtime::{
     NativeCall, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, ResumeInput,
     Trace,
 };
+use sema_core::ArgsExt;
 use sema_core::{check_arity, SemaError, Value};
 
 use crate::register_fn;
@@ -166,41 +167,20 @@ pub fn register(env: &sema_core::Env) {
     // (spy label value) — prints [label] value to stderr and returns value
     register_fn(env, "spy", |args| {
         check_arity!(args, "spy", 2);
-        let label = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let label = args.str_at(0, "spy")?;
         eprintln!("[{}] {}", label, args[1]);
         Ok(args[1].clone())
     });
 
     // (time thunk) — calls zero-arg thunk, prints elapsed time to stderr, returns result
-    crate::list::register_hof(
-        env,
-        "time",
-        |args| {
-            check_arity!(args, "time", 1);
-            let start = std::time::Instant::now();
-            let result = crate::list::call_function(&args[0], &[])?;
-            let elapsed = start.elapsed();
-            eprintln!("Elapsed: {:.3}ms", elapsed.as_secs_f64() * 1000.0);
-            Ok(result)
-        },
-        |args| timing_call(args, TimingMode::ReturnValue),
-    );
+    crate::list::register_hof_runtime(env, "time", |args| {
+        timing_call(args, TimingMode::ReturnValue)
+    });
 
     // (time/ms thunk) — calls zero-arg thunk, returns elapsed time in ms as float
-    crate::list::register_hof(
-        env,
-        "time/ms",
-        |args| {
-            check_arity!(args, "time/ms", 1);
-            let start = std::time::Instant::now();
-            let _result = crate::list::call_function(&args[0], &[])?;
-            let elapsed = start.elapsed();
-            Ok(Value::float(elapsed.as_secs_f64() * 1000.0))
-        },
-        |args| timing_call(args, TimingMode::ReturnMillis),
-    );
+    crate::list::register_hof_runtime(env, "time/ms", |args| {
+        timing_call(args, TimingMode::ReturnMillis)
+    });
 
     // (assert condition) or (assert condition message) — throws if condition is falsy
     register_fn(env, "assert", |args| {
@@ -237,10 +217,7 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "gensym", |args| {
         check_arity!(args, "gensym", 0..=1);
         let prefix = if args.len() == 1 {
-            args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                .to_string()
+            args.str_at(0, "gensym")?.to_string()
         } else {
             "g".to_string()
         };

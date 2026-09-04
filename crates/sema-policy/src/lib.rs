@@ -2190,7 +2190,7 @@ mod tests {
 
     #[test]
     fn semantic_subject_rules_use_declared_argument_mappings() {
-        let root = std::env::temp_dir().join(format!("sema-policy-subject-{}", std::process::id()));
+        let root = sema_core::testing::unique_temp_dir("policy-subject");
         fs::create_dir_all(root.join("src")).unwrap();
         let policy = CompiledPolicy::compile(&named_policy([(
             "subjects",
@@ -2579,7 +2579,7 @@ mod tests {
 
     #[test]
     fn shorthand_and_explicit_path_arguments_match() {
-        let root = std::env::temp_dir().join(format!("sema-policy-path-{}", std::process::id()));
+        let root = sema_core::testing::unique_temp_dir("policy-path");
         fs::create_dir_all(root.join("src")).unwrap();
         let policy = CompiledPolicy::compile(&named_policy([(
             "tools",
@@ -2656,8 +2656,7 @@ mod tests {
 
     #[test]
     fn path_traversal_and_absolute_paths_are_denied() {
-        let root =
-            std::env::temp_dir().join(format!("sema-policy-traversal-{}", std::process::id()));
+        let root = sema_core::testing::unique_temp_dir("policy-traversal");
         fs::create_dir_all(root.join("src")).unwrap();
         let rule = PathConstraint {
             allow: compile_path_globs(&["**".to_string()]).unwrap(),
@@ -2673,9 +2672,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unix_backslash_is_not_treated_as_a_path_separator() {
-        let root =
-            std::env::temp_dir().join(format!("sema-policy-backslash-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
+        let root = sema_core::testing::unique_temp_dir("policy-backslash");
         fs::write(root.join(r"safe\secret"), "not in the safe directory").unwrap();
         let rule = PathConstraint {
             allow: compile_path_globs(&["safe/**".to_string()]).unwrap(),
@@ -2693,11 +2690,8 @@ mod tests {
     fn symlink_escape_is_denied() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join(format!("sema-policy-symlink-{}", std::process::id()));
-        let outside =
-            std::env::temp_dir().join(format!("sema-policy-outside-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        fs::create_dir_all(&outside).unwrap();
+        let root = sema_core::testing::unique_temp_dir("policy-symlink");
+        let outside = sema_core::testing::unique_temp_dir("policy-outside");
         symlink(&outside, root.join("escape")).unwrap();
         let rule = PathConstraint {
             allow: compile_path_globs(&["**".to_string()]).unwrap(),

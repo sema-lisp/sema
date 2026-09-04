@@ -26,7 +26,7 @@
 
 use std::collections::BTreeMap;
 
-use sema_core::{check_arity, SemaError, Value};
+use sema_core::{check_arity, ArgsExt, SemaError, Value};
 #[cfg(not(target_arch = "wasm32"))]
 use sema_policy::content::INPUT_BYTE_CAP;
 use sema_policy::content::{detect_pii, detect_secrets, redact as redact_findings, Finding};
@@ -202,9 +202,7 @@ pub fn register(env: &sema_core::Env) {
     #[cfg(not(target_arch = "wasm32"))]
     register_runtime_fn(env, "secret/detect", |args| {
         check_arity!(args, "secret/detect", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "secret/detect")?;
         if sema_core::in_runtime_quantum() {
             check_secret_limit(
                 "secret/detect",
@@ -229,18 +227,14 @@ pub fn register(env: &sema_core::Env) {
     #[cfg(target_arch = "wasm32")]
     register_fn(env, "secret/detect", |args| {
         check_arity!(args, "secret/detect", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "secret/detect")?;
         Ok(findings_to_list(s, &detect_secrets(s)))
     });
 
     #[cfg(not(target_arch = "wasm32"))]
     register_runtime_fn(env, "secret/redact", |args| {
         check_arity!(args, "secret/redact", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "secret/redact")?;
         if sema_core::in_runtime_quantum() {
             check_secret_limit(
                 "secret/redact",
@@ -265,18 +259,14 @@ pub fn register(env: &sema_core::Env) {
     #[cfg(target_arch = "wasm32")]
     register_fn(env, "secret/redact", |args| {
         check_arity!(args, "secret/redact", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "secret/redact")?;
         Ok(Value::string(&redact_findings(s, &detect_secrets(s))))
     });
 
     #[cfg(not(target_arch = "wasm32"))]
     register_runtime_fn(env, "pii/detect", |args| {
         check_arity!(args, "pii/detect", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "pii/detect")?;
         if sema_core::in_runtime_quantum() {
             check_secret_limit(
                 "pii/detect",
@@ -294,21 +284,15 @@ pub fn register(env: &sema_core::Env) {
     #[cfg(target_arch = "wasm32")]
     register_fn(env, "pii/detect", |args| {
         check_arity!(args, "pii/detect", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "pii/detect")?;
         Ok(findings_to_list(s, &detect_pii(s)))
     });
 
     #[cfg(not(target_arch = "wasm32"))]
     register_runtime_fn(env, "redact/spans", |args| {
         check_arity!(args, "redact/spans", 2);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let spans = args[1]
-            .as_list()
-            .ok_or_else(|| SemaError::type_error("list", args[1].type_name()))?;
+        let text = args.str_at(0, "redact/spans")?;
+        let spans = args.list_at(1, "redact/spans")?;
         let in_quantum = sema_core::in_runtime_quantum();
         if in_quantum {
             check_secret_limit(
@@ -336,12 +320,8 @@ pub fn register(env: &sema_core::Env) {
     #[cfg(target_arch = "wasm32")]
     register_fn(env, "redact/spans", |args| {
         check_arity!(args, "redact/spans", 2);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let spans = args[1]
-            .as_list()
-            .ok_or_else(|| SemaError::type_error("list", args[1].type_name()))?;
+        let text = args.str_at(0, "redact/spans")?;
+        let spans = args.list_at(1, "redact/spans")?;
         let edits = collect_span_edits(text, spans);
         Ok(Value::string(&apply_span_edits(text.to_string(), edits)))
     });
@@ -351,9 +331,7 @@ pub fn register(env: &sema_core::Env) {
     // bounded (a synchronous split, not a fake async wrap).
     register_fn(env, "hash/digest", |args| {
         check_arity!(args, "hash/digest", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "hash/digest")?;
         #[cfg(not(target_arch = "wasm32"))]
         if sema_core::in_runtime_quantum() {
             check_secret_limit(

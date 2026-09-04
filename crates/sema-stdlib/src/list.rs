@@ -4,9 +4,10 @@ use std::collections::{BTreeMap, VecDeque};
 use sema_core::cycle::GcEdge;
 use sema_core::number::SemaNumber;
 use sema_core::runtime::{
-    NativeCall, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, ResumeInput,
-    SyncHofHost, Trace,
+    CancellationView, NativeCall, NativeCallContext, NativeContinuation, NativeOutcome,
+    NativeResult, ResumeInput, SyncHofHost, TaskContextHandle, Trace,
 };
+use sema_core::ArgsExt;
 use sema_core::{check_arity, intern, Record, SemaError, Value, ValueViewRef};
 
 use crate::register_fn;
@@ -250,22 +251,6 @@ fn map_call(callback: &Value, items: &[Value]) -> NativeOutcome {
         args: vec![first.clone()],
         continuation,
     })
-}
-
-/// Synchronous value-ABI implementation for multi-list `map`: iterate the lists
-/// in lockstep (shortest wins), calling the callback on each column.
-fn map_multi(args: &[Value]) -> Result<Value, SemaError> {
-    let lists: Vec<Cow<[Value]>> = args[1..]
-        .iter()
-        .map(|a| get_sequence(a, "map"))
-        .collect::<Result<_, _>>()?;
-    let min_len = lists.iter().map(|l| l.len()).min().unwrap_or(0);
-    let mut result = Vec::with_capacity(min_len);
-    for i in 0..min_len {
-        let call_args: Vec<Value> = lists.iter().map(|l| l[i].clone()).collect();
-        result.push(call_function(&args[0], &call_args)?);
-    }
-    Ok(Value::list(result))
 }
 
 /// Pending inputs for a predicate scan. Immutable lists and vectors are kept as
@@ -1867,12 +1852,6 @@ fn repeat_impl(args: &[Value]) -> Result<Value, SemaError> {
     Ok(Value::list(vec![val; n]))
 }
 
-/// Register a higher-order function whose callback may suspend as a DUAL-ABI
-/// native. Under a runtime quantum the VM invokes `runtime`, which returns the
-/// initial `NativeOutcome::Call` so the runtime drives the callback cooperatively
-/// (an async op inside it parks/resumes). Everywhere else (a bare top-level eval
-/// or nested/sync re-entry) the VM runs `legacy`, the synchronous per-element
-/// path.
 /// Callback argument positions per HOF name, consumed by the VM's suspension
 /// analysis: a call to the HOF may suspend only if a callback at one of these
 /// positions may. Every `register_hof`/`register_hof_ctx` registration is a
@@ -1889,6 +1868,14 @@ fn hof_callback_positions(name: &str) -> &'static [usize] {
     }
 }
 
+/// Register a higher-order function whose callback may suspend as a DUAL-ABI
+/// native. Under a runtime quantum the VM invokes `runtime`, which returns the
+/// initial `NativeOutcome::Call` so the runtime drives the callback cooperatively
+/// (an async op inside it parks/resumes). Everywhere else (a bare top-level eval
+/// or nested/sync re-entry) the VM runs `legacy`, the synchronous per-element
+/// path. Use this form only when `legacy` must differ from `runtime` (an owned
+/// accumulator handoff, an in-place map update, a runtime-only-native guard);
+/// otherwise [`register_hof_runtime`] derives `legacy` from `runtime`.
 pub(crate) fn register_hof(
     env: &sema_core::Env,
     name: &'static str,
@@ -1915,6 +1902,72 @@ pub(crate) fn register_hof_ctx(
                 .with_callback_suspension(hof_callback_positions(name)),
         ),
     );
+}
+
+/// [`register_hof`] whose value-ABI arm is the runtime arm driven to
+/// completion by [`drive_sync`].
+pub(crate) fn register_hof_runtime(
+    env: &sema_core::Env,
+    name: &'static str,
+    runtime: impl Fn(&[Value]) -> NativeResult + 'static,
+) {
+    register_hof_runtime_ctx(env, name, move |_ctx, args| runtime(args));
+}
+
+/// [`register_hof_ctx`] whose value-ABI arm is the runtime arm driven to
+/// completion by [`drive_sync`] (with no `hof_host`, so the arm takes its
+/// cooperative `NativeOutcome::Call` shape).
+pub(crate) fn register_hof_runtime_ctx(
+    env: &sema_core::Env,
+    name: &'static str,
+    runtime: impl for<'a> Fn(&mut NativeCallContext<'a>, &[Value]) -> NativeResult + 'static,
+) {
+    let runtime = std::rc::Rc::new(runtime);
+    let sync_arm = std::rc::Rc::clone(&runtime);
+    register_hof_ctx(
+        env,
+        name,
+        move |args| drive_sync(name, |ctx| sync_arm(ctx, args)),
+        move |ctx, args| runtime(ctx, args),
+    );
+}
+
+/// Run a HOF's runtime arm to completion outside the cooperative runtime: every
+/// `NativeOutcome::Call` it yields is executed through [`call_function`] and
+/// its continuation resumed with the result, so the value ABI produces exactly
+/// the values and errors of the cooperative path. A callback error propagates
+/// immediately (the continuation never sees `ResumeInput::Failed`), matching a
+/// hand-written synchronous loop's `?`.
+fn drive_sync(
+    hof: &'static str,
+    run: impl FnOnce(&mut NativeCallContext<'_>) -> NativeResult,
+) -> Result<Value, SemaError> {
+    sema_core::with_stdlib_ctx(|eval_context| {
+        let mut context = NativeCallContext {
+            eval_context,
+            task_context: TaskContextHandle::default(),
+            call_env: None,
+            cancellation: CancellationView::default(),
+            hof_host: None,
+        };
+        let mut outcome = run(&mut context)?;
+        loop {
+            match outcome {
+                NativeOutcome::Return(value) => return Ok(value),
+                NativeOutcome::Call(call) => {
+                    let value = call_function(&call.callable, &call.args)?;
+                    outcome = call
+                        .continuation
+                        .resume(&mut context, ResumeInput::Returned(value))?;
+                }
+                NativeOutcome::Suspend(_) | NativeOutcome::Runtime(_) => {
+                    return Err(SemaError::eval(format!(
+                        "{hof}: native suspended outside the cooperative runtime"
+                    )))
+                }
+            }
+        }
+    })
 }
 
 pub fn register(env: &sema_core::Env) {
@@ -2049,66 +2102,33 @@ pub fn register(env: &sema_core::Env) {
     // callback (spawn/await/channel) parks and resumes correctly — unless the
     // host proves the callback non-suspending, in which case the element loop
     // runs synchronously (`sync_map`). Both the single-list and multi-list
-    // (zipped) shapes are cooperative; the legacy value ABI keeps the
-    // synchronous per-element path for bare/top-level eval.
-    register_hof_ctx(
-        env,
-        "map",
-        |args| {
-            check_arity!(args, "map", 2..);
-            if args.len() == 2 {
-                let items = get_sequence(&args[1], "map")?;
-                let mut result = Vec::with_capacity(items.len());
-                for item in items.iter() {
-                    result.push(call_function(&args[0], &[item.clone()])?);
+    // (zipped) shapes are cooperative; the value ABI drives the same arm
+    // through `drive_sync` for bare/top-level eval.
+    register_hof_runtime_ctx(env, "map", |ctx, args| {
+        check_arity!(args, "map", 2..);
+        if args.len() == 2 {
+            let items = get_sequence(&args[1], "map")?;
+            if let Some(host) = ctx.hof_host {
+                if let Some(result) = sync_map(host, &args[0], &items) {
+                    return result;
                 }
-                Ok(Value::list(result))
-            } else {
-                map_multi(args)
             }
-        },
-        |ctx, args| {
-            check_arity!(args, "map", 2..);
-            if args.len() == 2 {
-                let items = get_sequence(&args[1], "map")?;
-                if let Some(host) = ctx.hof_host {
-                    if let Some(result) = sync_map(host, &args[0], &items) {
-                        return result;
-                    }
-                }
-                Ok(map_call(&args[0], &items))
-            } else {
-                map_multi_call(args)
-            }
-        },
-    );
+            Ok(map_call(&args[0], &items))
+        } else {
+            map_multi_call(args)
+        }
+    });
 
-    register_hof(
-        env,
-        "map-indexed",
-        |args| {
-            check_arity!(args, "map-indexed", 2);
-            let items = get_sequence(&args[1], "map-indexed")?;
-            let mut result = Vec::with_capacity(items.len());
-            for (i, item) in items.iter().enumerate() {
-                result.push(call_function(
-                    &args[0],
-                    &[Value::int(i as i64), item.clone()],
-                )?);
-            }
-            Ok(Value::list(result))
-        },
-        |args| {
-            check_arity!(args, "map-indexed", 2);
-            let items = get_sequence(&args[1], "map-indexed")?;
-            Ok(collect_indexed_call(
-                &args[0],
-                items.to_vec(),
-                CollectMode::Values,
-                "map-indexed",
-            ))
-        },
-    );
+    register_hof_runtime(env, "map-indexed", |args| {
+        check_arity!(args, "map-indexed", 2);
+        let items = get_sequence(&args[1], "map-indexed")?;
+        Ok(collect_indexed_call(
+            &args[0],
+            items.to_vec(),
+            CollectMode::Values,
+            "map-indexed",
+        ))
+    });
 
     register_fn(env, "enumerate", |args| {
         check_arity!(args, "enumerate", 1);
@@ -2121,41 +2141,24 @@ pub fn register(env: &sema_core::Env) {
     });
 
     // `filter` drives its predicate COOPERATIVELY under the runtime (see `map`).
-    register_hof_ctx(
-        env,
-        "filter",
-        |args| {
-            check_arity!(args, "filter", 2);
+    register_hof_runtime_ctx(env, "filter", |ctx, args| {
+        check_arity!(args, "filter", 2);
+        if let Some(host) = ctx.hof_host {
             let items = get_sequence(&args[1], "filter")?;
-            let mut result = Vec::new();
-            for item in items.iter() {
-                let owned = item.clone();
-                let keep = call_function(&args[0], std::slice::from_ref(&owned))?;
-                if keep.is_truthy() {
-                    result.push(owned);
-                }
+            if let Some(result) = sync_filter(host, &args[0], &items) {
+                return result;
             }
-            Ok(Value::list(result))
-        },
-        |ctx, args| {
-            check_arity!(args, "filter", 2);
-            if let Some(host) = ctx.hof_host {
-                let items = get_sequence(&args[1], "filter")?;
-                if let Some(result) = sync_filter(host, &args[0], &items) {
-                    return result;
-                }
-            }
-            predicate_call(
-                &args[0],
-                &args[1],
-                PredicateMode::Select {
-                    keep_when_truthy: true,
-                    results: Vec::new(),
-                },
-                "filter",
-            )
-        },
-    );
+        }
+        predicate_call(
+            &args[0],
+            &args[1],
+            PredicateMode::Select {
+                keep_when_truthy: true,
+                results: Vec::new(),
+            },
+            "filter",
+        )
+    });
 
     // `foldl` threads its accumulator COOPERATIVELY under the runtime (see `map`).
     register_hof_ctx(
@@ -2200,58 +2203,30 @@ pub fn register(env: &sema_core::Env) {
     );
 
     // `for-each` runs its callback COOPERATIVELY under the runtime (see `map`).
-    register_hof_ctx(
-        env,
-        "for-each",
-        |args| {
-            check_arity!(args, "for-each", 2);
-            let items = get_sequence(&args[1], "for-each")?;
-            for item in items.iter() {
-                call_function(&args[0], &[item.clone()])?;
+    register_hof_runtime_ctx(env, "for-each", |ctx, args| {
+        check_arity!(args, "for-each", 2);
+        let items = get_sequence(&args[1], "for-each")?;
+        if let Some(host) = ctx.hof_host {
+            if let Some(result) = sync_for_each(host, &args[0], &items) {
+                return result;
             }
-            Ok(Value::nil())
-        },
-        |ctx, args| {
-            check_arity!(args, "for-each", 2);
-            let items = get_sequence(&args[1], "for-each")?;
-            if let Some(host) = ctx.hof_host {
-                if let Some(result) = sync_for_each(host, &args[0], &items) {
-                    return result;
-                }
-            }
-            Ok(for_each_call(&args[0], &items))
-        },
-    );
+        }
+        Ok(for_each_call(&args[0], &items))
+    });
 
     register_fn(env, "range", |args| {
         check_arity!(args, "range", 1..=3);
         let (start, end, step) = match args.len() {
-            1 => (
-                0i64,
-                args[0]
-                    .as_int()
-                    .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?,
-                1i64,
-            ),
+            1 => (0i64, args.int_at(0, "range")?, 1i64),
             2 => {
-                let s = args[0]
-                    .as_int()
-                    .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
-                let e = args[1]
-                    .as_int()
-                    .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
+                let s = args.int_at(0, "range")?;
+                let e = args.int_at(1, "range")?;
                 (s, e, 1)
             }
             _ => {
-                let s = args[0]
-                    .as_int()
-                    .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
-                let e = args[1]
-                    .as_int()
-                    .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
-                let st = args[2]
-                    .as_int()
-                    .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?;
+                let s = args.int_at(0, "range")?;
+                let e = args.int_at(1, "range")?;
+                let st = args.int_at(2, "range")?;
                 (s, e, st)
             }
         };
@@ -2468,43 +2443,15 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::bool(false))
     });
 
-    register_hof(
-        env,
-        "any",
-        |args| {
-            check_arity!(args, "any", 2);
-            let items = get_sequence(&args[1], "any")?;
-            for item in items.iter() {
-                if call_function(&args[0], &[item.clone()])?.is_truthy() {
-                    return Ok(Value::bool(true));
-                }
-            }
-            Ok(Value::bool(false))
-        },
-        |args| {
-            check_arity!(args, "any", 2);
-            predicate_call(&args[0], &args[1], PredicateMode::Any, "any")
-        },
-    );
+    register_hof_runtime(env, "any", |args| {
+        check_arity!(args, "any", 2);
+        predicate_call(&args[0], &args[1], PredicateMode::Any, "any")
+    });
 
-    register_hof(
-        env,
-        "every",
-        |args| {
-            check_arity!(args, "every", 2);
-            let items = get_sequence(&args[1], "every")?;
-            for item in items.iter() {
-                if !call_function(&args[0], &[item.clone()])?.is_truthy() {
-                    return Ok(Value::bool(false));
-                }
-            }
-            Ok(Value::bool(true))
-        },
-        |args| {
-            check_arity!(args, "every", 2);
-            predicate_call(&args[0], &args[1], PredicateMode::Every, "every")
-        },
-    );
+    register_hof_runtime(env, "every", |args| {
+        check_arity!(args, "every", 2);
+        predicate_call(&args[0], &args[1], PredicateMode::Every, "every")
+    });
     // Note: canonical predicate-? aliases (`any?`, `every?`) are registered
     // at the end of this fn (see below).
 
@@ -2548,64 +2495,30 @@ pub fn register(env: &sema_core::Env) {
         },
     );
 
-    register_hof(
-        env,
-        "partition",
-        |args| {
-            check_arity!(args, "partition", 2);
-            let items = get_sequence(&args[1], "partition")?;
-            let mut matching = Vec::new();
-            let mut non_matching = Vec::new();
-            for item in items.iter() {
-                if call_function(&args[0], &[item.clone()])?.is_truthy() {
-                    matching.push(item.clone());
-                } else {
-                    non_matching.push(item.clone());
-                }
-            }
-            Ok(Value::list(vec![
-                Value::list(matching),
-                Value::list(non_matching),
-            ]))
-        },
-        |args| {
-            check_arity!(args, "partition", 2);
-            predicate_call(
-                &args[0],
-                &args[1],
-                PredicateMode::Partition {
-                    matching: Vec::new(),
-                    non_matching: Vec::new(),
-                },
-                "partition",
-            )
-        },
-    );
+    register_hof_runtime(env, "partition", |args| {
+        check_arity!(args, "partition", 2);
+        predicate_call(
+            &args[0],
+            &args[1],
+            PredicateMode::Partition {
+                matching: Vec::new(),
+                non_matching: Vec::new(),
+            },
+            "partition",
+        )
+    });
 
-    register_hof(
-        env,
-        "foldr",
-        |args| {
-            check_arity!(args, "foldr", 3);
-            let items = get_sequence(&args[2], "foldr")?;
-            let mut acc = args[1].clone();
-            for item in items.iter().rev() {
-                acc = call_function(&args[0], &[item.clone(), acc])?;
-            }
-            Ok(acc)
-        },
-        |args| {
-            check_arity!(args, "foldr", 3);
-            fold_sequence_call(
-                &args[0],
-                args[1].clone(),
-                &args[2],
-                FoldDirection::Reverse,
-                FoldOrder::ItemThenAccumulator,
-                "foldr",
-            )
-        },
-    );
+    register_hof_runtime(env, "foldr", |args| {
+        check_arity!(args, "foldr", 3);
+        fold_sequence_call(
+            &args[0],
+            args[1].clone(),
+            &args[2],
+            FoldDirection::Reverse,
+            FoldOrder::ItemThenAccumulator,
+            "foldr",
+        )
+    });
 
     // Comparator-driven sorting uses a resumable stable merge under the runtime:
     // each comparison is one structural call, while comparator-free sorting stays
@@ -2670,37 +2583,15 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::list(result))
     });
 
-    register_hof(
-        env,
-        "list/group-by",
-        |args| {
-            check_arity!(args, "list/group-by", 2);
-            let items = get_sequence(&args[1], "list/group-by")?;
-            let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
-            for item in items.iter() {
-                let key = call_function(&args[0], &[item.clone()])?;
-                if let Some(group) = groups.iter_mut().find(|(k, _)| k == &key) {
-                    group.1.push(item.clone());
-                } else {
-                    groups.push((key, vec![item.clone()]));
-                }
-            }
-            let mut map = BTreeMap::new();
-            for (key, vals) in groups {
-                map.insert(key, Value::list(vals));
-            }
-            Ok(Value::map(map))
-        },
-        |args| {
-            check_arity!(args, "list/group-by", 2);
-            key_projection_call(
-                &args[0],
-                &args[1],
-                KeyProjectionMode::GroupBy { groups: Vec::new() },
-                "list/group-by",
-            )
-        },
-    );
+    register_hof_runtime(env, "list/group-by", |args| {
+        check_arity!(args, "list/group-by", 2);
+        key_projection_call(
+            &args[0],
+            &args[1],
+            KeyProjectionMode::GroupBy { groups: Vec::new() },
+            "list/group-by",
+        )
+    });
 
     register_fn(env, "list/interleave", |args| {
         check_arity!(args, "list/interleave", 2..);
@@ -2720,27 +2611,11 @@ pub fn register(env: &sema_core::Env) {
 
     // `sort-by` computes each element's sort key COOPERATIVELY under the runtime
     // (each key call may park/resume) BEFORE sorting; the sort stays synchronous.
-    register_hof(
-        env,
-        "sort-by",
-        |args| {
-            check_arity!(args, "sort-by", 2);
-            let items = get_sequence(&args[1], "sort-by")?;
-            let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
-            for item in items.iter() {
-                let key = call_function(&args[0], &[item.clone()])?;
-                keyed.push((key, item.clone()));
-            }
-            keyed.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
-            let result: Vec<Value> = keyed.into_iter().map(|(_, v)| v).collect();
-            Ok(Value::list(result))
-        },
-        |args| {
-            check_arity!(args, "sort-by", 2);
-            let items = get_sequence(&args[1], "sort-by")?;
-            Ok(sort_by_call(&args[0], &items))
-        },
-    );
+    register_hof_runtime(env, "sort-by", |args| {
+        check_arity!(args, "sort-by", 2);
+        let items = get_sequence(&args[1], "sort-by")?;
+        Ok(sort_by_call(&args[0], &items))
+    });
 
     register_fn(env, "flatten-deep", |args| {
         check_arity!(args, "flatten-deep", 1);
@@ -2813,57 +2688,22 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::list(result))
     });
 
-    register_hof(
-        env,
-        "take-while",
-        |args| {
-            check_arity!(args, "take-while", 2);
-            let items = get_sequence(&args[1], "take-while")?;
-            let mut result = Vec::new();
-            for item in items.iter() {
-                if call_function(&args[0], &[item.clone()])?.is_truthy() {
-                    result.push(item.clone());
-                } else {
-                    break;
-                }
-            }
-            Ok(Value::list(result))
-        },
-        |args| {
-            check_arity!(args, "take-while", 2);
-            predicate_call(
-                &args[0],
-                &args[1],
-                PredicateMode::TakeWhile {
-                    results: Vec::new(),
-                },
-                "take-while",
-            )
-        },
-    );
+    register_hof_runtime(env, "take-while", |args| {
+        check_arity!(args, "take-while", 2);
+        predicate_call(
+            &args[0],
+            &args[1],
+            PredicateMode::TakeWhile {
+                results: Vec::new(),
+            },
+            "take-while",
+        )
+    });
 
-    register_hof(
-        env,
-        "drop-while",
-        |args| {
-            check_arity!(args, "drop-while", 2);
-            let items = get_sequence(&args[1], "drop-while")?;
-            let mut dropping = true;
-            let mut result = Vec::new();
-            for item in items.iter() {
-                if dropping && call_function(&args[0], &[item.clone()])?.is_truthy() {
-                    continue;
-                }
-                dropping = false;
-                result.push(item.clone());
-            }
-            Ok(Value::list(result))
-        },
-        |args| {
-            check_arity!(args, "drop-while", 2);
-            predicate_call(&args[0], &args[1], PredicateMode::DropWhile, "drop-while")
-        },
-    );
+    register_hof_runtime(env, "drop-while", |args| {
+        check_arity!(args, "drop-while", 2);
+        predicate_call(&args[0], &args[1], PredicateMode::DropWhile, "drop-while")
+    });
 
     register_fn(env, "list/dedupe", |args| {
         check_arity!(args, "list/dedupe", 1);
@@ -2877,36 +2717,16 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::list(result))
     });
 
-    register_hof(
-        env,
-        "flat-map",
-        |args| {
-            check_arity!(args, "flat-map", 2);
-            let items = get_sequence(&args[1], "flat-map")?;
-            let mut result = Vec::new();
-            for item in items.iter() {
-                let mapped = call_function(&args[0], &[item.clone()])?;
-                if let Some(l) = mapped.as_list() {
-                    result.extend(l.iter().cloned());
-                } else if let Some(v) = mapped.as_vector() {
-                    result.extend(v.iter().cloned());
-                } else {
-                    result.push(mapped);
-                }
-            }
-            Ok(Value::list(result))
-        },
-        |args| {
-            check_arity!(args, "flat-map", 2);
-            let items = get_sequence(&args[1], "flat-map")?;
-            Ok(collect_unary_call(
-                &args[0],
-                items.iter().cloned(),
-                CollectMode::FlattenedValues,
-                "flat-map",
-            ))
-        },
-    );
+    register_hof_runtime(env, "flat-map", |args| {
+        check_arity!(args, "flat-map", 2);
+        let items = get_sequence(&args[1], "flat-map")?;
+        Ok(collect_unary_call(
+            &args[0],
+            items.iter().cloned(),
+            CollectMode::FlattenedValues,
+            "flat-map",
+        ))
+    });
 
     register_fn(env, "list/shuffle", |args| {
         check_arity!(args, "list/shuffle", 1);
@@ -2926,66 +2746,27 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::list(vec![Value::list(left), Value::list(right)]))
     });
 
-    register_hof(
-        env,
-        "list/take-while",
-        |args| {
-            check_arity!(args, "list/take-while", 2);
-            let items = get_sequence(&args[1], "list/take-while")?;
-            let mut result = Vec::new();
-            for item in items.iter() {
-                let keep = call_function(&args[0], &[item.clone()])?;
-                if keep.is_truthy() {
-                    result.push(item.clone());
-                } else {
-                    break;
-                }
-            }
-            Ok(Value::list(result))
-        },
-        |args| {
-            check_arity!(args, "list/take-while", 2);
-            predicate_call(
-                &args[0],
-                &args[1],
-                PredicateMode::TakeWhile {
-                    results: Vec::new(),
-                },
-                "list/take-while",
-            )
-        },
-    );
+    register_hof_runtime(env, "list/take-while", |args| {
+        check_arity!(args, "list/take-while", 2);
+        predicate_call(
+            &args[0],
+            &args[1],
+            PredicateMode::TakeWhile {
+                results: Vec::new(),
+            },
+            "list/take-while",
+        )
+    });
 
-    register_hof(
-        env,
-        "list/drop-while",
-        |args| {
-            check_arity!(args, "list/drop-while", 2);
-            let items = get_sequence(&args[1], "list/drop-while")?;
-            let mut dropping = true;
-            let mut result = Vec::new();
-            for item in items.iter() {
-                if dropping {
-                    let drop = call_function(&args[0], &[item.clone()])?;
-                    if drop.is_truthy() {
-                        continue;
-                    }
-                    dropping = false;
-                }
-                result.push(item.clone());
-            }
-            Ok(Value::list(result))
-        },
-        |args| {
-            check_arity!(args, "list/drop-while", 2);
-            predicate_call(
-                &args[0],
-                &args[1],
-                PredicateMode::DropWhile,
-                "list/drop-while",
-            )
-        },
-    );
+    register_hof_runtime(env, "list/drop-while", |args| {
+        check_arity!(args, "list/drop-while", 2);
+        predicate_call(
+            &args[0],
+            &args[1],
+            PredicateMode::DropWhile,
+            "list/drop-while",
+        )
+    });
 
     register_fn(env, "list/sum", |args| {
         check_arity!(args, "list/sum", 1);
@@ -3044,30 +2825,18 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "iota", 1..=3);
         let (count, start, step) = match args.len() {
             1 => {
-                let c = args[0]
-                    .as_int()
-                    .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
+                let c = args.int_at(0, "iota")?;
                 (c, 0i64, 1i64)
             }
             2 => {
-                let c = args[0]
-                    .as_int()
-                    .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
-                let s = args[1]
-                    .as_int()
-                    .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
+                let c = args.int_at(0, "iota")?;
+                let s = args.int_at(1, "iota")?;
                 (c, s, 1)
             }
             _ => {
-                let c = args[0]
-                    .as_int()
-                    .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
-                let s = args[1]
-                    .as_int()
-                    .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
-                let st = args[2]
-                    .as_int()
-                    .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?;
+                let c = args.int_at(0, "iota")?;
+                let s = args.int_at(1, "iota")?;
+                let st = args.int_at(2, "iota")?;
                 (c, s, st)
             }
         };
@@ -3083,34 +2852,18 @@ pub fn register(env: &sema_core::Env) {
     });
 
     // list/reject — inverse of filter
-    register_hof(
-        env,
-        "list/reject",
-        |args| {
-            check_arity!(args, "list/reject", 2);
-            let items = get_sequence(&args[1], "list/reject")?;
-            let mut result = Vec::new();
-            for item in items.iter() {
-                let reject = call_function(&args[0], &[item.clone()])?;
-                if !reject.is_truthy() {
-                    result.push(item.clone());
-                }
-            }
-            Ok(Value::list(result))
-        },
-        |args| {
-            check_arity!(args, "list/reject", 2);
-            predicate_call(
-                &args[0],
-                &args[1],
-                PredicateMode::Select {
-                    keep_when_truthy: false,
-                    results: Vec::new(),
-                },
-                "list/reject",
-            )
-        },
-    );
+    register_hof_runtime(env, "list/reject", |args| {
+        check_arity!(args, "list/reject", 2);
+        predicate_call(
+            &args[0],
+            &args[1],
+            PredicateMode::Select {
+                keep_when_truthy: false,
+                results: Vec::new(),
+            },
+            "list/reject",
+        )
+    });
 
     // list/pluck — extract a field from list of maps
     register_fn(env, "list/pluck", |args| {
@@ -3254,58 +3007,30 @@ pub fn register(env: &sema_core::Env) {
     });
 
     // list/key-by — turn list of maps into map keyed by fn
-    register_hof(
-        env,
-        "list/key-by",
-        |args| {
-            check_arity!(args, "list/key-by", 2);
-            let items = get_sequence(&args[1], "list/key-by")?;
-            let mut map = BTreeMap::new();
-            for item in items.iter() {
-                let key = call_function(&args[0], &[item.clone()])?;
-                map.insert(key, item.clone());
-            }
-            Ok(Value::map(map))
-        },
-        |args| {
-            check_arity!(args, "list/key-by", 2);
-            key_projection_call(
-                &args[0],
-                &args[1],
-                KeyProjectionMode::KeyBy {
-                    keyed: BTreeMap::new(),
-                },
-                "list/key-by",
-            )
-        },
-    );
+    register_hof_runtime(env, "list/key-by", |args| {
+        check_arity!(args, "list/key-by", 2);
+        key_projection_call(
+            &args[0],
+            &args[1],
+            KeyProjectionMode::KeyBy {
+                keyed: BTreeMap::new(),
+            },
+            "list/key-by",
+        )
+    });
 
     // list/times — generate list by calling fn N times
-    register_hof(
-        env,
-        "list/times",
-        |args| {
-            check_arity!(args, "list/times", 2);
-            let n = args[0].as_index("list/times")?;
-            crate::check_bulk_len("list/times", n)?;
-            let mut result = Vec::with_capacity(n);
-            for i in 0..n {
-                result.push(call_function(&args[1], &[Value::int(i as i64)])?);
-            }
-            Ok(Value::list(result))
-        },
-        |args| {
-            check_arity!(args, "list/times", 2);
-            let n = args[0].as_index("list/times")?;
-            crate::check_bulk_len("list/times", n)?;
-            Ok(collect_range_call(
-                &args[1],
-                n,
-                CollectMode::Values,
-                "list/times",
-            ))
-        },
-    );
+    register_hof_runtime(env, "list/times", |args| {
+        check_arity!(args, "list/times", 2);
+        let n = args[0].as_index("list/times")?;
+        crate::check_bulk_len("list/times", n)?;
+        Ok(collect_range_call(
+            &args[1],
+            n,
+            CollectMode::Values,
+            "list/times",
+        ))
+    });
 
     // list/duplicates — find duplicate values
     register_fn(env, "list/duplicates", |args| {
@@ -3339,9 +3064,7 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "list/page", |args| {
         check_arity!(args, "list/page", 3);
         let items = get_sequence(&args[0], "list/page")?;
-        let page = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
+        let page = args.int_at(1, "list/page")?;
         let per_page = args[2].as_index("list/page")?;
         if page < 1 {
             return Err(SemaError::eval("list/page: page must be >= 1"));
@@ -3355,25 +3078,10 @@ pub fn register(env: &sema_core::Env) {
     });
 
     // list/find — first matching item
-    register_hof(
-        env,
-        "list/find",
-        |args| {
-            check_arity!(args, "list/find", 2);
-            let items = get_sequence(&args[1], "list/find")?;
-            for item in items.iter() {
-                let result = call_function(&args[0], &[item.clone()])?;
-                if result.is_truthy() {
-                    return Ok(item.clone());
-                }
-            }
-            Ok(Value::nil())
-        },
-        |args| {
-            check_arity!(args, "list/find", 2);
-            predicate_call(&args[0], &args[1], PredicateMode::Find, "list/find")
-        },
-    );
+    register_hof_runtime(env, "list/find", |args| {
+        check_arity!(args, "list/find", 2);
+        predicate_call(&args[0], &args[1], PredicateMode::Find, "list/find")
+    });
 
     // list/pad — pad list to length
     register_fn(env, "list/pad", |args| {
@@ -3388,48 +3096,23 @@ pub fn register(env: &sema_core::Env) {
     });
 
     // list/sole — single matching item or error
-    register_hof(
-        env,
-        "list/sole",
-        |args| {
-            check_arity!(args, "list/sole", 2);
-            let items = get_sequence(&args[1], "list/sole")?;
-            let mut found: Option<Value> = None;
-            for item in items.iter() {
-                let result = call_function(&args[0], &[item.clone()])?;
-                if result.is_truthy() {
-                    if found.is_some() {
-                        return Err(SemaError::eval("list/sole: more than one matching item"));
-                    }
-                    found = Some(item.clone());
-                }
-            }
-            found.ok_or_else(|| SemaError::eval("list/sole: no matching item"))
-        },
-        |args| {
-            check_arity!(args, "list/sole", 2);
-            predicate_call(
-                &args[0],
-                &args[1],
-                PredicateMode::Sole { found: None },
-                "list/sole",
-            )
-        },
-    );
+    register_hof_runtime(env, "list/sole", |args| {
+        check_arity!(args, "list/sole", 2);
+        predicate_call(
+            &args[0],
+            &args[1],
+            PredicateMode::Sole { found: None },
+            "list/sole",
+        )
+    });
 
     // list/join — join with optional final separator
     register_fn(env, "list/join", |args| {
         check_arity!(args, "list/join", 2..=3);
         let items = get_sequence(&args[0], "list/join")?;
-        let sep = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-            .to_string();
+        let sep = args.str_at(1, "list/join")?.to_string();
         let final_sep = if args.len() == 3 {
-            args[2]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[2].type_name()))?
-                .to_string()
+            args.str_at(2, "list/join")?.to_string()
         } else {
             sep.clone()
         };
@@ -3449,16 +3132,7 @@ pub fn register(env: &sema_core::Env) {
     });
 
     // tap — side-effect then return original
-    register_hof(
-        env,
-        "tap",
-        |args| {
-            check_arity!(args, "tap", 2);
-            call_function(&args[1], &[args[0].clone()])?;
-            Ok(args[0].clone())
-        },
-        tap_call,
-    );
+    register_hof_runtime(env, "tap", tap_call);
 
     // Car/cdr compositions (2-deep)
     register_fn(env, "caar", |args| first(&[first(args)?]));

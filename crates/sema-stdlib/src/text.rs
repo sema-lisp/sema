@@ -1,4 +1,4 @@
-use sema_core::{check_arity, SemaError, Value};
+use sema_core::{check_arity, ArgsExt, OptionsExt, SemaError, Value};
 
 use crate::register_fn;
 
@@ -6,9 +6,7 @@ pub fn register(env: &sema_core::Env) {
     // (text/chunk text) or (text/chunk text {:size 1000 :overlap 200})
     register_fn(env, "text/chunk", |args| {
         check_arity!(args, "text/chunk", 1..=2);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let text = args.str_at(0, "text/chunk")?;
         if text.is_empty() {
             return Ok(Value::list(vec![]));
         }
@@ -16,13 +14,10 @@ pub fn register(env: &sema_core::Env) {
         let mut chunk_size: usize = 1000;
         let mut overlap: usize = 200;
         if let Some(opts) = args.get(1).and_then(|v| v.as_map_rc()) {
-            if let Some(v) = opts.get(&Value::keyword("size")).and_then(|v| v.as_int()) {
+            if let Some(v) = opts.opt_int("size") {
                 chunk_size = v.max(1) as usize;
             }
-            if let Some(v) = opts
-                .get(&Value::keyword("overlap"))
-                .and_then(|v| v.as_int())
-            {
+            if let Some(v) = opts.opt_int("overlap") {
                 overlap = v.max(0) as usize;
             }
         }
@@ -38,12 +33,8 @@ pub fn register(env: &sema_core::Env) {
     // (text/chunk-by-separator text separator)
     register_fn(env, "text/chunk-by-separator", |args| {
         check_arity!(args, "text/chunk-by-separator", 2);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let sep = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let text = args.str_at(0, "text/chunk-by-separator")?;
+        let sep = args.str_at(1, "text/chunk-by-separator")?;
         if text.is_empty() {
             return Ok(Value::list(vec![]));
         }
@@ -58,9 +49,7 @@ pub fn register(env: &sema_core::Env) {
     // (text/split-sentences text)
     register_fn(env, "text/split-sentences", |args| {
         check_arity!(args, "text/split-sentences", 1);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let text = args.str_at(0, "text/split-sentences")?;
         if text.is_empty() {
             return Ok(Value::list(vec![]));
         }
@@ -74,9 +63,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "text/clean-whitespace", |args| {
         check_arity!(args, "text/clean-whitespace", 1);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let text = args.str_at(0, "text/clean-whitespace")?;
         Ok(Value::string(
             &text.split_whitespace().collect::<Vec<_>>().join(" "),
         ))
@@ -84,21 +71,14 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "text/strip-html", |args| {
         check_arity!(args, "text/strip-html", 1);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let text = args.str_at(0, "text/strip-html")?;
         Ok(Value::string(&strip_html(text)))
     });
 
     register_fn(env, "text/truncate", |args| {
         check_arity!(args, "text/truncate", 2..=3);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let max_len = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[1].type_name()))?
-            as usize;
+        let text = args.str_at(0, "text/truncate")?;
+        let max_len = args.int_at(1, "text/truncate")? as usize;
         let suffix = args
             .get(2)
             .and_then(|v| v.as_str())
@@ -119,17 +99,13 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "text/word-count", |args| {
         check_arity!(args, "text/word-count", 1);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let text = args.str_at(0, "text/word-count")?;
         Ok(Value::int(text.split_whitespace().count() as i64))
     });
 
     register_fn(env, "text/trim-indent", |args| {
         check_arity!(args, "text/trim-indent", 1);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let text = args.str_at(0, "text/trim-indent")?;
         Ok(Value::string(&trim_indent(text)))
     });
 
@@ -137,33 +113,25 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "prompt/template", |args| {
         check_arity!(args, "prompt/template", 1);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let text = args.str_at(0, "prompt/template")?;
         Ok(Value::string(text))
     });
 
     register_fn(env, "prompt/render", |args| {
         check_arity!(args, "prompt/render", 2);
-        let template = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let vars = args[1]
-            .as_map_rc()
-            .ok_or_else(|| SemaError::type_error("map", args[1].type_name()))?;
-        Ok(Value::string(&render_template(template, &vars)))
+        let template = args.str_at(0, "prompt/render")?;
+        let vars = args.map_at(1, "prompt/render")?;
+        Ok(Value::string(&sema_core::text_util::render_template(
+            template, &vars,
+        )))
     });
 
     // --- Task 15: Document Metadata ---
 
     register_fn(env, "document/create", |args| {
         check_arity!(args, "document/create", 2);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let metadata = args[1]
-            .as_map_rc()
-            .ok_or_else(|| SemaError::type_error("map", args[1].type_name()))?;
+        let text = args.str_at(0, "document/create")?;
+        let metadata = args.map_at(1, "document/create")?;
         let mut doc = std::collections::BTreeMap::new();
         doc.insert(Value::keyword("text"), Value::string(text));
         doc.insert(Value::keyword("metadata"), Value::map((*metadata).clone()));
@@ -175,8 +143,7 @@ pub fn register(env: &sema_core::Env) {
         let map = args[0]
             .as_map_rc()
             .ok_or_else(|| SemaError::type_error("map (document)", args[0].type_name()))?;
-        map.get(&Value::keyword("text"))
-            .cloned()
+        map.opt("text")
             .ok_or_else(|| SemaError::eval("not a document: missing :text"))
     });
 
@@ -185,8 +152,7 @@ pub fn register(env: &sema_core::Env) {
         let map = args[0]
             .as_map_rc()
             .ok_or_else(|| SemaError::type_error("map (document)", args[0].type_name()))?;
-        map.get(&Value::keyword("metadata"))
-            .cloned()
+        map.opt("metadata")
             .ok_or_else(|| SemaError::eval("not a document: missing :metadata"))
     });
 
@@ -196,25 +162,20 @@ pub fn register(env: &sema_core::Env) {
             .as_map_rc()
             .ok_or_else(|| SemaError::type_error("map (document)", args[0].type_name()))?;
         let text = doc
-            .get(&Value::keyword("text"))
-            .and_then(|v| v.as_str())
+            .opt_str("text")
             .ok_or_else(|| SemaError::eval("document/chunk: document missing :text"))?;
         let base_metadata = doc
-            .get(&Value::keyword("metadata"))
-            .and_then(|v| v.as_map_rc())
+            .opt_map("metadata")
             .map(|m| (*m).clone())
             .unwrap_or_default();
 
         let mut chunk_size: usize = 1000;
         let mut overlap: usize = 200;
         if let Some(opts) = args.get(1).and_then(|v| v.as_map_rc()) {
-            if let Some(v) = opts.get(&Value::keyword("size")).and_then(|v| v.as_int()) {
+            if let Some(v) = opts.opt_int("size") {
                 chunk_size = v.max(1) as usize;
             }
-            if let Some(v) = opts
-                .get(&Value::keyword("overlap"))
-                .and_then(|v| v.as_int())
-            {
+            if let Some(v) = opts.opt_int("overlap") {
                 overlap = v.max(0) as usize;
             }
         }
@@ -222,7 +183,7 @@ pub fn register(env: &sema_core::Env) {
             overlap = 0;
         }
 
-        let chunks = recursive_chunk(text, chunk_size, overlap);
+        let chunks = recursive_chunk(&text, chunk_size, overlap);
         let total = chunks.len() as i64;
         let result: Vec<Value> = chunks
             .into_iter()
@@ -244,24 +205,17 @@ pub fn register(env: &sema_core::Env) {
     // text/excerpt — extract a snippet around a match with omission markers
     register_fn(env, "text/excerpt", |args| {
         check_arity!(args, "text/excerpt", 2..=3);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let query = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let text = args.str_at(0, "text/excerpt")?;
+        let query = args.str_at(1, "text/excerpt")?;
 
         let mut radius: usize = 100;
         let mut omission = "...".to_string();
         if let Some(opts) = args.get(2).and_then(|v| v.as_map_rc()) {
-            if let Some(v) = opts.get(&Value::keyword("radius")).and_then(|v| v.as_int()) {
+            if let Some(v) = opts.opt_int("radius") {
                 radius = v.max(0) as usize;
             }
-            if let Some(v) = opts
-                .get(&Value::keyword("omission"))
-                .and_then(|v| v.as_str())
-            {
-                omission = v.to_string();
+            if let Some(v) = opts.opt_str("omission") {
+                omission = v;
             }
         }
 
@@ -295,9 +249,7 @@ pub fn register(env: &sema_core::Env) {
     // text/normalize-newlines — convert \r\n and \r to \n
     register_fn(env, "text/normalize-newlines", |args| {
         check_arity!(args, "text/normalize-newlines", 1);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let text = args.str_at(0, "text/normalize-newlines")?;
         Ok(Value::string(
             &text.replace("\r\n", "\n").replace('\r', "\n"),
         ))
@@ -474,42 +426,3 @@ fn strip_leading_whitespace(line: &str, count: usize) -> &str {
 }
 
 // --- Template helpers ---
-
-fn render_template(template: &str, vars: &std::collections::BTreeMap<Value, Value>) -> String {
-    let mut result = String::with_capacity(template.len());
-    let mut chars = template.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '{' && chars.peek() == Some(&'{') {
-            chars.next();
-            let mut var_name = String::new();
-            let mut found_close = false;
-            while let Some(c) = chars.next() {
-                if c == '}' && chars.peek() == Some(&'}') {
-                    chars.next();
-                    found_close = true;
-                    break;
-                }
-                var_name.push(c);
-            }
-            if found_close {
-                if let Some(val) = vars.get(&Value::keyword(&var_name)) {
-                    if let Some(s) = val.as_str() {
-                        result.push_str(s);
-                    } else {
-                        result.push_str(&val.to_string());
-                    }
-                } else {
-                    result.push_str("{{");
-                    result.push_str(&var_name);
-                    result.push_str("}}");
-                }
-            } else {
-                result.push_str("{{");
-                result.push_str(&var_name);
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-    result
-}

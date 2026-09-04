@@ -4,22 +4,41 @@ use std::process::Command;
 
 use sema_core::resolve::{packages_dir, validate_package_spec};
 
+use crate::output::{human_output, print_json};
+use crate::PkgCommands;
+
 const DEFAULT_REGISTRY: &str = "https://pkg.sema-lang.com";
 const PKG_META_FILE: &str = ".sema-pkg.json";
 
-macro_rules! human_output {
-    ($json:expr, $($arg:tt)*) => {
-        if !$json {
-            println!($($arg)*);
-        }
-    };
-}
-
-fn print_json(value: &serde_json::Value) -> Result<(), String> {
-    let output = serde_json::to_string_pretty(value)
-        .map_err(|error| format!("Failed to serialize package result: {error}"))?;
-    println!("{output}");
-    Ok(())
+/// Dispatch one `sema pkg` subcommand.
+pub(crate) fn run(command: PkgCommands, json: bool) -> Result<(), String> {
+    match command {
+        PkgCommands::Add { spec, registry } => cmd_add(&spec, registry.as_deref(), json),
+        PkgCommands::Install { locked } => cmd_install(locked, json),
+        PkgCommands::Update { name } => cmd_update(name.as_deref(), json),
+        PkgCommands::Remove { name } => cmd_remove(&name, json),
+        PkgCommands::List => cmd_list(json),
+        PkgCommands::Init => cmd_init(json),
+        PkgCommands::Login {
+            token,
+            username,
+            password,
+            registry,
+        } => cmd_login(
+            token.as_deref(),
+            username.as_deref(),
+            password.as_deref(),
+            &registry,
+            json,
+        ),
+        PkgCommands::Logout => cmd_logout(json),
+        PkgCommands::Whoami { registry } => cmd_whoami(registry.as_deref(), json),
+        PkgCommands::Config { key, value } => cmd_config(key.as_deref(), value.as_deref(), json),
+        PkgCommands::Publish { registry } => cmd_publish(registry.as_deref(), json),
+        PkgCommands::Search { query, registry } => cmd_search(&query, registry.as_deref(), json),
+        PkgCommands::Yank { spec, registry } => cmd_yank(&spec, registry.as_deref(), json),
+        PkgCommands::Info { name, registry } => cmd_info(&name, registry.as_deref(), json),
+    }
 }
 
 fn ensure_sema_toml(json: bool) -> Result<(), String> {
@@ -1381,12 +1400,7 @@ fn token_from_password(
             .json(&serde_json::json!({"name": "sema-cli login"}))
             .send()
     })?;
-    if !resp.status().is_success() {
-        return Err(format!("Could not create an API token ({})", resp.status()));
-    }
-    let body: serde_json::Value = resp
-        .json()
-        .map_err(|e| format!("Invalid token response: {e}"))?;
+    let body = registry_json("Token create", resp)?;
     body.get("token")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
@@ -1466,13 +1480,7 @@ pub fn cmd_whoami(registry: Option<&str>, json: bool) -> Result<(), String> {
             "{registry_url} does not support whoami (no /api/v1/me endpoint — registry too old)"
         ));
     }
-    if !status.is_success() {
-        return Err(format!("Whoami failed ({status})"));
-    }
-
-    let body: serde_json::Value = resp
-        .json()
-        .map_err(|e| format!("Invalid whoami response: {e}"))?;
+    let body = registry_json("Whoami", resp)?;
     if json {
         return print_json(&body);
     }
@@ -1982,6 +1990,44 @@ where
     unreachable!("the final attempt always returns")
 }
 
+/// Decode a registry reply. A non-2xx status maps to
+/// `"<what> failed (<status>): <body.error>"`; a 2xx body is parsed as JSON.
+fn registry_json(
+    what: &str,
+    resp: reqwest::blocking::Response,
+) -> Result<serde_json::Value, String> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body: serde_json::Value = resp.json().unwrap_or_default();
+        let error = body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        return Err(format!("{what} failed ({status}): {error}"));
+    }
+    resp.json()
+        .map_err(|e| format!("Failed to parse response: {e}"))
+}
+
+/// One JSON request to the registry: `send_with_retry` plus `registry_json`.
+/// `token`, when given, is sent as a bearer header.
+fn registry_request(
+    what: &str,
+    method: reqwest::Method,
+    url: &str,
+    token: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let client = http_client()?;
+    let resp = send_with_retry(what, || {
+        let mut req = client.request(method.clone(), url);
+        if let Some(t) = token {
+            req = req.header("Authorization", format!("Bearer {t}"));
+        }
+        req.send()
+    })?;
+    registry_json(what, resp)
+}
+
 /// Download a registry package and return (tarball_bytes, checksum).
 /// The registry may return a redirect (e.g. to GitHub for meta-registry packages),
 /// so we explicitly follow redirects.
@@ -2062,30 +2108,14 @@ fn registry_install_locked(
 
 /// Fetch package info from the registry.
 fn registry_package_info(name: &str, registry_url: &str) -> Result<serde_json::Value, String> {
-    let client = http_client()?;
     let base = registry_url.trim_end_matches('/');
     let url = format!("{base}/api/v1/packages/{name}");
-    let token = read_token();
-
-    let resp = send_with_retry("Fetch package", || {
-        let mut req = client.get(&url);
-        if let Some(ref t) = token {
-            req = req.header("Authorization", format!("Bearer {t}"));
-        }
-        req.send()
-    })?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body: serde_json::Value = resp.json().unwrap_or_default();
-        let error = body
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown error");
-        return Err(format!("Failed to fetch package ({status}): {error}"));
-    }
-
-    resp.json()
-        .map_err(|e| format!("Failed to parse response: {e}"))
+    registry_request(
+        "Fetch package",
+        reqwest::Method::GET,
+        &url,
+        read_token().as_deref(),
+    )
 }
 
 fn current_sema_version() -> semver::Version {
@@ -2353,29 +2383,17 @@ pub fn cmd_publish(registry: Option<&str>, json: bool) -> Result<(), String> {
             .send()
     })?;
 
-    if resp.status().is_success() {
-        let body: serde_json::Value = resp
-            .json()
-            .map_err(|e| format!("Failed to parse response: {e}"))?;
-        if json {
-            return print_json(&body);
-        }
-        let checksum = body
-            .get("checksum")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let size = body.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
-        println!("✓ Published {name}@{version} ({size} bytes, sha256:{checksum})");
-        Ok(())
-    } else {
-        let status = resp.status();
-        let body: serde_json::Value = resp.json().unwrap_or_default();
-        let error = body
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown error");
-        Err(format!("Publish failed ({status}): {error}"))
+    let body = registry_json("Publish", resp)?;
+    if json {
+        return print_json(&body);
     }
+    let checksum = body
+        .get("checksum")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let size = body.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    println!("✓ Published {name}@{version} ({size} bytes, sha256:{checksum})");
+    Ok(())
 }
 
 pub fn cmd_search(query: &str, registry: Option<&str>, json: bool) -> Result<(), String> {
@@ -2383,17 +2401,7 @@ pub fn cmd_search(query: &str, registry: Option<&str>, json: bool) -> Result<(),
     let base = registry_url.trim_end_matches('/');
     let url = format!("{base}/api/v1/search?q={}", urlencoded(query));
 
-    let client = http_client()?;
-    let resp = send_with_retry("Search", || client.get(&url).send())?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        return Err(format!("Search failed ({status})"));
-    }
-
-    let body: serde_json::Value = resp
-        .json()
-        .map_err(|e| format!("Failed to parse response: {e}"))?;
+    let body = registry_request("Search", reqwest::Method::GET, &url, None)?;
 
     if json {
         return print_json(&body);
@@ -2442,36 +2450,20 @@ pub fn cmd_yank(spec: &str, registry: Option<&str>, json: bool) -> Result<(), St
     let base = registry_url.trim_end_matches('/');
 
     let url = format!("{base}/api/v1/packages/{name}/{version}/yank");
-    let client = http_client()?;
-    let resp = send_with_retry("Yank", || {
-        client
-            .post(&url)
-            .header("Authorization", format!("Bearer {token}"))
-            .send()
-    })?;
+    registry_request("Yank", reqwest::Method::POST, &url, Some(&token))?;
 
-    if resp.status().is_success() {
-        if json {
-            print_json(&serde_json::json!({
-                "ok": true,
-                "command": "yank",
-                "package": name,
-                "version": version,
-                "registry": registry_url,
-            }))?;
-        } else {
-            println!("✓ Yanked {name}@{version}");
-        }
-        Ok(())
+    if json {
+        print_json(&serde_json::json!({
+            "ok": true,
+            "command": "yank",
+            "package": name,
+            "version": version,
+            "registry": registry_url,
+        }))?;
     } else {
-        let status = resp.status();
-        let body: serde_json::Value = resp.json().unwrap_or_default();
-        let error = body
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown error");
-        Err(format!("Yank failed ({status}): {error}"))
+        println!("✓ Yanked {name}@{version}");
     }
+    Ok(())
 }
 
 pub fn cmd_info(name: &str, registry: Option<&str>, json: bool) -> Result<(), String> {
@@ -2555,7 +2547,7 @@ fn urlencoded(s: &str) -> String {
 
 const LOCK_FILE: &str = "sema.lock";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum LockEntry {
     Git {
         git_ref: String,
@@ -2783,6 +2775,7 @@ fn remove_lock_entry(name: &str) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sema_core::testing::{unique_temp_dir, TempDir};
     use serial_test::serial;
     use std::fs;
     use std::io::Write;
@@ -3063,10 +3056,7 @@ mod tests {
     }
 
     fn tmpdir(name: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("sema-pkg-test-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        fs::create_dir_all(&d).unwrap();
-        d
+        unique_temp_dir(&format!("pkg-{name}"))
     }
 
     #[test]
@@ -3181,9 +3171,7 @@ mod tests {
 
     #[test]
     fn test_find_all_packages_empty() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-find-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_temp_dir("pkg-find");
 
         let packages = find_all_packages(&tmp);
         assert!(packages.is_empty());
@@ -3193,8 +3181,7 @@ mod tests {
 
     #[test]
     fn test_find_all_packages_finds_package_sema() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-find2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = unique_temp_dir("pkg-find2");
 
         let pkg = tmp.join("github.com/user/repo");
         std::fs::create_dir_all(&pkg).unwrap();
@@ -3209,8 +3196,7 @@ mod tests {
 
     #[test]
     fn test_find_all_packages_finds_sema_toml() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-find3-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = unique_temp_dir("pkg-find3");
 
         let pkg = tmp.join("github.com/user/lib");
         std::fs::create_dir_all(&pkg).unwrap();
@@ -3224,8 +3210,7 @@ mod tests {
 
     #[test]
     fn test_find_package_dir_by_full_path() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-find4-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = unique_temp_dir("pkg-find4");
 
         let pkg = tmp.join("github.com/user/repo");
         std::fs::create_dir_all(&pkg).unwrap();
@@ -3240,8 +3225,7 @@ mod tests {
 
     #[test]
     fn test_find_package_dir_by_name() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-find5-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = unique_temp_dir("pkg-find5");
 
         let pkg = tmp.join("github.com/user/mylib");
         std::fs::create_dir_all(&pkg).unwrap();
@@ -3255,9 +3239,7 @@ mod tests {
 
     #[test]
     fn test_find_package_dir_not_found() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-find6-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_temp_dir("pkg-find6");
 
         let found = find_package_dir(&tmp, "nonexistent");
         assert!(found.is_none());
@@ -3269,9 +3251,7 @@ mod tests {
     fn test_run_git_checkout_ref_not_as_path() {
         // Verify that `git checkout <ref>` (without `--`) correctly switches
         // to a branch/tag. With `--`, git would interpret the ref as a file path.
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-checkout-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_temp_dir("pkg-checkout");
 
         // Init a repo and create a branch
         run_git(Some(&tmp), &["init"]).unwrap();
@@ -3311,9 +3291,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_cmd_init_creates_sema_toml() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-init-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_temp_dir("pkg-init");
 
         // Run cmd_init in the temp directory
         let original_dir = std::env::current_dir().unwrap();
@@ -3352,9 +3330,7 @@ mod tests {
 
     #[test]
     fn test_add_dep_to_toml_new_entry() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-adddep1-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_temp_dir("pkg-adddep1");
 
         let toml_path = tmp.join("sema.toml");
         std::fs::write(
@@ -3378,9 +3354,7 @@ mod tests {
 
     #[test]
     fn test_add_dep_to_toml_updates_existing() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-adddep2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_temp_dir("pkg-adddep2");
 
         let toml_path = tmp.join("sema.toml");
         std::fs::write(
@@ -3407,9 +3381,7 @@ mod tests {
 
     #[test]
     fn test_add_dep_to_toml_already_up_to_date() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-adddep3-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_temp_dir("pkg-adddep3");
 
         let toml_path = tmp.join("sema.toml");
         std::fs::write(
@@ -3426,9 +3398,7 @@ mod tests {
 
     #[test]
     fn test_add_dep_to_toml_no_deps_section() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-adddep4-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_temp_dir("pkg-adddep4");
 
         let toml_path = tmp.join("sema.toml");
         std::fs::write(&toml_path, "[package]\nname = \"test\"\n").unwrap();
@@ -3448,9 +3418,7 @@ mod tests {
 
     #[test]
     fn test_add_dep_to_toml_preserves_existing_deps() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-adddep5-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_temp_dir("pkg-adddep5");
 
         let toml_path = tmp.join("sema.toml");
         std::fs::write(
@@ -3477,9 +3445,7 @@ mod tests {
 
     #[test]
     fn test_remove_dep_from_toml_quoted_key() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-rmdep1-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_temp_dir("pkg-rmdep1");
 
         let toml_path = tmp.join("sema.toml");
         std::fs::write(
@@ -3514,9 +3480,7 @@ version = "0.1.0"
 
     #[test]
     fn test_remove_dep_from_toml_quoted_key_with_slashes() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-rmdep2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_temp_dir("pkg-rmdep2");
 
         let toml_path = tmp.join("sema.toml");
         std::fs::write(
@@ -3540,9 +3504,7 @@ version = "0.1.0"
 
     #[test]
     fn test_remove_dep_from_toml_not_found() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-rmdep3-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_temp_dir("pkg-rmdep3");
 
         let toml_path = tmp.join("sema.toml");
         std::fs::write(
@@ -3563,9 +3525,7 @@ version = "0.1.0"
 
     #[test]
     fn test_remove_dep_from_toml_no_deps_section() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-rmdep4-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_temp_dir("pkg-rmdep4");
 
         let toml_path = tmp.join("sema.toml");
         std::fs::write(&toml_path, "[package]\nname = \"test\"\n").unwrap();
@@ -3578,9 +3538,7 @@ version = "0.1.0"
 
     #[test]
     fn test_remove_dep_from_toml_preserves_comments() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-rmdep5-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_temp_dir("pkg-rmdep5");
 
         let toml_path = tmp.join("sema.toml");
         std::fs::write(
@@ -3613,9 +3571,7 @@ name = "myproject"
     #[test]
     #[serial]
     fn test_cmd_init_rejects_existing() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-init2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_temp_dir("pkg-init2");
         std::fs::write(tmp.join("sema.toml"), "existing").unwrap();
 
         let original_dir = std::env::current_dir().unwrap();
@@ -3641,9 +3597,7 @@ name = "myproject"
 
     #[test]
     fn test_write_and_read_pkg_meta() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-meta-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_temp_dir("pkg-meta");
 
         write_pkg_meta(
             &tmp,
@@ -3668,9 +3622,7 @@ name = "myproject"
 
     #[test]
     fn test_read_pkg_meta_missing() {
-        let tmp = std::env::temp_dir().join(format!("sema-pkg-meta2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        let tmp = unique_temp_dir("pkg-meta2");
 
         assert!(read_pkg_meta(&tmp).is_none());
 
@@ -3760,6 +3712,27 @@ name = "myproject"
         gz.finish().unwrap()
     }
 
+    /// A gzipped tarball of regular files (`path`, `contents`), mode 0644.
+    fn tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut ar = tar::Builder::new(&mut gz);
+            for (path, data) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(path).unwrap();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                ar.append(&header, *data).unwrap();
+            }
+            ar.finish().unwrap();
+        }
+        gz.finish().unwrap()
+    }
+
     #[test]
     fn extract_tarball_rejects_path_traversal() {
         let malicious = make_malicious_tarball("../pwned.txt", b"pwned!");
@@ -3806,22 +3779,7 @@ name = "myproject"
 
     #[test]
     fn extract_tarball_extracts_valid_archive() {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-
-        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
-        {
-            let mut ar = tar::Builder::new(&mut gz);
-            let data = b"(define x 42)";
-            let mut header = tar::Header::new_gnu();
-            header.set_path("package.sema").unwrap();
-            header.set_size(data.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            ar.append(&header, &data[..]).unwrap();
-            ar.finish().unwrap();
-        }
-        let tarball = gz.finish().unwrap();
+        let tarball = tarball(&[("package.sema", b"(define x 42)")]);
 
         let dir = tmpdir("valid-tar");
         let dest = dir.join("extracted");
@@ -3861,23 +3819,7 @@ name = "myproject"
 
     #[test]
     fn extract_tarball_handles_nested_directories() {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-
-        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
-        {
-            let mut ar = tar::Builder::new(&mut gz);
-
-            let data = b"(define deep 1)";
-            let mut header = tar::Header::new_gnu();
-            header.set_path("src/lib/deep.sema").unwrap();
-            header.set_size(data.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            ar.append(&header, &data[..]).unwrap();
-            ar.finish().unwrap();
-        }
-        let tarball = gz.finish().unwrap();
+        let tarball = tarball(&[("src/lib/deep.sema", b"(define deep 1)")]);
 
         let dir = tmpdir("nested-dirs");
         let dest = dir.join("extracted");
@@ -3890,21 +3832,7 @@ name = "myproject"
 
     /// Build a minimal valid gzipped tarball containing `package.sema`.
     fn make_pkg_tarball(content: &str) -> Vec<u8> {
-        use flate2::write::GzEncoder;
-        use flate2::Compression;
-        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
-        {
-            let mut ar = tar::Builder::new(&mut gz);
-            let data = content.as_bytes();
-            let mut header = tar::Header::new_gnu();
-            header.set_path("package.sema").unwrap();
-            header.set_size(data.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            ar.append(&header, data).unwrap();
-            ar.finish().unwrap();
-        }
-        gz.finish().unwrap()
+        tarball(&[("package.sema", content.as_bytes())])
     }
 
     // BIN-4: a failed extraction must not corrupt an existing install, and a
@@ -3979,138 +3907,74 @@ name = "myproject"
 
     // ── Round-trip tests ──────────────────────────────────────────────
 
+    /// Write a lock file holding only `name = entry` in a fresh cwd, then read
+    /// it back. Returns the written text and the loaded entry.
+    fn roundtrip(name: &str, entry: LockEntry) -> (String, LockEntry) {
+        let dir = TempDir::new("pkg-lock");
+        let _guard = TestDir::new(dir.path());
+        let mut lock = LockFile::new();
+        lock.entries.insert(name.to_string(), entry);
+        write_lock_file(&lock).unwrap();
+        let content = fs::read_to_string(dir.path().join(LOCK_FILE)).unwrap();
+        let mut loaded = read_lock_file().unwrap().unwrap();
+        assert_eq!(loaded.entries.len(), 1);
+        (content, loaded.entries.remove(name).unwrap())
+    }
+
     #[test]
     #[serial]
     fn lock_file_round_trip_git() {
-        let dir = tmpdir("lock-git");
-        let _guard = TestDir::new(&dir);
-
-        let mut lock = LockFile::new();
-        lock.entries.insert(
-            "github.com/user/repo".to_string(),
-            LockEntry::Git {
-                git_ref: "main".to_string(),
-                commit: "abc123def456".to_string(),
-                direct: true,
-            },
-        );
-
-        write_lock_file(&lock).unwrap();
-
-        let content = fs::read_to_string(dir.join(LOCK_FILE)).unwrap();
+        let entry = LockEntry::Git {
+            git_ref: "main".to_string(),
+            commit: "abc123def456".to_string(),
+            direct: true,
+        };
+        let (content, loaded) = roundtrip("github.com/user/repo", entry.clone());
         assert!(content.contains("lock_version = 1"));
         assert!(content.contains("[packages.\"github.com/user/repo\"]"));
         assert!(content.contains("source = \"git\""));
         assert!(content.contains("commit = \"abc123def456\""));
         assert!(content.contains("direct = true"));
-
-        let loaded = read_lock_file().unwrap().unwrap();
-        assert_eq!(loaded.entries.len(), 1);
-        match &loaded.entries["github.com/user/repo"] {
-            LockEntry::Git {
-                git_ref,
-                commit,
-                direct,
-            } => {
-                assert_eq!(git_ref, "main");
-                assert_eq!(commit, "abc123def456");
-                assert!(direct);
-            }
-            _ => panic!("Expected git entry"),
-        }
-
-        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(loaded, entry);
     }
 
     #[test]
     #[serial]
     fn lock_file_round_trip_registry() {
-        let dir = tmpdir("lock-registry");
-        let _guard = TestDir::new(&dir);
-
-        let mut lock = LockFile::new();
-        lock.entries.insert(
-            "http-helpers".to_string(),
-            LockEntry::Registry {
-                version: "1.2.0".to_string(),
-                registry: "https://pkg.sema-lang.com".to_string(),
-                checksum: "deadbeef".to_string(),
-                direct: true,
-            },
-        );
-
-        write_lock_file(&lock).unwrap();
-
-        let loaded = read_lock_file().unwrap().unwrap();
-        assert_eq!(loaded.entries.len(), 1);
-        match &loaded.entries["http-helpers"] {
-            LockEntry::Registry {
-                version,
-                registry,
-                checksum,
-                direct,
-            } => {
-                assert_eq!(version, "1.2.0");
-                assert_eq!(registry, "https://pkg.sema-lang.com");
-                assert_eq!(checksum, "deadbeef");
-                assert!(direct);
-            }
-            _ => panic!("Expected registry entry"),
-        }
-
-        let _ = fs::remove_dir_all(&dir);
+        let entry = LockEntry::Registry {
+            version: "1.2.0".to_string(),
+            registry: "https://pkg.sema-lang.com".to_string(),
+            checksum: "deadbeef".to_string(),
+            direct: true,
+        };
+        let (_, loaded) = roundtrip("http-helpers", entry.clone());
+        assert_eq!(loaded, entry);
     }
 
     #[test]
     #[serial]
     fn lock_file_round_trip_git_transitive() {
-        let dir = tmpdir("lock-git-transitive");
-        let _guard = TestDir::new(&dir);
-
-        let mut lock = LockFile::new();
-        lock.entries.insert(
-            "github.com/user/repo".to_string(),
-            LockEntry::Git {
-                git_ref: "main".to_string(),
-                commit: "abc123def456".to_string(),
-                direct: false,
-            },
-        );
-
-        write_lock_file(&lock).unwrap();
-
-        let content = fs::read_to_string(dir.join(LOCK_FILE)).unwrap();
+        let entry = LockEntry::Git {
+            git_ref: "main".to_string(),
+            commit: "abc123def456".to_string(),
+            direct: false,
+        };
+        let (content, loaded) = roundtrip("github.com/user/repo", entry.clone());
         assert!(content.contains("direct = false"));
-
-        let loaded = read_lock_file().unwrap().unwrap();
-        assert!(!loaded.entries["github.com/user/repo"].is_direct());
-
-        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(loaded, entry);
     }
 
     #[test]
     #[serial]
     fn lock_file_round_trip_registry_transitive() {
-        let dir = tmpdir("lock-registry-transitive");
-        let _guard = TestDir::new(&dir);
-
-        let mut lock = LockFile::new();
-        lock.entries.insert(
-            "http-helpers".to_string(),
-            LockEntry::Registry {
-                version: "1.2.0".to_string(),
-                registry: "https://pkg.sema-lang.com".to_string(),
-                checksum: "deadbeef".to_string(),
-                direct: false,
-            },
-        );
-
-        write_lock_file(&lock).unwrap();
-
-        let loaded = read_lock_file().unwrap().unwrap();
-        assert!(!loaded.entries["http-helpers"].is_direct());
-
-        let _ = fs::remove_dir_all(&dir);
+        let entry = LockEntry::Registry {
+            version: "1.2.0".to_string(),
+            registry: "https://pkg.sema-lang.com".to_string(),
+            checksum: "deadbeef".to_string(),
+            direct: false,
+        };
+        let (_, loaded) = roundtrip("http-helpers", entry.clone());
+        assert_eq!(loaded, entry);
     }
 
     #[test]
@@ -4811,73 +4675,57 @@ name = "myproject"
     // ── cmd_install --locked logic tests ──────────────────────────────
     // These test the validation logic without requiring network access.
 
+    /// Run `cmd_install --locked` in a fresh cwd holding `sema.toml` (and
+    /// `sema.lock` when given) and return its error.
+    fn install_locked_err(toml: &str, lock: Option<&str>) -> String {
+        let dir = TempDir::new("pkg-install-locked");
+        let _guard = TestDir::new(dir.path());
+        fs::write("sema.toml", toml).unwrap();
+        if let Some(lock) = lock {
+            fs::write(LOCK_FILE, lock).unwrap();
+        }
+        cmd_install(true, false).unwrap_err()
+    }
+
     #[test]
     #[serial]
     fn cmd_install_locked_fails_without_lock_file() {
-        let dir = tmpdir("install-no-lock");
-        let _guard = TestDir::new(&dir);
-
-        fs::write(
-            "sema.toml",
+        let err = install_locked_err(
             "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[deps]\nfoo = \"1.0.0\"\n",
-        )
-        .unwrap();
-
-        let err = cmd_install(true, false).unwrap_err();
+            None,
+        );
         assert!(err.contains("sema.lock not found"), "got: {err}");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     #[serial]
     fn cmd_install_locked_fails_dep_not_in_lock() {
-        let dir = tmpdir("install-dep-missing");
-        let _guard = TestDir::new(&dir);
-
-        fs::write(
-            "sema.toml",
+        // Lock only has foo, not bar
+        let err = install_locked_err(
             "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
              [deps]\nfoo = \"1.0.0\"\nbar = \"2.0.0\"\n",
-        )
-        .unwrap();
-
-        // Lock only has foo, not bar
-        fs::write(
-            LOCK_FILE,
-            "lock_version = 1\n\n\
+            Some(
+                "lock_version = 1\n\n\
              [packages.foo]\n\
              source = \"registry\"\n\
              version = \"1.0.0\"\n\
              registry = \"http://localhost\"\n\
              checksum = \"aaa\"\n",
-        )
-        .unwrap();
-
-        let err = cmd_install(true, false).unwrap_err();
+            ),
+        );
         assert!(err.contains("bar"), "got: {err}");
         assert!(err.contains("not in sema.lock"), "got: {err}");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     #[serial]
     fn cmd_install_locked_fails_orphan_in_lock() {
-        let dir = tmpdir("install-orphan");
-        let _guard = TestDir::new(&dir);
-
         // sema.toml has only foo
-        fs::write(
-            "sema.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[deps]\nfoo = \"1.0.0\"\n",
-        )
-        .unwrap();
-
         // Lock has foo AND orphaned-pkg
-        fs::write(
-            LOCK_FILE,
-            "lock_version = 1\n\n\
+        let err = install_locked_err(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[deps]\nfoo = \"1.0.0\"\n",
+            Some(
+                "lock_version = 1\n\n\
              [packages.foo]\n\
              source = \"registry\"\n\
              version = \"1.0.0\"\n\
@@ -4888,103 +4736,65 @@ name = "myproject"
              version = \"3.0.0\"\n\
              registry = \"http://localhost\"\n\
              checksum = \"bbb\"\n",
-        )
-        .unwrap();
-
-        let err = cmd_install(true, false).unwrap_err();
+            ),
+        );
         assert!(err.contains("orphaned-pkg"), "got: {err}");
         assert!(err.contains("not in sema.toml"), "got: {err}");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     #[serial]
     fn cmd_install_locked_fails_version_mismatch_registry() {
-        let dir = tmpdir("install-version-mismatch");
-        let _guard = TestDir::new(&dir);
-
         // sema.toml wants 2.0.0
-        fs::write(
-            "sema.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[deps]\nfoo = \"2.0.0\"\n",
-        )
-        .unwrap();
-
         // Lock has 1.0.0
-        fs::write(
-            LOCK_FILE,
-            "lock_version = 1\n\n\
+        let err = install_locked_err(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[deps]\nfoo = \"2.0.0\"\n",
+            Some(
+                "lock_version = 1\n\n\
              [packages.foo]\n\
              source = \"registry\"\n\
              version = \"1.0.0\"\n\
              registry = \"http://localhost\"\n\
              checksum = \"aaa\"\n",
-        )
-        .unwrap();
-
-        let err = cmd_install(true, false).unwrap_err();
+            ),
+        );
         assert!(err.contains("foo"), "got: {err}");
         assert!(err.contains("mismatch"), "got: {err}");
         assert!(err.contains("2.0.0"), "got: {err}");
         assert!(err.contains("1.0.0"), "got: {err}");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     #[serial]
     fn cmd_install_locked_fails_ref_mismatch_git() {
-        let dir = tmpdir("install-ref-mismatch");
-        let _guard = TestDir::new(&dir);
-
         // sema.toml wants v2.0
-        fs::write(
-            "sema.toml",
+        // Lock has v1.0
+        let err = install_locked_err(
             "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
              [deps]\n\"github.com/user/repo\" = \"v2.0\"\n",
-        )
-        .unwrap();
-
-        // Lock has v1.0
-        fs::write(
-            LOCK_FILE,
-            "lock_version = 1\n\n\
+            Some(
+                "lock_version = 1\n\n\
              [packages.\"github.com/user/repo\"]\n\
              source = \"git\"\n\
              ref = \"v1.0\"\n\
              commit = \"abc123\"\n",
-        )
-        .unwrap();
-
-        let err = cmd_install(true, false).unwrap_err();
+            ),
+        );
         assert!(err.contains("github.com/user/repo"), "got: {err}");
         assert!(err.contains("mismatch"), "got: {err}");
         assert!(err.contains("v2.0"), "got: {err}");
         assert!(err.contains("v1.0"), "got: {err}");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     #[serial]
     fn cmd_install_locked_fails_malformed_lock() {
-        let dir = tmpdir("install-malformed-lock");
-        let _guard = TestDir::new(&dir);
-
-        fs::write(
-            "sema.toml",
-            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[deps]\nfoo = \"1.0.0\"\n",
-        )
-        .unwrap();
-
         // Invalid TOML in lock
-        fs::write(LOCK_FILE, "this is garbage {{{").unwrap();
-
-        let err = cmd_install(true, false).unwrap_err();
+        let err = install_locked_err(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[deps]\nfoo = \"1.0.0\"\n",
+            Some("this is garbage {{{"),
+        );
         assert!(err.contains("parse"), "got: {err}");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5032,15 +4842,36 @@ name = "myproject"
     // No network involved: cmd_remove only touches sema.toml/sema.lock and
     // whatever manifests already sit on disk under SEMA_HOME.
 
+    /// A fresh `SEMA_HOME`; the variable is unset and the directory deleted on
+    /// drop, panic included.
+    struct SemaHome(TempDir);
+
+    impl SemaHome {
+        fn new() -> Self {
+            let dir = TempDir::new("pkg-home");
+            std::env::set_var("SEMA_HOME", dir.path());
+            Self(dir)
+        }
+
+        fn packages(&self) -> PathBuf {
+            self.0.path().join("packages")
+        }
+    }
+
+    impl Drop for SemaHome {
+        fn drop(&mut self) {
+            std::env::remove_var("SEMA_HOME");
+        }
+    }
+
     #[test]
     #[serial]
     fn cmd_remove_keeps_transitively_required_package_on_disk() {
-        let dir = tmpdir("remove-keep-cwd");
-        let sema_home = tmpdir("remove-keep-home");
-        let _guard = TestDir::new(&dir);
-        std::env::set_var("SEMA_HOME", sema_home.to_str().unwrap());
+        let dir = TempDir::new("pkg-remove-keep-cwd");
+        let sema_home = SemaHome::new();
+        let _guard = TestDir::new(dir.path());
 
-        let pkg_dir = sema_home.join("packages");
+        let pkg_dir = sema_home.packages();
         fs::create_dir_all(pkg_dir.join("A")).unwrap();
         fs::write(
             pkg_dir.join("A").join("sema.toml"),
@@ -5086,21 +4917,16 @@ name = "myproject"
             !lock.entries["A"].is_direct(),
             "A's lock entry must be demoted to transitive, not dropped"
         );
-
-        std::env::remove_var("SEMA_HOME");
-        let _ = fs::remove_dir_all(&dir);
-        let _ = fs::remove_dir_all(&sema_home);
     }
 
     #[test]
     #[serial]
     fn cmd_remove_deletes_package_nothing_else_needs() {
-        let dir = tmpdir("remove-delete-cwd");
-        let sema_home = tmpdir("remove-delete-home");
-        let _guard = TestDir::new(&dir);
-        std::env::set_var("SEMA_HOME", sema_home.to_str().unwrap());
+        let dir = TempDir::new("pkg-remove-delete-cwd");
+        let sema_home = SemaHome::new();
+        let _guard = TestDir::new(dir.path());
 
-        let pkg_dir = sema_home.join("packages");
+        let pkg_dir = sema_home.packages();
         fs::create_dir_all(pkg_dir.join("A")).unwrap();
         fs::write(
             pkg_dir.join("A").join("sema.toml"),
@@ -5127,10 +4953,6 @@ name = "myproject"
             "A must be deleted — nothing else needs it"
         );
         assert!(!Path::new(LOCK_FILE).exists(), "lock must be empty/removed");
-
-        std::env::remove_var("SEMA_HOME");
-        let _ = fs::remove_dir_all(&dir);
-        let _ = fs::remove_dir_all(&sema_home);
     }
 
     // ── TOML key edge cases ───────────────────────────────────────────

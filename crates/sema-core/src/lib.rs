@@ -1,5 +1,6 @@
 #![allow(clippy::mutable_key_type)]
 pub mod archive;
+pub mod args;
 pub mod async_signal;
 pub mod context;
 pub mod cycle;
@@ -16,10 +17,12 @@ pub mod output_hook;
 pub mod resolve;
 pub mod sandbox;
 pub mod stack;
+pub mod testing;
 pub mod text_util;
 pub mod value;
 pub mod vfs;
 
+pub use args::{ArgsExt, OptionsExt, ResultExt};
 pub use async_signal::{
     blocking_sleep_ms, check_interrupt, clear_blocking_sleep_callback, clear_interrupt_callback,
     current_conversation_scope_boxed, current_llm_scope_boxed, current_task_id,
@@ -56,7 +59,9 @@ pub use io_backend::{
     io_backend, io_block_on, io_spawn, io_spawn_blocking, set_io_backend, AbortHook, BoxIoFuture,
     IoBackend,
 };
-pub use json::{json_to_value, key_to_string, value_to_json, value_to_json_lossy};
+pub use json::{
+    json_to_value, key_to_string, value_to_json, value_to_json_lossy, value_to_json_schema,
+};
 pub use lasso::Spur;
 pub use mcp_cassette::{
     clear_mcp_cassette_hook, mcp_cassette_decide, set_mcp_cassette_hook, McpCassetteDecision,

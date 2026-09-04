@@ -28,7 +28,7 @@
 
 use std::collections::BTreeMap;
 
-use sema_core::{check_arity, SemaError, Value};
+use sema_core::{check_arity, ArgsExt, ResultExt, SemaError, Value};
 use similar::TextDiff;
 
 use crate::register_fn;
@@ -139,9 +139,7 @@ fn diff_string_to_value(s: String) -> Value {
 /// Parse `diff/unified`'s optional context-radius argument (default 3).
 fn diff_context_arg(args: &[Value]) -> Result<usize, SemaError> {
     if args.len() == 3 {
-        let n = args[2]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?;
+        let n = args.int_at(2, "diff/unified")?;
         if n < 0 {
             return Err(SemaError::eval("diff/unified: context must be >= 0"));
         }
@@ -245,8 +243,7 @@ fn prepare_patch_runtime_input(
 ) -> Result<PatchRuntimeInput, SemaError> {
     check_patch_limit("patch bytes", patch.len() as u64, bounds.patch_bytes)?;
     check_patch_limit("hunks", patch_hunk_count(patch) as u64, bounds.hunks as u64)?;
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+    let metadata = std::fs::metadata(path).io_ctx(format!("patch/apply-file {path}"))?;
     if !metadata.is_file() {
         return Err(SemaError::eval(format!(
             "patch/apply-file: target must be a regular file: {path}"
@@ -262,10 +259,8 @@ fn prepare_patch_runtime_input(
     }
     let file = options
         .open(path)
-        .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
-    let opened = file
-        .metadata()
-        .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+        .io_ctx(format!("patch/apply-file {path}"))?;
+    let opened = file.metadata().io_ctx(format!("patch/apply-file {path}"))?;
     if !opened.is_file() {
         return Err(SemaError::eval(format!(
             "patch/apply-file: target must be a regular file: {path}"
@@ -524,12 +519,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     #[cfg(not(target_arch = "wasm32"))]
     register_runtime_fn(env, "diff/unified", |args| {
         check_arity!(args, "diff/unified", 2..=3);
-        let old = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let new = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let old = args.str_at(0, "diff/unified")?;
+        let new = args.str_at(1, "diff/unified")?;
         let context = diff_context_arg(args)?;
         if sema_core::in_runtime_quantum() {
             // Cap each input by byte length BEFORE snapshotting (no excess
@@ -552,12 +543,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     #[cfg(target_arch = "wasm32")]
     register_fn(env, "diff/unified", |args| {
         check_arity!(args, "diff/unified", 2..=3);
-        let old = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let new = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let old = args.str_at(0, "diff/unified")?;
+        let new = args.str_at(1, "diff/unified")?;
         let context = diff_context_arg(args)?;
         Ok(Value::string(&diff_unified_text(old, new, context)))
     });
@@ -565,9 +552,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // (diff/stat patch) -> {:added <int> :removed <int> :hunks <int>}
     register_fn(env, "diff/stat", |args| {
         check_arity!(args, "diff/stat", 1);
-        let patch = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let patch = args.str_at(0, "diff/stat")?;
         #[cfg(not(target_arch = "wasm32"))]
         check_diff_patch_caps("diff/stat", patch)?;
         let mut added = 0i64;
@@ -607,9 +592,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // (diff/hunks patch) -> list of hunk maps
     register_fn(env, "diff/hunks", |args| {
         check_arity!(args, "diff/hunks", 1);
-        let patch = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let patch = args.str_at(0, "diff/hunks")?;
         #[cfg(not(target_arch = "wasm32"))]
         check_diff_patch_caps("diff/hunks", patch)?;
         let hunks = parse_hunks(patch);
@@ -620,9 +603,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // (diff/parse patch) -> {:files [ {:old-path :new-path :hunks [...]} ... ]}
     register_fn(env, "diff/parse", |args| {
         check_arity!(args, "diff/parse", 1);
-        let patch = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let patch = args.str_at(0, "diff/parse")?;
         #[cfg(not(target_arch = "wasm32"))]
         check_diff_patch_caps("diff/parse", patch)?;
 
@@ -725,12 +706,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // (diff/apply content patch) -> patched string (errors if a hunk doesn't apply)
     register_fn(env, "diff/apply", |args| {
         check_arity!(args, "diff/apply", 2);
-        let content = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let patch = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let content = args.str_at(0, "diff/apply")?;
+        let patch = args.str_at(1, "diff/apply")?;
         #[cfg(not(target_arch = "wasm32"))]
         check_diff_apply_caps(content, patch)?;
         let hunks = parse_hunks(patch);
@@ -743,14 +720,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     #[cfg(not(target_arch = "wasm32"))]
     register_runtime_fn_gated(env, sandbox, Caps::FS_WRITE, "patch/apply-file", |args| {
         check_arity!(args, "patch/apply-file", 2);
-        let path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
-        let patch = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-            .to_string();
+        let path = args.str_at(0, "patch/apply-file")?.to_string();
+        let patch = args.str_at(1, "patch/apply-file")?.to_string();
 
         if sema_core::in_runtime_quantum() {
             let bounds = PATCH_RUNTIME_BOUNDS;
@@ -783,14 +754,13 @@ fn patch_apply_file_work(
         (&file)
             .take(bounds.target_bytes.saturating_add(1))
             .read_to_string(&mut content)
-            .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+            .io_ctx(format!("patch/apply-file {path}"))?;
         check_patch_limit("target bytes", content.len() as u64, bounds.target_bytes)?;
         check_patch_output_bound(content.len() as u64, patch, bounds)?;
         (content, Some((file, bounds)))
     } else {
         (
-            std::fs::read_to_string(path)
-                .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?,
+            std::fs::read_to_string(path).io_ctx(format!("patch/apply-file {path}"))?,
             None,
         )
     };
@@ -801,16 +771,14 @@ fn patch_apply_file_work(
         use std::io::{Seek as _, Write as _};
 
         check_patch_limit("output bytes", patched.len() as u64, bounds.output_bytes)?;
-        file.set_len(0)
-            .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+        file.set_len(0).io_ctx(format!("patch/apply-file {path}"))?;
         file.seek(std::io::SeekFrom::Start(0))
-            .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+            .io_ctx(format!("patch/apply-file {path}"))?;
         file.write_all(patched.as_bytes())
-            .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+            .io_ctx(format!("patch/apply-file {path}"))?;
         return Ok(count);
     }
-    std::fs::write(path, patched)
-        .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
+    std::fs::write(path, patched).io_ctx(format!("patch/apply-file {path}"))?;
     Ok(count)
 }
 

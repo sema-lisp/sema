@@ -296,6 +296,8 @@ fn download_runtime(
             .unwrap_or_default();
         if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } == 0 {
             let stat = unsafe { stat.assume_init() };
+            // f_bavail/f_frsize are u32 on some libc targets and u64 on others;
+            // the casts keep the product 64-bit on every target.
             #[allow(clippy::unnecessary_cast)]
             let avail = stat.f_bavail as u64 * stat.f_frsize as u64;
             if avail < 200 * 1024 * 1024 {

@@ -1028,7 +1028,7 @@ fn call_mcp_tool_inner(
                 None => path.with_extension("semac"),
             };
 
-            if let Err(e) = std::fs::write(&out_path, &bytes) {
+            if let Err(e) = sema_core::fs::AtomicFile::write(&out_path, &bytes) {
                 return error_result(format!("Error writing {}: {e}", out_path.display()));
             }
 
@@ -1136,7 +1136,10 @@ fn call_mcp_tool_inner(
                     Ok(f) => f,
                     Err(e) => return error_result(format!("Format error: {e}")),
                 };
-                if let Err(e) = std::fs::write(path, formatted) {
+                if let Err(e) = sema_core::fs::AtomicFile::write_through(
+                    std::path::Path::new(path),
+                    formatted.as_bytes(),
+                ) {
                     return error_result(format!("Failed to write {file}: {e}"));
                 }
                 success_result(format!("Formatted file {file} in-place successfully."))
@@ -1452,7 +1455,10 @@ fn call_mcp_tool_inner(
                 Ok((_, engine_rc)) => match export_notebook(&engine_rc, format) {
                     Ok(exported_text) => {
                         if let Some(out_p) = output_path {
-                            if let Err(e) = std::fs::write(out_p, &exported_text) {
+                            if let Err(e) = sema_core::fs::AtomicFile::write(
+                                std::path::Path::new(out_p),
+                                exported_text.as_bytes(),
+                            ) {
                                 return error_result(format!(
                                     "Failed to write export to {out_p}: {e}"
                                 ));

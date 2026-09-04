@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use tower_lsp::lsp_types::*;
 
+use sema_core::path::PathExt as _;
 use sema_core::{Caps, Sandbox, Span, SpanMap};
 
 use crate::builtin_docs;
@@ -37,7 +38,9 @@ pub(crate) struct WorkspaceScanner {
 impl WorkspaceScanner {
     pub(crate) fn new(root: &Path) -> Self {
         let mut visited = std::collections::HashSet::new();
-        let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let canonical_root = root
+            .resolve_allow_missing()
+            .unwrap_or_else(|_| root.to_path_buf());
         visited.insert(canonical_root.clone());
         WorkspaceScanner {
             dir_stack: vec![canonical_root],

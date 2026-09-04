@@ -809,7 +809,7 @@ fn patch_apply_file_work(
             .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
         return Ok(count);
     }
-    std::fs::write(path, patched)
+    sema_core::fs::AtomicFile::write_through(std::path::Path::new(path), patched.as_bytes())
         .map_err(|e| SemaError::Io(format!("patch/apply-file {path}: {e}")))?;
     Ok(count)
 }

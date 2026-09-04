@@ -4,6 +4,8 @@ pub mod async_signal;
 pub mod context;
 pub mod cycle;
 pub mod error;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod fs;
 pub mod home;
 pub mod io_backend;
 pub mod json;
@@ -13,6 +15,7 @@ pub mod net;
 pub mod num;
 pub mod number;
 pub mod output_hook;
+pub mod path;
 pub mod resolve;
 pub mod sandbox;
 pub mod stack;

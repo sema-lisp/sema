@@ -24,14 +24,27 @@ num-traits = "0.2"
 # here because `IoExecutor`/`ExecutorLease` (`runtime/executor.rs`) carry an
 # `Instant` deadline that sema-vm's runtime module must interoperate with.
 web-time = "1.1.0"
+same-file = "1.0"
 
 [dev-dependencies]
 num-bigint = "0.4"
 num-rational = "0.4"
 num-traits = "0.2"
+tempfile = "3"
 
 # Stack-growth for deep recursive value walks + native→VM re-entry (see
 # `stack::maybe_grow`). Not available on wasm (no stack growth), so gate it off
 # that target; `maybe_grow` is a plain call there.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 stacker = "0.1"
+soft-canonicalize = "0.5.6"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+soft-canonicalize = { version = "0.5.6", default-features = false }
+
+[target.'cfg(all(not(target_arch = "wasm32"), not(windows)))'.dependencies]
+atomic-write-file = "0.3.0"
+
+[target.'cfg(windows)'.dependencies]
+tempfile = "3"
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

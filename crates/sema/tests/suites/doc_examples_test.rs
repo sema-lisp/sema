@@ -158,6 +158,14 @@ fn check_example(
             Ok(v) => {
                 *checked += 1;
                 let got = format!("{v}");
+                // These entries show Unix paths; Windows returns native separators.
+                // The expected value is printed Sema, so backslashes are escaped.
+                let expected = if cfg!(windows) && matches!(name, "path/join" | "path/relative-to")
+                {
+                    expected.replace('/', "\\\\")
+                } else {
+                    expected
+                };
                 if got.trim() != expected {
                     failures.push(format!(
                         "{name}: `{expr}` => `{got}` (expected `{expected}`)"

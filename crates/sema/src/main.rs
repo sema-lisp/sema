@@ -3,6 +3,8 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use sema_core::path::PathExt as _;
+
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
@@ -3104,7 +3106,10 @@ fn run_notebook_command(command: NotebookCommands) {
 
             match output {
                 Some(out_path) => {
-                    if let Err(e) = std::fs::write(&out_path, &content) {
+                    if let Err(e) = sema_core::fs::AtomicFile::write(
+                        std::path::Path::new(&out_path),
+                        content.as_bytes(),
+                    ) {
                         print_cli_error(format!("could not write {out_path}: {e}"));
                         std::process::exit(1);
                     }
@@ -3447,7 +3452,7 @@ fn run_compile(file: &str, output: Option<&str>) {
         Some(o) => std::path::PathBuf::from(o),
         None => path.with_extension("semac"),
     };
-    if let Err(e) = std::fs::write(&out_path, &bytes) {
+    if let Err(e) = sema_core::fs::AtomicFile::write(&out_path, &bytes) {
         print_cli_error(format!("could not write {}: {e}", out_path.display()));
         std::process::exit(1);
     }
@@ -3760,9 +3765,19 @@ fn check_output_not_source(
     source: &std::path::Path,
     output_path: &std::path::Path,
 ) -> Result<(), String> {
-    let a = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
-    let b = std::fs::canonicalize(output_path).unwrap_or_else(|_| output_path.to_path_buf());
-    if a == b {
+    // Identity, not spelling: a hard link, a symlink, or `new/../app.sema`
+    // all resolve to the source. A path that cannot be resolved is an error
+    // rather than a silent "different file".
+    if source
+        .is_same_destination_as(output_path)
+        .map_err(|error| {
+            format!(
+                "resolving {} against {}: {error}",
+                output_path.display(),
+                source.display()
+            )
+        })?
+    {
         return Err(format!(
             "Output path would overwrite the source file '{}'.\n  Hint: use `-o <output>` to specify a different output path, or rename your source file to use a .sema extension.",
             source.display()
@@ -3900,8 +3915,10 @@ fn write_target_executable(
     opts: BuildOutputOpts,
 ) -> Result<BuiltArtifact, String> {
     let started = std::time::Instant::now();
-    check_output_not_source(source, output_path)?;
+    // Writability first: an unwritable parent gets its own message, and the
+    // identity check below needs a resolvable parent to work.
     probe_output_writable(output_path)?;
+    check_output_not_source(source, output_path)?;
 
     let resolved_target = target.and_then(|t| cross_compile::resolve_target(t).ok());
 
@@ -4159,8 +4176,8 @@ fn run_build(
     // clobber the source, and probe the parent for writability (creating missing
     // directories). Avoids "failed at the last step" after a full compile.
     let output_path = resolve_output_path(output, path, target);
-    check_output_not_source(path, &output_path)?;
     probe_output_writable(&output_path)?;
+    check_output_not_source(path, &output_path)?;
 
     let archive = build_archive(file, includes, opts)?;
     let artifact = write_target_executable(
@@ -4360,6 +4377,17 @@ fn run_build_web(
         return Err(format!("source file not found: {file}"));
     }
 
+    // Pre-flight before compiling: `-o app.sema` (or any alias of the source)
+    // would otherwise replace the program with its own archive.
+    let output_path = web_output_path(path, output);
+    if let Some(parent) = output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("creating output directory {}: {e}", parent.display()))?;
+        }
+    }
+    check_output_not_source(path, &output_path)?;
+
     let (archive_bytes, files_count) = build_web_archive(path, includes, opts)?;
     eprintln!(
         "Compiled {file} → web archive ({} file{}, {})",
@@ -4368,14 +4396,7 @@ fn run_build_web(
         human_size(archive_bytes.len() as u64)
     );
 
-    let output_path = web_output_path(path, output);
-    if let Some(parent) = output_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("creating output directory {}: {e}", parent.display()))?;
-        }
-    }
-    std::fs::write(&output_path, &archive_bytes)
+    sema_core::fs::AtomicFile::write(&output_path, &archive_bytes)
         .map_err(|e| format!("writing {}: {e}", output_path.display()))?;
 
     let abs = std::path::absolute(&output_path).unwrap_or_else(|_| output_path.clone());
@@ -4606,7 +4627,7 @@ fn write_executable_platform(
                 .set_icon(include_bytes!("../assets/sema-mark-rounded-512.png"))?
                 .build(&mut branded)?;
             let branded = set_windows_version_info(branded, output_path)?;
-            std::fs::write(output_path, branded)?;
+            sema_core::fs::AtomicFile::write(output_path, &branded)?;
         }
         cross_compile::BinaryFormat::Elf => {
             archive::write_bundled_executable_from_bytes(&runtime, output_path, archive_bytes)?;
@@ -5226,7 +5247,12 @@ fn run_fmt(
                 print_simple_diff(file, &source, &formatted);
             } else {
                 // Write formatted output back
-                if let Err(e) = std::fs::write(file, &formatted) {
+                // Write through a symlink so `sema fmt` updates the linked
+                // file instead of replacing the link with a regular file.
+                if let Err(e) = sema_core::fs::AtomicFile::write_through(
+                    std::path::Path::new(file),
+                    formatted.as_bytes(),
+                ) {
                     print_cli_error(format!("could not write {file}: {e}"));
                     errors += 1;
                     continue;
@@ -5842,6 +5868,32 @@ fn install_completions(shell: Shell) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `check_output_not_source` compares identities, so an output path that
+    /// merely spells the source differently (`new/../app.sema`) is refused
+    /// and the source is left untouched.
+    #[test]
+    fn web_output_alias_cannot_overwrite_source() {
+        let root =
+            std::env::temp_dir().join(format!("sema-web-output-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("new")).unwrap();
+        let source = root.join("app.sema");
+        let alias = root.join("new/../app.sema");
+        std::fs::write(&source, "(+ 1 2)").unwrap();
+
+        let error = run_build_web(
+            source.to_str().unwrap(),
+            Some(alias.to_str().unwrap()),
+            &[],
+            BuildOutputOpts::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("overwrite the source"), "{error}");
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "(+ 1 2)");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[cfg(unix)]
     #[test]

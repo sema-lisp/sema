@@ -241,7 +241,7 @@ impl Tape {
             out.push_str(&serde_json::to_string(entry).unwrap_or_default());
             out.push('\n');
         }
-        std::fs::write(path, out)
+        sema_core::fs::AtomicFile::write_through(path, out.as_bytes())
     }
 
     /// First entry recorded under `key`, if any.

@@ -268,10 +268,13 @@ fn web_prepare_send(
         return ("source".to_string(), None);
     }
     match crate::build_web_archive(entry, &[], crate::BuildOutputOpts::default()) {
-        Ok((bytes, _)) => match std::fs::write(build_dir.join("app.vfs"), &bytes) {
-            Ok(()) => ("archive".to_string(), None),
-            Err(e) => ("error".to_string(), Some(format!("writing archive: {e}"))),
-        },
+        // Atomic: the browser may fetch app.vfs while a rebuild is in flight.
+        Ok((bytes, _)) => {
+            match sema_core::fs::AtomicFile::write(&build_dir.join("app.vfs"), &bytes) {
+                Ok(()) => ("archive".to_string(), None),
+                Err(e) => ("error".to_string(), Some(format!("writing archive: {e}"))),
+            }
+        }
         Err(e) => ("error".to_string(), Some(e)),
     }
 }

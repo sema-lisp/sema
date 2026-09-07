@@ -50,6 +50,23 @@
   numbers ("expected number, got rational"); the shared arithmetic fold now
   promotes them like bignums.
 
+### Paths and atomic file writes
+
+- New `sema_core::path` (`PathExt::{absolute_from, resolve_allow_missing,
+  is_same_destination_as}`, `PathBoundary`) and `sema_core::fs::AtomicFile`
+  (`write`, `write_through`, `write_private`) replace four hand-rolled
+  temp-file writers and the lexical fallback in sandbox containment checks.
+  `--allowed-paths` and `path/within?` now fail closed when a path cannot be
+  resolved; `sema build` refuses an output path that resolves to the source
+  file through a symlink, hard link, or `..`; `sema fmt`, `sema pkg`, notebook
+  saves, `kv/flush`, `patch/apply-file`, build outputs, the dev server's
+  `app.vfs`, the LLM cache, MCP token stores, and workflow evidence bundles are
+  written atomically (temp file, fsync, rename). Editors write through a
+  symlink instead of replacing it.
+- **`sema build --target web app.sema -o app.sema` overwrote the source with
+  its own archive.** The web target now runs the same source-collision
+  pre-flight as the native targets.
+
 ### sema-web and `sema web`
 
 - **A Sema error inside a `ws/listen` handler was lost** (it escaped into

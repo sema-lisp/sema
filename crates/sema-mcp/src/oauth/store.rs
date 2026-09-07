@@ -147,34 +147,8 @@ impl FileStore {
         let json = serde_json::to_string_pretty(doc)
             .map_err(|e| format!("failed to encode token store: {e}"))?;
 
-        // Write to a sibling temp file created 0600 (never a world-readable
-        // window), then atomically rename over the target — which also fixes an
-        // existing wrongly-permissioned file. On Windows we rely on the user
-        // profile ACL and just write in place.
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let tmp = self.path.with_extension("json.tmp");
-            let mut file = std::fs::OpenOptions::new()
-                .mode(0o600)
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&tmp)
-                .map_err(|e| format!("failed to open temp token store: {e}"))?;
-            file.write_all(json.as_bytes())
-                .map_err(|e| format!("failed to write token store: {e}"))?;
-            file.sync_all().ok();
-            drop(file);
-            std::fs::rename(&tmp, &self.path)
-                .map_err(|e| format!("failed to replace token store: {e}"))?;
-        }
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&self.path, json)
-                .map_err(|e| format!("failed to write token store: {e}"))?;
-        }
+        sema_core::fs::AtomicFile::write_private(&self.path, json.as_bytes())
+            .map_err(|e| format!("failed to replace token store: {e}"))?;
         Ok(())
     }
 }

@@ -150,7 +150,8 @@ impl Notebook {
         self.metadata.sema_version = env!("CARGO_PKG_VERSION").to_string();
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize notebook: {e}"))?;
-        std::fs::write(path, json).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+        sema_core::fs::AtomicFile::write_through(path, json.as_bytes())
+            .map_err(|e| format!("Failed to write {}: {e}", path.display()))
     }
 
     /// Add a new code cell and return its ID.

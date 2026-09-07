@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use tower_lsp::lsp_types::*;
 
+use sema_core::path::PathExt as _;
 pub(crate) use sema_core::SemaError;
 use sema_core::{Span, SpanMap};
 
@@ -406,7 +407,8 @@ pub fn extract_symbol_at(line: &str, byte_offset: usize) -> &str {
 /// (`a/../lib.sema`), a symlinked root (macOS `/tmp` -> `/private/tmp`), an
 /// open-document URI — maps to a single identity.
 pub(crate) fn canonicalize_or_raw(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    path.resolve_allow_missing()
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Resolve an import/load path relative to a document URI.

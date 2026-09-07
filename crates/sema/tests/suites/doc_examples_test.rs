@@ -12,6 +12,8 @@
 
 use sema_eval::Interpreter;
 
+use crate::common::{sema_path, sema_str};
+
 /// Substrings that mark an example as side-effecting / nondeterministic → skip.
 const SKIP_MARKERS: &[&str] = &[
     "http",
@@ -157,7 +159,12 @@ fn check_example(
             }
             Ok(v) => {
                 *checked += 1;
-                let got = format!("{v}");
+                // Path docs use forward slashes on every host. Normalize the
+                // path value before encoding it, not its printed string escapes.
+                let got = match (name.starts_with("path/"), v.as_str()) {
+                    (true, Some(path)) => sema_str(&sema_path(std::path::Path::new(path))),
+                    _ => v.to_string(),
+                };
                 if got.trim() != expected {
                     failures.push(format!(
                         "{name}: `{expr}` => `{got}` (expected `{expected}`)"
@@ -250,6 +257,25 @@ fn builtin_doc_examples_evaluate() {
             .map(move |example| (entry.name.as_str(), example.as_str()))
     });
     assert_examples("builtin doc examples", examples);
+}
+
+#[test]
+fn path_examples_normalize_separators_without_hiding_mismatches() {
+    for (name, example, expected_failures) in [
+        ("path/join", r#""src\\main.rs" ; => "src/main.rs""#, 0),
+        ("path/join", r#""src/main.rs" ; => "src/main.rs""#, 0),
+        ("path/join", r#""src\\wrong.rs" ; => "src/main.rs""#, 1),
+        ("string/append", r#""src\\main.rs" ; => "src/main.rs""#, 1),
+        ("path/absolute?", "#f ; => #t", 1),
+    ] {
+        let mut checked = 0;
+        let mut skipped = 0;
+        let mut failures = Vec::new();
+        check_example(name, example, &mut checked, &mut skipped, &mut failures);
+        assert_eq!(checked, 1, "{name}: {example}");
+        assert_eq!(skipped, 0, "{name}: {example}");
+        assert_eq!(failures.len(), expected_failures, "{name}: {example}");
+    }
 }
 
 #[test]

@@ -128,7 +128,7 @@ pub(super) fn persist_cache_file_off_quantum(path: std::path::PathBuf, json: Str
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(&path, json);
+        let _ = sema_core::fs::AtomicFile::write(&path, json.as_bytes());
     };
     #[cfg(not(target_arch = "wasm32"))]
     {

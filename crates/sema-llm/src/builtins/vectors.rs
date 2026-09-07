@@ -115,9 +115,8 @@ pub(super) fn register(env: &Env) {
                     )
                 })?;
             let data = store.to_json().map_err(SemaError::Io)?;
-            let tmp = format!("{path}.tmp");
-            std::fs::write(&tmp, &data).io_ctx("vector-store/save")?;
-            std::fs::rename(&tmp, path).io_ctx("vector-store/save")?;
+            sema_core::fs::AtomicFile::write(std::path::Path::new(path), &data)
+                .io_ctx("vector-store/save")?;
             Ok(Value::string(path))
         })
     });

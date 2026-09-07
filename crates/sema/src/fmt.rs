@@ -283,8 +283,11 @@ pub(crate) fn run_fmt(
                 // Simple line-by-line diff
                 print_simple_diff(file, &source, &formatted);
             } else {
-                // Write formatted output back
-                if let Err(e) = std::fs::write(file, &formatted) {
+                // Write through a symlink so formatting preserves the link.
+                if let Err(e) = sema_core::fs::AtomicFile::write_through(
+                    std::path::Path::new(file),
+                    formatted.as_bytes(),
+                ) {
                     print_cli_error(format!("could not write {file}: {e}"));
                     errors += 1;
                     continue;

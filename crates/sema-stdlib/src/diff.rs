@@ -778,7 +778,8 @@ fn patch_apply_file_work(
             .io_ctx(format!("patch/apply-file {path}"))?;
         return Ok(count);
     }
-    std::fs::write(path, patched).io_ctx(format!("patch/apply-file {path}"))?;
+    sema_core::fs::AtomicFile::write_through(std::path::Path::new(path), patched.as_bytes())
+        .io_ctx(format!("patch/apply-file {path}"))?;
     Ok(count)
 }
 

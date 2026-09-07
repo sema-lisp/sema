@@ -699,7 +699,9 @@ fn flush_store(store: &KvStore, bounds: KvBounds) -> Result<(), SemaError> {
             bounds.max_store_bytes,
         ));
     }
-    std::fs::write(&store.path, json).io_ctx("kv/flush")?;
+    // Atomic: a crash mid-write must not leave a truncated store on disk.
+    sema_core::fs::AtomicFile::write(std::path::Path::new(&store.path), json.as_bytes())
+        .io_ctx("kv/flush")?;
     Ok(())
 }
 

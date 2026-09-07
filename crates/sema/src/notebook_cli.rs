@@ -128,7 +128,10 @@ pub(crate) fn run_notebook_command(command: NotebookCommands) {
 
             match output {
                 Some(out_path) => {
-                    if let Err(e) = std::fs::write(&out_path, &content) {
+                    if let Err(e) = sema_core::fs::AtomicFile::write(
+                        std::path::Path::new(&out_path),
+                        content.as_bytes(),
+                    ) {
                         die(format!("could not write {out_path}: {e}"));
                     }
                     eprintln!("Exported to {out_path}");

@@ -88,8 +88,21 @@ pub trait LlmProvider: Send + Sync {
         Ok(resp)
     }
 
-    /// Batch — run multiple requests concurrently.
+    /// Batch — run multiple requests concurrently. A provider that exposes
+    /// `complete_future` runs the whole batch under one `join_all`; a sync-only
+    /// provider runs the requests one after another.
     fn batch_complete(&self, requests: Vec<ChatRequest>) -> Vec<Result<ChatResponse, LlmError>> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let futures: Option<Vec<_>> = requests
+                .iter()
+                .cloned()
+                .map(|r| self.complete_future(r))
+                .collect();
+            if let Some(futures) = futures {
+                return sema_io::io_block_on(futures::future::join_all(futures));
+            }
+        }
         requests.into_iter().map(|r| self.complete(r)).collect()
     }
 
@@ -198,5 +211,15 @@ impl ProviderRegistry {
 impl Default for ProviderRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The model a request runs on: the requested name, or the provider's default
+/// when the request leaves it empty.
+pub(crate) fn resolve_model(requested: &str, default: &str) -> String {
+    if requested.is_empty() {
+        default.to_string()
+    } else {
+        requested.to_string()
     }
 }

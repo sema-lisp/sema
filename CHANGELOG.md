@@ -50,6 +50,41 @@
   numbers ("expected number, got rational"); the shared arithmetic fold now
   promotes them like bignums.
 
+### Refactoring
+
+- Shared `sema_core::{ArgsExt, OptionsExt, ResultExt}` helpers replace
+  ~500 hand-written argument type checks, option-map lookups, and error
+  mappings; every migrated type error now names the function and argument.
+- `value_to_json_schema` is one implementation in `sema-core`. The
+  `sema-llm` copy emitted Sema type names (`"list"`) that providers reject
+  and the MCP copy lacked `:default` handling; the merged version has both.
+- `sema-llm/src/builtins.rs` (15k lines) is split into 22 modules under
+  `builtins/`; the CLI's `main.rs` (6.2k lines) into nine modules. Public
+  APIs are unchanged.
+- Provider HTTP status handling is one `check_status`; the six
+  embeddings/Ollama call sites that turned a 429 into a non-retryable error
+  now get the normal retry loop.
+- `sema pkg search` no longer drops the registry's error body.
+- 28 higher-order stdlib functions derive their host-only arm from the
+  runtime arm instead of carrying a hand-written copy.
+
+### Paths and atomic file writes
+
+- New `sema_core::path` (`PathExt::{absolute_from, resolve_allow_missing,
+  is_same_destination_as}`, `PathBoundary`) and `sema_core::fs::AtomicFile`
+  (`write`, `write_through`, `write_private`) replace four hand-rolled
+  temp-file writers and the lexical fallback in sandbox containment checks.
+  `--allowed-paths` and `path/within?` now fail closed when a path cannot be
+  resolved; `sema build` refuses an output path that resolves to the source
+  file through a symlink, hard link, or `..`; `sema fmt`, `sema pkg`, notebook
+  saves, `kv/flush`, `patch/apply-file`, build outputs, the dev server's
+  `app.vfs`, the LLM cache, MCP token stores, and workflow evidence bundles are
+  written atomically (temp file, fsync, rename). Editors write through a
+  symlink instead of replacing it.
+- **`sema build --target web app.sema -o app.sema` overwrote the source with
+  its own archive.** The web target now runs the same source-collision
+  pre-flight as the native targets.
+
 ### sema-web and `sema web`
 
 - **A Sema error inside a `ws/listen` handler was lost** (it escaped into

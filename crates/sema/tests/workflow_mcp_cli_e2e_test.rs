@@ -23,9 +23,8 @@
 //! skips the OS keychain entirely (no macOS Keychain prompt, no CI hang).
 
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A minimal MCP-over-HTTP server: any `/mcp` POST without a recognized
 /// `Authorization: Bearer <token>` gets a `401` + `WWW-Authenticate` challenge; a
@@ -156,18 +155,7 @@ fn start_server() -> (ServerGuard, u16) {
     )
 }
 
-fn unique_temp_dir(tag: &str) -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!(
-        "sema-cli-mcp-e2e-{}-{}-{tag}",
-        std::process::id(),
-        n
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
-}
+use sema_core::testing::unique_temp_dir;
 
 /// A fixed 32-byte key, as 64 hex chars, for `SEMA_MCP_AUTH_KEY` — a TEST key,
 /// never used for anything real; each test's project dir is thrown away after.

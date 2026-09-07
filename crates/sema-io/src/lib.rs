@@ -58,6 +58,8 @@ use tokio::sync::Semaphore;
 
 mod executor;
 pub use executor::{process_executor, ProcessIoExecutor};
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 /// Cap on the pool's blocking-thread tier.
 const MAX_BLOCKING_THREADS: usize = 512;

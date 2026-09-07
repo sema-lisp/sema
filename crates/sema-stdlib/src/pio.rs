@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
 
-use sema_core::{check_arity, SemaError, Value};
+use sema_core::{check_arity, ArgsExt, SemaError, Value};
 
 use crate::register_fn;
 
@@ -382,9 +382,7 @@ fn encode_instruction(
 
 fn assemble(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "pio/assemble", 1..=2);
-    let program = args[0]
-        .as_list()
-        .ok_or_else(|| SemaError::type_error("list", args[0].type_name()))?;
+    let program = args.list_at(0, "pio/assemble")?;
 
     // Parse config
     let (side_set_bits, side_set_opt) = if args.len() == 2 {
@@ -520,9 +518,7 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "pio/jmp", |args| {
         check_arity!(args, "pio/jmp", 1..=2);
         if args.len() == 1 {
-            let target = args[0]
-                .as_symbol()
-                .ok_or_else(|| SemaError::type_error("symbol", args[0].type_name()))?;
+            let target = args.symbol_at(0, "pio/jmp")?;
             Ok(make_instr(
                 "jmp",
                 &[
@@ -531,13 +527,9 @@ pub fn register(env: &sema_core::Env) {
                 ],
             ))
         } else {
-            let cond = args[0]
-                .as_keyword()
-                .ok_or_else(|| SemaError::type_error("keyword", args[0].type_name()))?;
+            let cond = args.keyword_at(0, "pio/jmp")?;
             jmp_cond(&cond)?; // validate
-            let target = args[1]
-                .as_symbol()
-                .ok_or_else(|| SemaError::type_error("symbol", args[1].type_name()))?;
+            let target = args.symbol_at(1, "pio/jmp")?;
             Ok(make_instr(
                 "jmp",
                 &[
@@ -550,21 +542,15 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "pio/wait", |args| {
         check_arity!(args, "pio/wait", 3..=4);
-        let polarity = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
+        let polarity = args.int_at(0, "pio/wait")?;
         if polarity != 0 && polarity != 1 {
             return Err(SemaError::eval(format!(
                 "pio/wait: polarity must be 0 or 1, got {polarity}"
             )));
         }
-        let source = args[1]
-            .as_keyword()
-            .ok_or_else(|| SemaError::type_error("keyword", args[1].type_name()))?;
+        let source = args.keyword_at(1, "pio/wait")?;
         wait_source(&source)?;
-        let index = args[2]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?;
+        let index = args.int_at(2, "pio/wait")?;
         if !(0..=31).contains(&index) {
             return Err(SemaError::eval(format!(
                 "pio/wait: index {index} out of range 0..31"
@@ -576,9 +562,7 @@ pub fn register(env: &sema_core::Env) {
             ("index", Value::int(index)),
         ];
         if args.len() == 4 {
-            let rel = args[3]
-                .as_keyword()
-                .ok_or_else(|| SemaError::type_error("keyword", args[3].type_name()))?;
+            let rel = args.keyword_at(3, "pio/wait")?;
             if rel != "rel" {
                 return Err(SemaError::eval(format!(
                     "pio/wait: expected :rel, got :{rel}"
@@ -591,13 +575,9 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "pio/in", |args| {
         check_arity!(args, "pio/in", 2);
-        let source = args[0]
-            .as_keyword()
-            .ok_or_else(|| SemaError::type_error("keyword", args[0].type_name()))?;
+        let source = args.keyword_at(0, "pio/in")?;
         in_source(&source)?;
-        let bits = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
+        let bits = args.int_at(1, "pio/in")?;
         encode_bit_count(bits, "pio/in")?;
         Ok(make_instr(
             "in",
@@ -610,13 +590,9 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "pio/out", |args| {
         check_arity!(args, "pio/out", 2);
-        let dest = args[0]
-            .as_keyword()
-            .ok_or_else(|| SemaError::type_error("keyword", args[0].type_name()))?;
+        let dest = args.keyword_at(0, "pio/out")?;
         out_dest(&dest)?;
-        let bits = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
+        let bits = args.int_at(1, "pio/out")?;
         encode_bit_count(bits, "pio/out")?;
         Ok(make_instr(
             "out",
@@ -684,22 +660,16 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "pio/mov", |args| {
         check_arity!(args, "pio/mov", 2..=3);
-        let dest = args[0]
-            .as_keyword()
-            .ok_or_else(|| SemaError::type_error("keyword", args[0].type_name()))?;
+        let dest = args.keyword_at(0, "pio/mov")?;
         mov_dest(&dest)?;
-        let source = args[1]
-            .as_keyword()
-            .ok_or_else(|| SemaError::type_error("keyword", args[1].type_name()))?;
+        let source = args.keyword_at(1, "pio/mov")?;
         parse_mov_source(&source)?; // validate
         let mut fields: Vec<(&str, Value)> = vec![
             ("dest", Value::keyword(&dest)),
             ("source", Value::keyword(&source)),
         ];
         if args.len() == 3 {
-            let op = args[2]
-                .as_keyword()
-                .ok_or_else(|| SemaError::type_error("keyword", args[2].type_name()))?;
+            let op = args.keyword_at(2, "pio/mov")?;
             if op != "invert" && op != "reverse" {
                 return Err(SemaError::eval(format!("pio/mov: unknown operation :{op}"))
                     .with_hint("valid: :invert :reverse"));
@@ -711,16 +681,12 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "pio/irq", |args| {
         check_arity!(args, "pio/irq", 2..=3);
-        let mode = args[0]
-            .as_keyword()
-            .ok_or_else(|| SemaError::type_error("keyword", args[0].type_name()))?;
+        let mode = args.keyword_at(0, "pio/irq")?;
         if mode != "set" && mode != "wait" && mode != "clear" {
             return Err(SemaError::eval(format!("pio/irq: unknown mode :{mode}"))
                 .with_hint("valid: :set :wait :clear"));
         }
-        let index = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
+        let index = args.int_at(1, "pio/irq")?;
         if !(0..=7).contains(&index) {
             return Err(SemaError::eval(format!(
                 "pio/irq: index {index} out of range 0..7"
@@ -731,9 +697,7 @@ pub fn register(env: &sema_core::Env) {
             ("index", Value::int(index)),
         ];
         if args.len() == 3 {
-            let rel = args[2]
-                .as_keyword()
-                .ok_or_else(|| SemaError::type_error("keyword", args[2].type_name()))?;
+            let rel = args.keyword_at(2, "pio/irq")?;
             if rel != "rel" {
                 return Err(SemaError::eval(format!(
                     "pio/irq: expected :rel, got :{rel}"
@@ -746,13 +710,9 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "pio/set", |args| {
         check_arity!(args, "pio/set", 2);
-        let dest = args[0]
-            .as_keyword()
-            .ok_or_else(|| SemaError::type_error("keyword", args[0].type_name()))?;
+        let dest = args.keyword_at(0, "pio/set")?;
         set_dest(&dest)?;
-        let value = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
+        let value = args.int_at(1, "pio/set")?;
         if !(0..=31).contains(&value) {
             return Err(SemaError::eval(format!(
                 "pio/set: value {value} out of range 0..31"
@@ -771,9 +731,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "pio/side", |args| {
         check_arity!(args, "pio/side", 2);
-        let value = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
+        let value = args.int_at(0, "pio/side")?;
         if !(0..=31).contains(&value) {
             return Err(SemaError::eval(format!(
                 "pio/side: value {value} out of range 0..31"
@@ -789,9 +747,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "pio/delay", |args| {
         check_arity!(args, "pio/delay", 2);
-        let cycles = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
+        let cycles = args.int_at(0, "pio/delay")?;
         if !(0..=31).contains(&cycles) {
             return Err(SemaError::eval(format!(
                 "pio/delay: cycles {cycles} out of range 0..31"

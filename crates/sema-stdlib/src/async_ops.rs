@@ -5,9 +5,10 @@ use sema_core::runtime::{
     PromiseSetMode, PromiseSetWait, ResumeInput, RuntimeRequest, RuntimeResponse, TaskOutcome,
     TaskSettlement, Trace, WaitKind,
 };
+use sema_core::ArgsExt;
 use sema_core::{check_arity, in_runtime_quantum, Env, NativeFn, SemaError, Value, ValueView};
 
-use crate::register_fn;
+use crate::{register_fn, register_runtime_only_fn};
 
 /// Parse a duration-in-milliseconds argument for `async/sleep` / `async/timeout`.
 /// Accepts an int OR a float (rounded to the nearest whole ms): a duration is
@@ -168,24 +169,6 @@ fn register_predicates(env: &Env) {
 }
 
 // ── Promise operations ───────────────────────────────────────────
-
-/// Register a promise op as a structural runtime native. Plain value-ABI calls
-/// fail because promise operations require an active runtime task context.
-fn register_runtime_fn(env: &Env, name: &str, f: impl Fn(&[Value]) -> NativeResult + 'static) {
-    register_runtime_fn_with_escaping_args(env, name, &[], f);
-}
-
-fn register_runtime_fn_with_escaping_args(
-    env: &Env,
-    name: &str,
-    escaping_args: &'static [usize],
-    f: impl Fn(&[Value]) -> NativeResult + 'static,
-) {
-    env.set(
-        sema_core::intern(name),
-        Value::native_fn(NativeFn::simple_result(name, f).with_escaping_args(escaping_args)),
-    );
-}
 
 /// Map a settled promise's outcome to a native result: a returned value resumes
 /// the caller, a failure re-raises the PRESERVED `SemaError` (never re-wrapped),
@@ -450,7 +433,7 @@ fn inspect_op(args: &[Value], name: &str, predicate: Predicate) -> NativeResult 
 
 fn register_promise_ops(env: &Env) {
     // async/spawn — spawn a thunk as a detached task; resume with its promise.
-    register_runtime_fn(env, "async/spawn", |args| {
+    register_runtime_only_fn(env, "async/spawn", &[], |args| {
         check_arity!(args, "async/spawn", 1);
         Ok(NativeOutcome::Runtime(RuntimeRequest::Spawn {
             callable: args[0].clone(),
@@ -465,7 +448,7 @@ fn register_promise_ops(env: &Env) {
     // non-promise value is identity (like `await` of a non-thenable), so results
     // that are already plain values — e.g. an `async/all` value list — pass
     // straight through.
-    register_runtime_fn(env, "async/await", |args| {
+    register_runtime_only_fn(env, "async/await", &[], |args| {
         check_arity!(args, "async/await", 1);
         match args[0].view() {
             ValueView::AsyncPromise(promise) => Ok(NativeOutcome::Suspend(NativeSuspend {
@@ -479,7 +462,7 @@ fn register_promise_ops(env: &Env) {
     // async/run — suspend on the self-resolving-waits barrier: wait until every
     // OTHER task in this task's origin-root graph has settled or come to rest on a
     // cycle-forming wait (see `Runtime::resolve_origin_barriers`), then resume nil.
-    register_runtime_fn(env, "async/run", |args| {
+    register_runtime_only_fn(env, "async/run", &[], |args| {
         check_arity!(args, "async/run", 0);
         Ok(NativeOutcome::Runtime(RuntimeRequest::OriginBarrier {
             continuation: Box::new(RunCont),
@@ -487,7 +470,7 @@ fn register_promise_ops(env: &Env) {
     });
 
     // async/resolved — create an already-resolved promise.
-    register_runtime_fn(env, "async/resolved", |args| {
+    register_runtime_only_fn(env, "async/resolved", &[], |args| {
         check_arity!(args, "async/resolved", 1);
         Ok(NativeOutcome::Runtime(
             RuntimeRequest::CreateSettledPromise {
@@ -500,12 +483,9 @@ fn register_promise_ops(env: &Env) {
     // async/rejected — create an already-rejected promise. The reason string is
     // preserved as the promise's failure `SemaError`; awaiting it re-raises that
     // error verbatim (no `task rejected:` wrapping).
-    register_runtime_fn(env, "async/rejected", |args| {
+    register_runtime_only_fn(env, "async/rejected", &[], |args| {
         check_arity!(args, "async/rejected", 1);
-        let msg = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
+        let msg = args.str_at(0, "async/rejected")?.to_string();
         Ok(NativeOutcome::Runtime(
             RuntimeRequest::CreateSettledPromise {
                 outcome: TaskOutcome::Failed(SemaError::eval(msg)),
@@ -517,23 +497,23 @@ fn register_promise_ops(env: &Env) {
     // Terminal-state predicates — inspect the registry settlement. The states
     // partition cleanly: a promise is at most one of resolved?/rejected?/
     // cancelled?, and pending? is exactly the not-yet-settled case.
-    register_runtime_fn(env, "async/resolved?", |args| {
+    register_runtime_only_fn(env, "async/resolved?", &[], |args| {
         inspect_op(args, "async/resolved?", Predicate::Resolved)
     });
-    register_runtime_fn(env, "async/rejected?", |args| {
+    register_runtime_only_fn(env, "async/rejected?", &[], |args| {
         inspect_op(args, "async/rejected?", Predicate::Rejected)
     });
-    register_runtime_fn(env, "async/pending?", |args| {
+    register_runtime_only_fn(env, "async/pending?", &[], |args| {
         inspect_op(args, "async/pending?", Predicate::Pending)
     });
-    register_runtime_fn(env, "async/cancelled?", |args| {
+    register_runtime_only_fn(env, "async/cancelled?", &[], |args| {
         inspect_op(args, "async/cancelled?", Predicate::Cancelled)
     });
 
     // async/cancel — request cancellation of the spawned task behind a promise.
     // Returns #t only when this call records the FIRST cancellation request for a
     // still-pending spawned task; #f for a synthetic/terminal/reaped promise.
-    register_runtime_fn(env, "async/cancel", |args| {
+    register_runtime_only_fn(env, "async/cancel", &[], |args| {
         check_arity!(args, "async/cancel", 1);
         let id = expect_promise(args, "async/cancel", 0)?;
         Ok(NativeOutcome::Runtime(RuntimeRequest::CancelPromise {
@@ -545,7 +525,7 @@ fn register_promise_ops(env: &Env) {
     // async/all — OBSERVE every supplied promise; resume with the input-ordered
     // value list once all resolve, or short-circuit on the first failure/cancel.
     // The supplied producers are never cancelled. Empty input resolves to `()`.
-    register_runtime_fn(env, "async/all", |args| {
+    register_runtime_only_fn(env, "async/all", &[], |args| {
         check_arity!(args, "async/all", 1);
         let items = expect_list_or_vector(&args[0], "async/all")?;
         let promises = collect_promise_ids(items, "async/all")?;
@@ -560,7 +540,7 @@ fn register_promise_ops(env: &Env) {
 
     // async/race — OBSERVE the supplied promises; resume with the first (lowest-
     // settlement) winner, returned/failed/cancelled alike. Losers CONTINUE.
-    register_runtime_fn(env, "async/race", |args| {
+    register_runtime_only_fn(env, "async/race", &[], |args| {
         check_arity!(args, "async/race", 1);
         let items = expect_list_or_vector(&args[0], "async/race")?;
         if items.is_empty() {
@@ -579,7 +559,7 @@ fn register_promise_ops(env: &Env) {
     // async/timeout — OBSERVE a single promise bounded by a deadline. An
     // already-settled promise wins (even at ms=0); a promise still pending at the
     // deadline raises `:timeout` while the supplied producer CONTINUES.
-    register_runtime_fn(env, "async/timeout", |args| {
+    register_runtime_only_fn(env, "async/timeout", &[], |args| {
         check_arity!(args, "async/timeout", 2);
         let ms = duration_ms(&args[0], "async/timeout")?;
         const MAX_TIMEOUT_MS: i64 = 86_400_000; // 1 day
@@ -845,7 +825,7 @@ fn inspect_channel(args: &[Value], name: &str, query: ChannelQuery) -> NativeRes
 fn register_channel_ops(env: &Env) {
     // channel/new — create a bounded channel in the registry, resume with its
     // handle. Capacity validation stays here (the registry only allocates).
-    register_runtime_fn(env, "channel/new", |args| {
+    register_runtime_only_fn(env, "channel/new", &[], |args| {
         check_arity!(args, "channel/new", 0..=1);
         // An upper bound keeps an unrepresentable/allocation-impossible request
         // (e.g. `i64::MAX`) from reaching the registry's buffer, which would panic
@@ -854,9 +834,7 @@ fn register_channel_ops(env: &Env) {
         let capacity = if args.is_empty() {
             1
         } else {
-            let n = args[0]
-                .as_int()
-                .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
+            let n = args.int_at(0, "channel/new")?;
             if n <= 0 {
                 return Err(SemaError::eval("channel/new: capacity must be at least 1"));
             }
@@ -878,7 +856,7 @@ fn register_channel_ops(env: &Env) {
     // channel/send — send a value; suspend until buffered/handed to a receiver.
     // A full channel BLOCKS until space (the runtime parks the frame); a
     // send-to-closed raises the closed error naming the dropped value.
-    register_runtime_fn_with_escaping_args(env, "channel/send", &[1], |args| {
+    register_runtime_only_fn(env, "channel/send", &[1], |args| {
         check_arity!(args, "channel/send", 2);
         let channel = expect_channel(args, "channel/send", 0)?;
         Ok(NativeOutcome::Suspend(NativeSuspend {
@@ -894,7 +872,7 @@ fn register_channel_ops(env: &Env) {
 
     // channel/recv — receive a value; suspend until one is available. A closed +
     // empty channel resumes with nil (the documented closed sentinel).
-    register_runtime_fn(env, "channel/recv", |args| {
+    register_runtime_only_fn(env, "channel/recv", &[], |args| {
         check_arity!(args, "channel/recv", 1);
         let channel = expect_channel(args, "channel/recv", 0)?;
         Ok(NativeOutcome::Suspend(NativeSuspend {
@@ -904,7 +882,7 @@ fn register_channel_ops(env: &Env) {
     });
 
     // channel/try-recv — non-blocking receive: drain one value or nil sentinel.
-    register_runtime_fn(env, "channel/try-recv", |args| {
+    register_runtime_only_fn(env, "channel/try-recv", &[], |args| {
         check_arity!(args, "channel/try-recv", 1);
         let channel = expect_channel(args, "channel/try-recv", 0)?;
         Ok(NativeOutcome::Runtime(RuntimeRequest::ChannelOp {
@@ -915,7 +893,7 @@ fn register_channel_ops(env: &Env) {
     });
 
     // channel/close — close the channel, waking parked senders/receivers; nil.
-    register_runtime_fn(env, "channel/close", |args| {
+    register_runtime_only_fn(env, "channel/close", &[], |args| {
         check_arity!(args, "channel/close", 1);
         let channel = expect_channel(args, "channel/close", 0)?;
         Ok(NativeOutcome::Runtime(RuntimeRequest::ChannelOp {
@@ -926,16 +904,16 @@ fn register_channel_ops(env: &Env) {
     });
 
     // Observational channel ops — answered synchronously by the runtime.
-    register_runtime_fn(env, "channel/closed?", |args| {
+    register_runtime_only_fn(env, "channel/closed?", &[], |args| {
         inspect_channel(args, "channel/closed?", ChannelQuery::Closed)
     });
-    register_runtime_fn(env, "channel/count", |args| {
+    register_runtime_only_fn(env, "channel/count", &[], |args| {
         inspect_channel(args, "channel/count", ChannelQuery::Count)
     });
-    register_runtime_fn(env, "channel/empty?", |args| {
+    register_runtime_only_fn(env, "channel/empty?", &[], |args| {
         inspect_channel(args, "channel/empty?", ChannelQuery::Empty)
     });
-    register_runtime_fn(env, "channel/full?", |args| {
+    register_runtime_only_fn(env, "channel/full?", &[], |args| {
         inspect_channel(args, "channel/full?", ChannelQuery::Full)
     });
 }

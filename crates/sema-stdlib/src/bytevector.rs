@@ -1,4 +1,4 @@
-use sema_core::{check_arity, SemaError, Value};
+use sema_core::{check_arity, ArgsExt, SemaError, Value};
 
 use crate::register_fn;
 
@@ -91,18 +91,14 @@ fn parse_int10(bytes: &[u8]) -> Result<i64, String> {
 pub fn register(env: &sema_core::Env) {
     register_fn(env, "make-bytevector", |args| {
         check_arity!(args, "make-bytevector", 1..=2);
-        let size = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
+        let size = args.int_at(0, "make-bytevector")?;
         if size < 0 {
             return Err(SemaError::eval(format!(
                 "make-bytevector: size must be non-negative, got {size}"
             )));
         }
         let fill = if args.len() == 2 {
-            let f = args[1]
-                .as_int()
-                .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
+            let f = args.int_at(1, "make-bytevector")?;
             if !(0..=255).contains(&f) {
                 return Err(SemaError::eval(format!(
                     "make-bytevector: fill value {f} out of range 0..255"
@@ -133,20 +129,14 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "bytevector-length", |args| {
         check_arity!(args, "bytevector-length", 1);
-        let bv = args[0]
-            .as_bytevector()
-            .ok_or_else(|| SemaError::type_error("bytevector", args[0].type_name()))?;
+        let bv = args.bytes_at(0, "bytevector-length")?;
         Ok(Value::int(bv.len() as i64))
     });
 
     register_fn(env, "bytevector-u8-ref", |args| {
         check_arity!(args, "bytevector-u8-ref", 2);
-        let bv = args[0]
-            .as_bytevector()
-            .ok_or_else(|| SemaError::type_error("bytevector", args[0].type_name()))?;
-        let idx = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
+        let bv = args.bytes_at(0, "bytevector-u8-ref")?;
+        let idx = args.int_at(1, "bytevector-u8-ref")?;
         if idx < 0 || idx as usize >= bv.len() {
             return Err(SemaError::eval(format!(
                 "bytevector-u8-ref: index {idx} out of range for bytevector of length {}",
@@ -158,15 +148,9 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "bytevector-u8-set!", |args| {
         check_arity!(args, "bytevector-u8-set!", 3);
-        let bv = args[0]
-            .as_bytevector()
-            .ok_or_else(|| SemaError::type_error("bytevector", args[0].type_name()))?;
-        let idx = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
-        let byte = args[2]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?;
+        let bv = args.bytes_at(0, "bytevector-u8-set!")?;
+        let idx = args.int_at(1, "bytevector-u8-set!")?;
+        let byte = args.int_at(2, "bytevector-u8-set!")?;
         if idx < 0 || idx as usize >= bv.len() {
             return Err(SemaError::eval(format!(
                 "bytevector-u8-set!: index {idx} out of range for bytevector of length {}",
@@ -185,22 +169,14 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "bytevector-copy", |args| {
         check_arity!(args, "bytevector-copy", 1..=3);
-        let bv = args[0]
-            .as_bytevector()
-            .ok_or_else(|| SemaError::type_error("bytevector", args[0].type_name()))?;
+        let bv = args.bytes_at(0, "bytevector-copy")?;
         let start = if args.len() >= 2 {
-            args[1]
-                .as_int()
-                .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?
-                as usize
+            args.int_at(1, "bytevector-copy")? as usize
         } else {
             0
         };
         let end = if args.len() == 3 {
-            args[2]
-                .as_int()
-                .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?
-                as usize
+            args.int_at(2, "bytevector-copy")? as usize
         } else {
             bv.len()
         };
@@ -226,18 +202,14 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "bytevector->list", |args| {
         check_arity!(args, "bytevector->list", 1);
-        let bv = args[0]
-            .as_bytevector()
-            .ok_or_else(|| SemaError::type_error("bytevector", args[0].type_name()))?;
+        let bv = args.bytes_at(0, "bytevector->list")?;
         let items: Vec<Value> = bv.iter().map(|&b| Value::int(b as i64)).collect();
         Ok(Value::list(items))
     });
 
     register_fn(env, "list->bytevector", |args| {
         check_arity!(args, "list->bytevector", 1);
-        let items = args[0]
-            .as_list()
-            .ok_or_else(|| SemaError::type_error("list", args[0].type_name()))?;
+        let items = args.list_at(0, "list->bytevector")?;
         let mut bytes = Vec::with_capacity(items.len());
         for item in items {
             let n = item
@@ -255,9 +227,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "utf8->string", |args| {
         check_arity!(args, "utf8->string", 1);
-        let bv = args[0]
-            .as_bytevector()
-            .ok_or_else(|| SemaError::type_error("bytevector", args[0].type_name()))?;
+        let bv = args.bytes_at(0, "utf8->string")?;
         let s = String::from_utf8(bv.to_vec())
             .map_err(|e| SemaError::eval(format!("utf8->string: invalid UTF-8: {e}")))?;
         Ok(Value::string(&s))
@@ -265,9 +235,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "string->utf8", |args| {
         check_arity!(args, "string->utf8", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "string->utf8")?;
         Ok(Value::bytevector(s.as_bytes().to_vec()))
     });
 

@@ -17,6 +17,7 @@ use std::sync::mpsc::{
 use std::sync::Arc;
 
 use notify::{Event, EventKind, RecursiveMode, Watcher};
+use sema_core::ArgsExt;
 use sema_core::{check_arity, Caps, NativeFn, SemaError, Value};
 
 use crate::register_fn;
@@ -316,9 +317,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         sema_core::intern("fs/watch"),
         Value::native_fn(NativeFn::with_ctx("fs/watch", move |ctx, args| {
             check_arity!(args, "fs/watch", 1..=2);
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            let path = args.str_at(0, "fs/watch")?;
             let recursive = args
                 .get(1)
                 .and_then(|o| o.as_map_ref())

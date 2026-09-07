@@ -150,7 +150,8 @@ impl Notebook {
         self.metadata.sema_version = env!("CARGO_PKG_VERSION").to_string();
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize notebook: {e}"))?;
-        std::fs::write(path, json).map_err(|e| format!("Failed to write {}: {e}", path.display()))
+        sema_core::fs::AtomicFile::write_through(path, json.as_bytes())
+            .map_err(|e| format!("Failed to write {}: {e}", path.display()))
     }
 
     /// Add a new code cell and return its ID.
@@ -371,8 +372,7 @@ mod tests {
 
     #[test]
     fn save_and_load_round_trip() {
-        let dir = std::env::temp_dir().join(format!("sema-nb-test-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = sema_core::testing::unique_temp_dir("nb-test");
         let path = dir.join("test.sema-nb");
 
         let mut nb = Notebook::new("File Test");

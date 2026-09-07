@@ -71,7 +71,9 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateHandle};
-use sema_core::{in_runtime_quantum, Caps, Conversation, Message, Role, SemaError, Value};
+use sema_core::{
+    in_runtime_quantum, Caps, Conversation, Message, OptionsExt, Role, SemaError, Value,
+};
 
 use crate::runtime_offload::{checkout_external, external_io_interruptible_try, CheckoutOp};
 
@@ -297,13 +299,6 @@ fn thread_path(namespace: &str, id: &str) -> PathBuf {
     base_dir().join(namespace).join(format!("{id}.jsonl"))
 }
 
-/// Read the string under keyword `key` from a map value, if present.
-fn map_get_str(v: &Value, key: &str) -> Option<String> {
-    v.as_map_rc()?
-        .get(&Value::keyword(key))
-        .and_then(|s| s.as_str().map(str::to_string))
-}
-
 /// The handle map `{:memory/id id :memory/namespace ns}` all `memory/*`
 /// functions accept.
 fn handle_value(id: &str, namespace: &str) -> Value {
@@ -315,10 +310,7 @@ fn handle_value(id: &str, namespace: &str) -> Value {
 
 /// Read `(namespace, id)` back out of a handle map.
 fn parse_handle(fn_name: &str, v: &Value) -> Result<(String, String), SemaError> {
-    match (
-        map_get_str(v, "memory/id"),
-        map_get_str(v, "memory/namespace"),
-    ) {
+    match (v.opt_str("memory/id"), v.opt_str("memory/namespace")) {
         (Some(id), Some(ns)) => Ok((ns, id)),
         _ => Err(SemaError::type_error(
             format!("{fn_name}: a memory handle (from memory/open)"),
@@ -529,9 +521,12 @@ fn memory_open(
             opts.type_name(),
         ));
     }
-    let id = map_get_str(opts, "id")
+    let id = opts
+        .opt_str("id")
         .ok_or_else(|| SemaError::eval("memory/open: :id (string) is required"))?;
-    let namespace = map_get_str(opts, "namespace").unwrap_or_else(|| "default".to_string());
+    let namespace = opts
+        .opt_str("namespace")
+        .unwrap_or_else(|| "default".to_string());
     check_segment(":id", &id)?;
     check_segment(":namespace", &namespace)?;
 
@@ -737,8 +732,9 @@ fn memory_append(args: &[Value]) -> NativeResult {
             msg.type_name(),
         ));
     }
-    let role = map_get_str(msg, "role").unwrap_or_else(|| "user".to_string());
-    let content = map_get_str(msg, "content")
+    let role = msg.opt_str("role").unwrap_or_else(|| "user".to_string());
+    let content = msg
+        .opt_str("content")
         .ok_or_else(|| SemaError::eval("memory/append: :content (string) is required"))?;
     let bounds = effective_bounds();
     if role.len() + content.len() > bounds.max_turn_bytes {

@@ -16,6 +16,7 @@
 //! `make_closure` collection can intervene). Tests that WANT implicit
 //! collections churn far past the threshold instead.
 
+use sema_core::testing::unique_temp_dir;
 use sema_core::Value;
 use sema_eval::Interpreter;
 use std::path::PathBuf;
@@ -27,13 +28,7 @@ fn eval_ok(input: &str) -> Value {
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("sema-gc-{tag}-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
+    unique_temp_dir(&format!("gc-{tag}"))
 }
 
 fn write_file(dir: &std::path::Path, name: &str, src: &str) -> String {

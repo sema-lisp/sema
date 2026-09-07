@@ -268,15 +268,7 @@ mod tests {
     use super::*;
 
     fn tmp_root() -> PathBuf {
-        let mut p = std::env::temp_dir();
-        p.push(format!(
-            "sema-wf-journal-test-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        p
+        sema_core::testing::unique_temp_dir("wf-journal-test")
     }
 
     #[test]

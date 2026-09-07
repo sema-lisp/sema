@@ -99,21 +99,7 @@ pub fn run(interpreter: Interpreter, quiet: bool, sandbox_mode: Option<&str>) {
 
                 set_last_input(&trimmed, None);
 
-                match interpreter.eval_str_in_global(&trimmed) {
-                    Ok(val) => {
-                        drain_async_scheduler(&interpreter);
-                        rotate_result_slots(&env, val.clone());
-                        if !val.is_nil() {
-                            println!("{}", pretty_print(&val, 80));
-                        } else if let Some(name) = top_level_define_name(&trimmed) {
-                            println!("{}", crate::colors::dim(&format!("; defined {name}")));
-                        }
-                    }
-                    Err(e) => {
-                        env.set(intern("*e"), Value::string(&e.to_string()));
-                        print_error(&e);
-                    }
-                }
+                eval_and_report(&interpreter, &env, &trimmed);
             }
             Ok(Signal::CtrlC) => {
                 // Reedline already clears the in-progress buffer on Ctrl-C
@@ -137,6 +123,27 @@ pub fn run(interpreter: Interpreter, quiet: bool, sandbox_mode: Option<&str>) {
     }
 
     println!("Goodbye!");
+}
+
+/// Evaluate one REPL input and print the outcome: the value, a `; defined`
+/// note for a top-level define, or the error (also stored in `*e`). Shared by
+/// the interactive and headless loops.
+pub(super) fn eval_and_report(interpreter: &Interpreter, env: &sema_core::Env, src: &str) {
+    match interpreter.eval_str_in_global(src) {
+        Ok(val) => {
+            drain_async_scheduler(interpreter);
+            rotate_result_slots(env, val.clone());
+            if !val.is_nil() {
+                println!("{}", pretty_print(&val, 80));
+            } else if let Some(name) = top_level_define_name(src) {
+                println!("{}", crate::colors::dim(&format!("; defined {name}")));
+            }
+        }
+        Err(e) => {
+            env.set(intern("*e"), Value::string(&e.to_string()));
+            print_error(&e);
+        }
+    }
 }
 
 /// Roll `*1` → `*2` → `*3` (most recent first) and store the new value in `*1`.

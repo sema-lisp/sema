@@ -32,6 +32,7 @@ use std::thread::JoinHandle;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateHandle};
 use sema_core::{check_arity, in_runtime_quantum, Caps, SemaError, Value};
+use sema_core::{ArgsExt, ResultExt};
 
 use crate::runtime_offload::{
     checkout_external, finish_terminal_gate, group_sigkill_abort, prepare_terminal_gate,
@@ -239,7 +240,7 @@ fn spawn(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value, SemaErro
             pixel_width: 0,
             pixel_height: 0,
         })
-        .map_err(|e| SemaError::eval(format!("pty/spawn: {e}")))?;
+        .eval_ctx("pty/spawn")?;
 
     let mut cmd = CommandBuilder::new(&parts[0]);
     for a in &parts[1..] {
@@ -265,14 +266,8 @@ fn spawn(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value, SemaErro
     // Drop the slave so the master read sees EOF once the child exits.
     drop(pair.slave);
 
-    let reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| SemaError::eval(format!("pty/spawn: {e}")))?;
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| SemaError::eval(format!("pty/spawn: {e}")))?;
+    let reader = pair.master.try_clone_reader().eval_ctx("pty/spawn")?;
+    let writer = pair.master.take_writer().eval_ctx("pty/spawn")?;
     let out = Arc::new(Mutex::new(Vec::new()));
     let reader_thread = Some(pump(reader, out.clone()));
 
@@ -547,9 +542,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     crate::register_runtime_fn_path_gated(env, sandbox, Caps::PROCESS, "pty/write", &[], |args| {
         check_arity!(args, "pty/write", 2);
         let id = handle(args, 0)?;
-        let text = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let text = args.str_at(1, "pty/write")?;
         if in_runtime_quantum() {
             return pty_write_runtime(id, text.as_bytes().to_vec());
         }
@@ -557,7 +550,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             pt.writer
                 .write_all(text.as_bytes())
                 .and_then(|_| pt.writer.flush())
-                .map_err(|e| SemaError::Io(format!("pty/write: {e}")))?;
+                .io_ctx("pty/write")?;
             Ok(Value::nil())
         })
         .map(NativeOutcome::Return)
@@ -566,14 +559,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "pty/resize", |args| {
         check_arity!(args, "pty/resize", 3);
         let id = handle(args, 0)?;
-        let rows = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[1].type_name()))?
-            .clamp(1, u16::MAX as i64) as u16;
-        let cols = args[2]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[2].type_name()))?
-            .clamp(1, u16::MAX as i64) as u16;
+        let rows = args.int_at(1, "pty/resize")?.clamp(1, u16::MAX as i64) as u16;
+        let cols = args.int_at(2, "pty/resize")?.clamp(1, u16::MAX as i64) as u16;
         with_pty("pty/resize", id, |pt| {
             pt.master
                 .resize(PtySize {
@@ -582,7 +569,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     pixel_width: 0,
                     pixel_height: 0,
                 })
-                .map_err(|e| SemaError::eval(format!("pty/resize: {e}")))?;
+                .eval_ctx("pty/resize")?;
             Ok(Value::nil())
         })
     });
@@ -613,7 +600,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             let _ = t.join();
         }
         PTYS.with(|p| p.borrow_mut().insert(id, PtySlot::Available(pt)));
-        let status = status.map_err(|e| SemaError::Io(format!("pty/wait: {e}")))?;
+        let status = status.io_ctx("pty/wait")?;
         Ok(NativeOutcome::Return(Value::int(status.exit_code() as i64)))
     });
 
@@ -621,11 +608,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         check_arity!(args, "pty/exit-code", 1);
         let id = handle(args, 0)?;
         with_pty("pty/exit-code", id, |pt| {
-            match pt
-                .child
-                .try_wait()
-                .map_err(|e| SemaError::Io(format!("pty/exit-code: {e}")))?
-            {
+            match pt.child.try_wait().io_ctx("pty/exit-code")? {
                 Some(status) => Ok(Value::int(status.exit_code() as i64)),
                 None => Ok(Value::nil()),
             }
@@ -636,11 +619,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         check_arity!(args, "pty/running?", 1);
         let id = handle(args, 0)?;
         with_pty("pty/running?", id, |pt| {
-            let running = pt
-                .child
-                .try_wait()
-                .map_err(|e| SemaError::Io(format!("pty/running?: {e}")))?
-                .is_none();
+            let running = pt.child.try_wait().io_ctx("pty/running?")?.is_none();
             Ok(Value::bool(running))
         })
     });

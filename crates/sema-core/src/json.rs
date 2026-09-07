@@ -428,3 +428,161 @@ mod tests {
         assert_eq!(json, serde_json::Value::String("1/3".to_string()));
     }
 }
+
+/// JSON Schema (draft 2020-12) for a tool's parameter map, as `deftool` and
+/// MCP tool listings declare it: `{:name {:type :string :description "..."
+/// :optional #t :default "x" :enum [...]}}`. Sema type keywords are mapped
+/// to schema type names; a bare value declares a required string; `mcp/*`
+/// and `private` keys are metadata, not parameters. Shared by the LLM tool
+/// loop and the MCP server so the two cannot drift.
+pub fn value_to_json_schema(val: &Value) -> serde_json::Value {
+    if let Some(map) = val.as_map_rc() {
+        let mut properties = serde_json::Map::new();
+        let mut required = Vec::new();
+        for (k, v) in map.iter() {
+            let key = k
+                .as_keyword()
+                .or_else(|| k.as_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| k.to_string());
+
+            // Skip metadata parameters
+            if key == "mcp/expose" || key == "private" || key.starts_with("mcp/") {
+                continue;
+            }
+
+            let prop = if let Some(inner) = v.as_map_rc() {
+                let mut prop_obj = serde_json::Map::new();
+                if let Some(t) = inner.get(&Value::keyword("type")) {
+                    let type_str = t
+                        .as_keyword()
+                        .or_else(|| t.as_str().map(|s| s.to_string()))
+                        .unwrap_or_else(|| "string".to_string());
+                    // Sema type keywords → JSON Schema draft 2020-12 type names.
+                    // LLM providers validate tool schemas strictly and reject the
+                    // ENTIRE request over one bad name — `:list` leaking through as
+                    // "list" broke every turn of an MCP client session.
+                    let json_type = match type_str.as_str() {
+                        "str" => "string",
+                        "int" => "integer",
+                        "float" | "double" => "number",
+                        "bool" => "boolean",
+                        "list" | "vector" | "array" => "array",
+                        "map" | "dict" => "object",
+                        "nil" => "null",
+                        other => other,
+                    };
+                    prop_obj.insert(
+                        "type".to_string(),
+                        serde_json::Value::String(json_type.to_string()),
+                    );
+                } else {
+                    prop_obj.insert(
+                        "type".to_string(),
+                        serde_json::Value::String("string".to_string()),
+                    );
+                }
+                if let Some(d) = inner.get(&Value::keyword("description")) {
+                    let desc = d
+                        .as_str()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| d.to_string());
+                    prop_obj.insert("description".to_string(), serde_json::Value::String(desc));
+                }
+                if let Some(e) = inner.get(&Value::keyword("enum")) {
+                    if let Some(items) = e.as_seq() {
+                        let vals: Vec<serde_json::Value> = items
+                            .iter()
+                            .map(|v| {
+                                serde_json::Value::String(
+                                    v.as_str()
+                                        .map(|s| s.to_string())
+                                        .or_else(|| v.as_keyword())
+                                        .unwrap_or_else(|| v.to_string()),
+                                )
+                            })
+                            .collect();
+                        prop_obj.insert("enum".to_string(), serde_json::Value::Array(vals));
+                    }
+                }
+                // Mark as required unless :optional #t
+                let optional = inner
+                    .get(&Value::keyword("optional"))
+                    .map(|v| v.is_truthy())
+                    .unwrap_or(false);
+                let default = inner.get(&Value::keyword("default"));
+                if !optional && default.is_none() {
+                    required.push(serde_json::Value::String(key.clone()));
+                }
+                if let Some(d) = default {
+                    prop_obj.insert("default".to_string(), crate::value_to_json_lossy(d));
+                }
+                serde_json::Value::Object(prop_obj)
+            } else {
+                required.push(serde_json::Value::String(key.clone()));
+                serde_json::json!({"type": "string"})
+            };
+            properties.insert(key, prop);
+        }
+        serde_json::json!({
+            "type": "object",
+            "properties": properties,
+            "required": required
+        })
+    } else {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+
+    fn params(field: BTreeMap<Value, Value>) -> Value {
+        let mut params = BTreeMap::new();
+        params.insert(Value::keyword("name"), Value::map(field));
+        Value::map(params)
+    }
+
+    #[test]
+    fn default_marks_param_not_required_and_emits_default() {
+        let mut field = BTreeMap::new();
+        field.insert(Value::keyword("type"), Value::keyword("string"));
+        field.insert(Value::keyword("default"), Value::string("world"));
+        let schema = value_to_json_schema(&params(field));
+        let required = schema["required"].as_array().expect("required array");
+        assert!(!required.iter().any(|v| v == "name"), "{schema}");
+        assert_eq!(
+            schema["properties"]["name"]["default"],
+            serde_json::json!("world")
+        );
+    }
+
+    #[test]
+    fn sema_type_keywords_map_to_schema_names() {
+        for (sema, json) in [
+            ("list", "array"),
+            ("int", "integer"),
+            ("map", "object"),
+            ("str", "string"),
+        ] {
+            let mut field = BTreeMap::new();
+            field.insert(Value::keyword("type"), Value::keyword(sema));
+            let schema = value_to_json_schema(&params(field));
+            assert_eq!(
+                schema["properties"]["name"]["type"],
+                serde_json::json!(json),
+                "{sema}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_keys_are_not_parameters() {
+        let mut p = BTreeMap::new();
+        p.insert(Value::keyword("mcp/expose"), Value::bool(true));
+        p.insert(Value::keyword("x"), Value::keyword("int"));
+        let schema = value_to_json_schema(&Value::map(p));
+        assert!(schema["properties"].get("mcp/expose").is_none());
+        assert_eq!(schema["required"], serde_json::json!(["x"]));
+    }
+}

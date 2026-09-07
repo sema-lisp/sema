@@ -33,7 +33,6 @@ use sema_core::{Env, EvalContext, NativeFn, Value};
 
 use super::channel::{ChannelClose, ChannelWake};
 use super::wait::RuntimeCommand;
-#[cfg(test)]
 use super::RootHandle;
 use super::{
     AcquireResult, ChannelRegistry, ContinuationFrame, DriveBudget, DriveState, GateResult,
@@ -967,15 +966,33 @@ impl Runtime {
         &self,
         prepared: TestPreparedTask,
     ) -> Result<RootHandle, SubmitRootError> {
+        self.insert_root(
+            TaskPayload::Test(prepared),
+            None,
+            None,
+            TaskScopes::default(),
+        )
+    }
+
+    /// Allocate a root and its main task, insert both records, and enqueue the
+    /// task Ready. The main task's dynamic context is snapshotted from the
+    /// submitting scope.
+    pub(super) fn insert_root(
+        &self,
+        payload: TaskPayload,
+        vm_call: Option<VM>,
+        vm_owner: Option<ReturnOwner>,
+        scopes: TaskScopes,
+    ) -> Result<RootHandle, SubmitRootError> {
         let mut state = self.state.borrow_mut();
         if state.shutting_down || state.terminal_fault.is_some() {
             return Err(SubmitRootError::ShuttingDown);
         }
-        if state.force_root_exhaustion
-            || state.force_task_exhaustion
-            || state.root_ids.is_exhausted()
-            || state.task_ids.is_exhausted()
-        {
+        #[cfg(test)]
+        if state.force_root_exhaustion || state.force_task_exhaustion {
+            return Err(SubmitRootError::IdExhausted);
+        }
+        if state.root_ids.is_exhausted() || state.task_ids.is_exhausted() {
             return Err(SubmitRootError::IdExhausted);
         }
         let root = state
@@ -997,14 +1014,14 @@ impl Runtime {
             task,
             RuntimeTask {
                 record: TaskRecord::new(task, relations),
-                payload: TaskPayload::Test(prepared),
+                payload,
                 pending_resume: None,
                 suspended_owner: None,
-                vm_call: None,
-                vm_owner: None,
+                vm_call,
+                vm_owner,
                 context,
                 vm_resume: None,
-                scopes: TaskScopes::default(),
+                scopes,
             },
         );
         state.ready.enqueue(root, task);
@@ -1031,11 +1048,23 @@ impl Runtime {
         root: RootId,
         prepared: TestPreparedTask,
     ) -> TaskId {
+        self.insert_test_child(root, CancellationParent::Root(root), prepared)
+    }
+
+    /// Insert a Ready test task under `root` with the given cancellation
+    /// parent. See `submit_test_child_under_root` for the `vm_owner` choice.
+    #[cfg(test)]
+    fn insert_test_child(
+        &self,
+        root: RootId,
+        cancellation_parent: CancellationParent,
+        prepared: TestPreparedTask,
+    ) -> TaskId {
         let mut state = self.state.borrow_mut();
-        let task = state.task_ids.allocate().expect("child task identity");
+        let task = state.task_ids.allocate().expect("test task identity");
         let relations = TaskRelations {
             origin_root: root,
-            cancellation_parent: CancellationParent::Root(root),
+            cancellation_parent,
             lifetime_owner: LifetimeOwner::Root(root),
         };
         state.tasks.insert(
@@ -1092,29 +1121,7 @@ impl Runtime {
         parent: TaskId,
         prepared: TestPreparedTask,
     ) -> TaskId {
-        let mut state = self.state.borrow_mut();
-        let task = state.task_ids.allocate().expect("grandchild task identity");
-        let relations = TaskRelations {
-            origin_root: root,
-            cancellation_parent: CancellationParent::Task(parent),
-            lifetime_owner: LifetimeOwner::Root(root),
-        };
-        state.tasks.insert(
-            task,
-            RuntimeTask {
-                record: TaskRecord::new(task, relations),
-                payload: TaskPayload::Test(prepared),
-                pending_resume: None,
-                suspended_owner: None,
-                vm_call: None,
-                vm_owner: Some(ReturnOwner::Root),
-                context: TaskContextHandle::default(),
-                vm_resume: None,
-                scopes: TaskScopes::default(),
-            },
-        );
-        state.ready.enqueue(root, task);
-        task
+        self.insert_test_child(root, CancellationParent::Task(parent), prepared)
     }
 
     #[cfg(test)]
@@ -3105,24 +3112,8 @@ impl Runtime {
             other => other,
         };
         let mut state = self.state.borrow_mut();
-        let key = match state
-            .waits
-            .as_ref()
-            .expect("wait runtime installed")
-            .issue_internal_wait()
-        {
-            Ok(key) => key,
-            Err(_) => {
-                state.pending.push_back(PendingStage::ApplyRuntimeResponse(
-                    task_id,
-                    owner,
-                    frame,
-                    Err(sema_core::SemaError::eval(
-                        "runtime wait identity exhausted",
-                    )),
-                ));
-                return Ok(());
-            }
+        let Some((key, owner, frame)) = issue_wait_key(&mut state, task_id, owner, frame) else {
+            return Ok(());
         };
         let result = match wait {
             WaitKind::Promise(promise) => install_promise_wait(
@@ -3494,24 +3485,9 @@ impl Runtime {
         if let RuntimeRequest::OriginBarrier { continuation } = request {
             let frame = ContinuationFrame::native(continuation);
             let mut state = self.state.borrow_mut();
-            let key = match state
-                .waits
-                .as_ref()
-                .expect("wait runtime installed")
-                .issue_internal_wait()
-            {
-                Ok(key) => key,
-                Err(_) => {
-                    state.pending.push_back(PendingStage::ApplyRuntimeResponse(
-                        task_id,
-                        owner,
-                        frame,
-                        Err(sema_core::SemaError::eval(
-                            "runtime wait identity exhausted",
-                        )),
-                    ));
-                    return Ok(());
-                }
+            let Some((key, owner, frame)) = issue_wait_key(&mut state, task_id, owner, frame)
+            else {
+                return Ok(());
             };
             if let Err(error) = install_origin_barrier_wait(&mut state, task_id, key, owner, frame)
             {
@@ -4755,33 +4731,8 @@ impl Runtime {
         outcome: TaskOutcome,
     ) -> Result<(), RuntimeFault> {
         let mut state = self.state.borrow_mut();
-        #[cfg(test)]
-        let exhausted = state.force_settlement_exhaustion;
-        #[cfg(not(test))]
-        let exhausted = false;
-        let sequence = match (!exhausted)
-            .then(|| state.settlement_ids.allocate())
-            .transpose()
-            .ok()
-            .flatten()
-        {
-            Some(sequence) => sequence,
-            None => {
-                let fault = RuntimeFault::IdExhausted { kind: "settlement" };
-                state.shutting_down = true;
-                state.terminal_fault = Some(fault.clone());
-                if let Some(task) = state.tasks.get_mut(&task_id) {
-                    task.record
-                        .yield_ready()
-                        .map_err(|error| RuntimeFault::Invariant {
-                            message: format!("terminal detached child failed to yield: {error:?}"),
-                        })?;
-                    let root = task.record.relations().origin_root;
-                    state.ready.enqueue(root, task_id);
-                }
-                return Err(fault);
-            }
-        };
+        let sequence =
+            allocate_settlement_sequence(&mut state, task_id, "terminal detached child")?;
         let mut task = state
             .tasks
             .remove(&task_id)
@@ -4831,32 +4782,7 @@ impl Runtime {
             .map_err(|error| RuntimeFault::Invariant {
                 message: format!("root settlement transition failed: {error:?}"),
             })?;
-        #[cfg(test)]
-        let exhausted = state.force_settlement_exhaustion;
-        #[cfg(not(test))]
-        let exhausted = false;
-        let sequence = match (!exhausted)
-            .then(|| state.settlement_ids.allocate())
-            .transpose()
-            .ok()
-            .flatten()
-        {
-            Some(sequence) => sequence,
-            None => {
-                let fault = RuntimeFault::IdExhausted { kind: "settlement" };
-                state.shutting_down = true;
-                state.terminal_fault = Some(fault.clone());
-                if let Some(task) = state.tasks.get_mut(&task_id) {
-                    task.record
-                        .yield_ready()
-                        .map_err(|error| RuntimeFault::Invariant {
-                            message: format!("terminal task failed to yield: {error:?}"),
-                        })?;
-                    state.ready.enqueue(root, task_id);
-                }
-                return Err(fault);
-            }
-        };
+        let sequence = allocate_settlement_sequence(&mut state, task_id, "terminal task")?;
         let mut task = state.tasks.remove(&task_id).expect("task prevalidated");
         let eval_context = Rc::clone(&state._context);
         let dynamic_state = task
@@ -6239,6 +6165,73 @@ fn promise_set_response(
         ),
         sema_core::runtime::PromiseSetMode::All => None,
     })
+}
+
+/// Issue an internal wait key for `task_id`. When the key space is exhausted,
+/// queue an error response for the task's continuation and return `None`.
+fn issue_wait_key(
+    state: &mut RuntimeState,
+    task_id: TaskId,
+    owner: ReturnOwner,
+    frame: ContinuationFrame,
+) -> Option<(super::WaitKey, ReturnOwner, ContinuationFrame)> {
+    match state
+        .waits
+        .as_ref()
+        .expect("wait runtime installed")
+        .issue_internal_wait()
+    {
+        Ok(key) => Some((key, owner, frame)),
+        Err(_) => {
+            state.pending.push_back(PendingStage::ApplyRuntimeResponse(
+                task_id,
+                owner,
+                frame,
+                Err(sema_core::SemaError::eval(
+                    "runtime wait identity exhausted",
+                )),
+            ));
+            None
+        }
+    }
+}
+
+/// Allocate the settlement sequence for `task_id`. When the sequence space is
+/// exhausted the runtime enters terminal fault: the task is parked Ready so a
+/// later drive observes the fault instead of a half-settled task. `what` names
+/// the task in the yield-failure message.
+fn allocate_settlement_sequence(
+    state: &mut RuntimeState,
+    task_id: TaskId,
+    what: &str,
+) -> Result<SettlementSeq, RuntimeFault> {
+    #[cfg(test)]
+    let exhausted = state.force_settlement_exhaustion;
+    #[cfg(not(test))]
+    let exhausted = false;
+    match (!exhausted)
+        .then(|| state.settlement_ids.allocate())
+        .transpose()
+        .ok()
+        .flatten()
+    {
+        Some(sequence) => Ok(sequence),
+        None => {
+            let fault = RuntimeFault::IdExhausted { kind: "settlement" };
+            state.shutting_down = true;
+            state.terminal_fault = Some(fault.clone());
+            if let Some(task) = state.tasks.get_mut(&task_id) {
+                task.record
+                    .yield_ready()
+                    .map_err(|error| RuntimeFault::Invariant {
+                        message: format!("{what} failed to yield: {error:?}"),
+                    })?;
+                let root = task.record.relations().origin_root;
+                state.ready.enqueue(root, task_id);
+            }
+            Err(fault)
+        }
+    }
 }
 
 fn install_promise_wait(

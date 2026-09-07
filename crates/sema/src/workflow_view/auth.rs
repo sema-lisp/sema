@@ -293,6 +293,21 @@ mod tests {
         std::fs::write(dir.join(name), contents).unwrap();
     }
 
+    /// The `/auth` status JSON for a run `r1` whose `metadata.json` is `meta`
+    /// and whose `events.jsonl` is `events` (omitted when empty), at `now`.
+    fn status_for(meta: &str, events: &str, now: u64) -> String {
+        let root = temp_dir("status-for");
+        let run = root.join("r1");
+        std::fs::create_dir_all(&run).unwrap();
+        write(&run, "metadata.json", meta);
+        if !events.is_empty() {
+            write(&run, "events.jsonl", events);
+        }
+        let text = String::from_utf8(status_json_at(&root, "r1", now)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        text
+    }
+
     #[test]
     fn no_mcp_key_yields_empty_array() {
         let root = temp_dir("no-mcp");
@@ -333,12 +348,7 @@ mod tests {
 
     #[test]
     fn exact_json_across_every_status() {
-        let root = temp_dir("exact-json");
-        let run = root.join("r1");
-        std::fs::create_dir_all(&run).unwrap();
-        write(
-            &run,
-            "metadata.json",
+        let text = status_for(
             r#"{"meta":{"mcp":{
                 "asana": {"url":"https://mcp.asana.com/mcp",
                           "headers":{"Authorization":"<redacted>"},
@@ -347,51 +357,33 @@ mod tests {
                           "persist":"workflow"},
                 "fs": {"command":"npx"}
             }}}"#,
-        );
-        write(
-            &run,
-            "events.jsonl",
             concat!(
                 r#"{"event":"auth.required","seq":0,"ts":"0","server":"asana","scopes":["default"],"tools":["create_task"],"persist":"workflow"}"#,
                 "\n"
             ),
+            1_000,
         );
-
-        let json = status_json_at(&root, "r1", 1_000);
-        let text = String::from_utf8(json).unwrap();
         assert_eq!(
             text,
             r#"[{"alias":"asana","needs_auth":true,"persist":"workflow","scopes":["default"],"status":"needs-consent","tools":["create_task"],"url":"https://mcp.asana.com/mcp"},{"alias":"fs","command":"npx","needs_auth":false,"persist":"workflow","status":"open","tools":[]}]"#
         );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn granted_with_future_expiry_is_authorized_and_carries_expires_at() {
-        let root = temp_dir("granted-future");
-        let run = root.join("r1");
-        std::fs::create_dir_all(&run).unwrap();
-        write(
-            &run,
-            "metadata.json",
+        let text = status_for(
             r#"{"meta":{"mcp":{"asana":{"url":"https://mcp.asana.com/mcp","auth":{"scopes":["default"]},"persist":"run"}}}}"#,
-        );
-        write(
-            &run,
-            "events.jsonl",
             concat!(
                 r#"{"event":"auth.required","seq":0,"ts":"0","server":"asana","persist":"run"}"#,
                 "\n",
                 r#"{"event":"auth.granted","seq":1,"ts":"0","server":"asana","expires_at":2000,"source":"consented"}"#,
                 "\n",
             ),
+            1_000,
         );
-
-        let text = String::from_utf8(status_json_at(&root, "r1", 1_000)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v[0]["status"], "authorized");
         assert_eq!(v[0]["expires_at"], 2000);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -425,27 +417,17 @@ mod tests {
 
     #[test]
     fn failed_latest_event_wins_over_an_earlier_grant() {
-        let root = temp_dir("failed-latest");
-        let run = root.join("r1");
-        std::fs::create_dir_all(&run).unwrap();
-        write(
-            &run,
-            "metadata.json",
+        let text = status_for(
             r#"{"meta":{"mcp":{"asana":{"url":"https://x","auth":{}}}}}"#,
-        );
-        write(
-            &run,
-            "events.jsonl",
             concat!(
                 r#"{"event":"auth.granted","seq":0,"ts":"0","server":"asana","source":"cached"}"#,
                 "\n",
                 r#"{"event":"auth.failed","seq":1,"ts":"0","server":"asana","reason":"consent_denied"}"#,
                 "\n",
             ),
+            0,
         );
-        let text = String::from_utf8(status_json_at(&root, "r1", 0)).unwrap();
         assert!(text.contains(r#""status":"failed""#), "{text}");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -481,26 +463,16 @@ mod tests {
 
     #[test]
     fn malformed_journal_line_is_skipped_not_fatal() {
-        let root = temp_dir("malformed-line");
-        let run = root.join("r1");
-        std::fs::create_dir_all(&run).unwrap();
-        write(
-            &run,
-            "metadata.json",
+        let text = status_for(
             r#"{"meta":{"mcp":{"asana":{"url":"https://x","auth":{}}}}}"#,
-        );
-        write(
-            &run,
-            "events.jsonl",
             concat!(
                 "not even json\n",
                 r#"{"event":"auth.granted","seq":0,"ts":"0","server":"asana","source":"cached"}"#,
                 "\n",
             ),
+            0,
         );
-        let text = String::from_utf8(status_json_at(&root, "r1", 0)).unwrap();
         assert!(text.contains(r#""status":"authorized""#), "{text}");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -509,23 +481,18 @@ mod tests {
         // metadata.json (redaction is the runtime's job, not this endpoint's), this
         // endpoint must never forward `headers`/`env` — it only ever reads
         // url/command/auth/tools/persist off the spec.
-        let root = temp_dir("no-secrets");
-        let run = root.join("r1");
-        std::fs::create_dir_all(&run).unwrap();
-        write(
-            &run,
-            "metadata.json",
+        let text = status_for(
             r#"{"meta":{"mcp":{"asana":{
                 "url":"https://mcp.asana.com/mcp",
                 "headers":{"Authorization":"Bearer not-actually-redacted-in-this-test"},
                 "auth":{"scopes":["default"]},
                 "persist":"workflow"
             }}}}"#,
+            "",
+            0,
         );
-        let text = String::from_utf8(status_json_at(&root, "r1", 0)).unwrap();
         assert!(!text.contains("Bearer"), "{text}");
         assert!(!text.contains("headers"), "{text}");
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ── Task 10: in-memory flow-state overrides (`super::connect`) ────────────

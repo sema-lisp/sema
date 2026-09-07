@@ -27,7 +27,7 @@ use sema_core::runtime::{
     NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation, ResumeInput, RootId,
     RunningSubmission, RuntimeId, SendPayload, SubmissionRejected, Trace, WaitKind,
 };
-use sema_core::{SemaError, Value, ValueView};
+use sema_core::{OptionsExt, SemaError, Value, ValueView};
 use sema_eval::Interpreter;
 use sema_vm::runtime::{DriveState, RootHandle, RootOptions, RootPoll};
 use sema_vm::{DebugState, StepMode, StopInfo, StopReason, VM};
@@ -1466,31 +1466,25 @@ fn runtime_http_call(default_method: &'static str, args: &[Value]) -> NativeResu
     let mut timeout_ms: Option<u64> = None;
     let mut has_content_type = false;
     if let Some(opts_val) = opts {
-        if let Some(opts_map) = opts_val.as_map_rc() {
-            if let Some(headers_val) = opts_map.get(&Value::keyword("headers")) {
-                if let Some(hmap) = headers_val.as_map_rc() {
-                    for (k, v) in hmap.iter() {
-                        let key = match k.view() {
-                            ValueView::String(s) => s.to_string(),
-                            ValueView::Keyword(s) => sema_core::resolve(s),
-                            _ => k.to_string(),
-                        };
-                        let val = match v.as_str() {
-                            Some(s) => s.to_string(),
-                            None => v.to_string(),
-                        };
-                        if key.eq_ignore_ascii_case("content-type") {
-                            has_content_type = true;
-                        }
-                        headers.push((key, val));
-                    }
+        if let Some(hmap) = opts_val.opt_map("headers") {
+            for (k, v) in hmap.iter() {
+                let key = match k.view() {
+                    ValueView::String(s) => s.to_string(),
+                    ValueView::Keyword(s) => sema_core::resolve(s),
+                    _ => k.to_string(),
+                };
+                let val = match v.as_str() {
+                    Some(s) => s.to_string(),
+                    None => v.to_string(),
+                };
+                if key.eq_ignore_ascii_case("content-type") {
+                    has_content_type = true;
                 }
+                headers.push((key, val));
             }
-            if let Some(timeout_val) = opts_map.get(&Value::keyword("timeout")) {
-                if let Some(ms) = timeout_val.as_int() {
-                    timeout_ms = Some(ms.max(0) as u64);
-                }
-            }
+        }
+        if let Some(ms) = opts_val.opt_int("timeout") {
+            timeout_ms = Some(ms.max(0) as u64);
         }
     }
     let body_str: Option<String> = match body {

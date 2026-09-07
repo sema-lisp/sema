@@ -28,6 +28,7 @@ use sema_core::runtime::{
     PreparedExternalOperation, QuarantineBound, ResumeInput, SendPayload, TaskContextHandle, Trace,
     WaitKind,
 };
+use sema_core::{ArgsExt, OptionsExt, ResultExt};
 use sema_core::{PolicyDenial, SemaError, Value, ValueViewRef};
 use sema_llm::builtins::{
     PolicyAttributionScope, PolicyBypassScope, PolicyDecisionSink, PolicyObservation,
@@ -47,23 +48,6 @@ use crate::workflow_mcp::{self, ServerResolution, WorkflowMcpResolver};
 /// A keyword/string argument as a plain `String` (checkpoint keys, phase labels).
 fn as_name(v: &Value) -> Option<String> {
     v.as_keyword().or_else(|| v.as_str().map(|s| s.to_string()))
-}
-
-/// Read a string-valued option from an opts map (empty string if absent/not a map).
-/// Used for the hidden `:__prompt` / `:__schema-repr` content-key inputs the `agent`
-/// macro injects.
-fn opt_str(v: &Value, key: &str) -> String {
-    v.as_map_rc()
-        .and_then(|m| {
-            m.get(&Value::keyword(key))
-                .and_then(|x| x.as_str().map(String::from))
-        })
-        .unwrap_or_default()
-}
-
-fn opt_value(v: &Value, key: &str) -> Option<Value> {
-    v.as_map_rc()
-        .and_then(|m| m.get(&Value::keyword(key)).cloned())
 }
 
 const APPROVAL_TEXT_MAX_CHARS: usize = 1024;
@@ -577,7 +561,7 @@ fn approval_suspend(run_dir: PathBuf, request: ApprovalRequest) -> NativeResult 
 fn compile_policy(
     container: &Value,
 ) -> Result<Option<Vec<Rc<sema_policy::CompiledPolicy>>>, SemaError> {
-    opt_value(container, "policy")
+    container.opt("policy")
         .map(|policy| {
             let values = if policy.as_map_rc().is_some() {
                 vec![policy]
@@ -1290,11 +1274,7 @@ fn policy_bypass_plan(
             "policy/without requires an active workflow policy",
         ));
     }
-    let reason = args[0]
-        .as_str()
-        .ok_or_else(|| SemaError::argument_type("policy/without", 1, "string", &args[0]))?
-        .trim()
-        .to_string();
+    let reason = args.str_at(0, "policy/without")?.trim().to_string();
     if reason.is_empty() || reason.chars().count() > 256 {
         return Err(SemaError::eval(
             "policy/without reason must contain 1 to 256 characters",
@@ -1329,7 +1309,7 @@ fn step_plan(
     let label = agent_role(&args[0]);
     let thunk = args[1].clone();
     let Some(ctx) = context::current_for(task_context) else {
-        if opt_value(&args[0], "policy").is_some() {
+        if args[0].opt("policy").is_some() {
             return Err(SemaError::eval(
                 "workflow/step: :policy requires an enclosing workflow/run",
             ));
@@ -1351,16 +1331,16 @@ fn step_plan(
     // tripped cap must not refuse it. The key is computed on EVERY leaf so its occurrence
     // ordinal advances in body order either way.
     let prompt = {
-        let injected = opt_str(&args[0], "__prompt");
+        let injected = args[0].opt_str("__prompt").unwrap_or_default();
         if injected.is_empty() {
-            opt_str(&args[0], "prompt")
+            args[0].opt_str("prompt").unwrap_or_default()
         } else {
             injected
         }
     };
     let content_key = ctx.agent_content_key(
         &prompt,
-        &opt_str(&args[0], "__schema-repr"),
+        &args[0].opt_str("__schema-repr").unwrap_or_default(),
         &label,
         &ctx.cur_phase_label(),
         &sema_llm::builtins::effective_policy_fingerprint(),
@@ -1805,8 +1785,8 @@ fn run_plan(
     // the thread-local WorkflowCtx, and returns a panic-safe Drop guard that reaps the
     // previous scope. `set_workflow_scope` reads the SEMA_WORKFLOW_RUN_ID /
     // SEMA_WORKFLOW_FIXED_TS test seam internally.
-    let guard = context::set_workflow_scope(&name, &doc, &meta, task_context)
-        .map_err(|e| SemaError::eval(format!("workflow/run: {e}")))?;
+    let guard =
+        context::set_workflow_scope(&name, &doc, &meta, task_context).eval_ctx("workflow/run")?;
 
     // run.started — emitted inside the live scope so seq starts at 0.
     {
@@ -2203,10 +2183,7 @@ pub fn register(env: &sema_core::Env) {
         if args.len() != 1 {
             return Err(SemaError::arity("workflow/phase", "1", args.len()));
         }
-        let label = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-            .to_string();
+        let label = args.str_at(0, "workflow/phase")?.to_string();
         let ctx = context::current_for(task_context)
             .ok_or_else(|| SemaError::eval("workflow/phase outside a workflow/run"))?;
 

@@ -1,15 +1,13 @@
 use std::collections::BTreeMap;
 
-use sema_core::{check_arity, SemaError, Value, ValueView};
+use sema_core::{check_arity, ArgsExt, SemaError, Value, ValueView};
 
 use crate::register_fn;
 
 pub fn register(env: &sema_core::Env) {
     register_fn(env, "toml/decode", |args| {
         check_arity!(args, "toml/decode", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "toml/decode")?;
         let table: toml::Table = s.parse().map_err(|e| {
             SemaError::eval(format!("toml/decode: parse error: {e}")).with_hint(
                 "toml/decode expects a TOML document (keys use = not :, strings use double quotes)",

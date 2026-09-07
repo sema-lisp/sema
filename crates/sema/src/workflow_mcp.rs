@@ -27,7 +27,7 @@ use sema_core::{Caps, SemaError, Value};
 use sema_mcp::oauth::login::{self, LoginConfig};
 use sema_mcp::oauth::loopback::BrowserOpener;
 use sema_mcp::oauth::scoped::{store_encryption_key, MemoryStore, ScopedFileStore};
-use sema_mcp::oauth::store::{self, TokenSet, TokenStore};
+use sema_mcp::oauth::store::{self, StoredCredentials, TokenSet, TokenStore};
 use sema_mcp::{
     browser_open_allowed, close_handle, connect_from_config, connect_send, gated_browser_opener,
     host_capability_allowed, login_interactive, register_connected, ConnectFailure, ConnectOpts,
@@ -417,25 +417,9 @@ fn resolve_authenticated_http_send(
         }
     };
 
-    let (stored, imported_from_default) = if decl.persist == McpPersist::Keyring {
-        (scoped_store.load(url), false)
-    } else {
-        match scoped_store.load(url) {
-            Some(creds) => (Some(creds), false),
-            None => match store::default_store().load(url) {
-                Some(creds) => (Some(creds), true),
-                None => (None, false),
-            },
-        }
-    };
-
-    let Some(mut stored) = stored else {
+    let Some(mut stored) = load_or_import_creds(&*scoped_store, decl, url) else {
         return needs_auth_or_interactive_send(decl, auth, url, workflow, run_id, cfg);
     };
-
-    if imported_from_default && decl.persist != McpPersist::None {
-        let _ = scoped_store.save(&stored);
-    }
 
     let now = store::now_unix();
     if !stored.tokens.is_expired(now, EXPIRY_SKEW_SECS) {
@@ -852,29 +836,9 @@ fn resolve_authenticated_http(
     // default (keyring/file) store — a hit there is imported (saved) into the
     // scoped store (except :none, which just uses it for this run), so a prior
     // `sema mcp login <url>` satisfies any workflow (the plan's headless loop).
-    // `:keyring` persist skips the fallback: `store_for` already resolved
-    // `scoped_store` to `default_store()` for that scope, so re-querying it
-    // would just hit the same store, and "importing" a hit into itself is a
-    // no-op save worth skipping.
-    let (stored, imported_from_default) = if decl.persist == McpPersist::Keyring {
-        (scoped_store.load(url), false)
-    } else {
-        match scoped_store.load(url) {
-            Some(creds) => (Some(creds), false),
-            None => match store::default_store().load(url) {
-                Some(creds) => (Some(creds), true),
-                None => (None, false),
-            },
-        }
-    };
-
-    let Some(mut stored) = stored else {
+    let Some(mut stored) = load_or_import_creds(&*scoped_store, decl, url) else {
         return needs_auth_or_interactive(decl, auth, url, workflow, run_id);
     };
-
-    if imported_from_default && decl.persist != McpPersist::None {
-        let _ = scoped_store.save(&stored);
-    }
 
     let now = store::now_unix();
     if !stored.tokens.is_expired(now, EXPIRY_SKEW_SECS) {
@@ -912,6 +876,29 @@ fn resolve_authenticated_http(
     }
 
     needs_auth_or_interactive(decl, auth, url, workflow, run_id)
+}
+
+/// The stored credentials for `url`: from `scoped_store`, else imported from
+/// `default_store()` (and copied into `scoped_store` unless `:persist` is
+/// `:none`). `:keyring` persist skips the fallback: `store_for` already
+/// resolved `scoped_store` to `default_store()` for that scope, so re-querying
+/// it would hit the same store, and "importing" a hit into itself is a no-op.
+fn load_or_import_creds(
+    scoped_store: &dyn TokenStore,
+    decl: &McpDecl,
+    url: &str,
+) -> Option<StoredCredentials> {
+    if let Some(creds) = scoped_store.load(url) {
+        return Some(creds);
+    }
+    if decl.persist == McpPersist::Keyring {
+        return None;
+    }
+    let creds = store::default_store().load(url)?;
+    if decl.persist != McpPersist::None {
+        let _ = scoped_store.save(&creds);
+    }
+    Some(creds)
 }
 
 /// Connect with a resolved access token attached as a Bearer header. A connect

@@ -1,8 +1,8 @@
 use std::rc::Rc;
 
 use sema_core::{
-    intern, resolve, suggest_similar, Agent, Env, EvalContext, FileAccess, Record, SemaError, Spur,
-    ToolDefinition, ToolPolicySubject, Value,
+    intern, resolve, suggest_similar, Agent, ArgsExt, Env, EvalContext, FileAccess, Record,
+    ResultExt, SemaError, Spur, ToolDefinition, ToolPolicySubject, Value,
 };
 
 use crate::eval::{self, Trampoline};
@@ -386,10 +386,7 @@ pub(crate) fn prepare_load(
         return Err(SemaError::arity("load", "1", args.len()));
     }
     ctx.sandbox.check(sema_core::Caps::FS_READ, "load")?;
-    let path_val = args[0].clone();
-    let path_str = path_val
-        .as_str()
-        .ok_or_else(|| SemaError::type_error("string", path_val.type_name()))?;
+    let path_str = args.str_at(0, "load")?;
 
     crate::debug_session::warn_load_bypass_once("load", path_str);
 
@@ -433,9 +430,8 @@ pub(crate) fn prepare_load(
     };
     let canonical = resolved
         .canonicalize()
-        .map_err(|error| SemaError::Io(format!("load {}: {error}", resolved.display())))?;
-    let bytes = std::fs::read(&canonical)
-        .map_err(|error| SemaError::Io(format!("load {}: {error}", canonical.display())))?;
+        .io_ctx(format!("load {}", resolved.display()))?;
+    let bytes = std::fs::read(&canonical).io_ctx(format!("load {}", canonical.display()))?;
     Ok(ResolvedModuleBytes {
         requested: path_str.to_string(),
         identity: canonical.clone(),
@@ -474,10 +470,7 @@ pub(crate) fn prepare_import(
         return Err(SemaError::arity("import", "1+", 0));
     }
     ctx.sandbox.check(sema_core::Caps::FS_READ, "import")?;
-    let path_val = args[0].clone();
-    let path_str = path_val
-        .as_str()
-        .ok_or_else(|| SemaError::type_error("string", path_val.type_name()))?;
+    let path_str = args.str_at(0, "import")?;
 
     crate::debug_session::warn_load_bypass_once("import", path_str);
 
@@ -538,12 +531,11 @@ pub(crate) fn prepare_import(
 
     let canonical = resolved
         .canonicalize()
-        .map_err(|error| SemaError::Io(format!("import {path_str}: {error}")))?;
+        .io_ctx(format!("import {path_str}"))?;
     if let Some(exports) = ctx.get_cached_module(&canonical) {
         return Ok(ImportPreparation::Cached { exports, selective });
     }
-    let bytes = std::fs::read(&canonical)
-        .map_err(|error| SemaError::Io(format!("import {path_str}: {error}")))?;
+    let bytes = std::fs::read(&canonical).io_ctx(format!("import {path_str}"))?;
     Ok(ImportPreparation::Uncached {
         module: ResolvedModuleBytes {
             requested: path_str.to_string(),
@@ -571,7 +563,7 @@ fn eval_bytes_in_env(
         }
 
         let content = String::from_utf8(bytes.to_vec())
-            .map_err(|e| SemaError::Io(format!("{op_name} {path_str}: invalid UTF-8: {e}")))?;
+            .io_ctx(format!("{op_name} {path_str}: invalid UTF-8"))?;
         let (exprs, spans) = sema_reader::read_many_with_spans(&content)?;
         ctx.merge_span_table(spans.clone());
 
@@ -608,9 +600,8 @@ fn import_module_from_bytes(
                 let result = sema_vm::deserialize_from_bytes(&content_bytes)?;
                 eval::execute_compile_result(ctx, Rc::new(module_env.clone()), result)?;
             } else {
-                let content = String::from_utf8(content_bytes).map_err(|e| {
-                    SemaError::Io(format!("import {path_str}: invalid UTF-8 in module: {e}"))
-                })?;
+                let content = String::from_utf8(content_bytes)
+                    .io_ctx(format!("import {path_str}: invalid UTF-8 in module"))?;
                 let (exprs, spans) = sema_reader::read_many_with_spans(&content)?;
                 ctx.merge_span_table(spans.clone());
                 eval::eval_module_body_vm(

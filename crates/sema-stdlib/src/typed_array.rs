@@ -1,8 +1,9 @@
+use sema_core::ArgsExt;
 use sema_core::{check_arity, SemaError, Value};
 
 use crate::list::{
     collect_f64_array_call, collect_i64_array_call, fold_f64_array_call, fold_i64_array_call,
-    register_hof, CollectMode,
+    register_hof_runtime, CollectMode,
 };
 use crate::register_fn;
 
@@ -89,10 +90,7 @@ pub fn register(env: &sema_core::Env) {
         let arr = args[0]
             .as_f64_array()
             .ok_or_else(|| SemaError::type_error("f64-array", args[0].type_name()))?;
-        let idx = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[1].type_name()))?
-            as usize;
+        let idx = args.int_at(1, "f64-array/ref")? as usize;
         arr.get(idx).map(|&v| Value::float(v)).ok_or_else(|| {
             SemaError::eval(format!("index {idx} out of bounds (len {})", arr.len()))
         })
@@ -104,10 +102,7 @@ pub fn register(env: &sema_core::Env) {
         let arr = args[0]
             .as_i64_array()
             .ok_or_else(|| SemaError::type_error("i64-array", args[0].type_name()))?;
-        let idx = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[1].type_name()))?
-            as usize;
+        let idx = args.int_at(1, "i64-array/ref")? as usize;
         arr.get(idx).map(|&v| Value::int(v)).ok_or_else(|| {
             SemaError::eval(format!("index {idx} out of bounds (len {})", arr.len()))
         })
@@ -119,10 +114,7 @@ pub fn register(env: &sema_core::Env) {
         let mut arr = args[0]
             .as_f64_array_rc()
             .ok_or_else(|| SemaError::type_error("f64-array", args[0].type_name()))?;
-        let idx = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[1].type_name()))?
-            as usize;
+        let idx = args.int_at(1, "f64-array/set!")? as usize;
         let val = args[2]
             .as_float()
             .or_else(|| args[2].as_int().map(|i| i as f64))
@@ -144,13 +136,8 @@ pub fn register(env: &sema_core::Env) {
         let mut arr = args[0]
             .as_i64_array_rc()
             .ok_or_else(|| SemaError::type_error("i64-array", args[0].type_name()))?;
-        let idx = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[1].type_name()))?
-            as usize;
-        let val = args[2]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[2].type_name()))?;
+        let idx = args.int_at(1, "i64-array/set!")? as usize;
+        let val = args.int_at(2, "i64-array/set!")?;
         let data = std::rc::Rc::make_mut(&mut arr);
         if idx >= data.len() {
             return Err(SemaError::eval(format!(
@@ -219,148 +206,65 @@ pub fn register(env: &sema_core::Env) {
     });
 
     // (f64-array/map f arr) — apply f to each element, return new array
-    register_hof(
-        env,
-        "f64-array/map",
-        |args| {
-            check_arity!(args, "f64-array/map", 2);
-            let f = &args[0];
-            let arr = args[1]
-                .as_f64_array()
-                .ok_or_else(|| SemaError::type_error("f64-array", args[1].type_name()))?;
-            let mut result = Vec::with_capacity(arr.len());
-            for &v in arr.iter() {
-                let out = crate::list::call_function(f, &[Value::float(v)])?;
-                let fval = out
-                    .as_float()
-                    .or_else(|| out.as_int().map(|i| i as f64))
-                    .ok_or_else(|| {
-                        SemaError::type_error(
-                            "number (f64-array/map callback must return number)",
-                            out.type_name(),
-                        )
-                    })?;
-                result.push(fval);
-            }
-            Ok(Value::f64_array(result))
-        },
-        |args| {
-            check_arity!(args, "f64-array/map", 2);
-            args[1]
-                .as_f64_array()
-                .ok_or_else(|| SemaError::type_error("f64-array", args[1].type_name()))?;
-            Ok(collect_f64_array_call(
-                &args[0],
-                args[1].clone(),
-                CollectMode::F64Array,
-                "f64-array/map",
-            ))
-        },
-    );
+    register_hof_runtime(env, "f64-array/map", |args| {
+        check_arity!(args, "f64-array/map", 2);
+        args[1]
+            .as_f64_array()
+            .ok_or_else(|| SemaError::type_error("f64-array", args[1].type_name()))?;
+        Ok(collect_f64_array_call(
+            &args[0],
+            args[1].clone(),
+            CollectMode::F64Array,
+            "f64-array/map",
+        ))
+    });
 
     // (i64-array/map f arr) — apply f to each element, return new array
-    register_hof(
-        env,
-        "i64-array/map",
-        |args| {
-            check_arity!(args, "i64-array/map", 2);
-            let f = &args[0];
-            let arr = args[1]
-                .as_i64_array()
-                .ok_or_else(|| SemaError::type_error("i64-array", args[1].type_name()))?;
-            let mut result = Vec::with_capacity(arr.len());
-            for &v in arr.iter() {
-                let out = crate::list::call_function(f, &[Value::int(v)])?;
-                let ival = out.as_int().ok_or_else(|| {
-                    SemaError::type_error(
-                        "integer (i64-array/map callback must return integer)",
-                        out.type_name(),
-                    )
-                })?;
-                result.push(ival);
-            }
-            Ok(Value::i64_array(result))
-        },
-        |args| {
-            check_arity!(args, "i64-array/map", 2);
-            args[1]
-                .as_i64_array()
-                .ok_or_else(|| SemaError::type_error("i64-array", args[1].type_name()))?;
-            Ok(collect_i64_array_call(
-                &args[0],
-                args[1].clone(),
-                CollectMode::I64Array,
-                "i64-array/map",
-            ))
-        },
-    );
+    register_hof_runtime(env, "i64-array/map", |args| {
+        check_arity!(args, "i64-array/map", 2);
+        args[1]
+            .as_i64_array()
+            .ok_or_else(|| SemaError::type_error("i64-array", args[1].type_name()))?;
+        Ok(collect_i64_array_call(
+            &args[0],
+            args[1].clone(),
+            CollectMode::I64Array,
+            "i64-array/map",
+        ))
+    });
 
     // (f64-array/fold f init arr) — fold over array
-    register_hof(
-        env,
-        "f64-array/fold",
-        |args| {
-            check_arity!(args, "f64-array/fold", 3);
-            let f = &args[0];
-            let mut acc = args[1].clone();
-            let arr = args[2]
-                .as_f64_array()
-                .ok_or_else(|| SemaError::type_error("f64-array", args[2].type_name()))?;
-            for &v in arr.iter() {
-                acc = crate::list::call_function(f, &[acc, Value::float(v)])?;
-            }
-            Ok(acc)
-        },
-        |args| {
-            check_arity!(args, "f64-array/fold", 3);
-            args[2]
-                .as_f64_array()
-                .ok_or_else(|| SemaError::type_error("f64-array", args[2].type_name()))?;
-            Ok(fold_f64_array_call(
-                &args[0],
-                args[1].clone(),
-                args[2].clone(),
-                "f64-array/fold",
-            ))
-        },
-    );
+    register_hof_runtime(env, "f64-array/fold", |args| {
+        check_arity!(args, "f64-array/fold", 3);
+        args[2]
+            .as_f64_array()
+            .ok_or_else(|| SemaError::type_error("f64-array", args[2].type_name()))?;
+        Ok(fold_f64_array_call(
+            &args[0],
+            args[1].clone(),
+            args[2].clone(),
+            "f64-array/fold",
+        ))
+    });
 
     // (i64-array/fold f init arr) — fold over array
-    register_hof(
-        env,
-        "i64-array/fold",
-        |args| {
-            check_arity!(args, "i64-array/fold", 3);
-            let f = &args[0];
-            let mut acc = args[1].clone();
-            let arr = args[2]
-                .as_i64_array()
-                .ok_or_else(|| SemaError::type_error("i64-array", args[2].type_name()))?;
-            for &v in arr.iter() {
-                acc = crate::list::call_function(f, &[acc, Value::int(v)])?;
-            }
-            Ok(acc)
-        },
-        |args| {
-            check_arity!(args, "i64-array/fold", 3);
-            args[2]
-                .as_i64_array()
-                .ok_or_else(|| SemaError::type_error("i64-array", args[2].type_name()))?;
-            Ok(fold_i64_array_call(
-                &args[0],
-                args[1].clone(),
-                args[2].clone(),
-                "i64-array/fold",
-            ))
-        },
-    );
+    register_hof_runtime(env, "i64-array/fold", |args| {
+        check_arity!(args, "i64-array/fold", 3);
+        args[2]
+            .as_i64_array()
+            .ok_or_else(|| SemaError::type_error("i64-array", args[2].type_name()))?;
+        Ok(fold_i64_array_call(
+            &args[0],
+            args[1].clone(),
+            args[2].clone(),
+            "i64-array/fold",
+        ))
+    });
 
     // (f64-array/from-list lst) — convert list of numbers to f64 array
     register_fn(env, "f64-array/from-list", |args| {
         check_arity!(args, "f64-array/from-list", 1);
-        let lst = args[0]
-            .as_list()
-            .ok_or_else(|| SemaError::type_error("list", args[0].type_name()))?;
+        let lst = args.list_at(0, "f64-array/from-list")?;
         let mut data = Vec::with_capacity(lst.len());
         for v in lst.iter() {
             let f = v
@@ -375,9 +279,7 @@ pub fn register(env: &sema_core::Env) {
     // (i64-array/from-list lst) — convert list of ints to i64 array
     register_fn(env, "i64-array/from-list", |args| {
         check_arity!(args, "i64-array/from-list", 1);
-        let lst = args[0]
-            .as_list()
-            .ok_or_else(|| SemaError::type_error("list", args[0].type_name()))?;
+        let lst = args.list_at(0, "i64-array/from-list")?;
         let mut data = Vec::with_capacity(lst.len());
         for v in lst.iter() {
             let i = v
@@ -440,12 +342,8 @@ pub fn register(env: &sema_core::Env) {
     // (i64-array/range start end) — integer range as array
     register_fn(env, "i64-array/range", |args| {
         check_arity!(args, "i64-array/range", 2..=3);
-        let start = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?;
-        let end = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[1].type_name()))?;
+        let start = args.int_at(0, "i64-array/range")?;
+        let end = args.int_at(1, "i64-array/range")?;
         let step = if let Some(v) = args.get(2) {
             v.as_int()
                 .ok_or_else(|| SemaError::type_error("integer", v.type_name()))?

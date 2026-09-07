@@ -1,7 +1,8 @@
 use std::fmt;
-use std::path::{Component, PathBuf};
+use std::path::PathBuf;
 
 use crate::error::SemaError;
+use crate::path::PathExt as _;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Caps(u64);
@@ -94,21 +95,8 @@ impl fmt::Display for Caps {
 #[derive(Debug, Clone)]
 pub struct Sandbox {
     pub denied: Caps,
-    allowed_paths: Option<Vec<PathBuf>>,
-}
-
-fn normalize_lexical(path: &std::path::Path) -> PathBuf {
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                result.pop();
-            }
-            Component::CurDir => {}
-            other => result.push(other),
-        }
-    }
-    result
+    allowed_paths: Option<Vec<crate::path::PathBoundary>>,
+    allowed_path_errors: Vec<(PathBuf, String)>,
 }
 
 impl Sandbox {
@@ -116,6 +104,7 @@ impl Sandbox {
         Sandbox {
             denied: Caps::NONE,
             allowed_paths: None,
+            allowed_path_errors: Vec::new(),
         }
     }
 
@@ -123,6 +112,7 @@ impl Sandbox {
         Sandbox {
             denied: caps,
             allowed_paths: None,
+            allowed_path_errors: Vec::new(),
         }
     }
 
@@ -132,12 +122,15 @@ impl Sandbox {
     }
 
     pub fn with_allowed_paths(mut self, paths: Vec<PathBuf>) -> Self {
-        self.allowed_paths = Some(
-            paths
-                .into_iter()
-                .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
-                .collect(),
-        );
+        let mut boundaries = Vec::with_capacity(paths.len());
+        self.allowed_path_errors.clear();
+        for path in paths {
+            match crate::path::PathBoundary::new(&path) {
+                Ok(boundary) => boundaries.push(boundary),
+                Err(error) => self.allowed_path_errors.push((path, error.to_string())),
+            }
+        }
+        self.allowed_paths = Some(boundaries);
         self
     }
 
@@ -174,29 +167,35 @@ impl Sandbox {
             None => return Ok(()),
         };
         let p = std::path::Path::new(path);
-        let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| {
-            if let Some(parent) = p.parent() {
-                if let Ok(canon_parent) = std::fs::canonicalize(parent) {
-                    return canon_parent.join(p.file_name().unwrap_or_default());
+        let mut resolution_error = None;
+        for boundary in allowed {
+            match boundary.contains(p) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(error) => {
+                    resolution_error.get_or_insert(error);
                 }
             }
-            let abs = if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                std::env::current_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-                    .join(p)
-            };
-            normalize_lexical(&abs)
-        });
-        for allowed_path in allowed {
-            if canonical.starts_with(allowed_path) {
-                return Ok(());
-            }
+        }
+        if let Some((root, error)) = self.allowed_path_errors.first() {
+            return Err(SemaError::eval(format!(
+                "cannot resolve allowed path {}: {error}",
+                root.display()
+            )));
+        }
+        if let Some(error) = resolution_error {
+            return Err(SemaError::eval(format!(
+                "cannot resolve path {} against the allowed paths: {error}",
+                p.display()
+            )));
         }
         Err(SemaError::PathDenied {
             function: fn_name.to_string(),
-            path: canonical.display().to_string(),
+            path: p
+                .resolve_allow_missing()
+                .unwrap_or_else(|_| p.to_path_buf())
+                .display()
+                .to_string(),
         })
     }
 
@@ -205,10 +204,7 @@ impl Sandbox {
             .split(',')
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
-            .map(|s| {
-                let p = PathBuf::from(s);
-                std::fs::canonicalize(&p).unwrap_or(p)
-            })
+            .map(PathBuf::from)
             .collect()
     }
 
@@ -564,5 +560,68 @@ mod tests {
             "relative nonexistent escape should be denied"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allowed_symlink_root_cannot_be_retargeted() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let link = temp.path().join("allowed");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        symlink(&first, &link).unwrap();
+        let sandbox = Sandbox::allow_all().with_allowed_paths(vec![link.clone()]);
+
+        std::fs::remove_file(&link).unwrap();
+        symlink(&second, &link).unwrap();
+
+        assert!(sandbox
+            .check_path(second.join("file").to_str().unwrap(), "file/write")
+            .is_err());
+        assert!(sandbox
+            .check_path(first.join("file").to_str().unwrap(), "file/write")
+            .is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_allowed_root_reports_its_resolution_error() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let loop_path = temp.path().join("loop");
+        symlink(&loop_path, &loop_path).unwrap();
+        let sandbox = Sandbox::allow_all().with_allowed_paths(vec![loop_path.clone()]);
+
+        let error = sandbox
+            .check_path(temp.path().join("file").to_str().unwrap(), "file/read")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cannot resolve allowed path"));
+        assert!(error.to_string().contains(loop_path.to_str().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_candidate_reports_its_resolution_error() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let allowed = temp.path().join("allowed");
+        let loop_path = allowed.join("loop");
+        std::fs::create_dir_all(&allowed).unwrap();
+        symlink(&loop_path, &loop_path).unwrap();
+        let sandbox = Sandbox::allow_all().with_allowed_paths(vec![allowed]);
+
+        let error = sandbox
+            .check_path(loop_path.to_str().unwrap(), "file/read")
+            .unwrap_err();
+
+        assert!(error.to_string().contains("cannot resolve path"));
+        assert!(error.to_string().contains(loop_path.to_str().unwrap()));
     }
 }

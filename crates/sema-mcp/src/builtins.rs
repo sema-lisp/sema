@@ -70,7 +70,8 @@ use sema_core::runtime::{
     RuntimeResponse, SendPayload, Trace, WaitKind,
 };
 use sema_core::{
-    check_arity, in_runtime_quantum, Caps, Env, NativeFn, Sandbox, SemaError, ToolDefinition, Value,
+    check_arity, in_runtime_quantum, ArgsExt, Caps, Env, NativeFn, Sandbox, SemaError,
+    ToolDefinition, Value,
 };
 
 use crate::client::{McpClient, McpClientConfig, McpHttpConfig};
@@ -447,16 +448,7 @@ async fn connect_stdio_async(
             ));
         }
     };
-    let env_map = config_json
-        .get("env")
-        .and_then(|value| value.as_object())
-        .map(|object| {
-            object
-                .iter()
-                .filter_map(|(key, value)| value.as_str().map(|s| (key.to_string(), s.to_string())))
-                .collect::<HashMap<_, _>>()
-        })
-        .unwrap_or_default();
+    let env_map = string_map_entry(config_json, "env");
     let cwd = config_json
         .get("cwd")
         .and_then(|value| value.as_str())
@@ -508,16 +500,7 @@ async fn connect_http_async(
         .and_then(|value| value.as_str())
         .ok_or_else(|| SemaError::eval("mcp/connect requires a :url entry for http transport"))
         .map_err(ConnectOutcome::Sema)?;
-    let mut headers = config_json
-        .get("headers")
-        .and_then(|value| value.as_object())
-        .map(|object| {
-            object
-                .iter()
-                .filter_map(|(key, value)| value.as_str().map(|s| (key.to_string(), s.to_string())))
-                .collect::<HashMap<_, _>>()
-        })
-        .unwrap_or_default();
+    let mut headers = string_map_entry(config_json, "headers");
 
     // A user-configured pre-registered client id: `:auth {:client-id "…"}`.
     let preconfigured_client_id = config_json
@@ -672,6 +655,21 @@ async fn connect_dispatch_async(
             .await
             .map_err(ConnectOutcome::Sema)
     }
+}
+
+/// The string-valued entries of the JSON object under `key` (`:env`, `:headers`);
+/// empty when the key is absent or not an object.
+fn string_map_entry(config_json: &serde_json::Value, key: &str) -> HashMap<String, String> {
+    config_json
+        .get(key)
+        .and_then(|value| value.as_object())
+        .map(|object| {
+            object
+                .iter()
+                .filter_map(|(key, value)| value.as_str().map(|s| (key.to_string(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Convert a Sema config map — `mcp/connect`'s single argument, or a config
@@ -990,6 +988,29 @@ fn fire_cancel_signal(signal: &mut Option<McpCancelSignal>) {
 /// Only cancellation gets this treatment. An operation that merely FAILED still
 /// returns its connection: the decoder checks it back in and the handle stays
 /// usable, which is the intended behavior for a transport-level error.
+/// Run `close_async` on the worker thread until it finishes or `cancel_rx`
+/// fires. Cancellation (not a close that ran and failed) releases the
+/// connection — see `conn_unless_cancelled`.
+fn close_connection_blocking(
+    conn: McpConnection,
+    cancel_rx: McpCancelWaiter,
+) -> McpConnectionOperationPayload {
+    sema_io::io_block_on(run_transport_task(async move {
+        let mut conn = conn;
+        let completed = tokio::select! {
+            biased;
+            _ = cancel_rx => None,
+            result = close_async(&mut conn) => Some(result),
+        };
+        let conn = conn_unless_cancelled(conn, completed.is_none());
+        let result = completed.unwrap_or_else(|| Err("cancelled".to_string()));
+        McpConnectionOperationPayload {
+            conn,
+            result: McpConnectionOperationResult::Close(result),
+        }
+    }))
+}
+
 fn conn_unless_cancelled(conn: McpConnection, cancelled: bool) -> Option<McpConnection> {
     if cancelled {
         drop(conn);
@@ -1194,8 +1215,8 @@ fn connect_builtin(sandbox: &Sandbox, args: &[Value]) -> NativeResult {
 }
 
 fn require_handle<'a>(args: &'a [Value], fn_name: &str) -> Result<&'a str, SemaError> {
-    args[0].as_str().ok_or_else(|| {
-        SemaError::type_error("string", args[0].type_name()).with_hint(format!(
+    args.str_at(0, fn_name).map_err(|e| {
+        e.with_hint(format!(
             "{fn_name} expects the opaque handle returned by mcp/connect"
         ))
     })
@@ -2304,22 +2325,7 @@ impl McpGatedAction for McpConnectionAction {
                         }
                     }))
                 }
-                McpConnectionOperation::Close => {
-                    sema_io::io_block_on(run_transport_task(async move {
-                        let mut conn = conn;
-                        let completed = tokio::select! {
-                            biased;
-                            _ = cancel_rx => None,
-                            result = close_async(&mut conn) => Some(result),
-                        };
-                        let conn = conn_unless_cancelled(conn, completed.is_none());
-                        let result = completed.unwrap_or_else(|| Err("cancelled".to_string()));
-                        McpConnectionOperationPayload {
-                            conn,
-                            result: McpConnectionOperationResult::Close(result),
-                        }
-                    }))
-                }
+                McpConnectionOperation::Close => close_connection_blocking(conn, cancel_rx),
             };
             Ok(Box::new(payload) as SendPayload)
         })
@@ -2642,20 +2648,7 @@ fn foreign_runtime_close(
         decoder,
         resource,
         move || {
-            let payload = sema_io::io_block_on(run_transport_task(async move {
-                let mut conn = conn;
-                let completed = tokio::select! {
-                    biased;
-                    _ = cancel_rx => None,
-                    result = close_async(&mut conn) => Some(result),
-                };
-                let conn = conn_unless_cancelled(conn, completed.is_none());
-                let result = completed.unwrap_or_else(|| Err("cancelled".to_string()));
-                McpConnectionOperationPayload {
-                    conn,
-                    result: McpConnectionOperationResult::Close(result),
-                }
-            }));
+            let payload = close_connection_blocking(conn, cancel_rx);
             Ok(Box::new(payload) as SendPayload)
         },
     );
@@ -2818,10 +2811,9 @@ pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
         Value::native_fn(dual_native("mcp/call".to_string(), move |args| {
             check_arity!(args, "mcp/call", 3);
             let handle = require_handle(args, "mcp/call")?;
-            let tool_name = args[1].as_str().ok_or_else(|| {
-                SemaError::type_error("string", args[1].type_name())
-                    .with_hint("mcp/call expects the tool name as a string")
-            })?;
+            let tool_name = args
+                .str_at(1, "mcp/call")
+                .map_err(|e| e.with_hint("mcp/call expects the tool name as a string"))?;
             let arguments_json = sema_core::value_to_json_lossy(&args[2]);
             call_tool(&call_sandbox, handle, tool_name, arguments_json, |raw| {
                 Ok(result_to_value(&raw))
@@ -2974,6 +2966,16 @@ mod tests {
         assert!(err.to_string().contains("cancelled mid-call"));
     }
 
+    fn test_call_context(eval_context: &sema_core::EvalContext) -> NativeCallContext<'_> {
+        NativeCallContext {
+            hof_host: None,
+            eval_context,
+            task_context: sema_core::runtime::TaskContextHandle::default(),
+            call_env: None,
+            cancellation: sema_core::runtime::CancellationView::default(),
+        }
+    }
+
     fn checked_out_entry() -> Rc<ConnEntry> {
         Rc::new(ConnEntry {
             meta: ConnMeta {
@@ -3039,14 +3041,7 @@ mod tests {
     #[test]
     fn mcp_final_cont_does_not_swallow_runtime_transition_failure() {
         let eval_context = sema_core::EvalContext::new();
-        let task_context = sema_core::runtime::TaskContextHandle::default();
-        let mut context = NativeCallContext {
-            hof_host: None,
-            eval_context: &eval_context,
-            task_context,
-            call_env: None,
-            cancellation: sema_core::runtime::CancellationView::default(),
-        };
+        let mut context = test_call_context(&eval_context);
         let error = match Box::new(McpFinalCont::Value(Value::nil())).resume(
             &mut context,
             ResumeInput::Failed(SemaError::eval("wrong runtime close")),
@@ -3070,14 +3065,7 @@ mod tests {
             lifecycle: Rc::clone(&lifecycle),
         };
         let eval_context = sema_core::EvalContext::new();
-        let task_context = sema_core::runtime::TaskContextHandle::default();
-        let mut context = NativeCallContext {
-            hof_host: None,
-            eval_context: &eval_context,
-            task_context,
-            call_env: None,
-            cancellation: sema_core::runtime::CancellationView::default(),
-        };
+        let mut context = test_call_context(&eval_context);
         assert!(Box::new(decoder)
             .decode(&mut context, Err(ExternalFailure::rejected()))
             .is_err());
@@ -3110,14 +3098,7 @@ mod tests {
         }
 
         let eval_context = sema_core::EvalContext::new();
-        let task_context = sema_core::runtime::TaskContextHandle::default();
-        let mut context = NativeCallContext {
-            hof_host: None,
-            eval_context: &eval_context,
-            task_context,
-            call_env: None,
-            cancellation: sema_core::runtime::CancellationView::default(),
-        };
+        let mut context = test_call_context(&eval_context);
 
         let close_gate = gate_id();
         let close_entry = entry_with_gate(close_gate);

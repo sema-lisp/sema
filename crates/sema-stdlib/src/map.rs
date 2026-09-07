@@ -9,7 +9,7 @@ use sema_core::runtime::{
 };
 use sema_core::{check_arity, SemaError, Value, ValueViewRef};
 
-use crate::list::{call_function, register_hof};
+use crate::list::{call_function, register_hof, register_hof_runtime};
 use crate::register_fn;
 
 #[derive(Clone, Copy)]
@@ -611,88 +611,27 @@ pub fn register(env: &sema_core::Env) {
         }
     });
 
-    register_hof(
-        env,
-        "map/map-vals",
-        |args| {
-            check_arity!(args, "map/map-vals", 2);
-            match args[1].view_ref() {
-                ValueViewRef::Map(m) => {
-                    let mut result = BTreeMap::new();
-                    for (k, v) in m.iter() {
-                        let new_v = call_function(&args[0], &[v.clone()])?;
-                        result.insert(k.clone(), new_v);
-                    }
-                    Ok(Value::map(result))
-                }
-                ValueViewRef::HashMap(m) => {
-                    let mut result = HBHashMap::with_capacity(m.len());
-                    for (k, v) in m.iter() {
-                        let new_v = call_function(&args[0], &[v.clone()])?;
-                        result.insert(k.clone(), new_v);
-                    }
-                    Ok(Value::hashmap_from_rc(Rc::new(result)))
-                }
-                _ => Err(SemaError::type_error("map or hashmap", args[1].type_name())
-                    .with_hint("map/map-vals: argument 2 must be a map; applies fn to each value")),
-            }
-        },
-        |args| {
-            check_arity!(args, "map/map-vals", 2);
-            map_traversal_call(
-                &args[0],
-                &args[1],
-                MapTraversalMode::Values,
-                "map/map-vals",
-                "map/map-vals: argument 2 must be a map; applies fn to each value",
-            )
-        },
-    );
+    register_hof_runtime(env, "map/map-vals", |args| {
+        check_arity!(args, "map/map-vals", 2);
+        map_traversal_call(
+            &args[0],
+            &args[1],
+            MapTraversalMode::Values,
+            "map/map-vals",
+            "map/map-vals: argument 2 must be a map; applies fn to each value",
+        )
+    });
 
-    register_hof(
-        env,
-        "map/filter",
-        |args| {
-            check_arity!(args, "map/filter", 2);
-            match args[1].view_ref() {
-                ValueViewRef::Map(m) => {
-                    let mut result = BTreeMap::new();
-                    for (k, v) in m.iter() {
-                        let keep = call_function(&args[0], &[k.clone(), v.clone()])?;
-                        if keep.is_truthy() {
-                            result.insert(k.clone(), v.clone());
-                        }
-                    }
-                    Ok(Value::map(result))
-                }
-                ValueViewRef::HashMap(m) => {
-                    let mut result = HBHashMap::new();
-                    for (k, v) in m.iter() {
-                        let keep = call_function(&args[0], &[k.clone(), v.clone()])?;
-                        if keep.is_truthy() {
-                            result.insert(k.clone(), v.clone());
-                        }
-                    }
-                    Ok(Value::hashmap_from_rc(Rc::new(result)))
-                }
-                _ => Err(
-                    SemaError::type_error("map or hashmap", args[1].type_name()).with_hint(
-                        "map/filter: argument 2 must be a map; predicate receives (key value)",
-                    ),
-                ),
-            }
-        },
-        |args| {
-            check_arity!(args, "map/filter", 2);
-            map_traversal_call(
-                &args[0],
-                &args[1],
-                MapTraversalMode::Filter,
-                "map/filter",
-                "map/filter: argument 2 must be a map; predicate receives (key value)",
-            )
-        },
-    );
+    register_hof_runtime(env, "map/filter", |args| {
+        check_arity!(args, "map/filter", 2);
+        map_traversal_call(
+            &args[0],
+            &args[1],
+            MapTraversalMode::Filter,
+            "map/filter",
+            "map/filter: argument 2 must be a map; predicate receives (key value)",
+        )
+    });
 
     register_fn(env, "map/select-keys", |args| {
         check_arity!(args, "map/select-keys", 2);
@@ -728,45 +667,16 @@ pub fn register(env: &sema_core::Env) {
         }
     });
 
-    register_hof(
-        env,
-        "map/map-keys",
-        |args| {
-            check_arity!(args, "map/map-keys", 2);
-            match args[1].view_ref() {
-                ValueViewRef::Map(m) => {
-                    let mut result = BTreeMap::new();
-                    for (k, v) in m.iter() {
-                        let new_k = call_function(&args[0], &[k.clone()])?;
-                        check_map_key(&new_k, "map/map-keys")?;
-                        result.insert(new_k, v.clone());
-                    }
-                    Ok(Value::map(result))
-                }
-                ValueViewRef::HashMap(m) => {
-                    let mut result = HBHashMap::with_capacity(m.len());
-                    for (k, v) in m.iter() {
-                        let new_k = call_function(&args[0], &[k.clone()])?;
-                        check_map_key(&new_k, "map/map-keys")?;
-                        result.insert(new_k, v.clone());
-                    }
-                    Ok(Value::hashmap_from_rc(Rc::new(result)))
-                }
-                _ => Err(SemaError::type_error("map or hashmap", args[1].type_name())
-                    .with_hint("map/map-keys: argument 2 must be a map; applies fn to each key")),
-            }
-        },
-        |args| {
-            check_arity!(args, "map/map-keys", 2);
-            map_traversal_call(
-                &args[0],
-                &args[1],
-                MapTraversalMode::Keys,
-                "map/map-keys",
-                "map/map-keys: argument 2 must be a map; applies fn to each key",
-            )
-        },
-    );
+    register_hof_runtime(env, "map/map-keys", |args| {
+        check_arity!(args, "map/map-keys", 2);
+        map_traversal_call(
+            &args[0],
+            &args[1],
+            MapTraversalMode::Keys,
+            "map/map-keys",
+            "map/map-keys: argument 2 must be a map; applies fn to each key",
+        )
+    });
 
     register_fn(env, "map/from-entries", |args| {
         check_arity!(args, "map/from-entries", 1);
@@ -1104,95 +1014,18 @@ pub fn register(env: &sema_core::Env) {
         assoc_in_recursive(&args[0], &path, &args[2])
     });
 
-    register_hof(
-        env,
-        "update-in",
-        |args| {
-            check_arity!(args, "update-in", 3);
-            let path = match args[1].view_ref() {
-                ValueViewRef::List(l) => l.to_vec(),
-                ValueViewRef::Vector(v) => v.to_vec(),
-                _ => {
-                    return Err(SemaError::type_error("list or vector", args[1].type_name())
-                        .with_hint("update-in: argument 2 must be a list/vector path of keys"))
-                }
-            };
-            if path.is_empty() {
-                return call_function(&args[2], &[args[0].clone()]);
+    register_hof_runtime(env, "update-in", |args| {
+        check_arity!(args, "update-in", 3);
+        let path = match args[1].view_ref() {
+            ValueViewRef::List(path) => path.to_vec(),
+            ValueViewRef::Vector(path) => path.to_vec(),
+            _ => {
+                return Err(SemaError::type_error("list or vector", args[1].type_name())
+                    .with_hint("update-in: argument 2 must be a list/vector path of keys"))
             }
-            for key in &path {
-                check_map_key(key, "update-in")?;
-            }
-            fn update_in_recursive(
-                m: &Value,
-                path: &[Value],
-                f: &Value,
-            ) -> Result<Value, SemaError> {
-                let key = &path[0];
-                if path.len() == 1 {
-                    let current = if let Some(map) = m.as_map_ref() {
-                        map.get(key).cloned().unwrap_or(Value::nil())
-                    } else if let Some(map) = m.as_hashmap_ref() {
-                        map.get(key).cloned().unwrap_or(Value::nil())
-                    } else {
-                        Value::nil()
-                    };
-                    let new_val = call_function(f, &[current])?;
-                    if let Some(map) = m.as_map_ref() {
-                        let mut map = map.clone();
-                        map.insert(key.clone(), new_val);
-                        return Ok(Value::map(map));
-                    }
-                    if let Some(map) = m.as_hashmap_ref() {
-                        let mut map = map.clone();
-                        map.insert(key.clone(), new_val);
-                        return Ok(Value::hashmap_from_rc(Rc::new(map)));
-                    }
-                    let mut map = BTreeMap::new();
-                    map.insert(key.clone(), new_val);
-                    return Ok(Value::map(map));
-                }
-                let nested = if let Some(map) = m.as_map_ref() {
-                    map.get(key)
-                        .cloned()
-                        .unwrap_or_else(|| Value::map(BTreeMap::new()))
-                } else if let Some(map) = m.as_hashmap_ref() {
-                    map.get(key)
-                        .cloned()
-                        .unwrap_or_else(|| Value::map(BTreeMap::new()))
-                } else {
-                    Value::map(BTreeMap::new())
-                };
-                let new_nested = update_in_recursive(&nested, &path[1..], f)?;
-                if let Some(map) = m.as_map_ref() {
-                    let mut map = map.clone();
-                    map.insert(key.clone(), new_nested);
-                    Ok(Value::map(map))
-                } else if let Some(map) = m.as_hashmap_ref() {
-                    let mut map = map.clone();
-                    map.insert(key.clone(), new_nested);
-                    Ok(Value::hashmap_from_rc(Rc::new(map)))
-                } else {
-                    let mut map = BTreeMap::new();
-                    map.insert(key.clone(), new_nested);
-                    Ok(Value::map(map))
-                }
-            }
-            update_in_recursive(&args[0], &path, &args[2])
-        },
-        |args| {
-            check_arity!(args, "update-in", 3);
-            let path = match args[1].view_ref() {
-                ValueViewRef::List(path) => path.to_vec(),
-                ValueViewRef::Vector(path) => path.to_vec(),
-                _ => {
-                    return Err(SemaError::type_error("list or vector", args[1].type_name())
-                        .with_hint("update-in: argument 2 must be a list/vector path of keys"))
-                }
-            };
-            update_in_call(&args[0], &path, &args[2])
-        },
-    );
+        };
+        update_in_call(&args[0], &path, &args[2])
+    });
 
     register_fn(env, "deep-merge", |args| {
         if args.is_empty() {

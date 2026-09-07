@@ -18,16 +18,8 @@ impl AnthropicProvider {
         })
     }
 
-    fn resolve_model(&self, model: &str) -> String {
-        if model.is_empty() {
-            self.default_model.clone()
-        } else {
-            model.to_string()
-        }
-    }
-
     fn build_request_body(&self, request: &ChatRequest) -> AnthropicRequest {
-        let model = self.resolve_model(&request.model);
+        let model = crate::provider::resolve_model(&request.model, &self.default_model);
         // NOT a 1:1 map over messages: Anthropic requires every `tool_result`
         // answering one assistant turn to sit in the SINGLE message
         // immediately following it. The agent loop pushes one
@@ -171,25 +163,9 @@ impl AnthropicProvider {
         .await
         .map_err(|e| LlmError::Http(e.to_string()))?;
 
-        let status = resp.status().as_u16();
-        if status == 429 {
-            return Err(LlmError::RateLimited {
-                retry_after_ms: crate::http::retry_after_ms(resp.headers()),
-            });
-        }
-        if status != 200 {
-            let text = resp.text().await.unwrap_or_default();
-            if let Ok(err) = serde_json::from_str::<AnthropicError>(&text) {
-                return Err(LlmError::Api {
-                    status,
-                    message: err.error.message,
-                });
-            }
-            return Err(LlmError::Api {
-                status,
-                message: text,
-            });
-        }
+        let resp = crate::http::check_status(resp)
+            .await
+            .map_err(decode_error)?;
 
         let api_resp: AnthropicResponse = resp
             .json()
@@ -256,25 +232,9 @@ impl AnthropicProvider {
         .await
         .map_err(|e| LlmError::Http(e.to_string()))?;
 
-        let status = resp.status().as_u16();
-        if status == 429 {
-            return Err(LlmError::RateLimited {
-                retry_after_ms: crate::http::retry_after_ms(resp.headers()),
-            });
-        }
-        if status != 200 {
-            let text = resp.text().await.unwrap_or_default();
-            if let Ok(err) = serde_json::from_str::<AnthropicError>(&text) {
-                return Err(LlmError::Api {
-                    status,
-                    message: err.error.message,
-                });
-            }
-            return Err(LlmError::Api {
-                status,
-                message: text,
-            });
-        }
+        let resp = crate::http::check_status(resp)
+            .await
+            .map_err(decode_error)?;
 
         let mut acc = AnthropicStreamAccum::default();
         crate::sse::parse_sse_stream(resp, |data| {
@@ -517,6 +477,20 @@ struct AnthropicError {
     error: AnthropicErrorDetail,
 }
 
+/// Replace an `Api` error's raw body with the `error.message` Anthropic puts in
+/// it, when the body is that JSON shape.
+fn decode_error(err: LlmError) -> LlmError {
+    match err {
+        LlmError::Api { status, message } => LlmError::Api {
+            status,
+            message: serde_json::from_str::<AnthropicError>(&message)
+                .map(|e| e.error.message)
+                .unwrap_or(message),
+        },
+        other => other,
+    }
+}
+
 #[derive(Deserialize)]
 struct AnthropicErrorDetail {
     message: String,
@@ -553,16 +527,6 @@ impl LlmProvider for AnthropicProvider {
         // io_block_on drives ON THIS thread: `on_chunk` may touch non-Send Sema
         // values and must never migrate to a pool worker.
         sema_io::io_block_on(self.stream_complete_async(request, on_chunk))
-    }
-
-    fn batch_complete(&self, requests: Vec<ChatRequest>) -> Vec<Result<ChatResponse, LlmError>> {
-        sema_io::io_block_on(async {
-            let futures: Vec<_> = requests
-                .into_iter()
-                .map(|req| self.complete_async(req))
-                .collect();
-            futures::future::join_all(futures).await
-        })
     }
 }
 

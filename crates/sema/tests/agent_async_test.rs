@@ -402,7 +402,6 @@ fn cancelled_agent_run_reports_partial_transcript() {
 
     let fake = FakeProvider::builder("fake")
         .model("fake-model")
-        .chat_delay(100)
         .tool_loop(8, "ping", serde_json::json!({ "n": 1 }), "done")
         .build();
 
@@ -410,14 +409,28 @@ fn cancelled_agent_run_reports_partial_transcript() {
     reset_runtime_state();
     register_test_provider(Box::new(fake));
 
+    // The second tool call proves that the first round is in the transcript.
+    // Park there until cancellation; elapsed time cannot establish that state.
     let program = r#"
-        (deftool ping "ping" {:n {:type :number}} (fn (n) "pong"))
+        (define second-tool-entered (channel/new 1))
+        (define hold-tool (channel/new))
+        (define tool-calls 0)
+        (deftool ping "ping" {:n {:type :number}}
+          (fn (n)
+            (set! tool-calls (+ tool-calls 1))
+            (when (= tool-calls 2)
+              (channel/send second-tool-entered #t)
+              (channel/recv hold-tool))
+            "pong"))
         (defagent bot {:model "fake-model" :tools [ping] :max-turns 12})
         (define partial nil)
         (let ((p (async/spawn
                    (fn () (agent/run bot "go"
                             {:on-partial (fn (r) (set! partial r))})))))
-          (async/spawn (fn () (async/sleep 250) (async/cancel p)))
+          (async/spawn
+            (fn ()
+              (channel/recv second-tool-entered)
+              (async/cancel p)))
           (try (async/await p) (catch e nil)))
         (if (nil? partial) 0 (length (:messages partial)))
     "#;

@@ -1280,14 +1280,7 @@ mod tests {
     }
 
     fn temp_root(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "sema-approval-{label}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ))
+        sema_core::testing::unique_temp_dir(&format!("approval-{label}"))
     }
 
     fn request_input() -> NewApprovalRequest {

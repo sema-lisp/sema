@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use num_bigint::BigInt;
 use num_integer::Integer;
 use sema_core::number::SemaNumber;
-use sema_core::{check_arity, SemaError, Value, ValueViewRef};
+use sema_core::{check_arity, ArgsExt, SemaError, Value, ValueViewRef};
 
 use crate::register_fn;
 
@@ -210,12 +210,8 @@ pub fn register(env: &sema_core::Env) {
     // Round to `places` decimal places, returning a float: (math/round-to 3.14159 2) => 3.14.
     register_fn(env, "math/round-to", |args| {
         check_arity!(args, "math/round-to", 2);
-        let x = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        let places = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[1].type_name()))?;
+        let x = args.float_at(0, "math/round-to")?;
+        let places = args.int_at(1, "math/round-to")?;
         // `places as i32` silently truncated the high bits: 4294967298 became
         // 2, so an absurd argument quietly rounded to 2 decimals instead of
         // being a no-op. Past ~17 significant decimals an f64 has no digits
@@ -235,13 +231,8 @@ pub fn register(env: &sema_core::Env) {
     // Fixed-decimal display string, padding trailing zeros: (math/format-fixed 1.2 3) => "1.200".
     register_fn(env, "math/format-fixed", |args| {
         check_arity!(args, "math/format-fixed", 2);
-        let x = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        let places = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[1].type_name()))?
-            .max(0) as usize;
+        let x = args.float_at(0, "math/format-fixed")?;
+        let places = args.int_at(1, "math/format-fixed")?.max(0) as usize;
         Ok(Value::string(&format!("{x:.places$}")))
     });
 
@@ -477,12 +468,8 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "math/random-int", |args| {
         check_arity!(args, "math/random-int", 2);
-        let lo = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
-        let hi = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
+        let lo = args.int_at(0, "math/random-int")?;
+        let hi = args.int_at(1, "math/random-int")?;
         if lo > hi {
             return Err(SemaError::eval(format!(
                 "math/random-int: lo ({lo}) must be <= hi ({hi})"
@@ -500,15 +487,9 @@ pub fn register(env: &sema_core::Env) {
                 Ok(Value::int(v.max(lo).min(hi)))
             }
             _ => {
-                let v = args[0]
-                    .as_float()
-                    .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-                let lo = args[1]
-                    .as_float()
-                    .ok_or_else(|| SemaError::type_error("number", args[1].type_name()))?;
-                let hi = args[2]
-                    .as_float()
-                    .ok_or_else(|| SemaError::type_error("number", args[2].type_name()))?;
+                let v = args.float_at(0, "math/clamp")?;
+                let lo = args.float_at(1, "math/clamp")?;
+                let hi = args.float_at(2, "math/clamp")?;
                 // f64::max/min discard NaN, so a NaN input would silently become
                 // a bound. Propagate NaN instead, matching IEEE-754 expectations.
                 if v.is_nan() {
@@ -559,51 +540,31 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "math/degrees->radians", |args| {
         check_arity!(args, "math/degrees->radians", 1);
-        let f = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
+        let f = args.float_at(0, "math/degrees->radians")?;
         Ok(Value::float(f.to_radians()))
     });
 
     register_fn(env, "math/radians->degrees", |args| {
         check_arity!(args, "math/radians->degrees", 1);
-        let f = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
+        let f = args.float_at(0, "math/radians->degrees")?;
         Ok(Value::float(f.to_degrees()))
     });
 
     register_fn(env, "math/lerp", |args| {
         check_arity!(args, "math/lerp", 3);
-        let a = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        let b = args[1]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[1].type_name()))?;
-        let t = args[2]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[2].type_name()))?;
+        let a = args.float_at(0, "math/lerp")?;
+        let b = args.float_at(1, "math/lerp")?;
+        let t = args.float_at(2, "math/lerp")?;
         Ok(Value::float(a + (b - a) * t))
     });
 
     register_fn(env, "math/map-range", |args| {
         check_arity!(args, "math/map-range", 5);
-        let value = args[0]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        let in_min = args[1]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[1].type_name()))?;
-        let in_max = args[2]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[2].type_name()))?;
-        let out_min = args[3]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[3].type_name()))?;
-        let out_max = args[4]
-            .as_float()
-            .ok_or_else(|| SemaError::type_error("number", args[4].type_name()))?;
+        let value = args.float_at(0, "math/map-range")?;
+        let in_min = args.float_at(1, "math/map-range")?;
+        let in_max = args.float_at(2, "math/map-range")?;
+        let out_min = args.float_at(3, "math/map-range")?;
+        let out_max = args.float_at(4, "math/map-range")?;
         Ok(Value::float(
             out_min + (value - in_min) / (in_max - in_min) * (out_max - out_min),
         ))

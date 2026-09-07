@@ -2,15 +2,7 @@ use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 
-fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("sema-{prefix}-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("failed to create temp dir");
-    dir
-}
+use sema_core::testing::unique_temp_dir;
 
 #[test]
 fn test_mcp_e2e_initialize() {

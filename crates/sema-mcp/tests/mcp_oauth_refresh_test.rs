@@ -6,7 +6,6 @@
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sema_mcp::oauth::login::reauth_on_challenge;
@@ -102,13 +101,7 @@ fn start_server() -> (ServerGuard, u16) {
 }
 
 fn temp_store() -> FileStore {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    FileStore::new(std::env::temp_dir().join(format!(
-        "sema-mcp-refresh-{}-{}/auth.json",
-        std::process::id(),
-        n
-    )))
+    FileStore::new(sema_core::testing::unique_temp_dir("mcp-refresh").join("auth.json"))
 }
 
 #[tokio::test]

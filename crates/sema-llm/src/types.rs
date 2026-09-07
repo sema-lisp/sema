@@ -286,7 +286,40 @@ pub struct Usage {
     pub cache_creation_input_tokens: u32,
 }
 
+/// JSON pointer paths (relative to a provider's usage object) that carry the
+/// token counts in that provider's wire format.
+pub(crate) struct UsageFields {
+    pub prompt: &'static str,
+    pub completion: &'static str,
+    /// `None` when the provider reports no such counter.
+    pub cache_read: Option<&'static str>,
+    pub cache_write: Option<&'static str>,
+}
+
 impl Usage {
+    /// Overwrite the counts `usage` carries; a count `usage` omits keeps its value,
+    /// so a streaming caller can fold every chunk that reports usage into one tally.
+    pub(crate) fn merge_json(&mut self, usage: &serde_json::Value, fields: &UsageFields) {
+        let read = |path: &str| {
+            usage
+                .pointer(path)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+        };
+        if let Some(v) = read(fields.prompt) {
+            self.prompt_tokens = v;
+        }
+        if let Some(v) = read(fields.completion) {
+            self.completion_tokens = v;
+        }
+        if let Some(v) = fields.cache_read.and_then(read) {
+            self.cache_read_input_tokens = v;
+        }
+        if let Some(v) = fields.cache_write.and_then(read) {
+            self.cache_creation_input_tokens = v;
+        }
+    }
+
     pub fn total_tokens(&self) -> u32 {
         self.prompt_tokens + self.completion_tokens
     }

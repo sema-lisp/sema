@@ -11,7 +11,6 @@
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use sema_mcp::oauth::login::{ensure_access_token, LoginConfig};
@@ -161,13 +160,7 @@ fn start_server() -> (ServerGuard, u16) {
 }
 
 fn temp_store_path() -> std::path::PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-    std::env::temp_dir().join(format!(
-        "sema-mcp-connect-{}-{}/auth.json",
-        std::process::id(),
-        n
-    ))
+    sema_core::testing::unique_temp_dir("mcp-connect").join("auth.json")
 }
 
 /// Connect, and if the server challenges with a 401, authenticate via

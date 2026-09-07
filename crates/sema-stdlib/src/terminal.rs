@@ -14,7 +14,7 @@ use sema_core::runtime::{
     NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation,
     ResumeInput, SendPayload, Trace, WaitKind,
 };
-use sema_core::{check_arity, NativeFn, SemaError, Value, ValueView};
+use sema_core::{check_arity, ArgsExt, NativeFn, ResultExt, SemaError, Value, ValueView};
 
 use crate::register_fn;
 
@@ -27,9 +27,7 @@ fn make_style_fn(env: &sema_core::Env, name: &str, code: &str) {
     let fn_name = name.to_string();
     register_fn(env, name, move |args| {
         check_arity!(args, &fn_name, 1);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let text = args.str_at(0, &fn_name)?;
         Ok(Value::string(&wrap_sgr(text, &code)))
     });
 }
@@ -223,9 +221,7 @@ fn spinner_finish(symbol: &str, text: &str) {
 /// so nothing Sema-valued crosses into an offloaded worker.
 fn parse_spinner_stop_args(args: &[Value]) -> Result<(i64, String, String), SemaError> {
     check_arity!(args, "term/spinner-stop", 1..=2);
-    let id = args[0]
-        .as_int()
-        .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?;
+    let id = args.int_at(0, "term/spinner-stop")?;
     let (symbol, text) = if args.len() == 2 {
         if let ValueView::Map(opts) = args[1].view() {
             let symbol = opts
@@ -411,9 +407,7 @@ pub fn register(env: &sema_core::Env) {
     // (term/style "text" :bold :red ...)
     register_fn(env, "term/style", |args| {
         check_arity!(args, "term/style", 1..);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let text = args.str_at(0, "term/style")?;
 
         let mut codes: Vec<&str> = Vec::new();
         for arg in &args[1..] {
@@ -456,9 +450,7 @@ pub fn register(env: &sema_core::Env) {
     // (term/strip "ansi-string") -> plain string
     register_fn(env, "term/strip", |args| {
         check_arity!(args, "term/strip", 1);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let text = args.str_at(0, "term/strip")?;
         // Strip ANSI escape sequences (full CSI + OSC, not just SGR). Shared with
         // string/width & string/wrap via crate::strip_ansi.
         Ok(Value::string(&crate::strip_ansi(text)))
@@ -467,18 +459,10 @@ pub fn register(env: &sema_core::Env) {
     // (term/rgb "text" r g b) -> 24-bit color
     register_fn(env, "term/rgb", |args| {
         check_arity!(args, "term/rgb", 4);
-        let text = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let r = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[1].type_name()))?;
-        let g = args[2]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[2].type_name()))?;
-        let b = args[3]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[3].type_name()))?;
+        let text = args.str_at(0, "term/rgb")?;
+        let r = args.int_at(1, "term/rgb")?;
+        let g = args.int_at(2, "term/rgb")?;
+        let b = args.int_at(3, "term/rgb")?;
         Ok(Value::string(&format!(
             "\x1b[38;2;{r};{g};{b}m{text}\x1b[0m"
         )))
@@ -500,10 +484,7 @@ pub fn register(env: &sema_core::Env) {
             "term/spinner-start",
             move |ctx, args| {
                 check_arity!(args, "term/spinner-start", 1);
-                let msg = args[0]
-                    .as_str()
-                    .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                    .to_string();
+                let msg = args.str_at(0, "term/spinner-start")?.to_string();
 
                 let stop = Arc::new(SpinnerStop::new());
                 let message = Arc::new(Mutex::new(msg));
@@ -544,13 +525,8 @@ pub fn register(env: &sema_core::Env) {
     let update_registry = Rc::clone(&spinner_registry);
     register_fn(env, "term/spinner-update", move |args| {
         check_arity!(args, "term/spinner-update", 2);
-        let id = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?;
-        let new_msg = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-            .to_string();
+        let id = args.int_at(0, "term/spinner-update")?;
+        let new_msg = args.str_at(1, "term/spinner-update")?.to_string();
         update_registry.update(id, new_msg);
         Ok(Value::nil())
     });
@@ -571,7 +547,7 @@ fn emit(seq: &str) -> Result<Value, SemaError> {
     let mut out = std::io::stdout();
     out.write_all(seq.as_bytes())
         .and_then(|_| out.flush())
-        .map_err(|e| SemaError::Io(format!("term: {e}")))?;
+        .io_ctx("term")?;
     Ok(Value::nil())
 }
 
@@ -680,17 +656,13 @@ fn register_screen_control(env: &sema_core::Env) {
         check_arity!(args, "term/write-at", 3);
         let row = coord(&args[0])?;
         let col = coord(&args[1])?;
-        let text = args[2]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[2].type_name()))?;
+        let text = args.str_at(2, "term/write-at")?;
         emit(&format!("\x1b[{row};{col}H{text}"))
     });
 
     register_fn(env, "term/set-title", |args| {
         check_arity!(args, "term/set-title", 1);
-        let title = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let title = args.str_at(0, "term/set-title")?;
         // OSC 0 sets both icon name and window title; BEL terminates.
         emit(&format!("\x1b]0;{title}\x07"))
     });
@@ -699,9 +671,7 @@ fn register_screen_control(env: &sema_core::Env) {
     // io/print before showing a frame. (Control fns above already self-flush.)
     register_fn(env, "term/flush", |args| {
         check_arity!(args, "term/flush", 0);
-        std::io::stdout()
-            .flush()
-            .map_err(|e| SemaError::Io(format!("term/flush: {e}")))?;
+        std::io::stdout().flush().io_ctx("term/flush")?;
         Ok(Value::nil())
     });
 }

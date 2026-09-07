@@ -64,7 +64,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use sema_core::runtime::{CompletionKind, NativeOutcome, NativeResult, ResourceGateHandle};
-use sema_core::{check_arity, in_runtime_quantum, Caps, SemaError, Value};
+use sema_core::{check_arity, in_runtime_quantum, ArgsExt, Caps, SemaError, Value};
 
 use crate::runtime_offload::{
     checkout_external, finish_terminal_gate, prepare_terminal_gate, CheckoutOp,
@@ -366,19 +366,10 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             if args.len() < 2 || args.len() > 3 {
                 return Err(SemaError::arity("serial/open", "2-3", args.len()));
             }
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                .to_string();
-            let baud = args[1]
-                .as_int()
-                .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?
-                as u32;
+            let path = args.str_at(0, "serial/list")?.to_string();
+            let baud = args.int_at(1, "serial/list")? as u32;
             let timeout_ms = if args.len() == 3 {
-                args[2]
-                    .as_int()
-                    .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?
-                    as u64
+                args.int_at(2, "serial/list")? as u64
             } else {
                 DEFAULT_SERIAL_TIMEOUT_MS
             };
@@ -460,10 +451,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // synchronous error text verbatim.
     crate::register_runtime_fn_gated(env, sandbox, Caps::SERIAL, "serial/close", |args| {
         check_arity!(args, "serial/close", 1);
-        let handle = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
-            as u64;
+        let handle = args.int_at(0, "serial/close")? as u64;
         PORTS.with(|ports| match ports.borrow().get(&handle) {
             Some(PortSlot::CheckedOut) => Err(busy_err("serial/close", handle)),
             Some(_) => Ok(()),
@@ -502,14 +490,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[],
         |args| {
             check_arity!(args, "serial/write", 2);
-            let handle = args[0]
-                .as_int()
-                .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
-                as u64;
-            let data = args[1]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-                .to_string();
+            let handle = args.int_at(0, "serial/write")? as u64;
+            let data = args.str_at(1, "serial/write")?.to_string();
 
             if in_runtime_quantum() {
                 return checkout_runtime(
@@ -548,10 +530,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[],
         |args| {
             check_arity!(args, "serial/read-line", 1);
-            let handle = args[0]
-                .as_int()
-                .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
-                as u64;
+            let handle = args.int_at(0, "serial/read-line")? as u64;
 
             if in_runtime_quantum() {
                 return checkout_runtime(
@@ -590,14 +569,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // Convenience for the sema-bridge protocol.
     crate::register_runtime_fn_path_gated(env, sandbox, Caps::SERIAL, "serial/send", &[], |args| {
         check_arity!(args, "serial/send", 2);
-        let handle = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
-            as u64;
-        let cmd = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-            .to_string();
+        let handle = args.int_at(0, "serial/send")? as u64;
+        let cmd = args.str_at(1, "serial/send")?.to_string();
 
         if in_runtime_quantum() {
             return checkout_runtime(

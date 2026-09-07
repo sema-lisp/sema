@@ -10,3 +10,8 @@ description = "The process-wide tokio I/O pool behind sema-core's executor seam"
 [dependencies]
 sema-core.workspace = true
 tokio.workspace = true
+
+[features]
+# Exposes `sema_io::test_support` (channel sender, nil decoder, no-op hook,
+# blocking sleep op) to other crates' executor tests.
+test-support = []

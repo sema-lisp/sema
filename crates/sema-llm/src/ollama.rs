@@ -120,59 +120,11 @@ impl OllamaProvider {
         })
     }
 
-    fn resolve_model(&self, model: &str) -> String {
-        if model.is_empty() {
-            self.default_model.clone()
-        } else {
-            model.to_string()
-        }
-    }
-
     async fn complete_async(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
-        let model = self.resolve_model(&request.model);
+        let model = crate::provider::resolve_model(&request.model, &self.default_model);
         let url = format!("{}/api/chat", self.host);
 
-        let messages = build_ollama_messages(&request);
-
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "stream": false,
-        });
-
-        // Add tools if provided
-        if !request.tools.is_empty() {
-            body["tools"] = build_tools_json(&request.tools);
-        }
-
-        // Options
-        let mut options = serde_json::Map::new();
-        if let Some(max_tokens) = request.max_tokens {
-            options.insert("num_predict".to_string(), serde_json::json!(max_tokens));
-        }
-        if let Some(temp) = request.temperature {
-            options.insert("temperature".to_string(), serde_json::json!(temp));
-        }
-        // Canonical `ChatRequest` fields Ollama does support, and was silently
-        // dropping. Per the one-canonical-request rule these must be translated
-        // here rather than being no-ops the caller cannot see.
-        if !request.stop_sequences.is_empty() {
-            options.insert(
-                "stop".to_string(),
-                serde_json::json!(request.stop_sequences),
-            );
-        }
-        if !options.is_empty() {
-            body["options"] = serde_json::Value::Object(options);
-        }
-        if request.json_mode {
-            body["format"] = serde_json::json!("json");
-        }
-        if let Some(ref effort) = request.reasoning_effort {
-            // Ollama exposes reasoning as a boolean switch, so map the tiers:
-            // "none" turns thinking off, anything else turns it on.
-            body["think"] = serde_json::json!(effort != "none");
-        }
+        let body = chat_body(&request, &model, false);
 
         let resp = self
             .client
@@ -183,14 +135,7 @@ impl OllamaProvider {
             .await
             .map_err(|e| LlmError::Http(e.to_string()))?;
 
-        let status = resp.status().as_u16();
-        if status != 200 {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Api {
-                status,
-                message: text,
-            });
-        }
+        let resp = crate::http::check_status(resp).await?;
 
         let api_resp: serde_json::Value = resp
             .json()
@@ -214,26 +159,18 @@ impl OllamaProvider {
             "tool_use"
         };
 
-        let prompt_tokens = api_resp
-            .get("prompt_eval_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let completion_tokens = api_resp
-            .get("eval_count")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
+        let mut usage = Usage {
+            model: model.clone(),
+            ..Default::default()
+        };
+        usage.merge_json(&api_resp, &USAGE_FIELDS);
 
         Ok(ChatResponse {
             content,
             role: "assistant".to_string(),
-            model: model.clone(),
+            model,
             tool_calls,
-            usage: Usage {
-                prompt_tokens,
-                completion_tokens,
-                model,
-                ..Default::default()
-            },
+            usage,
             stop_reason: Some(stop_reason.to_string()),
         })
     }
@@ -243,49 +180,10 @@ impl OllamaProvider {
         request: ChatRequest,
         on_chunk: &mut dyn FnMut(&str) -> Result<(), LlmError>,
     ) -> Result<ChatResponse, LlmError> {
-        let model = self.resolve_model(&request.model);
+        let model = crate::provider::resolve_model(&request.model, &self.default_model);
         let url = format!("{}/api/chat", self.host);
 
-        let messages = build_ollama_messages(&request);
-
-        let mut body = serde_json::json!({
-            "model": model,
-            "messages": messages,
-            "stream": true,
-        });
-
-        // Add tools if provided
-        if !request.tools.is_empty() {
-            body["tools"] = build_tools_json(&request.tools);
-        }
-
-        let mut options = serde_json::Map::new();
-        if let Some(max_tokens) = request.max_tokens {
-            options.insert("num_predict".to_string(), serde_json::json!(max_tokens));
-        }
-        if let Some(temp) = request.temperature {
-            options.insert("temperature".to_string(), serde_json::json!(temp));
-        }
-        // Canonical `ChatRequest` fields Ollama does support, and was silently
-        // dropping. Per the one-canonical-request rule these must be translated
-        // here rather than being no-ops the caller cannot see.
-        if !request.stop_sequences.is_empty() {
-            options.insert(
-                "stop".to_string(),
-                serde_json::json!(request.stop_sequences),
-            );
-        }
-        if !options.is_empty() {
-            body["options"] = serde_json::Value::Object(options);
-        }
-        if request.json_mode {
-            body["format"] = serde_json::json!("json");
-        }
-        if let Some(ref effort) = request.reasoning_effort {
-            // Ollama exposes reasoning as a boolean switch, so map the tiers:
-            // "none" turns thinking off, anything else turns it on.
-            body["think"] = serde_json::json!(effort != "none");
-        }
+        let body = chat_body(&request, &model, true);
 
         let resp = self
             .client
@@ -296,18 +194,13 @@ impl OllamaProvider {
             .await
             .map_err(|e| LlmError::Http(e.to_string()))?;
 
-        let status = resp.status().as_u16();
-        if status != 200 {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Api {
-                status,
-                message: text,
-            });
-        }
+        let resp = crate::http::check_status(resp).await?;
 
         let mut full_content = String::new();
-        let mut prompt_tokens = 0u32;
-        let mut completion_tokens = 0u32;
+        let mut usage = Usage {
+            model: model.clone(),
+            ..Default::default()
+        };
         let mut tool_calls: Vec<ToolCall> = Vec::new();
 
         crate::ndjson::parse_ndjson_stream(resp, |json| {
@@ -321,12 +214,7 @@ impl OllamaProvider {
 
             // Check if done — final chunk has usage info and tool calls
             if let Some(true) = json.get("done").and_then(|v| v.as_bool()) {
-                prompt_tokens = json
-                    .get("prompt_eval_count")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-                completion_tokens =
-                    json.get("eval_count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                usage.merge_json(json, &USAGE_FIELDS);
 
                 // Tool calls appear in the final message
                 if let Some(msg) = json.get("message") {
@@ -346,18 +234,22 @@ impl OllamaProvider {
         Ok(ChatResponse {
             content: full_content,
             role: "assistant".to_string(),
-            model: model.clone(),
+            model,
             tool_calls,
-            usage: Usage {
-                prompt_tokens,
-                completion_tokens,
-                model,
-                ..Default::default()
-            },
+            usage,
             stop_reason: Some(stop_reason.to_string()),
         })
     }
 }
+
+/// Token counts sit at the top level of the final `/api/chat` object; Ollama
+/// reports no prompt-cache counters.
+const USAGE_FIELDS: crate::types::UsageFields = crate::types::UsageFields {
+    prompt: "/prompt_eval_count",
+    completion: "/eval_count",
+    cache_read: None,
+    cache_write: None,
+};
 
 impl LlmProvider for OllamaProvider {
     fn name(&self) -> &str {
@@ -389,14 +281,51 @@ impl LlmProvider for OllamaProvider {
         // values and must never migrate to a pool worker.
         sema_io::io_block_on(self.stream_complete_async(request, on_chunk))
     }
+}
 
-    fn batch_complete(&self, requests: Vec<ChatRequest>) -> Vec<Result<ChatResponse, LlmError>> {
-        sema_io::io_block_on(async {
-            let futures: Vec<_> = requests
-                .into_iter()
-                .map(|req| self.complete_async(req))
-                .collect();
-            futures::future::join_all(futures).await
-        })
+/// The `/api/chat` request body for `request`, in Ollama's wire format.
+/// Shared by the blocking and streaming paths so the two cannot drift.
+fn chat_body(request: &ChatRequest, model: &str, stream: bool) -> serde_json::Value {
+    let messages = build_ollama_messages(request);
+
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+    });
+
+    // Add tools if provided
+    if !request.tools.is_empty() {
+        body["tools"] = build_tools_json(&request.tools);
     }
+
+    // Options
+    let mut options = serde_json::Map::new();
+    if let Some(max_tokens) = request.max_tokens {
+        options.insert("num_predict".to_string(), serde_json::json!(max_tokens));
+    }
+    if let Some(temp) = request.temperature {
+        options.insert("temperature".to_string(), serde_json::json!(temp));
+    }
+    // Canonical `ChatRequest` fields Ollama does support, and was silently
+    // dropping. Per the one-canonical-request rule these must be translated
+    // here rather than being no-ops the caller cannot see.
+    if !request.stop_sequences.is_empty() {
+        options.insert(
+            "stop".to_string(),
+            serde_json::json!(request.stop_sequences),
+        );
+    }
+    if !options.is_empty() {
+        body["options"] = serde_json::Value::Object(options);
+    }
+    if request.json_mode {
+        body["format"] = serde_json::json!("json");
+    }
+    if let Some(ref effort) = request.reasoning_effort {
+        // Ollama exposes reasoning as a boolean switch, so map the tiers:
+        // "none" turns thinking off, anything else turns it on.
+        body["think"] = serde_json::json!(effort != "none");
+    }
+    body
 }

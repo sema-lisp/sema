@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use sema_core::{check_arity, SemaError, Value, ValueView};
+use sema_core::{check_arity, ArgsExt, SemaError, Value, ValueView};
 
 use crate::register_fn;
 #[cfg(not(target_arch = "wasm32"))]
@@ -201,9 +201,7 @@ pub fn register(env: &sema_core::Env) {
     #[cfg(not(target_arch = "wasm32"))]
     register_runtime_fn(env, "csv/parse", |args| {
         check_arity!(args, "csv/parse", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "csv/parse")?;
         if sema_core::in_runtime_quantum() {
             check_csv_limit(
                 "csv/parse",
@@ -226,9 +224,7 @@ pub fn register(env: &sema_core::Env) {
     #[cfg(target_arch = "wasm32")]
     register_fn(env, "csv/parse", |args| {
         check_arity!(args, "csv/parse", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "csv/parse")?;
         Ok(csv_rows_to_value(csv_parse_work(
             s,
             CSV_MAX_ROWS,
@@ -240,9 +236,7 @@ pub fn register(env: &sema_core::Env) {
     #[cfg(not(target_arch = "wasm32"))]
     register_runtime_fn(env, "csv/parse-maps", |args| {
         check_arity!(args, "csv/parse-maps", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "csv/parse-maps")?;
         if sema_core::in_runtime_quantum() {
             check_csv_limit(
                 "csv/parse-maps",
@@ -267,9 +261,7 @@ pub fn register(env: &sema_core::Env) {
     #[cfg(target_arch = "wasm32")]
     register_fn(env, "csv/parse-maps", |args| {
         check_arity!(args, "csv/parse-maps", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "csv/parse-maps")?;
         Ok(csv_maps_to_value(csv_parse_maps_work(
             s,
             CSV_MAX_ROWS,

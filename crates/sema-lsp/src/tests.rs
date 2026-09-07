@@ -2806,14 +2806,10 @@ fn insert_parsed_doc(state: &mut BackendState, uri: &str, source: &str) {
 /// Unique per-test temp dir, canonicalized so expected URIs stay stable on
 /// platforms where the temp root is itself a symlink (macOS `/var`).
 fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .subsec_nanos();
-    let dir =
-        std::env::temp_dir().join(format!("sema-lsp-{prefix}-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::canonicalize(&dir).unwrap()
+    std::fs::canonicalize(sema_core::testing::unique_temp_dir(&format!(
+        "lsp-{prefix}"
+    )))
+    .unwrap()
 }
 
 /// Write `source` to `path`, parse it, and insert it into

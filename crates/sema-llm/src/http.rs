@@ -92,6 +92,23 @@ pub fn with_timeout(
     }
 }
 
+/// Pass a 200 response through. Any other status becomes the `LlmError` the
+/// retry loop understands: 429 is `RateLimited` with the server's retry hint,
+/// everything else is `Api` carrying the response body.
+pub async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, LlmError> {
+    let status = resp.status().as_u16();
+    if status == 200 {
+        return Ok(resp);
+    }
+    if status == 429 {
+        return Err(LlmError::RateLimited {
+            retry_after_ms: retry_after_ms(resp.headers()),
+        });
+    }
+    let message = resp.text().await.unwrap_or_default();
+    Err(LlmError::Api { status, message })
+}
+
 /// Milliseconds to wait after a 429, taken from the response when the server
 /// says so.
 ///

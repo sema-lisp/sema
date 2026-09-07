@@ -45,8 +45,9 @@ use std::cell::{Cell, RefCell};
 
 use sema_core::runtime::NativeOutcome;
 use sema_core::{check_arity, SemaError, SemaStream, Value};
+use sema_core::{ArgsExt, ResultExt};
 
-use crate::register_fn;
+use crate::{register_fn, register_runtime_fn};
 
 /// Default maximum for one `stream/read-all` or `stream/copy` call. Callers can
 /// pass a smaller or larger explicit maximum as the final argument, but no
@@ -124,37 +125,6 @@ fn checked_copy_total(total: usize, next: usize, cap: usize) -> Result<usize, Se
 /// excess chunk.
 fn capped_read_len(current: usize, cap: usize) -> usize {
     STREAM_CHUNK_BYTES.min(cap.saturating_sub(current).saturating_add(1).max(1))
-}
-
-/// Register a builtin whose body speaks the runtime native ABI
-/// (`NativeResult`), so its async branch can return a `NativeOutcome::Suspend`
-/// (a gate-guarded checkout offload) directly. Mirrors
-/// `crate::register_runtime_fn_path_gated` minus the sandbox/path gating (the
-/// `stream/*` builtins are ungated). The body is exposed under BOTH ABIs: the
-/// runtime callback returns the body's `NativeOutcome` structurally, and the
-/// value callback accepts the plain `Return` produced for bare/top-level eval.
-fn register_runtime_fn(
-    env: &sema_core::Env,
-    name: &'static str,
-    f: impl Fn(&[Value]) -> sema_core::runtime::NativeResult + 'static,
-) {
-    use sema_core::runtime::NativeOutcome;
-    let body = std::rc::Rc::new(f);
-    let for_func = body.clone();
-    let for_runtime = body;
-    env.set(
-        sema_core::intern(name),
-        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
-            name,
-            move |args| match for_func(args)? {
-                NativeOutcome::Return(value) => Ok(value),
-                _ => Err(sema_core::SemaError::eval(format!(
-                    "{name}: native suspended outside the cooperative runtime"
-                ))),
-            },
-            move |_ctx, args| for_runtime(args),
-        )),
-    );
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -282,6 +252,17 @@ fn expect_byte_buffer<'a>(
 
 // ── Registration ─────────────────────────────────────────────────
 
+/// A copy of a byte-buffer stream's whole buffer (argument 0), for the
+/// extraction builtins.
+fn byte_buffer_contents(args: &[Value], fname: &str) -> Result<Vec<u8>, SemaError> {
+    let s = expect_stream(args, fname, 0)?;
+    let stype = s.stream_type(); // get before borrowing inner
+    let inner = s.borrow_inner();
+    let buf = expect_byte_buffer(&inner, stype, fname)?;
+    let bytes = buf.buf.borrow().clone();
+    Ok(bytes)
+}
+
 pub fn register(env: &sema_core::Env) {
     // --- predicate ---
 
@@ -295,9 +276,7 @@ pub fn register(env: &sema_core::Env) {
     register_runtime_fn(env, "stream/read", |args| {
         check_arity!(args, "stream/read", 2);
         let s = expect_stream(args, "stream/read", 0)?;
-        let n = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
+        let n = args.int_at(1, "stream/read")?;
         if n < 0 {
             return Err(SemaError::eval(format!(
                 "stream/read: count must be non-negative, got {n}"
@@ -318,9 +297,7 @@ pub fn register(env: &sema_core::Env) {
     register_runtime_fn(env, "stream/write", |args| {
         check_arity!(args, "stream/write", 2);
         let s = expect_stream(args, "stream/write", 0)?;
-        let data = args[1]
-            .as_bytevector()
-            .ok_or_else(|| SemaError::type_error("bytevector", args[1].type_name()))?;
+        let data = args.bytes_at(1, "stream/write")?;
 
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(outcome) = io_streams::maybe_async_write(&s, data)? {
@@ -352,9 +329,7 @@ pub fn register(env: &sema_core::Env) {
     register_runtime_fn(env, "stream/write-byte", |args| {
         check_arity!(args, "stream/write-byte", 2);
         let s = expect_stream(args, "stream/write-byte", 0)?;
-        let b = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
+        let b = args.int_at(1, "stream/write-byte")?;
         if !(0..=255).contains(&b) {
             return Err(SemaError::eval(format!(
                 "stream/write-byte: value {b} out of range 0..255"
@@ -431,9 +406,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "stream/from-string", |args| {
         check_arity!(args, "stream/from-string", 1);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let s = args.str_at(0, "stream/from-string")?;
         Ok(Value::stream(StringStream {
             data: s.as_bytes().to_vec(),
             pos: Cell::new(0),
@@ -442,9 +415,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "stream/from-bytes", |args| {
         check_arity!(args, "stream/from-bytes", 1);
-        let bv = args[0]
-            .as_bytevector()
-            .ok_or_else(|| SemaError::type_error("bytevector", args[0].type_name()))?;
+        let bv = args.bytes_at(0, "stream/from-bytes")?;
         Ok(Value::stream(ByteBufferStream::new(bv.to_vec())))
     });
 
@@ -452,23 +423,16 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "stream/to-bytes", |args| {
         check_arity!(args, "stream/to-bytes", 1);
-        let s = expect_stream(args, "stream/to-bytes", 0)?;
-        let stype = s.stream_type(); // get before borrowing inner
-        let inner = s.borrow_inner();
-        let buf = expect_byte_buffer(&inner, stype, "stream/to-bytes")?;
-        let bytes = buf.buf.borrow().clone();
-        Ok(Value::bytevector(bytes))
+        Ok(Value::bytevector(byte_buffer_contents(
+            args,
+            "stream/to-bytes",
+        )?))
     });
 
     register_fn(env, "stream/to-string", |args| {
         check_arity!(args, "stream/to-string", 1);
-        let s = expect_stream(args, "stream/to-string", 0)?;
-        let stype = s.stream_type(); // get before borrowing inner
-        let inner = s.borrow_inner();
-        let buf = expect_byte_buffer(&inner, stype, "stream/to-string")?;
-        let bytes = buf.buf.borrow().clone();
-        let text = std::str::from_utf8(&bytes)
-            .map_err(|e| SemaError::eval(format!("stream/to-string: invalid UTF-8: {e}")))?;
+        let bytes = byte_buffer_contents(args, "stream/to-string")?;
+        let text = std::str::from_utf8(&bytes).eval_ctx("stream/to-string: invalid UTF-8")?;
         Ok(Value::string(text))
     });
 
@@ -526,17 +490,14 @@ pub fn register(env: &sema_core::Env) {
         if line.last() == Some(&b'\r') {
             line.pop();
         }
-        let text = String::from_utf8(line)
-            .map_err(|e| SemaError::eval(format!("stream/read-line: invalid UTF-8: {e}")))?;
+        let text = String::from_utf8(line).eval_ctx("stream/read-line: invalid UTF-8")?;
         Ok(NativeOutcome::Return(Value::string(&text)))
     });
 
     register_runtime_fn(env, "stream/write-string", |args| {
         check_arity!(args, "stream/write-string", 2);
         let s = expect_stream(args, "stream/write-string", 0)?;
-        let text = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let text = args.str_at(1, "stream/write-string")?;
 
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(outcome) = io_streams::maybe_async_write(&s, text.as_bytes())? {
@@ -688,8 +649,7 @@ mod io_streams {
 
     impl FileInputStream {
         pub fn open(path: &str) -> Result<Self, SemaError> {
-            let file = std::fs::File::open(path)
-                .map_err(|e| SemaError::eval(format!("stream/open-input: {path}: {e}")))?;
+            let file = std::fs::File::open(path).eval_ctx(format!("stream/open-input: {path}"))?;
             Ok(Self::from_reader(BufReader::new(file)))
         }
 
@@ -712,9 +672,7 @@ mod io_streams {
     impl SemaStream for FileInputStream {
         fn read(&self, buf: &mut [u8]) -> Result<usize, SemaError> {
             match &mut *self.slot.borrow_mut() {
-                FileInSlot::Available(r) => r
-                    .read(buf)
-                    .map_err(|e| SemaError::eval(format!("stream/read: I/O error: {e}"))),
+                FileInSlot::Available(r) => r.read(buf).eval_ctx("stream/read: I/O error"),
                 FileInSlot::CheckedOut => Err(busy_err("stream/read")),
                 FileInSlot::Tombstone(msg) => Err(tombstone_err("stream/read", msg)),
             }
@@ -772,8 +730,8 @@ mod io_streams {
 
     impl FileOutputStream {
         pub fn create(path: &str) -> Result<Self, SemaError> {
-            let file = std::fs::File::create(path)
-                .map_err(|e| SemaError::eval(format!("stream/open-output: {path}: {e}")))?;
+            let file =
+                std::fs::File::create(path).eval_ctx(format!("stream/open-output: {path}"))?;
             Ok(Self::from_writer(BufWriter::new(file)))
         }
 
@@ -802,9 +760,7 @@ mod io_streams {
 
         fn write(&self, data: &[u8]) -> Result<usize, SemaError> {
             match &mut *self.slot.borrow_mut() {
-                FileOutSlot::Available(w) => w
-                    .write(data)
-                    .map_err(|e| SemaError::eval(format!("stream/write: I/O error: {e}"))),
+                FileOutSlot::Available(w) => w.write(data).eval_ctx("stream/write: I/O error"),
                 FileOutSlot::Closed => Err(SemaError::eval("stream/write: file stream is closed")),
                 FileOutSlot::CheckedOut => Err(busy_err("stream/write")),
                 FileOutSlot::Tombstone(msg) => Err(tombstone_err("stream/write", msg)),
@@ -813,9 +769,7 @@ mod io_streams {
 
         fn flush(&self) -> Result<(), SemaError> {
             match &mut *self.slot.borrow_mut() {
-                FileOutSlot::Available(w) => w
-                    .flush()
-                    .map_err(|e| SemaError::eval(format!("stream/flush: I/O error: {e}"))),
+                FileOutSlot::Available(w) => w.flush().eval_ctx("stream/flush: I/O error"),
                 // Matches today: flushing an already-closed writer is a
                 // silent no-op rather than an error (StreamBox's own closed
                 // flag is what normally intercepts this first).
@@ -833,8 +787,7 @@ mod io_streams {
                     // `Available`) rather than transitioning to `Closed` —
                     // matches today's behavior exactly (the old `self.flush()?`
                     // early-return left `writer` as `Some`, i.e. still open).
-                    w.flush()
-                        .map_err(|e| SemaError::eval(format!("stream/close: I/O error: {e}")))?;
+                    w.flush().eval_ctx("stream/close: I/O error")?;
                     *slot = FileOutSlot::Closed;
                     Ok(())
                 }
@@ -2860,9 +2813,7 @@ pub fn register_io(env: &Env, sandbox: &Sandbox) {
         &[0],
         |args| {
             check_arity!(args, "stream/open-input", 1);
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            let path = args.str_at(0, "stream/open-input")?;
             io_streams::open_input(path)
         },
     );
@@ -2875,9 +2826,7 @@ pub fn register_io(env: &Env, sandbox: &Sandbox) {
         &[0],
         |args| {
             check_arity!(args, "stream/open-output", 1);
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            let path = args.str_at(0, "stream/open-output")?;
             io_streams::open_output(path)
         },
     );

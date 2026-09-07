@@ -3699,6 +3699,7 @@ dependencies = [
  "num-rational",
  "sema-core",
  "sema-eval",
+ "sema-io",
  "sema-reader",
  "sema-stdlib",
  "smallvec",

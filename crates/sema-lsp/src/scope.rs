@@ -122,19 +122,16 @@ impl ScopeTree {
         match head.as_str() {
             // ── Top-level definitions ────────────────────────────
             "define" | "def" => self.walk_define(items, expr, parent_scope, span_map, symbol_spans),
-            "defun" | "defn" => self.walk_defun(items, expr, parent_scope, span_map, symbol_spans),
-            "defmacro" => self.walk_defmacro(items, expr, parent_scope, span_map, symbol_spans),
+            "defun" | "defn" | "defmacro" => {
+                self.walk_defun(items, expr, parent_scope, span_map, symbol_spans)
+            }
             "defagent" | "deftool" | "defpolicy" => {
                 // These define a name at the parent scope level.
                 if items.len() >= 2 {
                     if let Some(name) = items[1].as_symbol() {
                         let form_span = expr_span(expr, span_map);
                         if let Some(fs) = &form_span {
-                            if let Some(ns) = find_symbol_span(&name, fs, symbol_spans) {
-                                self.scopes[parent_scope]
-                                    .bindings
-                                    .push(Binding { name, def_span: ns });
-                            }
+                            self.bind_symbol(parent_scope, name, fs, symbol_spans);
                         }
                     }
                 }
@@ -189,11 +186,7 @@ impl ScopeTree {
 
         if let Some(name) = items[1].as_symbol() {
             // (define x val) — simple binding at parent scope
-            if let Some(ns) = find_symbol_span(&name, &form_span, symbol_spans) {
-                self.scopes[parent_scope]
-                    .bindings
-                    .push(Binding { name, def_span: ns });
-            }
+            self.bind_symbol(parent_scope, name, &form_span, symbol_spans);
             // Recurse into the value expression
             if items.len() > 2 {
                 self.walk_expr(&items[2], parent_scope, span_map, symbol_spans);
@@ -207,21 +200,11 @@ impl ScopeTree {
                 // Bind the function name at parent scope
                 let sig_span = expr_span(&items[1], span_map);
                 if let Some(ss) = &sig_span {
-                    if let Some(ns) = find_symbol_span(&fname, ss, symbol_spans) {
-                        self.scopes[parent_scope].bindings.push(Binding {
-                            name: fname,
-                            def_span: ns,
-                        });
-                    }
+                    self.bind_symbol(parent_scope, fname, ss, symbol_spans);
                 }
 
                 // Create a child scope for the body with params bound
-                let body_scope_idx = self.scopes.len();
-                self.scopes.push(Scope {
-                    parent: Some(parent_scope),
-                    span: form_span,
-                    bindings: Vec::new(),
-                });
+                let body_scope_idx = self.push_scope(parent_scope, form_span);
 
                 // Bind parameters in the body scope
                 for param in &sig[1..] {
@@ -247,7 +230,8 @@ impl ScopeTree {
         }
     }
 
-    /// `(defun f (params...) body...)` or `(defn f (params...) body...)`
+    /// `(defun f (params...) body...)`, `(defn ...)`, or `(defmacro ...)`:
+    /// the name binds at the parent scope, the params in a child body scope.
     fn walk_defun(
         &mut self,
         items: &[Value],
@@ -266,86 +250,17 @@ impl ScopeTree {
 
         if let Some(fname) = items[1].as_symbol() {
             // Bind name at parent scope
-            if let Some(ns) = find_symbol_span(&fname, &form_span, symbol_spans) {
-                self.scopes[parent_scope].bindings.push(Binding {
-                    name: fname,
-                    def_span: ns,
-                });
-            }
+            self.bind_symbol(parent_scope, fname, &form_span, symbol_spans);
 
             // Create child scope for body
-            let body_scope_idx = self.scopes.len();
-            self.scopes.push(Scope {
-                parent: Some(parent_scope),
-                span: form_span,
-                bindings: Vec::new(),
-            });
+            let body_scope_idx = self.push_scope(parent_scope, form_span);
 
             // Bind parameters
             if let Some(params) = items[2].as_list() {
-                for param in params {
-                    self.collect_param_binding(
-                        param,
-                        body_scope_idx,
-                        &form_span,
-                        span_map,
-                        symbol_spans,
-                    );
-                }
+                self.bind_params(params, body_scope_idx, &form_span, span_map, symbol_spans);
             }
 
             // Recurse into body
-            for item in &items[3..] {
-                self.walk_expr(item, body_scope_idx, span_map, symbol_spans);
-            }
-        }
-    }
-
-    /// `(defmacro name (params...) body...)`
-    fn walk_defmacro(
-        &mut self,
-        items: &[Value],
-        expr: &Value,
-        parent_scope: usize,
-        span_map: &SpanMap,
-        symbol_spans: &[(String, Span)],
-    ) {
-        if items.len() < 3 {
-            return;
-        }
-        let form_span = match expr_span(expr, span_map) {
-            Some(s) => s,
-            None => return,
-        };
-
-        if let Some(name) = items[1].as_symbol() {
-            // Bind name at parent scope
-            if let Some(ns) = find_symbol_span(&name, &form_span, symbol_spans) {
-                self.scopes[parent_scope]
-                    .bindings
-                    .push(Binding { name, def_span: ns });
-            }
-
-            // Create child scope for body with params
-            let body_scope_idx = self.scopes.len();
-            self.scopes.push(Scope {
-                parent: Some(parent_scope),
-                span: form_span,
-                bindings: Vec::new(),
-            });
-
-            if let Some(params) = items[2].as_list() {
-                for param in params {
-                    self.collect_param_binding(
-                        param,
-                        body_scope_idx,
-                        &form_span,
-                        span_map,
-                        symbol_spans,
-                    );
-                }
-            }
-
             for item in &items[3..] {
                 self.walk_expr(item, body_scope_idx, span_map, symbol_spans);
             }
@@ -369,25 +284,12 @@ impl ScopeTree {
             None => return,
         };
 
-        let body_scope_idx = self.scopes.len();
-        self.scopes.push(Scope {
-            parent: Some(parent_scope),
-            span: form_span,
-            bindings: Vec::new(),
-        });
+        let body_scope_idx = self.push_scope(parent_scope, form_span);
 
         // Bind parameters (from list or vector)
         let params: Option<&[Value]> = items[1].as_list().or_else(|| items[1].as_vector());
         if let Some(params) = params {
-            for param in params {
-                self.collect_param_binding(
-                    param,
-                    body_scope_idx,
-                    &form_span,
-                    span_map,
-                    symbol_spans,
-                );
-            }
+            self.bind_params(params, body_scope_idx, &form_span, span_map, symbol_spans);
         }
 
         // Recurse into body
@@ -420,20 +322,10 @@ impl ScopeTree {
         // malformed `(let name non-list ...)` as a named let.
         if items.len() >= 3 && items[2].as_list().is_some() {
             if let Some(loop_name) = items[1].as_symbol() {
-                let body_scope_idx = self.scopes.len();
-                self.scopes.push(Scope {
-                    parent: Some(parent_scope),
-                    span: form_span,
-                    bindings: Vec::new(),
-                });
+                let body_scope_idx = self.push_scope(parent_scope, form_span);
 
                 // Bind the loop name
-                if let Some(ns) = find_symbol_span(&loop_name, &form_span, symbol_spans) {
-                    self.scopes[body_scope_idx].bindings.push(Binding {
-                        name: loop_name,
-                        def_span: ns,
-                    });
-                }
+                self.bind_symbol(body_scope_idx, loop_name, &form_span, symbol_spans);
 
                 // Bind variables from bindings list
                 if let Some(bindings) = items[2].as_list() {
@@ -463,12 +355,7 @@ impl ScopeTree {
         }
 
         // Regular let: items[0] is "let", items[1] is bindings list
-        let body_scope_idx = self.scopes.len();
-        self.scopes.push(Scope {
-            parent: Some(parent_scope),
-            span: form_span,
-            bindings: Vec::new(),
-        });
+        let body_scope_idx = self.push_scope(parent_scope, form_span);
 
         if let Some(bindings) = items[1].as_list() {
             for binding in bindings {
@@ -524,12 +411,7 @@ impl ScopeTree {
                         self.walk_expr(&pair[1], current_scope, span_map, symbol_spans);
 
                         // Create a new nested scope for this binding.
-                        let new_scope_idx = self.scopes.len();
-                        self.scopes.push(Scope {
-                            parent: Some(current_scope),
-                            span: form_span,
-                            bindings: Vec::new(),
-                        });
+                        let new_scope_idx = self.push_scope(current_scope, form_span);
                         self.collect_param_binding(
                             &pair[0],
                             new_scope_idx,
@@ -568,12 +450,7 @@ impl ScopeTree {
             None => return,
         };
 
-        let body_scope_idx = self.scopes.len();
-        self.scopes.push(Scope {
-            parent: Some(parent_scope),
-            span: form_span,
-            bindings: Vec::new(),
-        });
+        let body_scope_idx = self.push_scope(parent_scope, form_span);
 
         // First pass: collect ALL binding names into the scope.
         if let Some(bindings) = items[1].as_list() {
@@ -628,12 +505,7 @@ impl ScopeTree {
                 if clause_items.len() >= 2 {
                     let clause_span = expr_span(clause, span_map);
                     if let Some(cs) = clause_span {
-                        let clause_scope_idx = self.scopes.len();
-                        self.scopes.push(Scope {
-                            parent: Some(parent_scope),
-                            span: cs,
-                            bindings: Vec::new(),
-                        });
+                        let clause_scope_idx = self.push_scope(parent_scope, cs);
 
                         // Collect pattern bindings
                         self.collect_pattern_bindings(
@@ -671,23 +543,14 @@ impl ScopeTree {
             None => return,
         };
 
-        let body_scope_idx = self.scopes.len();
-        self.scopes.push(Scope {
-            parent: Some(parent_scope),
-            span: form_span,
-            bindings: Vec::new(),
-        });
+        let body_scope_idx = self.push_scope(parent_scope, form_span);
 
         if let Some(bindings) = items[1].as_list() {
             for binding in bindings {
                 if let Some(parts) = binding.as_list() {
                     if parts.len() >= 2 {
                         if let Some(name) = parts[0].as_symbol() {
-                            if let Some(ns) = find_symbol_span(&name, &form_span, symbol_spans) {
-                                self.scopes[body_scope_idx]
-                                    .bindings
-                                    .push(Binding { name, def_span: ns });
-                            }
+                            self.bind_symbol(body_scope_idx, name, &form_span, symbol_spans);
                         }
                         // Init exprs in outer scope
                         self.walk_expr(&parts[1], parent_scope, span_map, symbol_spans);
@@ -729,19 +592,8 @@ impl ScopeTree {
                             if let Some(var_name) = clause[1].as_symbol() {
                                 let catch_span = expr_span(item, span_map).or(form_span);
                                 if let Some(cs) = catch_span {
-                                    let catch_scope_idx = self.scopes.len();
-                                    self.scopes.push(Scope {
-                                        parent: Some(parent_scope),
-                                        span: cs,
-                                        bindings: Vec::new(),
-                                    });
-                                    if let Some(ns) = find_symbol_span(&var_name, &cs, symbol_spans)
-                                    {
-                                        self.scopes[catch_scope_idx].bindings.push(Binding {
-                                            name: var_name,
-                                            def_span: ns,
-                                        });
-                                    }
+                                    let catch_scope_idx = self.push_scope(parent_scope, cs);
+                                    self.bind_symbol(catch_scope_idx, var_name, &cs, symbol_spans);
                                     for handler in &clause[2..] {
                                         self.walk_expr(
                                             handler,
@@ -762,6 +614,46 @@ impl ScopeTree {
         }
     }
 
+    /// Open a child scope of `parent` covering `span`; returns its index.
+    fn push_scope(&mut self, parent: usize, span: Span) -> usize {
+        self.scopes.push(Scope {
+            parent: Some(parent),
+            span,
+            bindings: Vec::new(),
+        });
+        self.scopes.len() - 1
+    }
+
+    /// Bind `name` in `scope_idx` at its symbol span inside `within`, if the
+    /// symbol has one.
+    fn bind_symbol(
+        &mut self,
+        scope_idx: usize,
+        name: String,
+        within: &Span,
+        symbol_spans: &[(String, Span)],
+    ) {
+        if let Some(ns) = find_symbol_span(&name, within, symbol_spans) {
+            self.scopes[scope_idx]
+                .bindings
+                .push(Binding { name, def_span: ns });
+        }
+    }
+
+    /// Bind every parameter of a parameter list in `scope_idx`.
+    fn bind_params(
+        &mut self,
+        params: &[Value],
+        scope_idx: usize,
+        enclosing_span: &Span,
+        span_map: &SpanMap,
+        symbol_spans: &[(String, Span)],
+    ) {
+        for param in params {
+            self.collect_param_binding(param, scope_idx, enclosing_span, span_map, symbol_spans);
+        }
+    }
+
     /// Collect a binding for a single parameter (symbol or destructuring pattern).
     #[allow(clippy::only_used_in_recursion)]
     fn collect_param_binding(
@@ -777,11 +669,7 @@ impl ScopeTree {
             if name == "." {
                 return;
             }
-            if let Some(ns) = find_symbol_span(&name, enclosing_span, symbol_spans) {
-                self.scopes[scope_idx]
-                    .bindings
-                    .push(Binding { name, def_span: ns });
-            }
+            self.bind_symbol(scope_idx, name, enclosing_span, symbol_spans);
         } else if let Some(items) = param.as_vector() {
             // Vector destructuring: [a b c]
             for item in items {
@@ -838,11 +726,7 @@ impl ScopeTree {
             // In match patterns, bare symbols are bindings unless they're
             // literals like `_`, `true`, `false`, `nil`.
             if name != "_" && name != "true" && name != "false" && name != "nil" {
-                if let Some(ns) = find_symbol_span(&name, enclosing_span, symbol_spans) {
-                    self.scopes[scope_idx]
-                        .bindings
-                        .push(Binding { name, def_span: ns });
-                }
+                self.bind_symbol(scope_idx, name, enclosing_span, symbol_spans);
             }
         } else if let Some(items) = pattern.as_list() {
             // (cons h t) or (list a b c) — skip the head keyword

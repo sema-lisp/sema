@@ -28,14 +28,7 @@ fn sema_binary() -> String {
 }
 
 fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let dir =
-        std::env::temp_dir().join(format!("sema-dap-{prefix}-{}-{nanos}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("failed to create temp dir");
-    dir
+    sema_core::testing::unique_temp_dir(&format!("dap-{prefix}"))
 }
 
 fn send_dap(stdin: &mut impl Write, seq: u64, command: &str, args: Option<serde_json::Value>) {

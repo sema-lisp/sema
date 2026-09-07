@@ -25,7 +25,7 @@ use sema_core::runtime::{
     CancelDisposition, CancelHook, CancelHookError, CompletionKind, InterruptibleResource,
     NativeOutcome, NativeResult, Trace,
 };
-use sema_core::{check_arity, in_runtime_quantum, Caps, SemaError, Value};
+use sema_core::{check_arity, in_runtime_quantum, ArgsExt, Caps, SemaError, Value};
 
 /// Completion tag for an offloaded `git` subprocess. Consistent between the
 /// issued identity and the prepared op (not a uniqueness key), so one shared
@@ -684,12 +684,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let path = if args.is_empty() {
             None
         } else {
-            Some(
-                args[0]
-                    .as_str()
-                    .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                    .to_string(),
-            )
+            Some(args.str_at(0, "git/diff")?.to_string())
         };
         let diff_args = || match &path {
             None => vec!["diff".to_string()],
@@ -735,9 +730,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             let n = if args.is_empty() {
                 20
             } else {
-                args[0]
-                    .as_int()
-                    .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
+                args.int_at(0, "git/recent-files")?
             };
             let n_str = n.to_string();
             let log_args = || {
@@ -765,10 +758,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         &[],
         |args| {
             check_arity!(args, "git/ignore-matches?", 1);
-            let path = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
-                .to_string();
+            let path = args.str_at(0, "git/ignore-matches?")?.to_string();
             // `git check-ignore -q` exits 0 if the path is ignored, 1 if not, and
             // >1 on a real error. We need the raw exit code, so bypass the
             // helpers above (`git()`/`git_stdout_runtime`, which treat any non-zero

@@ -63,8 +63,18 @@ pub(crate) fn try_run_embedded() -> Option<i32> {
             Ok(data) => {
                 let len = data.len();
                 let trailer = &data[len - 16..];
-                let archive_size = u64::from_le_bytes(trailer[0..8].try_into().unwrap()) as usize;
-                data[len - 16 - archive_size..len - 16].to_vec()
+                let archive_size = u64::from_le_bytes(trailer[0..8].try_into().unwrap());
+                let payload_end = len - 16;
+                let archive_size = match usize::try_from(archive_size) {
+                    Ok(size) if size <= payload_end => size,
+                    _ => {
+                        print_cli_error(
+                            "could not load embedded archive: archive size exceeds file size",
+                        );
+                        return Some(1);
+                    }
+                };
+                data[payload_end - archive_size..payload_end].to_vec()
             }
             Err(_) => return None,
         }
@@ -86,6 +96,23 @@ pub(crate) fn try_run_embedded() -> Option<i32> {
         .and_then(|v| std::str::from_utf8(v).ok())
         .unwrap_or("__main__.semac")
         .to_string();
+    let entry_file = match arch
+        .metadata
+        .get("entry-file")
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .map(|value| {
+            sema_core::vfs::validate_vfs_path(value).map(|()| std::path::PathBuf::from(value))
+        })
+        .transpose()
+    {
+        Ok(path) => path,
+        Err(error) => {
+            print_cli_error(format!(
+                "could not load embedded archive: invalid entry file: {error}"
+            ));
+            return Some(1);
+        }
+    };
 
     let bytecode = match arch.files.get(&entry_point) {
         Some(b) => b.clone(),
@@ -108,6 +135,10 @@ pub(crate) fn try_run_embedded() -> Option<i32> {
     let is_mcp = args
         .iter()
         .any(|arg| arg == "--mcp" || arg.starts_with("--mcp="));
+    let run_entry = || match &entry_file {
+        Some(path) => interpreter.run_bytecode_at_path(path, &bytecode),
+        None => interpreter.run_bytecode_bytes(&bytecode),
+    };
 
     if is_mcp {
         let mut include = None;
@@ -144,7 +175,7 @@ pub(crate) fn try_run_embedded() -> Option<i32> {
         });
         let tool_timeout = resolve_mcp_tool_timeout(timeout_ms);
 
-        if let Err(e) = interpreter.run_bytecode_bytes(&bytecode) {
+        if let Err(e) = run_entry() {
             print_error(&e);
             return Some(1);
         }
@@ -157,7 +188,7 @@ pub(crate) fn try_run_embedded() -> Option<i32> {
         }
         Some(0)
     } else {
-        match interpreter.run_bytecode_bytes(&bytecode) {
+        match run_entry() {
             Ok(_) => Some(0),
             Err(e) => {
                 print_error(&e);
@@ -406,8 +437,8 @@ fn build_archive(
     if opts.verbose {
         eprintln!("[2/4] Tracing imports...");
     }
-    let imports =
-        import_tracer::trace_imports(path).map_err(|e| format!("tracing imports: {e}"))?;
+    let imports = import_tracer::trace_imports_with_paths(path)
+        .map_err(|e| format!("tracing imports: {e}"))?;
 
     if opts.verbose {
         eprintln!("[3/4] Collecting assets...");
@@ -415,7 +446,7 @@ fn build_archive(
     let mut files = std::collections::HashMap::new();
     files.insert("__main__.semac".to_string(), bytecode);
 
-    for (rel_path, contents) in &imports {
+    for (rel_path, contents) in &imports.files {
         if let Err(e) = sema_core::vfs::validate_vfs_path(rel_path) {
             print_cli_warning(format!("skipping import with invalid VFS path: {e}"));
             continue;
@@ -472,6 +503,10 @@ fn build_archive(
         build_timestamp().into_bytes(),
     );
     metadata.insert("entry-point".to_string(), b"__main__.semac".to_vec());
+    metadata.insert(
+        "entry-file".to_string(),
+        imports.entry_file.as_bytes().to_vec(),
+    );
 
     let canonical_root = path
         .parent()
@@ -482,7 +517,8 @@ fn build_archive(
         canonical_root.to_string_lossy().into_owned().into_bytes(),
     );
 
-    let archive_bytes = archive::serialize_archive(&metadata, &files);
+    let archive_bytes = archive::serialize_archive(&metadata, &files)
+        .map_err(|error| format!("could not serialize build archive: {error}"))?;
     eprintln!(
         "Compiled {file} → archive ({} file{}, {})",
         files.len(),
@@ -803,7 +839,7 @@ pub(crate) fn run_build(
     Ok(())
 }
 
-fn compile_source_to_bytecode(source: &str) -> Result<Vec<u8>, String> {
+fn compile_source_to_bytecode(path: &std::path::Path, source: &str) -> Result<Vec<u8>, String> {
     let source_hash = crc32fast::hash(source.as_bytes());
     let sandbox = sema_core::Sandbox::allow_all();
     let interpreter = Interpreter::new_with_sandbox(&sandbox);
@@ -811,7 +847,7 @@ fn compile_source_to_bytecode(source: &str) -> Result<Vec<u8>, String> {
         .eval_str_in_global(include_str!("web_prelude.sema"))
         .map_err(|e| format!("web prelude failed: {}", e.format_plain()))?;
     let result = interpreter
-        .compile_to_bytecode(source)
+        .compile_file_to_bytecode(path, source)
         .map_err(|e| format!("compile failed: {}", e.format_plain()))?;
     sema_vm::serialize_to_bytes(&result, source_hash)
         .map_err(|e| format!("serialization failed: {}", e.format_plain()))
@@ -859,18 +895,18 @@ pub(crate) fn build_web_archive(
     if opts.verbose {
         eprintln!("[1/4] Compiling {} (web prelude)...", path.display());
     }
-    let entry_bytecode = compile_source_to_bytecode(&source)?;
+    let entry_bytecode = compile_source_to_bytecode(path, &source)?;
 
     if opts.verbose {
         eprintln!("[2/4] Tracing imports...");
     }
-    let imports =
-        import_tracer::trace_imports(path).map_err(|e| format!("tracing imports: {e}"))?;
+    let imports = import_tracer::trace_imports_with_paths(path)
+        .map_err(|e| format!("tracing imports: {e}"))?;
 
     let mut files = std::collections::HashMap::new();
     files.insert("__main__.semac".to_string(), entry_bytecode);
 
-    for (rel_path, contents) in &imports {
+    for (rel_path, contents) in &imports.files {
         if let Err(e) = sema_core::vfs::validate_vfs_path(rel_path) {
             print_cli_warning(format!("skipping import with invalid VFS path: {e}"));
             continue;
@@ -880,7 +916,11 @@ pub(crate) fn build_web_archive(
             let import_source = String::from_utf8(contents.clone()).map_err(|e| {
                 format!("compile error in {rel_path}: import is not valid UTF-8: {e}")
             })?;
-            compile_source_to_bytecode(&import_source).map_err(|e| format!("{e} in {rel_path}"))?
+            let source_path = imports.source_paths.get(rel_path).ok_or_else(|| {
+                format!("tracing imports did not retain a source path for {rel_path}")
+            })?;
+            compile_source_to_bytecode(source_path, &import_source)
+                .map_err(|e| format!("{e} in {rel_path}"))?
         } else {
             contents.clone()
         };
@@ -933,6 +973,10 @@ pub(crate) fn build_web_archive(
         build_timestamp().into_bytes(),
     );
     metadata.insert("entry-point".to_string(), b"__main__.semac".to_vec());
+    metadata.insert(
+        "entry-file".to_string(),
+        imports.entry_file.as_bytes().to_vec(),
+    );
     metadata.insert("build-target".to_string(), b"web".to_vec());
 
     let canonical_root = path
@@ -952,7 +996,9 @@ pub(crate) fn build_web_archive(
         );
     }
     let files_count = files.len();
-    Ok((archive::serialize_archive(&metadata, &files), files_count))
+    let archive_bytes = archive::serialize_archive(&metadata, &files)
+        .map_err(|error| format!("could not serialize web archive: {error}"))?;
+    Ok((archive_bytes, files_count))
 }
 
 fn run_build_web(
@@ -1539,7 +1585,7 @@ mod tests {
     /// positionals first, which swallows the subcommand word — `sema notebook
     /// <TAB>` completed files). If this fails after a clap_complete upgrade,
     /// refresh the anchors in `fix_zsh_root_completion`.
-    use super::compile_source_to_bytecode;
+    use super::{build_web_archive, compile_source_to_bytecode, BuildOutputOpts};
     use sema_core::{intern, NativeFn, Sandbox, Value};
     use sema_eval::Interpreter;
 
@@ -1551,7 +1597,9 @@ mod tests {
             (mount! "#app" counter-view)
         "##;
 
-        let bytes = compile_source_to_bytecode(source).expect("compile should succeed");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/hello.sema");
+        let bytes = compile_source_to_bytecode(&path, source).expect("compile should succeed");
 
         let interp = Interpreter::new_with_sandbox(&Sandbox::allow_all());
         interp.global_env.set(
@@ -1582,7 +1630,9 @@ mod tests {
             (def batched (batch 1 2 3))
         "#;
 
-        let bytes = compile_source_to_bytecode(source).expect("compile should succeed");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/hello.sema");
+        let bytes = compile_source_to_bytecode(&path, source).expect("compile should succeed");
 
         let interp = Interpreter::new_with_sandbox(&Sandbox::allow_all());
         interp.global_env.set(
@@ -1613,5 +1663,30 @@ mod tests {
 
         assert_eq!(doubled, Value::string("computed-ok"));
         assert_eq!(batched, Value::string("batch-ok"));
+    }
+
+    #[test]
+    fn web_build_compiles_imports_with_their_source_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "sema-web-build-relative-macros-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/macros.sema"), "(defmacro answer () 42)").unwrap();
+        std::fs::write(
+            dir.join("lib/feature.sema"),
+            "(load \"macros.sema\") (define value (answer))",
+        )
+        .unwrap();
+        let main = dir.join("main.sema");
+        std::fs::write(&main, "(import \"lib/feature.sema\")").unwrap();
+
+        let result = build_web_archive(&main, &[], BuildOutputOpts::default());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            result.is_ok(),
+            "web build must retain import source paths: {result:?}"
+        );
     }
 }

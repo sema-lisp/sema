@@ -129,7 +129,7 @@ impl InterpreterBuilder {
         let guard = sema_otel::activate(self.telemetry);
 
         let env = Env::new();
-        let ctx = sema_eval::EvalContext::new();
+        let ctx = sema_eval::EvalContext::new_with_sandbox(self.sandbox.clone());
 
         sema_core::set_eval_callback(&ctx, sema_eval::eval_value_vm);
         sema_core::set_call_callback(&ctx, sema_eval::call_value);
@@ -269,9 +269,17 @@ impl Interpreter {
     /// ```
     pub fn load_file(&self, path: impl AsRef<std::path::Path>) -> EvalResult {
         let path = path.as_ref();
+        self.inner
+            .ctx
+            .sandbox
+            .check(sema_core::Caps::FS_READ, "load_file")?;
         let canonical = path
             .canonicalize()
             .map_err(|e| SemaError::eval(format!("load_file {}: {e}", path.display())))?;
+        self.inner
+            .ctx
+            .sandbox
+            .check_path(&canonical.to_string_lossy(), "load_file")?;
         let content = std::fs::read_to_string(&canonical)
             .map_err(|e| SemaError::eval(format!("load_file {}: {e}", path.display())))?;
         self.inner.ctx.push_file_path(canonical);

@@ -17,8 +17,16 @@ use sema_core::Value;
 /// Returns a map of `relative_path -> file_contents` for every discovered
 /// dependency. The root file itself is **not** included (it is compiled to
 /// bytecode separately).
+#[cfg(test)]
 pub fn trace_imports(root_file: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
     trace_imports_with_mode(root_file, false).map(|snapshot| snapshot.files)
+}
+
+/// Trace imports and retain the canonical source path for every VFS key.
+/// Compilers use the path to resolve literal macro loads relative to the file
+/// that declares them.
+pub fn trace_imports_with_paths(root_file: &Path) -> Result<StrictImportSnapshot, String> {
+    trace_imports_with_mode(root_file, false)
 }
 
 /// Exact dependency bytes and their filesystem identities for an approval run.
@@ -28,6 +36,10 @@ pub struct StrictImportSnapshot {
     pub files: HashMap<String, Vec<u8>>,
     /// Filesystem spellings used to make absolute imports hit the snapshot.
     pub filesystem_files: HashMap<PathBuf, Vec<u8>>,
+    /// Canonical source file for every portable VFS key in `files`.
+    pub source_paths: HashMap<String, PathBuf>,
+    /// Portable VFS identity of the root source file.
+    pub entry_file: String,
 }
 
 /// Approval binding variant: every import must be literal, readable, and inside the
@@ -40,17 +52,19 @@ fn trace_imports_with_mode(root_file: &Path, strict: bool) -> Result<StrictImpor
     let root_file = root_file
         .canonicalize()
         .map_err(|e| format!("cannot canonicalize root file {}: {e}", root_file.display()))?;
-
     let root_dir = root_file
         .parent()
         .ok_or_else(|| format!("root file has no parent directory: {}", root_file.display()))?
         .to_path_buf();
 
     let mut state = TraceState {
+        root_file: &root_file,
         root_dir: &root_dir,
         visited: HashSet::new(),
         result: HashMap::new(),
+        local_files: HashMap::new(),
         filesystem_files: HashMap::new(),
+        source_paths: HashMap::new(),
         strict,
     };
 
@@ -71,23 +85,96 @@ fn trace_imports_with_mode(root_file: &Path, strict: bool) -> Result<StrictImpor
 
     trace_file_imports(&exprs, &root_file, &mut state)?;
 
+    let filesystem_files = std::mem::take(&mut state.filesystem_files);
+    let (files, source_paths, entry_file) = state.finish()?;
     Ok(StrictImportSnapshot {
-        files: state.result,
-        filesystem_files: state.filesystem_files,
+        files,
+        filesystem_files,
+        source_paths,
+        entry_file,
     })
 }
 
 /// The parts of import-tracing state that stay fixed for the whole recursive
-/// walk (`root_dir`, `strict`) alongside the accumulators every recursive call
+/// walk (`root_file`, `strict`) alongside the accumulators every recursive call
 /// threads through (`visited`, `result`, `filesystem_files`) — bundled so each
 /// function takes one `&mut TraceState` plus the one value that actually
 /// varies per call (`current_file`/`import_path`/`expr`).
 struct TraceState<'a> {
+    root_file: &'a Path,
     root_dir: &'a Path,
     visited: HashSet<PathBuf>,
+    /// Package files keep package-relative VFS keys as they are discovered.
     result: HashMap<String, Vec<u8>>,
+    /// Local files are keyed after tracing finds a virtual root shared with the
+    /// entry file. This preserves parent-relative imports in a standalone VFS.
+    local_files: HashMap<PathBuf, Vec<u8>>,
     filesystem_files: HashMap<PathBuf, Vec<u8>>,
+    source_paths: HashMap<String, PathBuf>,
     strict: bool,
+}
+
+type TraceResult = (HashMap<String, Vec<u8>>, HashMap<String, PathBuf>, String);
+
+impl TraceState<'_> {
+    fn finish(mut self) -> Result<TraceResult, String> {
+        let common_root = common_parent(
+            std::iter::once(self.root_file).chain(self.local_files.keys().map(PathBuf::as_path)),
+        )?;
+        let entry_file = vfs_relative_path(self.root_file, &common_root)?;
+
+        for (path, contents) in self.local_files {
+            let key = vfs_relative_path(&path, &common_root)?;
+            if let Some(existing) = self.result.get(&key) {
+                if *existing != contents {
+                    return Err(format!(
+                        "VFS key collision: \"{key}\" maps to two different files with different content"
+                    ));
+                }
+            } else {
+                self.result.insert(key.clone(), contents);
+                self.source_paths.insert(key, path);
+            }
+        }
+        Ok((self.result, self.source_paths, entry_file))
+    }
+}
+
+fn common_parent<'a>(paths: impl Iterator<Item = &'a Path>) -> Result<PathBuf, String> {
+    let mut paths = paths.peekable();
+    let first = paths
+        .next()
+        .ok_or_else(|| "cannot derive a VFS root without source paths".to_string())?;
+    let mut common = first
+        .parent()
+        .ok_or_else(|| format!("source file has no parent directory: {}", first.display()))?
+        .to_path_buf();
+
+    for path in paths {
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("source file has no parent directory: {}", path.display()))?;
+        while !parent.starts_with(&common) {
+            if !common.pop() {
+                return Err("imported files do not share a filesystem root".to_string());
+            }
+        }
+    }
+    Ok(common)
+}
+
+fn vfs_relative_path(path: &Path, root: &Path) -> Result<String, String> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        format!(
+            "imported file {} is outside the virtual source root {}",
+            path.display(),
+            root.display()
+        )
+    })?;
+    let key = relative.to_string_lossy().replace('\\', "/");
+    sema_core::vfs::validate_vfs_path(&key)
+        .map_err(|e| format!("invalid VFS key for {}: {e}", path.display()))?;
+    Ok(key)
 }
 
 /// Parse the expressions from a single file and extract all import/load paths,
@@ -111,6 +198,15 @@ fn extract_imports(
     current_file: &Path,
     state: &mut TraceState,
 ) -> Result<(), String> {
+    extract_imports_at_depth(expr, current_file, state, 0)
+}
+
+fn extract_imports_at_depth(
+    expr: &Value,
+    current_file: &Path,
+    state: &mut TraceState,
+    quasiquote_depth: usize,
+) -> Result<(), String> {
     let items = match expr.as_list() {
         Some(items) if !items.is_empty() => items,
         _ => return Ok(()),
@@ -120,9 +216,22 @@ fn extract_imports(
     if let Some(head) = items[0].as_symbol() {
         match head.as_str() {
             // Quoted data is not evaluated — don't trace imports inside it.
-            "quote" | "quasiquote" => return Ok(()),
+            "quote" => return Ok(()),
+            "quasiquote" => {
+                for item in items.iter().skip(1) {
+                    extract_imports_at_depth(item, current_file, state, quasiquote_depth + 1)?;
+                }
+                return Ok(());
+            }
+            "unquote" | "unquote-splicing" if quasiquote_depth > 0 => {
+                let next_depth = quasiquote_depth - 1;
+                for item in items.iter().skip(1) {
+                    extract_imports_at_depth(item, current_file, state, next_depth)?;
+                }
+                return Ok(());
+            }
             "import" | "load" => {
-                if items.len() >= 2 {
+                if quasiquote_depth == 0 && items.len() >= 2 {
                     if let Some(path_str) = items[1].as_str() {
                         process_import(path_str, current_file, state)?;
                     } else {
@@ -141,7 +250,8 @@ fn extract_imports(
                         ));
                     }
                 }
-                // Don't recurse further into import/load forms.
+                // Imports are executable only outside quasiquote. An import in
+                // quoted data can still contain an unquote at a deeper level.
                 return Ok(());
             }
             "module" => {
@@ -150,7 +260,7 @@ fn extract_imports(
                 // may be an (export ...) form in there too -- just recurse
                 // into everything after the name.
                 for item in items.iter().skip(2) {
-                    extract_imports(item, current_file, state)?;
+                    extract_imports_at_depth(item, current_file, state, quasiquote_depth)?;
                 }
                 return Ok(());
             }
@@ -160,7 +270,7 @@ fn extract_imports(
 
     // For any other list, recurse into all children.
     for item in items.iter() {
-        extract_imports(item, current_file, state)?;
+        extract_imports_at_depth(item, current_file, state, quasiquote_depth)?;
     }
 
     Ok(())
@@ -241,65 +351,46 @@ fn process_import(
         .filesystem_files
         .insert(canonical.clone(), contents.clone());
 
-    // Compute relative path for the VFS key.
-    // Check packages_dir FIRST — package files must get package-relative keys
-    // (e.g., "json-utils/helpers.sema"), not project-relative keys that would
-    // leak the SEMA_HOME path.
-    let rel_path = {
-        let pkg_dir = sema_core::resolve::packages_dir();
-        let canon_pkg = pkg_dir.canonicalize().ok();
-        if let Some(ref cpkg) = canon_pkg {
-            if let Ok(rel) = canonical.strip_prefix(cpkg) {
-                rel.to_string_lossy().replace('\\', "/")
-            } else if let Ok(rel) = canonical.strip_prefix(state.root_dir) {
-                rel.to_string_lossy().replace('\\', "/")
-            } else {
-                if state.strict {
+    // Package-relative imports retain their package VFS keys. Local imports use
+    // a shared virtual root chosen after tracing, which can include files above
+    // the entry file's directory.
+    let package_root = sema_core::resolve::packages_dir().canonicalize().ok();
+    if let Some(package_root) = package_root {
+        if let Ok(relative) = canonical.strip_prefix(&package_root) {
+            let key = relative.to_string_lossy().replace('\\', "/");
+            sema_core::vfs::validate_vfs_path(&key)
+                .map_err(|e| format!("invalid VFS key for {}: {e}", canonical.display()))?;
+            if let Some(existing) = state.result.get(&key) {
+                if *existing != contents {
                     return Err(format!(
-                        "imported file {} is outside the project and packages directories",
-                        canonical.display()
-                    ));
-                }
-                crate::print_cli_warning(format!(
-                    "imported file {} is outside the project and packages \
-                     directories; not bundled (resolved at runtime)",
-                    canonical.display()
+                    "VFS key collision: \"{key}\" maps to two different files with different content"
                 ));
-                return Ok(());
+                }
+            } else {
+                state.result.insert(key.clone(), contents.clone());
+                state.source_paths.insert(key, canonical.clone());
             }
-        } else if let Ok(rel) = canonical.strip_prefix(state.root_dir) {
-            rel.to_string_lossy().replace('\\', "/")
         } else {
-            if state.strict {
+            if state.strict && !canonical.starts_with(state.root_dir) {
                 return Err(format!(
                     "imported file {} is outside the project directory",
                     canonical.display()
                 ));
             }
-            crate::print_cli_warning(format!(
-                "imported file {} is outside the project directory; not \
-                 bundled (resolved at runtime)",
+            state
+                .local_files
+                .insert(canonical.clone(), contents.clone());
+        }
+    } else {
+        if state.strict && !canonical.starts_with(state.root_dir) {
+            return Err(format!(
+                "imported file {} is outside the project directory",
                 canonical.display()
             ));
-            return Ok(());
         }
-    };
-
-    // Validate the VFS key before inserting
-    sema_core::vfs::validate_vfs_path(&rel_path)
-        .map_err(|e| format!("invalid VFS key for {}: {e}", canonical.display()))?;
-
-    // Detect collisions: if a key already exists with different content, error
-    if let Some(existing) = state.result.get(&rel_path) {
-        if *existing != contents {
-            return Err(format!(
-                "VFS key collision: \"{}\" maps to two different files with different content",
-                rel_path
-            ));
-        }
-        // Same content — skip reinserting (diamond dependency)
-    } else {
-        state.result.insert(rel_path, contents.clone());
+        state
+            .local_files
+            .insert(canonical.clone(), contents.clone());
     }
 
     // Recursively trace the imported file's own imports.
@@ -371,6 +462,9 @@ fn process_package_import(import_path: &str, state: &mut TraceState) -> Result<(
         state
             .result
             .insert(import_path.to_string(), contents.clone());
+        state
+            .source_paths
+            .insert(import_path.to_string(), canonical.clone());
     }
 
     // Recursively trace the package file's own imports.
@@ -462,6 +556,20 @@ mod tests {
             result.contains_key("lib.sema"),
             "expected lib.sema in result: {result:?}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trace_parent_relative_import_uses_a_shared_virtual_root() {
+        let dir = tmpdir("parent-relative");
+        fs::create_dir_all(dir.join("sub")).unwrap();
+        fs::write(dir.join("shared.sema"), "(define shared 1)").unwrap();
+        let main = dir.join("sub/main.sema");
+        fs::write(&main, r#"(import "../shared.sema")"#).unwrap();
+
+        let traced = trace_imports_with_paths(&main).unwrap();
+        assert!(traced.files.contains_key("shared.sema"), "{traced:?}");
+        assert_eq!(traced.entry_file, "sub/main.sema");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -721,6 +829,21 @@ mod tests {
             result.is_empty(),
             "quasiquoted imports should not be traced"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_trace_import_inside_quasiquote_unquote() {
+        let dir = tmpdir("quasiquote-unquote");
+        fs::write(dir.join("lib.sema"), "(define answer 42)").unwrap();
+        fs::write(
+            dir.join("main.sema"),
+            r#"(quasiquote (list (unquote (import "lib.sema"))))"#,
+        )
+        .unwrap();
+
+        let result = trace_imports(&dir.join("main.sema")).unwrap();
+        assert!(result.contains_key("lib.sema"), "{result:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -39,7 +39,7 @@ use std::path::{Component, Path, PathBuf};
 use sema_core::runtime::{NativeOutcome, NativeResult, QuarantineBound};
 use sema_core::{check_arity, ArgsExt, Caps, ResultExt, SemaError, Value};
 
-use crate::{register_runtime_fn, register_runtime_fn_gated};
+use crate::{register_runtime_fn, register_runtime_fn_path_gated};
 
 const ARCHIVE_INPUT_BYTE_CAP: u64 = 256 * 1024 * 1024;
 const ARCHIVE_OUTPUT_BYTE_CAP: u64 = 512 * 1024 * 1024;
@@ -275,6 +275,66 @@ fn safe_relative(name: &str) -> Option<PathBuf> {
     }
 }
 
+fn ensure_extract_root(path: &Path, op: &str) -> Result<(), SemaError> {
+    std::fs::create_dir_all(path).io_ctx(format!("{op} {}", path.display()))?;
+    ensure_safe_directory(path, op)
+}
+
+fn ensure_safe_directory(path: &Path, op: &str) -> Result<(), SemaError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(SemaError::eval(format!(
+            "{op}: destination directory is a symlink: {}",
+            path.display()
+        ))),
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(SemaError::eval(format!(
+            "{op}: destination path is not a directory: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(path).io_ctx(format!("{op} {}", path.display()))?;
+            ensure_safe_directory(path, op)
+        }
+        Err(error) => Err(SemaError::Io(format!("{op} {}: {error}", path.display()))),
+    }
+}
+
+fn ensure_safe_parent(dest_root: &Path, rel: &Path, op: &str) -> Result<(), SemaError> {
+    let mut current = dest_root.to_path_buf();
+    if let Some(parent) = rel.parent() {
+        for component in parent.components() {
+            if let Component::Normal(segment) = component {
+                current.push(segment);
+                ensure_safe_directory(&current, op)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn open_safe_output_file(path: &Path, op: &str) -> Result<std::fs::File, SemaError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(SemaError::eval(format!(
+                "{op}: destination file is a symlink: {}",
+                path.display()
+            )));
+        }
+        Ok(_) | Err(_) => {}
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+        .open(path)
+        .io_ctx(format!("{op} {}", path.display()))
+}
+
 /// True if the path looks gzip-compressed by extension.
 fn looks_gzip(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
@@ -382,7 +442,7 @@ fn zip_extract_from_reader<R: std::io::Read + std::io::Seek>(
     }
 
     let dest_root = Path::new(dest_dir);
-    std::fs::create_dir_all(dest_root).io_ctx(format!("zip/extract {dest_dir}"))?;
+    ensure_extract_root(dest_root, "zip/extract")?;
 
     let mut count = 0i64;
     let mut declared_output_bytes = 0u64;
@@ -411,7 +471,8 @@ fn zip_extract_from_reader<R: std::io::Read + std::io::Seek>(
             )?;
         }
         if entry.is_dir() || name.ends_with('/') {
-            std::fs::create_dir_all(&target).io_ctx(format!("zip/extract {name}"))?;
+            ensure_safe_parent(dest_root, &rel, "zip/extract")?;
+            ensure_safe_directory(&target, "zip/extract")?;
         } else {
             // A foreign archive can carry two file entries that map to the
             // same target; the create-side dedup doesn't protect extraction,
@@ -422,10 +483,8 @@ fn zip_extract_from_reader<R: std::io::Read + std::io::Seek>(
                     rel.display()
                 )));
             }
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent).io_ctx(format!("zip/extract {name}"))?;
-            }
-            let out = std::fs::File::create(&target).io_ctx(format!("zip/extract {name}"))?;
+            ensure_safe_parent(dest_root, &rel, "zip/extract")?;
+            let out = open_safe_output_file(&target, "zip/extract")?;
             let remaining = bounds.map_or(u64::MAX, |bounds| {
                 bounds.output_bytes.saturating_sub(actual_output_bytes)
             });
@@ -586,11 +645,11 @@ fn tar_extract_work(
     let gzipped = looks_gzip(tar_path) || raw.starts_with(&[0x1f, 0x8b]);
 
     let dest_root = Path::new(dest_dir);
-    std::fs::create_dir_all(dest_root).io_ctx(format!("tar/extract {dest_dir}"))?;
+    ensure_extract_root(dest_root, "tar/extract")?;
 
     // Decompress up front (if needed) so the rest is a single tar-reading path.
     let tar_bytes: Vec<u8> = if gzipped {
-        let mut decoder = flate2::read::GzDecoder::new(&raw[..]);
+        let mut decoder = flate2::read::MultiGzDecoder::new(&raw[..]);
         let mut out = BoundedWriter::new(
             Vec::new(),
             bounds.map_or(u64::MAX, |bounds| bounds.output_bytes),
@@ -639,11 +698,9 @@ fn tar_extract_work(
                 bounds.output_bytes,
             )?;
         }
-        // Symlink/hardlink guard: a link entry (e.g. `evil -> /etc`) followed
-        // by a regular entry written *through* it (`evil/passwd`) escapes
-        // dest-dir even though neither path contains `..`. Refuse link
-        // entries entirely so no traversal symlink is ever materialized.
-        if etype.is_symlink() || etype.is_hard_link() {
+        // Only regular files and directories can be extracted. Links and other
+        // special entries can redirect a later write outside the destination.
+        if !etype.is_file() && !etype.is_dir() {
             continue;
         }
         let path = entry
@@ -664,12 +721,13 @@ fn tar_extract_work(
                 rel.display()
             )));
         }
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent).io_ctx(format!("tar/extract {name}"))?;
+        ensure_safe_parent(dest_root, &rel, "tar/extract")?;
+        if etype.is_dir() {
+            ensure_safe_directory(&target, "tar/extract")?;
+        } else {
+            let mut out = open_safe_output_file(&target, "tar/extract")?;
+            std::io::copy(&mut entry, &mut out).io_ctx(format!("tar/extract {name}"))?;
         }
-        entry
-            .unpack(&target)
-            .io_ctx(format!("tar/extract {name}"))?;
         count += 1;
     }
     Ok(count)
@@ -696,7 +754,7 @@ fn gzip_compress_work(data: &[u8], output_limit: Option<u64>) -> Result<Vec<u8>,
 /// The CPU-bound half of `gzip/decompress`: inflate a gzip byte stream. Same
 /// offload rationale as `gzip_compress_work`.
 fn gzip_decompress_work(data: &[u8], output_limit: Option<u64>) -> Result<Vec<u8>, SemaError> {
-    let mut decoder = flate2::read::GzDecoder::new(data);
+    let mut decoder = flate2::read::MultiGzDecoder::new(data);
     let mut out = BoundedWriter::new(Vec::new(), output_limit.unwrap_or(u64::MAX));
     std::io::copy(&mut decoder, &mut out)
         .map_err(|e| SemaError::eval(format!("gzip/decompress: {e}")))?;
@@ -761,43 +819,61 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (zip/create out-path files) -> entry count. Each file added under its basename.
-    register_runtime_fn_gated(env, sandbox, Caps::FS_WRITE, "zip/create", |args| {
-        check_arity!(args, "zip/create", 2);
-        let out_path = args.str_at(0, "zip/create")?.to_string();
-        let files = string_list_arg(args.list_at(1, "zip/create")?, "zip/create")?;
+    let zip_create_sandbox = sandbox.clone();
+    register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::FS_READ.union(Caps::FS_WRITE),
+        "zip/create",
+        &[0],
+        move |args| {
+            check_arity!(args, "zip/create", 2);
+            let out_path = args.str_at(0, "zip/create")?.to_string();
+            let files = string_list_arg(args.list_at(1, "zip/create")?, "zip/create")?;
+            for path in &files {
+                zip_create_sandbox.check_path(path, "zip/create")?;
+            }
 
-        if sema_core::in_runtime_quantum() {
-            let bounds = ARCHIVE_RUNTIME_BOUNDS;
-            archive_create_preflight("zip/create", &files, bounds)?;
-            return archive_offload("zip/create", Value::int, move || {
-                zip_create_work(&out_path, &files, Some(bounds)).map_err(|e| e.to_string())
-            });
-        }
-        Ok(NativeOutcome::Return(Value::int(zip_create_work(
-            &out_path, &files, None,
-        )?)))
-    });
+            if sema_core::in_runtime_quantum() {
+                let bounds = ARCHIVE_RUNTIME_BOUNDS;
+                archive_create_preflight("zip/create", &files, bounds)?;
+                return archive_offload("zip/create", Value::int, move || {
+                    zip_create_work(&out_path, &files, Some(bounds)).map_err(|e| e.to_string())
+                });
+            }
+            Ok(NativeOutcome::Return(Value::int(zip_create_work(
+                &out_path, &files, None,
+            )?)))
+        },
+    );
 
     // (zip/extract zip-path dest-dir) -> count of entries extracted.
-    register_runtime_fn_gated(env, sandbox, Caps::FS_WRITE, "zip/extract", |args| {
-        check_arity!(args, "zip/extract", 2);
-        let zip_path = args.str_at(0, "zip/extract")?.to_string();
-        let dest_dir = args.str_at(1, "zip/extract")?.to_string();
+    register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::FS_READ.union(Caps::FS_WRITE),
+        "zip/extract",
+        &[0, 1],
+        |args| {
+            check_arity!(args, "zip/extract", 2);
+            let zip_path = args.str_at(0, "zip/extract")?.to_string();
+            let dest_dir = args.str_at(1, "zip/extract")?.to_string();
 
-        if sema_core::in_runtime_quantum() {
-            let bounds = ARCHIVE_RUNTIME_BOUNDS;
-            archive_path_preflight("zip/extract", &zip_path, bounds)?;
-            return archive_offload("zip/extract", Value::int, move || {
-                zip_extract_work(&zip_path, &dest_dir, Some(bounds)).map_err(|e| e.to_string())
-            });
-        }
-        Ok(NativeOutcome::Return(Value::int(zip_extract_work(
-            &zip_path, &dest_dir, None,
-        )?)))
-    });
+            if sema_core::in_runtime_quantum() {
+                let bounds = ARCHIVE_RUNTIME_BOUNDS;
+                archive_path_preflight("zip/extract", &zip_path, bounds)?;
+                return archive_offload("zip/extract", Value::int, move || {
+                    zip_extract_work(&zip_path, &dest_dir, Some(bounds)).map_err(|e| e.to_string())
+                });
+            }
+            Ok(NativeOutcome::Return(Value::int(zip_extract_work(
+                &zip_path, &dest_dir, None,
+            )?)))
+        },
+    );
 
     // (zip/list zip-path) -> list of entry-name strings.
-    register_runtime_fn_gated(env, sandbox, Caps::FS_READ, "zip/list", |args| {
+    register_runtime_fn_path_gated(env, sandbox, Caps::FS_READ, "zip/list", &[0], |args| {
         check_arity!(args, "zip/list", 1);
         let zip_path = args.str_at(0, "zip/list")?.to_string();
 
@@ -815,41 +891,59 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     // (tar/create out-path files) -> entry count. gzip-compressed if out-path
     // ends in .tar.gz / .tgz, else plain tar. Each file added under its basename.
-    register_runtime_fn_gated(env, sandbox, Caps::FS_WRITE, "tar/create", |args| {
-        check_arity!(args, "tar/create", 2);
-        let out_path = args.str_at(0, "tar/create")?.to_string();
-        let files = string_list_arg(args.list_at(1, "tar/create")?, "tar/create")?;
+    let tar_create_sandbox = sandbox.clone();
+    register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::FS_READ.union(Caps::FS_WRITE),
+        "tar/create",
+        &[0],
+        move |args| {
+            check_arity!(args, "tar/create", 2);
+            let out_path = args.str_at(0, "tar/create")?.to_string();
+            let files = string_list_arg(args.list_at(1, "tar/create")?, "tar/create")?;
+            for path in &files {
+                tar_create_sandbox.check_path(path, "tar/create")?;
+            }
 
-        if sema_core::in_runtime_quantum() {
-            let bounds = ARCHIVE_RUNTIME_BOUNDS;
-            archive_create_preflight("tar/create", &files, bounds)?;
-            return archive_offload("tar/create", Value::int, move || {
-                tar_create_work(&out_path, &files, Some(bounds)).map_err(|e| e.to_string())
-            });
-        }
-        Ok(NativeOutcome::Return(Value::int(tar_create_work(
-            &out_path, &files, None,
-        )?)))
-    });
+            if sema_core::in_runtime_quantum() {
+                let bounds = ARCHIVE_RUNTIME_BOUNDS;
+                archive_create_preflight("tar/create", &files, bounds)?;
+                return archive_offload("tar/create", Value::int, move || {
+                    tar_create_work(&out_path, &files, Some(bounds)).map_err(|e| e.to_string())
+                });
+            }
+            Ok(NativeOutcome::Return(Value::int(tar_create_work(
+                &out_path, &files, None,
+            )?)))
+        },
+    );
 
     // (tar/extract tar-path dest-dir) -> entry count. gzip auto-detected by
     // extension or magic bytes. Guards against path traversal.
-    register_runtime_fn_gated(env, sandbox, Caps::FS_WRITE, "tar/extract", |args| {
-        check_arity!(args, "tar/extract", 2);
-        let tar_path = args.str_at(0, "tar/extract")?.to_string();
-        let dest_dir = args.str_at(1, "tar/extract")?.to_string();
+    register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::FS_READ.union(Caps::FS_WRITE),
+        "tar/extract",
+        &[0, 1],
+        |args| {
+            check_arity!(args, "tar/extract", 2);
+            let tar_path = args.str_at(0, "tar/extract")?.to_string();
+            let dest_dir = args.str_at(1, "tar/extract")?.to_string();
 
-        if sema_core::in_runtime_quantum() {
-            let bounds = ARCHIVE_RUNTIME_BOUNDS;
-            archive_path_preflight("tar/extract", &tar_path, bounds)?;
-            return archive_offload("tar/extract", Value::int, move || {
-                tar_extract_work(&tar_path, &dest_dir, Some(bounds)).map_err(|e| e.to_string())
-            });
-        }
-        Ok(NativeOutcome::Return(Value::int(tar_extract_work(
-            &tar_path, &dest_dir, None,
-        )?)))
-    });
+            if sema_core::in_runtime_quantum() {
+                let bounds = ARCHIVE_RUNTIME_BOUNDS;
+                archive_path_preflight("tar/extract", &tar_path, bounds)?;
+                return archive_offload("tar/extract", Value::int, move || {
+                    tar_extract_work(&tar_path, &dest_dir, Some(bounds)).map_err(|e| e.to_string())
+                });
+            }
+            Ok(NativeOutcome::Return(Value::int(tar_extract_work(
+                &tar_path, &dest_dir, None,
+            )?)))
+        },
+    );
 }
 
 #[cfg(test)]
@@ -981,6 +1075,15 @@ mod tests {
         (nf.func)(&ctx, args).unwrap_or_else(|e| panic!("{name} failed: {e}"))
     }
 
+    fn call_error(env: &sema_core::Env, name: &str, args: &[Value]) -> SemaError {
+        let f = env
+            .get(sema_core::intern(name))
+            .unwrap_or_else(|| panic!("{name} not registered"));
+        let nf = f.as_native_fn_ref().expect("native fn");
+        let ctx = sema_core::EvalContext::new();
+        (nf.func)(&ctx, args).expect_err("operation must be denied")
+    }
+
     /// Unique scratch directory under the system temp dir, removed on drop.
     struct TempDir(PathBuf);
     impl TempDir {
@@ -1019,6 +1122,125 @@ mod tests {
         assert!(compressed.as_bytevector().is_some());
         let decompressed = call(&env, "gzip/decompress", &[compressed]);
         assert_eq!(decompressed.as_bytevector().unwrap(), &original[..]);
+    }
+
+    #[test]
+    fn gzip_decompress_reads_concatenated_members() {
+        let first = gzip_compress_work(b"first", None).expect("compress first member");
+        let second = gzip_compress_work(b"second", None).expect("compress second member");
+        let mut members = first;
+        members.extend(second);
+
+        let output = gzip_decompress_work(&members, None).expect("decompress all members");
+        assert_eq!(output, b"firstsecond");
+    }
+
+    #[test]
+    fn archive_create_requires_read_and_write_capabilities() {
+        let env = sema_core::Env::new();
+        let sandbox = sema_core::Sandbox::deny(Caps::FS_READ);
+        register(&env, &sandbox);
+
+        let error = call_error(
+            &env,
+            "zip/create",
+            &[
+                Value::string("output.zip"),
+                Value::list(vec![Value::string("input.txt")]),
+            ],
+        );
+        assert!(error.to_string().contains("fs-read"), "{error}");
+    }
+
+    #[test]
+    fn archive_create_checks_each_source_path() {
+        let dir = TempDir::new("allowed-path");
+        let allowed = dir.join("allowed");
+        let outside = dir.join("outside.txt");
+        std::fs::create_dir_all(&allowed).expect("create allowed directory");
+        std::fs::write(&outside, b"outside").expect("write outside source");
+
+        let env = sema_core::Env::new();
+        let sandbox = sema_core::Sandbox::allow_all().with_allowed_paths(vec![allowed.clone()]);
+        register(&env, &sandbox);
+        let output = allowed.join("output.tar").to_string_lossy().into_owned();
+        let source = outside.to_string_lossy().into_owned();
+        let error = call_error(
+            &env,
+            "tar/create",
+            &[
+                Value::string(&output),
+                Value::list(vec![Value::string(&source)]),
+            ],
+        );
+        assert!(
+            error.to_string().contains("outside allowed directories"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zip_extract_rejects_destination_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new("zip-symlink");
+        let zip_path = dir.join("archive.zip");
+        let file = std::fs::File::create(&zip_path).expect("create zip");
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .start_file::<_, ()>("sub/escaped.txt", zip::write::FileOptions::default())
+            .expect("start zip entry");
+        writer.write_all(b"escaped").expect("write zip entry");
+        writer.finish().expect("finish zip");
+
+        let dest = dir.join("dest");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&dest).expect("create destination");
+        std::fs::create_dir_all(&outside).expect("create outside directory");
+        symlink(&outside, dest.join("sub")).expect("create destination symlink");
+
+        let error = zip_extract_work(
+            zip_path.to_str().expect("UTF-8 path"),
+            dest.to_str().expect("UTF-8 path"),
+            None,
+        )
+        .expect_err("extract must not follow destination symlink");
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert!(!outside.join("escaped.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tar_extract_rejects_destination_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new("tar-symlink");
+        let tar_path = dir.join("archive.tar");
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(7);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "sub/escaped.txt", &b"escaped"[..])
+            .expect("append tar entry");
+        std::fs::write(&tar_path, builder.into_inner().expect("finish tar")).expect("write tar");
+
+        let dest = dir.join("dest");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&dest).expect("create destination");
+        std::fs::create_dir_all(&outside).expect("create outside directory");
+        symlink(&outside, dest.join("sub")).expect("create destination symlink");
+
+        let error = tar_extract_work(
+            tar_path.to_str().expect("UTF-8 path"),
+            dest.to_str().expect("UTF-8 path"),
+            None,
+        )
+        .expect_err("extract must not follow destination symlink");
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert!(!outside.join("escaped.txt").exists());
     }
 
     #[test]

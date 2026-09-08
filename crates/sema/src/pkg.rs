@@ -83,17 +83,42 @@ fn current_git_ref(dir: &Path) -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-fn find_package_dir(pkg_dir: &Path, name: &str) -> Option<PathBuf> {
+fn find_package_dir(pkg_dir: &Path, name: &str) -> Result<PathBuf, String> {
     let exact = pkg_dir.join(name);
     if exact.is_dir() {
-        return Some(exact);
+        return Ok(exact);
     }
 
-    find_all_packages(pkg_dir).into_iter().find(|p| {
-        p.file_name()
-            .map(|n| n.to_string_lossy() == name)
-            .unwrap_or(false)
-    })
+    let matches: Vec<PathBuf> = find_all_packages(pkg_dir)
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .map(|candidate| candidate.to_string_lossy() == name)
+                .unwrap_or(false)
+        })
+        .collect();
+
+    match matches.as_slice() {
+        [] => Err(format!(
+            "Package '{name}' not found. Run `sema pkg list` to see installed packages."
+        )),
+        [path] => Ok(path.clone()),
+        _ => {
+            let candidates = matches
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(pkg_dir)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "Package name '{name}' is ambiguous: {candidates}. Use its full package path."
+            ))
+        }
+    }
 }
 
 fn find_all_packages(pkg_dir: &Path) -> Vec<PathBuf> {
@@ -202,6 +227,9 @@ fn collect_packages(dir: &Path, packages: &mut Vec<PathBuf>) {
 
     for entry in entries.flatten() {
         let path = entry.path();
+        if path.file_name().is_some_and(|name| name == ".store") {
+            continue;
+        }
         // Skip symlinks to avoid loops and escaping the packages directory
         if path
             .symlink_metadata()
@@ -271,6 +299,7 @@ fn install_git(
         }
     };
     run_git(Some(&dest), &["checkout", "--detach", &commit])?;
+    cache_git_package(&spec.path, &dest, &commit)?;
     human_output!(
         json,
         "✓ Installed {} → {} ({commit})",
@@ -319,11 +348,49 @@ fn install_git_locked(
             spec.path
         ));
     }
+    cache_git_package(&spec.path, &dest, &commit)?;
     human_output!(
         json,
         "✓ Installed {} → {expected_commit} (locked)",
         spec.path
     );
+    Ok(())
+}
+
+fn cache_git_package(
+    path: &sema_core::resolve::PackagePath,
+    source: &Path,
+    commit: &str,
+) -> Result<(), String> {
+    let cache = sema_core::resolve::git_cache_dir(commit).join(path.as_str());
+    if cache.exists() {
+        let actual = run_git(Some(&cache), &["rev-parse", "HEAD"])?;
+        if actual == commit {
+            return Ok(());
+        }
+        return Err(format!(
+            "package cache collision for {} at commit {commit}",
+            path.as_str()
+        ));
+    }
+    let parent = cache
+        .parent()
+        .ok_or_else(|| format!("Invalid package cache destination: {}", cache.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("Failed to create package cache: {error}"))?;
+    run_git(
+        None,
+        &[
+            "clone",
+            "--no-checkout",
+            &source.to_string_lossy(),
+            &cache.to_string_lossy(),
+        ],
+    )?;
+    if let Err(error) = run_git(Some(&cache), &["checkout", "--detach", commit]) {
+        let _ = std::fs::remove_dir_all(&cache);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -352,7 +419,7 @@ fn cmd_add_git(spec: &str, json: bool) -> Result<(), String> {
     }
 
     // Pull in this package's own dependencies, if any (transitive resolution).
-    cmd_install_inner(false, json)
+    cmd_install_inner(false, None, json)
 }
 
 fn cmd_add_registry(spec: &str, registry: Option<&str>, json: bool) -> Result<(), String> {
@@ -401,7 +468,7 @@ fn cmd_add_registry(spec: &str, registry: Option<&str>, json: bool) -> Result<()
     }
 
     // Pull in this package's own dependencies, if any (transitive resolution).
-    cmd_install_inner(false, json)
+    cmd_install_inner(false, registry, json)
 }
 
 /// Parse a `[deps]`-shaped TOML table into a plain name → version/ref map.
@@ -420,7 +487,12 @@ fn parse_deps_table(
 
 /// Resolve+install a package with no usable lock entry (fresh install or a
 /// version/ref bump). Does not touch sema.toml or the lock file.
-fn resolve_and_install_one(name: &str, version: &str, json: bool) -> Result<LockEntry, String> {
+fn resolve_and_install_one(
+    name: &str,
+    version: &str,
+    registry: Option<&str>,
+    json: bool,
+) -> Result<LockEntry, String> {
     if is_git_spec(name) {
         let spec_str = format!("{name}@{version}");
         let spec = sema_core::resolve::PackageSpec::parse(&spec_str).map_err(|e| e.to_string())?;
@@ -431,7 +503,7 @@ fn resolve_and_install_one(name: &str, version: &str, json: bool) -> Result<Lock
             direct: false, // caller normalizes via LockEntry::set_direct
         })
     } else {
-        let registry_url = effective_registry(None);
+        let registry_url = effective_registry(registry);
         let checksum = registry_install(name, version, &registry_url)?;
         Ok(LockEntry::Registry {
             version: version.to_string(),
@@ -588,6 +660,7 @@ fn resolve_dependency_graph(
     read_manifest_deps: &ReadManifestDeps,
 ) -> Result<(LockFile, Vec<String>, Vec<ResolutionNote>), String> {
     let mut resolved: BTreeMap<String, ResolvedPkg> = BTreeMap::new();
+    let mut active_children: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut notes = Vec::new();
     let mut queue: VecDeque<(String, String, String)> = VecDeque::new();
     let mut steps: usize = 0;
@@ -607,6 +680,7 @@ fn resolve_dependency_graph(
         let mut entry = resolve_one(name, version)?;
         entry.set_direct(true);
         let children = read_manifest_deps(name)?;
+        active_children.insert(name.clone(), children.clone());
         resolved.insert(
             name.clone(),
             ResolvedPkg {
@@ -631,11 +705,21 @@ fn resolve_dependency_graph(
             ));
         }
 
+        if requested_by != "<root>"
+            && active_children
+                .get(&requested_by)
+                .and_then(|children| children.get(&name))
+                != Some(&version)
+        {
+            continue;
+        }
+
         match resolved.get_mut(&name) {
             None => {
                 let mut entry = resolve_one(&name, &version)?;
                 entry.set_direct(false);
                 let children = read_manifest_deps(&name)?;
+                active_children.insert(name.clone(), children.clone());
                 resolved.insert(
                     name.clone(),
                     ResolvedPkg {
@@ -673,6 +757,7 @@ fn resolve_dependency_graph(
                     new_entry.set_direct(false);
                     let new_children = read_manifest_deps(&name)?;
                     pkg.entry = new_entry;
+                    active_children.insert(name.clone(), new_children.clone());
                     for (child_name, child_version) in new_children {
                         queue.push_back((child_name, child_version, name.clone()));
                     }
@@ -686,16 +771,29 @@ fn resolve_dependency_graph(
         }
     }
 
+    let mut reachable = BTreeSet::new();
+    let mut reachable_queue: VecDeque<String> = direct_deps.keys().cloned().collect();
+    while let Some(name) = reachable_queue.pop_front() {
+        if !reachable.insert(name.clone()) {
+            continue;
+        }
+        if let Some(children) = active_children.get(&name) {
+            reachable_queue.extend(children.keys().cloned());
+        }
+    }
+
     let pruned: Vec<String> = existing_lock
         .entries
         .keys()
-        .filter(|name| !resolved.contains_key(name.as_str()))
+        .filter(|name| !reachable.contains(name.as_str()))
         .cloned()
         .collect();
 
     let mut new_lock = LockFile::new();
     for (name, pkg) in resolved {
-        new_lock.entries.insert(name, pkg.entry);
+        if reachable.contains(&name) {
+            new_lock.entries.insert(name, pkg.entry);
+        }
     }
 
     Ok((new_lock, pruned, notes))
@@ -769,7 +867,7 @@ fn check_locked_orphans(deps: &BTreeMap<String, String>, lock: &LockFile) -> Res
 }
 
 pub fn cmd_install(locked: bool, json: bool) -> Result<(), String> {
-    cmd_install_inner(locked, json)?;
+    cmd_install_inner(locked, None, json)?;
     if json {
         print_json(&serde_json::json!({
             "ok": true,
@@ -780,7 +878,7 @@ pub fn cmd_install(locked: bool, json: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_install_inner(locked: bool, json: bool) -> Result<(), String> {
+fn cmd_install_inner(locked: bool, registry: Option<&str>, json: bool) -> Result<(), String> {
     let toml_path = Path::new("sema.toml");
     if !toml_path.exists() {
         return Err("No sema.toml found in current directory. Run `sema pkg init` first.".into());
@@ -860,7 +958,7 @@ fn cmd_install_inner(locked: bool, json: bool) -> Result<(), String> {
         &existing_lock,
         &mut |name, version| {
             human_output!(json, "Installing {name}...");
-            resolve_and_install_one(name, version, json)
+            resolve_and_install_one(name, version, registry, json)
         },
         &mut |name, entry| {
             human_output!(json, "Installing {name} (locked)...");
@@ -901,6 +999,7 @@ pub fn cmd_update(name: Option<&str>, json: bool) -> Result<(), String> {
     let mut errors = Vec::new();
 
     if let Some(name) = name {
+        validate_package_spec(name).map_err(|error| error.to_string())?;
         if !is_direct_dep(name) {
             return Err(format!(
                 "'{name}' is a transitive dependency — its version is controlled by whichever \
@@ -908,9 +1007,7 @@ pub fn cmd_update(name: Option<&str>, json: bool) -> Result<(), String> {
                  override it directly."
             ));
         }
-        let dir = find_package_dir(&pkg_dir, name).ok_or_else(|| {
-            format!("Package '{name}' not found. Run `sema pkg list` to see installed packages.")
-        })?;
+        let dir = find_package_dir(&pkg_dir, name)?;
         update_single_package(&pkg_dir, &dir, json)?;
     } else {
         let packages = find_all_packages(&pkg_dir);
@@ -948,7 +1045,7 @@ pub fn cmd_update(name: Option<&str>, json: bool) -> Result<(), String> {
     // Re-resolve the whole graph so transitive requirements introduced or
     // dropped by the version bump(s) above get picked up or pruned.
     if Path::new("sema.toml").exists() {
-        cmd_install_inner(false, json)?;
+        cmd_install_inner(false, None, json)?;
     }
 
     if json {
@@ -1057,10 +1154,9 @@ fn update_single_package(pkg_dir: &Path, dir: &Path, json: bool) -> Result<(), S
 }
 
 pub fn cmd_remove(name: &str, json: bool) -> Result<(), String> {
+    validate_package_spec(name).map_err(|error| error.to_string())?;
     let pkg_dir = packages_dir();
-    let dir = find_package_dir(&pkg_dir, name).ok_or_else(|| {
-        format!("Package '{name}' not found. Run `sema pkg list` to see installed packages.")
-    })?;
+    let dir = find_package_dir(&pkg_dir, name)?;
 
     let rel_path = dir
         .strip_prefix(&pkg_dir)
@@ -1654,10 +1750,12 @@ fn effective_registry(flag: Option<&str>) -> String {
 fn is_git_spec(spec: &str) -> bool {
     // Strip @ref suffix for the check
     let path = spec.split('@').next().unwrap_or(spec);
-    path.split('/')
-        .next()
-        .map(|first| first.contains('.'))
-        .unwrap_or(false)
+    path.contains('/')
+        && path
+            .split('/')
+            .next()
+            .map(|first| first.contains('.'))
+            .unwrap_or(false)
 }
 
 /// Write registry package metadata to a `.sema-pkg.json` file.
@@ -1698,6 +1796,7 @@ fn create_tarball(dir: &str) -> Result<Vec<u8>, String> {
     let dir_path = Path::new(dir);
     let enc = GzEncoder::new(Vec::new(), Compression::default());
     let mut ar = tar::Builder::new(enc);
+    ar.follow_symlinks(false);
 
     let mut files = Vec::new();
     collect_files_for_tar(dir_path, &mut files)?;
@@ -1721,12 +1820,24 @@ fn collect_files_for_tar(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), Str
     for entry in entries {
         let entry = entry.map_err(|e| format!("directory entry error: {e}"))?;
         let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|e| format!("Failed to inspect {}: {e}", path.display()))?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "Refusing to publish symlink {}. Package archives must not include symlinks.",
+                path.display()
+            ));
+        }
+        let metadata = entry
+            .metadata()
+            .map_err(|e| format!("Failed to inspect {}: {e}", path.display()))?;
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
             if name == ".git" || name == "target" {
                 continue;
             }
         }
-        if path.is_dir() {
+        if metadata.is_dir() {
             collect_files_for_tar(&path, files)?;
         } else {
             files.push(path);
@@ -1879,6 +1990,15 @@ fn registry_install(name: &str, version: &str, registry_url: &str) -> Result<Str
 
     // Extract to packages dir (atomically — see install_tarball_atomic / BIN-4).
     let pkg_dir = packages_dir();
+    let cache_dest = sema_core::resolve::registry_cache_dir(&checksum).join(name);
+    install_tarball_atomic(
+        &tarball,
+        &cache_dest,
+        name,
+        version,
+        registry_url,
+        &checksum,
+    )?;
     let dest = pkg_dir.join(name);
     install_tarball_atomic(&tarball, &dest, name, version, registry_url, &checksum)?;
 
@@ -2089,6 +2209,15 @@ fn registry_install_locked(
     }
 
     let pkg_dir = packages_dir();
+    let cache_dest = sema_core::resolve::registry_cache_dir(&checksum).join(name);
+    install_tarball_atomic(
+        &tarball,
+        &cache_dest,
+        name,
+        version,
+        registry_url,
+        &checksum,
+    )?;
     let dest = pkg_dir.join(name);
     install_tarball_atomic(&tarball, &dest, name, version, registry_url, &checksum)?;
 
@@ -3206,9 +3335,8 @@ mod tests {
         std::fs::create_dir_all(&pkg).unwrap();
         std::fs::write(pkg.join("package.sema"), "(define x 1)").unwrap();
 
-        let found = find_package_dir(&tmp, "github.com/user/repo");
-        assert!(found.is_some());
-        assert!(found.unwrap().ends_with("github.com/user/repo"));
+        let found = find_package_dir(&tmp, "github.com/user/repo").unwrap();
+        assert!(found.ends_with("github.com/user/repo"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -3221,8 +3349,8 @@ mod tests {
         std::fs::create_dir_all(&pkg).unwrap();
         std::fs::write(pkg.join("package.sema"), "(define x 1)").unwrap();
 
-        let found = find_package_dir(&tmp, "mylib");
-        assert!(found.is_some());
+        let found = find_package_dir(&tmp, "mylib").unwrap();
+        assert!(found.ends_with("mylib"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -3231,8 +3359,8 @@ mod tests {
     fn test_find_package_dir_not_found() {
         let tmp = unique_temp_dir("pkg-find6");
 
-        let found = find_package_dir(&tmp, "nonexistent");
-        assert!(found.is_none());
+        let error = find_package_dir(&tmp, "nonexistent").unwrap_err();
+        assert!(error.contains("not found"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -3583,6 +3711,54 @@ name = "myproject"
         assert!(!is_git_spec("http-helpers"));
         assert!(!is_git_spec("http-helpers@1.0.0"));
         assert!(!is_git_spec("my-package"));
+        assert!(!is_git_spec("foo.bar"));
+    }
+
+    #[test]
+    fn find_package_dir_rejects_ambiguous_short_name() {
+        let tmp = unique_temp_dir("pkg-find-ambiguous");
+        for path in ["github.com/a/repo", "gitlab.com/b/repo"] {
+            let package = tmp.join(path);
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::write(package.join("package.sema"), "(define x 1)").unwrap();
+        }
+
+        let error = find_package_dir(&tmp, "repo").unwrap_err();
+        assert!(error.contains("ambiguous"), "got: {error}");
+        assert!(error.contains("github.com/a/repo"), "got: {error}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    #[serial]
+    fn cmd_remove_rejects_package_path_traversal() {
+        let project = TempDir::new("pkg-remove-traversal-project");
+        let sema_home = SemaHome::new();
+        let _guard = TestDir::new(project.path());
+        let outside = sema_home.0.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.sema"), "keep").unwrap();
+
+        let error = cmd_remove("../outside", false).unwrap_err();
+        assert!(error.contains("path traversal"), "got: {error}");
+        assert!(outside.join("keep.sema").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_files_for_tar_rejects_symlinks() {
+        let package = unique_temp_dir("pkg-publish-symlink");
+        let outside = unique_temp_dir("pkg-publish-outside");
+        let target = outside.join("secret.sema");
+        fs::write(&target, "secret").unwrap();
+        std::os::unix::fs::symlink(&target, package.join("linked.sema")).unwrap();
+
+        let error = create_tarball(&package.to_string_lossy()).unwrap_err();
+        assert!(error.contains("symlink"), "got: {error}");
+
+        let _ = fs::remove_dir_all(&package);
+        let _ = fs::remove_dir_all(&outside);
     }
 
     #[test]
@@ -4572,14 +4748,12 @@ name = "myproject"
 
     #[test]
     fn resolve_diamond_reinstall_reenqueues_new_versions_deps() {
-        // foo@1.0.0 has no deps; foo@1.2.0 (same major, auto-resolved higher)
-        // depends on bar — the resolver must pick that dep up after the
-        // reinstall, not leave the graph stale at foo@1.0.0's (empty) deps.
+        // foo@1.0.0 depends on bar, but foo@1.2.0 does not. The lock must
+        // retain only children from the selected version.
         let h = ResolverHarness::new()
             .with_manifest("a", &[("foo", "1.0.0")])
             .with_manifest("b", &[("foo", "1.2.0")]);
-        let foo_1_2_0_deps: BTreeMap<String, String> =
-            [("bar".to_string(), "1.0.0".to_string())].into();
+        let foo_reads = std::cell::Cell::new(0);
         let (lock, _, _) = resolve_dependency_graph(
             &direct_deps(&[("a", "1.0.0"), ("b", "1.0.0")]),
             &LockFile::new(),
@@ -4593,7 +4767,13 @@ name = "myproject"
             &mut |_, _| Ok(()),
             &|name| {
                 if name == "foo" {
-                    Ok(foo_1_2_0_deps.clone())
+                    let reads = foo_reads.get();
+                    foo_reads.set(reads + 1);
+                    if reads == 0 {
+                        Ok([("bar".to_string(), "1.0.0".to_string())].into())
+                    } else {
+                        Ok(BTreeMap::new())
+                    }
                 } else {
                     Ok(h.manifests.get(name).cloned().unwrap_or_default())
                 }
@@ -4601,10 +4781,7 @@ name = "myproject"
         )
         .unwrap();
         assert_eq!(lock.entries["foo"].requested(), "1.2.0");
-        assert!(
-            lock.entries.contains_key("bar"),
-            "bar must be pulled in via foo's post-reinstall manifest"
-        );
+        assert!(!lock.entries.contains_key("bar"));
     }
 
     #[test]

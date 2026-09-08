@@ -125,17 +125,23 @@ pub fn extract_archive(path: &Path) -> io::Result<Archive> {
         ));
     }
 
-    let archive_size = u64::from_le_bytes(trailer[0..8].try_into().unwrap()) as usize;
-    let archive_start = len - TRAILER_SIZE - archive_size;
-
-    if archive_start > len - TRAILER_SIZE {
+    let archive_size = u64::from_le_bytes(trailer[0..8].try_into().unwrap());
+    let payload_end = len - TRAILER_SIZE;
+    if archive_size > payload_end as u64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "archive size exceeds file size",
         ));
     }
+    let archive_size = usize::try_from(archive_size).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "archive size cannot be represented on this platform",
+        )
+    })?;
+    let archive_start = payload_end - archive_size;
 
-    let archive_bytes = &data[archive_start..archive_start + archive_size];
+    let archive_bytes = &data[archive_start..payload_end];
     deserialize_archive(archive_bytes)
 }
 
@@ -145,53 +151,40 @@ pub fn extract_archive(path: &Path) -> io::Result<Archive> {
 
 /// Helper to read a `u16` LE from a cursor position, advancing it.
 fn read_u16(data: &[u8], pos: &mut usize) -> io::Result<u16> {
-    if *pos + 2 > data.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "unexpected end of archive (u16)",
-        ));
-    }
-    let val = u16::from_le_bytes(data[*pos..*pos + 2].try_into().unwrap());
-    *pos += 2;
+    let bytes = read_bytes(data, pos, 2)?;
+    let val = u16::from_le_bytes(bytes.try_into().expect("u16 length is checked"));
     Ok(val)
 }
 
 /// Helper to read a `u32` LE from a cursor position, advancing it.
 fn read_u32(data: &[u8], pos: &mut usize) -> io::Result<u32> {
-    if *pos + 4 > data.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "unexpected end of archive (u32)",
-        ));
-    }
-    let val = u32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap());
-    *pos += 4;
+    let bytes = read_bytes(data, pos, 4)?;
+    let val = u32::from_le_bytes(bytes.try_into().expect("u32 length is checked"));
     Ok(val)
 }
 
 /// Helper to read a `u64` LE from a cursor position, advancing it.
 fn read_u64(data: &[u8], pos: &mut usize) -> io::Result<u64> {
-    if *pos + 8 > data.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "unexpected end of archive (u64)",
-        ));
-    }
-    let val = u64::from_le_bytes(data[*pos..*pos + 8].try_into().unwrap());
-    *pos += 8;
+    let bytes = read_bytes(data, pos, 8)?;
+    let val = u64::from_le_bytes(bytes.try_into().expect("u64 length is checked"));
     Ok(val)
 }
 
 /// Helper to read `n` bytes from a cursor position, advancing it.
 fn read_bytes<'a>(data: &'a [u8], pos: &mut usize, n: usize) -> io::Result<&'a [u8]> {
-    if *pos + n > data.len() {
-        return Err(io::Error::new(
+    let end = pos.checked_add(n).ok_or_else(|| {
+        io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "unexpected end of archive (bytes)",
-        ));
-    }
-    let slice = &data[*pos..*pos + n];
-    *pos += n;
+        )
+    })?;
+    let slice = data.get(*pos..end).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "unexpected end of archive (bytes)",
+        )
+    })?;
+    *pos = end;
     Ok(slice)
 }
 
@@ -277,8 +270,39 @@ fn deserialize_archive(data: &[u8]) -> io::Result<Archive> {
     let file_data_start = pos;
     let mut files = HashMap::with_capacity(toc.len());
     for entry in &toc {
-        let start = file_data_start + entry.offset as usize;
-        let end = start + entry.size as usize;
+        let offset = usize::try_from(entry.offset).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "file entry '{}' offset cannot be represented on this platform",
+                    entry.path
+                ),
+            )
+        })?;
+        let size = usize::try_from(entry.size).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "file entry '{}' size cannot be represented on this platform",
+                    entry.path
+                ),
+            )
+        })?;
+        let start = file_data_start.checked_add(offset).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "file entry '{}' offset overflows archive bounds",
+                    entry.path
+                ),
+            )
+        })?;
+        let end = start.checked_add(size).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("file entry '{}' size overflows archive bounds", entry.path),
+            )
+        })?;
         if end > data.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -320,7 +344,7 @@ pub fn deserialize_archive_from_bytes(data: &[u8]) -> io::Result<Archive> {
 pub fn serialize_archive(
     metadata: &HashMap<String, Vec<u8>>,
     files: &HashMap<String, Vec<u8>>,
-) -> Vec<u8> {
+) -> io::Result<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
 
     // -- Header --
@@ -333,13 +357,37 @@ pub fn serialize_archive(
     let mut meta_keys: Vec<&String> = metadata.keys().collect();
     meta_keys.sort();
 
-    buf.extend_from_slice(&(meta_keys.len() as u32).to_le_bytes()); // metadata_count
+    let metadata_count = u32::try_from(meta_keys.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "too many archive metadata entries",
+        )
+    })?;
+    buf.extend_from_slice(&metadata_count.to_le_bytes());
     for key in &meta_keys {
         let key_bytes = key.as_bytes();
-        buf.extend_from_slice(&(key_bytes.len() as u16).to_le_bytes());
+        let key_len = u16::try_from(key_bytes.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "metadata key exceeds the {}-byte archive limit: {key:?}",
+                    u16::MAX
+                ),
+            )
+        })?;
+        buf.extend_from_slice(&key_len.to_le_bytes());
         buf.extend_from_slice(key_bytes);
         let val = &metadata[*key];
-        buf.extend_from_slice(&(val.len() as u32).to_le_bytes());
+        let val_len = u32::try_from(val.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "metadata value for {key:?} exceeds the {}-byte archive limit",
+                    u32::MAX
+                ),
+            )
+        })?;
+        buf.extend_from_slice(&val_len.to_le_bytes());
         buf.extend_from_slice(val);
     }
 
@@ -364,19 +412,40 @@ pub fn serialize_archive(
             data,
             offset: current_offset,
         });
-        current_offset += data.len() as u64;
+        current_offset = current_offset
+            .checked_add(u64::try_from(data.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "archive file is too large")
+            })?)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "archive file offsets overflow")
+            })?;
     }
 
     // Write entry_count
-    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    let entry_count = u32::try_from(entries.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "too many archive files"))?;
+    buf.extend_from_slice(&entry_count.to_le_bytes());
 
     // Write TOC entries
     for entry in &entries {
         let path_bytes = entry.path.as_bytes();
-        buf.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+        let path_len = u32::try_from(path_bytes.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "archive file path exceeds the {}-byte limit: {:?}",
+                    u32::MAX,
+                    entry.path
+                ),
+            )
+        })?;
+        let data_len = u64::try_from(entry.data.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "archive file is too large")
+        })?;
+        buf.extend_from_slice(&path_len.to_le_bytes());
         buf.extend_from_slice(path_bytes);
         buf.extend_from_slice(&entry.offset.to_le_bytes());
-        buf.extend_from_slice(&(entry.data.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&data_len.to_le_bytes());
     }
 
     // Write file data
@@ -388,7 +457,7 @@ pub fn serialize_archive(
     let checksum = crc32fast::hash(&buf[8..]); // everything after the checksum field
     buf[4..8].copy_from_slice(&checksum.to_le_bytes());
 
-    buf
+    Ok(buf)
 }
 
 // ---------------------------------------------------------------------------
@@ -478,7 +547,7 @@ mod tests {
         files.insert("main.semac".to_string(), vec![0xDE, 0xAD, 0xBE, 0xEF]);
         files.insert("lib/utils.sema".to_string(), b"(define x 42)".to_vec());
 
-        let bytes = serialize_archive(&metadata, &files);
+        let bytes = serialize_archive(&metadata, &files).expect("serialize archive");
         let archive = deserialize_archive(&bytes).expect("deserialize should succeed");
 
         assert_eq!(archive.format_version, FORMAT_VERSION);
@@ -502,7 +571,7 @@ mod tests {
         let metadata = HashMap::new();
         let files = HashMap::new();
 
-        let bytes = serialize_archive(&metadata, &files);
+        let bytes = serialize_archive(&metadata, &files).expect("serialize archive");
         let archive = deserialize_archive(&bytes).expect("deserialize should succeed");
 
         assert_eq!(archive.format_version, FORMAT_VERSION);
@@ -527,7 +596,7 @@ mod tests {
     fn test_checksum_validation() {
         let metadata = HashMap::new();
         let files = HashMap::new();
-        let mut bytes = serialize_archive(&metadata, &files);
+        let mut bytes = serialize_archive(&metadata, &files).expect("serialize archive");
 
         // Corrupt the checksum
         bytes[4] ^= 0xFF;
@@ -547,7 +616,7 @@ mod tests {
         let mut files = HashMap::new();
         files.insert("test.txt".to_string(), b"hello".to_vec());
 
-        let bytes = serialize_archive(&metadata, &files);
+        let bytes = serialize_archive(&metadata, &files).expect("serialize archive");
         let archive =
             deserialize_archive_from_bytes(&bytes).expect("public deserialize should succeed");
 
@@ -596,6 +665,50 @@ mod tests {
     }
 
     #[test]
+    fn malformed_trailer_size_returns_invalid_data() {
+        let path = std::env::temp_dir().join(format!(
+            "sema-archive-malformed-trailer-{}",
+            std::process::id()
+        ));
+        let mut bytes = u64::MAX.to_le_bytes().to_vec();
+        bytes.extend_from_slice(MAGIC);
+        std::fs::write(&path, bytes).expect("write malformed executable");
+
+        let error = extract_archive(&path).expect_err("oversized trailer must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn overflowing_toc_range_returns_invalid_data() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(b"x");
+        data.extend_from_slice(&u64::MAX.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes());
+        let checksum = crc32fast::hash(&data[8..]);
+        data[4..8].copy_from_slice(&checksum.to_le_bytes());
+
+        let error = deserialize_archive(&data).expect_err("overflowing TOC must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn serializer_rejects_oversized_metadata_keys() {
+        let mut metadata = HashMap::new();
+        metadata.insert("x".repeat(usize::from(u16::MAX) + 1), Vec::new());
+
+        let error = serialize_archive(&metadata, &HashMap::new())
+            .expect_err("oversized metadata key must not produce malformed bytes");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn test_write_and_detect_bundled() {
         use std::io::Write;
 
@@ -617,7 +730,7 @@ mod tests {
         let mut files = HashMap::new();
         files.insert("main.semac".to_string(), vec![1, 2, 3, 4]);
 
-        let archive_bytes = serialize_archive(&metadata, &files);
+        let archive_bytes = serialize_archive(&metadata, &files).expect("serialize archive");
 
         // Write bundled executable
         write_bundled_executable(&runtime_path, &output_path, &archive_bytes).unwrap();
@@ -651,7 +764,7 @@ mod tests {
         metadata.insert("entry".to_string(), b"main.semac".to_vec());
         let mut files = HashMap::new();
         files.insert("main.semac".to_string(), vec![1, 2, 3, 4]);
-        let archive_bytes = serialize_archive(&metadata, &files);
+        let archive_bytes = serialize_archive(&metadata, &files).expect("serialize archive");
 
         write_bundled_executable_from_bytes(runtime, &output_path, &archive_bytes).unwrap();
 

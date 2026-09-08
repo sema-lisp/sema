@@ -22,6 +22,19 @@ pub fn vfs_exists(path: &str) -> Option<bool> {
     Some(map.contains_key(path))
 }
 
+/// Whether a VFS module key has files below it. Package entries use this to
+/// give relative imports a virtual directory, while extensionless source files
+/// keep the directory that contains the file.
+pub fn vfs_has_descendant(path: &str) -> Option<bool> {
+    let prefix = format!("{path}/");
+    Some(
+        EMBEDDED_VFS
+            .get()?
+            .keys()
+            .any(|candidate| candidate.starts_with(&prefix)),
+    )
+}
+
 /// Check if the VFS is active (has been initialized).
 pub fn is_vfs_active() -> bool {
     EMBEDDED_VFS.get().is_some()

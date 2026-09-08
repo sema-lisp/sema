@@ -8,6 +8,28 @@ pub fn packages_dir() -> PathBuf {
     sema_home().join("packages")
 }
 
+/// Returns the immutable cache root for one registry tarball checksum.
+///
+/// A package lock records this checksum, so package imports can resolve the
+/// exact package tree selected for the current project rather than whichever
+/// version was installed most recently in the compatibility directory.
+pub fn registry_cache_dir(checksum: &str) -> PathBuf {
+    registry_cache_dir_in(&packages_dir(), checksum)
+}
+
+fn registry_cache_dir_in(base: &Path, checksum: &str) -> PathBuf {
+    base.join(".store").join(format!("registry-{checksum}"))
+}
+
+/// Returns the immutable cache root for one git commit.
+pub fn git_cache_dir(commit: &str) -> PathBuf {
+    git_cache_dir_in(&packages_dir(), commit)
+}
+
+fn git_cache_dir_in(base: &Path, commit: &str) -> PathBuf {
+    base.join(".store").join(format!("git-{commit}"))
+}
+
 /// Determines if an import spec is a package path vs a file path.
 ///
 /// Package paths either:
@@ -166,6 +188,110 @@ pub fn resolve_package_import(spec: &str) -> Result<PathBuf, SemaError> {
     resolve_package_import_in(spec, &packages_dir())
 }
 
+/// Resolve a package import using the nearest project lock when one exists.
+///
+/// The lock selects an immutable content-addressed package cache. This keeps
+/// one project's imports independent from later installs in another project.
+pub fn resolve_package_import_for_project(
+    spec: &str,
+    project_file: Option<&Path>,
+) -> Result<PathBuf, SemaError> {
+    resolve_package_import_for_project_in(spec, project_file, &packages_dir())
+}
+
+fn resolve_package_import_for_project_in(
+    spec: &str,
+    project_file: Option<&Path>,
+    package_root: &Path,
+) -> Result<PathBuf, SemaError> {
+    validate_package_spec(spec)?;
+    let Some(lock_path) = project_file.and_then(find_project_lock) else {
+        return resolve_package_import_in(spec, package_root);
+    };
+
+    let content = std::fs::read_to_string(&lock_path).map_err(|error| {
+        SemaError::Io(format!("Failed to read {}: {error}", lock_path.display()))
+    })?;
+    let lock: toml::Value = toml::from_str(&content).map_err(|error| {
+        SemaError::Io(format!("Failed to parse {}: {error}", lock_path.display()))
+    })?;
+    let entry = lock
+        .get("packages")
+        .and_then(|packages| packages.get(spec))
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| {
+            SemaError::eval(format!(
+                "package '{spec}' is not recorded in {}",
+                lock_path.display()
+            ))
+            .with_hint("Run `sema pkg install` to update the project lock.")
+        })?;
+    let source = entry
+        .get("source")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| SemaError::eval(format!("invalid lock entry for package '{spec}'")))?;
+    let cache_root = match source {
+        "registry" => {
+            let checksum = entry
+                .get("checksum")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| {
+                    SemaError::eval(format!("invalid lock entry for package '{spec}'"))
+                })?;
+            validate_lock_cache_id(checksum, "checksum", spec)?;
+            registry_cache_dir_in(package_root, checksum)
+        }
+        "git" => {
+            let commit = entry
+                .get("commit")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| {
+                    SemaError::eval(format!("invalid lock entry for package '{spec}'"))
+                })?;
+            validate_lock_cache_id(commit, "commit", spec)?;
+            git_cache_dir_in(package_root, commit)
+        }
+        other => {
+            return Err(SemaError::eval(format!(
+                "invalid lock source {other:?} for package '{spec}'"
+            )));
+        }
+    };
+    if !cache_root.join(spec).is_dir() {
+        return Err(SemaError::eval(format!(
+            "locked package '{spec}' is not installed in the package cache"
+        ))
+        .with_hint("Run `sema pkg install --locked` to install the locked package."));
+    }
+    resolve_package_import_in(spec, &cache_root)
+}
+
+fn validate_lock_cache_id(value: &str, field: &str, package: &str) -> Result<(), SemaError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(SemaError::eval(format!(
+            "invalid {field} in lock entry for package '{package}'"
+        )));
+    }
+    Ok(())
+}
+
+fn find_project_lock(project_file: &Path) -> Option<PathBuf> {
+    let mut directory = if project_file.is_dir() {
+        project_file.to_path_buf()
+    } else {
+        project_file.parent()?.to_path_buf()
+    };
+    loop {
+        let lock = directory.join("sema.lock");
+        if lock.is_file() {
+            return Some(lock);
+        }
+        if !directory.pop() {
+            return None;
+        }
+    }
+}
+
 /// Resolves a package spec against a given packages directory.
 pub fn resolve_package_import_in(spec: &str, base: &Path) -> Result<PathBuf, SemaError> {
     validate_package_spec(spec)?;
@@ -182,7 +308,7 @@ pub fn resolve_package_import_in(spec: &str, base: &Path) -> Result<PathBuf, Sem
     // 2. sema.toml with custom entrypoint
     let toml_path = pkg_dir.join("sema.toml");
     if toml_path.is_file() {
-        if let Some(entrypoint) = parse_entrypoint(&toml_path) {
+        if let Some(entrypoint) = parse_entrypoint(&toml_path)? {
             // Validate the entrypoint itself doesn't escape the package dir
             if entrypoint.contains("..") || entrypoint.starts_with('/') {
                 return Err(SemaError::eval(format!(
@@ -226,9 +352,11 @@ fn verify_path_within(base: &Path, resolved: &Path) -> Result<(), SemaError> {
 ///
 /// Checks `[package].entrypoint` first, then falls back to a top-level `entrypoint` key.
 /// Ignores `entrypoint` keys in any other table (e.g. `[tool]`).
-fn parse_entrypoint(path: &Path) -> Option<String> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    let doc: toml::Value = toml::from_str(&contents).ok()?;
+fn parse_entrypoint(path: &Path) -> Result<Option<String>, SemaError> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| SemaError::Io(format!("Failed to read {}: {error}", path.display())))?;
+    let doc: toml::Value = toml::from_str(&contents)
+        .map_err(|error| SemaError::Io(format!("Failed to parse {}: {error}", path.display())))?;
 
     // Check [package].entrypoint first
     if let Some(ep) = doc
@@ -236,15 +364,15 @@ fn parse_entrypoint(path: &Path) -> Option<String> {
         .and_then(|p| p.get("entrypoint"))
         .and_then(|v| v.as_str())
     {
-        return Some(ep.to_string());
+        return Ok(Some(ep.to_string()));
     }
 
     // Fall back to top-level entrypoint
     if let Some(ep) = doc.get("entrypoint").and_then(|v| v.as_str()) {
-        return Some(ep.to_string());
+        return Ok(Some(ep.to_string()));
     }
 
-    None
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -460,6 +588,77 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_rejects_malformed_package_manifest() {
+        let base = temp_packages_dir();
+        let pkg_dir = base.join("repo");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        fs::write(pkg_dir.join("sema.toml"), "[package\nentrypoint = ").unwrap();
+        fs::write(pkg_dir.join("package.sema"), "fallback").unwrap();
+
+        let error = resolve_package_import_in("repo", &base).unwrap_err();
+        assert!(
+            error.to_string().contains("Failed to parse"),
+            "got: {error}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_project_lock_selects_its_immutable_registry_cache() {
+        let root = temp_packages_dir();
+        let project = root.join("project");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("src/main.sema"), "(import \"foo\")").unwrap();
+        fs::write(
+            project.join("sema.lock"),
+            "lock_version = 1\n\n[packages.foo]\nsource = \"registry\"\nversion = \"1.0.0\"\nregistry = \"https://registry.example\"\nchecksum = \"abc\"\n",
+        )
+        .unwrap();
+
+        let locked = registry_cache_dir_in(&root, "abc").join("foo");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("package.sema"), "locked").unwrap();
+        let global = root.join("foo");
+        fs::create_dir_all(&global).unwrap();
+        fs::write(global.join("package.sema"), "newer-global").unwrap();
+
+        let resolved = resolve_package_import_for_project_in(
+            "foo",
+            Some(&project.join("src/main.sema")),
+            &root,
+        )
+        .unwrap();
+        assert_eq!(resolved, locked.join("package.sema"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_project_lock_rejects_non_hex_cache_ids() {
+        let root = temp_packages_dir();
+        let project = root.join("project");
+        fs::create_dir_all(project.join("src")).unwrap();
+        let source_file = project.join("src/main.sema");
+        fs::write(&source_file, "(import \"foo\")").unwrap();
+
+        for (source, field) in [("registry", "checksum"), ("git", "commit")] {
+            fs::write(
+                project.join("sema.lock"),
+                format!(
+                    "lock_version = 1\n\n[packages.foo]\nsource = \"{source}\"\n{field} = \"../escape\"\n"
+                ),
+            )
+            .unwrap();
+            let error = resolve_package_import_for_project_in("foo", Some(&source_file), &root)
+                .unwrap_err();
+            assert!(error.to_string().contains(&format!("invalid {field}")));
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn test_resolve_sema_toml_without_entrypoint_uses_package_sema() {
         let base = temp_packages_dir();
         let pkg_dir = base.join("github.com/user/repo");
@@ -595,7 +794,7 @@ mod tests {
         let dir = temp_packages_dir();
         let toml_content = "[tool]\nentrypoint = \"tool.sema\"\n";
         fs::write(dir.join("sema.toml"), toml_content).unwrap();
-        let result = parse_entrypoint(&dir.join("sema.toml"));
+        let result = parse_entrypoint(&dir.join("sema.toml")).unwrap();
         assert_eq!(
             result, None,
             "should not pick up entrypoint from [tool] table"
@@ -608,7 +807,7 @@ mod tests {
         let dir = temp_packages_dir();
         let toml_content = "[package]\nentrypoint = \"lib.sema\"\n";
         fs::write(dir.join("sema.toml"), toml_content).unwrap();
-        let result = parse_entrypoint(&dir.join("sema.toml"));
+        let result = parse_entrypoint(&dir.join("sema.toml")).unwrap();
         assert_eq!(result, Some("lib.sema".to_string()));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -618,7 +817,7 @@ mod tests {
         let dir = temp_packages_dir();
         let toml_content = "entrypoint = \"main.sema\"\n[deps]\nfoo = \"1.0\"\n";
         fs::write(dir.join("sema.toml"), toml_content).unwrap();
-        let result = parse_entrypoint(&dir.join("sema.toml"));
+        let result = parse_entrypoint(&dir.join("sema.toml")).unwrap();
         assert_eq!(result, Some("main.sema".to_string()));
         let _ = fs::remove_dir_all(&dir);
     }

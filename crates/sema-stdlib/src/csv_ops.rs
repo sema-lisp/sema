@@ -134,6 +134,15 @@ fn csv_parse_maps_work(
         .iter()
         .map(|h| h.to_string())
         .collect();
+    let mut distinct_headers = std::collections::HashSet::with_capacity(headers.len());
+    for header in &headers {
+        if !distinct_headers.insert(header) {
+            return Err(
+                SemaError::eval(format!("csv/parse-maps: duplicate header {header:?}"))
+                    .with_hint("use a unique name for every CSV header"),
+            );
+        }
+    }
     let mut rows: Vec<Vec<String>> = Vec::new();
     for result in rdr.records() {
         let record = result.map_err(|e| {
@@ -357,6 +366,13 @@ mod tests {
             map.get(&Value::keyword("h1")).and_then(|v| v.as_str()),
             Some("x")
         );
+    }
+
+    #[test]
+    fn maps_work_rejects_duplicate_headers() {
+        let error = csv_parse_maps_work("name,name\nfirst,second\n", 8, 8)
+            .expect_err("duplicate headers would overwrite a field");
+        assert!(error.to_string().contains("duplicate header \"name\""));
     }
 
     /// The decoder keys strictly by header index, so an overflow cell with no

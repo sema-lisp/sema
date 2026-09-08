@@ -68,14 +68,14 @@ fn value_to_toml(val: &Value) -> Result<toml::Value, SemaError> {
         ValueView::Map(map) => {
             let mut t = toml::map::Map::new();
             for (k, v) in map.iter() {
-                t.insert(sema_core::key_to_string(k), value_to_toml(v)?);
+                insert_toml_entry(&mut t, k, v)?;
             }
             Ok(toml::Value::Table(t))
         }
         ValueView::HashMap(map) => {
             let mut t = toml::map::Map::new();
             for (k, v) in map.iter() {
-                t.insert(sema_core::key_to_string(k), value_to_toml(v)?);
+                insert_toml_entry(&mut t, k, v)?;
             }
             Ok(toml::Value::Table(t))
         }
@@ -84,4 +84,19 @@ fn value_to_toml(val: &Value) -> Result<toml::Value, SemaError> {
             val.type_name()
         ))),
     }
+}
+
+fn insert_toml_entry(
+    table: &mut toml::map::Map<String, toml::Value>,
+    key: &Value,
+    value: &Value,
+) -> Result<(), SemaError> {
+    let output_key = sema_core::key_to_string(key);
+    if table.contains_key(&output_key) {
+        return Err(SemaError::eval(format!(
+            "toml/encode: distinct map keys stringify to {output_key:?}"
+        )));
+    }
+    table.insert(output_key, value_to_toml(value)?);
+    Ok(())
 }

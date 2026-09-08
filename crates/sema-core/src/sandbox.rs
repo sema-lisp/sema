@@ -145,10 +145,25 @@ impl Sandbox {
         if required == Caps::NONE {
             return Ok(());
         }
-        if self.denied.contains(required) {
+        if self.denied.0 & required.0 != 0 {
+            let capability = [
+                (Caps::FS_READ, "fs-read"),
+                (Caps::FS_WRITE, "fs-write"),
+                (Caps::SHELL, "shell"),
+                (Caps::NETWORK, "network"),
+                (Caps::ENV_READ, "env-read"),
+                (Caps::ENV_WRITE, "env-write"),
+                (Caps::PROCESS, "process"),
+                (Caps::LLM, "llm"),
+                (Caps::SERIAL, "serial"),
+            ]
+            .into_iter()
+            .filter_map(|(cap, name)| required.contains(cap).then_some(name))
+            .collect::<Vec<_>>()
+            .join(", ");
             Err(SemaError::PermissionDenied {
                 function: fn_name.to_string(),
-                capability: required.name().to_string(),
+                capability,
             })
         } else {
             Ok(())
@@ -385,6 +400,14 @@ mod tests {
         assert!(sb.check(Caps::SHELL, "shell").is_err());
         assert!(sb.check(Caps::NETWORK, "http/get").is_err());
         assert!(sb.check(Caps::FS_READ, "file/read").is_ok());
+    }
+
+    #[test]
+    fn test_sandbox_composite_check_denies_any_denied_capability() {
+        let sb = Sandbox::deny(Caps::FS_READ);
+        let required = Caps::FS_READ.union(Caps::FS_WRITE);
+        let error = sb.check(required, "file/copy").unwrap_err();
+        assert!(error.to_string().contains("fs-read, fs-write"));
     }
 
     #[test]

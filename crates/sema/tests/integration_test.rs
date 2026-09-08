@@ -4903,6 +4903,47 @@ fn test_stack_trace_loaded_file() {
 }
 
 #[test]
+fn test_stack_trace_keeps_outer_frames_after_eval() {
+    let err = eval_err(
+        r#"
+        (define (outer) (eval '(car 1)))
+        (outer)
+        "#,
+    );
+    let trace = err.stack_trace().expect("error should carry a stack trace");
+    let names: Vec<_> = trace.0.iter().map(|frame| frame.name.as_str()).collect();
+    assert!(names.contains(&"car"), "missing inner frame: {names:?}");
+    assert!(names.contains(&"outer"), "missing caller frame: {names:?}");
+}
+
+#[test]
+fn test_thrown_condition_carries_stack_trace_into_catch() {
+    let trace = eval(
+        r#"
+        (try
+          (throw {:type :custom :message "boom"})
+          (catch e (:stack-trace e)))
+        "#,
+    );
+    assert!(
+        trace.as_list().is_some_and(|frames| !frames.is_empty()),
+        "caught condition should include the captured trace, got {trace}"
+    );
+}
+
+#[test]
+fn test_atom_and_collection_errors_carry_source_spans() {
+    for input in ["missing", "[missing]", "{:key missing}"] {
+        let err = eval_err(input);
+        assert!(
+            err.stack_trace()
+                .is_some_and(|trace| trace.0.iter().any(|frame| frame.span.is_some())),
+            "{input} should retain a source span: {err}"
+        );
+    }
+}
+
+#[test]
 fn test_tool_slash_name() {
     assert_eq!(
         eval(
@@ -8369,9 +8410,9 @@ fn test_list_pluck() {
 
 #[test]
 fn test_list_avg() {
-    assert_eq!(eval("(list/avg (list 2 4 6))"), Value::float(4.0));
-    assert_eq!(eval("(list/avg (list 1 2 3 4))"), Value::float(2.5));
-    assert_eq!(eval("(list/avg (list 10))"), Value::float(10.0));
+    assert_eq!(eval("(list/avg (list 2 4 6))"), Value::int(4));
+    assert_eq!(eval("(list/avg (list 1 2 3 4))"), eval("5/2"));
+    assert_eq!(eval("(list/avg (list 10))"), Value::int(10));
     assert_eq!(eval("(list/avg (list 1.5 2.5))"), Value::float(2.0));
 }
 
@@ -8384,13 +8425,13 @@ fn test_list_avg_empty_error() {
 #[test]
 fn test_list_median() {
     // Odd count
-    assert_eq!(eval("(list/median (list 3 1 2))"), Value::float(2.0));
+    assert_eq!(eval("(list/median (list 3 1 2))"), Value::int(2));
     // Even count
-    assert_eq!(eval("(list/median (list 1 2 3 4))"), Value::float(2.5));
+    assert_eq!(eval("(list/median (list 1 2 3 4))"), eval("5/2"));
     // Single element
-    assert_eq!(eval("(list/median (list 5))"), Value::float(5.0));
+    assert_eq!(eval("(list/median (list 5))"), Value::int(5));
     // Already sorted
-    assert_eq!(eval("(list/median (list 1 2 3 4 5))"), Value::float(3.0));
+    assert_eq!(eval("(list/median (list 1 2 3 4 5))"), Value::int(3));
 }
 
 #[test]
@@ -12168,6 +12209,77 @@ fn test_allowed_paths_none_allows_everything() {
         result.is_ok(),
         "no allowed_paths should allow all: {result:?}"
     );
+}
+
+#[test]
+fn interpreter_builder_propagates_its_sandbox_to_load() {
+    let interp = sema::InterpreterBuilder::new()
+        .with_sandbox(sema_core::Sandbox::deny(sema_core::Caps::FS_READ))
+        .build();
+    let error = interp
+        .eval_str(r#"(load "/does-not-matter.sema")"#)
+        .expect_err("the builder sandbox must gate evaluator special forms");
+    assert_permission_denied(&error);
+}
+
+#[test]
+fn sandbox_restricts_load_import_and_public_file_execution_paths() {
+    let base =
+        std::env::temp_dir().join(format!("sema-sandbox-special-files-{}", std::process::id()));
+    let allowed = base.join("allowed");
+    let outside = base.join("outside.sema");
+    std::fs::create_dir_all(&allowed).unwrap();
+    std::fs::write(&outside, "(define hidden 1)").unwrap();
+
+    let sandbox = sema_core::Sandbox::allow_all().with_allowed_paths(vec![allowed]);
+    let interp = sema::InterpreterBuilder::new()
+        .with_sandbox(sandbox)
+        .build();
+    let source = lisp_path(&outside);
+    for form in [
+        format!(r#"(load "{source}")"#),
+        format!(r#"(import "{source}")"#),
+    ] {
+        let error = interp
+            .eval_str(&form)
+            .expect_err("outside source must be rejected");
+        assert_path_denied(&error);
+    }
+    assert_path_denied(
+        &interp
+            .load_file(&outside)
+            .expect_err("outside load_file must be rejected"),
+    );
+    assert_path_denied(
+        &interp
+            .run_bytecode_file(&outside, &[])
+            .expect_err("outside run_bytecode_file must be rejected"),
+    );
+
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn file_copy_requires_source_read_permission() {
+    let base = std::env::temp_dir().join(format!("sema-sandbox-copy-{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    let source = base.join("source.txt");
+    let destination = base.join("destination.txt");
+    std::fs::write(&source, "private").unwrap();
+
+    let sandbox = sema_core::Sandbox::deny(sema_core::Caps::FS_READ);
+    let interp = Interpreter::new_with_sandbox(&sandbox);
+    let error = interp
+        .eval_str(&format!(
+            r#"(file/copy "{}" "{}")"#,
+            lisp_path(&source),
+            lisp_path(&destination),
+        ))
+        .expect_err("copy must not read when FS_READ is denied");
+    assert_permission_denied(&error);
+    assert!(!destination.exists());
+
+    let _ = std::fs::remove_dir_all(base);
 }
 
 #[test]

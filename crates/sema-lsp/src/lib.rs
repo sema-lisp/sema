@@ -16,12 +16,14 @@
 //! - [`helpers`], [`scope`], [`builtin_docs`] — shared parsing/analysis support.
 
 pub mod builtin_docs;
+pub(crate) mod byte_lru;
 pub(crate) mod definitions;
 pub(crate) mod handlers;
 pub(crate) mod helpers;
 pub mod scope;
 pub(crate) mod server;
 pub(crate) mod state;
+pub(crate) mod workspace;
 
 // ── Public API ───────────────────────────────────────────────────
 

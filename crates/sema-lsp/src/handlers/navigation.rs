@@ -1,6 +1,7 @@
 //! Navigation: goto-definition, references, document highlight, and rename.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use tower_lsp::lsp_types::*;
 
@@ -8,24 +9,246 @@ use crate::definitions::*;
 use crate::helpers::*;
 use crate::state::BackendState;
 
+/// The canonical identity of a source module. File URIs use their resolved
+/// filesystem path so an open symlink and a scanned real path remain one
+/// module; non-file documents retain their URI identity.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum ModuleIdentity {
+    File(PathBuf),
+    Uri(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GlobalBinding {
+    module: ModuleIdentity,
+    definition: Position,
+}
+
+fn module_identity(uri: &Url) -> ModuleIdentity {
+    uri.to_file_path()
+        .map(|path| ModuleIdentity::File(canonicalize_or_raw(&path)))
+        .unwrap_or_else(|_| ModuleIdentity::Uri(uri.to_string()))
+}
+
 impl BackendState {
-    /// Every occurrence of `symbol` across the workspace that resolves to a
-    /// top-level binding (not shadowed by a local one) — the shared core of
-    /// `handle_references`'s and `handle_rename`'s workspace-wide branch.
-    fn workspace_top_level_occurrences(&self, symbol: &str) -> Vec<(Url, Range)> {
+    /// Return the indexed definition which supplies a global binding at one
+    /// source position. The caller must prepare the navigation index first.
+    pub(crate) fn visible_indexed_definition(
+        &self,
+        uri: &Url,
+        symbol: &str,
+        occurrence: Position,
+    ) -> Option<(
+        &crate::workspace::IndexedFile,
+        &crate::workspace::IndexedDefinition,
+    )> {
+        let binding = self.global_symbol_owner(uri, symbol, Some(occurrence))?;
+        let ModuleIdentity::File(path) = binding.module else {
+            return None;
+        };
+        let file = self.workspace_index.get(&path)?;
+        let definition = file.definitions.iter().find(|definition| {
+            definition.name == symbol && definition.form_range.start == binding.definition
+        })?;
+        Some((file, definition))
+    }
+
+    /// Names installed after a module and its transitive imports finish
+    /// evaluating. The navigation index must be prepared before this query.
+    pub(crate) fn module_visible_names(&self, uri: &Url) -> HashSet<String> {
+        self.module_visible_names_inner(uri, &mut HashSet::new())
+    }
+
+    fn module_visible_names_inner(
+        &self,
+        uri: &Url,
+        visiting: &mut HashSet<ModuleIdentity>,
+    ) -> HashSet<String> {
+        let identity = module_identity(uri);
+        if !visiting.insert(identity) {
+            return HashSet::new();
+        }
+        let Ok(path) = uri.to_file_path() else {
+            return HashSet::new();
+        };
+        let path = canonicalize_or_raw(&path);
+        let Some(file) = self.workspace_index.get(&path) else {
+            return HashSet::new();
+        };
+        let mut names: HashSet<String> = file
+            .definitions
+            .iter()
+            .map(|definition| definition.name.clone())
+            .collect();
+        for import in &file.imports {
+            let Some(target) = resolve_import_path(uri, &import.path) else {
+                continue;
+            };
+            let target = canonicalize_or_raw(&target);
+            let Ok(target_uri) = Url::from_file_path(&target) else {
+                continue;
+            };
+            let target_exports = self
+                .workspace_index
+                .get(&target)
+                .and_then(|target| target.exports.as_ref());
+            names.extend(
+                self.module_visible_names_inner(&target_uri, visiting)
+                    .into_iter()
+                    .filter(|name| definition_is_visible(name, target_exports, import)),
+            );
+        }
+        visiting.remove(&module_identity(uri));
+        names
+    }
+
+    /// Resolve a global symbol to the source module that owns its binding.
+    ///
+    /// A module owns its own definitions. Otherwise a symbol can only come
+    /// from an explicit import or load. Import visibility follows the module's
+    /// export declaration and a selective-import list; load evaluates the
+    /// target into the caller's environment and therefore exposes all of its
+    /// bindings. Chasing the target recursively handles re-exporting modules.
+    fn global_symbol_owner(
+        &self,
+        uri: &Url,
+        symbol: &str,
+        occurrence: Option<Position>,
+    ) -> Option<GlobalBinding> {
+        self.global_symbol_owner_inner(uri, symbol, occurrence, &mut HashSet::new())
+    }
+
+    fn global_symbol_owner_inner(
+        &self,
+        uri: &Url,
+        symbol: &str,
+        occurrence: Option<Position>,
+        visiting: &mut HashSet<ModuleIdentity>,
+    ) -> Option<GlobalBinding> {
+        let identity = module_identity(uri);
+        if !visiting.insert(identity.clone()) {
+            return None;
+        }
+
+        let (definition_positions, imports) = match &identity {
+            ModuleIdentity::File(path) if self.workspace_index.get(path).is_some() => {
+                let file = self.workspace_index.get(path)?;
+                (
+                    file.definitions
+                        .iter()
+                        .filter(|definition| definition.name == symbol)
+                        .map(|definition| definition.form_range.start)
+                        .collect::<Vec<_>>(),
+                    file.imports.clone(),
+                )
+            }
+            _ => {
+                let parsed = if let Some(parsed) = self.cached_parses.get(uri.as_str()) {
+                    parsed
+                } else {
+                    let path = uri.to_file_path().ok()?;
+                    self.parsed_for_path(&path)?.1
+                };
+                let lines: Vec<&str> = parsed.source.lines().collect();
+                let definitions = user_definitions_from_ast(
+                    &parsed.ast,
+                    &parsed.span_map,
+                    &parsed.symbol_spans,
+                    &lines,
+                );
+                (
+                    definitions
+                        .into_iter()
+                        .filter(|(name, _)| name == symbol)
+                        .filter_map(|(_, range)| range.map(|range| range.start))
+                        .collect::<Vec<_>>(),
+                    import_specs_from_ast(&parsed.ast, &parsed.span_map),
+                )
+            }
+        };
+
+        // Definitions, imports, and loads all update the environment in source
+        // order. Walk possible providers from newest to oldest at this
+        // occurrence; the first one that exports the name owns the binding.
+        let mut providers: Vec<(Position, Option<ImportSpec>)> = definition_positions
+            .into_iter()
+            .map(|position| (position, None))
+            .chain(
+                imports
+                    .into_iter()
+                    .map(|import| (import.position, Some(import))),
+            )
+            .filter(|(position, _)| occurrence.is_none_or(|occurrence| *position <= occurrence))
+            .collect();
+        providers.sort_by_key(|(position, _)| *position);
+        for (provider_position, import) in providers.into_iter().rev() {
+            let Some(import) = import else {
+                return Some(GlobalBinding {
+                    module: identity,
+                    definition: provider_position,
+                });
+            };
+            let Some(path) = resolve_import_path(uri, &import.path) else {
+                continue;
+            };
+            let canonical_path = canonicalize_or_raw(&path);
+            let Ok(target_uri) = Url::from_file_path(&canonical_path) else {
+                continue;
+            };
+            let exports = if let Some(file) = self.workspace_index.get(&canonical_path) {
+                file.exports.clone()
+            } else if let Some((_, target)) = self.parsed_for_path(&canonical_path) {
+                module_exports(&target.ast)
+            } else {
+                continue;
+            };
+            if !definition_is_visible(symbol, exports.as_ref(), &import) {
+                continue;
+            }
+            if let Some(owner) = self.global_symbol_owner_inner(&target_uri, symbol, None, visiting)
+            {
+                return Some(owner);
+            }
+        }
+
+        None
+    }
+
+    /// Every occurrence of `symbol` whose global binding has `owner` as its
+    /// canonical defining module. Same-spelling definitions in unrelated
+    /// files are separate bindings, so they never enter this result.
+    fn workspace_top_level_occurrences(
+        &mut self,
+        owner: &GlobalBinding,
+        symbol: &str,
+    ) -> Vec<(Url, Range)> {
         let mut out = Vec::new();
-        for wf in self.iter_workspace_files() {
-            let lines = wf.lines();
-            for (name, span) in &wf.parsed.symbol_spans {
-                if name != symbol
-                    || !wf
-                        .parsed
-                        .scope_tree
-                        .resolves_to_top_level(name, span.line, span.col)
+        let candidates: Vec<(Url, Vec<(Range, bool)>)> = self
+            .workspace_index
+            .iter()
+            .filter(|file| self.indexed_file_is_current(file))
+            .filter_map(|file| {
+                file.top_level_occurrences.get(symbol).map(|ranges| {
+                    (
+                        file.uri.clone(),
+                        ranges
+                            .iter()
+                            .map(|range| (*range, file.export_occurrences.contains(range)))
+                            .collect(),
+                    )
+                })
+            })
+            .collect();
+        for (uri, ranges) in candidates {
+            self.ensure_navigation_closure(&uri);
+            for (range, is_export) in ranges {
+                if self
+                    .global_symbol_owner(&uri, symbol, (!is_export).then_some(range.start))
+                    .as_ref()
+                    == Some(owner)
                 {
-                    continue;
+                    out.push((uri.clone(), range));
                 }
-                out.push((wf.uri.clone(), span_to_range(span, &lines)));
             }
         }
         out
@@ -84,82 +307,41 @@ impl BackendState {
             }));
         }
 
-        // Phase 3c: Search imported modules for the definition
-        let import_paths = import_paths_from_ast(&cached.ast);
-        for path_str in &import_paths {
-            let resolved = match resolve_import_path(uri, path_str) {
-                Some(p) if p.exists() => p,
-                _ => continue,
-            };
-            let cached = match self.get_import_cache(&resolved) {
-                Some(c) => c,
-                None => continue,
-            };
-            // A path that can't become a URL can't be jumped to — skip this
-            // import and keep searching the rest, instead of aborting the
-            // whole goto-definition on one bad import.
-            let Ok(target_uri) = Url::from_file_path(&resolved) else {
-                continue;
-            };
-            let target_lines: Vec<&str> = cached.parsed.source.lines().collect();
-            let target_defs = user_definitions_from_ast(
-                &cached.parsed.ast,
-                &cached.parsed.span_map,
-                &cached.parsed.symbol_spans,
-                &target_lines,
-            );
-            for (name, range) in &target_defs {
-                if name == &symbol {
-                    if let Some(range) = range {
-                        return Some(GotoDefinitionResponse::Scalar(Location {
-                            uri: target_uri,
-                            range: *range,
-                        }));
-                    }
+        // Populate the direct-import entries before resolving the module
+        // graph. The resolver below enforces export and selective-import
+        // visibility and follows re-exports to the owning source module.
+        self.prepare_navigation_index(uri);
+
+        let owner = self.global_symbol_owner(uri, &symbol, Some(*position))?;
+        if let ModuleIdentity::File(path) = &owner.module {
+            if let Some(file) = self.workspace_index.get(path) {
+                if let Some(definition) = file.definitions.iter().find(|definition| {
+                    definition.name == symbol && definition.form_range.start == owner.definition
+                }) {
+                    return Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: file.uri.clone(),
+                        range: definition.name_range,
+                    }));
                 }
             }
         }
-
-        // Phase 3d: Fall back to a workspace-wide search over open documents
-        // and the workspace scan cache, mirroring how references and rename
-        // treat top-level symbols as workspace-global. Without this, a
-        // definition in a sibling file that is not explicitly imported is
-        // unreachable even though the scan has already parsed it.
-        let mut locations = Vec::new();
-        for wf in self.iter_workspace_files() {
-            let lines = wf.lines();
-            let defs = user_definitions_from_ast(
-                &wf.parsed.ast,
-                &wf.parsed.span_map,
-                &wf.parsed.symbol_spans,
-                &lines,
-            );
-            for (name, range) in &defs {
-                if name == &symbol {
-                    if let Some(range) = range {
-                        locations.push(Location {
-                            uri: wf.uri.clone(),
-                            range: *range,
-                        });
-                    }
-                }
-            }
-        }
-
-        match locations.len() {
-            0 => None,
-            1 => Some(GotoDefinitionResponse::Scalar(locations.remove(0))),
-            // Same top-level name defined in several files: return them all
-            // (cache iteration order is arbitrary — picking one would be a
-            // coin flip; clients render an array as a location picker).
-            _ => Some(GotoDefinitionResponse::Array(locations)),
-        }
+        None
     }
 
-    pub(crate) fn handle_references(&self, uri: &Url, position: &Position) -> Vec<Location> {
+    #[cfg(test)]
+    pub(crate) fn handle_references(&mut self, uri: &Url, position: &Position) -> Vec<Location> {
+        self.handle_references_with_context(uri, position, true)
+    }
+
+    pub(crate) fn handle_references_with_context(
+        &mut self,
+        uri: &Url,
+        position: &Position,
+        include_declaration: bool,
+    ) -> Vec<Location> {
         let uri_str = uri.as_str();
         let text = match self.documents.get(uri_str) {
-            Some(t) => t,
+            Some(t) => t.clone(),
             None => return vec![],
         };
 
@@ -196,9 +378,14 @@ impl BackendState {
             sema_col,
             &cached.symbol_spans,
         ) {
+            let definition_span = cached
+                .scope_tree
+                .resolve_at(symbol, sema_line, sema_col)
+                .map(|resolved| resolved.def_span);
             // Locally scoped — only return references within this document's scope
             return refs
                 .into_iter()
+                .filter(|span| include_declaration || Some(*span) != definition_span)
                 .map(|span| Location {
                     uri: uri.clone(),
                     range: span_to_range(&span, &lines),
@@ -206,16 +393,41 @@ impl BackendState {
                 .collect();
         }
 
-        // Top-level/global symbol — search all open documents, but skip
-        // occurrences that are shadowed by local bindings in each document.
-        self.workspace_top_level_occurrences(symbol)
+        // Top-level/global symbol — resolve its defining module before
+        // searching. Equal spellings in unrelated files are distinct
+        // bindings unless explicit import/load visibility joins them.
+        self.prepare_navigation_index(uri);
+        let Some(owner) = self.global_symbol_owner(uri, symbol, Some(*position)) else {
+            return vec![];
+        };
+        let mut locations: Vec<Location> = self
+            .workspace_top_level_occurrences(&owner, symbol)
             .into_iter()
             .map(|(uri, range)| Location { uri, range })
-            .collect()
+            .collect();
+        if !include_declaration {
+            let declarations: Vec<(Url, Range)> = self
+                .workspace_index
+                .iter()
+                .filter(|file| self.indexed_file_is_current(file))
+                .flat_map(|file| {
+                    file.definitions
+                        .iter()
+                        .filter(move |definition| definition.name == symbol)
+                        .map(move |definition| (file.uri.clone(), definition.name_range))
+                })
+                .collect();
+            locations.retain(|location| {
+                !declarations
+                    .iter()
+                    .any(|(uri, range)| uri == &location.uri && range == &location.range)
+            });
+        }
+        locations
     }
 
     pub(crate) fn handle_document_highlight(
-        &self,
+        &mut self,
         uri: &Url,
         position: &Position,
     ) -> Option<Vec<DocumentHighlight>> {
@@ -261,20 +473,17 @@ impl BackendState {
             };
         }
 
-        // Top-level/global: all occurrences in this document that resolve to top-level
-        let highlights: Vec<DocumentHighlight> = cached
-            .symbol_spans
-            .iter()
-            .filter(|(name, span)| {
-                name == symbol
-                    && cached
-                        .scope_tree
-                        .resolves_to_top_level(name, span.line, span.col)
-            })
-            .map(|(_, span)| DocumentHighlight {
-                range: span_to_range(span, &lines),
-                kind: None,
-            })
+        // Top-level/global: use the same source-ordered binding identity as
+        // references and rename, then keep occurrences in this document.
+        let symbol = symbol.to_string();
+        self.prepare_navigation_index(uri);
+        let owner = self.global_symbol_owner(uri, &symbol, Some(*position))?;
+        let current_module = module_identity(uri);
+        let highlights: Vec<DocumentHighlight> = self
+            .workspace_top_level_occurrences(&owner, &symbol)
+            .into_iter()
+            .filter(|(occurrence_uri, _)| module_identity(occurrence_uri) == current_module)
+            .map(|(_, range)| DocumentHighlight { range, kind: None })
             .collect();
 
         if highlights.is_empty() {
@@ -329,12 +538,15 @@ impl BackendState {
     }
 
     pub(crate) fn handle_rename(
-        &self,
+        &mut self,
         uri: &Url,
         position: &Position,
         new_name: &str,
     ) -> Option<WorkspaceEdit> {
-        let text = self.documents.get(uri.as_str())?;
+        if !is_valid_sema_symbol(new_name) {
+            return None;
+        }
+        let text = self.documents.get(uri.as_str())?.clone();
         let lines: Vec<&str> = text.lines().collect();
         let line_idx = position.line as usize;
         let line = lines.get(line_idx).copied()?;
@@ -371,6 +583,16 @@ impl BackendState {
             sema_col,
             &cached.symbol_spans,
         ) {
+            let original = cached.scope_tree.resolve_at(symbol, sema_line, sema_col)?;
+            if refs.iter().any(|span| {
+                cached
+                    .scope_tree
+                    .visible_bindings_at(span.line, span.col)
+                    .into_iter()
+                    .any(|(name, def_span)| name == new_name && def_span != original.def_span)
+            }) {
+                return None;
+            }
             // Locally scoped — only rename within this document's scope
             let edits: Vec<TextEdit> = refs
                 .into_iter()
@@ -390,9 +612,49 @@ impl BackendState {
             });
         }
 
-        // Top-level/global symbol — rename across all documents,
-        // but skip occurrences shadowed by local bindings.
-        for (uri, range) in self.workspace_top_level_occurrences(symbol) {
+        self.prepare_navigation_index(uri);
+        let owner = self.global_symbol_owner(uri, symbol, Some(*position))?;
+        // Top-level/global symbol — only rename occurrences that resolve to
+        // this exact defining module.
+        let occurrences = self.workspace_top_level_occurrences(&owner, symbol);
+        if occurrences.iter().any(|(occurrence_uri, _)| {
+            self.workspace_index.iter().any(|file| {
+                (&file.uri == occurrence_uri
+                    || occurrence_uri
+                        .to_file_path()
+                        .ok()
+                        .is_some_and(|path| canonicalize_or_raw(&path) == file.path))
+                    && file
+                        .definitions
+                        .iter()
+                        .any(|definition| definition.name == new_name)
+            })
+        }) {
+            return None;
+        }
+        for (occurrence_uri, range) in &occurrences {
+            let Some(file) = self.workspace_index.iter().find(|file| {
+                &file.uri == occurrence_uri
+                    || occurrence_uri
+                        .to_file_path()
+                        .ok()
+                        .is_some_and(|path| canonicalize_or_raw(&path) == file.path)
+            }) else {
+                continue;
+            };
+            if file
+                .local_names_at_occurrence
+                .get(symbol)
+                .into_iter()
+                .flatten()
+                .any(|(candidate_range, names)| {
+                    candidate_range == range && names.contains(new_name)
+                })
+            {
+                return None;
+            }
+        }
+        for (uri, range) in occurrences {
             changes.entry(uri).or_default().push(TextEdit {
                 range,
                 new_text: new_name.to_string(),
@@ -409,4 +671,19 @@ impl BackendState {
             change_annotations: None,
         })
     }
+}
+
+fn is_valid_sema_symbol(name: &str) -> bool {
+    let Ok(tokens) = sema_reader::lexer::tokenize(name) else {
+        return false;
+    };
+    matches!(
+        tokens.as_slice(),
+        [sema_reader::lexer::SpannedToken {
+            token: sema_reader::lexer::Token::Symbol(symbol),
+            byte_start: 0,
+            byte_end,
+            ..
+        }] if symbol == name && *byte_end == name.len()
+    )
 }

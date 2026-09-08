@@ -12,8 +12,17 @@ use crate::state::{token_modifiers, token_types, BackendState};
 /// set than [`SYMBOL_HEADS`]/[`DEFINITION_HEADS`] — `defagent`/`deftool`/
 /// `defpolicy` names get no special token type here, so they fall through
 /// to the ordinary scope-tree-based classification below.
-pub(crate) const NAME_CLASS_HEADS: &[&str] =
-    &["defun", "defn", "defmacro", "defworkflow", "define", "def"];
+pub(crate) const NAME_CLASS_HEADS: &[&str] = &[
+    "defun",
+    "defn",
+    "defmacro",
+    "define-syntax",
+    "defmulti",
+    "define-record-type",
+    "defworkflow",
+    "define",
+    "def",
+];
 
 impl BackendState {
     pub(crate) fn handle_semantic_tokens_full(&self, uri: &Url) -> Option<SemanticTokensResult> {
@@ -33,10 +42,10 @@ impl BackendState {
             &[],
         ) {
             match m.head.as_str() {
-                "defun" | "defn" => {
+                "defun" | "defn" | "defmulti" | "define-record-type" => {
                     user_fn_names.insert(m.name);
                 }
-                "defmacro" => {
+                "defmacro" | "define-syntax" => {
                     user_macro_names.insert(m.name);
                 }
                 "defworkflow" => {

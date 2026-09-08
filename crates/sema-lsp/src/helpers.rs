@@ -9,6 +9,26 @@ use sema_core::{Span, SpanMap};
 
 use sema_reader::lexer::{tokenize, SpannedToken, Token};
 
+/// Visit a syntax value and all nested list, vector, and map values without
+/// consuming the native thread stack.
+pub(crate) fn walk_values<'a>(
+    roots: &'a [sema_core::Value],
+    mut visit: impl FnMut(&'a sema_core::Value),
+) {
+    let mut pending: Vec<&sema_core::Value> = roots.iter().rev().collect();
+    while let Some(value) = pending.pop() {
+        visit(value);
+        if let Some(items) = value.as_list().or_else(|| value.as_vector()) {
+            pending.extend(items.iter().rev());
+        } else if let Some(map) = value.as_map_ref() {
+            for (key, item) in map.iter().rev() {
+                pending.push(item);
+                pending.push(key);
+            }
+        }
+    }
+}
+
 // ── Public helpers (also used by tests) ──────────────────────────
 
 /// Check if a character is valid inside a Sema symbol.
@@ -70,22 +90,30 @@ pub(crate) fn expr_range(
     span_map: &SpanMap,
     lines: &[&str],
 ) -> Option<Range> {
-    let ptr = if let Some(rc) = expr.as_list_rc() {
-        Rc::as_ptr(&rc) as usize
-    } else {
-        Rc::as_ptr(&expr.as_vector_rc()?) as usize
-    };
+    let ptr = compound_ptr(expr)?;
     span_map.get(&ptr).map(|s| span_to_range(s, lines))
 }
 
 /// Look up the raw Span for an expression via its Rc pointer in the SpanMap.
 pub(crate) fn expr_span<'a>(expr: &sema_core::Value, span_map: &'a SpanMap) -> Option<&'a Span> {
-    let ptr = if let Some(rc) = expr.as_list_rc() {
-        Rc::as_ptr(&rc) as usize
+    span_map.get(&compound_ptr(expr)?)
+}
+
+fn compound_ptr(expr: &sema_core::Value) -> Option<usize> {
+    if let Some(items) = expr.as_list_rc() {
+        Some(Rc::as_ptr(&items) as usize)
+    } else if let Some(items) = expr.as_vector_rc() {
+        Some(Rc::as_ptr(&items) as usize)
+    } else if let Some(items) = expr.as_map_rc() {
+        Some(Rc::as_ptr(&items) as usize)
+    } else if let Some(items) = expr.as_bytevector_rc() {
+        Some(Rc::as_ptr(&items) as usize)
+    } else if let Some(items) = expr.as_f64_array_rc() {
+        Some(Rc::as_ptr(&items) as usize)
     } else {
-        Rc::as_ptr(&expr.as_vector_rc()?) as usize
-    };
-    span_map.get(&ptr)
+        expr.as_i64_array_rc()
+            .map(|items| Rc::as_ptr(&items) as usize)
+    }
 }
 
 /// The text of line `idx` (0-based) for an LSP position. Unlike `str::lines()`, this
@@ -296,7 +324,9 @@ pub(crate) fn symbol_start(line: &str, pos: usize) -> usize {
 pub fn error_span(err: &SemaError) -> Option<&Span> {
     match err.inner() {
         SemaError::Reader { span, .. } => Some(span),
-        _ => None,
+        _ => err
+            .stack_trace()
+            .and_then(|trace| trace.0.iter().find_map(|frame| frame.span.as_ref())),
     }
 }
 
@@ -400,8 +430,12 @@ pub fn parse_diagnostics(text: &str) -> Vec<Diagnostic> {
 
 /// Run the VM compilation pipeline on parsed expressions to catch
 /// deeper errors (unbound variables, arity mismatches, invalid forms).
-pub fn compile_diagnostics(exprs: &[sema_core::Value], lines: &[&str]) -> Vec<Diagnostic> {
-    match sema_vm::compile_program(exprs, None) {
+pub fn compile_diagnostics(
+    exprs: &[sema_core::Value],
+    span_map: &SpanMap,
+    lines: &[&str],
+) -> Vec<Diagnostic> {
+    match sema_vm::compile_program_with_spans(exprs, span_map, None) {
         Ok(_) => vec![],
         Err(err) => vec![error_diagnostic(&err, DiagnosticSeverity::WARNING, lines)],
     }
@@ -411,7 +445,7 @@ pub fn compile_diagnostics(exprs: &[sema_core::Value], lines: &[&str]) -> Vec<Di
 /// Uses error recovery to report multiple parse errors at once.
 pub fn analyze_document(text: &str) -> Vec<Diagnostic> {
     let lines: Vec<&str> = text.lines().collect();
-    let (exprs, _spans, _symbol_spans, errors) = sema_reader::read_many_with_spans_recover(text);
+    let (exprs, spans, _symbol_spans, errors) = sema_reader::read_many_with_spans_recover(text);
     let mut diags: Vec<Diagnostic> = errors
         .iter()
         .map(|err| error_diagnostic(err, DiagnosticSeverity::ERROR, &lines))
@@ -419,7 +453,7 @@ pub fn analyze_document(text: &str) -> Vec<Diagnostic> {
     // Only run compile diagnostics when there are no parse errors,
     // since missing forms would cause false unbound-variable errors.
     if diags.is_empty() {
-        diags.extend(compile_diagnostics(&exprs, &lines));
+        diags.extend(compile_diagnostics(&exprs, &spans, &lines));
     }
     diags
 }
@@ -908,6 +942,32 @@ pub(crate) fn extract_params_from_doc(doc: &str, func_name: &str) -> Option<Vec<
 /// Returns `(function_name, active_parameter_index)` where active_parameter_index
 /// is the 0-based index of the argument the cursor is currently on.
 pub fn find_enclosing_call(text: &str, line: u32, character: u32) -> Option<(String, usize)> {
+    let sema_line = line as usize + 1;
+    let source_line = line_at(text, line as usize)?;
+    let sema_col = utf16_to_char_col(source_line, character as usize);
+    if let Ok(tokens) = tokenize(text) {
+        for token in tokens {
+            let Token::FString(parts) = token.token else {
+                continue;
+            };
+            for part in parts {
+                let sema_reader::lexer::FStringPart::Expr { source, span } = part else {
+                    continue;
+                };
+                if !span.contains_pos(sema_line, sema_col) {
+                    continue;
+                }
+                let relative_line = sema_line.saturating_sub(span.line) as u32;
+                let relative_character = if relative_line == 0 {
+                    sema_col.saturating_sub(span.col) as u32
+                } else {
+                    sema_col.saturating_sub(1) as u32
+                };
+                return find_enclosing_call(&source, relative_line, relative_character);
+            }
+        }
+    }
+
     // Convert line/character to byte offset
     let mut byte_offset = 0;
     for (i, l) in text.split('\n').enumerate() {

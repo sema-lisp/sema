@@ -8,7 +8,6 @@
 //! evaluator/parser state confined to one thread while still serving the async
 //! LSP protocol.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use tower_lsp::jsonrpc::Result;
@@ -24,9 +23,14 @@ use crate::state::{semantic_token_legend, BackendState, ParsedFile, WorkspaceSca
 
 pub(crate) enum LspRequest {
     /// Document opened or changed — reparse and publish diagnostics.
-    DocumentChanged { uri: Url, text: String },
+    DocumentChanged {
+        uri: Url,
+        text: String,
+    },
     /// Document closed — remove from cache and clear diagnostics.
-    DocumentClosed { uri: Url },
+    DocumentClosed {
+        uri: Url,
+    },
     /// Completion request.
     Complete {
         uri: Url,
@@ -54,6 +58,7 @@ pub(crate) enum LspRequest {
     References {
         uri: Url,
         position: Position,
+        include_declaration: bool,
         reply: tokio::sync::oneshot::Sender<Vec<Location>>,
     },
     /// Document symbols request.
@@ -159,11 +164,24 @@ pub(crate) enum LspRequest {
         arguments: Vec<serde_json::Value>,
     },
     /// Set the sema binary path (from initializationOptions).
-    SetSemaBinary { path: String },
+    SetSemaBinary {
+        path: String,
+    },
     /// Scan workspace for .sema files (triggered on initialized).
-    ScanWorkspace { root: PathBuf },
+    ScanWorkspace {
+        root: PathBuf,
+    },
     /// Continue incremental workspace scanning (directory-by-directory with yielding).
-    ScanWorkspaceContinue { scanner: WorkspaceScanner },
+    ScanWorkspaceContinue {
+        scanner: WorkspaceScanner,
+    },
+    WorkspaceRootsChanged {
+        added: Vec<PathBuf>,
+        removed: Vec<PathBuf>,
+    },
+    WorkspaceFilesChanged {
+        changes: Vec<FileEvent>,
+    },
     /// Shutdown the backend thread.
     Shutdown,
 }
@@ -175,7 +193,7 @@ pub(crate) struct Backend {
     pub(crate) client: Client,
     tx: tokio::sync::mpsc::UnboundedSender<LspRequest>,
     /// Workspace root extracted from InitializeParams, used for workspace scanning.
-    workspace_root: tokio::sync::Mutex<Option<PathBuf>>,
+    workspace_roots: tokio::sync::Mutex<Vec<PathBuf>>,
 }
 
 impl Backend {
@@ -183,7 +201,7 @@ impl Backend {
         Backend {
             client,
             tx,
-            workspace_root: tokio::sync::Mutex::new(None),
+            workspace_roots: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -201,15 +219,25 @@ impl LanguageServer for Backend {
         }
 
         // Store workspace root for scanning in `initialized`
-        let root = params
-            .root_uri
-            .as_ref()
-            .and_then(|uri| uri.to_file_path().ok())
-            .or_else(|| {
-                #[allow(deprecated)]
-                params.root_path.as_ref().map(PathBuf::from)
-            });
-        *self.workspace_root.lock().await = root;
+        let mut roots: Vec<PathBuf> = params
+            .workspace_folders
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|folder| folder.uri.to_file_path().ok())
+            .collect();
+        if roots.is_empty() {
+            let root = params
+                .root_uri
+                .as_ref()
+                .and_then(|uri| uri.to_file_path().ok())
+                .or_else(|| {
+                    #[allow(deprecated)]
+                    params.root_path.as_ref().map(PathBuf::from)
+                });
+            roots.extend(root);
+        }
+        *self.workspace_roots.lock().await = roots;
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -223,7 +251,11 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::FULL,
                 )),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec!["(".to_string(), " ".to_string()]),
+                    trigger_characters: Some(vec![
+                        "(".to_string(),
+                        " ".to_string(),
+                        "/".to_string(),
+                    ]),
                     resolve_provider: Some(true),
                     ..Default::default()
                 }),
@@ -245,7 +277,10 @@ impl LanguageServer for Backend {
                     work_done_progress_options: Default::default(),
                 })),
                 execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: vec!["sema.runTopLevel".to_string()],
+                    commands: vec![
+                        "sema.runTopLevel".to_string(),
+                        "sema.cancelTopLevel".to_string(),
+                    ],
                     ..Default::default()
                 }),
                 semantic_tokens_provider: Some(
@@ -270,6 +305,13 @@ impl LanguageServer for Backend {
                     work_done_progress_options: Default::default(),
                 }),
                 call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
+                workspace: Some(WorkspaceServerCapabilities {
+                    workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                        supported: Some(true),
+                        change_notifications: Some(OneOf::Left(true)),
+                    }),
+                    file_operations: None,
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -277,10 +319,19 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _: InitializedParams) {
-        // Scan workspace for .sema files to populate the definition cache
-        if let Some(root) = self.workspace_root.lock().await.take() {
+        for root in self.workspace_roots.lock().await.clone() {
             let _ = self.tx.send(LspRequest::ScanWorkspace { root });
         }
+        let _ = self
+            .client
+            .register_capability(vec![Registration {
+                id: "sema-watch-files".to_string(),
+                method: "workspace/didChangeWatchedFiles".to_string(),
+                register_options: Some(serde_json::json!({
+                    "watchers": [{ "globPattern": "**/*.sema" }]
+                })),
+            }])
+            .await;
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -317,6 +368,39 @@ impl LanguageServer for Backend {
         let _ = self.tx.send(LspRequest::DocumentClosed {
             uri: params.text_document.uri,
         });
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        let _ = self.tx.send(LspRequest::WorkspaceFilesChanged {
+            changes: params.changes,
+        });
+    }
+
+    async fn did_change_workspace_folders(&self, params: DidChangeWorkspaceFoldersParams) {
+        let added: Vec<PathBuf> = params
+            .event
+            .added
+            .into_iter()
+            .filter_map(|folder| folder.uri.to_file_path().ok())
+            .collect();
+        let removed: Vec<PathBuf> = params
+            .event
+            .removed
+            .into_iter()
+            .filter_map(|folder| folder.uri.to_file_path().ok())
+            .collect();
+        {
+            let mut roots = self.workspace_roots.lock().await;
+            roots.retain(|root| !removed.contains(root));
+            for root in &added {
+                if !roots.contains(root) {
+                    roots.push(root.clone());
+                }
+            }
+        }
+        let _ = self
+            .tx
+            .send(LspRequest::WorkspaceRootsChanged { added, removed });
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
@@ -376,11 +460,13 @@ impl LanguageServer for Backend {
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
+        let include_declaration = params.context.include_declaration;
 
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         let _ = self.tx.send(LspRequest::References {
             uri,
             position,
+            include_declaration,
             reply: reply_tx,
         });
 
@@ -800,7 +886,11 @@ pub async fn run_server() {
             // Workspace scans run only at initialization. Refresh files whose
             // on-disk mtime changed before serving the next request so the
             // scan cache cannot keep stale definitions or ranges indefinitely.
-            state.refresh_stale_import_cache();
+            for root in state.take_reconciliation_roots() {
+                deferred.push_back(LspRequest::ScanWorkspaceContinue {
+                    scanner: WorkspaceScanner::new(&root),
+                });
+            }
             match req {
                 LspRequest::DocumentChanged { uri, text } => {
                     // Batch document changes: drain any consecutive pending
@@ -830,9 +920,11 @@ pub async fn run_server() {
                         (latest_uri, latest_text)
                     };
 
+                    state.cancel_eval_for_document(&uri);
+
                     // Parse once, cache the result, and derive diagnostics
                     let (ast, span_map, symbol_spans, errors) =
-                        sema_reader::read_many_with_spans_recover(&text);
+                        sema_reader::read_many_with_spans_tolerant(&text);
                     let lines: Vec<&str> = text.lines().collect();
 
                     let mut diags: Vec<Diagnostic> = errors
@@ -840,7 +932,7 @@ pub async fn run_server() {
                         .map(|err| error_diagnostic(err, DiagnosticSeverity::ERROR, &lines))
                         .collect();
                     if diags.is_empty() {
-                        diags.extend(compile_diagnostics(&ast, &lines));
+                        diags.extend(compile_diagnostics(&ast, &span_map, &lines));
                     }
 
                     let uri_str = uri.as_str().to_string();
@@ -869,6 +961,7 @@ pub async fn run_server() {
                             source: text.clone(),
                         },
                     );
+                    state.index_open_document(&uri);
                     state.documents.insert(uri_str, text);
 
                     let client = client.clone();
@@ -877,6 +970,7 @@ pub async fn run_server() {
                     });
                 }
                 LspRequest::DocumentClosed { uri } => {
+                    state.cancel_eval_for_document(&uri);
                     state.documents.remove(uri.as_str());
                     state.cached_user_defs.remove(uri.as_str());
                     state.cached_parses.remove(uri.as_str());
@@ -920,9 +1014,11 @@ pub async fn run_server() {
                 LspRequest::References {
                     uri,
                     position,
+                    include_declaration,
                     reply,
                 } => {
-                    let result = state.handle_references(&uri, &position);
+                    let result =
+                        state.handle_references_with_context(&uri, &position, include_declaration);
                     let _ = reply.send(result);
                 }
                 LspRequest::DocumentSymbols { uri, reply } => {
@@ -1028,30 +1124,13 @@ pub async fn run_server() {
                     let _ = reply.send(result);
                 }
                 LspRequest::ExecuteCommand { command, arguments } => {
-                    // Run subprocess on a separate thread to avoid blocking
-                    // the backend (which would freeze diagnostics/completions).
-                    // Only clone the document text needed for this command.
-                    let target_uri = arguments
-                        .first()
-                        .and_then(|a| a.get("uri"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let mut docs = HashMap::new();
-                    if let Some(text) = state.documents.get(target_uri) {
-                        docs.insert(target_uri.to_string(), text.clone());
-                    }
-                    let sema_binary = state.sema_binary.clone();
-                    let client = client.clone();
-                    let handle = handle.clone();
-                    std::thread::spawn(move || {
-                        let tmp = BackendState::new_without_builtins(docs, sema_binary);
-                        tmp.handle_execute_command(&command, &arguments, &client, &handle);
-                    });
+                    state.handle_execute_command(&command, &arguments, &client, &handle);
                 }
                 LspRequest::SetSemaBinary { path } => {
                     state.sema_binary = path;
                 }
                 LspRequest::ScanWorkspace { root } => {
+                    state.add_workspace_root(&root);
                     // Start incremental workspace scanning. The scanner
                     // processes one directory at a time, yielding to
                     // interactive requests between directories.
@@ -1085,7 +1164,26 @@ pub async fn run_server() {
                         deferred.push_back(LspRequest::ScanWorkspaceContinue { scanner });
                     }
                 }
-                LspRequest::Shutdown => break,
+                LspRequest::WorkspaceRootsChanged { added, removed } => {
+                    for root in removed {
+                        state.remove_workspace_root(&root);
+                    }
+                    for root in added {
+                        state.add_workspace_root(&root);
+                        deferred.push_back(LspRequest::ScanWorkspaceContinue {
+                            scanner: WorkspaceScanner::new(&root),
+                        });
+                    }
+                }
+                LspRequest::WorkspaceFilesChanged { changes } => {
+                    for change in changes {
+                        state.apply_workspace_file_change(&change);
+                    }
+                }
+                LspRequest::Shutdown => {
+                    state.cancel_all_evals();
+                    break;
+                }
             }
         }
     });
@@ -1102,7 +1200,7 @@ pub async fn run_server() {
 /// notification, the frame is forwarded and then `exit_signal` reports whether
 /// a `shutdown` request preceded it, so [`run_server`] can terminate the
 /// process with the spec-mandated exit code.
-async fn normalize_lsp_input<R, W>(
+pub(crate) async fn normalize_lsp_input<R, W>(
     mut input: R,
     mut output: W,
     exit_signal: tokio::sync::oneshot::Sender<bool>,
@@ -1111,6 +1209,7 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    use sema_core::content_length::{parse_content_length, MAX_CONTENT_BYTES, MAX_HEADER_BYTES};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let mut pending = Vec::new();
@@ -1122,7 +1221,10 @@ where
         let read = input.read(&mut chunk).await?;
         if read == 0 {
             if !pending.is_empty() {
-                output.write_all(&pending).await?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "incomplete LSP frame",
+                ));
             }
             output.shutdown().await?;
             return Ok(());
@@ -1131,13 +1233,18 @@ where
         pending.extend_from_slice(&chunk[..read]);
 
         while let Some(separator) = find_subslice(&pending, b"\r\n\r\n") {
+            if separator > MAX_HEADER_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "LSP header exceeds the size limit",
+                ));
+            }
             let body_start = separator + 4;
-            let Some(content_length) = lsp_content_length(&pending[..separator]) else {
-                output.write_all(&pending).await?;
-                pending.clear();
-                break;
-            };
-            let frame_len = body_start + content_length;
+            let content_length = parse_content_length(&pending[..separator], MAX_CONTENT_BYTES)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            let frame_len = body_start.checked_add(content_length).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "LSP frame length overflow")
+            })?;
             if pending.len() < frame_len {
                 break;
             }
@@ -1146,8 +1253,8 @@ where
             pending.drain(..frame_len);
 
             let body = &frame[body_start..];
-            let method = lsp_message_method(body);
-            if method.as_deref() == Some("shutdown") {
+            let lifecycle = lsp_lifecycle_message(body);
+            if lifecycle == Some(LspLifecycleMessage::ShutdownRequest) {
                 shutdown_seen = true;
             }
             let normalized = normalize_lsp_message_body(body);
@@ -1158,19 +1265,47 @@ where
                 output.write_all(header.as_bytes()).await?;
                 output.write_all(&normalized).await?;
             }
-            if method.as_deref() == Some("exit") {
+            if lifecycle == Some(LspLifecycleMessage::ExitNotification) {
                 if let Some(signal) = exit_signal.take() {
                     let _ = signal.send(shutdown_seen);
                 }
             }
         }
+
+        if find_subslice(&pending, b"\r\n\r\n").is_none() && pending.len() > MAX_HEADER_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "LSP header exceeds the size limit",
+            ));
+        }
     }
 }
 
-/// Extracts the JSON-RPC `method` from an LSP message body, if any.
-fn lsp_message_method(body: &[u8]) -> Option<String> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LspLifecycleMessage {
+    ShutdownRequest,
+    ExitNotification,
+}
+
+/// Recognize lifecycle messages by their JSON-RPC envelope shape.
+pub(crate) fn lsp_lifecycle_message(body: &[u8]) -> Option<LspLifecycleMessage> {
     let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-    Some(value.as_object()?.get("method")?.as_str()?.to_string())
+    let object = value.as_object()?;
+    if object.get("jsonrpc")?.as_str()? != "2.0" {
+        return None;
+    }
+    if object.contains_key("result") || object.contains_key("error") {
+        return None;
+    }
+    let method = object.get("method")?.as_str()?;
+    let request_id = object
+        .get("id")
+        .is_some_and(|id| id.is_string() || id.is_number());
+    match (method, request_id, object.contains_key("id")) {
+        ("shutdown", true, true) => Some(LspLifecycleMessage::ShutdownRequest),
+        ("exit", false, false) => Some(LspLifecycleMessage::ExitNotification),
+        _ => None,
+    }
 }
 
 pub(crate) fn normalize_lsp_message_body(body: &[u8]) -> Vec<u8> {
@@ -1182,10 +1317,7 @@ pub(crate) fn normalize_lsp_message_body(body: &[u8]) -> Vec<u8> {
         return body.to_vec();
     };
 
-    let is_shutdown = object
-        .get("method")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|method| method == "shutdown");
+    let is_shutdown = lsp_lifecycle_message(body) == Some(LspLifecycleMessage::ShutdownRequest);
     let has_null_params = object.get("params").is_some_and(serde_json::Value::is_null);
 
     if is_shutdown && has_null_params {
@@ -1194,14 +1326,6 @@ pub(crate) fn normalize_lsp_message_body(body: &[u8]) -> Vec<u8> {
     } else {
         body.to_vec()
     }
-}
-
-fn lsp_content_length(header: &[u8]) -> Option<usize> {
-    std::str::from_utf8(header).ok()?.lines().find_map(|line| {
-        line.strip_prefix("Content-Length:")
-            .or_else(|| line.strip_prefix("content-length:"))
-            .and_then(|value| value.trim().parse().ok())
-    })
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {

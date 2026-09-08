@@ -2,9 +2,6 @@
 //! symbols, signature help, folding ranges, selection ranges, document links,
 //! call hierarchy, and inlay hints.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-
 use tower_lsp::lsp_types::*;
 
 use sema_core::SpanMap;
@@ -12,10 +9,14 @@ use sema_core::SpanMap;
 use crate::builtin_docs;
 use crate::definitions::*;
 use crate::helpers::*;
-use crate::state::{
-    build_selection_range, collect_call_sites, collect_outgoing_calls, position_in_range,
-    quoted_string_range, BackendState, ImportCache, ParsedFile, WorkspaceFile,
-};
+use crate::state::{build_selection_range, BackendState};
+
+fn position_in_selection_range(position: &Position, range: &Range) -> bool {
+    let position = (position.line, position.character);
+    let start = (range.start.line, range.start.character);
+    let end = (range.end.line, range.end.character);
+    position >= start && (position < end || start == end)
+}
 
 impl BackendState {
     pub(crate) fn handle_code_lens(&self, uri: &Url) -> Vec<CodeLens> {
@@ -75,25 +76,20 @@ impl BackendState {
         let mut results = Vec::new();
         let query_lower = query.to_lowercase();
 
-        for wf in self.iter_workspace_files() {
-            let lines = wf.lines();
-            let symbols = document_symbols_from_ast(
-                &wf.parsed.ast,
-                &wf.parsed.span_map,
-                &wf.parsed.symbol_spans,
-                &lines,
-            );
-
-            for sym in symbols {
-                if query.is_empty() || sym.name.to_lowercase().contains(&query_lower) {
+        for file in self.workspace_index.iter() {
+            if !self.indexed_file_is_current(file) {
+                continue;
+            }
+            for definition in &file.definitions {
+                if query.is_empty() || definition.name.to_lowercase().contains(&query_lower) {
                     results.push(SymbolInformation {
-                        name: sym.name,
-                        kind: sym.kind,
+                        name: definition.name.clone(),
+                        kind: definition.kind,
                         tags: None,
                         deprecated: None,
                         location: Location {
-                            uri: wf.uri.clone(),
-                            range: sym.selection_range,
+                            uri: file.uri.clone(),
+                            range: definition.name_range,
                         },
                         container_name: None,
                     });
@@ -120,15 +116,17 @@ impl BackendState {
                 documentation: None,
             })
             .collect();
+        let active_param = (!param_names.is_empty())
+            .then(|| active_param.min(param_names.len().saturating_sub(1)) as u32);
         SignatureHelp {
             signatures: vec![SignatureInformation {
                 label,
                 documentation: None,
                 parameters: Some(parameters),
-                active_parameter: Some(active_param as u32),
+                active_parameter: active_param,
             }],
             active_signature: Some(0),
-            active_parameter: Some(active_param as u32),
+            active_parameter: active_param,
         }
     }
 
@@ -138,40 +136,49 @@ impl BackendState {
         position: &Position,
     ) -> Option<SignatureHelp> {
         let uri_str = uri.as_str();
-        let text = self.documents.get(uri_str)?;
+        let text = self.documents.get(uri_str)?.clone();
 
         let (func_name, active_param) =
-            find_enclosing_call(text, position.line, position.character)?;
+            find_enclosing_call(&text, position.line, position.character)?;
 
         // Try user definitions in current document (use cached parse)
         let cached = self.cached_parses.get(uri_str)?;
 
-        if let Some(params_str) = extract_params_from_ast(&cached.ast, &func_name) {
+        let cursor_line = line_at(&text, position.line as usize)?;
+        let cursor_col = utf16_to_char_col(cursor_line, position.character as usize);
+        if cached
+            .scope_tree
+            .resolve_at(&func_name, position.line as usize + 1, cursor_col)
+            .is_some_and(|resolved| !resolved.is_top_level)
+        {
+            return None;
+        }
+
+        let non_file_params = uri
+            .to_file_path()
+            .is_err()
+            .then(|| extract_params_from_ast(&cached.ast, &func_name))
+            .flatten();
+
+        // Resolve current-file, imported, and re-exported definitions through
+        // the same source-ordered binding model used by navigation.
+        self.prepare_navigation_index(uri);
+        if let Some(params_str) = self
+            .visible_indexed_definition(uri, &func_name, *position)
+            .and_then(|(_, definition)| definition.params.as_deref())
+        {
+            return Some(Self::user_signature_help(
+                &func_name,
+                params_str,
+                active_param,
+            ));
+        }
+        if let Some(params_str) = non_file_params {
             return Some(Self::user_signature_help(
                 &func_name,
                 &params_str,
                 active_param,
             ));
-        }
-
-        // Try imported files
-        let import_paths = import_paths_from_ast(&cached.ast);
-        for path_str in &import_paths {
-            let resolved = match resolve_import_path(uri, path_str) {
-                Some(p) if p.exists() => p,
-                _ => continue,
-            };
-            let cached = match self.get_import_cache(&resolved) {
-                Some(c) => c,
-                None => continue,
-            };
-            if let Some(params_str) = extract_params_from_ast(&cached.parsed.ast, &func_name) {
-                return Some(Self::user_signature_help(
-                    &func_name,
-                    &params_str,
-                    active_param,
-                ));
-            }
         }
 
         // Builtin docs — with parameter highlighting when the entry carries (or its example
@@ -193,6 +200,7 @@ impl BackendState {
                     })
                     .collect();
                 let label = format!("({} {})", func_name, names.join(" "));
+                let active_param = active_param.min(names.len().saturating_sub(1));
                 (Some(params), Some(active_param as u32), label)
             };
             return Some(SignatureHelp {
@@ -210,17 +218,7 @@ impl BackendState {
             });
         }
 
-        // Fall back to a workspace-wide search (other open documents, then
-        // still-fresh scanned files), mirroring goto-definition Phase 3d.
-        // Builtin docs outrank a workspace match — only an explicit import
-        // shadows a builtin signature.
-        let (ast, _module_name) = self.find_workspace_definition(uri, &func_name)?;
-        let params_str = extract_params_from_ast(ast, &func_name)?;
-        Some(Self::user_signature_help(
-            &func_name,
-            &params_str,
-            active_param,
-        ))
+        None
     }
 
     pub(crate) fn handle_folding_ranges(&self, uri: &Url) -> Vec<FoldingRange> {
@@ -241,35 +239,31 @@ impl BackendState {
         lines: &[&str],
         ranges: &mut Vec<FoldingRange>,
     ) {
-        for expr in exprs {
-            if let Some(items) = expr.as_list() {
-                if let Some(span) = expr_span(expr, span_map) {
-                    // Only emit a fold when the form spans at least 2 visible
-                    // lines (`end_line - line >= 2`). Tiny 1-2-line forms add
-                    // folding noise without any benefit.
-                    if span.end_line.saturating_sub(span.line) >= 2 {
-                        // Span columns are chars; LSP characters are UTF-16
-                        // code units.
-                        ranges.push(FoldingRange {
-                            start_line: (span.line - 1) as u32,
-                            start_character: Some(char_col_to_utf16(
-                                lines.get(span.line - 1).copied(),
-                                span.col,
-                            )),
-                            end_line: (span.end_line - 1) as u32,
-                            end_character: Some(char_col_to_utf16(
-                                lines.get(span.end_line - 1).copied(),
-                                span.end_col,
-                            )),
-                            kind: Some(FoldingRangeKind::Region),
-                            collapsed_text: None,
-                        });
-                    }
+        walk_values(exprs, |expr| {
+            if let Some(span) = expr_span(expr, span_map) {
+                // Only emit a fold when the form spans at least 2 visible
+                // lines (`end_line - line >= 2`). Tiny 1-2-line forms add
+                // folding noise without any benefit.
+                if span.end_line.saturating_sub(span.line) >= 2 {
+                    // Span columns are chars; LSP characters are UTF-16
+                    // code units.
+                    ranges.push(FoldingRange {
+                        start_line: (span.line - 1) as u32,
+                        start_character: Some(char_col_to_utf16(
+                            lines.get(span.line - 1).copied(),
+                            span.col,
+                        )),
+                        end_line: (span.end_line - 1) as u32,
+                        end_character: Some(char_col_to_utf16(
+                            lines.get(span.end_line - 1).copied(),
+                            span.end_col,
+                        )),
+                        kind: Some(FoldingRangeKind::Region),
+                        collapsed_text: None,
+                    });
                 }
-                // Recurse into sub-expressions
-                Self::collect_folding_ranges(items, span_map, lines, ranges);
             }
-        }
+        });
     }
 
     /// Compute structural selection ranges: for each requested position, the chain of enclosing
@@ -289,47 +283,29 @@ impl BackendState {
                 // Innermost candidates: the symbol token under the cursor.
                 for (_, span) in &cached.symbol_spans {
                     let r = span_to_range(span, &lines);
-                    if position_in_range(pos, &r) {
+                    if position_in_selection_range(pos, &r) {
                         ranges.push(r);
                     }
                 }
                 // Enclosing list forms (recursively).
-                Self::collect_selection_list_ranges(
-                    &cached.ast,
-                    &cached.span_map,
-                    &lines,
-                    pos,
-                    &mut ranges,
-                );
+                walk_values(&cached.ast, |expr| {
+                    if let Some(r) = expr_range(expr, &cached.span_map, &lines) {
+                        if position_in_selection_range(pos, &r) {
+                            ranges.push(r);
+                        }
+                    }
+                });
                 build_selection_range(ranges, pos)
             })
             .collect();
         Some(result)
     }
 
-    fn collect_selection_list_ranges(
-        exprs: &[sema_core::Value],
-        span_map: &SpanMap,
-        lines: &[&str],
-        pos: &Position,
-        out: &mut Vec<Range>,
-    ) {
-        for expr in exprs {
-            if let Some(items) = expr.as_list() {
-                if let Some(r) = expr_range(expr, span_map, lines) {
-                    if position_in_range(pos, &r) {
-                        out.push(r);
-                    }
-                }
-                Self::collect_selection_list_ranges(items, span_map, lines, pos, out);
-            }
-        }
-    }
-
     /// Document links for `import`/`load` path strings → the resolved file.
     pub(crate) fn handle_document_links(&self, uri: &Url) -> Option<Vec<DocumentLink>> {
         let cached = self.cached_parses.get(uri.as_str())?;
         let lines: Vec<&str> = cached.source.lines().collect();
+        let tokens = sema_reader::lexer::tokenize(&cached.source).ok()?;
         let mut links = Vec::new();
         for expr in flatten_module_forms(&cached.ast) {
             let items = match expr.as_list() {
@@ -349,8 +325,23 @@ impl BackendState {
                 Some(s) => s,
                 None => continue,
             };
-            let form_range = span_to_range(span, &lines);
-            let range = quoted_string_range(&lines, &form_range, path).unwrap_or(form_range);
+            let Some(string_token) = tokens.iter().find(|token| {
+                span.contains(&token.span)
+                    && matches!(&token.token, sema_reader::lexer::Token::String(value) if value == path)
+            }) else {
+                continue;
+            };
+            let token_range = span_to_range(&string_token.span, &lines);
+            let range = Range {
+                start: Position {
+                    line: token_range.start.line,
+                    character: token_range.start.character.saturating_add(1),
+                },
+                end: Position {
+                    line: token_range.end.line,
+                    character: token_range.end.character.saturating_sub(1),
+                },
+            };
             // Only link paths that resolve to an existing file (the import
             // jump in goto-definition applies the same filter).
             if let Some(resolved) = resolve_import_path(uri, path).filter(|p| p.exists()) {
@@ -391,51 +382,6 @@ impl BackendState {
         )])
     }
 
-    /// Collect the incoming calls to `target` found in one file's top-level
-    /// definitions (shared between open documents and scanned files).
-    fn collect_incoming_calls_in_file(
-        wf: &WorkspaceFile,
-        target: &str,
-        result: &mut Vec<CallHierarchyIncomingCall>,
-    ) {
-        let lines = wf.lines();
-        // SYMBOL_HEADS, not DEFINITION_HEADS: a defworkflow is a valid call-
-        // hierarchy root/target (see def_index's doc comment) even though
-        // it isn't a real binding.
-        for m in scan_definitions(
-            flatten_module_forms(&wf.parsed.ast),
-            SYMBOL_HEADS,
-            &wf.parsed.span_map,
-            &wf.parsed.symbol_spans,
-            &lines,
-        ) {
-            // Skip a definition form with no span (reader error-recovery) —
-            // nothing to anchor a call-hierarchy item at.
-            let Some(form_range) = m.form_range else {
-                continue;
-            };
-            let name_range = m.name_range.unwrap_or(form_range);
-            // Only the body (skip the head/name/param-list) to avoid matching
-            // a same-named parameter as a call — see DefMatch::body.
-            let body = m.body();
-            let mut sites = Vec::new();
-            collect_call_sites(
-                body,
-                &wf.parsed.span_map,
-                &wf.parsed.symbol_spans,
-                &lines,
-                target,
-                &mut sites,
-            );
-            if !sites.is_empty() {
-                result.push(CallHierarchyIncomingCall {
-                    from: Self::call_hierarchy_item(&m.name, &wf.uri, form_range, name_range),
-                    from_ranges: sites,
-                });
-            }
-        }
-    }
-
     /// Who calls this function: every definition whose body contains a call to
     /// `item.name`, across open documents and still-fresh scanned files.
     pub(crate) fn handle_call_hierarchy_incoming(
@@ -444,53 +390,26 @@ impl BackendState {
     ) -> Option<Vec<CallHierarchyIncomingCall>> {
         let target = &item.name;
         let mut result = Vec::new();
-        for wf in self.iter_workspace_files() {
-            Self::collect_incoming_calls_in_file(&wf, target, &mut result);
-        }
-        Some(result)
-    }
-
-    /// The outgoing calls of `name`'s definition if this file defines it
-    /// (shared between open documents and scanned files).
-    fn outgoing_calls_of_definition(
-        wf: &WorkspaceFile,
-        name: &str,
-        index: &HashMap<String, (Url, Range, Range)>,
-    ) -> Option<Vec<CallHierarchyOutgoingCall>> {
-        let lines = wf.lines();
-        // SYMBOL_HEADS, not DEFINITION_HEADS: see collect_incoming_calls_in_file.
-        let m = scan_definitions(
-            flatten_module_forms(&wf.parsed.ast),
-            SYMBOL_HEADS,
-            &wf.parsed.span_map,
-            &wf.parsed.symbol_spans,
-            &lines,
-        )
-        .into_iter()
-        .find(|m| m.name == name)?;
-        let body = m.body();
-        let mut calls: HashMap<String, Vec<Range>> = Default::default();
-        collect_outgoing_calls(
-            body,
-            &wf.parsed.span_map,
-            &wf.parsed.symbol_spans,
-            &lines,
-            index,
-            &mut calls,
-        );
-        let mut out = Vec::new();
-        for (callee, sites) in calls {
-            if callee == name {
-                continue; // skip self-recursion in outgoing view
+        for file in self.workspace_index.iter() {
+            if !self.indexed_file_is_current(file) {
+                continue;
             }
-            if let Some((curi, crange, cname_range)) = index.get(&callee) {
-                out.push(CallHierarchyOutgoingCall {
-                    to: Self::call_hierarchy_item(&callee, curi, *crange, *cname_range),
-                    from_ranges: sites,
+            for definition in &file.definitions {
+                let Some(sites) = definition.calls.get(target) else {
+                    continue;
+                };
+                result.push(CallHierarchyIncomingCall {
+                    from: Self::call_hierarchy_item(
+                        &definition.name,
+                        &file.uri,
+                        definition.form_range,
+                        definition.name_range,
+                    ),
+                    from_ranges: sites.clone(),
                 });
             }
         }
-        Some(out)
+        Some(result)
     }
 
     /// Which functions this function calls: known definitions invoked from
@@ -502,10 +421,38 @@ impl BackendState {
     ) -> Option<Vec<CallHierarchyOutgoingCall>> {
         let name = &item.name;
         let index = self.def_index();
-        let found = self
-            .iter_workspace_files()
-            .find_map(|wf| Self::outgoing_calls_of_definition(&wf, name, &index));
-        Some(found.unwrap_or_default())
+        let item_path = item
+            .uri
+            .to_file_path()
+            .ok()
+            .map(|path| canonicalize_or_raw(&path));
+        let definition = self.workspace_index.iter().find_map(|file| {
+            let same_file =
+                item_path.as_ref().is_some_and(|path| path == &file.path) || file.uri == item.uri;
+            (same_file && self.indexed_file_is_current(file))
+                .then(|| {
+                    file.definitions
+                        .iter()
+                        .find(|definition| definition.name == *name)
+                })
+                .flatten()
+        });
+        let Some(definition) = definition else {
+            return Some(Vec::new());
+        };
+        let mut result = Vec::new();
+        for (callee, sites) in &definition.calls {
+            if callee == name {
+                continue;
+            }
+            if let Some((uri, range, name_range)) = index.get(callee) {
+                result.push(CallHierarchyOutgoingCall {
+                    to: Self::call_hierarchy_item(callee, uri, *range, *name_range),
+                    from_ranges: sites.clone(),
+                });
+            }
+        }
+        Some(result)
     }
 
     pub(crate) fn handle_inlay_hints(
@@ -515,33 +462,19 @@ impl BackendState {
     ) -> Option<Vec<InlayHint>> {
         let uri_str = uri.as_str();
 
-        // Pre-populate import caches before the immutable borrow phase,
-        // so resolve_param_names can be called without &mut self.
-        if let Some(cached) = self.cached_parses.get(uri_str) {
-            let import_paths = import_paths_from_ast(&cached.ast);
-            let paths_to_cache: Vec<PathBuf> = import_paths
-                .iter()
-                .filter_map(|p| resolve_import_path(uri, p))
-                .filter(|p| p.exists())
-                .collect();
-            for path in &paths_to_cache {
-                let _ = self.get_import_cache(path);
-            }
-        }
+        self.prepare_navigation_index(uri);
 
         let text = self.documents.get(uri_str)?;
         let cached = self.cached_parses.get(uri_str)?;
 
         let mut hints = Vec::new();
         Self::collect_inlay_hints_inner(
+            self,
             &cached.ast,
             &cached.span_map,
             text,
             uri,
             range,
-            &self.cached_parses,
-            &self.import_cache,
-            &self.builtin_docs,
             &mut hints,
         );
         if hints.is_empty() {
@@ -551,16 +484,13 @@ impl BackendState {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn collect_inlay_hints_inner(
+        state: &BackendState,
         exprs: &[sema_core::Value],
         span_map: &SpanMap,
         text: &str,
         uri: &Url,
         range: &Range,
-        cached_parses: &HashMap<String, ParsedFile>,
-        import_cache: &HashMap<PathBuf, ImportCache>,
-        builtin_docs: &builtin_docs::BuiltinDocs,
         hints: &mut Vec<InlayHint>,
     ) {
         let lines: Vec<&str> = text.lines().collect();
@@ -576,22 +506,17 @@ impl BackendState {
                 Some(s) => s,
                 None => {
                     Self::collect_inlay_hints_inner(
-                        items,
-                        span_map,
-                        text,
-                        uri,
-                        range,
-                        cached_parses,
-                        import_cache,
-                        builtin_docs,
-                        hints,
+                        state, items, span_map, text, uri, range, hints,
                     );
                     continue;
                 }
             };
-            let form_start_line = form_span.line.saturating_sub(1) as u32;
-            let form_end_line = form_span.end_line.saturating_sub(1) as u32;
-            if form_end_line < range.start.line || form_start_line > range.end.line {
+            let form_range = span_to_range(form_span, &lines);
+            if (form_range.end.line, form_range.end.character)
+                <= (range.start.line, range.start.character)
+                || (range.end.line, range.end.character)
+                    <= (form_range.start.line, form_range.start.character)
+            {
                 continue;
             }
 
@@ -600,15 +525,7 @@ impl BackendState {
                 Some(name) => name,
                 None => {
                     Self::collect_inlay_hints_inner(
-                        items,
-                        span_map,
-                        text,
-                        uri,
-                        range,
-                        cached_parses,
-                        import_cache,
-                        builtin_docs,
-                        hints,
+                        state, items, span_map, text, uri, range, hints,
                     );
                     continue;
                 }
@@ -619,15 +536,7 @@ impl BackendState {
                 for item in &items[1..] {
                     if let Some(sub) = item.as_list() {
                         Self::collect_inlay_hints_inner(
-                            sub,
-                            span_map,
-                            text,
-                            uri,
-                            range,
-                            cached_parses,
-                            import_cache,
-                            builtin_docs,
-                            hints,
+                            state, sub, span_map, text, uri, range, hints,
                         );
                     }
                 }
@@ -635,13 +544,8 @@ impl BackendState {
             }
 
             // Try to resolve parameter names
-            let param_names = Self::resolve_param_names_immut(
-                uri,
-                &func_name,
-                cached_parses,
-                import_cache,
-                builtin_docs,
-            );
+            let param_names =
+                Self::resolve_param_names_immut(state, uri, &func_name, form_range.start);
 
             if let Some(params) = &param_names {
                 // Find argument positions by scanning the source text within the form.
@@ -663,11 +567,19 @@ impl BackendState {
                             .get(line)
                             .map(|l| byte_offset_to_utf16(l, col))
                             .unwrap_or(col as u32);
+                        let position = Position {
+                            line: line as u32,
+                            character,
+                        };
+                        if (position.line, position.character)
+                            < (range.start.line, range.start.character)
+                            || (position.line, position.character)
+                                >= (range.end.line, range.end.character)
+                        {
+                            continue;
+                        }
                         hints.push(InlayHint {
-                            position: Position {
-                                line: line as u32,
-                                character,
-                            },
+                            position,
                             label: InlayHintLabel::String(format!("{}:", param)),
                             kind: Some(InlayHintKind::PARAMETER),
                             text_edits: None,
@@ -683,17 +595,7 @@ impl BackendState {
             // Recurse into arguments (they may contain nested calls)
             for item in &items[1..] {
                 if let Some(sub) = item.as_list() {
-                    Self::collect_inlay_hints_inner(
-                        sub,
-                        span_map,
-                        text,
-                        uri,
-                        range,
-                        cached_parses,
-                        import_cache,
-                        builtin_docs,
-                        hints,
-                    );
+                    Self::collect_inlay_hints_inner(state, sub, span_map, text, uri, range, hints);
                 }
             }
         }
@@ -703,17 +605,32 @@ impl BackendState {
     /// imported modules, and builtin docs. Immutable version — import caches
     /// must be pre-populated before calling.
     fn resolve_param_names_immut(
+        state: &BackendState,
         uri: &Url,
         func_name: &str,
-        cached_parses: &HashMap<String, ParsedFile>,
-        import_cache: &HashMap<PathBuf, ImportCache>,
-        builtin_docs: &builtin_docs::BuiltinDocs,
+        occurrence: Position,
     ) -> Option<Vec<String>> {
         let uri_str = uri.as_str();
 
-        // 1. Check current document
-        if let Some(cached) = cached_parses.get(uri_str) {
-            if let Some(params_str) = extract_params_from_ast(&cached.ast, func_name) {
+        // Resolve current-file and imported bindings through the same
+        // source-ordered model used by navigation.
+        if let Some(params_str) = state
+            .visible_indexed_definition(uri, func_name, occurrence)
+            .and_then(|(_, definition)| definition.params.as_deref())
+        {
+            let names = parse_param_names(params_str);
+            if !names.is_empty() {
+                return Some(names);
+            }
+        }
+
+        // Non-file documents are not represented in the workspace index.
+        if uri.to_file_path().is_err() {
+            if let Some(params_str) = state
+                .cached_parses
+                .get(uri_str)
+                .and_then(|cached| extract_params_from_ast(&cached.ast, func_name))
+            {
                 let names = parse_param_names(&params_str);
                 if !names.is_empty() {
                     return Some(names);
@@ -721,31 +638,8 @@ impl BackendState {
             }
         }
 
-        // 2. Check imported modules (from pre-populated cache)
-        if let Some(cached) = cached_parses.get(uri_str) {
-            let paths = import_paths_from_ast(&cached.ast);
-            for path_str in &paths {
-                let resolved = match resolve_import_path(uri, path_str) {
-                    Some(p) if p.exists() => p,
-                    _ => continue,
-                };
-                // Cache keys are canonical paths (see get_import_cache);
-                // resolve_import_path may yield an un-normalized spelling.
-                if let Some(import_cached) = import_cache.get(&canonicalize_or_raw(&resolved)) {
-                    if let Some(params_str) =
-                        extract_params_from_ast(&import_cached.parsed.ast, func_name)
-                    {
-                        let names = parse_param_names(&params_str);
-                        if !names.is_empty() {
-                            return Some(names);
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Try builtin docs — structured params, or parsed from the entry's example.
-        if let Some(e) = builtin_docs.get(func_name) {
+        // Try builtin docs — structured params, or parsed from the entry's example.
+        if let Some(e) = state.builtin_docs.get(func_name) {
             if let Some(params) = builtin_docs::param_names(e) {
                 if !params.is_empty() {
                     return Some(params);

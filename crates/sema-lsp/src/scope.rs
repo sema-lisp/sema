@@ -49,10 +49,16 @@ pub struct ResolvedSymbol {
 
 // ── Helpers ──────────────────────────────────────────────────────
 
-/// Look up the Span for a list expression via its Rc pointer in the SpanMap.
+/// Look up the span for a compound syntax value.
 fn expr_span(expr: &Value, span_map: &SpanMap) -> Option<Span> {
-    let rc = expr.as_list_rc()?;
-    let ptr = Rc::as_ptr(&rc) as usize;
+    let ptr = if let Some(value) = expr.as_list_rc() {
+        Rc::as_ptr(&value) as usize
+    } else if let Some(value) = expr.as_vector_rc() {
+        Rc::as_ptr(&value) as usize
+    } else {
+        let value = expr.as_map_rc()?;
+        Rc::as_ptr(&value) as usize
+    };
     span_map.get(&ptr).copied()
 }
 
@@ -282,12 +288,102 @@ impl ScopeTree {
             // ── Try/catch ────────────────────────────────────────
             "try" => self.walk_try(items, expr, parent_scope, span_map, symbol_spans),
 
+            "when-let" | "if-let" | "with-stream" | "with-open" | "dotimes" | "for-range" => {
+                self.walk_binding_macro(items, expr, parent_scope, span_map, symbol_spans)
+            }
+            "as->" => {
+                if let Some(value) = items.get(1) {
+                    self.walk_expr(value, parent_scope, span_map, symbol_spans);
+                }
+                if let (Some(name), Some(form_span)) = (
+                    items.get(2).and_then(Value::as_symbol),
+                    expr_span(expr, span_map),
+                ) {
+                    let child = self.push_scope(parent_scope, form_span);
+                    let skip = usize::from(
+                        items.get(1).and_then(Value::as_symbol).as_deref() == Some(&name),
+                    );
+                    if let Some((_, def_span)) = symbol_spans
+                        .iter()
+                        .filter(|(candidate, span)| candidate == &name && form_span.contains(span))
+                        .nth(skip)
+                    {
+                        self.scopes[child].bindings.push(Binding {
+                            name,
+                            def_span: *def_span,
+                        });
+                    }
+                    for item in &items[3..] {
+                        self.walk_expr(item, child, span_map, symbol_spans);
+                    }
+                }
+            }
+            "guard" => {
+                if let Some(spec) = items.get(1) {
+                    if let (Some(parts), Some(spec_span)) = (
+                        spec.as_list().or_else(|| spec.as_vector()),
+                        expr_span(spec, span_map),
+                    ) {
+                        let child = self.push_scope(parent_scope, spec_span);
+                        if let Some(binding) = parts.first() {
+                            self.collect_param_binding(
+                                binding,
+                                child,
+                                &spec_span,
+                                span_map,
+                                symbol_spans,
+                            );
+                        }
+                        for clause in &parts[1..] {
+                            self.walk_expr(clause, child, span_map, symbol_spans);
+                        }
+                    }
+                }
+                for item in &items[2..] {
+                    self.walk_expr(item, parent_scope, span_map, symbol_spans);
+                }
+            }
+
             // ── Everything else: recurse ─────────────────────────
             _ => {
                 for item in items {
                     self.walk_expr(item, parent_scope, span_map, symbol_spans);
                 }
             }
+        }
+    }
+
+    fn walk_binding_macro(
+        &mut self,
+        items: &[Value],
+        expr: &Value,
+        parent_scope: usize,
+        span_map: &SpanMap,
+        symbol_spans: &[(String, Span)],
+    ) {
+        let Some(binding) = items.get(1) else {
+            return;
+        };
+        let Some(parts) = binding.as_list().or_else(|| binding.as_vector()) else {
+            return;
+        };
+        let Some(form_span) = expr_span(expr, span_map) else {
+            return;
+        };
+        let binding_span = expr_span(binding, span_map).unwrap_or(form_span);
+        let initializer_range = match items[0].as_symbol().as_deref() {
+            Some("for-range") => 1..parts.len(),
+            _ => 1..parts.len().min(2),
+        };
+        for initializer in &parts[initializer_range] {
+            self.walk_expr(initializer, parent_scope, span_map, symbol_spans);
+        }
+        let child = self.push_scope(parent_scope, form_span);
+        if let Some(pattern) = parts.first() {
+            self.collect_param_binding(pattern, child, &binding_span, span_map, symbol_spans);
+        }
+        for item in &items[2..] {
+            self.walk_expr(item, child, span_map, symbol_spans);
         }
     }
 
@@ -350,7 +446,14 @@ impl ScopeTree {
                 }
             }
         } else {
-            // Destructuring define — recurse into value
+            // Destructuring define binds every pattern name at top level.
+            self.collect_param_binding(
+                &items[1],
+                parent_scope,
+                &expr_span(&items[1], span_map).unwrap_or(form_span),
+                span_map,
+                symbol_spans,
+            );
             if items.len() > 2 {
                 self.walk_expr(&items[2], parent_scope, span_map, symbol_spans);
             }
@@ -763,7 +866,7 @@ impl ScopeTree {
 
         // Each clause creates a scope
         for clause in &items[2..] {
-            if let Some(clause_items) = clause.as_list() {
+            if let Some(clause_items) = clause.as_list().or_else(|| clause.as_vector()) {
                 if clause_items.len() >= 2 {
                     let clause_span = expr_span(clause, span_map);
                     if let Some(cs) = clause_span {
@@ -946,9 +1049,17 @@ impl ScopeTree {
         symbol_spans: &[(String, Span)],
     ) {
         if let Some(name) = param.as_symbol() {
-            // Skip the dot separator in rest params
-            if name == "." {
+            // Skip rest separators; the following symbol is the binding.
+            if name == "." || name == "&" {
                 return;
+            }
+            if name == "%1" {
+                if let Some(def_span) = find_symbol_span("%", enclosing_span, symbol_spans) {
+                    self.scopes[scope_idx].bindings.push(Binding {
+                        name: "%".to_string(),
+                        def_span,
+                    });
+                }
             }
             self.bind_symbol(scope_idx, name, enclosing_span, symbol_spans);
         } else if let Some(items) = param.as_vector() {
@@ -1006,7 +1117,7 @@ impl ScopeTree {
         if let Some(name) = pattern.as_symbol() {
             // In match patterns, bare symbols are bindings unless they're
             // literals like `_`, `true`, `false`, `nil`.
-            if name != "_" && name != "true" && name != "false" && name != "nil" {
+            if name != "_" && name != "&" && name != "true" && name != "false" && name != "nil" {
                 self.bind_symbol(scope_idx, name, enclosing_span, symbol_spans);
             }
         } else if pattern.as_list().is_some() {
@@ -1078,14 +1189,20 @@ impl ScopeTree {
         let mut idx = scope_idx;
         loop {
             let scope = &self.scopes[idx];
-            for binding in &scope.bindings {
-                if binding.name == name {
-                    return Some(ResolvedSymbol {
-                        scope_idx: idx,
-                        def_span: binding.def_span,
-                        is_top_level: idx == 0,
-                    });
-                }
+            let binding = if idx == 0 {
+                scope.bindings.iter().rev().find(|binding| {
+                    binding.name == name
+                        && (binding.def_span.line, binding.def_span.col) <= (line, col)
+                })
+            } else {
+                scope.bindings.iter().find(|binding| binding.name == name)
+            };
+            if let Some(binding) = binding {
+                return Some(ResolvedSymbol {
+                    scope_idx: idx,
+                    def_span: binding.def_span,
+                    is_top_level: idx == 0,
+                });
             }
             idx = scope.parent?;
         }
@@ -1231,6 +1348,44 @@ mod tests {
     fn unknown_symbol_returns_none() {
         let (tree, _) = build_scope("(define x 42)");
         assert!(tree.resolve_at("y", 1, 1).is_none());
+    }
+
+    #[test]
+    fn prelude_binding_macros_share_lexical_scope_rules() {
+        let cases = [
+            "(as-> 1 bound (+ bound 1))",
+            "(when-let (bound 1) bound)",
+            "(if-let (bound 1) bound bound)",
+            "(with-stream (bound stream) bound)",
+            "(with-open (bound resource) bound)",
+            "(dotimes (bound 2) bound)",
+            "(for-range (bound 0 2) bound)",
+            "(guard (bound ((string? bound) bound)) (raise \"x\"))",
+        ];
+        for source in cases {
+            let (tree, spans) = build_scope(source);
+            let bound: Vec<Span> = spans
+                .iter()
+                .filter_map(|(name, span)| (name == "bound").then_some(*span))
+                .collect();
+            assert!(bound.len() >= 2, "missing test occurrences in {source}");
+            for occurrence in bound {
+                let resolved = tree
+                    .resolve_at("bound", occurrence.line, occurrence.col)
+                    .unwrap_or_else(|| panic!("unresolved binding at {occurrence:?} in {source}"));
+                assert!(
+                    !resolved.is_top_level,
+                    "binding escaped local scope in {source}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rest_markers_are_not_bindings() {
+        let (tree, _) = build_scope("(lambda (first & rest) (list first rest &))");
+        assert!(tree.resolve_at("&", 1, 41).is_none());
+        assert!(tree.resolve_at("rest", 1, 36).is_some());
     }
 
     #[test]

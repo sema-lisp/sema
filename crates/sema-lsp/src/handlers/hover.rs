@@ -1,7 +1,5 @@
 //! Hover (`textDocument/hover`).
 
-use std::path::Path;
-
 use tower_lsp::lsp_types::*;
 
 use crate::builtin_docs;
@@ -46,31 +44,73 @@ impl BackendState {
         // A user definition in this file shadows a builtin of the same name, so
         // check user definitions FIRST: hovering a redefined `map` should show
         // the user's signature, not the builtin's doc.
-        if let Some(cached) = self.cached_parses.get(uri_str) {
-            // Only names are used here (ranges discarded), so the line context
-            // is irrelevant — pass &[] to skip UTF-16 mapping.
-            let defs =
-                user_definitions_from_ast(&cached.ast, &cached.span_map, &cached.symbol_spans, &[]);
-            if defs.iter().any(|(name, _)| name == &symbol) {
-                let mut hover_text = format!("```sema\n({symbol}");
-                if let Some(params) = extract_params_from_ast(&cached.ast, &symbol) {
-                    hover_text.push(' ');
-                    hover_text.push_str(&params);
+        if uri.to_file_path().is_err() {
+            if let Some(cached) = self.cached_parses.get(uri_str) {
+                // Only names are used here (ranges discarded), so the line context
+                // is irrelevant — pass &[] to skip UTF-16 mapping.
+                let defs = user_definitions_from_ast(
+                    &cached.ast,
+                    &cached.span_map,
+                    &cached.symbol_spans,
+                    &[],
+                );
+                if defs.iter().any(|(name, _)| name == &symbol) {
+                    let mut hover_text = format!("```sema\n({symbol}");
+                    if let Some(params) = extract_params_from_ast(&cached.ast, &symbol) {
+                        hover_text.push(' ');
+                        hover_text.push_str(&params);
+                    }
+                    hover_text.push_str(")\n```\n\n");
+                    if let Some(docstring) = extract_docstring_from_ast(&cached.ast, &symbol) {
+                        hover_text.push_str(&docstring);
+                        hover_text.push_str("\n\n");
+                    }
+                    hover_text.push_str("*User-defined*");
+                    return Some(Hover {
+                        contents: HoverContents::Markup(MarkupContent {
+                            kind: MarkupKind::Markdown,
+                            value: hover_text,
+                        }),
+                        range: None,
+                    });
                 }
-                hover_text.push_str(")\n```\n\n");
-                if let Some(docstring) = extract_docstring_from_ast(&cached.ast, &symbol) {
-                    hover_text.push_str(&docstring);
+            }
+        }
+
+        // Imported and re-exported definitions shadow builtins.
+        self.prepare_navigation_index(uri);
+        if let Some((file, definition)) = self.visible_indexed_definition(uri, &symbol, *position) {
+            let mut hover_text = format!("```sema\n({symbol}");
+            if let Some(params) = &definition.params {
+                hover_text.push(' ');
+                hover_text.push_str(params);
+            }
+            hover_text.push_str(")\n```\n\n");
+            let is_current_file = uri
+                .to_file_path()
+                .ok()
+                .is_some_and(|path| canonicalize_or_raw(&path) == file.path);
+            if is_current_file {
+                if let Some(docstring) = &definition.docstring {
+                    hover_text.push_str(docstring);
                     hover_text.push_str("\n\n");
                 }
                 hover_text.push_str("*User-defined*");
-                return Some(Hover {
-                    contents: HoverContents::Markup(MarkupContent {
-                        kind: MarkupKind::Markdown,
-                        value: hover_text,
-                    }),
-                    range: None,
-                });
+            } else {
+                let module_name = file
+                    .path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("module");
+                hover_text.push_str(&format!("*Imported from `{module_name}`*"));
             }
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: hover_text,
+                }),
+                range: None,
+            });
         }
 
         // Builtin docs (rendered markdown), for names the user hasn't redefined.
@@ -106,67 +146,6 @@ impl BackendState {
             });
         }
 
-        // Phase 3c: Check imported modules for hover info
-        {
-            let cached = self.cached_parses.get(uri_str)?;
-            let import_paths = import_paths_from_ast(&cached.ast);
-            for path_str in &import_paths {
-                let resolved = match resolve_import_path(uri, path_str) {
-                    Some(p) if p.exists() => p,
-                    _ => continue,
-                };
-                let import_cached = match self.get_import_cache(&resolved) {
-                    Some(c) => c,
-                    None => continue,
-                };
-                // Names only; ranges discarded — &[] skips UTF-16 mapping.
-                let target_defs = user_definitions_from_ast(
-                    &import_cached.parsed.ast,
-                    &import_cached.parsed.span_map,
-                    &import_cached.parsed.symbol_spans,
-                    &[],
-                );
-                if target_defs.iter().any(|(n, _)| n == &symbol) {
-                    let module_name = Path::new(path_str)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(path_str);
-                    let mut hover_text = format!("```sema\n({symbol}");
-                    if let Some(params) =
-                        extract_params_from_ast(&import_cached.parsed.ast, &symbol)
-                    {
-                        hover_text.push(' ');
-                        hover_text.push_str(&params);
-                    }
-                    hover_text.push_str(&format!(")\n```\n\n*Imported from `{module_name}`*"));
-                    return Some(Hover {
-                        contents: HoverContents::Markup(MarkupContent {
-                            kind: MarkupKind::Markdown,
-                            value: hover_text,
-                        }),
-                        range: None,
-                    });
-                }
-            }
-        }
-
-        // Fall back to a workspace-wide search (other open documents, then
-        // still-fresh scanned files), mirroring goto-definition Phase 3d.
-        // Attributed as "Defined in" so the user can tell a workspace match
-        // from an explicit import ("Imported from").
-        let (ast, module_name) = self.find_workspace_definition(uri, &symbol)?;
-        let mut hover_text = format!("```sema\n({symbol}");
-        if let Some(params) = extract_params_from_ast(ast, &symbol) {
-            hover_text.push(' ');
-            hover_text.push_str(&params);
-        }
-        hover_text.push_str(&format!(")\n```\n\n*Defined in `{module_name}`*"));
-        Some(Hover {
-            contents: HoverContents::Markup(MarkupContent {
-                kind: MarkupKind::Markdown,
-                value: hover_text,
-            }),
-            range: None,
-        })
+        None
     }
 }

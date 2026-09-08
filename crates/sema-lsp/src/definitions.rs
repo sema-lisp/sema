@@ -57,23 +57,98 @@ pub(crate) const SYMBOL_HEADS: &[&str] = &[
     "defpolicy",
 ];
 
-/// Flatten `forms` so that any `(module name (export ...) body...)` wrapper is
-/// replaced by its body — a module's definitions are reachable as if they were
-/// file-top-level for goto-definition/hover/completion purposes. Recurses into
-/// nested modules. Every other form (including forms that merely start with
-/// the symbol `module` but have no name/export slot) passes through unchanged.
+/// Flatten top-level containers whose bodies execute in the surrounding scope.
 pub(crate) fn flatten_module_forms(forms: &[sema_core::Value]) -> Vec<&sema_core::Value> {
     let mut out = Vec::new();
     for expr in forms {
         if let Some(items) = expr.as_list() {
-            if items.len() >= 2 && items[0].as_symbol().as_deref() == Some("module") {
-                out.extend(flatten_module_forms(&items[2..]));
-                continue;
+            if let Some(head) = items.first().and_then(sema_core::Value::as_symbol) {
+                if items.len() >= 2 && head == "module" {
+                    out.extend(flatten_module_forms(&items[2..]));
+                    continue;
+                }
+                if head == "begin" || head == "progn" {
+                    out.extend(flatten_module_forms(&items[1..]));
+                    continue;
+                }
             }
         }
         out.push(expr);
     }
     out
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ImportSpec {
+    pub(crate) path: String,
+    /// Start of the import form, used to model source-order visibility.
+    pub(crate) position: Position,
+    /// `None` imports every exported name; `Some` is a selective import.
+    pub(crate) selected: Option<std::collections::HashSet<String>>,
+    pub(crate) is_load: bool,
+}
+
+pub(crate) fn import_specs_from_ast(
+    ast: &[sema_core::Value],
+    span_map: &SpanMap,
+) -> Vec<ImportSpec> {
+    flatten_module_forms(ast)
+        .into_iter()
+        .filter_map(|expr| {
+            let items = expr.as_list()?;
+            let head = items.first()?.as_symbol()?;
+            if head != "import" && head != "load" {
+                return None;
+            }
+            let path = items.get(1)?.as_str()?.to_string();
+            let span = expr_span(expr, span_map)?;
+            let selected: std::collections::HashSet<String> = items[2..]
+                .iter()
+                .filter_map(sema_core::Value::as_symbol)
+                .collect();
+            Some(ImportSpec {
+                path,
+                position: Position::new(
+                    span.line.saturating_sub(1) as u32,
+                    span.col.saturating_sub(1) as u32,
+                ),
+                selected: (!selected.is_empty()).then_some(selected),
+                is_load: head == "load",
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn module_exports(
+    ast: &[sema_core::Value],
+) -> Option<std::collections::HashSet<String>> {
+    ast.iter().find_map(|expr| {
+        let module = expr.as_list()?;
+        (module.first()?.as_symbol()?.as_str() == "module").then_some(())?;
+        module.iter().skip(2).find_map(|form| {
+            let export = form.as_list()?;
+            (export.first()?.as_symbol()?.as_str() == "export").then(|| {
+                export[1..]
+                    .iter()
+                    .filter_map(sema_core::Value::as_symbol)
+                    .collect()
+            })
+        })
+    })
+}
+
+pub(crate) fn definition_is_visible(
+    name: &str,
+    exports: Option<&std::collections::HashSet<String>>,
+    import: &ImportSpec,
+) -> bool {
+    if !import.is_load && exports.is_some_and(|exports| !exports.contains(name)) {
+        return false;
+    }
+    import
+        .selected
+        .as_ref()
+        .is_none_or(|selected| selected.contains(name))
 }
 
 /// One match found while scanning for definitions: a form whose head is in
@@ -173,6 +248,15 @@ impl<'a> DefMatch<'a> {
         };
         items.get(start..).unwrap_or(&[])
     }
+
+    pub(crate) fn docstring(&self) -> Option<String> {
+        let body = self.body();
+        if body.len() < 2 {
+            return None;
+        }
+        let doc = body.first()?.as_str()?.trim();
+        (!doc.is_empty()).then(|| doc.to_string())
+    }
 }
 
 /// Walk `forms` (already module-flattened via [`flatten_module_forms`]),
@@ -205,6 +289,26 @@ pub(crate) fn scan_definitions<'a>(
         let form_range = form_span.map(|s| span_to_range(s, lines));
 
         match head.as_str() {
+            "define" | "def"
+                if items.get(1).is_some_and(|value| {
+                    value.as_vector().is_some() || value.as_map_ref().is_some()
+                }) =>
+            {
+                let mut names = Vec::new();
+                collect_formal_names(&items[1], &mut names);
+                for name in names {
+                    push_definition(
+                        &mut matches,
+                        &head,
+                        name,
+                        expr,
+                        (form_span, form_range),
+                        symbol_spans,
+                        lines,
+                    );
+                }
+                continue;
+            }
             "define-values" => {
                 if let Some(formals) = items.get(1) {
                     let mut names = Vec::new();
@@ -242,16 +346,30 @@ pub(crate) fn scan_definitions<'a>(
                         names.push(name);
                     }
                 }
+                let mut candidates: Vec<&(String, Span)> = symbol_spans
+                    .iter()
+                    .filter(|(_, span)| form_span.is_some_and(|form| form.contains(span)))
+                    .collect();
+                candidates.sort_by_key(|(_, span)| (span.line, span.col));
+                let mut next = 2usize;
                 for name in names {
-                    push_definition(
-                        &mut matches,
-                        &head,
+                    let found = candidates
+                        .iter()
+                        .enumerate()
+                        .skip(next)
+                        .find(|(_, (candidate, _))| candidate.as_str() == name);
+                    let name_range = found.map(|(index, (_, span))| {
+                        next = index + 1;
+                        span_to_range(span, lines)
+                    });
+                    matches.push(DefMatch {
+                        head: head.clone(),
                         name,
                         expr,
-                        (form_span, form_range),
-                        symbol_spans,
-                        lines,
-                    );
+                        form_range,
+                        name_range,
+                        is_shorthand: false,
+                    });
                 }
                 continue;
             }
@@ -572,7 +690,7 @@ pub fn document_symbols_from_ast(
 /// (see [`DefMatch`]) distinguishes a plain `(define x val)` (`VARIABLE`)
 /// from the `(define (f args) body)` function shorthand (`FUNCTION`) —
 /// only `define`/`def` can produce either shape.
-fn symbol_kind_for(head: &str, is_shorthand: bool) -> SymbolKind {
+pub(crate) fn symbol_kind_for(head: &str, is_shorthand: bool) -> SymbolKind {
     match head {
         "defun" | "defn" | "defworkflow" | "defmulti" | "define-record-type" => {
             SymbolKind::FUNCTION
@@ -594,7 +712,7 @@ fn symbol_kind_for(head: &str, is_shorthand: bool) -> SymbolKind {
 /// `defworkflow` also maps to `SymbolKind::FUNCTION` but its second slot is
 /// a doc string, not params (`(defworkflow name doc meta . body)` — see
 /// `DEFINITION_HEADS`' doc comment), so it deliberately falls to `None`.
-fn params_of(m: &DefMatch) -> Option<String> {
+pub(crate) fn params_of(m: &DefMatch) -> Option<String> {
     let items = m.expr.as_list()?;
     match m.head.as_str() {
         "defun" | "defn" => Some(sema_core::pretty_print(items.get(2)?, 80)),

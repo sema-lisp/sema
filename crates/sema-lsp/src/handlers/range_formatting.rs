@@ -8,6 +8,7 @@
 
 use tower_lsp::lsp_types::*;
 
+use crate::handlers::formatting::formatter_options;
 use crate::helpers::{top_level_ranges, utf16_to_byte_offset};
 use crate::state::BackendState;
 
@@ -53,10 +54,7 @@ impl BackendState {
         let end_byte = position_to_byte(&lines, &span.end);
         let slice = text.get(start_byte..end_byte)?;
 
-        let mut fmt_opts = sema_fmt::FormatOptions::default();
-        if options.tab_size > 0 {
-            fmt_opts.indent = options.tab_size as usize;
-        }
+        let fmt_opts = formatter_options(options);
         let formatted = sema_fmt::format_source(slice, &fmt_opts).ok()?;
 
         // `format_source` always emits a trailing newline; preserve the original slice's trailing
@@ -78,7 +76,7 @@ impl BackendState {
 
 /// True when `a` ends strictly before `b` starts (no overlap, not even touching).
 fn range_before(a: &Range, b: &Range) -> bool {
-    (a.end.line, a.end.character) < (b.start.line, b.start.character)
+    (a.end.line, a.end.character) <= (b.start.line, b.start.character)
 }
 
 /// Convert an LSP [`Position`] (UTF-16 columns) to a byte offset into the full document.

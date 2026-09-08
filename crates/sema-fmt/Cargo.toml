@@ -9,3 +9,4 @@ description = "Code formatter for Sema source files"
 [dependencies]
 sema-core.workspace = true
 sema-reader.workspace = true
+unicode-width.workspace = true

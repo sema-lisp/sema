@@ -927,8 +927,12 @@ pub fn find_enclosing_call(text: &str, line: u32, character: u32) -> Option<(Str
     let mut in_string = false;
     let mut escape = false;
     let mut in_comment = false;
+    let mut char_literal_end = 0;
 
     for (i, ch) in prefix.char_indices() {
+        if i < char_literal_end {
+            continue;
+        }
         if in_comment {
             if ch == '\n' {
                 in_comment = false;
@@ -950,6 +954,11 @@ pub fn find_enclosing_call(text: &str, line: u32, character: u32) -> Option<(Str
             continue;
         }
         match ch {
+            '#' => {
+                if let Some(end) = char_literal_end_at(prefix, i) {
+                    char_literal_end = end;
+                }
+            }
             ';' => in_comment = true,
             '"' => {
                 in_string = true;
@@ -1004,8 +1013,12 @@ pub fn find_enclosing_call(text: &str, line: u32, character: u32) -> Option<(Str
     let mut in_str = false;
     let mut esc = false;
     let mut in_cmt = false;
+    let mut char_literal_end = 0;
 
-    for ch in rest.chars() {
+    for (byte_idx, ch) in rest.char_indices() {
+        if byte_idx < char_literal_end {
+            continue;
+        }
         if in_cmt {
             if ch == '\n' {
                 in_cmt = false;
@@ -1031,6 +1044,14 @@ pub fn find_enclosing_call(text: &str, line: u32, character: u32) -> Option<(Str
             continue;
         }
         match ch {
+            '#' => {
+                if let Some(end) = char_literal_end_at(rest, byte_idx) {
+                    char_literal_end = end;
+                    if nest == 0 && !in_atom {
+                        in_atom = true;
+                    }
+                }
+            }
             ';' => {
                 in_cmt = true;
                 if nest == 0 && in_atom {
@@ -1075,4 +1096,23 @@ pub fn find_enclosing_call(text: &str, line: u32, character: u32) -> Option<(Str
     }
 
     Some((func_name.to_string(), arg_count))
+}
+
+/// Return the byte offset immediately after a character literal beginning at
+/// `start`. Delimiters such as `(` are valid character values, so scanners
+/// that only track strings must skip the whole `#\\…` token too.
+fn char_literal_end_at(source: &str, start: usize) -> Option<usize> {
+    let rest = source.get(start..)?.strip_prefix("#\\")?;
+    let mut chars = rest.char_indices();
+    let (_, first) = chars.next()?;
+    let consumed = if first.is_alphabetic() {
+        rest.char_indices()
+            .take_while(|&(_, ch)| is_sema_symbol_char(ch))
+            .last()
+            .map(|(idx, ch)| idx + ch.len_utf8())
+            .unwrap_or(first.len_utf8())
+    } else {
+        first.len_utf8()
+    };
+    Some(start + 2 + consumed)
 }

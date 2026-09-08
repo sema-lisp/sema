@@ -19,6 +19,7 @@ use std::borrow::Cow;
 
 use sema_core::SemaError;
 use sema_reader::lexer::{tokenize, FStringPart, SpannedToken, Token};
+use unicode_width::UnicodeWidthStr;
 
 // ---------------------------------------------------------------------------
 // Node tree — lightweight structure built from the flat token stream
@@ -496,18 +497,14 @@ fn measure_width(node: &Node, budget: usize) -> Option<usize> {
         Node::StringAtom(raw) => {
             if raw.contains('\n') {
                 None
-            } else if raw.len() <= budget {
-                Some(raw.len())
             } else {
-                None
+                let width = display_width(raw);
+                (width <= budget).then_some(width)
             }
         }
         Node::Comment(text) => {
-            if text.len() <= budget {
-                Some(text.len())
-            } else {
-                None
-            }
+            let width = display_width(text);
+            (width <= budget).then_some(width)
         }
         Node::Newline => Some(0),
         Node::List(children) => grouped_measure_width(children, 1, 1, budget),
@@ -519,7 +516,7 @@ fn measure_width(node: &Node, budget: usize) -> Option<usize> {
             grouped_measure_width(children, 5, 1, budget)
         }
         Node::Prefix(tok, inner) => {
-            let prefix_w = prefix_text(tok).len();
+            let prefix_w = display_width(prefix_text(tok));
             if prefix_w > budget {
                 return None;
             }
@@ -572,16 +569,16 @@ fn flat_width(node: &Node) -> usize {
 /// Compute the flat width of a token without allocating a String.
 fn token_width(tok: &Token) -> usize {
     match tok {
-        Token::Symbol(s) => s.len(),
-        Token::Keyword(s) => s.len() + 1, // ":" prefix
-        Token::String(s) => escape_string(s).len() + 2, // quotes
-        Token::Int(n) => n.to_string().len(),
-        Token::BigInt(n) => n.to_string().len(),
-        Token::Rational(r) => r.to_string().len(),
-        Token::Float(f) => format_float(*f).len(),
+        Token::Symbol(s) => display_width(s),
+        Token::Keyword(s) => display_width(s) + 1, // ":" prefix
+        Token::String(s) => display_width(&escape_string(s)) + 2, // quotes
+        Token::Int(n) => display_width(&n.to_string()),
+        Token::BigInt(n) => display_width(&n.to_string()),
+        Token::Rational(r) => display_width(&r.to_string()),
+        Token::Float(f) => display_width(&format_float(*f)),
         Token::Bool(true) => 2,
         Token::Bool(false) => 2,
-        Token::Char(c) => format_char(*c).len(),
+        Token::Char(c) => display_width(&format_char(*c)),
         Token::Dot => 1,
         Token::LParen | Token::RParen => 1,
         Token::LBracket | Token::RBracket => 1,
@@ -592,11 +589,13 @@ fn token_width(tok: &Token) -> usize {
         Token::ShortLambdaStart => 2,
         Token::BytevectorStart => 4,
         Token::F64ArrayStart | Token::I64ArrayStart => 5,
-        Token::Comment(text) => text.len(),
+        Token::Comment(text) => display_width(text),
         Token::Newline => 1,
         // FString, Regex, and Complex have variable-length formatted output —
         // fall back to token_text for correctness (rare in width measurement).
-        Token::FString(_) | Token::Regex(_) | Token::Complex(_, _) => token_text(tok).len(),
+        Token::FString(_) | Token::Regex(_) | Token::Complex(_, _) => {
+            display_width(&token_text(tok))
+        }
     }
 }
 
@@ -763,8 +762,8 @@ impl Formatter {
     /// Column where the next character will land on the current output line.
     fn current_col(&self) -> usize {
         match self.output.rfind('\n') {
-            Some(pos) => self.output.len() - pos - 1,
-            None => self.output.len(),
+            Some(pos) => display_width(&self.output[pos + 1..]),
+            None => display_width(&self.output),
         }
     }
 
@@ -885,7 +884,7 @@ impl Formatter {
             return false;
         }
         let one_line = flat_string(children, open, close);
-        if indent + one_line.len() > self.width {
+        if indent.saturating_add(display_width(&one_line)) > self.width {
             return false;
         }
         self.output.push_str(&one_line);
@@ -2423,11 +2422,9 @@ impl Formatter {
     }
 }
 
-/// Column width of a rendered fragment: characters, not bytes, so non-ASCII
-/// symbols and strings don't skew alignment padding. (An approximation —
-/// combining marks and wide CJK glyphs still count as one column each.)
+/// Terminal column width of a rendered fragment.
 fn display_width(s: &str) -> usize {
-    s.chars().count()
+    UnicodeWidthStr::width(s)
 }
 
 /// Render a single node as a flat (single-line) string.
@@ -2501,6 +2498,30 @@ pub struct FormatOptions {
     pub max_blank_lines: usize,
 }
 
+impl FormatOptions {
+    /// Largest supported indentation width.
+    ///
+    /// Formatter nesting is bounded, so this keeps indentation allocation and
+    /// arithmetic bounded for values supplied through the CLI, config, or API.
+    pub const MAX_INDENT: usize = 256;
+
+    /// Validate options supplied by a caller.
+    pub fn validate(&self) -> Result<(), SemaError> {
+        if self.indent == 0 {
+            return Err(SemaError::eval(
+                "formatter indent must be at least one space",
+            ));
+        }
+        if self.indent > Self::MAX_INDENT {
+            return Err(SemaError::eval(format!(
+                "formatter indent must not exceed {} spaces",
+                Self::MAX_INDENT
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl Default for FormatOptions {
     fn default() -> Self {
         Self {
@@ -2527,6 +2548,8 @@ impl Default for FormatOptions {
 /// assert_eq!(out, "(+ 1 2)\n");
 /// ```
 pub fn format_source(input: &str, opts: &FormatOptions) -> Result<String, SemaError> {
+    opts.validate()?;
+
     if input.is_empty() {
         return Ok(String::new());
     }

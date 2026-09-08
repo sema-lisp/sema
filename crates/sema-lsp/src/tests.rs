@@ -1302,7 +1302,7 @@ fn let_binding_is_not_visible_in_its_initializer() {
 
 #[test]
 fn scope_tree_covers_multiple_value_and_match_forms() {
-    let src = "(define-values (a b) (values 1 2))\n(let-values (((x y) (values a b))) (match* (list x y) ((p q) (+ p q))))\n(defmulti choose (x))";
+    let src = "(define-values (a b) (values 1 2))\n(let-values (((x y) (values a b))) (match* (list x y) ([p q] (+ p q))))\n(defmulti choose (x))";
     let (ast, spans, symbols) = sema_reader::read_many_with_symbol_spans(src).unwrap();
     let tree = scope::ScopeTree::build(&ast, &spans, &symbols);
     for name in ["a", "b", "choose"] {
@@ -2547,6 +2547,23 @@ fn references_top_level_skips_shadowing_param() {
     );
 }
 
+#[test]
+fn references_select_the_nearest_shadowing_let_star_binding() {
+    let (state, uri) = parsed_state("file:///let-star-shadow.sema", "(let* ((x 1) (x 2)) x)");
+    let refs = state.handle_references(
+        &uri,
+        &Position {
+            line: 0,
+            character: 20,
+        },
+    );
+    let starts: Vec<u32> = refs
+        .iter()
+        .map(|location| location.range.start.character)
+        .collect();
+    assert_eq!(starts, vec![14, 20]);
+}
+
 // prepare_rename must accept the cursor sitting at the END of a symbol:
 // extract_symbol_at (and therefore rename itself) treats end-of-token as
 // on-symbol, and prepare/rename must agree or the client aborts the rename.
@@ -2643,6 +2660,37 @@ fn completion_offers_symbols_from_scanned_workspace_files() {
         greet.detail.as_deref(),
         Some("(name)"),
         "params from the scanned definition must surface as detail"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn completion_offers_symbols_from_other_open_documents() {
+    let dir = unique_temp_dir("comp-open-document");
+    let main_uri = Url::from_file_path(dir.join("main.sema")).unwrap();
+    let library_uri = Url::from_file_path(dir.join("library.sema")).unwrap();
+    let (mut state, main_uri) = parsed_state(main_uri.as_str(), "(gre)\n");
+    insert_parsed_doc(
+        &mut state,
+        library_uri.as_str(),
+        "(defun greet (name) name)\n",
+    );
+
+    let items = state.handle_complete(
+        &main_uri,
+        &Position {
+            line: 0,
+            character: 4,
+        },
+    );
+    let greet = items
+        .iter()
+        .find(|item| item.label == "greet")
+        .expect("open-document symbol must be offered");
+    assert_eq!(greet.detail.as_deref(), Some("(name)"));
+    assert_eq!(
+        greet.data,
+        Some(serde_json::Value::String(library_uri.to_string()))
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2802,6 +2850,45 @@ fn call_hierarchy_outgoing_finds_callee_in_scanned_file() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[test]
+fn call_hierarchy_finds_calls_nested_in_vectors_and_maps() {
+    let src = "(defun helper (x) x)\n(defun main () [(helper 1) {:value (helper 2)}])";
+    let (state, uri) = parsed_state("file:///call-containers.sema", src);
+    let item = state
+        .handle_call_hierarchy_prepare(
+            &uri,
+            &Position {
+                line: 1,
+                character: 8,
+            },
+        )
+        .expect("prepare main")
+        .remove(0);
+    let outgoing = state
+        .handle_call_hierarchy_outgoing(&item)
+        .expect("outgoing calls");
+    assert_eq!(outgoing.len(), 1);
+    assert_eq!(outgoing[0].to.name, "helper");
+    assert_eq!(outgoing[0].from_ranges.len(), 2);
+
+    let helper = state
+        .handle_call_hierarchy_prepare(
+            &uri,
+            &Position {
+                line: 0,
+                character: 8,
+            },
+        )
+        .expect("prepare helper")
+        .remove(0);
+    let incoming = state
+        .handle_call_hierarchy_incoming(&helper)
+        .expect("incoming calls");
+    assert_eq!(incoming.len(), 1);
+    assert_eq!(incoming[0].from.name, "main");
+    assert_eq!(incoming[0].from_ranges.len(), 2);
+}
+
 // ── hover / signature help: workspace-wide fallback ──────────
 
 #[test]
@@ -2928,6 +3015,22 @@ fn signature_help_finds_definition_in_scanned_workspace_file() {
     assert_eq!(help.signatures.len(), 1);
     assert_eq!(help.signatures[0].label, "(greet name)");
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn signature_help_counts_character_literal_delimiters_as_one_argument() {
+    let src = "(defun f (first second) first)\n(f #\\( )";
+    let (mut state, uri) = parsed_state("file:///signature-char.sema", src);
+    let help = state
+        .handle_signature_help(
+            &uri,
+            &Position {
+                line: 1,
+                character: 7,
+            },
+        )
+        .expect("signature help");
+    assert_eq!(help.active_parameter, Some(1));
 }
 
 // ── workspace scanner ────────────────────────────────────────

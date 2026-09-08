@@ -3443,6 +3443,7 @@ version = "1.36.0"
 dependencies = [
  "sema-core",
  "sema-reader",
+ "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -3683,6 +3684,7 @@ dependencies = [
  "unicode-normalization",
  "unicode-segmentation",
  "unicode-width 0.1.14",
+ "url",
  "uuid",
  "zip",
 ]
@@ -3703,6 +3705,7 @@ dependencies = [
  "sema-reader",
  "sema-stdlib",
  "smallvec",
+ "stacker",
  "web-time",
 ]
 

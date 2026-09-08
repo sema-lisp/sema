@@ -1327,6 +1327,9 @@ fn main() {
                     align: align.unwrap_or(config.fmt.align),
                     max_blank_lines: max_blank_lines.unwrap_or(config.fmt.max_blank_lines),
                 };
+                if let Err(error) = opts.validate() {
+                    die(error);
+                }
                 fmt::run_fmt(&files, check, diff, &opts, &config.fmt.ignore, json);
             }
             Commands::Lsp => {

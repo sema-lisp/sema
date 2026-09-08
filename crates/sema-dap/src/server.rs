@@ -1035,10 +1035,8 @@ fn backend_thread(
                     // uncaught-exception filter enabled, stop and let the user
                     // inspect before the session ends: the program cannot resume
                     // past an uncaught error, so any resume/disconnect just
-                    // propagates it. The root's VM was consumed by the runtime and
-                    // its frames are unwound, so inspection is best-effort (an empty
-                    // stack) — parity with the legacy in-VM exception park, which
-                    // also ran after unwinding. A throwaway VM serves the park loop.
+                    // propagates it. The root's VM has unwound, so a throwaway VM
+                    // serves the park loop with the captured error frames.
                     if result.is_err() && ds.break_on_uncaught {
                         if let Err(ref e) = result {
                             ds.last_exception = Some(e.to_string());
@@ -1050,6 +1048,11 @@ fn backend_thread(
                         if let Ok(mut park_vm) =
                             sema_vm::VM::new(interpreter.global_env.clone(), Vec::new(), &[], 0)
                         {
+                            if let Err(ref error) = result {
+                                if let Some(trace) = error.stack_trace() {
+                                    park_vm.set_debug_exception_stack_trace(trace);
+                                }
+                            }
                             park_vm.debug_exception_park(&interpreter.ctx, ds);
                         }
                     }

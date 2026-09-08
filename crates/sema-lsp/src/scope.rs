@@ -166,7 +166,22 @@ impl ScopeTree {
     ) {
         let items = match expr.as_list() {
             Some(items) if !items.is_empty() => items,
-            _ => return,
+            _ => {
+                // Vectors and maps are evaluated expressions too. They do not
+                // have SpanMap entries of their own, but their nested lists can
+                // introduce lexical scopes.
+                if let Some(items) = expr.as_vector() {
+                    for item in items {
+                        self.walk_expr(item, parent_scope, span_map, symbol_spans);
+                    }
+                } else if let Some(map) = expr.as_map_ref() {
+                    for (key, value) in map.iter() {
+                        self.walk_expr(key, parent_scope, span_map, symbol_spans);
+                        self.walk_expr(value, parent_scope, span_map, symbol_spans);
+                    }
+                }
+                return;
+            }
         };
 
         let head = match items[0].as_symbol() {
@@ -229,7 +244,7 @@ impl ScopeTree {
                     self.collect_param_binding(
                         formals,
                         parent_scope,
-                        &form_span,
+                        &expr_span(formals, span_map).unwrap_or(form_span),
                         span_map,
                         symbol_spans,
                     );
@@ -323,7 +338,7 @@ impl ScopeTree {
                     self.collect_param_binding(
                         param,
                         body_scope_idx,
-                        &form_span,
+                        &sig_span.unwrap_or(form_span),
                         span_map,
                         symbol_spans,
                     );
@@ -369,7 +384,13 @@ impl ScopeTree {
 
             // Bind parameters
             if let Some(params) = items[2].as_list() {
-                self.bind_params(params, body_scope_idx, &form_span, span_map, symbol_spans);
+                self.bind_params(
+                    params,
+                    body_scope_idx,
+                    &expr_span(&items[2], span_map).unwrap_or(form_span),
+                    span_map,
+                    symbol_spans,
+                );
             }
 
             // Recurse into body
@@ -404,7 +425,13 @@ impl ScopeTree {
         // Bind parameters (from list or vector)
         let params: Option<&[Value]> = items[1].as_list().or_else(|| items[1].as_vector());
         if let Some(params) = params {
-            self.bind_params(params, body_scope_idx, &form_span, span_map, symbol_spans);
+            self.bind_params(
+                params,
+                body_scope_idx,
+                &expr_span(&items[1], span_map).unwrap_or(form_span),
+                span_map,
+                symbol_spans,
+            );
         }
 
         // Recurse into body
@@ -455,7 +482,7 @@ impl ScopeTree {
                                 self.collect_param_binding(
                                     &pair[0],
                                     body_scope_idx,
-                                    &form_span,
+                                    &expr_span(binding, span_map).unwrap_or(form_span),
                                     span_map,
                                     symbol_spans,
                                 );
@@ -487,7 +514,7 @@ impl ScopeTree {
                         self.collect_param_binding(
                             &pair[0],
                             body_scope_idx,
-                            &form_span,
+                            &expr_span(binding, span_map).unwrap_or(form_span),
                             span_map,
                             symbol_spans,
                         );
@@ -539,7 +566,7 @@ impl ScopeTree {
                         self.collect_param_binding(
                             &pair[0],
                             new_scope_idx,
-                            &form_span,
+                            &expr_span(binding, span_map).unwrap_or(form_span),
                             span_map,
                             symbol_spans,
                         );
@@ -592,7 +619,7 @@ impl ScopeTree {
                 self.collect_param_binding(
                     &pair[0],
                     next_scope,
-                    &form_span,
+                    &expr_span(binding, span_map).unwrap_or(form_span),
                     span_map,
                     symbol_spans,
                 );
@@ -615,7 +642,7 @@ impl ScopeTree {
                     self.collect_param_binding(
                         &pair[0],
                         body_scope_idx,
-                        &form_span,
+                        &expr_span(binding, span_map).unwrap_or(form_span),
                         span_map,
                         symbol_spans,
                     );
@@ -695,7 +722,7 @@ impl ScopeTree {
                         self.collect_param_binding(
                             &pair[0],
                             body_scope_idx,
-                            &form_span,
+                            &expr_span(binding, span_map).unwrap_or(form_span),
                             span_map,
                             symbol_spans,
                         );
@@ -982,34 +1009,9 @@ impl ScopeTree {
             if name != "_" && name != "true" && name != "false" && name != "nil" {
                 self.bind_symbol(scope_idx, name, enclosing_span, symbol_spans);
             }
-        } else if let Some(items) = pattern.as_list() {
-            // (cons h t) or (list a b c) — skip the head keyword
-            if !items.is_empty() {
-                if let Some(head) = items[0].as_symbol() {
-                    if matches!(head.as_str(), "cons" | "list" | "quote" | "vector") {
-                        for item in &items[1..] {
-                            self.collect_pattern_bindings(
-                                item,
-                                scope_idx,
-                                enclosing_span,
-                                span_map,
-                                symbol_spans,
-                            );
-                        }
-                        return;
-                    }
-                }
-                // Generic list pattern
-                for item in items {
-                    self.collect_pattern_bindings(
-                        item,
-                        scope_idx,
-                        enclosing_span,
-                        span_map,
-                        symbol_spans,
-                    );
-                }
-            }
+        } else if pattern.as_list().is_some() {
+            // Lists are literal match patterns. Only vectors and maps bind
+            // names recursively; see `sema_eval::destructure::match_into`.
         } else if let Some(items) = pattern.as_vector() {
             for item in items {
                 self.collect_pattern_bindings(
@@ -1347,6 +1349,48 @@ mod tests {
     }
 
     #[test]
+    fn let_star_shadowing_uses_the_second_binding_span() {
+        let src = "(let* ((x 1) (x 2)) x)";
+        let (tree, symbols) = build_scope(src);
+        let xs: Vec<Span> = symbols
+            .iter()
+            .filter(|(name, _)| name == "x")
+            .map(|(_, span)| *span)
+            .collect();
+        assert_eq!(xs.len(), 3);
+
+        let body = tree.resolve_at("x", xs[2].line, xs[2].col).unwrap();
+        assert_eq!(body.def_span, xs[1]);
+        assert_eq!(
+            tree.find_scope_aware_references("x", xs[2].line, xs[2].col, &symbols),
+            vec![xs[1], xs[2]]
+        );
+    }
+
+    #[test]
+    fn nested_lambda_shadowing_uses_the_inner_parameter_span() {
+        let src = "(lambda (x) (lambda (x) x))";
+        let (tree, symbols) = build_scope(src);
+        let xs: Vec<Span> = symbols
+            .iter()
+            .filter(|(name, _)| name == "x")
+            .map(|(_, span)| *span)
+            .collect();
+        assert_eq!(xs.len(), 3);
+
+        let body = tree.resolve_at("x", xs[2].line, xs[2].col).unwrap();
+        assert_eq!(body.def_span, xs[1]);
+    }
+
+    #[test]
+    fn scopes_nested_in_vectors_and_maps_are_walked() {
+        let src = "[(lambda (x) x)]\n{:value (lambda (y) y)}";
+        let (tree, _) = build_scope(src);
+        assert!(tree.is_locally_scoped("x", 1, 14));
+        assert!(tree.is_locally_scoped("y", 2, 21));
+    }
+
+    #[test]
     fn define_function_shorthand() {
         let src = "(define (square x) (* x x))";
         let (tree, _) = build_scope(src);
@@ -1667,11 +1711,11 @@ mod tests {
     }
 
     #[test]
-    fn match_cons_pattern_binds_parts() {
+    fn match_list_pattern_is_literal() {
         let src = "(match lst ((cons h t) (+ h t)))";
         let (tree, _) = build_scope(src);
-        assert!(tree.is_locally_scoped("h", 1, 25));
-        assert!(tree.is_locally_scoped("t", 1, 27));
+        assert!(!tree.is_locally_scoped("h", 1, 25));
+        assert!(!tree.is_locally_scoped("t", 1, 27));
     }
 
     #[test]

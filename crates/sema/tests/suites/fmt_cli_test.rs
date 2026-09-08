@@ -167,6 +167,31 @@ fn fmt_rejects_malformed_config() {
 }
 
 #[test]
+fn fmt_rejects_unsafe_indent_from_config() {
+    let dir = tempdir("unsafe-indent");
+    write(&dir, "sema.toml", "[fmt]\nindent = 18446744073709551615\n");
+    write(&dir, "main.sema", UGLY);
+    let status = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["fmt", "main.sema"])
+        .current_dir(dir)
+        .status()
+        .unwrap();
+    assert!(!status.success());
+}
+
+#[test]
+fn fmt_rejects_unsafe_indent_from_cli() {
+    let dir = tempdir("unsafe-indent-cli");
+    write(&dir, "main.sema", UGLY);
+    let status = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["fmt", "--indent", "18446744073709551615", "main.sema"])
+        .current_dir(dir)
+        .status()
+        .unwrap();
+    assert!(!status.success());
+}
+
+#[test]
 fn fmt_accepts_literal_paths_with_glob_characters() {
     let dir = tempdir("literal-glob");
     write(&dir, "name[1].sema", UGLY);

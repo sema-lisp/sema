@@ -244,6 +244,27 @@ pub(crate) fn collect_call_sites(
                 }
             }
             collect_call_sites(items, span_map, symbol_spans, lines, target, out);
+        } else if let Some(items) = expr.as_vector() {
+            collect_call_sites(items, span_map, symbol_spans, lines, target, out);
+        } else if let Some(map) = expr.as_map_ref() {
+            for (key, value) in map.iter() {
+                collect_call_sites(
+                    std::slice::from_ref(key),
+                    span_map,
+                    symbol_spans,
+                    lines,
+                    target,
+                    out,
+                );
+                collect_call_sites(
+                    std::slice::from_ref(value),
+                    span_map,
+                    symbol_spans,
+                    lines,
+                    target,
+                    out,
+                );
+            }
         }
     }
 }
@@ -270,6 +291,27 @@ pub(crate) fn collect_outgoing_calls(
                 }
             }
             collect_outgoing_calls(items, span_map, symbol_spans, lines, index, out);
+        } else if let Some(items) = expr.as_vector() {
+            collect_outgoing_calls(items, span_map, symbol_spans, lines, index, out);
+        } else if let Some(map) = expr.as_map_ref() {
+            for (key, value) in map.iter() {
+                collect_outgoing_calls(
+                    std::slice::from_ref(key),
+                    span_map,
+                    symbol_spans,
+                    lines,
+                    index,
+                    out,
+                );
+                collect_outgoing_calls(
+                    std::slice::from_ref(value),
+                    span_map,
+                    symbol_spans,
+                    lines,
+                    index,
+                    out,
+                );
+            }
         }
     }
 }

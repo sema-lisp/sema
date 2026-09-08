@@ -1939,3 +1939,27 @@ fn test_max_blank_lines() {
         "should be idempotent"
     );
 }
+
+#[test]
+fn unicode_width_controls_flat_layout() {
+    let input = "(foo λ λ λ λ λ λ λ λ λ λ λ λ λ λ λ λ λ λ λ λ)";
+    let options = opts(50, 2, false);
+
+    assert_eq!(
+        format_source(input, &options).unwrap(),
+        format!("{input}\n")
+    );
+}
+
+#[test]
+fn rejects_unsafe_indent_from_public_api() {
+    for indent in [0, usize::MAX] {
+        let options = FormatOptions {
+            indent,
+            ..Default::default()
+        };
+
+        let error = format_source("(define x 1)", &options).unwrap_err();
+        assert!(error.to_string().contains("formatter indent"));
+    }
+}

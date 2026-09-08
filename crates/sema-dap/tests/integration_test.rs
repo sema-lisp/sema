@@ -505,15 +505,25 @@ fn test_dap_exception_breakpoint_stops_on_uncaught_error() {
         "exceptionInfo should carry a non-empty description"
     );
 
+    send_dap(&mut stdin, 6, "stackTrace", Some(serde_json::json!({})));
+    let resp = read_dap(&mut reader).unwrap();
+    let frames = resp["body"]["stackFrames"]
+        .as_array()
+        .expect("stackTrace should return frames");
+    assert!(
+        !frames.is_empty(),
+        "uncaught exception stop should retain its captured call stack: {resp}"
+    );
+
     // Continue past the exception stop: the session terminates.
-    send_dap(&mut stdin, 6, "continue", Some(serde_json::json!({})));
+    send_dap(&mut stdin, 7, "continue", Some(serde_json::json!({})));
     let _resp = read_dap(&mut reader).unwrap();
     assert!(
         wait_for_event(&mut reader, "terminated", 50),
         "session should terminate after the uncaught exception"
     );
 
-    send_dap(&mut stdin, 7, "disconnect", None);
+    send_dap(&mut stdin, 8, "disconnect", None);
     let _ = read_dap(&mut reader);
     let _ = child.wait();
 

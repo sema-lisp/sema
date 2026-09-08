@@ -92,6 +92,34 @@ impl BackendState {
         // request is the same pattern references and rename use.
         let mut emitted: std::collections::HashSet<String> =
             items.iter().map(|i| i.label.clone()).collect();
+
+        // Other open documents are already parsed and can contain definitions
+        // that have not been written to disk yet. Goto-definition and hover
+        // search them, so completion must expose the same workspace view.
+        let mut open_documents: Vec<_> = self
+            .cached_parses
+            .iter()
+            .filter(|(other_uri, _)| other_uri.as_str() != uri_str)
+            .collect();
+        open_documents.sort_by(|a, b| a.0.cmp(b.0));
+        for (other_uri, parsed) in open_documents {
+            let defs =
+                user_definitions_from_ast(&parsed.ast, &parsed.span_map, &parsed.symbol_spans, &[]);
+            for (name, _) in defs {
+                if !(prefix.is_empty() || name.starts_with(prefix)) || emitted.contains(&name) {
+                    continue;
+                }
+                emitted.insert(name.clone());
+                items.push(CompletionItem {
+                    detail: extract_params_from_ast(&parsed.ast, &name),
+                    label: name,
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    data: Some(serde_json::Value::String(other_uri.clone())),
+                    ..Default::default()
+                });
+            }
+        }
+
         let mut scanned: Vec<_> = self
             .import_cache
             .iter()

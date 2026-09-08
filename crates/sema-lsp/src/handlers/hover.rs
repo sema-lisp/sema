@@ -21,6 +21,28 @@ impl BackendState {
             return None;
         }
 
+        let cached = self.cached_parses.get(uri_str)?;
+        let sema_line = position.line as usize + 1;
+        let sema_col = utf16_to_char_col(line, position.character as usize);
+        if !cached
+            .symbol_spans
+            .iter()
+            .any(|(name, span)| name == &symbol && span.contains_pos(sema_line, sema_col))
+        {
+            return None;
+        }
+        if let Some(resolved) = cached.scope_tree.resolve_at(&symbol, sema_line, sema_col) {
+            if !resolved.is_top_level {
+                return Some(Hover {
+                    contents: HoverContents::Markup(MarkupContent {
+                        kind: MarkupKind::Markdown,
+                        value: format!("```sema\n{symbol}\n```\n\n*Local binding*"),
+                    }),
+                    range: None,
+                });
+            }
+        }
+
         // A user definition in this file shadows a builtin of the same name, so
         // check user definitions FIRST: hovering a redefined `map` should show
         // the user's signature, not the builtin's doc.

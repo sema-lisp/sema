@@ -303,7 +303,8 @@ fn parsed_state(uri: &str, source: &str) -> (BackendState, Url) {
     let mut state = BackendState::new_without_builtins(HashMap::new(), "sema".to_string());
     let (ast, span_map, symbol_spans) = sema_reader::read_many_with_symbol_spans(source).unwrap();
     // Mirror the production build path (server.rs / state.rs): drop quoted symbols.
-    let symbol_spans = crate::helpers::filter_quoted_symbol_spans(&ast, &span_map, symbol_spans);
+    let symbol_spans =
+        crate::helpers::filter_quoted_symbol_spans(&ast, &span_map, symbol_spans, source);
     let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
     state.cached_parses.insert(
         uri.to_string(),
@@ -1236,6 +1237,128 @@ fn import_path_on_correct_line_multiline() {
     let src = "(define x 1)\n(import \"utils.sema\")";
     let path = import_path_at_cursor(src, 1, 10);
     assert_eq!(path, Some("utils.sema".to_string()));
+}
+
+#[test]
+fn import_path_requires_cursor_on_path_string() {
+    let src = "(import \"utils.sema\" helper)";
+    assert_eq!(import_path_at_cursor(src, 0, 3), None);
+    assert_eq!(import_path_at_cursor(src, 0, 22), None);
+}
+
+#[test]
+fn import_path_selects_the_string_under_cursor_when_imports_share_a_line() {
+    let src = "(import \"first.sema\") (load \"second.sema\")";
+    assert_eq!(import_path_at_cursor(src, 0, 10), Some("first.sema".into()));
+    assert_eq!(
+        import_path_at_cursor(src, 0, 31),
+        Some("second.sema".into())
+    );
+}
+
+#[test]
+fn user_definitions_index_all_bindings_from_multi_name_forms() {
+    let src = "(define-values (left right) (values 1 2))\n\
+               (define-syntax unless (syntax-rules () ((_ test body) (if test nil body))))\n\
+               (defmulti dispatch (value))\n\
+               (define-record-type point (make-point x y) point? (x point-x) (y point-y))";
+    let names = user_definitions(src);
+    for name in [
+        "left",
+        "right",
+        "unless",
+        "dispatch",
+        "make-point",
+        "point?",
+        "point-x",
+        "point-y",
+    ] {
+        assert!(
+            names.contains(&name.to_string()),
+            "missing {name}: {names:?}"
+        );
+    }
+    assert!(
+        !names.contains(&"point".to_string()),
+        "record type labels are not runtime bindings: {names:?}"
+    );
+}
+
+#[test]
+fn let_binding_is_not_visible_in_its_initializer() {
+    let src = "(let ((x x)) x)";
+    let (ast, spans, symbols) = sema_reader::read_many_with_symbol_spans(src).unwrap();
+    let tree = scope::ScopeTree::build(&ast, &spans, &symbols);
+    let xs: Vec<_> = symbols.iter().filter(|(name, _)| name == "x").collect();
+    assert_eq!(xs.len(), 3);
+    assert!(tree.resolve_at("x", xs[1].1.line, xs[1].1.col).is_none());
+    assert!(
+        !tree
+            .resolve_at("x", xs[2].1.line, xs[2].1.col)
+            .unwrap()
+            .is_top_level
+    );
+}
+
+#[test]
+fn scope_tree_covers_multiple_value_and_match_forms() {
+    let src = "(define-values (a b) (values 1 2))\n(let-values (((x y) (values a b))) (match* (list x y) ((p q) (+ p q))))\n(defmulti choose (x))";
+    let (ast, spans, symbols) = sema_reader::read_many_with_symbol_spans(src).unwrap();
+    let tree = scope::ScopeTree::build(&ast, &spans, &symbols);
+    for name in ["a", "b", "choose"] {
+        let use_span = symbols
+            .iter()
+            .rev()
+            .find(|(candidate, _)| candidate == name)
+            .unwrap()
+            .1;
+        assert!(
+            tree.resolve_at(name, use_span.line, use_span.col).is_some(),
+            "{name}"
+        );
+    }
+    for name in ["x", "y", "p", "q"] {
+        let use_span = symbols
+            .iter()
+            .rev()
+            .find(|(candidate, span)| candidate == name && span.line == 2)
+            .unwrap()
+            .1;
+        assert!(
+            !tree
+                .resolve_at(name, use_span.line, use_span.col)
+                .unwrap_or_else(|| panic!("{name} did not resolve"))
+                .is_top_level,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn hover_reports_local_binding_and_ignores_comment_text() {
+    let (mut state, uri) = parsed_state("file:///hover-local.sema", "(let ((map 1)) map)\n; map\n");
+    let local = state
+        .handle_hover(
+            &uri,
+            &Position {
+                line: 0,
+                character: 16,
+            },
+        )
+        .unwrap();
+    let HoverContents::Markup(local) = local.contents else {
+        panic!("markup")
+    };
+    assert!(local.value.contains("Local binding"));
+    assert!(state
+        .handle_hover(
+            &uri,
+            &Position {
+                line: 1,
+                character: 3
+            }
+        )
+        .is_none());
 }
 
 // ── resolve_import_path ──────────────────────────────────────
@@ -2343,6 +2466,69 @@ fn rename_and_references_ignore_quoted_symbols() {
 }
 
 #[test]
+fn rename_and_references_ignore_quoted_vectors_and_maps() {
+    let src = "(define vector-only 1)\n(define map-only 2)\n'[vector-only]\n'{:right map-only :left map-only}\n(+ vector-only map-only)";
+    let (state, uri) = parsed_state("file:///quoted-compounds.sema", src);
+    let vector_code_pos = Position {
+        line: 4,
+        character: 3,
+    };
+
+    assert!(
+        state.cached_parses[uri.as_str()]
+            .symbol_spans
+            .iter()
+            .all(|(name, span)| name != "vector-only" || span.line != 3),
+        "the quoted vector leaf must be removed from the code symbol index"
+    );
+    let refs = state.handle_references(&uri, &vector_code_pos);
+    assert!(
+        refs.iter()
+            .all(|location| location.range.start.line == 0 || location.range.start.line == 4),
+        "quoted vector leaf must not be a reference: {refs:?}"
+    );
+    let edit = state
+        .handle_rename(&uri, &vector_code_pos, "renamed")
+        .expect("rename code symbol");
+    let edits = &edit.changes.expect("edits")[&uri];
+    assert!(
+        edits
+            .iter()
+            .all(|edit| edit.range.start.line == 0 || edit.range.start.line == 4),
+        "quoted vector leaf must not be renamed: {edits:?}"
+    );
+
+    let map_refs = state.handle_references(
+        &uri,
+        &Position {
+            line: 4,
+            character: 15,
+        },
+    );
+    assert!(
+        map_refs
+            .iter()
+            .all(|location| location.range.start.line == 1 || location.range.start.line == 4),
+        "quoted map leaves must not be references: {map_refs:?}"
+    );
+}
+
+#[test]
+fn navigation_refactors_reject_comment_tokens() {
+    let src = "(define foo 1)\n; foo is documentation\n(+ foo 1)";
+    let (state, uri) = parsed_state("file:///comment.sema", src);
+    let comment_pos = Position {
+        line: 1,
+        character: 3,
+    };
+    assert!(state.handle_references(&uri, &comment_pos).is_empty());
+    assert!(state
+        .handle_document_highlight(&uri, &comment_pos)
+        .is_none());
+    assert!(state.handle_rename(&uri, &comment_pos, "renamed").is_none());
+}
+
+#[test]
 fn references_top_level_skips_shadowing_param() {
     // A param named `total` shadows the top-level `total` inside `f`. References on the
     // top-level binding must NOT include the shadowing param/use on line 1.
@@ -2788,7 +2974,8 @@ fn workspace_scanner_follows_symlinks_without_cycling() {
 /// the production build path (same steps as `parsed_state`).
 fn insert_parsed_doc(state: &mut BackendState, uri: &str, source: &str) {
     let (ast, span_map, symbol_spans) = sema_reader::read_many_with_symbol_spans(source).unwrap();
-    let symbol_spans = crate::helpers::filter_quoted_symbol_spans(&ast, &span_map, symbol_spans);
+    let symbol_spans =
+        crate::helpers::filter_quoted_symbol_spans(&ast, &span_map, symbol_spans, source);
     let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
     state.cached_parses.insert(
         uri.to_string(),
@@ -2821,7 +3008,8 @@ fn insert_scanned_file(state: &mut BackendState, path: &std::path::Path, source:
     std::fs::write(path, source).unwrap();
     let mtime = std::fs::metadata(path).and_then(|m| m.modified()).unwrap();
     let (ast, span_map, symbol_spans) = sema_reader::read_many_with_symbol_spans(source).unwrap();
-    let symbol_spans = crate::helpers::filter_quoted_symbol_spans(&ast, &span_map, symbol_spans);
+    let symbol_spans =
+        crate::helpers::filter_quoted_symbol_spans(&ast, &span_map, symbol_spans, source);
     let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
     state.import_cache.insert(
         path.to_path_buf(),
@@ -3174,6 +3362,30 @@ fn get_import_cache_evicts_entry_when_reparse_fails() {
     assert!(
         state.import_cache.is_empty(),
         "the entry for a file that no longer parses must be evicted"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn stale_workspace_cache_refreshes_before_workspace_queries() {
+    let dir = unique_temp_dir("cache-refresh");
+    let path = dir.join("library.sema");
+    let mut state = BackendState::new_without_builtins(HashMap::new(), "sema".to_string());
+    insert_scanned_file(&mut state, &path, "(define old-name 1)\n");
+
+    std::fs::write(&path, "(define fresh-name 2)\n").unwrap();
+    bump_mtime(&path);
+    state.refresh_stale_import_cache();
+
+    let cached = state
+        .import_cache
+        .get(&path)
+        .expect("refreshed cache entry");
+    assert_eq!(cached.parsed.source, "(define fresh-name 2)\n");
+    assert_eq!(
+        user_definitions(&cached.parsed.source),
+        vec!["fresh-name"],
+        "workspace queries must see the disk version after a stale-cache refresh"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

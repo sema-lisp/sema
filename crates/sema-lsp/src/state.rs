@@ -422,7 +422,7 @@ impl BackendState {
             return None;
         };
         // Drop quoted (data) symbol occurrences (see filter_quoted_symbol_spans).
-        let symbol_spans = filter_quoted_symbol_spans(&ast, &span_map, symbol_spans);
+        let symbol_spans = filter_quoted_symbol_spans(&ast, &span_map, symbol_spans, &text);
         let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
 
         self.import_cache.insert(
@@ -439,6 +439,22 @@ impl BackendState {
             },
         );
         self.import_cache.get(&path)
+    }
+
+    /// Refresh files discovered by the workspace scan after they change on
+    /// disk. A scan is incremental and may finish long before the next editor
+    /// request; refreshing stale entries here keeps workspace navigation and
+    /// symbols useful without waiting for the client to restart the server.
+    pub(crate) fn refresh_stale_import_cache(&mut self) {
+        let stale_paths: Vec<PathBuf> = self
+            .import_cache
+            .iter()
+            .filter(|(path, cached)| !cached.is_fresh(path))
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in stale_paths {
+            let _ = self.get_import_cache(&path);
+        }
     }
 
     /// Yield every workspace file once, open documents first: other open

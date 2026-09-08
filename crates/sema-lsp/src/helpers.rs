@@ -70,15 +70,21 @@ pub(crate) fn expr_range(
     span_map: &SpanMap,
     lines: &[&str],
 ) -> Option<Range> {
-    let rc = expr.as_list_rc()?;
-    let ptr = Rc::as_ptr(&rc) as usize;
+    let ptr = if let Some(rc) = expr.as_list_rc() {
+        Rc::as_ptr(&rc) as usize
+    } else {
+        Rc::as_ptr(&expr.as_vector_rc()?) as usize
+    };
     span_map.get(&ptr).map(|s| span_to_range(s, lines))
 }
 
 /// Look up the raw Span for an expression via its Rc pointer in the SpanMap.
 pub(crate) fn expr_span<'a>(expr: &sema_core::Value, span_map: &'a SpanMap) -> Option<&'a Span> {
-    let rc = expr.as_list_rc()?;
-    let ptr = Rc::as_ptr(&rc) as usize;
+    let ptr = if let Some(rc) = expr.as_list_rc() {
+        Rc::as_ptr(&rc) as usize
+    } else {
+        Rc::as_ptr(&expr.as_vector_rc()?) as usize
+    };
     span_map.get(&ptr)
 }
 
@@ -104,11 +110,13 @@ pub(crate) fn filter_quoted_symbol_spans(
     ast: &[sema_core::Value],
     span_map: &SpanMap,
     symbol_spans: Vec<(String, Span)>,
+    source: &str,
 ) -> Vec<(String, Span)> {
+    let tokens = tokenize(source).unwrap_or_default();
     let mut excl: Vec<Span> = Vec::new(); // quoted regions (data)
     let mut reincl: Vec<Span> = Vec::new(); // `,x` / `,@x` holes inside quasiquote (code)
     for e in ast {
-        collect_quote_regions(e, span_map, &symbol_spans, false, &mut excl, &mut reincl);
+        collect_quote_regions(e, span_map, &tokens, 0, &mut excl, &mut reincl);
     }
     if excl.is_empty() {
         return symbol_spans;
@@ -123,23 +131,78 @@ pub(crate) fn filter_quoted_symbol_spans(
         .collect()
 }
 
-/// The span covering a quoted/unquoted ARGUMENT. The `'`/`,` head span only covers the
-/// glyph, so the data is the argument's own extent: a list's `expr_span`, or a bare
-/// symbol's token — which begins exactly where the head glyph ends.
+/// The span covering a quoted/unquoted ARGUMENT. Lists and vectors retain reader
+/// spans. Maps are stored in key order, so recover their source span from delimiters.
 fn quoted_arg_span(
     arg: &sema_core::Value,
     span_map: &SpanMap,
-    symbol_spans: &[(String, Span)],
-    head_span: &Span,
+    tokens: &[SpannedToken],
+    form_span: &Span,
 ) -> Option<Span> {
     if let Some(s) = expr_span(arg, span_map) {
         return Some(*s);
     }
-    if arg.as_symbol().is_some() {
-        return symbol_spans
-            .iter()
-            .find(|(_, sp)| sp.line == head_span.end_line && sp.col == head_span.end_col)
-            .map(|(_, sp)| *sp);
+    let arg_token = quote_argument_token(tokens, form_span)?;
+    if arg.as_map_ref().is_some() && matches!(arg_token.token, Token::LBrace) {
+        return delimited_token_span(tokens, arg_token.byte_start, Token::LBrace, Token::RBrace);
+    }
+    if arg.as_symbol().is_some() && matches!(arg_token.token, Token::Symbol(_)) {
+        return Some(arg_token.span);
+    }
+    None
+}
+
+/// Find the first source token of a quote form's argument. Prefix reader forms start
+/// at `'`, `` ` ``, `,`, or `,@`; long `(quote arg)` forms start with `(` then a head.
+fn quote_argument_token<'a>(
+    tokens: &'a [SpannedToken],
+    form_span: &Span,
+) -> Option<&'a SpannedToken> {
+    let start = tokens
+        .iter()
+        .position(|token| (token.span.line, token.span.col) == (form_span.line, form_span.col))?;
+    let mut index = start + 1;
+    if matches!(tokens[start].token, Token::LParen) {
+        index = next_significant_token(tokens, index)? + 1;
+    }
+    tokens.get(next_significant_token(tokens, index)?)
+}
+
+fn next_significant_token(tokens: &[SpannedToken], start: usize) -> Option<usize> {
+    tokens
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find(|(_, token)| !matches!(token.token, Token::Comment(_) | Token::Newline))
+        .map(|(index, _)| index)
+}
+
+/// Return the span enclosed by matching delimiters beginning at `open_byte_start`.
+fn delimited_token_span(
+    tokens: &[SpannedToken],
+    open_byte_start: usize,
+    open: Token,
+    close: Token,
+) -> Option<Span> {
+    let start = tokens
+        .iter()
+        .position(|token| token.byte_start == open_byte_start && token.token == open)?;
+    let mut depth = 0usize;
+    for token in &tokens[start..] {
+        if token.token == open {
+            depth += 1;
+        } else if token.token == close {
+            depth -= 1;
+            if depth == 0 {
+                let first = &tokens[start].span;
+                return Some(Span::new(
+                    first.line,
+                    first.col,
+                    token.span.end_line,
+                    token.span.end_col,
+                ));
+            }
+        }
     }
     None
 }
@@ -150,8 +213,8 @@ fn quoted_arg_span(
 fn collect_quote_regions(
     expr: &sema_core::Value,
     span_map: &SpanMap,
-    symbol_spans: &[(String, Span)],
-    in_quote: bool,
+    tokens: &[SpannedToken],
+    quasiquote_depth: usize,
     excl: &mut Vec<Span>,
     reincl: &mut Vec<Span>,
 ) {
@@ -161,43 +224,44 @@ fn collect_quote_regions(
     let head = items.first().and_then(|v| v.as_symbol());
     let form_span = expr_span(expr, span_map).copied();
     match head.as_deref() {
-        Some("quote") if !in_quote => {
+        Some("quote") => {
             if let Some(fs) = form_span {
                 for arg in items.iter().skip(1) {
-                    if let Some(s) = quoted_arg_span(arg, span_map, symbol_spans, &fs) {
+                    if let Some(s) = quoted_arg_span(arg, span_map, tokens, &fs) {
                         excl.push(s);
                     }
                 }
             }
-            // plain quote has no unquote semantics — the argument is wholly data.
         }
-        Some("quasiquote") if !in_quote => {
+        Some("quasiquote") => {
             if let Some(fs) = form_span {
                 for arg in items.iter().skip(1) {
-                    if let Some(s) = quoted_arg_span(arg, span_map, symbol_spans, &fs) {
+                    if let Some(s) = quoted_arg_span(arg, span_map, tokens, &fs) {
                         excl.push(s);
                     }
                 }
             }
-            for item in items.iter() {
-                collect_quote_regions(item, span_map, symbol_spans, true, excl, reincl);
+            for item in items {
+                collect_quote_regions(item, span_map, tokens, quasiquote_depth + 1, excl, reincl);
             }
         }
-        Some("unquote") | Some("unquote-splicing") if in_quote => {
-            if let Some(fs) = form_span {
-                for arg in items.iter().skip(1) {
-                    if let Some(s) = quoted_arg_span(arg, span_map, symbol_spans, &fs) {
-                        reincl.push(s);
+        Some("unquote") | Some("unquote-splicing") if quasiquote_depth > 0 => {
+            if quasiquote_depth == 1 {
+                if let Some(fs) = form_span {
+                    for arg in items.iter().skip(1) {
+                        if let Some(s) = quoted_arg_span(arg, span_map, tokens, &fs) {
+                            reincl.push(s);
+                        }
                     }
                 }
             }
             for item in items.iter().skip(1) {
-                collect_quote_regions(item, span_map, symbol_spans, false, excl, reincl);
+                collect_quote_regions(item, span_map, tokens, quasiquote_depth - 1, excl, reincl);
             }
         }
         _ => {
-            for item in items.iter() {
-                collect_quote_regions(item, span_map, symbol_spans, in_quote, excl, reincl);
+            for item in items {
+                collect_quote_regions(item, span_map, tokens, quasiquote_depth, excl, reincl);
             }
         }
     }

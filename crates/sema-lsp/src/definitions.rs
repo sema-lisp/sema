@@ -29,6 +29,10 @@ pub(crate) const DEFINITION_HEADS: &[&str] = &[
     "defun",
     "defn",
     "defmacro",
+    "define-syntax",
+    "define-values",
+    "define-record-type",
+    "defmulti",
     "defagent",
     "deftool",
     "defpolicy",
@@ -43,6 +47,10 @@ pub(crate) const SYMBOL_HEADS: &[&str] = &[
     "defun",
     "defn",
     "defmacro",
+    "define-syntax",
+    "define-values",
+    "define-record-type",
+    "defmulti",
     "defagent",
     "deftool",
     "defworkflow",
@@ -96,6 +104,54 @@ pub(crate) struct DefMatch<'a> {
     pub(crate) is_shorthand: bool,
 }
 
+/// Collect names bound by a values-formal. The grammar is shared with lambda
+/// formals: a symbol, a dotted list, a vector, or a map destructuring pattern.
+fn collect_formal_names(value: &sema_core::Value, out: &mut Vec<String>) {
+    if let Some(name) = value.as_symbol() {
+        if name != "." {
+            out.push(name);
+        }
+    } else if let Some(items) = value.as_list().or_else(|| value.as_vector()) {
+        for item in items {
+            collect_formal_names(item, out);
+        }
+    } else if let Some(map) = value.as_map_ref() {
+        let keys = sema_core::Value::keyword("keys");
+        for (key, pattern) in map.iter() {
+            if *key == keys {
+                if let Some(names) = pattern.as_list().or_else(|| pattern.as_vector()) {
+                    for name in names {
+                        collect_formal_names(name, out);
+                    }
+                }
+            } else {
+                collect_formal_names(pattern, out);
+            }
+        }
+    }
+}
+
+fn push_definition<'a>(
+    matches: &mut Vec<DefMatch<'a>>,
+    head: &str,
+    name: String,
+    expr: &'a sema_core::Value,
+    location: (Option<&Span>, Option<Range>),
+    symbol_spans: &[(String, Span)],
+    lines: &[&str],
+) {
+    let (form_span, form_range) = location;
+    let name_range = form_span.and_then(|span| find_name_span(&name, span, symbol_spans, lines));
+    matches.push(DefMatch {
+        head: head.to_string(),
+        name,
+        expr,
+        form_range,
+        name_range,
+        is_shorthand: false,
+    });
+}
+
 impl<'a> DefMatch<'a> {
     /// The form's body — its executable/nested forms, skipping the
     /// head/name/param-list "header". Used by call-hierarchy's call-site
@@ -147,6 +203,60 @@ pub(crate) fn scan_definitions<'a>(
         }
         let form_span = expr_span(expr, span_map);
         let form_range = form_span.map(|s| span_to_range(s, lines));
+
+        match head.as_str() {
+            "define-values" => {
+                if let Some(formals) = items.get(1) {
+                    let mut names = Vec::new();
+                    collect_formal_names(formals, &mut names);
+                    for name in names {
+                        push_definition(
+                            &mut matches,
+                            &head,
+                            name,
+                            expr,
+                            (form_span, form_range),
+                            symbol_spans,
+                            lines,
+                        );
+                    }
+                }
+                continue;
+            }
+            "define-record-type" => {
+                let mut names = Vec::new();
+                if let Some(ctor) = items.get(2).and_then(sema_core::Value::as_list) {
+                    if let Some(name) = ctor.first().and_then(sema_core::Value::as_symbol) {
+                        names.push(name);
+                    }
+                }
+                if let Some(name) = items.get(3).and_then(sema_core::Value::as_symbol) {
+                    names.push(name);
+                }
+                for field in items.iter().skip(4) {
+                    if let Some(name) = field
+                        .as_list()
+                        .and_then(|spec| spec.get(1))
+                        .and_then(sema_core::Value::as_symbol)
+                    {
+                        names.push(name);
+                    }
+                }
+                for name in names {
+                    push_definition(
+                        &mut matches,
+                        &head,
+                        name,
+                        expr,
+                        (form_span, form_range),
+                        symbol_spans,
+                        lines,
+                    );
+                }
+                continue;
+            }
+            _ => {}
+        }
 
         if let Some(name) = items[1].as_symbol() {
             // (head name ...)
@@ -366,9 +476,35 @@ pub fn import_path_from_ast(
 }
 
 /// Convenience wrapper: parse text and check for import path at cursor.
-pub fn import_path_at_cursor(text: &str, line: u32, _character: u32) -> Option<String> {
+pub fn import_path_at_cursor(text: &str, line: u32, character: u32) -> Option<String> {
     let (ast, span_map) = sema_reader::read_many_with_spans(text).ok()?;
-    import_path_from_ast(&ast, &span_map, line)
+    let source_line = text.lines().nth(line as usize)?;
+    let char_col = crate::helpers::utf16_to_char_col(source_line, character as usize);
+    let sema_line = line as usize + 1;
+    let path = sema_reader::lexer::tokenize(text)
+        .ok()?
+        .iter()
+        .find_map(|token| match &token.token {
+            sema_reader::lexer::Token::String(candidate)
+                if token.span.contains_pos(sema_line, char_col) =>
+            {
+                Some(candidate.clone())
+            }
+            _ => None,
+        })?;
+
+    // Several imports may share a line. Match the form containing this exact
+    // string token instead of taking the first import whose span covers it.
+    flatten_module_forms(&ast).into_iter().find_map(|expr| {
+        let items = expr.as_list()?;
+        let head = items.first()?.as_symbol()?;
+        let candidate = items.get(1)?.as_str()?;
+        (matches!(head.as_str(), "import" | "load")
+            && candidate == path
+            && expr_span(expr, &span_map)
+                .is_some_and(|span| span.contains_pos(sema_line, char_col)))
+        .then_some(path.clone())
+    })
 }
 
 /// Extract all import/load path strings from a pre-parsed AST.
@@ -438,8 +574,10 @@ pub fn document_symbols_from_ast(
 /// only `define`/`def` can produce either shape.
 fn symbol_kind_for(head: &str, is_shorthand: bool) -> SymbolKind {
     match head {
-        "defun" | "defn" | "defworkflow" => SymbolKind::FUNCTION,
-        "defmacro" => SymbolKind::OPERATOR,
+        "defun" | "defn" | "defworkflow" | "defmulti" | "define-record-type" => {
+            SymbolKind::FUNCTION
+        }
+        "defmacro" | "define-syntax" => SymbolKind::OPERATOR,
         "defagent" => SymbolKind::CLASS,
         "deftool" => SymbolKind::METHOD,
         "defpolicy" => SymbolKind::VARIABLE,

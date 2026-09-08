@@ -18,6 +18,8 @@ struct Scope {
     span: Span,
     /// Names bound in this scope, with the span of the binding site.
     bindings: Vec<Binding>,
+    /// Regions inside `span` where this scope is not active.
+    excluded_spans: Vec<Span>,
 }
 
 /// A single name binding (e.g. a `let` variable, a function parameter).
@@ -64,12 +66,70 @@ fn span_contains_span(outer: &Span, inner: &Span) -> bool {
     outer.contains(inner)
 }
 
+fn span_after(prefix: Option<Span>, whole: Span) -> Span {
+    match prefix {
+        Some(prefix) => Span::new(
+            prefix.end_line,
+            prefix.end_col,
+            whole.end_line,
+            whole.end_col,
+        ),
+        None => whole,
+    }
+}
+
 /// Find the span of a symbol name within a parent span, using symbol_spans.
 fn find_symbol_span(name: &str, within: &Span, symbol_spans: &[(String, Span)]) -> Option<Span> {
     symbol_spans
         .iter()
         .find(|(n, s)| n == name && span_contains_span(within, s))
         .map(|(_, s)| *s)
+}
+
+/// Collect symbol leaves from an expression in reader order. `do` initializers
+/// may be vectors or maps, whose containers do not have their own SpanMap
+/// entries; their symbol leaves still have lexer spans.
+fn collect_value_symbol_names(value: &Value, names: &mut Vec<String>) {
+    if let Some(name) = value.as_symbol() {
+        names.push(name);
+    } else if let Some(items) = value.as_list().or_else(|| value.as_vector()) {
+        for item in items {
+            collect_value_symbol_names(item, names);
+        }
+    } else if let Some(map) = value.as_map_ref() {
+        for (key, value) in map.iter() {
+            collect_value_symbol_names(key, names);
+            collect_value_symbol_names(value, names);
+        }
+    }
+}
+
+/// Return lexer spans for symbol leaves in a `do` initializer. The source
+/// reader does not retain spans for map values, which are stored in key order.
+/// Walk lexer spans in source order instead of AST iteration order so each
+/// initializer occurrence is excluded before an equally named step expression.
+fn initializer_symbol_spans(
+    initializer: &Value,
+    binding_span: &Span,
+    binder_span: &Span,
+    symbol_spans: &[(String, Span)],
+) -> Vec<Span> {
+    let mut names = Vec::new();
+    collect_value_symbol_names(initializer, &mut names);
+    let mut spans = Vec::new();
+
+    for (name, span) in symbol_spans {
+        if !span_contains_span(binding_span, span)
+            || (span.line, span.col) <= (binder_span.end_line, binder_span.end_col)
+        {
+            continue;
+        }
+        if let Some(index) = names.iter().position(|candidate| candidate == name) {
+            names.swap_remove(index);
+            spans.push(*span);
+        }
+    }
+    spans
 }
 
 // ── Builder ──────────────────────────────────────────────────────
@@ -84,6 +144,7 @@ impl ScopeTree {
             parent: None,
             span: Span::new(1, 1, usize::MAX / 2, usize::MAX / 2),
             bindings: Vec::new(),
+            excluded_spans: Vec::new(),
         };
         tree.scopes.push(top);
 
@@ -125,6 +186,17 @@ impl ScopeTree {
             "defun" | "defn" | "defmacro" => {
                 self.walk_defun(items, expr, parent_scope, span_map, symbol_spans)
             }
+            "define-syntax" => {
+                if let (Some(name), Some(form_span)) = (
+                    items.get(1).and_then(Value::as_symbol),
+                    expr_span(expr, span_map),
+                ) {
+                    self.bind_symbol(parent_scope, name, &form_span, symbol_spans);
+                }
+                for item in &items[2..] {
+                    self.walk_expr(item, parent_scope, span_map, symbol_spans);
+                }
+            }
             "defagent" | "deftool" | "defpolicy" => {
                 // These define a name at the parent scope level.
                 if items.len() >= 2 {
@@ -140,6 +212,35 @@ impl ScopeTree {
                     self.walk_expr(item, parent_scope, span_map, symbol_spans);
                 }
             }
+            "defmulti" => {
+                if let (Some(name), Some(form_span)) = (
+                    items.get(1).and_then(Value::as_symbol),
+                    expr_span(expr, span_map),
+                ) {
+                    self.bind_symbol(parent_scope, name, &form_span, symbol_spans);
+                }
+                for item in &items[2..] {
+                    self.walk_expr(item, parent_scope, span_map, symbol_spans);
+                }
+            }
+            "define-values" => {
+                if let (Some(formals), Some(form_span)) = (items.get(1), expr_span(expr, span_map))
+                {
+                    self.collect_param_binding(
+                        formals,
+                        parent_scope,
+                        &form_span,
+                        span_map,
+                        symbol_spans,
+                    );
+                }
+                if let Some(producer) = items.get(2) {
+                    self.walk_expr(producer, parent_scope, span_map, symbol_spans);
+                }
+            }
+            "define-record-type" => {
+                self.walk_define_record_type(items, expr, parent_scope, span_map, symbol_spans)
+            }
 
             // ── Lambda / fn ──────────────────────────────────────
             "lambda" | "fn" => self.walk_lambda(items, expr, parent_scope, span_map, symbol_spans),
@@ -148,9 +249,17 @@ impl ScopeTree {
             "let" => self.walk_let(items, expr, parent_scope, span_map, symbol_spans),
             "let*" => self.walk_let_star(items, expr, parent_scope, span_map, symbol_spans),
             "letrec" => self.walk_letrec(items, expr, parent_scope, span_map, symbol_spans),
+            "let-values" => {
+                self.walk_let_values(items, expr, parent_scope, span_map, symbol_spans, false)
+            }
+            "let*-values" => {
+                self.walk_let_values(items, expr, parent_scope, span_map, symbol_spans, true)
+            }
 
             // ── Match ────────────────────────────────────────────
-            "match" => self.walk_match(items, expr, parent_scope, span_map, symbol_spans),
+            "match" | "match*" => {
+                self.walk_match(items, expr, parent_scope, span_map, symbol_spans)
+            }
 
             // ── Do ───────────────────────────────────────────────
             "do" => self.walk_do(items, expr, parent_scope, span_map, symbol_spans),
@@ -204,7 +313,10 @@ impl ScopeTree {
                 }
 
                 // Create a child scope for the body with params bound
-                let body_scope_idx = self.push_scope(parent_scope, form_span);
+                let body_scope_idx = self.push_scope(
+                    parent_scope,
+                    span_after(expr_span(&items[1], span_map), form_span),
+                );
 
                 // Bind parameters in the body scope
                 for param in &sig[1..] {
@@ -284,7 +396,10 @@ impl ScopeTree {
             None => return,
         };
 
-        let body_scope_idx = self.push_scope(parent_scope, form_span);
+        let body_scope_idx = self.push_scope(
+            parent_scope,
+            span_after(expr_span(&items[1], span_map), form_span),
+        );
 
         // Bind parameters (from list or vector)
         let params: Option<&[Value]> = items[1].as_list().or_else(|| items[1].as_vector());
@@ -322,7 +437,10 @@ impl ScopeTree {
         // malformed `(let name non-list ...)` as a named let.
         if items.len() >= 3 && items[2].as_list().is_some() {
             if let Some(loop_name) = items[1].as_symbol() {
-                let body_scope_idx = self.push_scope(parent_scope, form_span);
+                let body_scope_idx = self.push_scope(
+                    parent_scope,
+                    span_after(expr_span(&items[2], span_map), form_span),
+                );
 
                 // Bind the loop name
                 self.bind_symbol(body_scope_idx, loop_name, &form_span, symbol_spans);
@@ -355,7 +473,10 @@ impl ScopeTree {
         }
 
         // Regular let: items[0] is "let", items[1] is bindings list
-        let body_scope_idx = self.push_scope(parent_scope, form_span);
+        let body_scope_idx = self.push_scope(
+            parent_scope,
+            span_after(expr_span(&items[1], span_map), form_span),
+        );
 
         if let Some(bindings) = items[1].as_list() {
             for binding in bindings {
@@ -411,7 +532,10 @@ impl ScopeTree {
                         self.walk_expr(&pair[1], current_scope, span_map, symbol_spans);
 
                         // Create a new nested scope for this binding.
-                        let new_scope_idx = self.push_scope(current_scope, form_span);
+                        let new_scope_idx = self.push_scope(
+                            current_scope,
+                            span_after(expr_span(binding, span_map), form_span),
+                        );
                         self.collect_param_binding(
                             &pair[0],
                             new_scope_idx,
@@ -427,6 +551,117 @@ impl ScopeTree {
 
         for item in &items[2..] {
             self.walk_expr(item, current_scope, span_map, symbol_spans);
+        }
+    }
+
+    fn walk_let_values(
+        &mut self,
+        items: &[Value],
+        expr: &Value,
+        parent_scope: usize,
+        span_map: &SpanMap,
+        symbol_spans: &[(String, Span)],
+        sequential: bool,
+    ) {
+        if items.len() < 2 {
+            return;
+        }
+        let Some(form_span) = expr_span(expr, span_map) else {
+            return;
+        };
+
+        let Some(bindings) = items[1].as_list() else {
+            return;
+        };
+
+        let body_scope_idx = if sequential {
+            let mut current_scope = parent_scope;
+            for binding in bindings {
+                let Some(pair) = binding.as_list() else {
+                    continue;
+                };
+                if pair.len() < 2 {
+                    continue;
+                }
+                // Each producer sees only formals from preceding clauses.
+                self.walk_expr(&pair[1], current_scope, span_map, symbol_spans);
+                let next_scope = self.push_scope(
+                    current_scope,
+                    span_after(expr_span(binding, span_map), form_span),
+                );
+                self.collect_param_binding(
+                    &pair[0],
+                    next_scope,
+                    &form_span,
+                    span_map,
+                    symbol_spans,
+                );
+                current_scope = next_scope;
+            }
+            current_scope
+        } else {
+            // All producers run before any formals become visible.
+            for binding in bindings {
+                if let Some(pair) = binding.as_list().filter(|pair| pair.len() >= 2) {
+                    self.walk_expr(&pair[1], parent_scope, span_map, symbol_spans);
+                }
+            }
+            let body_scope_idx = self.push_scope(
+                parent_scope,
+                span_after(expr_span(&items[1], span_map), form_span),
+            );
+            for binding in bindings {
+                if let Some(pair) = binding.as_list().filter(|pair| pair.len() >= 2) {
+                    self.collect_param_binding(
+                        &pair[0],
+                        body_scope_idx,
+                        &form_span,
+                        span_map,
+                        symbol_spans,
+                    );
+                }
+            }
+            body_scope_idx
+        };
+        for body in &items[2..] {
+            self.walk_expr(body, body_scope_idx, span_map, symbol_spans);
+        }
+    }
+
+    /// `(define-record-type type (constructor fields...) predicate (field accessor)...)`.
+    /// The type label is metadata; the constructor, predicate, and accessors are
+    /// the names that become visible in the enclosing scope.
+    fn walk_define_record_type(
+        &mut self,
+        items: &[Value],
+        expr: &Value,
+        parent_scope: usize,
+        span_map: &SpanMap,
+        symbol_spans: &[(String, Span)],
+    ) {
+        let Some(form_span) = expr_span(expr, span_map) else {
+            return;
+        };
+
+        if let Some(name) = items
+            .get(2)
+            .and_then(Value::as_list)
+            .and_then(|ctor| ctor.first())
+            .and_then(Value::as_symbol)
+        {
+            self.bind_symbol(parent_scope, name, &form_span, symbol_spans);
+        }
+        if let Some(name) = items.get(3).and_then(Value::as_symbol) {
+            self.bind_symbol(parent_scope, name, &form_span, symbol_spans);
+        }
+        for field in items.iter().skip(4) {
+            if let Some(name) = field
+                .as_list()
+                .and_then(|spec| spec.get(1))
+                .and_then(Value::as_symbol)
+            {
+                self.bind_symbol(parent_scope, name, &form_span, symbol_spans);
+            }
         }
     }
 
@@ -554,6 +789,24 @@ impl ScopeTree {
                         }
                         // Init exprs in outer scope
                         self.walk_expr(&parts[1], parent_scope, span_map, symbol_spans);
+                        if let Some(init_span) = expr_span(&parts[1], span_map) {
+                            self.scopes[body_scope_idx].excluded_spans.push(init_span);
+                        } else if let (Some(binding_span), Some(binder_name)) =
+                            (expr_span(binding, span_map), parts[0].as_symbol())
+                        {
+                            if let Some(binder_span) =
+                                find_symbol_span(&binder_name, &binding_span, symbol_spans)
+                            {
+                                self.scopes[body_scope_idx].excluded_spans.extend(
+                                    initializer_symbol_spans(
+                                        &parts[1],
+                                        &binding_span,
+                                        &binder_span,
+                                        symbol_spans,
+                                    ),
+                                );
+                            }
+                        }
                         // Step exprs in body scope
                         if parts.len() >= 3 {
                             self.walk_expr(&parts[2], body_scope_idx, span_map, symbol_spans);
@@ -620,6 +873,7 @@ impl ScopeTree {
             parent: Some(parent),
             span,
             bindings: Vec::new(),
+            excluded_spans: Vec::new(),
         });
         self.scopes.len() - 1
     }
@@ -802,6 +1056,19 @@ impl ScopeTree {
     /// Returns the scope index and definition span, or `None` if the symbol is
     /// not defined in any local scope (i.e., it's a global/builtin).
     pub fn resolve_at(&self, name: &str, line: usize, col: usize) -> Option<ResolvedSymbol> {
+        for (scope_idx, scope) in self.scopes.iter().enumerate().rev() {
+            if let Some(binding) = scope
+                .bindings
+                .iter()
+                .find(|binding| binding.name == name && binding.def_span.contains_pos(line, col))
+            {
+                return Some(ResolvedSymbol {
+                    scope_idx,
+                    def_span: binding.def_span,
+                    is_top_level: scope_idx == 0,
+                });
+            }
+        }
         // Find the innermost scope containing this position
         let scope_idx = self.innermost_scope_at(line, col);
 
@@ -924,7 +1191,12 @@ impl ScopeTree {
     /// so iterating in reverse finds the most nested match first.
     fn innermost_scope_at(&self, line: usize, col: usize) -> usize {
         for idx in (1..self.scopes.len()).rev() {
-            if span_contains_pos(&self.scopes[idx].span, line, col) {
+            if span_contains_pos(&self.scopes[idx].span, line, col)
+                && !self.scopes[idx]
+                    .excluded_spans
+                    .iter()
+                    .any(|span| span_contains_pos(span, line, col))
+            {
                 return idx;
             }
         }
@@ -1240,6 +1512,140 @@ mod tests {
         let (tree, _) = build_scope(src);
         // 'i' should be locally scoped in the body
         assert!(tree.is_locally_scoped("i", 1, 44));
+    }
+
+    #[test]
+    fn do_initializers_use_outer_scope_but_steps_use_iteration_scope() {
+        let src = "(define i 4)\n(do ((i i (+ i 1))) ((= i 5) i))";
+        let (tree, _) = build_scope(src);
+
+        let top = tree.resolve_at("i", 1, 9).unwrap();
+        let initializer = tree.resolve_at("i", 2, 9).unwrap();
+        let step = tree.resolve_at("i", 2, 14).unwrap();
+        assert_eq!(initializer.def_span, top.def_span);
+        assert!(!step.is_top_level);
+    }
+
+    #[test]
+    fn do_vector_and_map_initializers_use_outer_scope() {
+        let src =
+            "(define i 4)\n(do ((i [i] [i])) ((= i 5) i))\n(do ((i {:value i} i)) ((= i 5) i))";
+        let (tree, symbols) = build_scope(src);
+        let uses: Vec<Span> = symbols
+            .iter()
+            .filter(|(name, span)| name == "i" && span.line > 1)
+            .map(|(_, span)| *span)
+            .collect();
+
+        let top = tree.resolve_at("i", 1, 9).unwrap();
+        // First do: binder, vector initializer, vector step, test, result.
+        assert_eq!(
+            tree.resolve_at("i", uses[1].line, uses[1].col)
+                .unwrap()
+                .def_span,
+            top.def_span
+        );
+        assert!(
+            !tree
+                .resolve_at("i", uses[2].line, uses[2].col)
+                .unwrap()
+                .is_top_level
+        );
+        // Second do: binder, map initializer, step, test, result.
+        assert_eq!(
+            tree.resolve_at("i", uses[6].line, uses[6].col)
+                .unwrap()
+                .def_span,
+            top.def_span
+        );
+        assert!(
+            !tree
+                .resolve_at("i", uses[7].line, uses[7].col)
+                .unwrap()
+                .is_top_level
+        );
+    }
+
+    #[test]
+    fn do_map_initializer_uses_source_order_not_map_key_order() {
+        let src = "(define first 1)\n(define second 2)\n(do ((first {:second second :first first} first)) ((= first 3) first))";
+        let (tree, symbols) = build_scope(src);
+        let first: Vec<Span> = symbols
+            .iter()
+            .filter(|(name, span)| name == "first" && span.line == 3)
+            .map(|(_, span)| *span)
+            .collect();
+        let second = symbols
+            .iter()
+            .find(|(name, span)| name == "second" && span.line == 3)
+            .map(|(_, span)| *span)
+            .unwrap();
+        let top_first = tree.resolve_at("first", 1, 9).unwrap();
+        let top_second = tree.resolve_at("second", 2, 9).unwrap();
+
+        // The map writes :second before :first, while its BTreeMap AST stores
+        // :first first. Both initializer leaves still use their outer values.
+        assert_eq!(
+            tree.resolve_at("second", second.line, second.col)
+                .unwrap()
+                .def_span,
+            top_second.def_span
+        );
+        assert_eq!(
+            tree.resolve_at("first", first[1].line, first[1].col)
+                .unwrap()
+                .def_span,
+            top_first.def_span
+        );
+        assert!(
+            !tree
+                .resolve_at("first", first[2].line, first[2].col)
+                .unwrap()
+                .is_top_level,
+            "the equally named step remains in the iteration scope"
+        );
+    }
+
+    #[test]
+    fn let_values_producers_are_parallel_and_let_star_values_are_sequential() {
+        let parallel = "(define outer 1)\n(let-values (((outer) (values outer))) outer)";
+        let (tree, symbols) = build_scope(parallel);
+        let outer: Vec<Span> = symbols
+            .iter()
+            .filter(|(name, _)| name == "outer")
+            .map(|(_, span)| *span)
+            .collect();
+        let top = tree
+            .resolve_at("outer", outer[0].line, outer[0].col)
+            .unwrap();
+        assert_eq!(
+            tree.resolve_at("outer", outer[2].line, outer[2].col)
+                .unwrap()
+                .def_span,
+            top.def_span,
+            "a let-values producer must not see its own formal"
+        );
+        assert!(
+            !tree
+                .resolve_at("outer", outer[3].line, outer[3].col)
+                .unwrap()
+                .is_top_level
+        );
+
+        let sequential = "(let*-values (((first) (values 1)) ((second) (values first))) second)";
+        let (tree, symbols) = build_scope(sequential);
+        let first: Vec<Span> = symbols
+            .iter()
+            .filter(|(name, _)| name == "first")
+            .map(|(_, span)| *span)
+            .collect();
+        let binding = tree
+            .resolve_at("first", first[0].line, first[0].col)
+            .unwrap();
+        let producer = tree
+            .resolve_at("first", first[1].line, first[1].col)
+            .unwrap();
+        assert_eq!(binding.def_span, producer.def_span);
     }
 
     // ── match scoping ────────────────────────────────────────────

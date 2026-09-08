@@ -797,6 +797,10 @@ pub async fn run_server() {
                 }
             }
         } {
+            // Workspace scans run only at initialization. Refresh files whose
+            // on-disk mtime changed before serving the next request so the
+            // scan cache cannot keep stale definitions or ranges indefinitely.
+            state.refresh_stale_import_cache();
             match req {
                 LspRequest::DocumentChanged { uri, text } => {
                     // Batch document changes: drain any consecutive pending
@@ -852,7 +856,8 @@ pub async fn run_server() {
 
                     // Drop quoted (data) symbol occurrences so rename/references/highlight
                     // never rewrite quoted literals (a silent program-meaning change).
-                    let symbol_spans = filter_quoted_symbol_spans(&ast, &span_map, symbol_spans);
+                    let symbol_spans =
+                        filter_quoted_symbol_spans(&ast, &span_map, symbol_spans, &text);
                     let scope_tree = scope::ScopeTree::build(&ast, &span_map, &symbol_spans);
                     state.cached_parses.insert(
                         uri_str.clone(),
@@ -875,6 +880,9 @@ pub async fn run_server() {
                     state.documents.remove(uri.as_str());
                     state.cached_user_defs.remove(uri.as_str());
                     state.cached_parses.remove(uri.as_str());
+                    if let Ok(path) = uri.to_file_path() {
+                        let _ = state.get_import_cache(&path);
+                    }
 
                     let client = client.clone();
                     handle.block_on(async {

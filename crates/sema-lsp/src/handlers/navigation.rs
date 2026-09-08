@@ -40,7 +40,9 @@ impl BackendState {
         let cached = self.cached_parses.get(uri_str)?;
 
         // Phase 3a: Check if cursor is on an import/load path string
-        if let Some(path_str) = import_path_from_ast(&cached.ast, &cached.span_map, position.line) {
+        if let Some(path_str) =
+            import_path_at_cursor(&cached.source, position.line, position.character)
+        {
             if let Some(resolved) = resolve_import_path(uri, &path_str) {
                 if resolved.exists() {
                     let target_uri = Url::from_file_path(&resolved).ok()?;
@@ -63,10 +65,18 @@ impl BackendState {
             return None;
         }
 
-        // Check scope tree for binding definition (local + top-level)
-        let cached = self.cached_parses.get(uri_str)?;
         let sema_line = position.line as usize + 1;
         let sema_col = utf16_to_char_col(line, position.character as usize);
+        if !cached
+            .symbol_spans
+            .iter()
+            .any(|(name, span)| name == &symbol && span.contains_pos(sema_line, sema_col))
+        {
+            return None;
+        }
+
+        // Check scope tree for binding definition (local + top-level)
+        let cached = self.cached_parses.get(uri_str)?;
         if let Some(resolved) = cached.scope_tree.resolve_at(&symbol, sema_line, sema_col) {
             return Some(GotoDefinitionResponse::Scalar(Location {
                 uri: uri.clone(),
@@ -170,22 +180,30 @@ impl BackendState {
         let sema_col = utf16_to_char_col(line, position.character as usize);
 
         // Check scope tree in the current document
-        if let Some(cached) = self.cached_parses.get(uri_str) {
-            if let Some(refs) = cached.scope_tree.locally_scoped_occurrences(
-                symbol,
-                sema_line,
-                sema_col,
-                &cached.symbol_spans,
-            ) {
-                // Locally scoped — only return references within this document's scope
-                return refs
-                    .into_iter()
-                    .map(|span| Location {
-                        uri: uri.clone(),
-                        range: span_to_range(&span, &lines),
-                    })
-                    .collect();
-            }
+        let Some(cached) = self.cached_parses.get(uri_str) else {
+            return vec![];
+        };
+        if !cached
+            .symbol_spans
+            .iter()
+            .any(|(name, span)| name == symbol && span.contains_pos(sema_line, sema_col))
+        {
+            return vec![];
+        }
+        if let Some(refs) = cached.scope_tree.locally_scoped_occurrences(
+            symbol,
+            sema_line,
+            sema_col,
+            &cached.symbol_spans,
+        ) {
+            // Locally scoped — only return references within this document's scope
+            return refs
+                .into_iter()
+                .map(|span| Location {
+                    uri: uri.clone(),
+                    range: span_to_range(&span, &lines),
+                })
+                .collect();
         }
 
         // Top-level/global symbol — search all open documents, but skip
@@ -214,6 +232,13 @@ impl BackendState {
 
         let sema_line = position.line as usize + 1;
         let sema_col = utf16_to_char_col(line, position.character as usize);
+        if !cached
+            .symbol_spans
+            .iter()
+            .any(|(name, span)| name == symbol && span.contains_pos(sema_line, sema_col))
+        {
+            return None;
+        }
 
         // Use scope-aware references for locally scoped symbols
         if let Some(refs) = cached.scope_tree.locally_scoped_occurrences(
@@ -328,34 +353,41 @@ impl BackendState {
         let sema_line = position.line as usize + 1;
         let sema_col = utf16_to_char_col(line, position.character as usize);
 
+        let cached = self.cached_parses.get(uri.as_str())?;
+        if !cached
+            .symbol_spans
+            .iter()
+            .any(|(name, span)| name == symbol && span.contains_pos(sema_line, sema_col))
+        {
+            return None;
+        }
+
         let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
 
         // Check if the symbol is locally scoped
-        if let Some(cached) = self.cached_parses.get(uri.as_str()) {
-            if let Some(refs) = cached.scope_tree.locally_scoped_occurrences(
-                symbol,
-                sema_line,
-                sema_col,
-                &cached.symbol_spans,
-            ) {
-                // Locally scoped — only rename within this document's scope
-                let edits: Vec<TextEdit> = refs
-                    .into_iter()
-                    .map(|span| TextEdit {
-                        range: span_to_range(&span, &lines),
-                        new_text: new_name.to_string(),
-                    })
-                    .collect();
-                if edits.is_empty() {
-                    return None;
-                }
-                changes.insert(uri.clone(), edits);
-                return Some(WorkspaceEdit {
-                    changes: Some(changes),
-                    document_changes: None,
-                    change_annotations: None,
-                });
+        if let Some(refs) = cached.scope_tree.locally_scoped_occurrences(
+            symbol,
+            sema_line,
+            sema_col,
+            &cached.symbol_spans,
+        ) {
+            // Locally scoped — only rename within this document's scope
+            let edits: Vec<TextEdit> = refs
+                .into_iter()
+                .map(|span| TextEdit {
+                    range: span_to_range(&span, &lines),
+                    new_text: new_name.to_string(),
+                })
+                .collect();
+            if edits.is_empty() {
+                return None;
             }
+            changes.insert(uri.clone(), edits);
+            return Some(WorkspaceEdit {
+                changes: Some(changes),
+                document_changes: None,
+                change_annotations: None,
+            });
         }
 
         // Top-level/global symbol — rename across all documents,

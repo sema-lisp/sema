@@ -188,6 +188,14 @@ inherits = "release"
 debug = true
 strip = "none"
 
+# Optimized local builds with incremental compilation and parallel codegen.
+# Cross-crate LTO remains in the release/dist profiles.
+[profile.release-fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
+
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"

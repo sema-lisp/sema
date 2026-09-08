@@ -269,6 +269,14 @@ cd sema && cargo build --release
 # Binary at target/release/sema
 ```
 
+For local development that needs an optimized binary, use `jake release-fast`
+or `cargo build --profile release-fast`. The binary is at
+`target/release-fast/sema`. This profile uses incremental compilation and
+parallel codegen, with no cross-crate LTO. Use `--release` for performance
+measurements and distribution builds. See the
+[build profile measurements](docs/build-profiles-2026-09-08.md) for build times
+and runtime tradeoffs.
+
 ```bash
 sema                          # REPL (with tab completion)
 sema script.sema              # Run a file

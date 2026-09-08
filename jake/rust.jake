@@ -18,6 +18,12 @@ task release:
     @needs cargo
     cargo build --release
 
+@group build
+@desc "Optimized local build with incremental compilation"
+task release-fast:
+    @needs cargo
+    cargo build --profile release-fast
+
 # PGO build (instrument -> train -> rebuild). ~25% faster on 1BRC; see
 # docs/performance-roadmap.md.
 @group build

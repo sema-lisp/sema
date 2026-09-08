@@ -51,6 +51,7 @@ or install-path feature MUST add equivalent coverage.
 ```bash
 jake build              # dev build
 jake release            # optimized build
+jake release-fast       # incremental optimized build for local iteration
 jake test               # all tests (http tests ignored)
 jake test.http          # HTTP integration tests (requires network)
 jake lint               # fmt-check + clippy -D warnings

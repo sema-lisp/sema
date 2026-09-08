@@ -1,5 +1,8 @@
 # Build-time investigation report
 
+For the September 2026 follow-up on optimized local builds, see
+[Build profile measurements](build-profiles-2026-09-08.md).
+
 **Date:** 2026-07-17 · **Machine:** Apple Silicon macOS (Darwin 24.6), workspace at
 `/Users/helge/code/sema` with the shared sccache config from `../.cargo/config.toml`
 (incremental disabled, `rustc-wrapper = sccache`, 20G workspace-local cache).

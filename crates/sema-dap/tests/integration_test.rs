@@ -1879,6 +1879,101 @@ fn stack_frames(
 
 const STEP_PROG: &str = "(define (f n)\n  (+ n 1))\n(define a 1)\n(f 10)\n(define b 2)\n";
 
+fn client_convention_frames(
+    lines_start_at_one: bool,
+    columns_start_at_one: bool,
+    uri_paths: bool,
+) -> Vec<serde_json::Value> {
+    let dir = unique_temp_dir("client-conventions");
+    let path = dir.join("program é %.sema");
+    std::fs::write(&path, "(define answer (+ 1 2))\n(println answer)\n").unwrap();
+    let path = path.canonicalize().unwrap();
+    let client_path = if uri_paths {
+        url::Url::from_file_path(&path).unwrap().to_string()
+    } else {
+        path.to_string_lossy().into_owned()
+    };
+    let mut child = Command::new(sema_binary())
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    send_dap(
+        &mut stdin,
+        1,
+        "initialize",
+        Some(serde_json::json!({
+            "linesStartAt1": lines_start_at_one, "columnsStartAt1": columns_start_at_one,
+            "pathFormat": if uri_paths { "uri" } else { "path" },
+        })),
+    );
+    read_dap(&mut reader).unwrap();
+    assert!(wait_for_event(&mut reader, "initialized", 10));
+    let first_line = u32::from(lines_start_at_one);
+    send_dap(
+        &mut stdin,
+        2,
+        "setBreakpoints",
+        Some(serde_json::json!({
+            "source": {"path": client_path}, "breakpoints": [{"line": first_line}],
+        })),
+    );
+    let pending = read_dap(&mut reader).unwrap();
+    if pending["success"] != true {
+        child.kill().unwrap();
+        child.wait().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        panic!("valid client breakpoint rejected: {pending}");
+    }
+    send_dap(
+        &mut stdin,
+        3,
+        "launch",
+        Some(serde_json::json!({"program": client_path})),
+    );
+    assert_eq!(read_dap(&mut reader).unwrap()["success"], true);
+    let changed = read_dap(&mut reader).unwrap();
+    send_dap(&mut stdin, 4, "configurationDone", None);
+    read_dap(&mut reader).unwrap();
+    assert!(wait_for_event(&mut reader, "stopped", 20));
+    let frames = stack_frames(&mut stdin, &mut reader, 5);
+    send_dap(&mut stdin, 6, "disconnect", None);
+    read_dap(&mut reader).unwrap();
+    assert!(child.wait().unwrap().success());
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(pending["body"]["breakpoints"][0]["line"], first_line);
+    assert_eq!(changed["event"], "breakpoint", "{changed}");
+    assert_eq!(changed["body"]["breakpoint"]["line"], first_line);
+    assert_eq!(changed["body"]["breakpoint"]["verified"], true);
+    assert_eq!(frames[0]["line"], first_line);
+    assert_eq!(frames[0]["source"]["path"], client_path);
+    frames
+}
+
+#[test]
+fn test_dap_honors_zero_based_client_lines() {
+    client_convention_frames(false, true, false);
+}
+
+#[test]
+fn test_dap_honors_zero_based_client_columns() {
+    let one_based = client_convention_frames(true, true, false);
+    let zero_based = client_convention_frames(true, false, false);
+    assert_eq!(
+        zero_based[0]["column"].as_u64().unwrap() + 1,
+        one_based[0]["column"]
+    );
+}
+
+#[test]
+fn test_dap_returns_uri_source_paths_when_requested() {
+    client_convention_frames(true, true, true);
+}
+
 #[test]
 fn test_dap_next_steps_over_cooperative_callbacks() {
     let dir = unique_temp_dir("step-over-callback");

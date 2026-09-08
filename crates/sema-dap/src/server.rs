@@ -45,6 +45,7 @@ enum BackendEvent {
 }
 
 struct FrontendState {
+    client: ClientConventions,
     vm_active: bool,
     vm_suspended: bool,
     dbg_cmd_tx: Option<std_mpsc::Sender<DebugCommand>>,
@@ -58,6 +59,69 @@ struct FrontendState {
     next_session_id: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ClientConventions {
+    lines_start_at_one: bool,
+    columns_start_at_one: bool,
+    uri_paths: bool,
+}
+
+impl Default for ClientConventions {
+    fn default() -> Self {
+        Self {
+            lines_start_at_one: true,
+            columns_start_at_one: true,
+            uri_paths: false,
+        }
+    }
+}
+
+impl ClientConventions {
+    fn from_initialize(arguments: Option<&serde_json::Value>) -> Self {
+        Self {
+            lines_start_at_one: arguments
+                .and_then(|args| args.get("linesStartAt1"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
+            columns_start_at_one: arguments
+                .and_then(|args| args.get("columnsStartAt1"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
+            uri_paths: arguments
+                .and_then(|args| args.get("pathFormat"))
+                .and_then(serde_json::Value::as_str)
+                == Some("uri"),
+        }
+    }
+
+    fn line_to_client(self, line: u64) -> u64 {
+        line.saturating_sub(u64::from(!self.lines_start_at_one))
+    }
+
+    fn column_to_client(self, column: u64) -> u64 {
+        column.saturating_sub(u64::from(!self.columns_start_at_one))
+    }
+
+    fn line_from_client(self, line: u64) -> Option<u32> {
+        let line = u32::try_from(line).ok()?;
+        if self.lines_start_at_one {
+            (line > 0).then_some(line)
+        } else {
+            line.checked_add(1)
+        }
+    }
+
+    fn source_path(self, path: &std::path::Path) -> Option<String> {
+        if self.uri_paths {
+            url::Url::from_file_path(std::path::absolute(path).ok()?)
+                .ok()
+                .map(Into::into)
+        } else {
+            Some(path.to_string_lossy().into_owned())
+        }
+    }
+}
+
 pub async fn run() {
     let stdin = tokio::io::stdin();
     let mut reader = transport::MessageReader::new(BufReader::new(stdin));
@@ -67,6 +131,7 @@ pub async fn run() {
     let (backend_tx, backend_rx) = tokio_mpsc::channel::<BackendRequest>(32);
     let (event_bridge_tx, mut event_bridge_rx) = tokio_mpsc::channel::<BackendEvent>(32);
     let mut state = FrontendState {
+        client: ClientConventions::default(),
         vm_active: false,
         vm_suspended: false,
         dbg_cmd_tx: None,
@@ -124,7 +189,7 @@ pub async fn run() {
                 if let BackendEvent::BreakpointChanged { breakpoint, .. } = bridge_event {
                     let dap_event = DapEvent::new(seq, "breakpoint", Some(serde_json::json!({
                         "reason": "changed",
-                        "breakpoint": breakpoint_to_json(&breakpoint),
+                        "breakpoint": breakpoint_to_json(&breakpoint, state.client),
                     })));
                     seq += 1;
                     if let Ok(json) = serde_json::to_string(&dap_event) {
@@ -200,6 +265,7 @@ async fn handle_request(
 
     match command.as_str() {
         "initialize" => {
+            state.client = ClientConventions::from_initialize(msg.arguments.as_ref());
             let body = serde_json::json!({
                 "supportsConfigurationDoneRequest": true,
                 "supportsFunctionBreakpoints": false,
@@ -313,7 +379,7 @@ async fn handle_request(
                 .and_then(|p| p.as_str())
                 .map(clean_path)
                 .unwrap_or_default();
-            let breakpoints_req = match parse_source_breakpoints(msg) {
+            let breakpoints_req = match parse_source_breakpoints(msg, state.client) {
                 Ok(breakpoints) => breakpoints,
                 Err(message) => {
                     send_error(stdout, seq, msg.seq, "setBreakpoints", message).await;
@@ -346,7 +412,7 @@ async fn handle_request(
             };
             let breakpoints: Vec<serde_json::Value> = resolved_breakpoints
                 .iter()
-                .map(breakpoint_to_json)
+                .map(|breakpoint| breakpoint_to_json(breakpoint, state.client))
                 .collect();
             send_response(
                 stdout,
@@ -459,15 +525,18 @@ async fn handle_request(
                     let mut frame = serde_json::json!({
                         "id": f.id,
                         "name": f.name,
-                        "line": f.line,
-                        "column": f.column,
+                        "line": state.client.line_to_client(f.line),
+                        "column": state.client.column_to_client(f.column),
                     });
                     if let Some(ref path) = f.source_file {
+                        let Some(client_path) = state.client.source_path(path) else {
+                            return frame;
+                        };
                         frame.as_object_mut().unwrap().insert(
                             "source".to_string(),
                             serde_json::json!({
                                 "name": path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
-                                "path": path.to_string_lossy(),
+                                "path": client_path,
                             }),
                         );
                     }
@@ -890,7 +959,10 @@ fn request_frame_id_or_default(msg: &DapMessage) -> Option<usize> {
     }
 }
 
-fn parse_source_breakpoints(msg: &DapMessage) -> Result<Vec<SourceBreakpoint>, &'static str> {
+fn parse_source_breakpoints(
+    msg: &DapMessage,
+    client: ClientConventions,
+) -> Result<Vec<SourceBreakpoint>, &'static str> {
     let Some(value) = msg
         .arguments
         .as_ref()
@@ -906,9 +978,12 @@ fn parse_source_breakpoints(msg: &DapMessage) -> Result<Vec<SourceBreakpoint>, &
             let line = breakpoint
                 .get("line")
                 .and_then(serde_json::Value::as_u64)
-                .and_then(|line| u32::try_from(line).ok())
-                .filter(|line| *line > 0)
-                .ok_or("each breakpoint line must be an integer from 1 through 4294967295")?;
+                .and_then(|line| client.line_from_client(line))
+                .ok_or(if client.lines_start_at_one {
+                    "each breakpoint line must be an integer from 1 through 4294967295"
+                } else {
+                    "each breakpoint line must be an integer from 0 through 4294967294"
+                })?;
             let condition = breakpoint
                 .get("condition")
                 .and_then(serde_json::Value::as_str)
@@ -940,11 +1015,11 @@ async fn send_response(
     }
 }
 
-fn breakpoint_to_json(bp: &DapBreakpoint) -> serde_json::Value {
+fn breakpoint_to_json(bp: &DapBreakpoint, client: ClientConventions) -> serde_json::Value {
     let mut value = serde_json::json!({
         "id": bp.id,
         "verified": bp.verified,
-        "line": bp.line,
+        "line": client.line_to_client(u64::from(bp.line)),
     });
     if let Some(message) = &bp.message {
         value
@@ -1426,6 +1501,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn zero_based_breakpoint_lines_are_checked_before_conversion() {
+        let client = ClientConventions {
+            lines_start_at_one: false,
+            ..Default::default()
+        };
+        assert_eq!(client.line_from_client(0), Some(1));
+        assert_eq!(
+            client.line_from_client(u64::from(u32::MAX) - 1),
+            Some(u32::MAX)
+        );
+        assert_eq!(client.line_from_client(u64::from(u32::MAX)), None);
+        assert_eq!(client.line_from_client(u64::MAX), None);
+        assert_eq!(client.line_to_client(1), 0);
+        assert_eq!(ClientConventions::default().line_from_client(0), None);
+    }
+
+    #[test]
     fn prepare_program_expands_user_and_prelude_macros() {
         let interpreter = sema_eval::Interpreter::new();
         let program = prepare_program(&interpreter,
@@ -1515,7 +1607,7 @@ mod tests {
             }))
             .expect("valid DAP envelope");
 
-            assert!(parse_source_breakpoints(&message).is_err());
+            assert!(parse_source_breakpoints(&message, ClientConventions::default()).is_err());
         }
     }
 
@@ -1529,7 +1621,8 @@ mod tests {
         }))
         .expect("valid DAP envelope");
 
-        let breakpoints = parse_source_breakpoints(&message).expect("valid line");
+        let breakpoints =
+            parse_source_breakpoints(&message, ClientConventions::default()).expect("valid line");
         assert_eq!(breakpoints[0].line, u32::MAX);
     }
 }

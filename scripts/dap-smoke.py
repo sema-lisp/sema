@@ -136,27 +136,33 @@ def main():
     parser.add_argument("--finish-evaluate", action="append", default=[])
     parser.add_argument("--timeout", type=float, default=15)
     parser.add_argument("--verbose-output", action="store_true")
+    parser.add_argument("--zero-based", action="store_true", help="request zero-based DAP lines and columns")
+    parser.add_argument("--uri-paths", action="store_true", help="request file URI source paths")
     parser.add_argument("--expect-next-line", type=int)
     parser.add_argument("--expect-evaluate", action="append", default=[], metavar="EXPRESSION=RESULT")
     parser.add_argument("--expect-finish", action="append", default=[], metavar="EXPRESSION=RESULT")
     args = parser.parse_args()
     program = args.program.resolve()
+    client_path = program.as_uri() if args.uri_paths else str(program)
+    line_offset = int(args.zero_based)
     line = source_line(program, args.break_text)
     finish_line = source_line(program, args.finish_text) if args.finish_text else None
     client = DapClient(args.binary.resolve(), program.parent, args.timeout)
     report = {"program": str(program), "breakpoint_line": line}
+    report["client"] = {"zero_based": args.zero_based, "uri_paths": args.uri_paths}
     try:
-        client.request("initialize", {"adapterID": "sema-smoke", "linesStartAt1": True,
-                                      "columnsStartAt1": True, "pathFormat": "path"})
+        client.request("initialize", {"adapterID": "sema-smoke", "linesStartAt1": not args.zero_based,
+                                      "columnsStartAt1": not args.zero_based,
+                                      "pathFormat": "uri" if args.uri_paths else "path"})
         client.event("initialized")
-        client.request("setBreakpoints", {"source": {"path": str(program)},
-                                          "breakpoints": [{"line": line}]})
-        client.request("launch", {"program": str(program)})
+        client.request("setBreakpoints", {"source": {"path": client_path},
+                                          "breakpoints": [{"line": line - line_offset}]})
+        client.request("launch", {"program": client_path})
         client.request("configurationDone")
         assert client.event("stopped")["reason"] == "breakpoint"
         frames = client.frames()
-        assert frames[0]["line"] == line, frames
-        assert Path(frames[0]["source"]["path"]).resolve() == program, frames
+        assert frames[0]["line"] == line - line_offset, frames
+        assert frames[0]["source"]["path"] == client_path, frames
         report["frames"] = frames
         scopes = client.request("scopes", {"frameId": frames[0]["id"]})["scopes"]
         report["locals"] = []
@@ -171,18 +177,18 @@ def main():
         for check in args.expect_evaluate:
             expression, expected = check.rsplit("=", 1)
             assert report["evaluated"][expression] == expected, report["evaluated"]
-        client.request("setBreakpoints", {"source": {"path": str(program)},
-            "breakpoints": [{"line": finish_line}] if finish_line else []})
+        client.request("setBreakpoints", {"source": {"path": client_path},
+            "breakpoints": [{"line": finish_line - line_offset}] if finish_line else []})
         client.request("next", {"threadId": 1})
         assert client.event("stopped")["reason"] == "step"
         report["after_next"] = client.frames()
         if args.expect_next_line is not None:
-            assert report["after_next"][0]["line"] == args.expect_next_line, report["after_next"]
+            assert report["after_next"][0]["line"] == args.expect_next_line - line_offset, report["after_next"]
         client.request("continue", {"threadId": 1})
         if finish_line:
             assert client.event("stopped")["reason"] == "breakpoint"
             frames = client.frames()
-            assert frames[0]["line"] == finish_line, frames
+            assert frames[0]["line"] == finish_line - line_offset, frames
             report["finish_evaluated"] = {expr: client.request("evaluate", {
                 "expression": expr, "frameId": frames[0]["id"], "context": "watch",
             })["result"] for expr in args.finish_evaluate}

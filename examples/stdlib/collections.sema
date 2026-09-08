@@ -60,13 +60,13 @@
 (println "--- Statistics ---")
 
 ;; list/avg
-(assert-eq (list/avg (list 2 4 6)) 4.0 "list/avg")
-(assert-eq (list/avg (list 1 2 3 4)) 2.5 "list/avg fractional")
+(assert-eq (list/avg (list 2 4 6)) 4 "list/avg")
+(assert-eq (list/avg (list 1 2 3 4)) 5/2 "list/avg fractional")
 
 ;; list/median
-(assert-eq (list/median (list 3 1 2)) 2.0 "list/median odd")
-(assert-eq (list/median (list 1 2 3 4)) 2.5 "list/median even")
-(assert-eq (list/median (list 1 2 3 4 5)) 3.0 "list/median 5 items")
+(assert-eq (list/median (list 3 1 2)) 2 "list/median odd")
+(assert-eq (list/median (list 1 2 3 4)) 5/2 "list/median even")
+(assert-eq (list/median (list 1 2 3 4 5)) 3 "list/median 5 items")
 
 ;; list/mode (most frequent)
 (assert-eq (list/mode (list 1 2 2 3 3 3)) 3 "list/mode single")

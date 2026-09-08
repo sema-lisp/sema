@@ -623,19 +623,23 @@ Transform a list of maps into a map keyed by a function result.
 
 ### `list/avg`
 
-Return the average of a numeric list.
+Return the average of a numeric list. Exact inputs produce an exact result;
+an inexact input produces an inexact result.
 
 ```sema
-(list/avg '(2 4 6))   ; => 4.0
+(list/avg '(2 4 6))       ; => 4
+(list/avg '(1 2 3 4))     ; => 5/2
+(list/avg '(1 2.0 3))     ; => 2.0
 ```
 
 ### `list/median`
 
-Return the statistical median.
+Return the statistical median of real numbers. Exact inputs produce an exact
+result; an inexact input produces an inexact result.
 
 ```sema
-(list/median '(3 1 2))     ; => 2.0
-(list/median '(1 2 3 4))   ; => 2.5
+(list/median '(3 1 2))     ; => 2
+(list/median '(1 2 3 4))   ; => 5/2
 ```
 
 ### `list/mode`

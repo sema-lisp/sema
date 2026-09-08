@@ -103,7 +103,7 @@ Inside an async task, yield for `ms` milliseconds on the scheduler's **virtual c
 (async/timeout ms promise) → value
 ```
 
-Wait for `promise` to resolve, but raise an error if it takes longer than `ms` milliseconds. On expiry the target task **is cancelled** — and any in-flight offloaded I/O it holds is aborted for real (an HTTP connection is torn down, a subprocess is killed; LLM calls are best-effort — see [`async/cancel`](#async-cancel)). So a timed-out `http/get`/`shell` stops consuming resources immediately rather than running to completion in the background.
+Wait for `promise` to resolve, but raise an error if it takes longer than `ms` milliseconds. `async/timeout` only observes the supplied promise: on expiry its task continues running, including any in-flight I/O. Use [`async/with-timeout`](#asyncwith-timeout) when this form creates the task and must cancel it on expiry, or call [`async/cancel`](#async-cancel) explicitly when you own an existing promise.
 
 ```sema
 (async/timeout 100 (async (do-slow-work)))
@@ -111,6 +111,21 @@ Wait for `promise` to resolve, but raise an error if it takes longer than `ms` m
 ```
 
 A `ms = 0` (or very short) timeout still lets work that is **synchronously ready** finish — it only fires once the virtual clock actually reaches the deadline with the task still pending (i.e. the task had to block/wait). Durations are capped at `86_400_000` ms (1 day).
+
+### `async/with-timeout`
+
+```sema
+(async/with-timeout ms thunk) → value
+```
+
+Run a zero-argument `thunk` as an owned task. If the deadline expires first,
+cancel the task and raise a `:timeout` condition. Use this form when the work
+should stop with the timeout.
+
+```sema
+(async/with-timeout 100 (fn () (http/get slow-url)))
+;; raises a :timeout condition and cancels the request task
+```
 
 ### `async/cancel`
 

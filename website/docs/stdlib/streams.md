@@ -87,6 +87,8 @@ Open (or create) a file for writing. Returns a buffered output stream. Requires
 ### `stream/read`
 
 Read up to `n` bytes, returning a bytevector. Returns fewer bytes at EOF.
+`n` may be at most 8 MiB so one call cannot allocate an unbounded result; use
+repeated reads for larger input.
 
 ```sema
 (stream/read s 1024)   ;; => bytevector (up to 1024 bytes)
@@ -102,7 +104,7 @@ Read a single byte. Returns an integer 0–255, or `nil` at EOF.
 
 ### `stream/read-line`
 
-Read until newline (`\n`), returning a string without the newline. Strips trailing `\r` for Windows line endings. Returns `nil` at EOF.
+Read until newline (`\n`), returning a string without the newline. Strips trailing `\r` for Windows line endings. Returns `nil` at EOF. A line may contain at most 256 KiB, excluding the newline and its optional carriage return.
 
 ```sema
 (stream/read-line s)   ;; => "first line" (or nil)

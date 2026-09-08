@@ -7,9 +7,10 @@ returns: "number"
 see_also: ["list/avg", "list/mode", "list/sum"]
 ---
 
-Return the statistical median.
+Return the statistical median of real numbers. Exact inputs produce an exact
+result; an inexact input produces an inexact result.
 
 ```sema
-(list/median '(3 1 2))     ; => 2.0
-(list/median '(1 2 3 4))   ; => 2.5
+(list/median '(3 1 2))     ; => 2
+(list/median '(1 2 3 4))   ; => 5/2
 ```

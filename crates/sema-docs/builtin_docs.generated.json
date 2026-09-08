@@ -6006,7 +6006,7 @@
       "name": "list/avg",
       "module": "lists",
       "section": "Statistics",
-      "summary": "Return the average of a numeric list.",
+      "summary": "Return the average of a numeric list. Exact inputs produce an exact result; an inexact input produces an inexact result.",
       "params": [
         {
           "name": "seq",
@@ -6021,9 +6021,9 @@
         "list/max"
       ],
       "examples": [
-        "(list/avg '(2 4 6))   ; => 4.0"
+        "(list/avg '(2 4 6))       ; => 4\n(list/avg '(1 2 3 4))     ; => 5/2\n(list/avg '(1 2.0 3))     ; => 2.0"
       ],
-      "body": "Return the average of a numeric list.\n\n```sema\n(list/avg '(2 4 6))   ; => 4.0\n```"
+      "body": "Return the average of a numeric list. Exact inputs produce an exact result;\nan inexact input produces an inexact result.\n\n```sema\n(list/avg '(2 4 6))       ; => 4\n(list/avg '(1 2 3 4))     ; => 5/2\n(list/avg '(1 2.0 3))     ; => 2.0\n```"
     },
     {
       "name": "list/chunk",
@@ -6435,7 +6435,7 @@
       "name": "list/median",
       "module": "lists",
       "section": "Statistics",
-      "summary": "Return the statistical median.",
+      "summary": "Return the statistical median of real numbers. Exact inputs produce an exact result; an inexact input produces an inexact result.",
       "params": [
         {
           "name": "seq",
@@ -6449,9 +6449,9 @@
         "list/sum"
       ],
       "examples": [
-        "(list/median '(3 1 2))     ; => 2.0\n(list/median '(1 2 3 4))   ; => 2.5"
+        "(list/median '(3 1 2))     ; => 2\n(list/median '(1 2 3 4))   ; => 5/2"
       ],
-      "body": "Return the statistical median.\n\n```sema\n(list/median '(3 1 2))     ; => 2.0\n(list/median '(1 2 3 4))   ; => 2.5\n```"
+      "body": "Return the statistical median of real numbers. Exact inputs produce an exact\nresult; an inexact input produces an inexact result.\n\n```sema\n(list/median '(3 1 2))     ; => 2\n(list/median '(1 2 3 4))   ; => 5/2\n```"
     },
     {
       "name": "list/min",
@@ -15147,12 +15147,13 @@
     {
       "name": "for-range",
       "module": "special-forms",
-      "summary": "`for-range` executes `body` repeatedly with `var` bound to successive integers starting at `start` (inclusive) and continuing while strictly less than `end` (exclusive). An optional fourth element in the binding vector sets the step size, which defaults to `1`. The macro expands into a `do` loop with parallel stepping, so every iteration runs in constant stack space thanks to tail-call optimization in the VM. Use `for-range` for counted loops, index-based iteration over arrays, or any situation where you need a numeric counter.",
+      "summary": "`for-range` executes `body` repeatedly with `var` bound to successive integers starting at `start` (inclusive) and stopping before `end` (exclusive). An optional fourth element in the binding vector sets the step size, which defaults to `1`. A positive step iterates upward and a negative step iterates downward; a zero step raises an error. The macro expands into a `do` loop with parallel stepping, so every iteration runs in constant stack space thanks to tail-call optimization in the VM. Use `for-range` for counted loops, index-based iteration over arrays, or any situation where you need a numeric counter.",
       "examples": [
         "(for-range (i 0 5)\n  (println i))\n;; prints 0 1 2 3 4",
-        "(for-range (i 0 10 2)\n  (println i))\n;; prints 0 2 4 6 8"
+        "(for-range (i 0 10 2)\n  (println i))\n;; prints 0 2 4 6 8",
+        "(for-range (i 5 0 -1)\n  (println i))\n;; prints 5 4 3 2 1"
       ],
-      "body": "`for-range` executes `body` repeatedly with `var` bound to successive integers starting at `start` (inclusive) and continuing while strictly less than `end` (exclusive). An optional fourth element in the binding vector sets the step size, which defaults to `1`. The macro expands into a `do` loop with parallel stepping, so every iteration runs in constant stack space thanks to tail-call optimization in the VM. Use `for-range` for counted loops, index-based iteration over arrays, or any situation where you need a numeric counter.\n\n```sema\n(for-range (i 0 5)\n  (println i))\n;; prints 0 1 2 3 4\n```\n\nYou can specify a custom step to skip elements:\n\n```sema\n(for-range (i 0 10 2)\n  (println i))\n;; prints 0 2 4 6 8\n```\n\n**Note:** The step must evaluate to a positive number. `for-range` uses a single `>=` termination test, so backward iteration (negative step) is not supported by this macro; use a named `let` or `do` loop for decrementing ranges.",
+      "body": "`for-range` executes `body` repeatedly with `var` bound to successive integers starting at `start` (inclusive) and stopping before `end` (exclusive). An optional fourth element in the binding vector sets the step size, which defaults to `1`. A positive step iterates upward and a negative step iterates downward; a zero step raises an error. The macro expands into a `do` loop with parallel stepping, so every iteration runs in constant stack space thanks to tail-call optimization in the VM. Use `for-range` for counted loops, index-based iteration over arrays, or any situation where you need a numeric counter.\n\n```sema\n(for-range (i 0 5)\n  (println i))\n;; prints 0 1 2 3 4\n```\n\nYou can specify a custom step to skip elements:\n\n```sema\n(for-range (i 0 10 2)\n  (println i))\n;; prints 0 2 4 6 8\n```\n\nBackward iteration uses a negative step:\n\n```sema\n(for-range (i 5 0 -1)\n  (println i))\n;; prints 5 4 3 2 1\n```",
       "syntax": "(for-range (var start end [step]) body ...)",
       "special_form": true
     },
@@ -16015,7 +16016,7 @@
       "name": "stream/read",
       "module": "streams",
       "section": "Reading",
-      "summary": "Read up to `n` bytes, returning a bytevector. Returns fewer bytes at EOF.",
+      "summary": "Read up to `n` bytes, returning a bytevector. Returns fewer bytes at EOF. `n` may be at most 8 MiB; use repeated reads for larger input.",
       "params": [
         {
           "name": "stream",
@@ -16036,7 +16037,7 @@
       "examples": [
         "(stream/read s 1024)   ;; => bytevector (up to 1024 bytes)"
       ],
-      "body": "Read up to `n` bytes, returning a bytevector. Returns fewer bytes at EOF.\n\nOn a file-backed stream, calling `stream/read`, `stream/write`, `stream/read-line`, `stream/flush`, or `stream/close` again on the SAME stream object while one is already in flight (e.g. from a sibling `async/spawn` task) queues rather than racing the underlying file. In-memory streams (`stream/from-string`, `stream/byte-buffer`, …) are always synchronous and never queue.\n\n```sema\n(stream/read s 1024)   ;; => bytevector (up to 1024 bytes)\n```"
+      "body": "Read up to `n` bytes, returning a bytevector. Returns fewer bytes at EOF.\n`n` may be at most 8 MiB; use repeated reads for larger input.\n\nOn a file-backed stream, calling `stream/read`, `stream/write`, `stream/read-line`, `stream/flush`, or `stream/close` again on the SAME stream object while one is already in flight (e.g. from a sibling `async/spawn` task) queues rather than racing the underlying file. In-memory streams (`stream/from-string`, `stream/byte-buffer`, …) are always synchronous and never queue.\n\n```sema\n(stream/read s 1024)   ;; => bytevector (up to 1024 bytes)\n```"
     },
     {
       "name": "stream/read-all",
@@ -16092,7 +16093,7 @@
       "name": "stream/read-line",
       "module": "streams",
       "section": "Reading",
-      "summary": "Read until newline (`\\n`), returning a string without the newline. Strips trailing `\\r` for Windows line endings. Returns `nil` at EOF.",
+      "summary": "Read until newline (`\\n`), returning a string without the newline. Strips trailing `\\r` for Windows line endings. Returns `nil` at EOF. A line may contain at most 256 KiB, excluding the newline and its optional carriage return.",
       "params": [
         {
           "name": "stream",
@@ -16108,7 +16109,7 @@
       "examples": [
         "(stream/read-line s)   ;; => \"first line\" (or nil)"
       ],
-      "body": "Read until newline (`\\n`), returning a string without the newline. Strips trailing `\\r` for Windows line endings. Returns `nil` at EOF.\n\n```sema\n(stream/read-line s)   ;; => \"first line\" (or nil)\n```"
+      "body": "Read until newline (`\\n`), returning a string without the newline. Strips trailing `\\r` for Windows line endings. Returns `nil` at EOF. A line may contain at most 256 KiB, excluding the newline and its optional carriage return.\n\n```sema\n(stream/read-line s)   ;; => \"first line\" (or nil)\n```"
     },
     {
       "name": "stream/readable?",

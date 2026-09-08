@@ -14,5 +14,7 @@ mod llm_cassette_test;
 mod llm_chat_tools_async_test;
 #[path = "suites/llm_fake_test.rs"]
 mod llm_fake_test;
+#[path = "suites/llm_root_nonblocking_test.rs"]
+mod llm_root_nonblocking_test;
 #[path = "suites/memory_test.rs"]
 mod memory_test;

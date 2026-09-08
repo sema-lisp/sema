@@ -8,6 +8,10 @@ mod common;
 
 #[path = "suites/http_concurrent_test.rs"]
 mod http_concurrent_test;
+#[path = "suites/http_serve_cancel_test.rs"]
+mod http_serve_cancel_test;
+#[path = "suites/http_serve_concurrent_test.rs"]
+mod http_serve_concurrent_test;
 #[path = "suites/server_async_test.rs"]
 mod server_async_test;
 #[path = "suites/server_test.rs"]

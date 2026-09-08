@@ -3,12 +3,10 @@
 //! `take_output` (root-tagged captured output), `command_handle`, and
 //! `shutdown`.
 
-mod common;
-
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
-use common::watchdog::run_sema_with_timeout;
+use crate::common::watchdog::run_sema_with_timeout;
 use sema_eval::Interpreter;
 use sema_vm::runtime::{DriveState, OutputEvent, RootOptions, RootPoll, ShutdownOptions};
 

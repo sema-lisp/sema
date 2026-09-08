@@ -27,8 +27,7 @@ use sema_stdlib::{
 };
 use serial_test::serial;
 
-mod common;
-use common::sema_path;
+use crate::common::sema_path;
 
 /// A unique temp dir for one test, removed on drop (also on panic).
 struct TempDir(std::path::PathBuf);

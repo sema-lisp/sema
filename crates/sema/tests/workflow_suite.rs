@@ -8,8 +8,12 @@ mod common;
 
 mod workflow_common;
 
+#[path = "suites/workflow_approval_cli_test.rs"]
+mod workflow_approval_cli_test;
 #[path = "suites/workflow_budget_test.rs"]
 mod workflow_budget_test;
+#[path = "suites/workflow_checkpoint_async_test.rs"]
+mod workflow_checkpoint_async_test;
 #[path = "suites/workflow_cookbook_test.rs"]
 mod workflow_cookbook_test;
 #[path = "suites/workflow_mcp_seam_test.rs"]
@@ -24,3 +28,5 @@ mod workflow_selfrewrite_test;
 mod workflow_spike1_test;
 #[path = "suites/workflow_tools_test.rs"]
 mod workflow_tools_test;
+#[path = "suites/workflow_view_approval_test.rs"]
+mod workflow_view_approval_test;

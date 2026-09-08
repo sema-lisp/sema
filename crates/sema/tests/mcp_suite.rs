@@ -14,3 +14,5 @@ mod mcp_builtin_test;
 mod mcp_cassette_test;
 #[path = "suites/mcp_e2e_test.rs"]
 mod mcp_e2e_test;
+#[path = "suites/mcp_runtime_test.rs"]
+mod mcp_runtime_test;

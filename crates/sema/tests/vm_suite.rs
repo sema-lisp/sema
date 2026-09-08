@@ -6,6 +6,8 @@
 #[macro_use] // make common's macros (eval_tests! et al) visible in the member modules below
 mod common;
 
+#[path = "suites/compile_result_root_test.rs"]
+mod compile_result_root_test;
 #[path = "suites/gc_stress_test.rs"]
 mod gc_stress_test;
 #[path = "suites/pio_cross_validation_test.rs"]

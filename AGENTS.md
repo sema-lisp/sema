@@ -65,9 +65,11 @@ jake test.notebook-e2e  # Playwright E2E tests for notebook
 ```
 
 - Single crate: `cargo nextest run -p sema-reader` | Single test: `cargo nextest run -p sema-lang --test integration_test test_name` (positional arg is a substring filter)
-- Single eval test: `cargo nextest run -p sema-lang --test eval_test test_name` | Ignored tests: `cargo nextest run -p sema-lang --run-ignored ignored-only`
+- Single eval test: `cargo nextest run -p sema-lang --test eval_suite test_name` | Ignored tests: `cargo nextest run -p sema-lang --run-ignored ignored-only`
 - Run file: `cargo run -- examples/hello.sema` | REPL: `cargo run` | Eval: `cargo run -- -e "(+ 1 2)"`
-- Integration tests: `crates/sema/tests/integration_test.rs`. Eval tests: `crates/sema/tests/eval_test.rs`. Reader unit tests: `crates/sema-reader/src/reader.rs`.
+- Integration tests: `crates/sema/tests/integration_test.rs`. Eval tests: `crates/sema/tests/suites/eval_test.rs`. Reader unit tests: `crates/sema-reader/src/reader.rs`.
+- **New integration-test files go into a suite, not a new top-level file.** Every file directly under `crates/sema/tests/` links as its own ~100 MB binary, so put the file in `crates/sema/tests/suites/` and add a `#[path = "suites/<name>.rs"] mod <name>;` line to the matching `*_suite.rs` (async, eval, llm, mcp, server, vm, workflow, misc). Use `crate::common` / `crate::workflow_common` for the shared helpers. Only a test that needs process-global isolation stays top-level: `sema_otel::testing::install()`, `std::env::set_var`, `set_current_dir`, or an in-process signal handler (`signal_runtime_test.rs`). The July 2026 consolidation (docs/build-time-report.md) cut 86 binaries to 42; standalone files then crept back to 80 before the September 2026 pass, so check this on review.
+- `cargo <cmd> -p <crate>` builds a differently-featured copy of the dependency graph (feature unification follows the selected package set; ~20 dependency crates plus everything above them, ~1 GB and a separate incremental cache per selection). Prefer `cargo check` / `cargo nextest run -E 'package(<crate>)'` for cross-crate work; keep `-p` for a tight single-crate loop.
 - Editor plugins live in their own repos under the `sema-lisp` org (`vscode-sema`, `zed-sema`, `intellij-sema`, `emacs-sema`, `helix-sema`, `sema.nvim`, `sema.vim`, `sublime-sema`) and the grammar in `sema-lisp/tree-sitter-sema` — they are no longer in this repo. Each carries its own CI/publishing.
 
 ## Architecture (Cargo workspace)
@@ -142,11 +144,11 @@ OAuth terms are all fine).
 
 The bytecode VM (`sema-vm`) is the **sole evaluator**. All tests run on the VM. The `eval_tests!` / `eval_error_tests!` macros emit one test per case and pin each case to a literal expected value (`$input => $expected`) — that literal is the correctness oracle (there's no second backend to differentially compare against). The `common::eval_tw`/`eval_vm` helpers are equivalent and kept only because many tests call them to turn an expected Sema literal into a `Value` (`=> common::eval_tw("'(2 4 6)")`).
 
-- **Eval test file**: `crates/sema/tests/eval_test.rs` — use `eval_tests!` and `eval_error_tests!` (literal `=> expected` is the oracle)
-- **Async tests**: `crates/sema/tests/vm_async_test.rs` — async/channel tests
+- **Eval test file**: `crates/sema/tests/suites/eval_test.rs` (in `eval_suite`) — use `eval_tests!` and `eval_error_tests!` (literal `=> expected` is the oracle)
+- **Async tests**: `crates/sema/tests/suites/vm_async_test.rs` (in `vm_suite`) — async/channel tests
 - **Integration / equivalence**: `integration_test.rs`, `vm_integration_test.rs`
 - I/O, LLM, sandbox, CLI, module/import, server tests → `integration_test.rs`
-- **LLM / agent paths (keyless, deterministic)**: `crates/sema/tests/llm_fake_test.rs` uses `sema_llm::fake::FakeProvider` — a scripted provider (canned replies, tool calls, errors, streamed chunks) installed as the default via `sema_llm::builtins::register_test_provider`. It records every request (`FakeRecorder`) so tests can assert on the exact messages the runtime built (e.g. round-2 tool-result correlation). Test hooks: `set_retry_base_ms(0)` (no real sleeps) and `set_network_max_retries`. **Always add a FakeProvider test when changing the agent loop, retry, cache, budget, or provider serializers** — this is the CI regression oracle that runs without API keys.
+- **LLM / agent paths (keyless, deterministic)**: `crates/sema/tests/suites/llm_fake_test.rs` (in `llm_suite`) uses `sema_llm::fake::FakeProvider` — a scripted provider (canned replies, tool calls, errors, streamed chunks) installed as the default via `sema_llm::builtins::register_test_provider`. It records every request (`FakeRecorder`) so tests can assert on the exact messages the runtime built (e.g. round-2 tool-result correlation). Test hooks: `set_retry_base_ms(0)` (no real sleeps) and `set_network_max_retries`. **Always add a FakeProvider test when changing the agent loop, retry, cache, budget, or provider serializers** — this is the CI regression oracle that runs without API keys.
 - Notebook E2E tests: `crates/sema-notebook/tests/e2e/` (Playwright, run via `jake test.notebook-e2e`)
 - A few `#[ignore]`d tests in `integration_test.rs` are a ready acceptance suite for the deferred VM stack-trace parity work (see `docs/deferred.md`).
 

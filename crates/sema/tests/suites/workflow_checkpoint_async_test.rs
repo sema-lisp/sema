@@ -1,9 +1,7 @@
 //! Cooperative runtime coverage for the write form of `workflow/checkpoint`.
 
-mod workflow_common;
-
+use crate::workflow_common::{events_of, run_workflow, temp_run_dir, RunOpts};
 use sema_llm::fake::FakeProvider;
-use workflow_common::{events_of, run_workflow, temp_run_dir, RunOpts};
 
 fn fresh_fake() -> FakeProvider {
     FakeProvider::builder("fake").model("fake-model").build()

@@ -13,8 +13,7 @@ use sema_llm::types::LlmError;
 use serial_test::serial;
 use std::time::{Duration, Instant};
 
-mod common;
-use common::sema_path;
+use crate::common::sema_path;
 
 fn strings(value: &sema_core::Value) -> Vec<String> {
     value

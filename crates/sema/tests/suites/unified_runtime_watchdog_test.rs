@@ -1,8 +1,6 @@
-mod common;
-
 #[cfg(any(unix, windows))]
-use common::watchdog::run_command_with_timeout;
-use common::watchdog::run_sema_with_timeout;
+use crate::common::watchdog::run_command_with_timeout;
+use crate::common::watchdog::run_sema_with_timeout;
 #[cfg(any(unix, windows))]
 use std::process::Command;
 #[cfg(windows)]
@@ -158,6 +156,16 @@ fn escaped_pipe_writer_helper() {
 }
 
 #[cfg(unix)]
+/// libtest path of a `#[ignore]` helper test in this file, for re-invoking the
+/// test binary with `--exact`. Inside a suite binary the file is a module, so
+/// the path carries a module prefix; standalone it is the bare function name.
+fn helper_test_path(name: &str) -> String {
+    match module_path!().split_once("::") {
+        Some((_crate, module)) => format!("{module}::{name}"),
+        None => name.to_string(),
+    }
+}
+
 fn marked_pid(output: &str, marker: &str) -> libc::pid_t {
     output
         .split_whitespace()
@@ -190,7 +198,7 @@ fn escaped_session_pipe_writers_do_not_block_drain_join() {
         &[
             "--ignored",
             "--exact",
-            "escaped_pipe_writer_helper",
+            &helper_test_path("escaped_pipe_writer_helper"),
             "--nocapture",
         ],
         Duration::from_secs(1),
@@ -318,7 +326,7 @@ fn windows_inherited_pipe_writer_does_not_block_drain_join() {
         &[
             "--ignored",
             "--exact",
-            "windows_inherited_pipe_writer_helper",
+            &helper_test_path("windows_inherited_pipe_writer_helper"),
             "--nocapture",
         ],
         Duration::from_secs(1),
@@ -369,7 +377,7 @@ fn windows_immediate_child_markers_are_not_lost() {
             &[
                 "--ignored",
                 "--exact",
-                "windows_immediate_marker_helper",
+                &helper_test_path("windows_immediate_marker_helper"),
                 "--nocapture",
             ],
             Duration::from_secs(1),
@@ -424,7 +432,7 @@ fn windows_multichunk_markers_are_not_lost() {
             &[
                 "--ignored",
                 "--exact",
-                "windows_multichunk_helper",
+                &helper_test_path("windows_multichunk_helper"),
                 "--nocapture",
             ],
             Duration::from_secs(1),

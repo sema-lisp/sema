@@ -10,5 +10,7 @@ mod common;
 mod doc_examples_test;
 #[path = "suites/fmt_cli_test.rs"]
 mod fmt_cli_test;
+#[path = "suites/host_api_test.rs"]
+mod host_api_test;
 #[path = "suites/repl_display_test.rs"]
 mod repl_display_test;

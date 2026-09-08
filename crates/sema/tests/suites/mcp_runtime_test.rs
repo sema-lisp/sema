@@ -19,8 +19,7 @@ use sema_core::{Sandbox, Value};
 use sema_eval::Interpreter as EvalInterpreter;
 use sema_vm::runtime::RootOptions;
 
-mod common;
-use common::sema_str;
+use crate::common::sema_str;
 
 fn unique_temp_path(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};

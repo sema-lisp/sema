@@ -364,13 +364,20 @@ fn resolve_expr_inner(expr: &CoreExpr, r: &mut Resolver) -> Result<ResolvedExpr,
             pred_name,
             field_names,
             field_specs,
-        } => Ok(ResolvedExpr::DefineRecordType {
-            type_name: *type_name,
-            ctor_name: *ctor_name,
-            pred_name: *pred_name,
-            field_names: field_names.clone(),
-            field_specs: field_specs.clone(),
-        }),
+        } => {
+            let is_top_level = r.current().is_top_level && r.current().blocks.len() == 1;
+            let mut bind = |name| resolve_record_binding(r, name, is_top_level);
+            Ok(ResolvedExpr::DefineRecordType {
+                type_name: *type_name,
+                ctor_name: bind(*ctor_name),
+                pred_name: bind(*pred_name),
+                field_names: field_names.clone(),
+                field_specs: field_specs
+                    .iter()
+                    .map(|(field, accessor)| Ok((*field, bind(*accessor))))
+                    .collect::<Result<_, SemaError>>()?,
+            })
+        }
 
         CoreExpr::Module {
             name,
@@ -440,6 +447,40 @@ fn resolve_exprs(exprs: &[CoreExpr], r: &mut Resolver) -> Result<Vec<ResolvedExp
     exprs.iter().map(|e| resolve_expr(e, r)).collect()
 }
 
+fn resolve_record_binding(r: &mut Resolver, name: Spur, is_top_level: bool) -> VarRef {
+    if is_top_level {
+        return VarRef {
+            name,
+            resolution: VarResolution::Global { spur: name },
+        };
+    }
+    let slot = r
+        .current()
+        .find_local(name)
+        .unwrap_or_else(|| r.define_local(name));
+    VarRef {
+        name,
+        resolution: VarResolution::Local { slot },
+    }
+}
+
+fn record_binding_names(expr: &CoreExpr) -> Option<Vec<Spur>> {
+    let CoreExpr::DefineRecordType {
+        ctor_name,
+        pred_name,
+        field_specs,
+        ..
+    } = expr
+    else {
+        return None;
+    };
+    let mut names = Vec::with_capacity(2 + field_specs.len());
+    names.push(*ctor_name);
+    names.push(*pred_name);
+    names.extend(field_specs.iter().map(|(_, accessor)| *accessor));
+    Some(names)
+}
+
 /// Resolve a body (lambda, let, letrec, begin, etc.) with R5RS internal define
 /// semantics: pre-register all inner define names so they can forward-reference
 /// each other. Also records the body's rebound names (see `Resolver::rebound_names`)
@@ -453,10 +494,20 @@ fn resolve_body(exprs: &[CoreExpr], r: &mut Resolver) -> Result<Vec<ResolvedExpr
                 CoreExpr::Spanned(_, inner) => inner.as_ref(),
                 other => other,
             };
-            if let CoreExpr::Define(spur, _) = inner {
-                if r.current().find_local(*spur).is_none() {
-                    r.define_local(*spur);
+            match inner {
+                CoreExpr::Define(spur, _) => {
+                    if r.current().find_local(*spur).is_none() {
+                        r.define_local(*spur);
+                    }
                 }
+                record if let Some(names) = record_binding_names(record) => {
+                    for name in names {
+                        if r.current().find_local(name).is_none() {
+                            r.define_local(name);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         let mut rebound = std::collections::HashSet::new();

@@ -1,7 +1,7 @@
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::{BTreeMap, HashMap};
 use std::ops::{Deref, DerefMut};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
 use web_time::Instant;
@@ -457,6 +457,18 @@ impl EvalContext {
 
     pub fn embedded_file_exists(&self, path: &PathBuf) -> bool {
         self.embedded_files.borrow().contains_key(path)
+    }
+
+    /// Whether an embedded module key has files below it. Package entries are
+    /// stored as a key for the entry source plus keys below that key for their
+    /// relative dependencies; extensionless local source files have no such
+    /// descendants.
+    pub fn embedded_file_has_descendant(&self, path: &Path) -> bool {
+        let prefix = format!("{}/", path.display());
+        self.embedded_files
+            .borrow()
+            .keys()
+            .any(|candidate| candidate.to_string_lossy().starts_with(&prefix))
     }
 
     pub fn get_embedded_file(&self, path: &PathBuf) -> Option<Vec<u8>> {

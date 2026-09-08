@@ -363,8 +363,7 @@ fn trace_native_table(ptr: sema_core::NodePtr, sink: &mut dyn FnMut(sema_core::G
     // trace_vm_closure_payload.
     let table = unsafe { &*(ptr.raw() as *const Vec<Rc<NativeFn>>) };
     for native in table {
-        let value = Value::native_fn_from_rc(Rc::clone(native));
-        sink(sema_core::GcEdge::Value(&value));
+        sink(sema_core::GcEdge::NativeFn(native));
     }
     true
 }
@@ -536,6 +535,8 @@ pub struct VM {
     native_fns: Rc<Vec<Rc<NativeFn>>>,
     debug_values: HashMap<u64, Value>,
     next_debug_value_ref: u64,
+    /// Stack frames retained after an uncaught error has unwound the VM.
+    debug_exception_frames: Option<Vec<crate::debug::DapStackFrame>>,
     /// One-entry cache of the last home env this VM registered with the
     /// cycle collector (CORE-2): consecutive `make_closure`s share a home,
     /// so a pointer-equality hit skips the collector's seen-set probe. The
@@ -1337,6 +1338,9 @@ impl<'owner, 'state> DebugValueGraphWalker<'owner, 'state> {
     fn schedule_gc_edge(&mut self, edge: GcEdge<'_>, keepalive: &Value) -> Result<(), SemaError> {
         match edge {
             GcEdge::Value(value) => self.schedule_value(value.clone()),
+            GcEdge::NativeFn(native) => {
+                self.schedule_value(Value::native_fn_from_rc(Rc::clone(native)))
+            }
             GcEdge::Env(env) if self.mode == DebugGraphMode::SnapshotOwner => {
                 self.schedule_env(Rc::clone(env))
             }
@@ -1625,6 +1629,12 @@ fn check_literal_map_keys(items: &[Value]) -> Result<(), SemaError> {
                     .with_hint("freeze the key first (mutable-array/->vector or mutable-cell/get)"),
             );
         }
+        if pair[0].contains_non_reflexive_value() {
+            return Err(
+                SemaError::type_error("reflexive map key", pair[0].type_name())
+                    .with_hint("NaN cannot be used in a map key"),
+            );
+        }
     }
     Ok(())
 }
@@ -1748,6 +1758,7 @@ impl VM {
             native_fns: Rc::new(native_fns),
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
+            debug_exception_frames: None,
             gc_adopted_home: std::cell::RefCell::new(Weak::new()),
             instruction_budget: None,
             instructions_executed: 0,
@@ -1812,6 +1823,7 @@ impl VM {
             native_fns,
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
+            debug_exception_frames: None,
             gc_adopted_home: std::cell::RefCell::new(Weak::new()),
             instruction_budget: None,
             instructions_executed: 0,
@@ -1845,6 +1857,7 @@ impl VM {
             native_fns: Rc::new(native_fns),
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
+            debug_exception_frames: None,
             gc_adopted_home: std::cell::RefCell::new(Weak::new()),
             instruction_budget: None,
             instructions_executed: 0,
@@ -2219,6 +2232,7 @@ impl VM {
     pub(crate) fn reset_for_reuse(&mut self) {
         self.stack.clear();
         self.frames.clear();
+        self.debug_exception_frames = None;
         self.pending_resume_error = None;
         self.native_signal = None;
     }
@@ -4910,7 +4924,7 @@ impl VM {
     ) -> Result<ExceptionAction, SemaError> {
         // Capture the stack trace before unwinding frames.
         let trace = self.capture_vm_stack_trace(failing_pc);
-        err = err.with_stack_trace(trace);
+        err = err.append_stack_trace(trace);
 
         let mut pc_for_lookup = failing_pc as u32;
         // Walk frames from top looking for a handler.
@@ -4978,6 +4992,9 @@ impl VM {
     }
 
     pub fn debug_stack_trace(&self) -> Vec<crate::debug::DapStackFrame> {
+        if self.frames.is_empty() {
+            return self.debug_exception_frames.clone().unwrap_or_default();
+        }
         self.frames
             .iter()
             .enumerate()
@@ -4998,6 +5015,25 @@ impl VM {
                 }
             })
             .collect()
+    }
+
+    /// Preserve the trace captured before an uncaught error unwound its frames.
+    /// DAP uses this on its inspection-only exception VM.
+    pub fn set_debug_exception_stack_trace(&mut self, trace: &StackTrace) {
+        self.debug_exception_frames = Some(
+            trace
+                .0
+                .iter()
+                .enumerate()
+                .map(|(id, frame)| crate::debug::DapStackFrame {
+                    id: id as u64,
+                    name: frame.name.clone(),
+                    line: frame.span.map_or(1, |span| span.line as u64),
+                    column: frame.span.map_or(1, |span| span.col as u64),
+                    source_file: frame.file.clone(),
+                })
+                .collect(),
+        );
     }
 
     /// Locals in scope at the frame's current pc, as `(slot, name-spur)`, with
@@ -5686,11 +5722,20 @@ enum ExceptionAction {
 /// Convert a SemaError into a Sema map value.
 fn error_to_value(err: &SemaError) -> Value {
     let inner = err.inner();
-    // A re-raised condition IS its map already — hand it back unchanged so
-    // every catch layer binds the same value (its :stack-trace stays the
-    // original error's; the re-throw site adds nothing).
+    // Preserve a condition's fields, then attach the trace captured while it
+    // crossed the VM exception boundary. Re-raised conditions keep their
+    // original trace because `with_stack_trace` does not replace one.
     if let SemaError::Condition(condition) = inner {
-        return condition.clone();
+        let Some(existing) = condition.as_map_rc() else {
+            return condition.clone();
+        };
+        let mut map = (*existing).clone();
+        if let (std::collections::btree_map::Entry::Vacant(entry), Some(trace)) =
+            (map.entry(Value::keyword("stack-trace")), err.stack_trace())
+        {
+            entry.insert(stack_trace_to_value(trace));
+        }
+        return Value::map(map);
     }
     let mut map = BTreeMap::new();
     match inner {
@@ -5862,29 +5907,33 @@ fn error_to_value(err: &SemaError) -> Value {
 
     // Serialize stack trace if present
     if let Some(trace) = err.stack_trace() {
-        let frames: Vec<Value> = trace
-            .0
-            .iter()
-            .map(|frame| {
-                let mut fm = BTreeMap::new();
-                fm.insert(Value::keyword("name"), Value::string(&frame.name));
-                if let Some(file) = &frame.file {
-                    fm.insert(
-                        Value::keyword("file"),
-                        Value::string(&file.display().to_string()),
-                    );
-                }
-                if let Some(span) = &frame.span {
-                    fm.insert(Value::keyword("line"), Value::int(span.line as i64));
-                    fm.insert(Value::keyword("col"), Value::int(span.col as i64));
-                }
-                Value::map(fm)
-            })
-            .collect();
-        map.insert(Value::keyword("stack-trace"), Value::list(frames));
+        map.insert(Value::keyword("stack-trace"), stack_trace_to_value(trace));
     }
 
     Value::map(map)
+}
+
+fn stack_trace_to_value(trace: &StackTrace) -> Value {
+    let frames: Vec<Value> = trace
+        .0
+        .iter()
+        .map(|frame| {
+            let mut fm = BTreeMap::new();
+            fm.insert(Value::keyword("name"), Value::string(&frame.name));
+            if let Some(file) = &frame.file {
+                fm.insert(
+                    Value::keyword("file"),
+                    Value::string(&file.display().to_string()),
+                );
+            }
+            if let Some(span) = &frame.span {
+                fm.insert(Value::keyword("line"), Value::int(span.line as i64));
+                fm.insert(Value::keyword("col"), Value::int(span.col as i64));
+            }
+            Value::map(fm)
+        })
+        .collect();
+    Value::list(frames)
 }
 
 // --- Stack trace intrinsic name mapping ---
@@ -6236,16 +6285,23 @@ pub fn compile_program_with_spans_and_natives(
 ) -> Result<CompiledProgram, SemaError> {
     let source_file = source_file.map(|p| std::fs::canonicalize(&p).unwrap_or(p));
     let mut cores = Vec::with_capacity(vals.len());
-    for val in vals {
+    for (index, val) in vals.iter().enumerate() {
         // Lowering errors carry a synthesized trace frame with `file: None`
         // (lowering doesn't know the source path); stamp it so the trace line
         // renders the real filename instead of `<input>`.
-        cores.push(
+        let mut core =
             crate::lower::lower(val, Some(span_map)).map_err(|e| match &source_file {
                 Some(f) => e.fill_trace_file(f),
                 None => e,
-            })?,
-        );
+            })?;
+        let is_compound =
+            val.as_list_rc().is_some() || val.as_vector_rc().is_some() || val.as_map_rc().is_some();
+        if !is_compound {
+            if let Some(span) = span_map.get(&sema_core::top_level_span_key(index)) {
+                core = crate::core_expr::CoreExpr::Spanned(*span, Box::new(core));
+            }
+        }
+        cores.push(core);
     }
     // Lower everything first: a sibling top-level form can redefine a
     // foldable builtin, and the folder must see the whole program (the
@@ -6798,6 +6854,29 @@ mod tests {
         });
 
         assert_eq!(table_edges, 1, "VM must own one edge to the shared table");
+    }
+
+    #[test]
+    fn native_table_tracing_does_not_add_a_reference_to_its_entries() {
+        let native = Rc::new(NativeFn::simple("gc-probe", |_| Ok(Value::nil())));
+        let table = Rc::new(vec![Rc::clone(&native)]);
+        let expected_count = Rc::strong_count(&native);
+        let table_ptr = sema_core::NodePtr::of_rc(&table);
+        let mut native_edges = 0;
+
+        assert!(trace_native_table(table_ptr, &mut |edge| match edge {
+            sema_core::GcEdge::NativeFn(entry) => {
+                native_edges += 1;
+                assert!(Rc::ptr_eq(entry, &native));
+                assert_eq!(
+                    Rc::strong_count(entry),
+                    expected_count,
+                    "GC must sample the native table's actual reference count"
+                );
+            }
+            _ => panic!("native table emitted an unexpected edge"),
+        }));
+        assert_eq!(native_edges, 1);
     }
 
     #[test]
@@ -8340,6 +8419,10 @@ mod tests {
         let file = std::path::PathBuf::from("debug-condition-test.sema");
         let mut allows_stop = |condition: &str| {
             let mut debug = crate::debug::DebugState::new_headless();
+            debug.set_valid_breakpoint_lines(std::collections::BTreeMap::from([(
+                file.clone(),
+                vec![1],
+            )]));
             debug.set_breakpoints_with_conditions(
                 &file,
                 &[crate::debug::SourceBreakpoint {
@@ -8986,28 +9069,27 @@ mod tests {
     }
 
     #[test]
-    fn test_bare_literal_breakpoint_snaps() {
-        // Bare literals (like `42` or `"hello"`) don't get spans.
-        // A breakpoint on a bare literal line should snap to the nearest line with spans.
+    fn test_bare_literal_breakpoints_are_executable() {
+        // Top-level literals carry their own spans, so a debugger can stop on
+        // every executable source line.
         let code = "\"hello\"\n42\n(+ 1 2)";
         let (vals, span_map) = sema_reader::read_many_with_spans(code).unwrap();
         let prog = compile_program_with_spans(&vals, &span_map, None).unwrap();
         let valid = valid_breakpoint_lines(&prog.closure, &prog.functions);
 
-        // Lines 1 and 2 are bare literals — no spans
-        assert!(!valid.contains(&1), "bare string should lack span");
-        assert!(!valid.contains(&2), "bare int should lack span");
+        assert!(valid.contains(&1), "bare string should carry a span");
+        assert!(valid.contains(&2), "bare int should carry a span");
         assert!(valid.contains(&3), "function call should have span");
 
-        // Snapping: line 1 and 2 should snap to line 3
-        assert_eq!(snap_breakpoint_line(1, &valid), Some(3));
-        assert_eq!(snap_breakpoint_line(2, &valid), Some(3));
+        assert_eq!(snap_breakpoint_line(1, &valid), Some(1));
+        assert_eq!(snap_breakpoint_line(2, &valid), Some(2));
     }
 
     #[test]
     fn test_debug_variables_expand_records_with_field_names() {
         let mut vm = VM::new(make_test_env(), vec![], &[], 0).unwrap();
         let point_value = Value::record(sema_core::Record {
+            type_id: 1,
             type_tag: intern("point"),
             field_names: vec![intern("x"), intern("y")],
             fields: vec![Value::int(3), Value::int(4)],
@@ -9030,6 +9112,7 @@ mod tests {
     fn test_debug_variables_expand_records_with_fallback_field_names() {
         let mut vm = VM::new(make_test_env(), vec![], &[], 0).unwrap();
         let point_value = Value::record(sema_core::Record {
+            type_id: 1,
             type_tag: intern("point"),
             field_names: Vec::new(),
             fields: vec![Value::int(3), Value::int(4)],

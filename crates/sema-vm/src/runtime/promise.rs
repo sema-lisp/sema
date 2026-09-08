@@ -35,6 +35,10 @@ struct PromiseRecord {
     task: Option<TaskId>,
     settlement: Option<Rc<TaskSettlement>>,
     waiters: VecDeque<(WaitKey, TaskId)>,
+    /// Set when cycle collection observes that the language-facing handle is
+    /// gone while the task is still pending. Settlement must then retry record
+    /// eviction because no later collection will see that dead handle again.
+    handle_dead: bool,
 }
 
 pub struct PromiseRegistry {
@@ -70,6 +74,7 @@ impl PromiseRegistry {
                 task,
                 settlement: None,
                 waiters: VecDeque::new(),
+                handle_dead: false,
             },
         );
     }
@@ -184,14 +189,28 @@ impl PromiseRegistry {
 
     /// GC eviction: a settled promise whose handle is gone is unreachable —
     /// remove its record so the registry stays O(live handles). A pending
-    /// promise is kept (a live task may still settle it), as is one with
-    /// waiters.
+    /// promise records the dead handle and stays until its producer settles;
+    /// waiters also keep a settled record alive.
     pub(crate) fn gc_evict(&mut self, id: PromiseId) {
-        if let Some(record) = self.records.get(&id) {
-            if record.settlement.is_some() && record.waiters.is_empty() {
-                self.records.remove(&id);
+        let remove = match self.records.get_mut(&id) {
+            Some(record) if record.settlement.is_none() => {
+                record.handle_dead = true;
+                false
             }
+            Some(record) => record.waiters.is_empty(),
+            None => false,
+        };
+        if remove {
+            self.records.remove(&id);
         }
+    }
+
+    /// Whether a previously pruned handle requires eviction to be retried once
+    /// its pending task reaches a terminal state.
+    pub(crate) fn has_dead_handle(&self, id: PromiseId) -> bool {
+        self.records
+            .get(&id)
+            .is_some_and(|record| record.handle_dead)
     }
 }
 

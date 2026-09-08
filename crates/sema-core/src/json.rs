@@ -38,14 +38,14 @@ pub fn value_to_json(val: &Value) -> Result<serde_json::Value, SemaError> {
         ValueView::Map(map) => {
             let mut obj = serde_json::Map::new();
             for (k, v) in map.iter() {
-                obj.insert(key_to_string(k), value_to_json(v)?);
+                insert_json_entry(&mut obj, k, v)?;
             }
             Ok(serde_json::Value::Object(obj))
         }
         ValueView::HashMap(map) => {
             let mut obj = serde_json::Map::new();
             for (k, v) in map.iter() {
-                obj.insert(key_to_string(k), value_to_json(v)?);
+                insert_json_entry(&mut obj, k, v)?;
             }
             Ok(serde_json::Value::Object(obj))
         }
@@ -54,6 +54,21 @@ pub fn value_to_json(val: &Value) -> Result<serde_json::Value, SemaError> {
             val.type_name()
         ))),
     })
+}
+
+fn insert_json_entry(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &Value,
+    value: &Value,
+) -> Result<(), SemaError> {
+    let output_key = key_to_string(key);
+    if object.contains_key(&output_key) {
+        return Err(SemaError::eval(format!(
+            "cannot encode map as JSON: distinct keys stringify to {output_key:?}"
+        )));
+    }
+    object.insert(output_key, value_to_json(value)?);
+    Ok(())
 }
 
 /// Convert a Sema Value to JSON without erroring. NaN/Infinity become null,
@@ -206,6 +221,17 @@ mod tests {
         let val = Value::list(vec![Value::int(1), Value::float(f64::NAN)]);
         let err = value_to_json(&val).unwrap_err();
         assert!(err.to_string().contains("NaN"));
+    }
+
+    #[test]
+    fn strict_rejects_colliding_stringified_map_keys() {
+        let mut map = BTreeMap::new();
+        map.insert(Value::keyword("a"), Value::int(1));
+        map.insert(Value::string("a"), Value::int(2));
+
+        let error = value_to_json(&Value::map(map))
+            .expect_err("distinct map keys must not collapse into one JSON key");
+        assert!(error.to_string().contains("stringify"), "{error}");
     }
 
     #[test]

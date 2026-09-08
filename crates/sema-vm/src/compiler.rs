@@ -117,10 +117,15 @@ fn scan_global_rebinds(expr: &ResolvedExpr, f: &mut impl FnMut(GlobalMutation)) 
             field_specs,
             ..
         } => {
-            f(GlobalMutation::Bind(*ctor_name));
-            f(GlobalMutation::Bind(*pred_name));
+            for binding in [ctor_name, pred_name] {
+                if let VarResolution::Global { spur } = binding.resolution {
+                    f(GlobalMutation::Bind(spur));
+                }
+            }
             for (_, accessor_name) in field_specs {
-                f(GlobalMutation::Bind(*accessor_name));
+                if let VarResolution::Global { spur } = accessor_name.resolution {
+                    f(GlobalMutation::Bind(spur));
+                }
             }
         }
         E::Define(spur, val) => {
@@ -1372,10 +1377,10 @@ impl Compiler {
     fn compile_define_record_type(
         &mut self,
         type_name: Spur,
-        ctor_name: Spur,
-        pred_name: Spur,
+        ctor_name: VarRef,
+        pred_name: VarRef,
         field_names: &[Spur],
-        field_specs: &[(Spur, Spur)],
+        field_specs: &[(Spur, VarRef)],
     ) -> Result<(), SemaError> {
         // Emit as a call to __vm-define-record-type with all info as constants
         // Function must be pushed first (before args) to match VM calling convention
@@ -1383,9 +1388,11 @@ impl Compiler {
         self.stack_height += 1;
         self.emit.emit_const(Value::symbol_from_spur(type_name))?;
         self.stack_height += 1;
-        self.emit.emit_const(Value::symbol_from_spur(ctor_name))?;
+        self.emit
+            .emit_const(Value::symbol_from_spur(ctor_name.name))?;
         self.stack_height += 1;
-        self.emit.emit_const(Value::symbol_from_spur(pred_name))?;
+        self.emit
+            .emit_const(Value::symbol_from_spur(pred_name.name))?;
         self.stack_height += 1;
         let fields: Vec<Value> = field_names
             .iter()
@@ -1398,7 +1405,7 @@ impl Compiler {
             .map(|(f, a)| {
                 Value::list(vec![
                     Value::symbol_from_spur(*f),
-                    Value::symbol_from_spur(*a),
+                    Value::symbol_from_spur(a.name),
                 ])
             })
             .collect();
@@ -1407,6 +1414,39 @@ impl Compiler {
         self.emit.emit_op(Op::Call);
         self.emit.emit_u16(5);
         self.stack_height -= 6;
+        let mut bindings = Vec::with_capacity(2 + field_specs.len());
+        bindings.push(ctor_name);
+        bindings.push(pred_name);
+        bindings.extend(field_specs.iter().map(|(_, accessor)| *accessor));
+        for (index, binding) in bindings.iter().enumerate() {
+            if index + 1 < bindings.len() {
+                self.emit.emit_op(Op::Dup);
+                // The helper result is this expression's untracked result.
+                // Its first duplicate leaves one vector beneath the current
+                // result; later duplicates already have that saved vector.
+                if index == 0 {
+                    self.stack_height += 1;
+                }
+            }
+            self.emit.emit_const(Value::int(index as i64))?;
+            self.stack_height += 1;
+            self.emit.emit_op(Op::Nth);
+            // The retained result vector remains an intermediate operand until
+            // the final binding. `Nth` consumes its duplicate and the index.
+            self.stack_height -= if index + 1 < bindings.len() || index == 0 {
+                1
+            } else {
+                2
+            };
+            match binding.resolution {
+                VarResolution::Global { spur } => {
+                    self.emit.emit_op(Op::DefineGlobal);
+                    self.emit.emit_u32(sema_core::spur_to_bits(spur));
+                }
+                _ => self.compile_var_store(binding),
+            }
+        }
+        self.emit.emit_op(Op::Nil);
         Ok(())
     }
 

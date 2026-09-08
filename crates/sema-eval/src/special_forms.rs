@@ -302,18 +302,15 @@ pub(crate) fn register_agent(name: &str, opts: Value, env: &Env) -> Result<Value
 
 fn is_module_entry_spec(spec: &str) -> bool {
     sema_core::resolve::is_package_import(spec)
-        || (!spec.ends_with(".sema")
-            && !spec.starts_with("./")
-            && !spec.starts_with("../")
-            && !spec.starts_with('/'))
 }
 
 fn module_file_path(
     spec: &str,
     resolved_path: &std::path::Path,
     direct_hit: bool,
+    has_descendants: bool,
 ) -> std::path::PathBuf {
-    if direct_hit && is_module_entry_spec(spec) {
+    if direct_hit && (is_module_entry_spec(spec) || has_descendants) {
         resolved_path.join("__entry__")
     } else {
         resolved_path.to_path_buf()
@@ -344,7 +341,8 @@ fn resolve_embedded_file(
     if let Some(norm) = sema_core::vfs::normalize_path(std::path::Path::new(spec)) {
         let key = std::path::PathBuf::from(&norm);
         if let Some(bytes) = ctx.get_embedded_file(&key) {
-            let file_path = module_file_path(spec, &key, true);
+            let file_path =
+                module_file_path(spec, &key, true, ctx.embedded_file_has_descendant(&key));
             return Some((key, file_path, bytes));
         }
     }
@@ -353,7 +351,7 @@ fn resolve_embedded_file(
     if let Some(norm) = sema_core::vfs::normalize_path(&base_dir.join(spec)) {
         let key = std::path::PathBuf::from(&norm);
         if let Some(bytes) = ctx.get_embedded_file(&key) {
-            let file_path = module_file_path(spec, &key, false);
+            let file_path = module_file_path(spec, &key, false, false);
             return Some((key, file_path, bytes));
         }
     }
@@ -428,6 +426,8 @@ pub(crate) fn prepare_load(
     } else {
         std::path::PathBuf::from(path_str)
     };
+    ctx.sandbox
+        .check_path(&resolved.to_string_lossy(), "load")?;
     let canonical = resolved
         .canonicalize()
         .io_ctx(format!("load {}", resolved.display()))?;
@@ -501,8 +501,9 @@ pub(crate) fn prepare_import(
             .map(|dir| dir.to_string_lossy().to_string());
         if let Some(key) = sema_core::vfs::vfs_resolve_key(path_str, base_dir.as_deref()) {
             let identity = std::path::PathBuf::from(&key);
-            let is_package = sema_core::resolve::is_package_import(&key) || !key.ends_with(".sema");
-            let file_path = if is_package {
+            let file_path = if sema_core::resolve::is_package_import(&key)
+                || sema_core::vfs::vfs_has_descendant(&key).unwrap_or(false)
+            {
                 identity.join("__entry__")
             } else {
                 identity.clone()
@@ -516,7 +517,8 @@ pub(crate) fn prepare_import(
     }
 
     let resolved = if sema_core::resolve::is_package_import(path_str) {
-        sema_core::resolve::resolve_package_import(path_str)?
+        let project_file = ctx.current_file.borrow().first().cloned();
+        sema_core::resolve::resolve_package_import_for_project(path_str, project_file.as_deref())?
     } else if std::path::Path::new(path_str).is_absolute() {
         std::path::PathBuf::from(path_str)
     } else if let Some(dir) = ctx.current_file_dir() {
@@ -524,6 +526,9 @@ pub(crate) fn prepare_import(
     } else {
         std::path::PathBuf::from(path_str)
     };
+
+    ctx.sandbox
+        .check_path(&resolved.to_string_lossy(), "import")?;
 
     if let Some(exports) = ctx.get_cached_module(&resolved) {
         return Ok(ImportPreparation::Cached { exports, selective });
@@ -680,10 +685,16 @@ pub(crate) fn copy_exports_to_env(
             env.set(intern(name), val.clone());
         }
     } else {
-        for name in selective {
-            let val = exports.get(name).ok_or_else(|| {
-                SemaError::eval(format!("import: module does not export '{name}'"))
-            })?;
+        let selected = selective
+            .iter()
+            .map(|name| {
+                exports.get(name).map(|value| (name, value)).ok_or_else(|| {
+                    SemaError::eval(format!("import: module does not export '{name}'"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for (name, val) in selected {
             env.set(intern(name), val.clone());
         }
     }
@@ -709,8 +720,11 @@ pub(crate) fn eval_load(
     Ok(Trampoline::Value(result))
 }
 
-/// (define-record-type <name> (<ctor> <field> ...) <pred> (<field> <accessor> [<mutator>]) ...)
-pub(crate) fn eval_define_record_type(args: &[Value], env: &Env) -> Result<Trampoline, SemaError> {
+/// Build the constructor, predicate, and accessors for a record declaration.
+///
+/// Binding the returned values is the compiler's responsibility. Keeping this
+/// routine pure lets a declaration inside a lambda bind its lexical slots.
+pub(crate) fn eval_define_record_type(args: &[Value], _env: &Env) -> Result<Trampoline, SemaError> {
     if args.len() < 3 {
         return Err(SemaError::eval(
             "define-record-type: requires at least type name, constructor, and predicate",
@@ -747,53 +761,16 @@ pub(crate) fn eval_define_record_type(args: &[Value], env: &Env) -> Result<Tramp
         .as_symbol()
         .ok_or_else(|| SemaError::eval("define-record-type: predicate must be a symbol"))?;
 
-    let ctor_name_clone = ctor_name.clone();
-    let record_field_names = field_name_spurs.clone();
-    env.set_str(
-        &ctor_name,
-        Value::native_fn(sema_core::NativeFn::simple(
-            ctor_name.clone(),
-            move |args: &[Value]| {
-                if args.len() != field_count {
-                    return Err(SemaError::arity(
-                        &ctor_name_clone,
-                        field_count.to_string(),
-                        args.len(),
-                    ));
-                }
-                Ok(Value::record(Record {
-                    type_tag,
-                    field_names: record_field_names.clone(),
-                    fields: args.to_vec(),
-                }))
-            },
-        )),
-    );
-
-    let pred_name_for_closure = pred_name.clone();
-    let pred_name_for_set = pred_name.clone();
-    env.set_str(
-        &pred_name_for_set,
-        Value::native_fn(sema_core::NativeFn::simple(
-            pred_name,
-            move |args: &[Value]| {
-                if args.len() != 1 {
-                    return Err(SemaError::arity(&pred_name_for_closure, "1", args.len()));
-                }
-                Ok(Value::bool(
-                    args[0].as_record().is_some_and(|r| r.type_tag == type_tag),
-                ))
-            },
-        )),
-    );
-
+    // Validate every field specification before creating any bindings. A
+    // failed declaration must not leave a constructor or predicate behind.
+    let mut accessors = Vec::with_capacity(args.len().saturating_sub(3));
     for field_spec_val in &args[3..] {
         let field_spec = field_spec_val
             .as_list()
             .ok_or_else(|| SemaError::eval("define-record-type: field spec must be a list"))?;
-        if field_spec.len() < 2 {
+        if field_spec.len() != 2 {
             return Err(SemaError::eval(
-                "define-record-type: field spec must have at least (field-name accessor)",
+                "define-record-type: field spec must be (field-name accessor)",
             ));
         }
 
@@ -814,34 +791,75 @@ pub(crate) fn eval_define_record_type(args: &[Value], env: &Env) -> Result<Tramp
             .as_symbol()
             .ok_or_else(|| SemaError::eval("define-record-type: accessor must be a symbol"))?;
 
-        let accessor_name_for_closure = accessor_name.clone();
-        let accessor_name_for_set = accessor_name.clone();
-        let type_name_for_err = type_name.clone();
-        env.set_str(
-            &accessor_name_for_set,
-            Value::native_fn(sema_core::NativeFn::simple(
-                accessor_name,
-                move |args: &[Value]| {
-                    if args.len() != 1 {
-                        return Err(SemaError::arity(
-                            &accessor_name_for_closure,
-                            "1",
-                            args.len(),
-                        ));
-                    }
-                    match args[0].as_record() {
-                        Some(r) if r.type_tag == type_tag => Ok(r.fields[field_idx].clone()),
-                        _ => Err(SemaError::type_error(
-                            &type_name_for_err,
-                            args[0].type_name(),
-                        )),
-                    }
-                },
-            )),
-        );
+        accessors.push((accessor_name, field_idx));
     }
 
-    Ok(Trampoline::Value(Value::nil()))
+    let type_id = sema_core::fresh_record_type_id();
+    let ctor_name_for_closure = ctor_name.clone();
+    let record_field_names = field_name_spurs.clone();
+    let constructor = Value::native_fn(sema_core::NativeFn::simple(
+        ctor_name.clone(),
+        move |args| {
+            if args.len() != field_count {
+                return Err(SemaError::arity(
+                    &ctor_name_for_closure,
+                    field_count.to_string(),
+                    args.len(),
+                ));
+            }
+            Ok(Value::record(Record {
+                type_id,
+                type_tag,
+                field_names: record_field_names.clone(),
+                fields: args.to_vec(),
+            }))
+        },
+    ));
+
+    let pred_name_for_closure = pred_name.clone();
+    let predicate = Value::native_fn(sema_core::NativeFn::simple(pred_name, move |args| {
+        if args.len() != 1 {
+            return Err(SemaError::arity(&pred_name_for_closure, "1", args.len()));
+        }
+        Ok(Value::bool(
+            args[0]
+                .as_record()
+                .is_some_and(|record| record.type_id == type_id),
+        ))
+    }));
+
+    let mut bindings = Vec::with_capacity(2 + accessors.len());
+    bindings.push(constructor);
+    bindings.push(predicate);
+    for (accessor_name, field_idx) in accessors {
+        let accessor_name_for_closure = accessor_name.clone();
+        let type_name_for_err = type_name.clone();
+        bindings.push(Value::native_fn(sema_core::NativeFn::simple(
+            accessor_name,
+            move |args| {
+                if args.len() != 1 {
+                    return Err(SemaError::arity(
+                        &accessor_name_for_closure,
+                        "1",
+                        args.len(),
+                    ));
+                }
+                match args[0].as_record() {
+                    Some(record) if record.type_id == type_id => {
+                        record.fields.get(field_idx).cloned().ok_or_else(|| {
+                            SemaError::eval("record value has fewer fields than its declaration")
+                        })
+                    }
+                    _ => Err(SemaError::type_error(
+                        &type_name_for_err,
+                        args[0].type_name(),
+                    )),
+                }
+            },
+        )));
+    }
+
+    Ok(Trampoline::Value(Value::vector(bindings)))
 }
 
 /// Parse parameter list, handling rest params (e.g., `(a b . rest)`)
@@ -870,6 +888,32 @@ mod tests {
     fn compile_source(interp: &Interpreter, source: &str) -> Vec<u8> {
         let result = interp.compile_to_bytecode(source).unwrap();
         sema_vm::serialize_to_bytes(&result, 0).unwrap()
+    }
+
+    #[test]
+    fn record_declarations_bind_lexically_and_keep_redefinition_identity() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str(
+                "(begin
+                    (define make-point :global)
+                    (define local
+                      (let ()
+                        (define-record-type point (make-point x) point? (x point-x))
+                        (point-x (make-point 7))))
+                    (define outside make-point)
+                    (define-record-type point (make-point x) point? (x point-x))
+                    (define old-make make-point)
+                    (define old? point?)
+                    (define-record-type point (make-point x y) point? (x point-x) (y point-y))
+                    (list local outside (old? (old-make 1)) (point? (old-make 1))))",
+            )
+            .unwrap();
+        let values = result.as_list().expect("result list");
+        assert_eq!(values[0], Value::int(7));
+        assert_eq!(values[1], Value::keyword("global"));
+        assert_eq!(values[2], Value::bool(true));
+        assert_eq!(values[3], Value::bool(false));
     }
 
     #[test]
@@ -967,6 +1011,42 @@ mod tests {
             interp.eval_str(r#"(import "./lib/a.sema") av"#).unwrap(),
             Value::int(5)
         );
+    }
+
+    #[test]
+    fn embedded_extensionless_file_keeps_its_parent_directory() {
+        let interp = Interpreter::new();
+        embed(
+            &interp,
+            "helper",
+            "(module helper (export value) (define value 17))",
+        );
+        embed(
+            &interp,
+            "entry",
+            r#"(module entry (export result) (import "./helper") (define result value))"#,
+        );
+
+        assert_eq!(
+            interp.eval_str(r#"(import "entry") result"#).unwrap(),
+            Value::int(17)
+        );
+    }
+
+    #[test]
+    fn selective_import_does_not_install_partial_exports() {
+        let interp = Interpreter::new();
+        embed(
+            &interp,
+            "exports.sema",
+            "(module exports (export present) (define present 9))",
+        );
+
+        let error = interp
+            .eval_str(r#"(import "exports.sema" present absent)"#)
+            .unwrap_err();
+        assert!(error.to_string().contains("does not export 'absent'"));
+        assert!(interp.global_env.get_str("present").is_none());
     }
 
     #[test]

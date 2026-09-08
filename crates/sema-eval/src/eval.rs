@@ -667,10 +667,22 @@ impl Interpreter {
 
     /// Run bytecode with relative imports resolved from `path`'s directory.
     pub fn run_bytecode_file(&self, path: &std::path::Path, bytes: &[u8]) -> EvalResult {
+        self.ctx
+            .sandbox
+            .check(sema_core::Caps::FS_READ, "run_bytecode_file")?;
         let canonical = path
             .canonicalize()
             .map_err(|error| SemaError::eval(format!("run {}: {error}", path.display())))?;
-        self.ctx.push_file_path(canonical);
+        self.ctx
+            .sandbox
+            .check_path(&canonical.to_string_lossy(), "run_bytecode_file")?;
+        self.run_bytecode_at_path(&canonical, bytes)
+    }
+
+    /// Run bytecode with relative imports resolved from a host-provided virtual
+    /// path. Bundled archives use VFS paths that do not exist on the host.
+    pub fn run_bytecode_at_path(&self, path: &std::path::Path, bytes: &[u8]) -> EvalResult {
+        self.ctx.push_file_path(path.to_path_buf());
         let result = self.run_bytecode_bytes(bytes);
         self.ctx.pop_file_path();
         result
@@ -8373,6 +8385,24 @@ mod runtime_eval_tests {
         );
     }
 
+    #[test]
+    fn runtime_owned_spawn_all_cancels_ready_sibling_before_it_runs() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define flag 0) \
+                   (define outcome \
+                     (try (async/spawn-all \
+                            (list (fn () (error \"boom\")) \
+                                  (fn () (set! flag 1) :late))) \
+                          (catch e :caught))) \
+                   (list outcome flag))",
+            )
+            .expect("owned failure is caught");
+        assert_eq!(result, lit("(list :caught 0)"));
+    }
+
     // async/map GATE 1 — happy path: one owned child per item, input-order results.
     #[test]
     fn runtime_owned_map_returns_input_order() {
@@ -8498,6 +8528,23 @@ mod runtime_eval_tests {
             lit("(list 10 0)"),
             "winner is 10; the slow loser is cancelled before its side effect",
         );
+    }
+
+    #[test]
+    fn runtime_owned_race_cancels_ready_loser_before_it_runs() {
+        let interp = Interpreter::new();
+        let result = interp
+            .eval_str_via_runtime(
+                "(begin \
+                   (define flag 0) \
+                   (define winner \
+                     (async/race-owned \
+                       (list (fn () :winner) \
+                             (fn () (set! flag 1) :loser)))) \
+                   (list winner flag))",
+            )
+            .expect("owned race returns the winner");
+        assert_eq!(result, lit("(list :winner 0)"));
     }
 
     // async/race-owned GATE 2 — empty input is an argument error.

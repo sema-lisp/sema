@@ -301,6 +301,10 @@ pub enum GcEdge<'a> {
     /// A strong reference to the heap allocation behind a `Value`
     /// (immediates and leaf heap types are ignored by the collector).
     Value(&'a Value),
+    /// A strong reference held directly as an `Rc<NativeFn>`, without an
+    /// intermediate `Value` wrapper. VM native tables use this form so the
+    /// collector samples the real reference count before taking its snapshot.
+    NativeFn(&'a Rc<NativeFn>),
     /// A strong reference to an `Rc<Env>` *wrapper* allocation (e.g.
     /// `Env.parent`, `Closure.globals`). The wrapper is its own node whose
     /// children are its bindings allocation and its parent wrapper.
@@ -777,6 +781,19 @@ pub fn trace_value(v: &Value, sink: &mut dyn FnMut(GcEdge)) -> bool {
     }
 }
 
+/// Enumerate a native function's payload edges without constructing a temporary
+/// `Value`. A temporary wrapper would add a strong reference while the
+/// collector samples the native function's reference count.
+fn trace_native_fn(native: &NativeFn, sink: &mut dyn FnMut(GcEdge)) -> bool {
+    match &native.payload {
+        None => true,
+        Some(payload) => match registered_payload_tracer(Any::type_id(&**payload)) {
+            Some(tracer) => tracer(payload, sink),
+            None => true,
+        },
+    }
+}
+
 // ── Collection ────────────────────────────────────────────────────
 
 /// Run a full synchronous collection. `pins` = node pointers whose interiors
@@ -1071,6 +1088,9 @@ enum NodeHandle {
     /// Any cycle-capable heap value (containers, thunk, channel, promise,
     /// multimethod, macro, lambda, NativeFn).
     Value(Value),
+    /// A native function reached through an owner that stores its `Rc`
+    /// directly rather than in a `Value`.
+    NativeFn(Rc<NativeFn>),
     /// An `Rc<Env>` wrapper allocation.
     EnvWrapper(Rc<Env>),
     /// An env's shared bindings allocation.
@@ -1166,6 +1186,7 @@ impl Collector {
             NodeHandle::Value(v) => v
                 .heap_strong_count()
                 .expect("registered candidates are heap allocations"),
+            NodeHandle::NativeFn(native) => Rc::strong_count(native),
             NodeHandle::EnvWrapper(rc) => Rc::strong_count(rc),
             NodeHandle::Bindings(rc) => Rc::strong_count(rc),
             NodeHandle::Opaque { .. } => {
@@ -1202,6 +1223,16 @@ impl Collector {
                         .expect("node values are heap allocations");
                     let pin = has_unknown_payload(v);
                     self.insert_node(ptr, strong, pin, NodeHandle::Value(v.clone()));
+                }
+                self.dec(ptr);
+                Some(ptr)
+            }
+            GcEdge::NativeFn(native) => {
+                let ptr = NodePtr::of_rc(native);
+                if !self.s.nodes.contains_key(&ptr) {
+                    let strong = Rc::strong_count(native);
+                    let pin = has_unknown_native_payload(native);
+                    self.insert_node(ptr, strong, pin, NodeHandle::NativeFn(Rc::clone(native)));
                 }
                 self.dec(ptr);
                 Some(ptr)
@@ -1296,6 +1327,7 @@ impl Collector {
             };
             match &handle {
                 NodeHandle::Value(v) => trace_value(v, &mut sink),
+                NodeHandle::NativeFn(native) => trace_native_fn(native, &mut sink),
                 NodeHandle::EnvWrapper(env) => {
                     sink(GcEdge::EnvBindings(&env.bindings));
                     if let Some(parent) = &env.parent {
@@ -1424,6 +1456,13 @@ fn has_unknown_payload(v: &Value) -> bool {
     }
 }
 
+fn has_unknown_native_payload(native: &NativeFn) -> bool {
+    native
+        .payload
+        .as_ref()
+        .is_some_and(|payload| registered_payload_tracer(Any::type_id(&**payload)).is_none())
+}
+
 /// Clear a white node's mutable cell per the plan §3 "severed how" column,
 /// extracting the contents into `severed` (dropped by the caller after all
 /// severing completes). White nodes are unreachable from any live
@@ -1441,6 +1480,7 @@ fn sever_node(ptr: NodePtr, handle: &NodeHandle, severed: &mut Vec<Value>) {
         // immutable and dies with the wrapper in the cascade.
         NodeHandle::EnvWrapper(_) => {}
         NodeHandle::Opaque { sever, .. } => severed.extend(sever(ptr)),
+        NodeHandle::NativeFn(_) => {}
         NodeHandle::Value(v) => match v.view_ref() {
             ValueViewRef::Thunk(t) => match t.forced.try_borrow_mut() {
                 Ok(mut forced) => severed.extend(forced.take()),

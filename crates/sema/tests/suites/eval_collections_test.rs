@@ -105,6 +105,8 @@ eval_tests! {
     list_member_missing: "(member 5 '(1 2 3))" => Value::bool(false),
     list_reduce: "(reduce + '(1 2 3 4))" => Value::int(10),
     list_iota: "(iota 5)" => common::eval("'(0 1 2 3 4)"),
+    iota_promotes_past_i64_max: "(iota 2 9223372036854775807 1)" => common::eval("'(9223372036854775807 9223372036854775808)"),
+    iota_promotes_past_i64_min: "(iota 2 -9223372036854775808 -1)" => common::eval("'(-9223372036854775808 -9223372036854775809)"),
     list_interpose: r#"(interpose ", " '("a" "b" "c"))"# => common::eval(r#"'("a" ", " "b" ", " "c")"#),
 }
 
@@ -317,9 +319,12 @@ eval_tests! {
 // ============================================================
 
 eval_tests! {
-    avg_ints: "(list/avg '(2 4 6))" => Value::float(4.0),
+    avg_ints: "(list/avg '(2 4 6))" => Value::int(4),
     avg_mixed: "(list/avg '(1 2.0 3))" => Value::float(2.0),
-    avg_single: "(list/avg '(10))" => Value::float(10.0),
+    avg_single: "(list/avg '(10))" => Value::int(10),
+    avg_rationals_stays_exact: "(list/avg '(1/2 3/2))" => Value::int(1),
+    avg_bignums_stays_exact: "(list/avg '(9223372036854775808 9223372036854775810))" => common::eval("9223372036854775809"),
+    avg_complex: "(list/avg '(1+2i 3+4i))" => common::eval("2+3i"),
 }
 
 eval_error_tests! {
@@ -331,14 +336,19 @@ eval_error_tests! {
 // ============================================================
 
 eval_tests! {
-    median_odd: "(list/median '(3 1 2))" => Value::float(2.0),
-    median_even: "(list/median '(3 1 2 4))" => Value::float(2.5),
-    median_single: "(list/median '(7))" => Value::float(7.0),
-    median_sorted: "(list/median '(1 2 3 4 5))" => Value::float(3.0),
+    median_odd: "(list/median '(3 1 2))" => Value::int(2),
+    median_even: "(list/median '(3 1 2 4))" => common::eval("5/2"),
+    median_single: "(list/median '(7))" => Value::int(7),
+    median_sorted: "(list/median '(1 2 3 4 5))" => Value::int(3),
+    median_rationals_stays_exact: "(list/median '(5/2 1/2 3/2))" => common::eval("3/2"),
+    median_bignums_stays_exact: "(list/median '(9223372036854775810 9223372036854775808))" => common::eval("9223372036854775809"),
+    median_mixed_real_is_inexact: "(list/median '(1 2.0))" => Value::float(1.5),
 }
 
 eval_error_tests! {
     median_empty: "(list/median '())",
+    median_rejects_complex: "(list/median '(1+1i 2))" => "real number",
+    median_rejects_nan: "(list/median (list (/ 0.0 0.0) 1.0))" => "cannot order nan",
 }
 
 // ============================================================

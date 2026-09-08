@@ -83,6 +83,10 @@ eval_tests! {
     record_pred: "(begin (define-record-type point (make-point x y) point? (x point-x) (y point-y)) (point? (make-point 1 2)))" => Value::bool(true),
     record_pred_false: "(begin (define-record-type point (make-point x y) point? (x point-x) (y point-y)) (point? 42))" => Value::bool(false),
     record_equality: "(begin (define-record-type point (make-point x y) point? (x point-x) (y point-y)) (equal? (make-point 1 2) (make-point 1 2)))" => Value::bool(true),
+    record_redefinition_has_new_identity: "(begin (define-record-type point (make-point x) point? (x point-x)) (define old-make make-point) (define old? point?) (define-record-type point (make-point x y) point? (x point-x) (y point-y)) (list (old? (old-make 1)) (point? (old-make 1))))" => Value::list(vec![Value::bool(true), Value::bool(false)]),
+    record_definition_is_lexical: "(begin (define make-point :global) (list (let () (define-record-type point (make-point x) point? (x point-x)) (point-x (make-point 7))) make-point))" => Value::list(vec![Value::int(7), Value::keyword("global")]),
+    ordered_map_keeps_distinct_map_keys: "(count (hash-map {:a 1} :first {:b 2} :second))" => Value::int(2),
+    ordered_map_keeps_distinct_closure_keys: "(count (hash-map (lambda (x) x) :first (lambda (x) x) :second))" => Value::int(2),
 }
 
 // ============================================================

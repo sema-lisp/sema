@@ -592,6 +592,20 @@ fn owned_fanout_apis_accept_vector_inputs() {
 }
 
 #[test]
+fn parallel_rejects_extra_concurrency_arguments() {
+    for form in [
+        "(parallel (list (fn () 1)) 1 2)",
+        "(parallel-settled (list (fn () 1)) 1 2)",
+    ] {
+        let error = eval_vm_err(form);
+        assert!(
+            error.contains("at most one concurrency"),
+            "expected an arity error for {form}, got: {error}"
+        );
+    }
+}
+
+#[test]
 fn with_timeout_preserves_values_matching_the_old_timer_sentinel() {
     assert_eq!(
         eval("(async/with-timeout 1000 (fn () :__with-timeout-elapsed))"),

@@ -356,7 +356,10 @@ impl DebugState {
                 let requested_line = bp.line;
                 let resolved = match valid_lines {
                     Some(valid) => crate::vm::snap_breakpoint_line(requested_line, valid),
-                    None => Some(requested_line),
+                    // A compiled program supplies every executable source
+                    // file. An absent entry therefore means this source cannot
+                    // run in the active debug session.
+                    None => None,
                 };
                 match resolved {
                     Some(line) => {
@@ -392,6 +395,29 @@ impl DebugState {
 
     pub fn set_valid_breakpoint_lines(&mut self, lines: BTreeMap<PathBuf, Vec<u32>>) {
         self.valid_breakpoint_lines = lines;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn breakpoints_for_unknown_source_are_unverified() {
+        let (event_tx, _) = mpsc::channel();
+        let (_, command_rx) = mpsc::channel();
+        let mut debug = DebugState::new(event_tx, command_rx);
+        let file = PathBuf::from("missing.sema");
+
+        let breakpoint = debug
+            .set_breakpoints(&file, &[12])
+            .into_iter()
+            .next()
+            .expect("one breakpoint result");
+
+        assert!(!breakpoint.verified);
+        assert_eq!(breakpoint.line, 12);
+        assert!(debug.breakpoints.is_empty());
     }
 }
 

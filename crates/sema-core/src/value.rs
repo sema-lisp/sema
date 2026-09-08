@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use hashbrown::HashMap as SpurMap;
 use lasso::{Key, Rodeo, Spur};
@@ -618,9 +619,24 @@ impl fmt::Debug for Channel {
 /// A record: tagged product type created by define-record-type.
 #[derive(Debug, Clone)]
 pub struct Record {
+    /// Runtime identity of the declaration that created this value.
+    ///
+    /// The display tag is not an identity: separate modules and redefinitions
+    /// may use the same source name for incompatible records.
+    pub type_id: u64,
     pub type_tag: Spur,
     pub field_names: Vec<Spur>,
     pub fields: Vec<Value>,
+}
+
+/// Reserved identity for the private record used by `values`.
+pub const MULTIPLE_VALUES_RECORD_TYPE_ID: u64 = 0;
+
+static NEXT_RECORD_TYPE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate a process-unique record declaration identity.
+pub fn fresh_record_type_id() -> u64 {
+    NEXT_RECORD_TYPE_ID.fetch_add(1, AtomicOrdering::Relaxed)
 }
 
 /// A mutable array: an in-place mutable vector of Values (Janet-style
@@ -2513,6 +2529,52 @@ impl Value {
         }
         false
     }
+
+    /// True when structural equality can report false for this value compared
+    /// with itself. Such values cannot be map keys because a lookup cannot
+    /// find the inserted key again.
+    pub fn contains_non_reflexive_value(&self) -> bool {
+        fn scan(v: &Value, pending: &mut Vec<Value>) -> bool {
+            match v.view_ref() {
+                ValueViewRef::Float(n) => n.is_nan(),
+                ValueViewRef::Complex(n) => {
+                    matches!(&n.re, SemaNumber::Real(value) if value.is_nan())
+                        || matches!(&n.im, SemaNumber::Real(value) if value.is_nan())
+                }
+                ValueViewRef::List(items) | ValueViewRef::Vector(items) => {
+                    pending.extend(items.iter().cloned());
+                    false
+                }
+                ValueViewRef::Map(map) => {
+                    for (key, value) in map {
+                        pending.push(key.clone());
+                        pending.push(value.clone());
+                    }
+                    false
+                }
+                ValueViewRef::HashMap(map) => {
+                    for (key, value) in map {
+                        pending.push(key.clone());
+                        pending.push(value.clone());
+                    }
+                    false
+                }
+                ValueViewRef::Record(record) => {
+                    pending.extend(record.fields.iter().cloned());
+                    false
+                }
+                _ => false,
+            }
+        }
+
+        let mut pending = vec![self.clone()];
+        while let Some(value) = pending.pop() {
+            if scan(&value, &mut pending) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 // ── Clone ─────────────────────────────────────────────────────────
@@ -2936,7 +2998,7 @@ impl PartialEq for Value {
             (ValueViewRef::Map(a), ValueViewRef::Map(b)) => a == b,
             (ValueViewRef::HashMap(a), ValueViewRef::HashMap(b)) => a == b,
             (ValueViewRef::Record(a), ValueViewRef::Record(b)) => {
-                a.type_tag == b.type_tag && a.fields == b.fields
+                a.type_id == b.type_id && a.fields == b.fields
             }
             (ValueViewRef::Bytevector(a), ValueViewRef::Bytevector(b)) => a == b,
             (ValueViewRef::F64Array(a), ValueViewRef::F64Array(b)) => {
@@ -3036,7 +3098,7 @@ impl Hash for Value {
             }
             ValueViewRef::Record(r) => {
                 10u8.hash(state);
-                r.type_tag.hash(state);
+                r.type_id.hash(state);
                 r.fields.hash(state);
             }
             ValueViewRef::Bytevector(bv) => {
@@ -3141,9 +3203,22 @@ impl Ord for Value {
             (ValueViewRef::Char(a), ValueViewRef::Char(b)) => a.cmp(&b),
             (ValueViewRef::List(a), ValueViewRef::List(b)) => a.cmp(b),
             (ValueViewRef::Vector(a), ValueViewRef::Vector(b)) => a.cmp(b),
-            (ValueViewRef::Record(a), ValueViewRef::Record(b)) => {
-                compare_spurs(a.type_tag, b.type_tag).then_with(|| a.fields.cmp(&b.fields))
+            (ValueViewRef::Map(a), ValueViewRef::Map(b)) => a.cmp(b),
+            (ValueViewRef::HashMap(a), ValueViewRef::HashMap(b)) => {
+                let mut a_entries: Vec<_> = a.iter().collect();
+                let mut b_entries: Vec<_> = b.iter().collect();
+                let compare_entry =
+                    |(a_key, a_value): &(&Value, &Value), (b_key, b_value): &(&Value, &Value)| {
+                        a_key.cmp(b_key).then_with(|| a_value.cmp(b_value))
+                    };
+                a_entries.sort_unstable_by(compare_entry);
+                b_entries.sort_unstable_by(compare_entry);
+                a_entries.cmp(&b_entries)
             }
+            (ValueViewRef::Record(a), ValueViewRef::Record(b)) => a
+                .type_id
+                .cmp(&b.type_id)
+                .then_with(|| a.fields.cmp(&b.fields)),
             (ValueViewRef::Bytevector(a), ValueViewRef::Bytevector(b)) => a.cmp(b),
             (ValueViewRef::I64Array(a), ValueViewRef::I64Array(b)) => a.cmp(b),
             (ValueViewRef::F64Array(a), ValueViewRef::F64Array(b)) => a
@@ -3181,7 +3256,12 @@ impl Ord for Value {
                     }
                 })
             }
-            _ => type_order(self).cmp(&type_order(other)),
+            // Opaque runtime values compare equal only when they are the same
+            // allocation (the raw-bits fast path above). The pointer tiebreak
+            // keeps distinct closures and handles distinct ordered-map keys.
+            _ => type_order(self)
+                .cmp(&type_order(other))
+                .then_with(|| self.0.cmp(&other.0)),
         }
     }
 }
@@ -3968,12 +4048,14 @@ mod tests {
         use std::hash::{Hash, Hasher};
 
         let a = Value::record(Record {
+            type_id: 1,
             type_tag: intern("point"),
             field_names: vec![intern("x"), intern("y")],
             fields: vec![Value::int(1), Value::int(2)],
         });
         let b = Value::record(Record {
-            type_tag: intern("point"),
+            type_id: 1,
+            type_tag: intern("renamed-point"),
             field_names: vec![intern("left"), intern("top")],
             fields: vec![Value::int(1), Value::int(2)],
         });
@@ -3981,7 +4063,7 @@ mod tests {
         assert_eq!(a, b);
         assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal);
         assert_eq!(format!("{a}"), "#<record point 1 2>");
-        assert_eq!(format!("{a}"), format!("{b}"));
+        assert_eq!(format!("{b}"), "#<record renamed-point 1 2>");
 
         let mut a_hasher = DefaultHasher::new();
         a.hash(&mut a_hasher);

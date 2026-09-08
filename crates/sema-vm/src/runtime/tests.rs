@@ -75,6 +75,37 @@ fn protocol_registries_reject_foreign_ids_and_preserve_canonical_settlements() {
 }
 
 #[test]
+fn gc_eviction_retries_when_a_dead_pending_promise_settles() {
+    use super::PromiseRegistry;
+
+    let (runtime, issuers) = runtime_issuers();
+    let (_, promise_ids, _) = issuers.into_parts();
+    let mut promises = PromiseRegistry::new(runtime, promise_ids);
+    let promise = promises.allocate_pending(None).unwrap();
+
+    promises.gc_evict(promise);
+    assert!(promises.has_dead_handle(promise));
+    assert_eq!(
+        promises.len(),
+        1,
+        "a pending producer still needs its record"
+    );
+
+    let settlement = Rc::new(sema_core::runtime::TaskSettlement {
+        sequence: IdCounter::<SettlementSeq>::new().allocate().unwrap(),
+        outcome: TaskOutcome::Returned(Value::int(7)),
+    });
+    promises.settle(promise, settlement).unwrap();
+    promises.gc_evict(promise);
+
+    assert_eq!(
+        promises.len(),
+        0,
+        "settlement must evict a record whose handle died while it was pending"
+    );
+}
+
+#[test]
 fn channel_registry_is_fifo_and_cancellation_is_exact() {
     use super::{ChannelRegistry, ChannelResult};
     let (runtime, issuers) = runtime_issuers();
@@ -753,6 +784,40 @@ fn root_filtered_drive_leaves_a_later_foreign_root_queued() {
     assert!(matches!(foreign.poll_result(), RootPoll::Pending));
     assert_eq!(drive_root_to_int(&runtime, &owned), 42);
     assert_eq!(drive_root_to_int(&runtime, &foreign), 3);
+}
+
+#[test]
+fn root_filtered_drive_does_not_release_a_foreign_origin_barrier() {
+    let runtime = runtime_with_inline_executor(Rc::new(FakeClock::new()));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let foreign = runtime
+        .submit_test_root(TestPreparedTask::native(Ok(NativeOutcome::Runtime(
+            sema_core::runtime::RuntimeRequest::OriginBarrier {
+                continuation: Box::new(CountingContinuation(Arc::clone(&events))),
+            },
+        ))))
+        .expect("foreign barrier root admitted");
+    let selected = runtime
+        .submit_test_root(TestPreparedTask::yield_forever())
+        .expect("selected root admitted");
+    let one = drive_budget(1);
+
+    while runtime.origin_barrier_wait_count_for_test() == 0 {
+        runtime.drive_roots(&one, &[foreign.id()]).unwrap();
+    }
+
+    runtime.drive_roots(&one, &[selected.id()]).unwrap();
+    assert_eq!(
+        runtime.origin_barrier_wait_count_for_test(),
+        1,
+        "a selected drive must not release an eligible foreign barrier"
+    );
+    assert!(events.lock().unwrap().is_empty());
+
+    while matches!(foreign.poll_result(), RootPoll::Pending) {
+        runtime.drive_roots(&one, &[foreign.id()]).unwrap();
+    }
+    assert_eq!(*events.lock().unwrap(), vec!["returned"]);
 }
 
 #[test]

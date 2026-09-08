@@ -999,19 +999,13 @@ fn validate_bytecode(result: &CompileResult) -> Result<(), SemaError> {
     // and `native_id < n_natives` rejects it — matching the runtime invariant
     // that loaded bytecode is run with an empty native table.
     let n_natives = result.native_table.len();
-    validate_chunk_bytecode(
-        &result.chunk,
-        result.functions.len(),
-        0,
-        n_natives,
-        "main chunk",
-    )?;
+    validate_chunk_bytecode(&result.chunk, &result.functions, 0, n_natives, "main chunk")?;
     for (i, func) in result.functions.iter().enumerate() {
         let label = format!("function {i}");
         let n_upvalues = func.upvalue_descs.len();
         validate_chunk_bytecode(
             &func.chunk,
-            result.functions.len(),
+            &result.functions,
             n_upvalues,
             n_natives,
             &label,
@@ -1022,7 +1016,7 @@ fn validate_bytecode(result: &CompileResult) -> Result<(), SemaError> {
 
 fn validate_chunk_bytecode(
     chunk: &Chunk,
-    n_functions: usize,
+    functions: &[Function],
     n_upvalues: usize,
     n_natives: usize,
     label: &str,
@@ -1059,10 +1053,43 @@ fn validate_chunk_bytecode(
             }
             Op::MakeClosure => {
                 let func_id = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as usize;
-                if func_id >= n_functions {
+                if func_id >= functions.len() {
                     return Err(SemaError::eval(format!(
-                        "in {label}: MakeClosure func_id {func_id} out of range ({n_functions} functions) at pc {pc}",
+                        "in {label}: MakeClosure func_id {func_id} out of range ({} functions) at pc {pc}",
+                        functions.len(),
                     )));
+                }
+                let encoded_upvalues = u16::from_le_bytes([code[pc + 3], code[pc + 4]]) as usize;
+                let expected_upvalues = functions[func_id].upvalue_descs.len();
+                if encoded_upvalues != expected_upvalues {
+                    return Err(SemaError::eval(format!(
+                        "in {label}: MakeClosure at pc {pc} encodes {encoded_upvalues} upvalues, but function {func_id} declares {expected_upvalues}",
+                    )));
+                }
+                for capture in 0..encoded_upvalues {
+                    let capture_pc = pc + 5 + capture * 4;
+                    let kind = u16::from_le_bytes([code[capture_pc], code[capture_pc + 1]]);
+                    let slot =
+                        u16::from_le_bytes([code[capture_pc + 2], code[capture_pc + 3]]) as usize;
+                    match kind {
+                        0 if slot < n_upvalues => {}
+                        1 if slot < n_locals => {}
+                        0 => {
+                            return Err(SemaError::eval(format!(
+                                "in {label}: MakeClosure at pc {pc} captures parent upvalue {slot}, but only {n_upvalues} exist",
+                            )));
+                        }
+                        1 => {
+                            return Err(SemaError::eval(format!(
+                                "in {label}: MakeClosure at pc {pc} captures local {slot}, but only {n_locals} exist",
+                            )));
+                        }
+                        _ => {
+                            return Err(SemaError::eval(format!(
+                                "in {label}: MakeClosure at pc {pc} has invalid capture kind {kind}",
+                            )));
+                        }
+                    }
                 }
             }
             Op::LoadLocal | Op::TakeLocal | Op::StoreLocal => {
@@ -1072,6 +1099,36 @@ fn validate_chunk_bytecode(
                         "in {label}: local slot {slot} out of range (n_locals={n_locals}) at pc {pc}",
                     )));
                 }
+            }
+            Op::LoadLocal0 | Op::StoreLocal0 => {
+                validate_fixed_local_slot(0, n_locals, label, pc)?;
+            }
+            Op::LoadLocal1 | Op::StoreLocal1 => {
+                validate_fixed_local_slot(1, n_locals, label, pc)?;
+            }
+            Op::LoadLocal2 | Op::StoreLocal2 => {
+                validate_fixed_local_slot(2, n_locals, label, pc)?;
+            }
+            Op::LoadLocal3 | Op::StoreLocal3 => {
+                validate_fixed_local_slot(3, n_locals, label, pc)?;
+            }
+            Op::LoadGlobal => {
+                let cache_slot = u16::from_le_bytes([code[pc + 5], code[pc + 6]]) as usize;
+                validate_global_cache_slot(
+                    cache_slot,
+                    chunk.n_global_cache_slots as usize,
+                    label,
+                    pc,
+                )?;
+            }
+            Op::CallGlobal => {
+                let cache_slot = u16::from_le_bytes([code[pc + 7], code[pc + 8]]) as usize;
+                validate_global_cache_slot(
+                    cache_slot,
+                    chunk.n_global_cache_slots as usize,
+                    label,
+                    pc,
+                )?;
             }
             Op::LoadUpvalue | Op::StoreUpvalue => {
                 let slot = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as usize;
@@ -1107,6 +1164,8 @@ fn validate_chunk_bytecode(
     // code.len() is also valid (end-of-code, reachable by forward jumps)
     valid_pcs.insert(code.len());
 
+    validate_exception_table(chunk, &valid_pcs, label)?;
+
     // Second pass: validate all jump targets land on instruction boundaries
     for (source_pc, target) in jump_targets {
         if target < 0 || target as usize > code.len() {
@@ -1126,6 +1185,63 @@ fn validate_chunk_bytecode(
     // proves no reachable opcode can pop from an empty operand stack.
     verify_stack_balance(chunk, n_locals, label)?;
 
+    Ok(())
+}
+
+fn validate_fixed_local_slot(
+    slot: usize,
+    n_locals: usize,
+    label: &str,
+    pc: usize,
+) -> Result<(), SemaError> {
+    if slot >= n_locals {
+        return Err(SemaError::eval(format!(
+            "in {label}: fixed local slot {slot} out of range (n_locals={n_locals}) at pc {pc}",
+        )));
+    }
+    Ok(())
+}
+
+fn validate_global_cache_slot(
+    slot: usize,
+    n_slots: usize,
+    label: &str,
+    pc: usize,
+) -> Result<(), SemaError> {
+    if slot >= n_slots {
+        return Err(SemaError::eval(format!(
+            "in {label}: global cache slot {slot} out of range (n_global_cache_slots={n_slots}) at pc {pc}",
+        )));
+    }
+    Ok(())
+}
+
+fn validate_exception_table(
+    chunk: &Chunk,
+    valid_pcs: &std::collections::HashSet<usize>,
+    label: &str,
+) -> Result<(), SemaError> {
+    let code_len = chunk.code.len();
+    for entry in &chunk.exception_table {
+        let try_start = entry.try_start as usize;
+        let try_end = entry.try_end as usize;
+        let handler_pc = entry.handler_pc as usize;
+        if try_start >= try_end || try_end > code_len {
+            return Err(SemaError::eval(format!(
+                "in {label}: invalid exception range [{try_start}, {try_end}) for code length {code_len}",
+            )));
+        }
+        if !valid_pcs.contains(&try_start) || !valid_pcs.contains(&try_end) {
+            return Err(SemaError::eval(format!(
+                "in {label}: exception range [{try_start}, {try_end}) does not use instruction boundaries",
+            )));
+        }
+        if handler_pc >= code_len || !valid_pcs.contains(&handler_pc) {
+            return Err(SemaError::eval(format!(
+                "in {label}: exception handler_pc {handler_pc} is not an instruction boundary",
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -1346,6 +1462,12 @@ pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<CompileResult, SemaError> 
             "unsupported bytecode format version {format_version} (expected {FORMAT_VERSION}). Recompile from source."
         )));
     }
+    let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
+    if flags != 0 {
+        return Err(SemaError::eval(format!(
+            "unsupported bytecode header flags 0x{flags:04x}"
+        )));
+    }
     let reserved = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
     if reserved != 0 {
         return Err(SemaError::eval(format!(
@@ -1408,6 +1530,12 @@ pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<CompileResult, SemaError> 
                     table.push(s.to_string());
                     sc += len;
                 }
+                if sc != section_len {
+                    return Err(SemaError::eval(format!(
+                        "string table section has {} unconsumed trailing bytes",
+                        section_len - sc
+                    )));
+                }
                 string_table = Some(table);
             }
             0x02 => {
@@ -1421,6 +1549,13 @@ pub fn deserialize_from_bytes(bytes: &[u8]) -> Result<CompileResult, SemaError> 
             }
         }
         cursor += section_len;
+    }
+
+    if cursor != bytes.len() {
+        return Err(SemaError::eval(format!(
+            "bytecode file has {} trailing bytes after its sections",
+            bytes.len() - cursor
+        )));
     }
 
     // Validate required sections
@@ -2140,9 +2275,11 @@ mod tests {
         let mut fe = Emitter::new();
         fe.emit_op(Op::LoadLocal0);
         fe.emit_op(Op::Return);
+        let mut function_chunk = fe.into_chunk();
+        function_chunk.n_locals = 1;
         let func = Function {
             name: Some(intern("add-one")),
-            chunk: fe.into_chunk(),
+            chunk: function_chunk,
             upvalue_descs: vec![],
             upvalue_names: vec![],
             arity: 1,
@@ -2236,7 +2373,8 @@ mod tests {
         e.emit_const(Value::symbol("test-sym")).unwrap();
         e.emit_const(Value::keyword("test-kw")).unwrap();
         e.emit_op(Op::Return);
-        let chunk = e.into_chunk();
+        let mut chunk = e.into_chunk();
+        chunk.n_global_cache_slots = 2;
 
         let result = CompileResult::new(chunk, vec![]);
 

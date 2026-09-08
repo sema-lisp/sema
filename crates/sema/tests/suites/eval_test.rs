@@ -686,6 +686,8 @@ eval_error_tests! {
     toml_decode_wrong_type: r#"(toml/decode 42)"# => "expected string",
 
     toml_encode_nil_value: r#"(toml/encode {:key nil})"# => "cannot encode nil",
+
+    toml_encode_colliding_map_keys: r#"(toml/encode (hash-map :a 1 "a" 2))"# => "stringify",
 }
 
 eval_error_tests! {
@@ -1298,6 +1300,7 @@ eval_error_tests! {
     stream_to_bytes_wrong_stream: r#"(stream/to-bytes (stream/from-string "x"))"# => "expected byte-buffer stream",
     stream_to_string_wrong_stream: r#"(stream/to-string (stream/from-string "x"))"# => "expected byte-buffer stream",
     stream_read_negative_count: "(stream/read (stream/from-string \"x\") -1)" => "non-negative",
+    stream_read_too_large: "(stream/read (stream/from-string \"x\") 8388609)" => "8388608-byte cap",
     stream_from_string_wrong_type: "(stream/from-string 42)" => "expected string",
     stream_from_bytes_wrong_type: "(stream/from-bytes 42)" => "expected bytevector",
 
@@ -1360,6 +1363,8 @@ eval_tests! {
 
     // i64-array: from-list + sum
     i64_array_from_list_sum: "(i64-array/sum (i64-array/from-list '(10 20 30)))" => Value::int(60),
+    i64_array_sum_promotes_past_i64_max: "(i64-array/sum (i64-array 9223372036854775807 1))" => common::eval("9223372036854775808"),
+    i64_array_sum_promotes_past_i64_min: "(i64-array/sum (i64-array -9223372036854775808 -1))" => common::eval("-9223372036854775809"),
 
     // i64-array: map (squares 1..4 → sum is 1+4+9+16 = 30)
     i64_array_map_squares_sum: "(i64-array/sum (i64-array/map (fn (x) (* x x)) (i64-array 1 2 3 4)))" => Value::int(30),
@@ -3042,6 +3047,9 @@ eval_error_tests! {
     mutable_cell_nested_list_key_rejected: "(assoc {} (list (mutable-cell/new 1)) 2)" => "immutable map key",
     mutable_array_nested_literal_key_rejected: "(let ((a (mutable-array/new))) {[a] 1})" => "immutable map key",
     mutable_array_nested_map_value_key_rejected: "(hashmap/new {:k (mutable-array/new)} 1)" => "immutable map key",
+    nan_map_key_rejected: "(hash-map math/nan 1)" => "reflexive map key",
+    nested_nan_map_key_rejected: "(hashmap/new [math/nan] 1)" => "reflexive map key",
+    record_mutator_spec_rejected: "(define-record-type point (make-point x) point? (x point-x set-point-x!))" => "field spec must be",
 }
 
 // ============================================================

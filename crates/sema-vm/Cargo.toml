@@ -14,6 +14,7 @@ sema-reader.workspace = true
 hashbrown.workspace = true
 lasso.workspace = true
 smallvec.workspace = true
+stacker = "0.1"
 num-bigint = "0.4"
 num-integer = "0.1"
 num-rational = "0.4"

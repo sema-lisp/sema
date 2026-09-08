@@ -588,19 +588,15 @@ pub const PRELUDE: &str = r#"
              (__cancel-all (cdr promises)))))
 
 ;; __owned-all: await every already-spawned child, returning values in INPUT
-;; order. Fail-fast + OWNED: `async/all` raises on the FIRST child failure/
-;; cancellation (while later children may still be pending); we then CANCEL and
-;; reap every child before re-raising, so a still-running sibling is stopped
-;; before its side effects — the ownership property the observational `async/all`
-;; deliberately lacks. Empty input → empty list. The single engine behind
+;; order. Fail-fast + OWNED: `__async-owned-all` cancels unfinished children
+;; before it resumes this waiter on the FIRST child failure/cancellation, so a
+;; ready sibling cannot run in the gap before cancellation. Empty input → empty
+;; list. The single engine behind
 ;; spawn-all / map / pool-map (each differs only in how it produces the children).
 (define (__owned-all children)
   (if (null? children)
       (list)
-      (try (async/all children)
-           (catch e
-             (__cancel-all children)
-             (throw e)))))
+      (__async-owned-all children)))
 
 ;; __prefill-sem: seed a semaphore channel with `k` availability tokens
 ;; (bytecode-level channel/send — capacity is exactly k so none block).
@@ -689,9 +685,11 @@ pub const PRELUDE: &str = r#"
 ;;
 ;;   (parallel (list (fn () (http/get a)) (fn () (http/get b))))   ; both at once
 (defmacro parallel (thunks . rest)
-  (let ((n (if (null? rest) 8 (car rest))))
-    `(map (fn (pr#) (if (contains? pr# :err) nil (:ok pr#)))
-          (__fanout-tagged (fn (th#) (th#)) ,thunks ,n))))
+  (if (> (length rest) 1)
+      (error "parallel: expected thunks and at most one concurrency argument")
+      (let ((n (if (null? rest) 8 (car rest))))
+        `(map (fn (pr#) (if (contains? pr# :err) nil (:ok pr#)))
+              (__fanout-tagged (fn (th#) (th#)) ,thunks ,n)))))
 
 ;; pipeline: each item flows through ALL stage fns independently — NO barrier between
 ;; stages (every item is its own task, so item A can be in stage 3 while item B is still
@@ -728,8 +726,10 @@ pub const PRELUDE: &str = r#"
 ;;   (parallel-settled (list (fn () 1) (fn () (throw "boom")) (fn () 3)))
 ;;   => ({:ok 1} {:err #<error>} {:ok 3})
 (defmacro parallel-settled (thunks . rest)
-  (let ((n (if (null? rest) 8 (car rest))))
-    `(__fanout-tagged (fn (th#) (th#)) ,thunks ,n)))
+  (if (> (length rest) 1)
+      (error "parallel-settled: expected thunks and at most one concurrency argument")
+      (let ((n (if (null? rest) 8 (car rest))))
+        `(__fanout-tagged (fn (th#) (th#)) ,thunks ,n))))
 
 ;; pipeline-settled: like `pipeline`, but a stage that throws yields {:err e} for that
 ;; item (instead of nil), preserving the error. Items that survive every stage are {:ok final}.
@@ -873,15 +873,7 @@ pub const PRELUDE: &str = r#"
   (if (null? thunks)
       (error "async/race-owned: requires at least one thunk")
       (let ((children (__spawn-thunks thunks)))
-        ;; `async/race` settles on the FIRST child (value or error); either way we
-        ;; then CANCEL and reap every child, so losers are stopped before their
-        ;; side effects (the winner cancel is a no-op — it already settled).
-        (try (let ((winner (async/race children)))
-               (__cancel-all children)
-               winner)
-             (catch e
-               (__cancel-all children)
-               (throw e))))))
+        (__async-owned-race children))))
 
 ;; async/with-timeout: run one owned child (`thunk`) with a deadline of `ms`
 ;; milliseconds. If the child settles first, its outcome is preserved (value
@@ -909,11 +901,8 @@ pub const PRELUDE: &str = r#"
           (timer (async/spawn (fn ()
                                 (async/sleep duration)
                                 {:timer #t}))))
-      (let ((outcome (try {:v (async/race (list child timer))}
+      (let ((outcome (try {:v (__async-owned-race (list child timer))}
                           (catch e {:e e}))))       ; child errored before the deadline
-        ;; Owned cleanup: cancel BOTH — the child on a timeout, the timer on settle.
-        (async/cancel child)
-        (async/cancel timer)
         (cond
           ((contains? outcome :e) (throw (:e outcome)))          ; preserve child error
           ((contains? (:v outcome) :timer)

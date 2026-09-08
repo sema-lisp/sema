@@ -1,3 +1,4 @@
+use num_bigint::BigInt;
 use sema_core::ArgsExt;
 use sema_core::{check_arity, SemaError, Value};
 
@@ -182,7 +183,22 @@ pub fn register(env: &sema_core::Env) {
         let arr = args[0]
             .as_i64_array()
             .ok_or_else(|| SemaError::type_error("i64-array", args[0].type_name()))?;
-        Ok(Value::int(arr.iter().sum::<i64>()))
+        let mut sum = 0i64;
+        for (index, &value) in arr.iter().enumerate() {
+            if let Some(next) = sum.checked_add(value) {
+                sum = next;
+                continue;
+            }
+
+            // Keep the usual i64 fast path, but preserve the language's
+            // arbitrary-precision integer semantics once it overflows.
+            let mut wide_sum = BigInt::from(sum) + BigInt::from(value);
+            for &remaining in &arr[index + 1..] {
+                wide_sum += remaining;
+            }
+            return Ok(Value::from_bigint(wide_sum));
+        }
+        Ok(Value::int(sum))
     });
 
     // (f64-array/dot a b) — dot product, fast inner loop in Rust

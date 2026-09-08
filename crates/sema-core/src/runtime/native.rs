@@ -155,9 +155,16 @@ pub enum ChannelQuery {
     Full,
 }
 
+#[derive(Clone, Copy, Debug)]
 pub enum PromiseSetMode {
     All,
     Race,
+    /// Like `All`, but cancels unfinished producer tasks before its waiter runs
+    /// after a failed member.
+    OwnedAll,
+    /// Like `Race`, but cancels unfinished producer tasks before its waiter runs
+    /// after the winning member settles.
+    OwnedRace,
     Timeout(Duration),
 }
 pub struct PromiseSetWait {

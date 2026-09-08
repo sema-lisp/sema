@@ -10,7 +10,8 @@
 //!   - the SAFETY comment above `pop_unchecked` in `crates/sema-vm/src/vm.rs`
 
 use sema_vm::{
-    deserialize_from_bytes, serialize_to_bytes, Chunk, CompileResult, Emitter, ExceptionEntry, Op,
+    deserialize_from_bytes, serialize_to_bytes, Chunk, CompileResult, Emitter, ExceptionEntry,
+    Function, Op, UpvalueDesc,
 };
 
 /// Serialize a hand-built main chunk and attempt to deserialize it, returning
@@ -28,6 +29,44 @@ fn expect_rejected(chunk: Chunk, what: &str) -> String {
     match roundtrip_chunk(chunk) {
         Ok(_) => panic!("{what}: expected rejection, but deserialization succeeded"),
         Err(e) => e.to_string(),
+    }
+}
+
+fn expect_result_rejected(result: CompileResult, what: &str) -> String {
+    let bytes = serialize_to_bytes(&result, 0).expect("serialize should succeed");
+    match deserialize_from_bytes(&bytes) {
+        Ok(_) => panic!("{what}: expected rejection, but deserialization succeeded"),
+        Err(e) => e.to_string(),
+    }
+}
+
+fn deserialize_error(bytes: &[u8], what: &str) -> String {
+    match deserialize_from_bytes(bytes) {
+        Ok(_) => panic!("{what}: expected rejection, but deserialization succeeded"),
+        Err(e) => e.to_string(),
+    }
+}
+
+fn template(upvalue_descs: Vec<UpvalueDesc>) -> Function {
+    let mut e = Emitter::new();
+    e.emit_op(Op::Nil);
+    e.emit_op(Op::Return);
+    let upvalue_names = (0..upvalue_descs.len())
+        .map(|index| sema_core::intern(&format!("upvalue-{index}")))
+        .collect();
+    Function {
+        name: None,
+        chunk: e.into_chunk(),
+        upvalue_descs,
+        upvalue_names,
+        arity: 0,
+        has_rest: false,
+        param_names: Vec::new().into(),
+        local_names: vec![],
+        local_scopes: vec![],
+        source_file: None,
+        cache_offset: 0,
+        suspend_cache: std::cell::Cell::new(None),
     }
 }
 
@@ -275,5 +314,152 @@ fn semac_linear_stack_overflow_rejected() {
     assert!(
         err.contains("maximum"),
         "expected stack-overflow (maximum depth) rejection, got: {err}"
+    );
+}
+
+#[test]
+fn semac_fixed_local_opcode_out_of_range_rejected() {
+    let mut e = Emitter::new();
+    e.emit_op(Op::LoadLocal3);
+    e.emit_op(Op::Return);
+    let mut chunk = e.into_chunk();
+    chunk.n_locals = 3;
+
+    let err = expect_rejected(chunk, "fixed local slot out of range");
+    assert!(
+        err.contains("fixed local slot 3") && err.contains("out of range"),
+        "expected fixed-local rejection, got: {err}"
+    );
+}
+
+#[test]
+fn semac_global_cache_slot_out_of_range_rejected() {
+    let mut e = Emitter::new();
+    e.emit_op(Op::LoadGlobal);
+    e.emit_u32(sema_core::intern("cache-test").into_inner().get());
+    e.emit_u16(1);
+    e.emit_op(Op::Return);
+    let mut chunk = e.into_chunk();
+    chunk.n_global_cache_slots = 1;
+
+    let err = expect_rejected(chunk, "global cache slot out of range");
+    assert!(
+        err.contains("global cache slot 1") && err.contains("out of range"),
+        "expected cache-slot rejection, got: {err}"
+    );
+}
+
+#[test]
+fn semac_make_closure_capture_shape_rejected() {
+    let mut e = Emitter::new();
+    e.emit_op(Op::MakeClosure);
+    e.emit_u16(0);
+    e.emit_u16(0);
+    e.emit_op(Op::Return);
+    let chunk = e.into_chunk();
+    let result = CompileResult::new(chunk, vec![template(vec![UpvalueDesc::ParentLocal(0)])]);
+
+    let err = expect_result_rejected(result, "MakeClosure upvalue count mismatch");
+    assert!(
+        err.contains("MakeClosure") && err.contains("encodes 0 upvalues"),
+        "expected MakeClosure count rejection, got: {err}"
+    );
+}
+
+#[test]
+fn semac_make_closure_capture_bounds_rejected() {
+    let mut e = Emitter::new();
+    e.emit_op(Op::MakeClosure);
+    e.emit_u16(0);
+    e.emit_u16(1);
+    e.emit_u16(1);
+    e.emit_u16(0);
+    e.emit_op(Op::Return);
+    let chunk = e.into_chunk();
+    let result = CompileResult::new(chunk, vec![template(vec![UpvalueDesc::ParentLocal(0)])]);
+
+    let err = expect_result_rejected(result, "MakeClosure local capture out of range");
+    assert!(
+        err.contains("MakeClosure") && err.contains("captures local 0"),
+        "expected MakeClosure capture rejection, got: {err}"
+    );
+}
+
+#[test]
+fn semac_handler_mid_instruction_rejected() {
+    let mut e = Emitter::new();
+    e.emit_op(Op::Nil);
+    e.emit_op(Op::Throw);
+    e.emit_op(Op::StoreLocal);
+    e.emit_u16(0);
+    e.emit_op(Op::Nil);
+    e.emit_op(Op::Return);
+    let mut chunk = e.into_chunk();
+    chunk.n_locals = 1;
+    chunk.exception_table.push(ExceptionEntry {
+        try_start: 0,
+        try_end: 2,
+        handler_pc: 3,
+        stack_depth: 1,
+        catch_slot: 0,
+    });
+
+    let err = expect_rejected(chunk, "handler in instruction operand");
+    assert!(
+        err.contains("handler_pc 3") && err.contains("instruction boundary"),
+        "expected handler-boundary rejection, got: {err}"
+    );
+}
+
+#[test]
+fn semac_reserved_flags_and_trailing_bytes_rejected() {
+    let mut e = Emitter::new();
+    e.emit_op(Op::Nil);
+    e.emit_op(Op::Return);
+    let bytes = serialize_to_bytes(&CompileResult::new(e.into_chunk(), vec![]), 0)
+        .expect("serialize should succeed");
+
+    let mut flagged = bytes.clone();
+    flagged[6..8].copy_from_slice(&1u16.to_le_bytes());
+    let flags_err = deserialize_error(&flagged, "reserved flags");
+    assert!(
+        flags_err.contains("header flags"),
+        "unexpected error: {flags_err}"
+    );
+
+    let mut trailing = bytes;
+    trailing.push(0);
+    let trailer_err = deserialize_error(&trailing, "whole-file trailing bytes");
+    assert!(
+        trailer_err.contains("trailing bytes"),
+        "unexpected error: {trailer_err}"
+    );
+}
+
+#[test]
+fn semac_string_table_trailing_bytes_rejected() {
+    let mut e = Emitter::new();
+    e.emit_op(Op::Nil);
+    e.emit_op(Op::Return);
+    let mut bytes = serialize_to_bytes(&CompileResult::new(e.into_chunk(), vec![]), 0)
+        .expect("serialize should succeed");
+
+    const HEADER_LEN: usize = 24;
+    const SECTION_HEADER_LEN: usize = 6;
+    let length_offset = HEADER_LEN + 2;
+    let string_table_len = u32::from_le_bytes(
+        bytes[length_offset..length_offset + 4]
+            .try_into()
+            .expect("string table section length"),
+    ) as usize;
+    let string_table_end = HEADER_LEN + SECTION_HEADER_LEN + string_table_len;
+    bytes.insert(string_table_end, 0);
+    bytes[length_offset..length_offset + 4]
+        .copy_from_slice(&u32::try_from(string_table_len + 1).unwrap().to_le_bytes());
+
+    let err = deserialize_error(&bytes, "string-table trailing bytes");
+    assert!(
+        err.contains("string table section") && err.contains("trailing"),
+        "unexpected error: {err}"
     );
 }

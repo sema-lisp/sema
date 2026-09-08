@@ -1052,7 +1052,9 @@ impl Runtime {
     }
 
     /// Insert a Ready test task under `root` with the given cancellation
-    /// parent. See `submit_test_child_under_root` for the `vm_owner` choice.
+    /// parent. The root retains one descendant for the inserted task, matching
+    /// `spawn_via_registry`; task settlement releases that same count. See
+    /// `submit_test_child_under_root` for the `vm_owner` choice.
     #[cfg(test)]
     fn insert_test_child(
         &self,
@@ -1062,6 +1064,14 @@ impl Runtime {
     ) -> TaskId {
         let mut state = self.state.borrow_mut();
         let task = state.task_ids.allocate().expect("test task identity");
+        assert!(
+            state
+                .roots
+                .get_mut(&root)
+                .expect("test child root exists")
+                .retain_descendant(),
+            "test root descendant limit"
+        );
         let relations = TaskRelations {
             origin_root: root,
             cancellation_parent,
@@ -1203,6 +1213,17 @@ impl Runtime {
         self.state.borrow().resource_gates.len()
     }
 
+    /// Whether `root` still owns a runnable, waiting, or staged task. Hosts
+    /// that resolve a root's public result before detached children finish use
+    /// this to keep selecting the root until those children settle.
+    pub fn has_live_tasks_for_root(&self, root: RootId) -> bool {
+        self.state
+            .borrow()
+            .tasks
+            .values()
+            .any(|task| task.record.relations().origin_root == root)
+    }
+
     /// Whether any task is still parked on a wait with a cancellation recorded —
     /// i.e. its wait teardown (executor abort / gate release / cancelled
     /// settlement) has not yet been delivered. A host post-settle drain counts
@@ -1323,7 +1344,7 @@ impl Runtime {
             // origin-root graph BEFORE the source rotation, so the release
             // predicate is checked on every settlement/park transition this turn
             // (ASYNC-RUN-BARRIER-1). A released barrier resumes as one work item.
-            if self.resolve_origin_barriers()? {
+            if self.resolve_origin_barriers(selected_roots)? {
                 work_items += 1;
                 no_progress = 0;
                 continue;
@@ -1657,7 +1678,10 @@ impl Runtime {
     /// most one barrier per call: its resume marks it Ready, so a sibling barrier
     /// on the same root then observes it live and keeps waiting (the barriers
     /// serialize innermost-first rather than releasing en masse).
-    fn resolve_origin_barriers(&self) -> Result<bool, RuntimeFault> {
+    fn resolve_origin_barriers(
+        &self,
+        selected_roots: Option<&[RootId]>,
+    ) -> Result<bool, RuntimeFault> {
         let mut state = self.state.borrow_mut();
         if state.origin_barrier_waits == 0 {
             return Ok(false);
@@ -1668,14 +1692,27 @@ impl Runtime {
         // look settled/absent to `origin_barrier_released` and release the
         // barrier one turn too early. `fire_timer` guards the same deferred-wake
         // window; drain `pending` first and re-check next turn.
-        if !state.pending.is_empty() {
+        let selected_pending = selected_roots.map_or_else(
+            || !state.pending.is_empty(),
+            |roots| {
+                state
+                    .pending
+                    .iter()
+                    .any(|stage| stage.belongs_to_roots(&state, roots))
+            },
+        );
+        if selected_pending {
             return Ok(false);
         }
         let candidates: Vec<(super::WaitKey, RootId, TaskId)> = state
             .protocol_waits
             .iter()
             .filter_map(|(key, wait)| match wait.kind {
-                ProtocolWaitKind::OriginBarrier { root } => Some((*key, root, wait.task)),
+                ProtocolWaitKind::OriginBarrier { root }
+                    if selected_roots.is_none_or(|roots| roots.contains(&root)) =>
+                {
+                    Some((*key, root, wait.task))
+                }
                 _ => None,
             })
             .collect();
@@ -2292,7 +2329,7 @@ impl Runtime {
         key: super::WaitKey,
         task_id: TaskId,
     ) -> Result<(), RuntimeFault> {
-        let response = {
+        let (response, owned_promises) = {
             let state = self.state.borrow();
             let Some(wait) = state.protocol_waits.get(&key) else {
                 return Ok(());
@@ -2303,10 +2340,39 @@ impl Runtime {
             let ProtocolWaitKind::Promises(set) = &wait.kind else {
                 return Ok(());
             };
-            promise_set_response(&state.promises, set)?
+            let response = promise_set_response(&state.promises, set)?;
+            let owned_promises = response.as_ref().and_then(|_| {
+                matches!(
+                    set.mode,
+                    sema_core::runtime::PromiseSetMode::OwnedAll
+                        | sema_core::runtime::PromiseSetMode::OwnedRace
+                )
+                .then(|| set.promises.clone())
+            });
+            (response, owned_promises)
         };
         if let Some(response) = response {
+            if let Some(promises) = owned_promises {
+                self.cancel_owned_promise_tasks(&promises)?;
+            }
             self.finish_protocol_wait(key, task_id, Ok(response))?;
+        }
+        Ok(())
+    }
+
+    /// Cancel the producer tasks for an owned promise-set before resuming its
+    /// waiter. This runs at the settlement boundary, before the scheduler can
+    /// select another ready producer.
+    fn cancel_owned_promise_tasks(
+        &self,
+        promises: &[sema_core::runtime::PromiseId],
+    ) -> Result<(), RuntimeFault> {
+        let targets = {
+            let mut state = self.state.borrow_mut();
+            request_owned_promise_cancellation(&mut state, promises)
+        };
+        for task in targets {
+            deliver_cancel_teardown(&self.state, task)?;
         }
         Ok(())
     }
@@ -4594,9 +4660,28 @@ impl Runtime {
                     spawner.context.inherit_for_child(),
                 )
             };
+            let Some(root_record) = state.roots.get_mut(&root) else {
+                drop(state);
+                return respond_err(
+                    owner,
+                    frame,
+                    sema_core::SemaError::eval("async/spawn: origin root disappeared"),
+                );
+            };
+            if !root_record.retain_descendant() {
+                drop(state);
+                return respond_err(
+                    owner,
+                    frame,
+                    sema_core::SemaError::eval("async/spawn: root descendant limit reached"),
+                );
+            }
             let promise = match state.promises.allocate_pending(Some(child)) {
                 Ok(promise) => promise,
                 Err(_) => {
+                    if let Some(root_record) = state.roots.get_mut(&root) {
+                        root_record.release_descendant();
+                    }
                     drop(state);
                     return respond_err(
                         owner,
@@ -4739,6 +4824,7 @@ impl Runtime {
             .ok_or_else(|| RuntimeFault::Invariant {
                 message: "settling detached child disappeared".into(),
             })?;
+        let root = task.record.relations().origin_root;
         let settlement = task
             .record
             .settle(sequence, outcome)
@@ -4753,6 +4839,20 @@ impl Runtime {
             if !wakes.is_empty() {
                 state.pending.push_back(PendingStage::PromiseWakes(wakes));
             }
+            if state.promises.has_dead_handle(promise) {
+                state.gc_evict_promise(promise);
+            }
+        }
+        let root_record = state
+            .roots
+            .get_mut(&root)
+            .ok_or_else(|| RuntimeFault::Invariant {
+                message: "detached child origin root disappeared".into(),
+            })?;
+        root_record.release_descendant();
+        let reap_root = root_record.is_reap_eligible();
+        if reap_root {
+            state.handle_cleanup.push_back(root);
         }
         drop(state);
         drop(task);
@@ -4801,6 +4901,9 @@ impl Runtime {
                 })?;
             if !wakes.is_empty() {
                 state.pending.push_back(PendingStage::PromiseWakes(wakes));
+            }
+            if state.promises.has_dead_handle(promise) {
+                state.gc_evict_promise(promise);
             }
         }
         let root_record = state.roots.get_mut(&root).expect("root prevalidated");
@@ -5551,6 +5654,35 @@ fn cancel_descendants(state: &mut RuntimeState, parent: TaskId) -> Vec<TaskId> {
     newly
 }
 
+/// Mark the live producer tasks behind an owned promise set as cancelled. The
+/// caller delivers any required external-resource teardown after releasing the
+/// runtime-state borrow.
+fn request_owned_promise_cancellation(
+    state: &mut RuntimeState,
+    promises: &[sema_core::runtime::PromiseId],
+) -> Vec<TaskId> {
+    let mut targets = Vec::new();
+    let mut seen = hashbrown::HashSet::new();
+    for promise in promises {
+        let Ok(Some(task_id)) = state.promises.task(*promise) else {
+            continue;
+        };
+        if !seen.insert(task_id) {
+            continue;
+        }
+        let newly_cancelled = state
+            .tasks
+            .get_mut(&task_id)
+            .is_some_and(|task| task.record.request_cancellation(CancelReason::Owner));
+        if newly_cancelled {
+            state.pending_cancel_waits.push_back(task_id);
+            targets.push(task_id);
+            targets.extend(cancel_descendants(state, task_id));
+        }
+    }
+    targets
+}
+
 /// Which eager wait teardown a cancelled task needs (DECISION C2). Promise,
 /// bare Timer, and Channel waits carry no offloaded work to abort and are left
 /// to the per-drive-turn `cancel_waiting` scan.
@@ -6151,19 +6283,30 @@ fn promise_set_response(
         // settled promise wins (deterministically, even at `ms == 0`); the
         // deadline itself is delivered by the timer path, not here.
         sema_core::runtime::PromiseSetMode::Race
+        | sema_core::runtime::PromiseSetMode::OwnedRace
         | sema_core::runtime::PromiseSetMode::Timeout(_) => settled
             .into_iter()
             .flatten()
             .min_by_key(|settlement| settlement.sequence)
             .map(|settlement| RuntimeResponse::Settlement(Some(settlement))),
-        sema_core::runtime::PromiseSetMode::All if !fail_fast.is_empty() => fail_fast
-            .into_iter()
-            .min_by_key(|settlement| settlement.sequence)
-            .map(|settlement| RuntimeResponse::Settlement(Some(settlement))),
-        sema_core::runtime::PromiseSetMode::All if settled.iter().all(Option::is_some) => Some(
-            RuntimeResponse::Settlements(settled.into_iter().flatten().collect()),
-        ),
-        sema_core::runtime::PromiseSetMode::All => None,
+        sema_core::runtime::PromiseSetMode::All | sema_core::runtime::PromiseSetMode::OwnedAll
+            if !fail_fast.is_empty() =>
+        {
+            fail_fast
+                .into_iter()
+                .min_by_key(|settlement| settlement.sequence)
+                .map(|settlement| RuntimeResponse::Settlement(Some(settlement)))
+        }
+        sema_core::runtime::PromiseSetMode::All | sema_core::runtime::PromiseSetMode::OwnedAll
+            if settled.iter().all(Option::is_some) =>
+        {
+            Some(RuntimeResponse::Settlements(
+                settled.into_iter().flatten().collect(),
+            ))
+        }
+        sema_core::runtime::PromiseSetMode::All | sema_core::runtime::PromiseSetMode::OwnedAll => {
+            None
+        }
     })
 }
 
@@ -6242,7 +6385,12 @@ fn install_promise_wait(
     owner: ReturnOwner,
     frame: ContinuationFrame,
 ) -> Result<(), ProtocolInstallError> {
-    if wait.promises.is_empty() && !matches!(wait.mode, sema_core::runtime::PromiseSetMode::All) {
+    if wait.promises.is_empty()
+        && !matches!(
+            wait.mode,
+            sema_core::runtime::PromiseSetMode::All | sema_core::runtime::PromiseSetMode::OwnedAll
+        )
+    {
         return Err(Box::new((
             owner,
             frame,
@@ -6260,6 +6408,13 @@ fn install_promise_wait(
         }
     };
     if let Some(response) = response {
+        if matches!(
+            wait.mode,
+            sema_core::runtime::PromiseSetMode::OwnedAll
+                | sema_core::runtime::PromiseSetMode::OwnedRace
+        ) {
+            request_owned_promise_cancellation(state, &wait.promises);
+        }
         state.pending.push_back(PendingStage::ApplyRuntimeResponse(
             task_id,
             owner,

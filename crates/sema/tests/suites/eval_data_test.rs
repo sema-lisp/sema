@@ -32,6 +32,10 @@ eval_tests! {
     json_roundtrip_bigint: "(equal? (json/decode (json/encode 170141183460469231731687303715884105728)) 170141183460469231731687303715884105728)" => Value::bool(true),
 }
 
+eval_error_tests! {
+    json_encode_colliding_map_keys: r#"(json/encode (hash-map :a 1 "a" 2))"# => "stringify",
+}
+
 // ============================================================
 // Regex operations
 // ============================================================

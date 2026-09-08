@@ -147,6 +147,15 @@ impl fmt::Display for StackTrace {
 /// Maps Rc pointer addresses to source spans for expression tracking.
 pub type SpanMap = HashMap<usize, Span>;
 
+/// Return a SpanMap key for a top-level immediate expression by its source order.
+///
+/// Immediate values do not carry an allocation identity, so this reserves the
+/// unreachable upper address range for parser-to-compiler bookkeeping. Source
+/// order keeps repeated equal values on distinct lines distinct.
+pub fn top_level_span_key(index: usize) -> usize {
+    usize::MAX - index
+}
+
 /// Structured details for a policy denial.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyDenial {
@@ -727,6 +736,35 @@ impl SemaError {
         }
     }
 
+    /// Append caller frames to an existing stack trace.
+    ///
+    /// A VM-backed closure can run in a separate VM when invoked by a native
+    /// callback. Its error already has the callee frames when it returns to the
+    /// caller VM, so replacing that trace would lose the failing location.
+    pub fn append_stack_trace(self, trace: StackTrace) -> Self {
+        if trace.0.is_empty() {
+            return self;
+        }
+        match self {
+            SemaError::WithTrace {
+                inner,
+                trace: mut existing,
+            } => {
+                existing.0.extend(trace.0);
+                SemaError::WithTrace {
+                    inner,
+                    trace: existing,
+                }
+            }
+            SemaError::WithContext { inner, hint, note } => SemaError::WithContext {
+                inner: Box::new(inner.append_stack_trace(trace)),
+                hint,
+                note,
+            },
+            other => other.with_stack_trace(trace),
+        }
+    }
+
     /// Fill in `file` on any trace frame that lacks one (no-op without a trace).
     ///
     /// Lowering errors synthesize frames with `file: None` because the lowering
@@ -1040,6 +1078,29 @@ mod tests {
         let st = e2.stack_trace().unwrap();
         assert_eq!(st.0.len(), 1);
         assert_eq!(st.0[0].name, "first");
+    }
+
+    #[test]
+    fn append_stack_trace_keeps_callee_and_caller_frames() {
+        let e = SemaError::eval("err")
+            .with_stack_trace(StackTrace(vec![CallFrame {
+                name: "callee".into(),
+                file: None,
+                span: None,
+            }]))
+            .append_stack_trace(StackTrace(vec![CallFrame {
+                name: "caller".into(),
+                file: None,
+                span: None,
+            }]));
+        let names: Vec<_> = e
+            .stack_trace()
+            .unwrap()
+            .0
+            .iter()
+            .map(|frame| frame.name.as_str())
+            .collect();
+        assert_eq!(names, ["callee", "caller"]);
     }
 
     // fill_trace_file fills only `file: None` frames, recurses through

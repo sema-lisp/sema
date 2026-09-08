@@ -40,14 +40,16 @@ pub fn lower(expr: &Value, span_map: Option<&SpanMap>) -> Result<CoreExpr, SemaE
     }
 }
 
-/// Look up the span for a list Value using its Rc pointer identity.
+/// Look up the span for a compound Value using its Rc identity.
 fn lookup_span(val: &Value) -> Option<Span> {
-    if let Some(rc) = val.as_list_rc() {
-        let ptr = Rc::as_ptr(&rc) as usize;
-        SPAN_MAP.with(|sm| sm.borrow().as_ref().and_then(|map| map.get(&ptr).copied()))
+    let ptr = if let Some(rc) = val.as_list_rc() {
+        Some(Rc::as_ptr(&rc) as usize)
+    } else if let Some(rc) = val.as_vector_rc() {
+        Some(Rc::as_ptr(&rc) as usize)
     } else {
-        None
-    }
+        val.as_map_rc().map(|rc| Rc::as_ptr(&rc) as usize)
+    }?;
+    SPAN_MAP.with(|sm| sm.borrow().as_ref().and_then(|map| map.get(&ptr).copied()))
 }
 
 /// Attach a source location to a lowering error so the reporter can point at
@@ -107,7 +109,7 @@ impl Drop for LowerDepthGuard {
 
 fn lower_expr(expr: &Value, tail: bool) -> Result<CoreExpr, SemaError> {
     let _guard = LowerDepthGuard::new()?;
-    lower_expr_inner(expr, tail)
+    stacker::maybe_grow(64 * 1024, 1024 * 1024, || lower_expr_inner(expr, tail))
 }
 
 fn lower_expr_inner(expr: &Value, tail: bool) -> Result<CoreExpr, SemaError> {
@@ -126,7 +128,11 @@ fn lower_expr_inner(expr: &Value, tail: bool) -> Result<CoreExpr, SemaError> {
                 .iter()
                 .map(|v| lower_expr(v, false))
                 .collect::<Result<_, _>>()?;
-            Ok(CoreExpr::MakeVector(exprs))
+            let inner = CoreExpr::MakeVector(exprs);
+            Ok(match lookup_span(expr) {
+                Some(span) => CoreExpr::Spanned(span, Box::new(inner)),
+                None => inner,
+            })
         }
 
         ValueView::Map(map) => {
@@ -136,7 +142,11 @@ fn lower_expr_inner(expr: &Value, tail: bool) -> Result<CoreExpr, SemaError> {
                 .iter()
                 .map(|(k, v)| Ok((lower_expr(k, false)?, lower_expr(v, false)?)))
                 .collect::<Result<Vec<_>, SemaError>>()?;
-            Ok(CoreExpr::MakeMap(pairs))
+            let inner = CoreExpr::MakeMap(pairs);
+            Ok(match lookup_span(expr) {
+                Some(span) => CoreExpr::Spanned(span, Box::new(inner)),
+                None => inner,
+            })
         }
 
         ValueView::List(items) => {
@@ -2124,9 +2134,9 @@ fn lower_define_record_type(args: &[Value]) -> Result<CoreExpr, SemaError> {
     let mut field_specs = Vec::new();
     for spec_val in &args[3..] {
         let spec = require_list(spec_val, "define-record-type")?;
-        if spec.len() < 2 {
+        if spec.len() != 2 {
             return Err(SemaError::eval(
-                "define-record-type: field spec must have at least (field accessor)",
+                "define-record-type: field spec must be (field accessor)",
             ));
         }
         let field = require_symbol(&spec[0], "define-record-type")?;
@@ -2930,6 +2940,18 @@ mod tests {
                 );
             }
             other => panic!("expected Spanned(Lambda), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_lower_with_span_map_attaches_vector_and_map_spans() {
+        for input in ["[missing]", "{:key missing}"] {
+            let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
+            let core = lower(&vals[0], Some(&span_map)).unwrap();
+            assert!(
+                matches!(&core, CoreExpr::Spanned(span, _) if (span.line, span.col) == (1, 1)),
+                "{input} should retain its source span, got {core:?}"
+            );
         }
     }
 }

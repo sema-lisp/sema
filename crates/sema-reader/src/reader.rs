@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::{Rc, Weak};
 
-use sema_core::{resolve, SemaError, Span, SpanMap, Value, ValueView};
+use sema_core::{resolve, top_level_span_key, SemaError, Span, SpanMap, Value, ValueView};
 
 use crate::lexer::{tokenize, FStringPart, SpannedToken, Token};
 
@@ -93,6 +93,7 @@ struct Parser {
     pos: usize,
     span_map: SpanMap,
     symbol_spans: Vec<(String, Span)>,
+    top_level_atom_spans: Vec<Option<Span>>,
     depth: usize,
     short_lambda_depth: usize,
 }
@@ -104,6 +105,7 @@ impl Parser {
             pos: 0,
             span_map: SpanMap::new(),
             symbol_spans: Vec::new(),
+            top_level_atom_spans: Vec::new(),
             depth: 0,
             short_lambda_depth: 0,
         }
@@ -171,6 +173,8 @@ impl Parser {
     fn parse_expr(&mut self) -> Result<Value, SemaError> {
         // Bound recursion depth on the single common entry point: every nested
         // form (list/vector/map/short-lambda elements) recurses through here.
+        let top_level = self.depth == 0;
+        let start = self.span();
         self.depth += 1;
         if self.depth > MAX_PARSE_DEPTH {
             self.depth -= 1;
@@ -182,7 +186,25 @@ impl Parser {
         }
         let result = self.parse_expr_inner();
         self.depth -= 1;
+        if top_level {
+            if let Ok(expr) = &result {
+                let is_compound = expr.as_list_rc().is_some()
+                    || expr.as_vector_rc().is_some()
+                    || expr.as_map_rc().is_some();
+                self.top_level_atom_spans
+                    .push((!is_compound).then_some(start));
+            }
+        }
         result
+    }
+
+    fn take_span_map(&mut self) -> SpanMap {
+        for (index, span) in self.top_level_atom_spans.drain(..).enumerate() {
+            if let Some(span) = span {
+                self.span_map.insert(top_level_span_key(index), span);
+            }
+        }
+        std::mem::take(&mut self.span_map)
     }
 
     /// Parse the operand of a prefix reader form (`'`, `` ` ``, `,`, `,@`, `@`).
@@ -435,7 +457,13 @@ impl Parser {
             entries.push((key, val));
         }
         self.expect(&Token::RBrace)?;
-        Ok(ordered_map_literal(entries))
+        let close = self.prev_span();
+        let value = ordered_map_literal(entries);
+        if let Some(map) = value.as_map_rc() {
+            self.span_map
+                .insert(Rc::as_ptr(&map) as usize, open_span.to(&close));
+        }
+        Ok(value)
     }
 
     fn parse_bytevector(&mut self) -> Result<Value, SemaError> {
@@ -947,7 +975,7 @@ pub fn read_many_with_spans(input: &str) -> Result<(Vec<Value>, SpanMap), SemaEr
     while parser.peek().is_some() {
         exprs.push(parser.parse_expr()?);
     }
-    Ok((exprs, parser.span_map))
+    Ok((exprs, parser.take_span_map()))
 }
 
 /// Read all s-expressions and return spans for both compound expressions and individual symbols.
@@ -962,7 +990,8 @@ pub fn read_many_with_symbol_spans(
     while parser.peek().is_some() {
         exprs.push(parser.parse_expr()?);
     }
-    Ok((exprs, parser.span_map, parser.symbol_spans))
+    let span_map = parser.take_span_map();
+    Ok((exprs, span_map, parser.symbol_spans))
 }
 
 /// Read all s-expressions with error recovery.
@@ -989,7 +1018,8 @@ pub fn read_many_with_spans_recover(
             }
         }
     }
-    (exprs, parser.span_map, parser.symbol_spans, errors)
+    let span_map = parser.take_span_map();
+    (exprs, span_map, parser.symbol_spans, errors)
 }
 
 #[cfg(test)]

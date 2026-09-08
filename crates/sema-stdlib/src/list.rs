@@ -8,7 +8,9 @@ use sema_core::runtime::{
     NativeResult, ResumeInput, SyncHofHost, TaskContextHandle, Trace,
 };
 use sema_core::ArgsExt;
-use sema_core::{check_arity, intern, Record, SemaError, Value, ValueViewRef};
+use sema_core::{
+    check_arity, intern, Record, SemaError, Value, ValueViewRef, MULTIPLE_VALUES_RECORD_TYPE_ID,
+};
 
 use crate::register_fn;
 
@@ -1696,7 +1698,7 @@ impl NativeContinuation for CallWithValuesContinuation {
     ) -> NativeResult {
         let produced = resume_value(input, "call-with-values")?;
         let call_args = match produced.as_record() {
-            Some(rec) if rec.type_tag == intern(MULTIPLE_VALUES_TAG) => rec.fields.clone(),
+            Some(rec) if rec.type_id == MULTIPLE_VALUES_RECORD_TYPE_ID => rec.fields.clone(),
             _ => vec![produced],
         };
         Ok(NativeOutcome::Call(NativeCall {
@@ -1726,11 +1728,7 @@ pub(crate) fn resume_value(input: ResumeInput, hof: &str) -> Result<Value, SemaE
     }
 }
 
-/// Record `type_tag` used to bundle zero-or-multiple values produced by `values`
-/// and unpacked by `call-with-values`. Chosen to be unlikely to collide with a
-/// user `define-record-type` tag; R7RS leaves "multiple values leaking into a
-/// single-value context" unspecified, so a user constructing this exact tag via
-/// `define-record-type` is already outside spec.
+/// Display tag used for the private zero-or-multiple-values bundle.
 const MULTIPLE_VALUES_TAG: &str = "%multiple-values%";
 
 /// Sort category of a value for the comparator-free `sort`. Every real number
@@ -2299,6 +2297,7 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "values", |args| match args.len() {
         1 => Ok(args[0].clone()),
         _ => Ok(Value::record(Record {
+            type_id: MULTIPLE_VALUES_RECORD_TYPE_ID,
             type_tag: intern(MULTIPLE_VALUES_TAG),
             field_names: vec![],
             fields: args.to_vec(),
@@ -2328,7 +2327,7 @@ pub fn register(env: &sema_core::Env) {
                 return Err(runtime_only_sync_apply_err(&args[1], "call-with-values"));
             }
             match produced.as_record() {
-                Some(rec) if rec.type_tag == intern(MULTIPLE_VALUES_TAG) => {
+                Some(rec) if rec.type_id == MULTIPLE_VALUES_RECORD_TYPE_ID => {
                     call_function(&args[1], &rec.fields.clone())
                 }
                 _ => call_function(&args[1], &[produced]),
@@ -2843,10 +2842,15 @@ pub fn register(env: &sema_core::Env) {
         let count = count.max(0) as usize;
         crate::check_bulk_len("iota", count)?;
         let mut result = Vec::with_capacity(count);
-        let mut val = start;
+        // Compute through the numeric tower. A sequence may cross the i64
+        // boundary even though `iota`'s start and step arguments are i64s.
+        // Keeping this as an exact number promotes the later elements to
+        // bignums instead of panicking in debug builds or wrapping in release.
+        let mut value = SemaNumber::from_i64(start);
+        let step = SemaNumber::from_i64(step);
         for _ in 0..count {
-            result.push(Value::int(val));
-            val += step;
+            result.push(Value::from_number(value.clone()));
+            value = value.add(step.clone());
         }
         Ok(Value::list(result))
     });
@@ -2882,49 +2886,58 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::list(result))
     });
 
-    // list/avg — average of numeric list
+    // list/avg — average of a numeric list. This follows the numeric tower so
+    // exact inputs stay exact, while a float makes the result inexact.
     register_fn(env, "list/avg", |args| {
         check_arity!(args, "list/avg", 1);
         let items = get_sequence(&args[0], "list/avg")?;
         if items.is_empty() {
             return Err(SemaError::eval("list/avg: empty list"));
         }
-        let mut sum: f64 = 0.0;
-        for item in items.iter() {
-            if let Some(n) = item.as_int() {
-                sum += n as f64;
-            } else if let Some(f) = item.as_float() {
-                sum += f;
-            } else {
-                return Err(SemaError::type_error("number", item.type_name()));
-            }
-        }
-        Ok(Value::float(sum / items.len() as f64))
+        let sum = crate::arithmetic::sum_through_tower(items.iter())?;
+        let sum = sum
+            .as_number()
+            .ok_or_else(|| SemaError::type_error("number", sum.type_name()))?;
+        let count = i64::try_from(items.len())
+            .map_err(|_| SemaError::eval("list/avg: sequence is too long"))?;
+        let average = sum
+            .div(SemaNumber::from_i64(count))
+            .map_err(|_| SemaError::eval("list/avg: division by zero"))?;
+        Ok(Value::from_number(average))
     });
 
-    // list/median — statistical median
+    // list/median — statistical median. A median needs an ordering, so complex
+    // numbers and NaN are rejected while exact real inputs remain exact.
     register_fn(env, "list/median", |args| {
         check_arity!(args, "list/median", 1);
         let items = get_sequence(&args[0], "list/median")?;
         if items.is_empty() {
             return Err(SemaError::eval("list/median: empty list"));
         }
-        let mut nums: Vec<f64> = Vec::with_capacity(items.len());
+        let mut nums: Vec<SemaNumber> = Vec::with_capacity(items.len());
         for item in items.iter() {
-            if let Some(n) = item.as_int() {
-                nums.push(n as f64);
-            } else if let Some(f) = item.as_float() {
-                nums.push(f);
-            } else {
-                return Err(SemaError::type_error("number", item.type_name()));
+            let number = item
+                .as_number()
+                .ok_or_else(|| SemaError::type_error("number", item.type_name()))?;
+            if !number.is_real() {
+                return Err(SemaError::type_error("real number", item.type_name()));
             }
+            if number.cmp_real(&number).is_none() {
+                return Err(SemaError::eval("list/median: cannot order NaN"));
+            }
+            nums.push(number);
         }
-        nums.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        nums.sort_by(|a, b| a.cmp_real(b).unwrap_or(std::cmp::Ordering::Equal));
         let mid = nums.len() / 2;
         if nums.len().is_multiple_of(2) {
-            Ok(Value::float((nums[mid - 1] + nums[mid]) / 2.0))
+            let median = nums[mid - 1]
+                .clone()
+                .add(nums[mid].clone())
+                .div(SemaNumber::from_i64(2))
+                .map_err(|_| SemaError::eval("list/median: division by zero"))?;
+            Ok(Value::from_number(median))
         } else {
-            Ok(Value::float(nums[mid]))
+            Ok(Value::from_number(nums[mid].clone()))
         }
     });
 

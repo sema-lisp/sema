@@ -106,10 +106,10 @@ pub enum Expr<V> {
     /// Record type definition
     DefineRecordType {
         type_name: Spur,
-        ctor_name: Spur,
-        pred_name: Spur,
+        ctor_name: V,
+        pred_name: V,
         field_names: Vec<Spur>,
-        field_specs: Vec<(Spur, Spur)>,
+        field_specs: Vec<(Spur, V)>,
     },
     /// Module declaration
     Module {

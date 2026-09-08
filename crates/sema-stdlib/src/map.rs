@@ -339,6 +339,10 @@ pub(crate) fn check_map_key(key: &Value, who: &str) -> Result<(), SemaError> {
             )),
         );
     }
+    if key.contains_non_reflexive_value() {
+        return Err(SemaError::type_error("reflexive map key", key.type_name())
+            .with_hint(format!("{who}: NaN cannot be used in a map key")));
+    }
     Ok(())
 }
 

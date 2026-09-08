@@ -97,6 +97,9 @@ impl BackendState {
                 let data = indexed
                     .map(|(file, definition)| completion_definition_data(file, definition))
                     .unwrap_or_else(|| serde_json::Value::String(uri_str.to_string()));
+                if !sema_eval::SPECIAL_FORM_NAMES.contains(&name.as_str()) {
+                    items.retain(|item| item.label != *name);
+                }
                 items.push(CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::FUNCTION),
@@ -178,6 +181,15 @@ impl BackendState {
             let sema_line = position.line as usize + 1;
             let sema_col = utf16_to_char_col(line, position.character as usize);
             for (name, _span) in cached.scope_tree.visible_bindings_at(sema_line, sema_col) {
+                // Top-level definitions already carry their source identity and
+                // signature. Only lexical locals replace those completion items.
+                if cached
+                    .scope_tree
+                    .resolve_at(&name, sema_line, sema_col)
+                    .is_some_and(|binding| binding.is_top_level)
+                {
+                    continue;
+                }
                 if prefix.is_empty() || name.starts_with(prefix) {
                     if !sema_eval::SPECIAL_FORM_NAMES.contains(&name.as_str()) {
                         items.retain(|item| item.label != name);
@@ -198,11 +210,15 @@ impl BackendState {
     /// Lazily enrich a completion item with documentation (`completionItem/resolve`). Builtins and
     /// special forms already carry inline docs; this fills user-defined symbols with their signature.
     pub(crate) fn handle_completion_resolve(&self, mut item: CompletionItem) -> CompletionItem {
-        if item.documentation.is_some() {
+        if item.documentation.is_some() || item.kind == Some(CompletionItemKind::VARIABLE) {
             return item;
         }
         // Builtin/special-form docs (covers any not inlined at completion time).
-        if let Some(e) = self.builtin_docs.get(&item.label) {
+        if let Some(e) = self
+            .builtin_docs
+            .get(&item.label)
+            .filter(|_| item.data.is_none())
+        {
             item.documentation = Some(Documentation::MarkupContent(MarkupContent {
                 kind: MarkupKind::Markdown,
                 value: builtin_docs::render_markdown(e),

@@ -682,6 +682,56 @@ fn call_hierarchy_finds_defworkflow_as_a_root_and_a_caller() {
 // ── completion resolve ───────────────────────────────────────
 
 #[test]
+fn completion_redefined_builtin_has_one_item_with_user_documentation() {
+    let source = "(map inc '(1))\n(defun map (item) \"Custom map documentation.\" item)\n(map 1)";
+    let (mut state, uri) = parsed_state("file:///redefined-completion.sema", source);
+    state
+        .cached_user_defs
+        .insert(uri.to_string(), vec!["map".into()]);
+    state.builtin_names.insert("map".into());
+    state.builtin_docs = builtin_docs::BuiltinDocs::load();
+    let before = state.handle_complete(&uri, &Position::new(0, 3));
+    let builtin = before.iter().find(|item| item.label == "map").unwrap();
+    assert!(builtin.documentation.is_some());
+    let items = state.handle_complete(&uri, &Position::new(2, 3));
+    let matching: Vec<_> = items
+        .into_iter()
+        .filter(|item| item.label == "map")
+        .collect();
+    assert_eq!(matching.len(), 1, "one visible definition: {matching:?}");
+    assert_eq!(matching[0].kind, Some(CompletionItemKind::FUNCTION));
+    let resolved = state.handle_completion_resolve(matching[0].clone());
+    let Some(Documentation::MarkupContent(documentation)) = resolved.documentation else {
+        panic!("user documentation");
+    };
+    assert!(
+        documentation.value.contains("(map item)"),
+        "{documentation:?}"
+    );
+    assert!(documentation.value.contains("Custom map documentation."));
+}
+
+#[test]
+fn completion_resolve_does_not_attach_builtin_docs_to_a_local_binding() {
+    let (mut state, uri) = parsed_state(
+        "file:///local-completion.sema",
+        "(let ((map list))\n  (map 1))",
+    );
+    state.builtin_names.insert("map".into());
+    state.builtin_docs = builtin_docs::BuiltinDocs::load();
+    let item = state
+        .handle_complete(&uri, &Position::new(1, 5))
+        .into_iter()
+        .find(|item| item.label == "map")
+        .unwrap();
+    assert_eq!(item.kind, Some(CompletionItemKind::VARIABLE));
+    assert!(state
+        .handle_completion_resolve(item)
+        .documentation
+        .is_none());
+}
+
+#[test]
 fn completion_resolve_enriches_user_definition() {
     let (state, uri) = parsed_state("file:///c.sema", "(defun greet (name greeting) name)");
     // A bare user-def completion item as produced by handle_complete (data = uri).

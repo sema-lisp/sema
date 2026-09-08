@@ -7,9 +7,22 @@
 //! `cargo test` (which builds the workspace, incl. the binary) or do
 //! `cargo build -p sema-lang` first. (Found via mutation testing.)
 
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+#[derive(Debug)]
+struct PendingRequest {
+    seq: u64,
+    command: String,
+}
+
+thread_local! {
+    static PENDING_REQUESTS: RefCell<VecDeque<PendingRequest>> = const { RefCell::new(VecDeque::new()) };
+    static BUFFERED_MESSAGES: RefCell<VecDeque<serde_json::Value>> = const { RefCell::new(VecDeque::new()) };
+}
 
 fn sema_binary() -> String {
     // Find the sema binary in the target directory
@@ -32,6 +45,10 @@ fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
 }
 
 fn send_dap(stdin: &mut impl Write, seq: u64, command: &str, args: Option<serde_json::Value>) {
+    if command == "initialize" {
+        PENDING_REQUESTS.with(|pending| pending.borrow_mut().clear());
+        BUFFERED_MESSAGES.with(|messages| messages.borrow_mut().clear());
+    }
     let mut msg = serde_json::json!({
         "seq": seq,
         "type": "request",
@@ -47,10 +64,16 @@ fn send_dap(stdin: &mut impl Write, seq: u64, command: &str, args: Option<serde_
     stdin.write_all(header.as_bytes()).unwrap();
     stdin.write_all(body.as_bytes()).unwrap();
     stdin.flush().unwrap();
+    PENDING_REQUESTS.with(|pending| {
+        pending.borrow_mut().push_back(PendingRequest {
+            seq,
+            command: command.to_string(),
+        });
+    });
 }
 
-/// Read a DAP message from the child process stdout with a timeout.
-fn read_dap_timeout(
+/// Read one framed DAP message from the child process stdout with a timeout.
+fn read_frame_timeout(
     reader: &mut BufReader<impl Read>,
     timeout: Duration,
 ) -> Option<serde_json::Value> {
@@ -88,6 +111,64 @@ fn read_dap(reader: &mut BufReader<impl Read>) -> Option<serde_json::Value> {
     read_dap_timeout(reader, DAP_TIMEOUT)
 }
 
+/// Read the next response expected by `send_dap`, buffering interleaved DAP
+/// events so later event assertions still observe them. The adapter may send
+/// breakpoint changed events while it prepares the response to a later request.
+fn read_dap_timeout(
+    reader: &mut BufReader<impl Read>,
+    timeout: Duration,
+) -> Option<serde_json::Value> {
+    let expected = PENDING_REQUESTS.with(|pending| {
+        pending
+            .borrow()
+            .front()
+            .map(|request| (request.seq, request.command.clone()))
+    });
+    let Some((expected_seq, expected_command)) = expected else {
+        return take_buffered_message().or_else(|| read_frame_timeout(reader, timeout));
+    };
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut interleaved = VecDeque::new();
+    loop {
+        let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+            restore_buffered_messages(interleaved);
+            return None;
+        };
+        let message = take_buffered_message().or_else(|| read_frame_timeout(reader, remaining));
+        let Some(message) = message else {
+            restore_buffered_messages(interleaved);
+            return None;
+        };
+        if message["type"] == "response"
+            && message["request_seq"] == expected_seq
+            && message["command"] == expected_command
+        {
+            PENDING_REQUESTS.with(|pending| {
+                let _ = pending.borrow_mut().pop_front();
+            });
+            restore_buffered_messages(interleaved);
+            return Some(message);
+        }
+        interleaved.push_back(message);
+    }
+}
+
+fn take_buffered_message() -> Option<serde_json::Value> {
+    BUFFERED_MESSAGES.with(|messages| messages.borrow_mut().pop_front())
+}
+
+fn restore_buffered_messages(mut messages: VecDeque<serde_json::Value>) {
+    if messages.is_empty() {
+        return;
+    }
+    BUFFERED_MESSAGES.with(|buffered| {
+        let mut buffered = buffered.borrow_mut();
+        messages.append(&mut buffered);
+        *buffered = messages;
+    });
+}
+
 /// Wait for a specific DAP event, skipping unrelated messages.
 fn wait_for_event(
     reader: &mut BufReader<impl Read>,
@@ -118,6 +199,45 @@ fn wait_for_event_message(
         }
     }
     None
+}
+
+fn dap_frame(message: serde_json::Value) -> Vec<u8> {
+    let body = serde_json::to_vec(&message).expect("serializes DAP message");
+    let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+    frame.extend(body);
+    frame
+}
+
+#[test]
+fn response_reader_buffers_interleaved_events() {
+    PENDING_REQUESTS.with(|pending| pending.borrow_mut().clear());
+    BUFFERED_MESSAGES.with(|messages| messages.borrow_mut().clear());
+
+    let mut sink = Vec::new();
+    send_dap(&mut sink, 7, "configurationDone", None);
+
+    let mut bytes = dap_frame(serde_json::json!({
+        "seq": 1,
+        "type": "event",
+        "event": "breakpoint",
+        "body": { "reason": "changed" },
+    }));
+    bytes.extend(dap_frame(serde_json::json!({
+        "seq": 2,
+        "type": "response",
+        "request_seq": 7,
+        "success": true,
+        "command": "configurationDone",
+    })));
+    let mut reader = BufReader::new(std::io::Cursor::new(bytes));
+
+    let response = read_dap(&mut reader).expect("matching response");
+    assert_eq!(response["request_seq"], 7);
+    assert_eq!(response["command"], "configurationDone");
+
+    let event = read_dap(&mut reader).expect("buffered event");
+    assert_eq!(event["type"], "event");
+    assert_eq!(event["event"], "breakpoint");
 }
 
 #[test]
@@ -595,6 +715,118 @@ fn test_dap_exception_breakpoint_skips_caught_errors() {
 }
 
 #[test]
+fn test_dap_exception_breakpoint_stops_on_unobserved_detached_task_failure() {
+    let binary = sema_binary();
+    let dir = unique_temp_dir("exc_bp_detached");
+    let program_path = dir.join("detached.sema");
+    std::fs::write(
+        &program_path,
+        "(async (throw \"detached failure\"))\n(println \"root completed\")\n",
+    )
+    .unwrap();
+
+    let mut child = Command::new(&binary)
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {binary}: {e}"));
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    send_dap(&mut stdin, 1, "initialize", Some(serde_json::json!({})));
+    let _ = read_dap(&mut reader).unwrap();
+    let _ = read_dap(&mut reader).unwrap();
+    send_dap(
+        &mut stdin,
+        2,
+        "setExceptionBreakpoints",
+        Some(serde_json::json!({ "filters": ["uncaught"] })),
+    );
+    let _ = read_dap(&mut reader).unwrap();
+    send_dap(
+        &mut stdin,
+        3,
+        "launch",
+        Some(serde_json::json!({ "program": program_path.to_string_lossy() })),
+    );
+    let _ = read_dap(&mut reader).unwrap();
+    send_dap(&mut stdin, 4, "configurationDone", None);
+    let _ = read_dap(&mut reader).unwrap();
+
+    let stopped = wait_for_event_message(&mut reader, "stopped", 50)
+        .expect("unobserved detached task failure should stop execution");
+    assert_eq!(stopped["body"]["reason"], "exception");
+    assert!(stopped["body"]["description"]
+        .as_str()
+        .is_some_and(|description| description.contains("detached failure")));
+
+    send_dap(&mut stdin, 5, "continue", Some(serde_json::json!({})));
+    let _ = read_dap(&mut reader).unwrap();
+    assert!(wait_for_event(&mut reader, "terminated", 50));
+
+    send_dap(&mut stdin, 6, "disconnect", None);
+    let _ = read_dap(&mut reader);
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_dap_exception_breakpoint_skips_caught_awaited_task_failure() {
+    let binary = sema_binary();
+    let dir = unique_temp_dir("exc_bp_awaited");
+    let program_path = dir.join("awaited.sema");
+    std::fs::write(
+        &program_path,
+        "(try (async/await (async (throw \"caught async failure\"))) (catch e \"recovered\"))\n",
+    )
+    .unwrap();
+
+    let mut child = Command::new(&binary)
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {binary}: {e}"));
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    send_dap(&mut stdin, 1, "initialize", Some(serde_json::json!({})));
+    let _ = read_dap(&mut reader).unwrap();
+    let _ = read_dap(&mut reader).unwrap();
+    send_dap(
+        &mut stdin,
+        2,
+        "setExceptionBreakpoints",
+        Some(serde_json::json!({ "filters": ["uncaught"] })),
+    );
+    let _ = read_dap(&mut reader).unwrap();
+    send_dap(
+        &mut stdin,
+        3,
+        "launch",
+        Some(serde_json::json!({ "program": program_path.to_string_lossy() })),
+    );
+    let _ = read_dap(&mut reader).unwrap();
+    send_dap(&mut stdin, 4, "configurationDone", None);
+    let _ = read_dap(&mut reader).unwrap();
+
+    assert!(
+        wait_for_event(&mut reader, "terminated", 50),
+        "a caught awaited task failure must not stop as uncaught"
+    );
+
+    send_dap(&mut stdin, 5, "disconnect", None);
+    let _ = read_dap(&mut reader);
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_dap_breakpoint_after_launch() {
     let binary = sema_binary();
 
@@ -677,6 +909,60 @@ fn test_dap_breakpoint_after_launch() {
     let status = child.wait().expect("failed to wait for child");
     assert!(status.success());
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_dap_launch_with_more_breakpoints_than_event_capacity_does_not_deadlock() {
+    let binary = sema_binary();
+    let dir = unique_temp_dir("many_pending_bp");
+    let program_path = dir.join("many.sema");
+    let source = (1..=40)
+        .map(|line| format!("(define value-{line} {line})\n"))
+        .collect::<String>();
+    std::fs::write(&program_path, source).unwrap();
+
+    let mut child = Command::new(&binary)
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {binary}: {e}"));
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    send_dap(&mut stdin, 1, "initialize", Some(serde_json::json!({})));
+    read_dap(&mut reader).unwrap();
+    read_dap(&mut reader).unwrap();
+
+    let breakpoints = (1..=40)
+        .map(|line| serde_json::json!({ "line": line }))
+        .collect::<Vec<_>>();
+    send_dap(
+        &mut stdin,
+        2,
+        "setBreakpoints",
+        Some(serde_json::json!({
+            "source": { "path": program_path.to_string_lossy() },
+            "breakpoints": breakpoints,
+        })),
+    );
+    assert_eq!(read_dap(&mut reader).unwrap()["success"], true);
+
+    send_dap(
+        &mut stdin,
+        3,
+        "launch",
+        Some(serde_json::json!({ "program": program_path.to_string_lossy() })),
+    );
+    let launch = read_dap_timeout(&mut reader, Duration::from_secs(2))
+        .expect("launch must reply before breakpoint events fill the bridge");
+    assert_eq!(launch["command"], "launch");
+    assert_eq!(launch["success"], true);
+
+    drop(stdin);
+    let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1716,4 +2002,76 @@ fn test_dap_stop_on_entry_pauses_before_running() {
     send_dap(&mut stdin, 5, "disconnect", None);
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_dap_does_not_advertise_cancel_but_tolerates_late_cancel() {
+    let mut child = Command::new(sema_binary())
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("starts DAP server");
+    let mut stdin = child.stdin.take().expect("DAP stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("DAP stdout"));
+
+    send_dap(&mut stdin, 1, "initialize", Some(serde_json::json!({})));
+    let initialize = read_dap(&mut reader).expect("initialize response");
+    assert!(initialize["body"].get("supportsCancelRequest").is_none());
+    let initialized = read_dap(&mut reader).expect("initialized event");
+    assert_eq!(initialized["event"], "initialized");
+
+    send_dap(
+        &mut stdin,
+        2,
+        "cancel",
+        Some(serde_json::json!({ "requestId": 99 })),
+    );
+    let response = read_dap(&mut reader).expect("cancel response");
+    assert_eq!(response["command"], "cancel");
+    assert_eq!(response["request_seq"], 2);
+    assert_eq!(response["success"], true);
+
+    send_dap(&mut stdin, 3, "disconnect", None);
+    let _ = read_dap(&mut reader).expect("disconnect response");
+    assert!(child.wait().expect("DAP server exits").success());
+}
+
+#[test]
+fn test_dap_rejects_invalid_breakpoint_lines_without_wrapping() {
+    let mut child = Command::new(sema_binary())
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("starts DAP server");
+    let mut stdin = child.stdin.take().expect("DAP stdin");
+    let mut reader = BufReader::new(child.stdout.take().expect("DAP stdout"));
+
+    send_dap(&mut stdin, 1, "initialize", Some(serde_json::json!({})));
+    let _ = read_dap(&mut reader).expect("initialize response");
+    let _ = read_dap(&mut reader).expect("initialized event");
+
+    send_dap(
+        &mut stdin,
+        2,
+        "setBreakpoints",
+        Some(serde_json::json!({
+            "source": { "path": "/tmp/never-read.sema" },
+            "breakpoints": [{ "line": 4_294_967_296u64 }],
+        })),
+    );
+    let response = read_dap(&mut reader).expect("setBreakpoints response");
+    assert_eq!(response["command"], "setBreakpoints");
+    assert_eq!(response["request_seq"], 2);
+    assert_eq!(response["success"], false);
+    assert!(response["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("breakpoint line")));
+
+    send_dap(&mut stdin, 3, "disconnect", None);
+    let _ = read_dap(&mut reader).expect("disconnect response");
+    assert!(child.wait().expect("DAP server exits").success());
 }

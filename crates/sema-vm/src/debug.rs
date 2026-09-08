@@ -42,6 +42,8 @@ pub struct DapBreakpoint {
 /// condition expression that must evaluate truthy for the breakpoint to fire.
 #[derive(Debug, Clone)]
 pub struct SourceBreakpoint {
+    /// Stable DAP ID assigned before launch, when available.
+    pub id: Option<u32>,
     pub line: u32,
     pub condition: Option<String>,
 }
@@ -53,12 +55,21 @@ pub const DEBUG_VALUE_REF_BASE: u64 = 1_000_000;
 pub enum StepMode {
     /// Run until a breakpoint is hit.
     Continue,
+    /// Stop before the first source expression executes.
+    Entry,
     /// Stop at the next source line change (any frame depth).
     StepInto,
     /// Stop at the next source line change in the same or parent frame.
     StepOver,
     /// Stop when returning to the parent frame.
     StepOut,
+}
+
+/// DAP's optional classification for a variables request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugVariableFilter {
+    Indexed,
+    Named,
 }
 
 /// Commands sent from the DAP frontend to the VM backend.
@@ -86,6 +97,9 @@ pub enum DebugCommand {
     },
     GetVariables {
         reference: u64,
+        filter: Option<DebugVariableFilter>,
+        start: usize,
+        count: Option<usize>,
         reply: mpsc::SyncSender<Vec<DapVariable>>,
     },
     Evaluate {
@@ -110,12 +124,22 @@ pub enum ScopeKind {
 
 /// Encode a locals scope reference for the given frame.
 pub fn scope_locals_ref(frame_id: usize) -> u64 {
-    (frame_id as u64) * 2 + 1
+    u64::try_from(frame_id)
+        .ok()
+        .and_then(|id| id.checked_mul(2))
+        .and_then(|id| id.checked_add(1))
+        .filter(|reference| *reference < DEBUG_VALUE_REF_BASE)
+        .unwrap_or(0)
 }
 
 /// Encode an upvalues scope reference for the given frame.
 pub fn scope_upvalues_ref(frame_id: usize) -> u64 {
-    (frame_id as u64) * 2 + 2
+    u64::try_from(frame_id)
+        .ok()
+        .and_then(|id| id.checked_mul(2))
+        .and_then(|id| id.checked_add(2))
+        .filter(|reference| *reference < DEBUG_VALUE_REF_BASE)
+        .unwrap_or(0)
 }
 
 /// Decode a scope variable reference into frame ID and kind.
@@ -273,7 +297,7 @@ impl DebugState {
     fn step_mode_would_stop(&self, file: Option<&PathBuf>, line: u32, frame_depth: usize) -> bool {
         match self.step_mode {
             StepMode::Continue => false,
-            StepMode::StepInto => self.moved_since_last_stop(file, line),
+            StepMode::Entry | StepMode::StepInto => self.moved_since_last_stop(file, line),
             StepMode::StepOver => {
                 frame_depth <= self.step_frame_depth && self.moved_since_last_stop(file, line)
             }
@@ -329,6 +353,7 @@ impl DebugState {
         let requested: Vec<SourceBreakpoint> = lines
             .iter()
             .map(|&line| SourceBreakpoint {
+                id: None,
                 line,
                 condition: None,
             })
@@ -363,8 +388,23 @@ impl DebugState {
                 };
                 match resolved {
                     Some(line) => {
-                        let id = self.next_bp_id;
-                        self.next_bp_id += 1;
+                        let id = bp.id.unwrap_or_else(|| {
+                            let id = self.next_bp_id;
+                            self.next_bp_id = self.next_bp_id.saturating_add(1);
+                            id
+                        });
+                        self.next_bp_id = self.next_bp_id.max(id.saturating_add(1));
+                        if let Some(existing_id) = self.breakpoints.get(&(file.clone(), line)) {
+                            return DapBreakpoint {
+                                id,
+                                verified: false,
+                                requested_line,
+                                line: requested_line,
+                                message: Some(format!(
+                                    "Breakpoint resolves to the same executable line as breakpoint {existing_id}"
+                                )),
+                            };
+                        }
                         self.breakpoints.insert((file.clone(), line), id);
                         if let Some(cond) = &bp.condition {
                             if !cond.trim().is_empty() {
@@ -377,7 +417,7 @@ impl DebugState {
                             requested_line,
                             line,
                             message: (line != requested_line).then(|| {
-                                format!("Breakpoint moved to nearest executable line {line}")
+                                format!("Breakpoint moved to next executable line {line}")
                             }),
                         }
                     }

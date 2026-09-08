@@ -534,6 +534,7 @@ pub struct VM {
     /// Populated at VM creation from the compiler's native_table + global env.
     native_fns: Rc<Vec<Rc<NativeFn>>>,
     debug_values: HashMap<u64, Value>,
+    debug_value_refs: HashMap<u64, u64>,
     next_debug_value_ref: u64,
     /// Stack frames retained after an uncaught error has unwound the VM.
     debug_exception_frames: Option<Vec<crate::debug::DapStackFrame>>,
@@ -1757,6 +1758,7 @@ impl VM {
             ],
             native_fns: Rc::new(native_fns),
             debug_values: HashMap::new(),
+            debug_value_refs: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
             debug_exception_frames: None,
             gc_adopted_home: std::cell::RefCell::new(Weak::new()),
@@ -1822,6 +1824,7 @@ impl VM {
             inline_cache: vec![(u32::MAX, 0, CachedGlobal::Plain(Value::nil())); total_cache_slots],
             native_fns,
             debug_values: HashMap::new(),
+            debug_value_refs: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
             debug_exception_frames: None,
             gc_adopted_home: std::cell::RefCell::new(Weak::new()),
@@ -1856,6 +1859,7 @@ impl VM {
             inline_cache: vec![(u32::MAX, 0, CachedGlobal::Plain(Value::nil())); total_cache_slots],
             native_fns: Rc::new(native_fns),
             debug_values: HashMap::new(),
+            debug_value_refs: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
             debug_exception_frames: None,
             gc_adopted_home: std::cell::RefCell::new(Weak::new()),
@@ -1910,6 +1914,7 @@ impl VM {
         self.functions = functions;
         self.native_fns = native_fns;
         self.debug_values.clear();
+        self.debug_value_refs.clear();
         self.next_debug_value_ref = DEBUG_VALUE_REF_BASE;
         *self.gc_adopted_home.borrow_mut() = Weak::new();
         self.instruction_budget = None;
@@ -1939,6 +1944,7 @@ impl VM {
             *slot = (u32::MAX, 0, CachedGlobal::Plain(Value::nil()));
         }
         self.debug_values.clear();
+        self.debug_value_refs.clear();
     }
 
     pub fn execute(&mut self, closure: Rc<Closure>, ctx: &EvalContext) -> Result<Value, SemaError> {
@@ -1999,6 +2005,7 @@ impl VM {
                     if debug.break_on_uncaught {
                         debug.last_exception = Some(e.to_string());
                         self.debug_values.clear();
+                        self.debug_value_refs.clear();
                         self.next_debug_value_ref = DEBUG_VALUE_REF_BASE;
                         let _ = debug.event_tx.send(crate::debug::DebugEvent::Stopped {
                             reason: crate::debug::StopReason::Exception,
@@ -2051,6 +2058,7 @@ impl VM {
         // not retained for the whole session (otherwise debug_values grows
         // unbounded across a long stepping session, pinning the underlying heap).
         self.debug_values.clear();
+        self.debug_value_refs.clear();
         self.next_debug_value_ref = DEBUG_VALUE_REF_BASE;
 
         let _ = debug.event_tx.send(crate::debug::DebugEvent::Stopped {
@@ -2183,8 +2191,14 @@ impl VM {
             DebugCommand::GetScopes { frame_id, reply } => {
                 let _ = reply.send(self.debug_scopes(frame_id));
             }
-            DebugCommand::GetVariables { reference, reply } => {
-                let _ = reply.send(self.debug_variables(reference));
+            DebugCommand::GetVariables {
+                reference,
+                filter,
+                start,
+                count,
+                reply,
+            } => {
+                let _ = reply.send(self.debug_variables_range(reference, filter, start, count));
             }
             DebugCommand::Evaluate {
                 frame_id,
@@ -2978,9 +2992,14 @@ impl VM {
                                     }
                                     crate::debug::DebugCommand::GetVariables {
                                         reference,
+                                        filter,
+                                        start,
+                                        count,
                                         reply,
                                     } => {
-                                        let _ = reply.send(self.debug_variables(reference));
+                                        let _ = reply.send(self.debug_variables_range(
+                                            reference, filter, start, count,
+                                        ));
                                     }
                                     crate::debug::DebugCommand::Evaluate { reply, .. } => {
                                         let _ = reply.send(Err(
@@ -3066,6 +3085,8 @@ impl VM {
                                     self.frames[fi].pc = pc - 1;
                                     let reason = if dbg.pause_requested {
                                         crate::debug::StopReason::Pause
+                                    } else if dbg.step_mode == crate::debug::StepMode::Entry {
+                                        crate::debug::StopReason::Entry
                                     } else if dbg.step_mode != crate::debug::StepMode::Continue {
                                         crate::debug::StopReason::Step
                                     } else {
@@ -5089,12 +5110,25 @@ impl VM {
     }
 
     pub fn debug_locals(&mut self, frame_idx: usize) -> Vec<crate::debug::DapVariable> {
+        self.debug_locals_range(frame_idx, 0, None)
+    }
+
+    fn debug_locals_range(
+        &mut self,
+        frame_idx: usize,
+        start: usize,
+        count: Option<usize>,
+    ) -> Vec<crate::debug::DapVariable> {
         let Some(base) = self.frames.get(frame_idx).map(|f| f.base) else {
             return Vec::new();
         };
         let in_scope = self.in_scope_locals(frame_idx);
         let mut vars = Vec::new();
-        for (slot, spur) in in_scope {
+        for (slot, spur) in in_scope
+            .into_iter()
+            .skip(start)
+            .take(count.unwrap_or(usize::MAX))
+        {
             let idx = base + slot as usize;
             let val = self.stack.get(idx).cloned().unwrap_or(Value::nil());
             vars.push(self.debug_value_to_variable(&sema_core::resolve(spur), val));
@@ -5103,6 +5137,15 @@ impl VM {
     }
 
     pub fn debug_upvalues(&mut self, frame_idx: usize) -> Vec<crate::debug::DapVariable> {
+        self.debug_upvalues_range(frame_idx, 0, None)
+    }
+
+    fn debug_upvalues_range(
+        &mut self,
+        frame_idx: usize,
+        start: usize,
+        count: Option<usize>,
+    ) -> Vec<crate::debug::DapVariable> {
         let Some(frame) = self.frames.get(frame_idx) else {
             return Vec::new();
         };
@@ -5111,6 +5154,8 @@ impl VM {
         upvalues
             .iter()
             .enumerate()
+            .skip(start)
+            .take(count.unwrap_or(usize::MAX))
             .map(|(i, uv)| {
                 let val = match &*uv.state.borrow() {
                     UpvalueState::Closed(v) => v.clone(),
@@ -5129,6 +5174,9 @@ impl VM {
     }
 
     pub fn debug_scopes(&mut self, frame_id: usize) -> Vec<crate::debug::DapScope> {
+        if self.frames.get(frame_id).is_none() {
+            return Vec::new();
+        }
         let mut scopes = vec![crate::debug::DapScope {
             name: "Locals".to_string(),
             variables_reference: crate::debug::scope_locals_ref(frame_id),
@@ -5145,13 +5193,42 @@ impl VM {
     }
 
     pub fn debug_variables(&mut self, reference: u64) -> Vec<crate::debug::DapVariable> {
+        self.debug_variables_range(reference, None, 0, None)
+    }
+
+    pub fn debug_variables_range(
+        &mut self,
+        reference: u64,
+        filter: Option<crate::debug::DebugVariableFilter>,
+        start: usize,
+        count: Option<usize>,
+    ) -> Vec<crate::debug::DapVariable> {
         if let Some(value) = self.debug_values.get(&reference).cloned() {
-            return self.debug_children(value);
+            let indexed = matches!(
+                value.view_ref(),
+                ValueViewRef::List(_)
+                    | ValueViewRef::Vector(_)
+                    | ValueViewRef::Bytevector(_)
+                    | ValueViewRef::MutableArray(_)
+            );
+            if matches!(filter, Some(crate::debug::DebugVariableFilter::Indexed)) != indexed
+                && filter.is_some()
+            {
+                return Vec::new();
+            }
+            return self.debug_children(value, start, count);
+        }
+        if filter == Some(crate::debug::DebugVariableFilter::Indexed) {
+            return Vec::new();
         }
         match crate::debug::decode_scope_ref(reference) {
             None => Vec::new(),
-            Some(crate::debug::ScopeKind::Locals(frame_id)) => self.debug_locals(frame_id),
-            Some(crate::debug::ScopeKind::Upvalues(frame_id)) => self.debug_upvalues(frame_id),
+            Some(crate::debug::ScopeKind::Locals(frame_id)) => {
+                self.debug_locals_range(frame_id, start, count)
+            }
+            Some(crate::debug::ScopeKind::Upvalues(frame_id)) => {
+                self.debug_upvalues_range(frame_id, start, count)
+            }
         }
     }
 
@@ -5645,9 +5722,14 @@ impl VM {
         if !Self::is_debug_expandable(value) {
             return 0;
         }
+        let identity = value.raw_bits();
+        if let Some(reference) = self.debug_value_refs.get(&identity) {
+            return *reference;
+        }
         let reference = self.next_debug_value_ref;
-        self.next_debug_value_ref += 1;
+        self.next_debug_value_ref = self.next_debug_value_ref.saturating_add(1);
         self.debug_values.insert(reference, value.clone());
+        self.debug_value_refs.insert(identity, reference);
         reference
     }
 
@@ -5660,18 +5742,30 @@ impl VM {
                 | ValueViewRef::HashMap(_)
                 | ValueViewRef::Record(_)
                 | ValueViewRef::Bytevector(_)
+                | ValueViewRef::MutableArray(_)
+                | ValueViewRef::MutableCell(_)
         )
     }
 
-    fn debug_children(&mut self, value: Value) -> Vec<crate::debug::DapVariable> {
+    fn debug_children(
+        &mut self,
+        value: Value,
+        start: usize,
+        count: Option<usize>,
+    ) -> Vec<crate::debug::DapVariable> {
+        let count = count.unwrap_or(usize::MAX);
         match value.view_ref() {
             ValueViewRef::List(items) | ValueViewRef::Vector(items) => items
                 .iter()
                 .enumerate()
+                .skip(start)
+                .take(count)
                 .map(|(i, child)| self.debug_value_to_variable(&format!("[{i}]"), child.clone()))
                 .collect(),
             ValueViewRef::Map(map) => map
                 .iter()
+                .skip(start)
+                .take(count)
                 .map(|(key, child)| {
                     self.debug_value_to_variable(&sema_core::pretty_print(key, 80), child.clone())
                 })
@@ -5681,6 +5775,8 @@ impl VM {
                 entries.sort_by_key(|(key, _)| (*key).clone());
                 entries
                     .into_iter()
+                    .skip(start)
+                    .take(count)
                     .map(|(key, child)| {
                         self.debug_value_to_variable(
                             &sema_core::pretty_print(key, 80),
@@ -5693,6 +5789,8 @@ impl VM {
                 .fields
                 .iter()
                 .enumerate()
+                .skip(start)
+                .take(count)
                 .map(|(i, child)| {
                     let name = if record.field_names.len() == record.fields.len() {
                         sema_core::resolve(record.field_names[i])
@@ -5705,10 +5803,32 @@ impl VM {
             ValueViewRef::Bytevector(bytes) => bytes
                 .iter()
                 .enumerate()
+                .skip(start)
+                .take(count)
                 .map(|(i, byte)| {
                     self.debug_value_to_variable(&format!("[{i}]"), Value::int(*byte as i64))
                 })
                 .collect(),
+            ValueViewRef::MutableArray(array) => array
+                .items
+                .try_borrow()
+                .map(|items| {
+                    items
+                        .iter()
+                        .enumerate()
+                        .skip(start)
+                        .take(count)
+                        .map(|(i, child)| {
+                            self.debug_value_to_variable(&format!("[{i}]"), child.clone())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            ValueViewRef::MutableCell(cell) if start == 0 && count > 0 => cell
+                .value
+                .try_borrow()
+                .map(|value| vec![self.debug_value_to_variable("value", value.clone())])
+                .unwrap_or_default(),
             _ => Vec::new(),
         }
     }
@@ -6405,9 +6525,8 @@ fn collect_function_breakpoint_lines(
     }
 }
 
-/// Snap a requested breakpoint line to the nearest valid line with bytecode spans.
-/// Prefers the same line, then searches forward, then backward.
-/// Returns None if no valid lines exist.
+/// Resolve a breakpoint to the requested line or the next executable line.
+/// A request after the final executable line remains unverified.
 pub fn snap_breakpoint_line(requested: u32, valid_lines: &[u32]) -> Option<u32> {
     if valid_lines.is_empty() {
         return None;
@@ -6417,24 +6536,7 @@ pub fn snap_breakpoint_line(requested: u32, valid_lines: &[u32]) -> Option<u32> 
     }
     // Binary search for insertion point
     let idx = valid_lines.partition_point(|&l| l < requested);
-    let forward = valid_lines.get(idx).copied();
-    let backward = if idx > 0 {
-        valid_lines.get(idx - 1).copied()
-    } else {
-        None
-    };
-    match (forward, backward) {
-        (Some(f), Some(b)) => {
-            if (f - requested) <= (requested - b) {
-                Some(f)
-            } else {
-                Some(b)
-            }
-        }
-        (Some(f), None) => Some(f),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    }
+    valid_lines.get(idx).copied()
 }
 
 /// Result of compiling a program, ready for VM execution.
@@ -8426,6 +8528,7 @@ mod tests {
             debug.set_breakpoints_with_conditions(
                 &file,
                 &[crate::debug::SourceBreakpoint {
+                    id: None,
                     line: 1,
                     condition: Some(condition.to_string()),
                 }],
@@ -9054,14 +9157,14 @@ mod tests {
 
         // Exact match
         assert_eq!(snap_breakpoint_line(3, &valid), Some(3));
-        // Snap forward (closer)
+        // Snap forward to the next executable line
         assert_eq!(snap_breakpoint_line(4, &valid), Some(5));
-        // Equidistant between 1 and 3: prefers forward
+        // Never moves a breakpoint onto an earlier line
         assert_eq!(snap_breakpoint_line(2, &valid), Some(3));
-        // Equidistant: prefers forward
+        // An executable line after the request is selected
         assert_eq!(snap_breakpoint_line(4, &[3, 5]), Some(5));
-        // Past the end: snaps to last
-        assert_eq!(snap_breakpoint_line(20, &valid), Some(10));
+        // Past the end: remains unverified instead of moving backward
+        assert_eq!(snap_breakpoint_line(20, &valid), None);
         // Before the start: snaps to first
         assert_eq!(snap_breakpoint_line(0, &valid), Some(1));
         // Empty valid lines
@@ -9123,6 +9226,34 @@ mod tests {
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].name, "field_0");
         assert_eq!(fields[1].name, "field_1");
+    }
+
+    #[test]
+    fn debug_variable_paging_materializes_only_the_requested_children() {
+        let mut vm = VM::new(make_test_env(), vec![], &[], 0).unwrap();
+        let children = (0..20)
+            .map(|value| Value::list(vec![Value::int(value)]))
+            .collect();
+        let parent = vm.debug_value_to_variable("items", Value::vector(children));
+        assert_eq!(vm.debug_values.len(), 1);
+
+        let page = vm.debug_variables_range(
+            parent.variables_reference,
+            Some(crate::debug::DebugVariableFilter::Indexed),
+            7,
+            Some(1),
+        );
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].name, "[7]");
+        assert_eq!(vm.debug_values.len(), 2);
+        assert!(vm
+            .debug_variables_range(
+                parent.variables_reference,
+                Some(crate::debug::DebugVariableFilter::Named),
+                0,
+                None,
+            )
+            .is_empty());
     }
 
     #[test]

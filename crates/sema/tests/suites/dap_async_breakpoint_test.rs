@@ -235,6 +235,9 @@ fn async_task_breakpoint_inspects_task_frame_locals() {
     run.cmd_tx
         .send(DebugCommand::GetVariables {
             reference: locals_ref,
+            filter: None,
+            start: 0,
+            count: None,
             reply: tx,
         })
         .unwrap();

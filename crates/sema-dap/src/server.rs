@@ -4,7 +4,9 @@ use std::sync::mpsc as std_mpsc;
 use tokio::io::BufReader;
 use tokio::sync::mpsc as tokio_mpsc;
 
-use sema_vm::debug::{DapBreakpoint, DebugCommand, DebugEvent, DebugState, SourceBreakpoint};
+use sema_vm::debug::{
+    DapBreakpoint, DebugCommand, DebugEvent, DebugState, DebugVariableFilter, SourceBreakpoint,
+};
 
 use crate::protocol::{DapEvent, DapMessage, DapResponse};
 use crate::transport;
@@ -13,9 +15,11 @@ use crate::transport;
 /// Only used for operations that require access to the backend thread's state.
 enum BackendRequest {
     Launch {
+        session_id: u64,
         program: PathBuf,
         stop_on_entry: bool,
         cmd_rx: std_mpsc::Receiver<DebugCommand>,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     SetBreakpoints {
         file: PathBuf,
@@ -29,6 +33,17 @@ enum BackendRequest {
     Disconnect,
 }
 
+enum BackendEvent {
+    Debug {
+        session_id: u64,
+        event: DebugEvent,
+    },
+    BreakpointChanged {
+        session_id: u64,
+        breakpoint: DapBreakpoint,
+    },
+}
+
 struct FrontendState {
     vm_active: bool,
     vm_suspended: bool,
@@ -39,6 +54,8 @@ struct FrontendState {
     /// Message of the most recent uncaught exception we stopped on, surfaced via
     /// the exceptionInfo request.
     last_exception: Option<String>,
+    session_id: Option<u64>,
+    next_session_id: u64,
 }
 
 pub async fn run() {
@@ -48,13 +65,15 @@ pub async fn run() {
 
     let mut seq: u64 = 1;
     let (backend_tx, backend_rx) = tokio_mpsc::channel::<BackendRequest>(32);
-    let (event_bridge_tx, mut event_bridge_rx) = tokio_mpsc::channel::<DebugEvent>(32);
+    let (event_bridge_tx, mut event_bridge_rx) = tokio_mpsc::channel::<BackendEvent>(32);
     let mut state = FrontendState {
         vm_active: false,
         vm_suspended: false,
         dbg_cmd_tx: None,
         break_on_uncaught: false,
         last_exception: None,
+        session_id: None,
+        next_session_id: 1,
     };
 
     // Spawn the backend thread
@@ -73,6 +92,9 @@ pub async fn run() {
                             eprintln!("DAP: failed to parse message: {text}");
                             continue;
                         };
+                        if msg.msg_type != "request" {
+                            continue;
+                        }
                         let handled = handle_request(
                             &msg,
                             &mut stdout,
@@ -91,10 +113,32 @@ pub async fn run() {
                     }
                 }
             }
-            Some(event) = event_bridge_rx.recv() => {
+            Some(bridge_event) = event_bridge_rx.recv() => {
+                let event_session_id = match &bridge_event {
+                    BackendEvent::Debug { session_id, .. }
+                    | BackendEvent::BreakpointChanged { session_id, .. } => *session_id,
+                };
+                if state.session_id != Some(event_session_id) {
+                    continue;
+                }
+                if let BackendEvent::BreakpointChanged { breakpoint, .. } = bridge_event {
+                    let dap_event = DapEvent::new(seq, "breakpoint", Some(serde_json::json!({
+                        "reason": "changed",
+                        "breakpoint": breakpoint_to_json(&breakpoint),
+                    })));
+                    seq += 1;
+                    if let Ok(json) = serde_json::to_string(&dap_event) {
+                        let _ = transport::write_message(&mut stdout, &json).await;
+                    }
+                    continue;
+                }
+                let BackendEvent::Debug { event, .. } = bridge_event else {
+                    unreachable!();
+                };
                 let dap_event = match event {
                     DebugEvent::Stopped { reason, description } => {
                         state.vm_suspended = true;
+                        state.last_exception = None;
                         let reason_str = match reason {
                             sema_vm::debug::StopReason::Breakpoint => "breakpoint",
                             sema_vm::debug::StopReason::Step => "step",
@@ -122,6 +166,8 @@ pub async fn run() {
                         // any later request routes to the (pending) backend path
                         // rather than a VM that is no longer polling.
                         state.dbg_cmd_tx = None;
+                        state.session_id = None;
+                        state.last_exception = None;
                         DapEvent::new(seq, "terminated", None)
                     }
                     DebugEvent::Output { category, output } => {
@@ -164,6 +210,7 @@ async fn handle_request(
                 "supportsRestartFrame": false,
                 "supportsModulesRequest": false,
                 "supportsExceptionInfoRequest": true,
+                "supportsVariablePaging": true,
                 "exceptionBreakpointFilters": [{
                     "filter": "uncaught",
                     "label": "Uncaught Exceptions",
@@ -182,6 +229,17 @@ async fn handle_request(
             }
         }
         "launch" => {
+            if state.dbg_cmd_tx.is_some() {
+                send_error(
+                    stdout,
+                    seq,
+                    msg.seq,
+                    "launch",
+                    "a debug session is already active",
+                )
+                .await;
+                return true;
+            }
             let program = msg
                 .arguments
                 .as_ref()
@@ -196,16 +254,52 @@ async fn handle_request(
                 .unwrap_or(false);
 
             if let Some(program) = program {
+                let session_id = state.next_session_id;
+                state.next_session_id = state.next_session_id.saturating_add(1);
                 let (cmd_tx, cmd_rx) = std_mpsc::channel::<DebugCommand>();
-                let _ = backend_tx
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                if backend_tx
                     .send(BackendRequest::Launch {
+                        session_id,
                         program,
                         stop_on_entry,
                         cmd_rx,
+                        reply: reply_tx,
                     })
+                    .await
+                    .is_err()
+                {
+                    send_error(
+                        stdout,
+                        seq,
+                        msg.seq,
+                        "launch",
+                        "debug backend is unavailable",
+                    )
                     .await;
-                state.dbg_cmd_tx = Some(cmd_tx);
-                send_response(stdout, seq, msg.seq, "launch", None).await;
+                    return true;
+                }
+                match reply_rx.await {
+                    Ok(Ok(())) => {
+                        state.dbg_cmd_tx = Some(cmd_tx);
+                        state.session_id = Some(session_id);
+                        state.last_exception = None;
+                        send_response(stdout, seq, msg.seq, "launch", None).await;
+                    }
+                    Ok(Err(message)) => {
+                        send_error(stdout, seq, msg.seq, "launch", &message).await;
+                    }
+                    Err(_) => {
+                        send_error(
+                            stdout,
+                            seq,
+                            msg.seq,
+                            "launch",
+                            "debug backend is unavailable",
+                        )
+                        .await;
+                    }
+                }
             } else {
                 send_error(stdout, seq, msg.seq, "launch", "missing 'program' argument").await;
             }
@@ -219,25 +313,13 @@ async fn handle_request(
                 .and_then(|p| p.as_str())
                 .map(clean_path)
                 .unwrap_or_default();
-            let breakpoints_req: Vec<SourceBreakpoint> = msg
-                .arguments
-                .as_ref()
-                .and_then(|a| a.get("breakpoints"))
-                .and_then(|b| b.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|bp| {
-                            let line = bp.get("line").and_then(|l| l.as_u64())? as u32;
-                            let condition = bp
-                                .get("condition")
-                                .and_then(|c| c.as_str())
-                                .filter(|c| !c.trim().is_empty())
-                                .map(|c| c.to_string());
-                            Some(SourceBreakpoint { line, condition })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let breakpoints_req = match parse_source_breakpoints(msg) {
+                Ok(breakpoints) => breakpoints,
+                Err(message) => {
+                    send_error(stdout, seq, msg.seq, "setBreakpoints", message).await;
+                    return true;
+                }
+            };
 
             let resolved_breakpoints = if state.vm_active {
                 if let Some(ref tx) = state.dbg_cmd_tx {
@@ -300,22 +382,35 @@ async fn handle_request(
             send_response(stdout, seq, msg.seq, "setExceptionBreakpoints", None).await;
         }
         "exceptionInfo" => {
-            let body = match &state.last_exception {
-                Some(message) => serde_json::json!({
-                    "exceptionId": "uncaught",
-                    "description": message,
-                    "breakMode": "unhandled",
-                    "details": { "message": message },
-                }),
-                None => serde_json::json!({
-                    "exceptionId": "uncaught",
-                    "description": "No exception information available",
-                    "breakMode": "unhandled",
-                }),
+            let Some(message) = &state.last_exception else {
+                send_error(
+                    stdout,
+                    seq,
+                    msg.seq,
+                    "exceptionInfo",
+                    "execution is not stopped on an exception",
+                )
+                .await;
+                return true;
             };
+            let body = serde_json::json!({
+                "exceptionId": "uncaught",
+                "description": message,
+                "breakMode": "unhandled",
+                "details": { "message": message },
+            });
             send_response(stdout, seq, msg.seq, "exceptionInfo", Some(body)).await;
         }
         "configurationDone" => {
+            if state.dbg_cmd_tx.is_none() || state.vm_active {
+                let message = if state.vm_active {
+                    "configurationDone was already received"
+                } else {
+                    "configurationDone requires a successful launch"
+                };
+                send_error(stdout, seq, msg.seq, "configurationDone", message).await;
+                return true;
+            }
             let _ = backend_tx.send(BackendRequest::ConfigurationDone).await;
             // Only mark the VM active if a launch actually produced a command
             // channel and it hasn't already terminated (e.g. a launch/compile
@@ -349,8 +444,17 @@ async fn handle_request(
             } else {
                 Vec::new()
             };
+            let total_frames = frames.len();
+            let start = request_usize(msg, "startFrame")
+                .unwrap_or(0)
+                .min(total_frames);
+            let levels = request_usize(msg, "levels")
+                .filter(|levels| *levels > 0)
+                .unwrap_or(total_frames.saturating_sub(start));
             let stack_frames: Vec<serde_json::Value> = frames
                 .iter()
+                .skip(start)
+                .take(levels)
                 .map(|f| {
                     let mut frame = serde_json::json!({
                         "id": f.id,
@@ -377,18 +481,16 @@ async fn handle_request(
                 "stackTrace",
                 Some(serde_json::json!({
                     "stackFrames": stack_frames,
-                    "totalFrames": stack_frames.len(),
+                    "totalFrames": total_frames,
                 })),
             )
             .await;
         }
         "scopes" => {
-            let frame_id = msg
-                .arguments
-                .as_ref()
-                .and_then(|a| a.get("frameId"))
-                .and_then(|f| f.as_u64())
-                .unwrap_or(0) as usize;
+            let Some(frame_id) = request_frame_id(msg) else {
+                send_error(stdout, seq, msg.seq, "scopes", "invalid frameId").await;
+                return true;
+            };
             let scopes = if state.vm_active && state.vm_suspended {
                 if let Some(ref tx) = state.dbg_cmd_tx {
                     send_cmd_and_recv(tx, |reply| DebugCommand::GetScopes { frame_id, reply }).await
@@ -408,6 +510,10 @@ async fn handle_request(
                     })
                 })
                 .collect();
+            if state.vm_active && state.vm_suspended && scopes.is_empty() {
+                send_error(stdout, seq, msg.seq, "scopes", "unknown frameId").await;
+                return true;
+            }
             send_response(
                 stdout,
                 seq,
@@ -424,10 +530,32 @@ async fn handle_request(
                 .and_then(|a| a.get("variablesReference"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
+            let filter = match msg
+                .arguments
+                .as_ref()
+                .and_then(|args| args.get("filter"))
+                .and_then(|value| value.as_str())
+            {
+                None => None,
+                Some("indexed") => Some(DebugVariableFilter::Indexed),
+                Some("named") => Some(DebugVariableFilter::Named),
+                Some(_) => {
+                    send_error(stdout, seq, msg.seq, "variables", "invalid variable filter").await;
+                    return true;
+                }
+            };
+            let start = request_usize(msg, "start").unwrap_or(0);
+            let count = request_usize(msg, "count").filter(|count| *count > 0);
             let vars = if state.vm_active && state.vm_suspended {
                 if let Some(ref tx) = state.dbg_cmd_tx {
-                    send_cmd_and_recv(tx, |reply| DebugCommand::GetVariables { reference, reply })
-                        .await
+                    send_cmd_and_recv(tx, |reply| DebugCommand::GetVariables {
+                        reference,
+                        filter,
+                        start,
+                        count,
+                        reply,
+                    })
+                    .await
                 } else {
                     Vec::new()
                 }
@@ -474,12 +602,10 @@ async fn handle_request(
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string();
-            let frame_id = msg
-                .arguments
-                .as_ref()
-                .and_then(|a| a.get("frameId"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as usize;
+            let Some(frame_id) = request_frame_id_or_default(msg) else {
+                send_error(stdout, seq, msg.seq, "evaluate", "invalid frameId").await;
+                return true;
+            };
 
             let Some(ref tx) = state.dbg_cmd_tx else {
                 send_error(
@@ -658,6 +784,40 @@ async fn handle_request(
             }
             send_response(stdout, seq, msg.seq, "pause", None).await;
         }
+        "cancel" => {
+            let Some(arguments) = msg.arguments.as_ref() else {
+                send_error(
+                    stdout,
+                    seq,
+                    msg.seq,
+                    "cancel",
+                    "cancel requires requestId or progressId",
+                )
+                .await;
+                return true;
+            };
+            let has_request_id = arguments.get("requestId").is_some_and(|id| id.is_u64());
+            let has_progress_id = arguments
+                .get("progressId")
+                .is_some_and(serde_json::Value::is_string);
+            if !has_request_id && !has_progress_id {
+                send_error(
+                    stdout,
+                    seq,
+                    msg.seq,
+                    "cancel",
+                    "cancel requires requestId or progressId",
+                )
+                .await;
+                return true;
+            }
+
+            // The adapter processes one frontend request at a time. By the time
+            // a cancel request is read, any earlier request has either completed
+            // or has no cancellable backend work. DAP requires this request to be
+            // harmless when its target has already completed.
+            send_response(stdout, seq, msg.seq, "cancel", None).await;
+        }
         "disconnect" => {
             if state.vm_active {
                 if let Some(ref tx) = state.dbg_cmd_tx {
@@ -708,6 +868,59 @@ async fn send_cmd_and_recv_result<T: Send + 'static>(
     tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_else(|_| Err(err_msg)))
         .await
         .unwrap_or_else(|e| Err(format!("task failed: {e}")))
+}
+
+fn request_usize(msg: &DapMessage, name: &str) -> Option<usize> {
+    msg.arguments
+        .as_ref()?
+        .get(name)?
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+}
+
+fn request_frame_id(msg: &DapMessage) -> Option<usize> {
+    let frame_id = request_usize(msg, "frameId")?;
+    (sema_vm::scope_locals_ref(frame_id) != 0).then_some(frame_id)
+}
+
+fn request_frame_id_or_default(msg: &DapMessage) -> Option<usize> {
+    match msg.arguments.as_ref().and_then(|args| args.get("frameId")) {
+        None => Some(0),
+        Some(_) => request_frame_id(msg),
+    }
+}
+
+fn parse_source_breakpoints(msg: &DapMessage) -> Result<Vec<SourceBreakpoint>, &'static str> {
+    let Some(value) = msg
+        .arguments
+        .as_ref()
+        .and_then(|arguments| arguments.get("breakpoints"))
+    else {
+        return Ok(Vec::new());
+    };
+    let breakpoints = value.as_array().ok_or("breakpoints must be an array")?;
+
+    breakpoints
+        .iter()
+        .map(|breakpoint| {
+            let line = breakpoint
+                .get("line")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|line| u32::try_from(line).ok())
+                .filter(|line| *line > 0)
+                .ok_or("each breakpoint line must be an integer from 1 through 4294967295")?;
+            let condition = breakpoint
+                .get("condition")
+                .and_then(serde_json::Value::as_str)
+                .filter(|condition| !condition.trim().is_empty())
+                .map(str::to_owned);
+            Ok(SourceBreakpoint {
+                id: None,
+                line,
+                condition,
+            })
+        })
+        .collect()
 }
 
 async fn send_response(
@@ -806,10 +1019,11 @@ struct LaunchedProgram {
 
 fn backend_thread(
     mut rx: tokio_mpsc::Receiver<BackendRequest>,
-    event_tx: tokio_mpsc::Sender<DebugEvent>,
+    event_tx: tokio_mpsc::Sender<BackendEvent>,
 ) {
     let mut launched: Option<LaunchedProgram> = None;
     let mut pending_breakpoints: Vec<(PathBuf, Vec<SourceBreakpoint>)> = Vec::new();
+    let mut next_pending_breakpoint_id = 1u32;
     let mut pending_break_on_uncaught = false;
 
     loop {
@@ -818,18 +1032,17 @@ fn backend_thread(
 
         match req {
             BackendRequest::Launch {
+                session_id,
                 program,
                 stop_on_entry,
                 cmd_rx,
+                reply,
             } => {
                 let source = match std::fs::read_to_string(&program) {
                     Ok(s) => s,
                     Err(e) => {
-                        let _ = event_tx.blocking_send(DebugEvent::Output {
-                            category: "stderr".to_string(),
-                            output: format!("Failed to read {}: {e}\n", program.display()),
-                        });
-                        let _ = event_tx.blocking_send(DebugEvent::Terminated);
+                        let _ =
+                            reply.send(Err(format!("failed to read {}: {e}", program.display())));
                         continue;
                     }
                 };
@@ -837,11 +1050,7 @@ fn backend_thread(
                 let (vals, span_map) = match sema_reader::read_many_with_spans(&source) {
                     Ok(v) => v,
                     Err(e) => {
-                        let _ = event_tx.blocking_send(DebugEvent::Output {
-                            category: "stderr".to_string(),
-                            output: format!("Parse error: {e}\n"),
-                        });
-                        let _ = event_tx.blocking_send(DebugEvent::Terminated);
+                        let _ = reply.send(Err(format!("parse error: {e}")));
                         continue;
                     }
                 };
@@ -853,11 +1062,7 @@ fn backend_thread(
                 ) {
                     Ok(v) => v,
                     Err(e) => {
-                        let _ = event_tx.blocking_send(DebugEvent::Output {
-                            category: "stderr".to_string(),
-                            output: format!("Compile error: {e}\n"),
-                        });
-                        let _ = event_tx.blocking_send(DebugEvent::Terminated);
+                        let _ = reply.send(Err(format!("compile error: {e}")));
                         continue;
                     }
                 };
@@ -876,14 +1081,18 @@ fn backend_thread(
                 ));
 
                 if stop_on_entry {
-                    ds.step_mode = sema_vm::StepMode::StepInto;
+                    ds.step_mode = sema_vm::StepMode::Entry;
                 }
 
                 ds.break_on_uncaught = pending_break_on_uncaught;
 
-                // Apply pending breakpoints
+                // Resolve pending breakpoints before publishing the session.
+                // Their changed events are sent only after the launch reply so
+                // a large set cannot fill the event bridge and block launch.
+                let mut changed_breakpoints = Vec::new();
                 for (file, breakpoints) in pending_breakpoints.drain(..) {
-                    ds.set_breakpoints_with_conditions(&file, &breakpoints);
+                    changed_breakpoints
+                        .extend(ds.set_breakpoints_with_conditions(&file, &breakpoints));
                 }
 
                 let new_vm = match sema_vm::VM::new(
@@ -894,11 +1103,7 @@ fn backend_thread(
                 ) {
                     Ok(vm) => vm,
                     Err(e) => {
-                        let _ = event_tx.blocking_send(DebugEvent::Output {
-                            category: "stderr".to_string(),
-                            output: format!("VM init error: {e}\n"),
-                        });
-                        let _ = event_tx.blocking_send(DebugEvent::Terminated);
+                        let _ = reply.send(Err(format!("VM initialization error: {e}")));
                         continue;
                     }
                 };
@@ -907,7 +1112,13 @@ fn backend_thread(
                 let event_tx_fwd = event_tx.clone();
                 std::thread::spawn(move || {
                     while let Ok(evt) = dbg_event_rx.recv() {
-                        if event_tx_fwd.blocking_send(evt).is_err() {
+                        if event_tx_fwd
+                            .blocking_send(BackendEvent::Debug {
+                                session_id,
+                                event: evt,
+                            })
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -920,11 +1131,23 @@ fn backend_thread(
                     debug_state: ds,
                     interp: interpreter,
                 });
+                let _ = reply.send(Ok(()));
+                for breakpoint in changed_breakpoints {
+                    if event_tx
+                        .blocking_send(BackendEvent::BreakpointChanged {
+                            session_id,
+                            breakpoint,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
             }
 
             BackendRequest::SetBreakpoints {
                 file,
-                breakpoints,
+                mut breakpoints,
                 reply,
             } => {
                 if let Some(lp) = launched.as_mut() {
@@ -937,16 +1160,21 @@ fn backend_thread(
                     // with pending breakpoints so the frontend doesn't block.
                     let count = breakpoints.len();
                     let pending: Vec<DapBreakpoint> = breakpoints
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, bp)| DapBreakpoint {
-                            id: (idx + 1) as u32,
-                            verified: false,
-                            requested_line: bp.line,
-                            line: bp.line,
-                            message: Some(
-                                "Breakpoint pending until program is compiled".to_string(),
-                            ),
+                        .iter_mut()
+                        .map(|bp| {
+                            let id = next_pending_breakpoint_id;
+                            next_pending_breakpoint_id =
+                                next_pending_breakpoint_id.saturating_add(1);
+                            bp.id = Some(id);
+                            DapBreakpoint {
+                                id,
+                                verified: false,
+                                requested_line: bp.line,
+                                line: bp.line,
+                                message: Some(
+                                    "Breakpoint pending until program is compiled".to_string(),
+                                ),
+                            }
                         })
                         .collect();
                     pending_breakpoints.push((file, breakpoints));
@@ -981,16 +1209,16 @@ fn backend_thread(
                     let interpreter = &interp;
                     // Redirect program stdout/stderr into DAP Output events so they
                     // don't corrupt the JSON-RPC protocol stream on the server's stdout.
-                    let event_tx_stdout = event_tx.clone();
+                    let event_tx_stdout = ds.event_tx.clone();
                     sema_core::set_host_stdout_hook(Some(Box::new(move |s: &str| {
-                        let _ = event_tx_stdout.blocking_send(DebugEvent::Output {
+                        let _ = event_tx_stdout.send(DebugEvent::Output {
                             category: "stdout".to_string(),
                             output: s.to_string(),
                         });
                     })));
-                    let event_tx_stderr = event_tx.clone();
+                    let event_tx_stderr = ds.event_tx.clone();
                     sema_core::set_host_stderr_hook(Some(Box::new(move |s: &str| {
-                        let _ = event_tx_stderr.blocking_send(DebugEvent::Output {
+                        let _ = event_tx_stderr.send(DebugEvent::Output {
                             category: "stderr".to_string(),
                             output: s.to_string(),
                         });
@@ -1018,11 +1246,11 @@ fn backend_thread(
                     // with no `RuntimeState` borrow held. Async ops (async/await,
                     // channels, sleep, external I/O) Just Work under the debugger
                     // because they are ordinary runtime suspensions now.
-                    let result = {
+                    let (result, detached_failures) = {
                         let mut vm_inst = vm;
                         vm_inst.seed_main_frame(cl.clone());
                         let _active = sema_vm::ActiveDebugGuard::enter(ds);
-                        interpreter.drive_vm_on_runtime(vm_inst)
+                        interpreter.drive_vm_on_runtime_with_debug_failures(vm_inst)
                     };
 
                     // Clear the hooks immediately after execution so any server-side
@@ -1037,21 +1265,24 @@ fn backend_thread(
                     // past an uncaught error, so any resume/disconnect just
                     // propagates it. The root's VM has unwound, so a throwaway VM
                     // serves the park loop with the captured error frames.
-                    if result.is_err() && ds.break_on_uncaught {
-                        if let Err(ref e) = result {
-                            ds.last_exception = Some(e.to_string());
-                            let _ = ds.event_tx.send(sema_vm::debug::DebugEvent::Stopped {
-                                reason: sema_vm::debug::StopReason::Exception,
-                                description: Some(e.to_string()),
-                            });
-                        }
+                    let uncaught_exception = result
+                        .as_ref()
+                        .err()
+                        .cloned()
+                        .or_else(|| detached_failures.into_iter().next());
+                    if let Some(error) =
+                        uncaught_exception.as_ref().filter(|_| ds.break_on_uncaught)
+                    {
+                        ds.last_exception = Some(error.to_string());
+                        let _ = ds.event_tx.send(sema_vm::debug::DebugEvent::Stopped {
+                            reason: sema_vm::debug::StopReason::Exception,
+                            description: Some(error.to_string()),
+                        });
                         if let Ok(mut park_vm) =
                             sema_vm::VM::new(interpreter.global_env.clone(), Vec::new(), &[], 0)
                         {
-                            if let Err(ref error) = result {
-                                if let Some(trace) = error.stack_trace() {
-                                    park_vm.set_debug_exception_stack_trace(trace);
-                                }
+                            if let Some(trace) = error.stack_trace() {
+                                park_vm.set_debug_exception_stack_trace(trace);
                             }
                             park_vm.debug_exception_park(&interpreter.ctx, ds);
                         }
@@ -1060,20 +1291,28 @@ fn backend_thread(
                     match result {
                         Ok(val) => {
                             if !val.is_nil() {
-                                let _ = event_tx.blocking_send(DebugEvent::Output {
+                                let _ = ds.event_tx.send(DebugEvent::Output {
                                     category: "stdout".to_string(),
                                     output: format!("{}\n", sema_core::pretty_print(&val, 80)),
                                 });
                             }
+                            if ds.break_on_uncaught {
+                                if let Some(error) = uncaught_exception.as_ref() {
+                                    let _ = ds.event_tx.send(DebugEvent::Output {
+                                        category: "stderr".to_string(),
+                                        output: format!("Detached task error: {error}\n"),
+                                    });
+                                }
+                            }
                         }
                         Err(e) => {
-                            let _ = event_tx.blocking_send(DebugEvent::Output {
+                            let _ = ds.event_tx.send(DebugEvent::Output {
                                 category: "stderr".to_string(),
                                 output: format!("Runtime error: {e}\n"),
                             });
                         }
                     }
-                    let _ = event_tx.blocking_send(DebugEvent::Terminated);
+                    let _ = ds.event_tx.send(DebugEvent::Terminated);
 
                     // The VM is no longer polling its command channel. Drain any
                     // commands the frontend sends in the race window before it
@@ -1096,13 +1335,26 @@ fn backend_thread(
 }
 
 fn clean_path(path_str: &str) -> PathBuf {
-    let decoded_str = if let Some(rest) = path_str.strip_prefix("file://") {
-        decode_percent(rest)
-    } else if let Some(rest) = path_str.strip_prefix("file:") {
-        decode_percent(rest)
-    } else {
-        path_str.to_string()
-    };
+    if path_str.starts_with("file:") {
+        if let Ok(mut uri) = url::Url::parse(path_str) {
+            if uri.host_str() == Some("localhost") {
+                let _ = uri.set_host(None);
+            }
+            if let Ok(path) = uri.to_file_path() {
+                return path;
+            }
+            if let Some(host) = uri.host_str() {
+                let decoded_path = decode_percent(uri.path());
+                return if cfg!(windows) {
+                    PathBuf::from(format!(r"\\{host}{}", decoded_path.replace('/', r"\")))
+                } else {
+                    PathBuf::from(format!("//{host}{decoded_path}"))
+                };
+            }
+        }
+    }
+
+    let decoded_str = path_str.to_string();
 
     let clean =
         if cfg!(windows) && decoded_str.starts_with('/') && decoded_str.chars().nth(2) == Some(':')
@@ -1190,5 +1442,34 @@ mod tests {
     fn clean_path_decodes_file_uri_multibyte() {
         let p = clean_path("file:///tmp/caf%C3%A9/main.sema");
         assert_eq!(p, PathBuf::from("/tmp/café/main.sema"));
+    }
+
+    #[test]
+    fn parse_source_breakpoints_rejects_out_of_range_and_zero_lines() {
+        for line in [serde_json::json!(0), serde_json::json!(4_294_967_296u64)] {
+            let message: DapMessage = serde_json::from_value(serde_json::json!({
+                "seq": 1,
+                "type": "request",
+                "command": "setBreakpoints",
+                "arguments": { "breakpoints": [{ "line": line }] },
+            }))
+            .expect("valid DAP envelope");
+
+            assert!(parse_source_breakpoints(&message).is_err());
+        }
+    }
+
+    #[test]
+    fn parse_source_breakpoints_preserves_the_largest_valid_line() {
+        let message: DapMessage = serde_json::from_value(serde_json::json!({
+            "seq": 1,
+            "type": "request",
+            "command": "setBreakpoints",
+            "arguments": { "breakpoints": [{ "line": u32::MAX }] },
+        }))
+        .expect("valid DAP envelope");
+
+        let breakpoints = parse_source_breakpoints(&message).expect("valid line");
+        assert_eq!(breakpoints[0].line, u32::MAX);
     }
 }

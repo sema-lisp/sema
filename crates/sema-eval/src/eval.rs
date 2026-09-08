@@ -689,6 +689,18 @@ impl Interpreter {
     }
 
     pub fn drive_vm_on_runtime(&self, vm: sema_vm::VM) -> EvalResult {
+        self.drive_vm_on_runtime_with_debug_failures(vm).0
+    }
+
+    /// Drive a VM root and return detached failures that were left unobserved
+    /// while a native DAP session was active for that root.
+    ///
+    /// The runtime only records these failures during DAP execution, so this
+    /// method leaves ordinary evaluation semantics unchanged.
+    pub fn drive_vm_on_runtime_with_debug_failures(
+        &self,
+        vm: sema_vm::VM,
+    ) -> (EvalResult, Vec<SemaError>) {
         // Submit as a fresh ROOT to the interpreter's single persistent runtime
         // (constructed once over THIS interpreter's context, so the VM's
         // `call_value`/`eval_value` re-entry resolves the registered callbacks
@@ -700,11 +712,24 @@ impl Interpreter {
             .runtime
             .as_ref()
             .expect("runtime is present outside of Drop");
-        self.ensure_synchronous_runtime_entry_allowed()?;
-        let handle = runtime.submit_root(vm).map_err(|error| {
-            runtime_internal("could not submit the evaluation to the runtime", error)
-        })?;
-        self.drive_handle_to_settlement(&handle)
+        if let Err(error) = self.ensure_synchronous_runtime_entry_allowed() {
+            return (Err(error), Vec::new());
+        }
+        let handle = match runtime.submit_root(vm) {
+            Ok(handle) => handle,
+            Err(error) => {
+                return (
+                    Err(runtime_internal(
+                        "could not submit the evaluation to the runtime",
+                        error,
+                    )),
+                    Vec::new(),
+                );
+            }
+        };
+        let result = self.drive_handle_to_settlement(&handle);
+        let failures = runtime.take_debug_unobserved_failures(handle.id());
+        (result, failures)
     }
 
     /// The drive loop shared by [`drive_vm_on_runtime`](Self::drive_vm_on_runtime)

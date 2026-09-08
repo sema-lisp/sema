@@ -29,7 +29,7 @@ use sema_core::runtime::{
     TaskId, TaskOutcome, TaskSettlement, Trace, WaitKind,
 };
 use sema_core::runtime::{CancellationParent, LifetimeOwner, TaskRelations};
-use sema_core::{Env, EvalContext, NativeFn, Value};
+use sema_core::{Env, EvalContext, NativeFn, SemaError, Value};
 
 use super::channel::{ChannelClose, ChannelWake};
 use super::wait::RuntimeCommand;
@@ -501,6 +501,10 @@ pub(super) struct RuntimeState {
     pending: VecDeque<PendingStage>,
     protocol_waits: HashMap<super::WaitKey, ProtocolWait>,
     task_promises: HashMap<TaskId, sema_core::runtime::PromiseId>,
+    /// Failed detached tasks which no task has observed while a native DAP
+    /// session is driving their origin root. The DAP host drains these after
+    /// the root finishes so an ignored async failure can stop as uncaught.
+    debug_unobserved_failures: Vec<(RootId, sema_core::runtime::PromiseId, SemaError)>,
     /// Promise ids whose handle-death GC eviction was deferred because a
     /// registered promise-set wait still listed them (see
     /// [`RuntimeState::gc_evict_promise`]). The collector prunes a dead handle's
@@ -686,6 +690,10 @@ impl Trace for RuntimeState {
                 .protocol_waits
                 .values()
                 .all(|wait| wait.owner.trace(sink) && wait.continuation.trace(sink))
+            && self
+                .debug_unobserved_failures
+                .iter()
+                .all(|(_, _, error)| error.trace(sink))
             && self.pending.iter().all(|stage| stage.trace(sink))
             && self
                 .scratch_callback_vm
@@ -903,6 +911,7 @@ impl Runtime {
                 pending: VecDeque::new(),
                 protocol_waits: HashMap::new(),
                 task_promises: HashMap::new(),
+                debug_unobserved_failures: Vec::new(),
                 deferred_promise_evictions: hashbrown::HashSet::new(),
                 pending_cancel_waits: VecDeque::new(),
                 drive_cursor: 0,
@@ -1222,6 +1231,27 @@ impl Runtime {
             .tasks
             .values()
             .any(|task| task.record.relations().origin_root == root)
+    }
+
+    /// Take failures from detached tasks that no task observed while a native
+    /// debugger was driving `root`.
+    ///
+    /// This queue is populated only for an active DAP session. Normal runtime
+    /// execution therefore keeps its existing detached-task behavior.
+    pub fn take_debug_unobserved_failures(&self, root: RootId) -> Vec<SemaError> {
+        let mut state = self.state.borrow_mut();
+        let mut failures = Vec::new();
+        state
+            .debug_unobserved_failures
+            .retain(|(failure_root, _, error)| {
+                if *failure_root == root {
+                    failures.push(error.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        failures
     }
 
     /// Whether any task is still parked on a wait with a cancellation recorded —
@@ -4825,6 +4855,12 @@ impl Runtime {
                 message: "settling detached child disappeared".into(),
             })?;
         let root = task.record.relations().origin_root;
+        let unobserved_failure = crate::vm::is_debug_session_active_for(root)
+            .then(|| match &outcome {
+                TaskOutcome::Failed(error) => Some(error.clone()),
+                TaskOutcome::Returned(_) | TaskOutcome::Cancelled(_) => None,
+            })
+            .flatten();
         let settlement = task
             .record
             .settle(sequence, outcome)
@@ -4838,6 +4874,8 @@ impl Runtime {
                 })?;
             if !wakes.is_empty() {
                 state.pending.push_back(PendingStage::PromiseWakes(wakes));
+            } else if let Some(error) = unobserved_failure {
+                state.debug_unobserved_failures.push((root, promise, error));
             }
             if state.promises.has_dead_handle(promise) {
                 state.gc_evict_promise(promise);
@@ -6397,6 +6435,12 @@ fn install_promise_wait(
             sema_core::SemaError::eval("promise race requires at least one promise"),
         )));
     }
+    // A wait is an explicit observation of every supplied promise. Remove a
+    // queued debugger-only failure even when the promise had already settled,
+    // so a later `try`/`catch` around `async/await` remains handled.
+    state
+        .debug_unobserved_failures
+        .retain(|(_, promise, _)| !wait.promises.contains(promise));
     let response = match promise_set_response(&state.promises, &wait) {
         Ok(response) => response,
         Err(fault) => {

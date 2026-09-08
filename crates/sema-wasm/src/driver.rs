@@ -93,6 +93,11 @@ thread_local! {
 pub(crate) struct PromiseDriver {
     interp: Rc<Interpreter>,
     promises: RefCell<HashMap<RootId, PromiseSettlers>>,
+    /// Roots whose public Promise has settled while detached children still
+    /// belong to that root. They remain in the exact drive set until every
+    /// child is terminal, so fire-and-forget work keeps receiving timers and
+    /// external completions after its parent result is delivered.
+    background_roots: RefCell<HashMap<RootId, RootHandle>>,
     /// Source compilation and Promise-debugger setup can invoke registered JS
     /// functions during macro expansion. A scoped count closes legacy-debugger
     /// admission until that preparation either fails or hands off to a root.
@@ -117,6 +122,7 @@ impl PromiseDriver {
         Rc::new(Self {
             interp,
             promises: RefCell::new(HashMap::new()),
+            background_roots: RefCell::new(HashMap::new()),
             preparing_roots: Cell::new(0),
             drive_scheduled: Cell::new(false),
             drive_timeout_id: Cell::new(None),
@@ -135,8 +141,8 @@ impl PromiseDriver {
         self.output.set_sink(sink);
     }
 
-    pub(crate) fn take_output_sink(&self) -> Option<Function> {
-        self.output.take_sink()
+    pub(crate) fn capture_output(&self) -> Rc<crate::output::PromiseOutputCapture> {
+        self.output.capture()
     }
 }
 
@@ -302,6 +308,7 @@ impl PromiseDriver {
 
     fn owned_roots(&self) -> Vec<RootId> {
         let mut roots: Vec<_> = self.promises.borrow().keys().copied().collect();
+        roots.extend(self.background_roots.borrow().keys().copied());
         if let Some(root) = self.debug_root.get() {
             roots.push(root);
         }
@@ -890,10 +897,12 @@ fn drive_and_settle(driver: &Rc<PromiseDriver>) {
         let _ = stop_debug(driver);
     }
     settle_ready_roots(driver);
+    reap_background_roots(driver);
     settle_debug_action(driver, &drive_state);
     settle_retiring_debug_roots(driver);
 
-    let ordinary_pending = !driver.promises.borrow().is_empty();
+    let ordinary_pending =
+        !driver.promises.borrow().is_empty() || !driver.background_roots.borrow().is_empty();
     let retiring_debug_pending = !driver.retiring_debug_roots.borrow().is_empty();
     let (debug_active, debug_action_pending) = driver
         .debug_session
@@ -1116,6 +1125,12 @@ fn settle_ready_roots(driver: &PromiseDriver) {
         let Some(entry) = driver.promises.borrow_mut().remove(&root) else {
             continue;
         };
+        if driver.interp.runtime().has_live_tasks_for_root(root) {
+            driver
+                .background_roots
+                .borrow_mut()
+                .insert(root, entry.handle.clone());
+        }
         match entry.handle.poll_result() {
             RootPoll::Ready(settlement) => match &settlement.outcome {
                 sema_core::runtime::TaskOutcome::Returned(value) => {
@@ -1140,6 +1155,16 @@ fn settle_ready_roots(driver: &PromiseDriver) {
             RootPoll::Pending => unreachable!("filtered to non-pending above"),
         }
     }
+}
+
+/// Drop retained settled-root handles only after every same-origin detached
+/// task is gone. `RootHandle::poll_result` reports its main task, so it cannot
+/// answer this question by itself.
+fn reap_background_roots(driver: &PromiseDriver) {
+    driver
+        .background_roots
+        .borrow_mut()
+        .retain(|root, _| driver.interp.runtime().has_live_tasks_for_root(*root));
 }
 
 /// Keep cancelled debugger roots in the driver's exact scheduling set until
@@ -1179,6 +1204,7 @@ fn fail_all_pending(driver: &Rc<PromiseDriver>, message: &str) {
             Some((action.resolve, result))
         });
     driver.debug_root.set(None);
+    driver.background_roots.borrow_mut().clear();
     driver.retiring_debug_roots.borrow_mut().clear();
     if let Some((resolve, result)) = debug_delivery {
         resolve_debug_immediately(&resolve, result);

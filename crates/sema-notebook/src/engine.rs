@@ -4,13 +4,13 @@
 //! sequentially. Each cell shares the same environment, so definitions
 //! in earlier cells are visible to later ones.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use sema_core::runtime::RootId;
-use sema_core::{pretty_print, resolve, Spur, Value};
+use sema_core::{pretty_print, resolve, Env, Spur, Value, ValueView};
 use sema_eval::Interpreter;
 use sema_vm::runtime::{OutputEvent, RootOptions, RuntimeCommandHandle};
 
@@ -46,6 +46,159 @@ struct EnvSnapshot {
     /// by this evaluation (i.e. they were `stale == false` with non-empty outputs
     /// before `mark_downstream_stale` ran). Undo restores them to `stale = false`.
     downstream_stale_ids: Vec<String>,
+    /// The contents of mutable containers reachable from the kernel before
+    /// evaluation. Binding clones preserve their identity, so their interior
+    /// state needs its own snapshot for undo to be complete.
+    mutable_values: Vec<MutableSnapshot>,
+}
+
+/// A restorable mutable container reachable from an environment binding.
+enum MutableSnapshot {
+    Array { target: Value, items: Vec<Value> },
+    Cell { target: Value, value: Value },
+}
+
+impl MutableSnapshot {
+    fn restore(self) {
+        match self {
+            Self::Array { target, items } => {
+                if let Some(array) = target.as_mutable_array() {
+                    *array.items.borrow_mut() = items;
+                }
+            }
+            Self::Cell { target, value } => {
+                if let Some(cell) = target.as_mutable_cell() {
+                    *cell.value.borrow_mut() = value;
+                }
+            }
+        }
+    }
+}
+
+/// Collect mutable containers from values and closure environments without
+/// revisiting cycles. Immutable values can still lead back through a mutable
+/// container, so both value and environment identity are tracked.
+struct MutableSnapshotCollector {
+    values: BTreeSet<u64>,
+    environments: BTreeSet<usize>,
+    snapshots: Vec<MutableSnapshot>,
+}
+
+impl MutableSnapshotCollector {
+    fn collect(bindings: &[(Spur, Value)]) -> Vec<MutableSnapshot> {
+        let mut collector = Self {
+            values: BTreeSet::new(),
+            environments: BTreeSet::new(),
+            snapshots: Vec::new(),
+        };
+        for (_, value) in bindings {
+            collector.visit_value(value);
+        }
+        collector.snapshots
+    }
+
+    fn visit_env(&mut self, env: &Env) {
+        let identity = std::rc::Rc::as_ptr(&env.bindings) as usize;
+        if !self.environments.insert(identity) {
+            return;
+        }
+        env.iter_bindings(|_, value| self.visit_value(value));
+        if let Some(parent) = &env.parent {
+            self.visit_env(parent);
+        }
+    }
+
+    fn visit_value(&mut self, value: &Value) {
+        if !self.values.insert(value.raw_bits()) {
+            return;
+        }
+
+        match value.view() {
+            ValueView::List(items) | ValueView::Vector(items) => {
+                for item in items.iter() {
+                    self.visit_value(item);
+                }
+            }
+            ValueView::Map(entries) => {
+                for (key, value) in entries.iter() {
+                    self.visit_value(key);
+                    self.visit_value(value);
+                }
+            }
+            ValueView::HashMap(entries) => {
+                for (key, value) in entries.iter() {
+                    self.visit_value(key);
+                    self.visit_value(value);
+                }
+            }
+            ValueView::Lambda(lambda) => {
+                for expression in &lambda.body {
+                    self.visit_value(expression);
+                }
+                self.visit_env(&lambda.env);
+            }
+            ValueView::Macro(macro_) => {
+                for expression in &macro_.body {
+                    self.visit_value(expression);
+                }
+                if let Some(rules) = &macro_.syntax_rules {
+                    for (pattern, template) in &rules.rules {
+                        self.visit_value(pattern);
+                        self.visit_value(template);
+                    }
+                }
+            }
+            ValueView::Thunk(thunk) => {
+                self.visit_value(&thunk.body);
+                if let Some(value) = thunk.forced.borrow().as_ref() {
+                    self.visit_value(value);
+                }
+            }
+            ValueView::Record(record) => {
+                for field in &record.fields {
+                    self.visit_value(field);
+                }
+            }
+            ValueView::ToolDef(tool) => {
+                self.visit_value(&tool.parameters);
+                self.visit_value(&tool.handler);
+            }
+            ValueView::Agent(agent) => {
+                for tool in &agent.tools {
+                    self.visit_value(tool);
+                }
+            }
+            ValueView::MultiMethod(multimethod) => {
+                self.visit_value(&multimethod.dispatch_fn);
+                for (key, value) in multimethod.methods.borrow().iter() {
+                    self.visit_value(key);
+                    self.visit_value(value);
+                }
+                if let Some(value) = multimethod.default.borrow().as_ref() {
+                    self.visit_value(value);
+                }
+            }
+            ValueView::MutableArray(array) => {
+                let items = array.items.borrow().clone();
+                self.snapshots.push(MutableSnapshot::Array {
+                    target: value.clone(),
+                    items: items.clone(),
+                });
+                for item in &items {
+                    self.visit_value(item);
+                }
+            }
+            ValueView::MutableCell(cell) => {
+                let contents = cell.value.borrow().clone();
+                self.snapshots.push(MutableSnapshot::Cell {
+                    target: value.clone(),
+                    value: contents.clone(),
+                });
+                self.visit_value(&contents);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Result of evaluating a single cell.
@@ -102,6 +255,10 @@ pub struct Engine {
     pub notebook: Notebook,
     /// Snapshot from before the last cell eval (for single-step undo).
     snapshot: Option<EnvSnapshot>,
+    /// Capturing roots submitted for notebook cells. A detached task retains
+    /// its origin root, so output that arrives during a later cell can still
+    /// be attached to the cell that started it.
+    output_roots: BTreeMap<RootId, String>,
     /// Per-cell wall-clock evaluation budget. `None` disables the limit.
     cell_timeout: Option<Duration>,
     /// The root id of the cell currently being driven, if any. Set just
@@ -119,6 +276,7 @@ impl Engine {
             interpreter,
             notebook,
             snapshot: None,
+            output_roots: BTreeMap::new(),
             cell_timeout: resolve_cell_timeout(),
             running_root: Arc::new(Mutex::new(None)),
         }
@@ -179,6 +337,7 @@ impl Engine {
             .map(|c| c.id.clone())
             .collect();
         self.snapshot = Some(EnvSnapshot {
+            mutable_values: MutableSnapshotCollector::collect(&bindings),
             bindings,
             cell_id: cell_id.to_string(),
             cell_outputs: cell.outputs.clone(),
@@ -274,12 +433,16 @@ impl Engine {
         // `OutputEvent`s (drained below) instead of the real process
         // stdout — the fd-free capture the old thread-local stdout hook
         // provided, now attributed per-root by the runtime itself.
+        let cell_id = name.clone();
         let opts = RootOptions {
             name,
             capture_output: true,
         };
         let (eval_result, captured) = match self.interpreter.submit_str(source, opts) {
             Ok(handle) => {
+                if let Some(cell_id) = &cell_id {
+                    self.output_roots.insert(handle.id(), cell_id.clone());
+                }
                 *self
                     .running_root
                     .lock()
@@ -290,27 +453,26 @@ impl Engine {
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner()) = None;
 
-                // Only this root's own output belongs to this cell — a
-                // detached task left over from an earlier cell that happens
-                // to print while this root drives is captured too (never
-                // leaked to the real stdout), but attributed to its own
-                // root, not this cell. Stderr (`println-error` etc.) is
-                // folded into the same text stream as stdout, in the order
-                // events were emitted, since the `.sema-nb` format has a
-                // single text output per cell (`OutputType::Stdout`) rather
-                // than a distinct stderr channel — the sink preserves
-                // per-root FIFO/execution order, so simple interleaving here
-                // reproduces the order the cell actually printed in.
-                let captured: String = self
-                    .interpreter
-                    .take_output()
-                    .into_iter()
-                    .filter_map(|event| match event {
-                        OutputEvent::Stdout { root, text } if root == handle.id() => Some(text),
-                        OutputEvent::Stderr { root, text } if root == handle.id() => Some(text),
-                        _ => None,
-                    })
-                    .collect();
+                // A detached task keeps its origin root. Route output from
+                // an older root back to the cell that submitted it instead of
+                // losing it while this root is being driven.
+                let mut captured = String::new();
+                for event in self.interpreter.take_output() {
+                    let (root, text) = match event {
+                        OutputEvent::Stdout { root, text } | OutputEvent::Stderr { root, text } => {
+                            (root, text)
+                        }
+                    };
+                    if root == handle.id()
+                        || cell_id.as_deref().is_some_and(|cell_id| {
+                            self.output_roots.get(&root).is_some_and(|id| id == cell_id)
+                        })
+                    {
+                        captured.push_str(&text);
+                    } else {
+                        self.append_detached_output(root, text);
+                    }
+                }
                 (result, captured)
             }
             Err(err) => (Err(err), String::new()),
@@ -369,6 +531,38 @@ impl Engine {
                 },
             },
         }
+    }
+
+    fn append_detached_output(&mut self, root: RootId, text: String) {
+        let Some(cell_id) = self.output_roots.get(&root) else {
+            return;
+        };
+        let Some(cell) = self.notebook.cell_mut(cell_id) else {
+            return;
+        };
+
+        if let Some(output) = cell
+            .outputs
+            .iter_mut()
+            .find(|output| output.output_type == OutputType::Stdout)
+        {
+            output.display.push_str(&text);
+            return;
+        }
+
+        cell.outputs.insert(
+            0,
+            CellOutput {
+                output_type: OutputType::Stdout,
+                display: text,
+                sema_value: None,
+                timestamp: Utc::now(),
+                cost_usd: None,
+                usage: None,
+                requires_reeval: false,
+                duration_ms: None,
+            },
+        );
     }
 
     /// Evaluate all code cells in order.
@@ -447,6 +641,10 @@ impl Engine {
         self.interpreter
             .global_env
             .replace_bindings(snapshot.bindings);
+
+        for mutable_value in snapshot.mutable_values {
+            mutable_value.restore();
+        }
 
         // Restore the cell's outputs
         if let Some(cell) = self.notebook.cell_mut(&snapshot.cell_id) {
@@ -769,6 +967,31 @@ mod tests {
     }
 
     #[test]
+    fn undo_restores_mutable_container_contents() {
+        let mut engine = test_engine();
+        engine
+            .create_and_eval(
+                "(define array (mutable-array/new 1 10)) \
+                 (define cell (mutable-cell/new 20))",
+            )
+            .unwrap();
+
+        let mutation = engine
+            .create_and_eval(
+                "(mutable-array/set! array 0 99) \
+                 (mutable-cell/set! cell 88)",
+            )
+            .unwrap();
+        assert_eq!(mutation.1.output.output_type, OutputType::Value);
+
+        engine.undo_last_cell().unwrap();
+        let (_, restored) = engine
+            .create_and_eval("(list (mutable-array/get array 0) (mutable-cell/get cell))")
+            .unwrap();
+        assert_eq!(restored.output.display, "(10 20)");
+    }
+
+    #[test]
     fn undo_clears_errored_cell_output() {
         let mut engine = test_engine();
         let (id, _) = engine.create_and_eval("(bad-fn)").unwrap();
@@ -966,6 +1189,27 @@ mod tests {
             "expected stdout/stderr interleaved in emission order, got: {:?}",
             result.stdout
         );
+    }
+
+    #[test]
+    fn detached_output_returns_to_its_originating_cell() {
+        let mut engine = test_engine();
+        let first = engine
+            .notebook
+            .add_code_cell("(async/spawn (fn () (async/sleep 1) (println \"late\")))");
+        engine.eval_cell(&first).unwrap();
+
+        std::thread::sleep(Duration::from_millis(5));
+        let second = engine.notebook.add_code_cell("(async/sleep 1)");
+        engine.eval_cell(&second).unwrap();
+
+        let first = engine.notebook.cell(&first).unwrap();
+        let output = first
+            .outputs
+            .iter()
+            .find(|output| output.output_type == OutputType::Stdout)
+            .expect("detached output should remain attached to the first cell");
+        assert_eq!(output.display, "late\n");
     }
 
     /// Cancelling a running cell from another thread (via `CancelToken`,

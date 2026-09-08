@@ -24,15 +24,35 @@ use crate::register_fn;
 fn select_setup(args: &[Value]) -> Result<(Vec<Value>, u128, Instant), SemaError> {
     let sources = sources_of(&args[0])?;
     // Explicit timeout, else the smallest timer among the sources, else 10s.
-    let explicit = args.get(1).and_then(|v| v.as_int());
+    let explicit = args
+        .get(1)
+        .map(|value| duration(value, "event/select timeout"))
+        .transpose()?;
     let min_timer = sources
         .iter()
         .filter_map(|s| s.as_map_ref())
         .filter(|m| m.get(&kw("type")) == Some(&kw("timer")))
-        .filter_map(|m| m.get(&kw("ms")).and_then(|v| v.as_int()))
+        .map(|m| {
+            let value = m.get(&kw("ms")).ok_or_else(|| {
+                SemaError::eval("event/select: timer source requires an :ms integer")
+            })?;
+            duration(value, "event/select timer :ms")
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .min();
-    let timeout_ms = explicit.or(min_timer).unwrap_or(10_000).max(0) as u128;
+    let timeout_ms = explicit.or(min_timer).unwrap_or(10_000) as u128;
     Ok((sources, timeout_ms, Instant::now()))
+}
+
+fn duration(value: &Value, name: &str) -> Result<i64, SemaError> {
+    let ms = value
+        .as_int()
+        .ok_or_else(|| SemaError::type_error("integer", value.type_name()))?;
+    if ms < 0 {
+        return Err(SemaError::eval(format!("{name} must be non-negative")));
+    }
+    Ok(ms)
 }
 
 /// Synchronous value-ABI body for `event/select`. The cooperative path lives in
@@ -291,6 +311,26 @@ mod tests {
             &[Value::list(vec![Value::map(src)]), Value::int(20)],
         );
         assert!(ev.is_nil());
+    }
+
+    #[test]
+    fn select_rejects_invalid_timeout_values() {
+        let sources = Value::list(vec![source("proc", &[("handle", Value::int(999999))])]);
+        for timeout in [Value::string("10"), Value::int(-1)] {
+            let error = select_setup(&[sources.clone(), timeout])
+                .expect_err("invalid timeout must be rejected");
+            assert!(
+                error.to_string().contains("integer") || error.to_string().contains("non-negative")
+            );
+        }
+    }
+
+    #[test]
+    fn select_rejects_malformed_timer_source() {
+        let missing_ms = Value::list(vec![source("timer", &[])]);
+        assert!(select_setup(&[missing_ms]).is_err());
+        let string_ms = Value::list(vec![source("timer", &[("ms", Value::string("10"))])]);
+        assert!(select_setup(&[string_ms]).is_err());
     }
 
     #[cfg(not(target_arch = "wasm32"))]

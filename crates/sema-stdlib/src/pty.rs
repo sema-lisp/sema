@@ -97,10 +97,7 @@ fn teardown_ptys() {
     let slots: Vec<PtySlot> = PTYS.with(|p| p.borrow_mut().drain().map(|(_, slot)| slot).collect());
     for slot in slots {
         if let PtySlot::Available(mut pty) = slot {
-            if let Some(pid) = pty.child.process_id() {
-                group_sigkill_abort(pid)();
-            }
-            let _ = pty.child.kill();
+            kill_process_group(&mut pty);
             let _ = pty.child.wait();
         }
     }
@@ -141,6 +138,16 @@ fn peek_pid(id: i64) -> Option<u32> {
         Some(PtySlot::Available(pt)) => pt.child.process_id(),
         _ => None,
     })
+}
+
+/// Kill the pty child's process group before killing the leader. The pty child
+/// is its own session and process-group leader, so this also stops descendants.
+fn kill_process_group(pty: &mut Pty) {
+    if let Some(pid) = pty.child.process_id() {
+        group_sigkill_abort(pid)();
+    }
+    // Keep the portable leader kill as a fallback on non-Unix hosts.
+    let _ = pty.child.kill();
 }
 
 fn pump(mut reader: Box<dyn Read + Send>, buf: Arc<Mutex<Vec<u8>>>) -> JoinHandle<()> {
@@ -426,7 +433,7 @@ fn pty_close_runtime(id: i64) -> NativeResult {
         }
         let pid = peek_pid(id);
         let mut pty = take_pty("pty/close", id)?;
-        let _ = pty.child.kill();
+        kill_process_group(&mut pty);
         let kind = CompletionKind::try_from_raw(PTY_COMPLETION_KIND)
             .expect("pty completion kind is nonzero");
         return suspend_terminal_external(
@@ -472,7 +479,7 @@ fn pty_close_runtime(id: i64) -> NativeResult {
         CloseAction::Proceed => {
             PTYS.with(|p| {
                 if let Some(PtySlot::Available(pty)) = p.borrow_mut().get_mut(&id) {
-                    let _ = pty.child.kill();
+                    kill_process_group(pty);
                 }
             });
             let kind = CompletionKind::try_from_raw(PTY_COMPLETION_KIND)
@@ -628,7 +635,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         check_arity!(args, "pty/kill", 1);
         let id = handle(args, 0)?;
         with_pty("pty/kill", id, |pt| {
-            let _ = pt.child.kill();
+            kill_process_group(pt);
             Ok(Value::nil())
         })
     });
@@ -650,7 +657,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         PTYS.with(|p| {
             let mut ptys = p.borrow_mut();
             if let Some(PtySlot::Available(mut pt)) = ptys.remove(&id) {
-                let _ = pt.child.kill();
+                kill_process_group(&mut pt);
                 let _ = pt.child.wait();
             }
         });

@@ -129,8 +129,7 @@ fn teardown_procs() {
         PROCS.with(|p| p.borrow_mut().drain().map(|(_, slot)| slot).collect());
     for slot in slots {
         if let ProcSlot::Available(mut proc) = slot {
-            group_sigkill_abort(proc.child.id())();
-            let _ = proc.child.kill();
+            kill_process_group(&mut proc);
             let _ = proc.child.wait();
         }
     }
@@ -169,6 +168,15 @@ fn peek_pid(id: i64) -> Option<u32> {
         Some(ProcSlot::Available(pr)) => Some(pr.child.id()),
         _ => None,
     })
+}
+
+/// Kill the child's process group before killing the leader. `proc/spawn` puts
+/// the leader in a group of its own, so this also stops descendants that a
+/// shell or wrapper process started.
+fn kill_process_group(proc: &mut Proc) {
+    group_sigkill_abort(proc.child.id())();
+    // Keep the platform-neutral leader kill as a fallback on non-Unix hosts.
+    let _ = proc.child.kill();
 }
 
 /// Spawn a thread that drains `reader` into `buf` until EOF. The returned
@@ -582,7 +590,7 @@ fn proc_close_runtime(id: i64) -> NativeResult {
         }
         let mut proc = take_proc("proc/close", id)?;
         let pid = proc.child.id();
-        let _ = proc.child.kill();
+        kill_process_group(&mut proc);
         let kind = CompletionKind::try_from_raw(PROC_COMPLETION_KIND)
             .expect("proc completion kind is nonzero");
         return suspend_terminal_external(
@@ -636,7 +644,7 @@ fn proc_close_runtime(id: i64) -> NativeResult {
         CloseAction::Proceed => {
             PROCS.with(|p| {
                 if let Some(ProcSlot::Available(proc)) = p.borrow_mut().get_mut(&id) {
-                    let _ = proc.child.kill();
+                    kill_process_group(proc);
                 }
             });
             let kind = CompletionKind::try_from_raw(PROC_COMPLETION_KIND)
@@ -822,7 +830,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         check_arity!(args, "proc/kill", 1);
         let id = handle(args, 0)?;
         with_proc("proc/kill", id, |pr| {
-            let _ = pr.child.kill(); // ignore "already exited"
+            kill_process_group(pr);
             Ok(Value::nil())
         })
     });
@@ -848,7 +856,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         PROCS.with(|p| {
             let mut procs = p.borrow_mut();
             if let Some(ProcSlot::Available(mut pr)) = procs.remove(&id) {
-                let _ = pr.child.kill();
+                kill_process_group(&mut pr);
                 let _ = pr.child.wait();
             }
         });

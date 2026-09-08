@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::engine::CancelToken;
 use crate::format::{CellType, Notebook};
 use crate::render;
 
@@ -98,6 +99,7 @@ enum EngineRequest {
 /// Async handle to the notebook engine running on a dedicated thread.
 pub struct EngineHandle {
     tx: mpsc::Sender<EngineRequest>,
+    cancel: CancelToken,
 }
 
 impl EngineHandle {
@@ -109,6 +111,7 @@ impl EngineHandle {
     /// panicking on a detached thread and leaving a silent, dead server.
     pub fn spawn(notebook: Notebook, notebook_path: Option<PathBuf>) -> Result<Self, String> {
         let (tx, mut rx) = mpsc::channel::<EngineRequest>(64);
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel(1);
 
         // Build the runtime up front so a build failure is reported
         // synchronously to the caller rather than panicking on the detached
@@ -133,6 +136,9 @@ impl EngineHandle {
                 use crate::engine::Engine;
 
                 let mut engine = Engine::new(notebook);
+                if cancel_tx.send(engine.cancel_token()).is_err() {
+                    return;
+                }
                 let nb_path = notebook_path;
 
                 while let Some(req) = rt.block_on(rx.recv()) {
@@ -344,7 +350,11 @@ impl EngineHandle {
             })
             .map_err(|e| format!("Failed to spawn notebook engine thread: {e}"))?;
 
-        Ok(Self { tx })
+        let cancel = cancel_rx
+            .recv()
+            .map_err(|_| "Notebook engine stopped before it initialized".to_string())?;
+
+        Ok(Self { tx, cancel })
     }
 
     // ── Private send helper ─────────────────────────────────────
@@ -456,6 +466,13 @@ impl EngineHandle {
             .await?
             .map_err(BridgeError::Request)
     }
+
+    /// Request cancellation of the cell currently executing on the engine
+    /// thread. This bypasses the request queue so it can interrupt an eval
+    /// that is already occupying that queue.
+    pub fn cancel_running(&self) -> bool {
+        self.cancel.cancel_running()
+    }
 }
 
 #[cfg(test)]
@@ -492,6 +509,12 @@ mod tests {
             .await
             .expect("valid reorder should succeed");
         assert_eq!(cell_ids(&handle).await, vec![c, a, b]);
+    }
+
+    #[tokio::test]
+    async fn cancel_without_a_running_cell_is_inert() {
+        let (handle, _, _, _) = handle_with_three_cells();
+        assert!(!handle.cancel_running());
     }
 
     #[tokio::test]

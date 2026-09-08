@@ -1503,6 +1503,28 @@ fn fs_read_op<T: Send + 'static>(
     Ok(NativeOutcome::Return(to_value(value)))
 }
 
+fn fs_read_lines_op(args: &[Value]) -> NativeResult {
+    check_arity!(args, "file/read-lines", 1);
+    let path = args.str_at(0, "file/read-lines")?;
+    let to_value = |content: String| Value::list(content.lines().map(Value::string).collect());
+    if let Some(data) = sema_core::vfs::vfs_read(path) {
+        let content = String::from_utf8(data)
+            .io_ctx(format!("file/read-lines {path}: invalid UTF-8 in VFS"))?;
+        return Ok(NativeOutcome::Return(to_value(content)));
+    }
+    if sema_core::in_runtime_quantum() {
+        admit_regular_file("file/read-lines", path)?;
+        fs_byte_cap_check("file/read-lines", path)?;
+        let path = path.to_string();
+        return fs_quarantined("file/read-lines", to_value, move || {
+            std::fs::read_to_string(&path)
+                .map_err(|error| format!("file/read-lines {path}: {error}"))
+        });
+    }
+    let content = std::fs::read_to_string(path).io_ctx(format!("file/read-lines {path}"))?;
+    Ok(NativeOutcome::Return(to_value(content)))
+}
+
 /// Shared body of the whole-file writers (`file/write`, `file/write-bytes`):
 /// inside a runtime quantum the file is admitted, the payload size-capped, and
 /// the write runs on the quarantined worker; otherwise it runs inline.
@@ -1520,6 +1542,81 @@ fn fs_write_op(op: &'static str, path: &str, content: &[u8]) -> NativeResult {
     }
     std::fs::write(path, content).io_ctx(format!("{op} {path}"))?;
     Ok(NativeOutcome::Return(Value::nil()))
+}
+
+fn fs_append_op(path: &str, content: &str) -> NativeResult {
+    fn append(path: &str, content: &str) -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        file.write_all(content.as_bytes())
+    }
+
+    if sema_core::in_runtime_quantum() {
+        admit_regular_file("file/append", path)?;
+        fs_write_cap_check("file/append", content.len())?;
+        let path = path.to_string();
+        let content = content.to_string();
+        return fs_quarantined(
+            "file/append",
+            |()| Value::nil(),
+            move || append(&path, &content).map_err(|error| format!("file/append {path}: {error}")),
+        );
+    }
+    append(path, content).io_ctx(format!("file/append {path}"))?;
+    Ok(NativeOutcome::Return(Value::nil()))
+}
+
+fn fs_delete_op(path: &str) -> NativeResult {
+    if sema_core::in_runtime_quantum() {
+        admit_regular_file("file/delete", path)?;
+        let path = path.to_string();
+        return fs_quarantined(
+            "file/delete",
+            |()| Value::nil(),
+            move || {
+                std::fs::remove_file(&path).map_err(|error| format!("file/delete {path}: {error}"))
+            },
+        );
+    }
+    std::fs::remove_file(path).io_ctx(format!("file/delete {path}"))?;
+    Ok(NativeOutcome::Return(Value::nil()))
+}
+
+fn fs_copy_op(src: &str, dest: &str) -> NativeResult {
+    if sema_core::in_runtime_quantum() {
+        admit_regular_file("file/copy", src)?;
+        admit_regular_file("file/copy", dest)?;
+        fs_byte_cap_check("file/copy", src)?;
+        let src = src.to_string();
+        let dest = dest.to_string();
+        return fs_quarantined(
+            "file/copy",
+            |()| Value::nil(),
+            move || {
+                std::fs::copy(&src, &dest)
+                    .map(|_| ())
+                    .map_err(|error| format!("file/copy {src} -> {dest}: {error}"))
+            },
+        );
+    }
+    std::fs::copy(src, dest).io_ctx(format!("file/copy {src} -> {dest}"))?;
+    Ok(NativeOutcome::Return(Value::nil()))
+}
+
+fn file_info_to_value((size, is_dir, is_file, modified): (u64, bool, bool, Option<i64>)) -> Value {
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(
+        Value::keyword("size"),
+        Value::from_bigint(num_bigint::BigInt::from(size)),
+    );
+    map.insert(Value::keyword("is-dir"), Value::bool(is_dir));
+    map.insert(Value::keyword("is-file"), Value::bool(is_file));
+    if let Some(modified) = modified {
+        map.insert(Value::keyword("modified"), Value::int(modified));
+    }
+    Value::map(map)
 }
 
 fn fs_byte_cap_check(op: &str, path: &str) -> Result<(), SemaError> {
@@ -1565,7 +1662,9 @@ pub(crate) fn admit_regular_file(op: &str, path: &str) -> Result<(), SemaError> 
     use std::os::unix::fs::FileTypeExt;
     if let Ok(meta) = std::fs::metadata(path) {
         let ft = meta.file_type();
-        let kind = if ft.is_fifo() {
+        let kind = if meta.is_dir() {
+            Some("directory")
+        } else if ft.is_fifo() {
             Some("named pipe (FIFO)")
         } else if ft.is_socket() {
             Some("socket")
@@ -1573,6 +1672,8 @@ pub(crate) fn admit_regular_file(op: &str, path: &str) -> Result<(), SemaError> 
             Some("character device")
         } else if ft.is_block_device() {
             Some("block device")
+        } else if !meta.is_file() {
+            Some("non-regular file")
         } else {
             None
         };
@@ -2787,29 +2888,17 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         Err(SemaError::from_thrown(args[0].clone()))
     });
 
-    crate::register_fn_path_gated0(env, sandbox, Caps::FS_WRITE, "file/append", |args| {
+    crate::register_runtime_fn_path_gated0(env, sandbox, Caps::FS_WRITE, "file/append", |args| {
         check_arity!(args, "file/append", 2);
         let path = args.str_at(0, "file/append")?;
         let content = args.str_at(1, "file/append")?;
-        fn append_impl(path: &str, content: &str) -> Result<(), String> {
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|e| format!("file/append {path}: {e}"))?;
-            file.write_all(content.as_bytes())
-                .map_err(|e| format!("file/append {path}: {e}"))
-        }
-        append_impl(path, content).map_err(SemaError::Io)?;
-        Ok(Value::nil())
+        fs_append_op(path, content)
     });
 
-    crate::register_fn_path_gated0(env, sandbox, Caps::FS_WRITE, "file/delete", |args| {
+    crate::register_runtime_fn_path_gated0(env, sandbox, Caps::FS_WRITE, "file/delete", |args| {
         check_arity!(args, "file/delete", 1);
         let path = args.str_at(0, "file/delete")?;
-        std::fs::remove_file(path).io_ctx(format!("file/delete {path}"))?;
-        Ok(Value::nil())
+        fs_delete_op(path)
     });
 
     crate::register_fn_path_gated(
@@ -2909,24 +2998,12 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             });
             Ok((meta.len(), meta.is_dir(), meta.is_file(), modified))
         }
-        fn info_to_value(
-            (size, is_dir, is_file, modified): (u64, bool, bool, Option<i64>),
-        ) -> Value {
-            let mut map = std::collections::BTreeMap::new();
-            map.insert(Value::keyword("size"), Value::int(size as i64));
-            map.insert(Value::keyword("is-dir"), Value::bool(is_dir));
-            map.insert(Value::keyword("is-file"), Value::bool(is_file));
-            if let Some(modified) = modified {
-                map.insert(Value::keyword("modified"), Value::int(modified));
-            }
-            Value::map(map)
-        }
         if sema_core::in_runtime_quantum() {
             let path = path.to_string();
-            return fs_quarantined("file/info", info_to_value, move || info_impl(&path));
+            return fs_quarantined("file/info", file_info_to_value, move || info_impl(&path));
         }
         let info = info_impl(path).map_err(SemaError::Io)?;
-        Ok(NativeOutcome::Return(info_to_value(info)))
+        Ok(NativeOutcome::Return(file_info_to_value(info)))
     });
 
     register_fn(env, "path/join", |args| {
@@ -3056,18 +3133,13 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         Ok(Value::bool(child.starts_with(&base)))
     });
 
-    crate::register_fn_path_gated0(env, sandbox, Caps::FS_READ, "file/read-lines", |args| {
-        check_arity!(args, "file/read-lines", 1);
-        let path = args.str_at(0, "file/read-lines")?;
-        let content = if let Some(data) = sema_core::vfs::vfs_read(path) {
-            String::from_utf8(data)
-                .io_ctx(format!("file/read-lines {path}: invalid UTF-8 in VFS"))?
-        } else {
-            std::fs::read_to_string(path).io_ctx(format!("file/read-lines {path}"))?
-        };
-        let lines: Vec<Value> = content.lines().map(Value::string).collect();
-        Ok(Value::list(lines))
-    });
+    crate::register_runtime_fn_path_gated0(
+        env,
+        sandbox,
+        Caps::FS_READ,
+        "file/read-lines",
+        fs_read_lines_op,
+    );
 
     crate::register_runtime_fn_path_gated0(
         env,
@@ -3076,10 +3148,11 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         "file/for-each-line",
         |args| {
             check_arity!(args, "file/for-each-line", 2);
+            let path = args.str_at(0, "file/for-each-line")?;
+            admit_regular_file("file/for-each-line", path)?;
             if sema_core::in_runtime_quantum() {
                 return file_line_runtime(args, FileLineKind::ForEachText);
             }
-            let path = args.str_at(0, "file/for-each-line")?;
             let func = args[1].clone();
             let file = std::fs::File::open(path).io_ctx(format!("file/for-each-line {path}"))?;
             let mut reader = std::io::BufReader::new(file);
@@ -3114,10 +3187,11 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         "file/fold-lines",
         |args| {
             check_arity!(args, "file/fold-lines", 3);
+            let path = args.str_at(0, "file/fold-lines")?;
+            admit_regular_file("file/fold-lines", path)?;
             if sema_core::in_runtime_quantum() {
                 return file_line_runtime(args, FileLineKind::FoldText);
             }
-            let path = args.str_at(0, "file/fold-lines")?;
             let func = args[1].clone();
             let mut acc = args[2].clone();
             let file = std::fs::File::open(path).io_ctx(format!("file/fold-lines {path}"))?;
@@ -3161,10 +3235,11 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         "file/fold-lines-bytes",
         |args| {
             check_arity!(args, "file/fold-lines-bytes", 3);
+            let path = args.str_at(0, "file/fold-lines-bytes")?;
+            admit_regular_file("file/fold-lines-bytes", path)?;
             if sema_core::in_runtime_quantum() {
                 return file_line_runtime(args, FileLineKind::FoldBytes);
             }
-            let path = args.str_at(0, "file/fold-lines-bytes")?;
             let func = args[1].clone();
             let mut acc = args[2].clone();
             let file = std::fs::File::open(path).io_ctx(format!("file/fold-lines-bytes {path}"))?;
@@ -3208,33 +3283,44 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         },
     );
 
-    crate::register_fn_path_gated0(env, sandbox, Caps::FS_WRITE, "file/write-lines", |args| {
-        check_arity!(args, "file/write-lines", 2);
-        let path = args.str_at(0, "file/write-lines")?;
-        let lines = match args[1].view() {
-            ValueView::List(l) => l,
-            ValueView::Vector(v) => v,
-            _ => return Err(SemaError::type_error("list or vector", args[1].type_name())),
-        };
-        let strs: Vec<String> = lines
-            .iter()
-            .map(|v| match v.as_str() {
-                Some(s) => s.to_string(),
-                None => v.to_string(),
-            })
-            .collect();
-        let content = strs.join("\n");
-        std::fs::write(path, content).io_ctx(format!("file/write-lines {path}"))?;
-        Ok(Value::nil())
-    });
+    crate::register_runtime_fn_path_gated0(
+        env,
+        sandbox,
+        Caps::FS_WRITE,
+        "file/write-lines",
+        |args| {
+            check_arity!(args, "file/write-lines", 2);
+            let path = args.str_at(0, "file/write-lines")?;
+            let lines = match args[1].view() {
+                ValueView::List(l) => l,
+                ValueView::Vector(v) => v,
+                _ => return Err(SemaError::type_error("list or vector", args[1].type_name())),
+            };
+            let strs: Vec<String> = lines
+                .iter()
+                .map(|v| match v.as_str() {
+                    Some(s) => s.to_string(),
+                    None => v.to_string(),
+                })
+                .collect();
+            let content = strs.join("\n");
+            fs_write_op("file/write-lines", path, content.as_bytes())
+        },
+    );
 
-    crate::register_fn_path_gated(env, sandbox, Caps::FS_WRITE, "file/copy", &[0, 1], |args| {
-        check_arity!(args, "file/copy", 2);
-        let src = args.str_at(0, "file/copy")?;
-        let dest = args.str_at(1, "file/copy")?;
-        std::fs::copy(src, dest).io_ctx(format!("file/copy {src} -> {dest}"))?;
-        Ok(Value::nil())
-    });
+    crate::register_runtime_fn_path_gated(
+        env,
+        sandbox,
+        Caps::FS_READ.union(Caps::FS_WRITE),
+        "file/copy",
+        &[0, 1],
+        |args| {
+            check_arity!(args, "file/copy", 2);
+            let src = args.str_at(0, "file/copy")?;
+            let dest = args.str_at(1, "file/copy")?;
+            fs_copy_op(src, dest)
+        },
+    );
 
     register_fn(env, "print-error", |args| {
         let mut output = String::new();
@@ -3625,6 +3711,24 @@ mod file_line_trace_tests {
         assert!(second.eof);
 
         std::fs::remove_file(path).expect("remove byte fixture");
+    }
+}
+
+#[cfg(test)]
+mod file_info_tests {
+    use super::*;
+
+    #[test]
+    fn file_info_preserves_sizes_above_i64_max() {
+        let info = file_info_to_value((i64::MAX as u64 + 1, false, true, None));
+        let size = info
+            .as_map_ref()
+            .and_then(|map| map.get(&Value::keyword("size")))
+            .expect("file info has size");
+        assert_eq!(
+            size.as_bigint(),
+            Some(num_bigint::BigInt::from(i64::MAX) + 1)
+        );
     }
 }
 

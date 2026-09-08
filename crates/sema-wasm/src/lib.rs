@@ -479,6 +479,29 @@ fn normalize_path(path: &str) -> Result<String, SemaError> {
     Ok(result)
 }
 
+/// Record a directory and all of its ancestors. File writes use this so a
+/// nested file remains discoverable through `file/list`, VFS persistence, and
+/// the browser file tree without requiring a separate `file/mkdir` call.
+fn vfs_register_directory(path: &str) {
+    VFS_DIRS.with(|dirs| {
+        let mut dirs = dirs.borrow_mut();
+        let mut current = String::new();
+        for segment in path.trim_matches('/').split('/').filter(|s| !s.is_empty()) {
+            current.push('/');
+            current.push_str(segment);
+            dirs.insert(current.clone());
+        }
+    });
+}
+
+fn vfs_register_parent_dirs(path: &str) {
+    if let Some((parent, _)) = path.rsplit_once('/') {
+        if !parent.is_empty() {
+            vfs_register_directory(parent);
+        }
+    }
+}
+
 /// Append text to the current line buffer (no newline).
 ///
 /// Also forwards `s` through `sema_core::write_stdout`. The fallback hook is a
@@ -1202,6 +1225,7 @@ fn register_wasm_io(env: &Env) {
                 vfs.borrow_mut()
                     .insert(path.to_string(), content.to_string());
             });
+            vfs_register_parent_dirs(path);
             Ok(Value::nil())
         }),
     );
@@ -1250,6 +1274,8 @@ fn register_wasm_io(env: &Env) {
                 match map.remove(from.as_str()) {
                     Some(content) => {
                         map.insert(to.to_string(), content);
+                        drop(map);
+                        vfs_register_parent_dirs(to);
                         Ok(Value::nil())
                     }
                     None => Err(SemaError::Io(format!(
@@ -1305,15 +1331,7 @@ fn register_wasm_io(env: &Env) {
             }
             let path = args.str_at(0, "file/mkdir")?;
             let path = &normalize_path(path)?;
-            VFS_DIRS.with(|dirs| {
-                let mut set = dirs.borrow_mut();
-                let mut current = String::new();
-                for seg in path.strip_prefix('/').unwrap_or(path).split('/') {
-                    current.push('/');
-                    current.push_str(seg);
-                    set.insert(current.clone());
-                }
-            });
+            vfs_register_directory(path);
             Ok(Value::nil())
         }),
     );
@@ -1376,6 +1394,7 @@ fn register_wasm_io(env: &Env) {
                     .and_modify(|existing| existing.push_str(content))
                     .or_insert_with(|| content.to_string());
             });
+            vfs_register_parent_dirs(path);
             Ok(Value::nil())
         }),
     );
@@ -1399,6 +1418,8 @@ fn register_wasm_io(env: &Env) {
                         vfs_check_quota(dest, content.len())?;
                         let mut map = vfs.borrow_mut();
                         map.insert(dest.to_string(), content.clone());
+                        drop(map);
+                        vfs_register_parent_dirs(dest);
                         Ok(Value::nil())
                     }
                     None => Err(SemaError::Io(format!(
@@ -1453,6 +1474,7 @@ fn register_wasm_io(env: &Env) {
             VFS.with(|vfs| {
                 vfs.borrow_mut().insert(path.to_string(), content);
             });
+            vfs_register_parent_dirs(path);
             Ok(Value::nil())
         }),
     );
@@ -1564,51 +1586,23 @@ fn register_wasm_io(env: &Env) {
 /// `{"value":...,"output":[...],"error":...}` JSON shape shared by
 /// `evalAsync`, `evalVMAsync`, and `runEntryAsync`.
 ///
-/// Installs a private `Closure`-backed `setPromiseOutputSink` for the
-/// duration of one call, collecting only the lines tagged with the root id
-/// this call's `on_root_id` callback reports. The sink belongs to this
-/// interpreter's driver, so a different interpreter may use the same local
-/// root id without cross-talk. Restores whatever sink predates the call.
+/// Registers a private root-tagged output capture for the duration of one
+/// call. Captures subscribe beside the public `setPromiseOutputSink`, so
+/// concurrent compatibility calls cannot replace or restore each other's
+/// output routing.
 struct PromiseCapture {
-    driver: Rc<driver::PromiseDriver>,
-    collected: Rc<RefCell<Vec<String>>>,
-    target_root: Rc<Cell<Option<f64>>>,
-    previous_sink: Option<js_sys::Function>,
-    // Retained only to keep the underlying JS functions alive until this
-    // capture is dropped (after the awaited promise settles) — never called
-    // directly from Rust.
-    _sink_closure: Closure<dyn FnMut(f64, JsValue, JsValue)>,
+    collected: Rc<output::PromiseOutputCapture>,
     _on_root_closure: Closure<dyn FnMut(f64)>,
     on_root_js: JsValue,
 }
 
 impl PromiseCapture {
     fn install(driver: &Rc<driver::PromiseDriver>) -> Self {
-        let collected: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
-        let target_root: Rc<Cell<Option<f64>>> = Rc::new(Cell::new(None));
-        let previous_sink = driver.take_output_sink();
+        let collected = driver.capture_output();
 
-        let sink_collected = Rc::clone(&collected);
-        let sink_root = Rc::clone(&target_root);
-        let sink_closure = Closure::wrap(Box::new(
-            move |root_id: f64, _stream: JsValue, text: JsValue| {
-                if sink_root.get() == Some(root_id) {
-                    if let Some(text) = text.as_string() {
-                        sink_collected.borrow_mut().push(text);
-                    }
-                }
-            },
-        ) as Box<dyn FnMut(f64, JsValue, JsValue)>);
-        driver.set_output_sink(Some(
-            sink_closure
-                .as_ref()
-                .unchecked_ref::<js_sys::Function>()
-                .clone(),
-        ));
-
-        let on_root_root = Rc::clone(&target_root);
+        let on_root_capture = Rc::clone(&collected);
         let on_root_closure = Closure::wrap(Box::new(move |root_id: f64| {
-            on_root_root.set(Some(root_id));
+            on_root_capture.set_root(root_id as u64);
         }) as Box<dyn FnMut(f64)>);
         let on_root_js: JsValue = on_root_closure
             .as_ref()
@@ -1617,11 +1611,7 @@ impl PromiseCapture {
             .into();
 
         Self {
-            driver: Rc::clone(driver),
             collected,
-            target_root,
-            previous_sink,
-            _sink_closure: sink_closure,
             _on_root_closure: on_root_closure,
             on_root_js,
         }
@@ -1632,15 +1622,11 @@ impl PromiseCapture {
         self.on_root_js.clone()
     }
 
-    /// Await `promise` to settlement, restore the previous output sink, and
-    /// build the compatibility JSON result from the resolved/rejected value plus
-    /// whatever output was captured for this call's root.
+    /// Await `promise` to settlement and build the compatibility JSON result
+    /// from the resolved/rejected value plus this call's root-tagged output.
     async fn await_as_old_json(self, promise: js_sys::Promise) -> JsValue {
-        let _ = &self.target_root; // kept alive for the sink closure's Weak-free capture
         let settled = JsFuture::from(promise).await;
-        self.driver.set_output_sink(self.previous_sink.clone());
-
-        let output_lines = self.collected.borrow();
+        let output_lines = self.collected.take_lines();
         let output_json = output_lines
             .iter()
             .map(|s| format!("\"{}\"", escape_json(s)))
@@ -1804,11 +1790,10 @@ impl WasmInterpreter {
     /// no way to "read it back" after the fact (a real `setPromiseOutputSink`
     /// caller, if any, would already have drained it by the next drive turn).
     /// This installs a private `Closure`-backed sink for the duration of the
-    /// call that only collects lines tagged with THIS call's root id, then
-    /// restores whatever sink was previously installed — so a concurrent real
-    /// `evalPromise`/`setPromiseOutputSink` caller on the same interpreter
-    /// (not a supported combination for the compatibility wrappers, but not
-    /// corrupted either) gets its sink back exactly as it left it.
+    /// call that only collects lines tagged with THIS call's root id. The
+    /// capture is independent of the public `setPromiseOutputSink`, so
+    /// concurrent calls retain their own routing and the public sink receives
+    /// every event throughout.
     ///
     /// Error fidelity: `eval_promise` rejects with a plain JS `Error`, but
     /// `driver::reject_with_error` bakes the full inner message + stack trace
@@ -2990,6 +2975,7 @@ impl WasmInterpreter {
                     vfs.borrow_mut()
                         .insert(path.to_string(), content.to_string());
                 });
+                vfs_register_parent_dirs(&path);
                 JsValue::NULL
             }
             Err(e) => JsValue::from_str(&e.format_plain()),
@@ -3066,15 +3052,7 @@ impl WasmInterpreter {
             Ok(p) => p,
             Err(_) => return,
         };
-        VFS_DIRS.with(|dirs| {
-            let mut set = dirs.borrow_mut();
-            let mut current = String::new();
-            for seg in path.strip_prefix('/').unwrap_or(&path).split('/') {
-                current.push('/');
-                current.push_str(seg);
-                set.insert(current.clone());
-            }
-        });
+        vfs_register_directory(&path);
     }
 
     /// Check if a path is a directory in the virtual filesystem.
@@ -3135,42 +3113,93 @@ impl WasmInterpreter {
     }
 
     /// Replace the entire VFS from a snapshot produced by `dumpVfs`. Resets
-    /// first, so the VFS exactly matches the snapshot.
+    /// only after the complete snapshot passes the same path and quota checks
+    /// as ordinary writes. An invalid snapshot leaves the current VFS intact.
     #[wasm_bindgen(js_name = loadVfs)]
     pub fn load_vfs(&self, snapshot: JsValue) {
-        self.reset_vfs();
         if !snapshot.is_object() {
             return;
         }
-        if let Ok(files) = js_sys::Reflect::get(&snapshot, &JsValue::from_str("files")) {
-            if files.is_object() {
-                let files_obj: js_sys::Object = files.unchecked_into();
-                for key in js_sys::Object::keys(&files_obj).iter() {
-                    let (Some(path), Ok(val)) =
-                        (key.as_string(), js_sys::Reflect::get(&files_obj, &key))
-                    else {
-                        continue;
-                    };
-                    if let Some(content) = val.as_string() {
-                        VFS.with(|vfs| {
-                            vfs.borrow_mut().insert(path, content);
-                        });
-                    }
+        let Ok(files) = js_sys::Reflect::get(&snapshot, &JsValue::from_str("files")) else {
+            return;
+        };
+        let Ok(dirs) = js_sys::Reflect::get(&snapshot, &JsValue::from_str("dirs")) else {
+            return;
+        };
+        if !files.is_object() {
+            return;
+        }
+        let Ok(dirs) = dirs.dyn_into::<js_sys::Array>() else {
+            return;
+        };
+
+        let files_obj: js_sys::Object = files.unchecked_into();
+        let mut restored_files = BTreeMap::new();
+        let mut total_bytes = 0usize;
+        for key in js_sys::Object::keys(&files_obj).iter() {
+            let (Some(path), Ok(value)) = (key.as_string(), js_sys::Reflect::get(&files_obj, &key))
+            else {
+                return;
+            };
+            let Some(content) = value.as_string() else {
+                return;
+            };
+            let Ok(path) = normalize_path(&path) else {
+                return;
+            };
+            if content.len() > VFS_MAX_FILE_BYTES
+                || restored_files.len() >= VFS_MAX_FILES
+                || restored_files.contains_key(&path)
+            {
+                return;
+            }
+            let Some(next_total) = total_bytes.checked_add(content.len()) else {
+                return;
+            };
+            if next_total > VFS_MAX_TOTAL_BYTES {
+                return;
+            }
+            total_bytes = next_total;
+            restored_files.insert(path, content);
+        }
+
+        let mut restored_dirs = BTreeSet::new();
+        restored_dirs.insert("/".to_string());
+        for value in dirs.iter() {
+            let Some(path) = value.as_string() else {
+                return;
+            };
+            let Ok(path) = normalize_path(&path) else {
+                return;
+            };
+            let mut current = String::new();
+            for segment in path
+                .trim_matches('/')
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+            {
+                current.push('/');
+                current.push_str(segment);
+                restored_dirs.insert(current.clone());
+            }
+        }
+        for path in restored_files.keys() {
+            let mut current = String::new();
+            for segment in path
+                .trim_matches('/')
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+            {
+                current.push('/');
+                current.push_str(segment);
+                if current != *path {
+                    restored_dirs.insert(current.clone());
                 }
             }
         }
-        if let Ok(dirs) = js_sys::Reflect::get(&snapshot, &JsValue::from_str("dirs")) {
-            if let Ok(arr) = dirs.dyn_into::<js_sys::Array>() {
-                VFS_DIRS.with(|d| {
-                    let mut set = d.borrow_mut();
-                    for item in arr.iter() {
-                        if let Some(p) = item.as_string() {
-                            set.insert(p);
-                        }
-                    }
-                });
-            }
-        }
+
+        VFS.with(|vfs| *vfs.borrow_mut() = restored_files);
+        VFS_DIRS.with(|dirs| *dirs.borrow_mut() = restored_dirs);
     }
 
     /// Get the Sema version
@@ -3347,6 +3376,20 @@ impl WasmInterpreter {
 }
 
 const CALLBACK_HANDLE_KEY: &str = "__semaCallbackHandle";
+const JS_MAX_SAFE_INTEGER: i64 = (1_i64 << 53) - 1;
+
+/// JavaScript `Number` cannot exactly represent every Sema integer. Preserve
+/// values outside its safe range as JavaScript `BigInt` values.
+fn sema_integer_to_jsvalue(decimal: &str, value: i64) -> JsValue {
+    if (-JS_MAX_SAFE_INTEGER..=JS_MAX_SAFE_INTEGER).contains(&value) {
+        JsValue::from_f64(value as f64)
+    } else {
+        match js_sys::BigInt::new(&JsValue::from_str(decimal)) {
+            Ok(bigint) => bigint.into(),
+            Err(_) => JsValue::from_str(decimal),
+        }
+    }
+}
 
 fn callback_handle_from_js(value: &JsValue) -> Option<u32> {
     if !value.is_object() {
@@ -3402,7 +3445,11 @@ fn sema_value_to_jsvalue_with_callbacks(
     match val.view() {
         ValueView::Nil => JsValue::NULL,
         ValueView::Bool(b) => JsValue::from_bool(b),
-        ValueView::Int(n) => JsValue::from_f64(n as f64),
+        ValueView::Int(n) => sema_integer_to_jsvalue(&n.to_string(), n),
+        ValueView::BigInt(n) => match js_sys::BigInt::new(&JsValue::from_str(&n.to_string())) {
+            Ok(bigint) => bigint.into(),
+            Err(_) => JsValue::from_str(&n.to_string()),
+        },
         ValueView::Float(f) => JsValue::from_f64(f),
         ValueView::String(s) => JsValue::from_str(&s),
         ValueView::Keyword(s) => JsValue::from_str(&format!(":{}", sema_core::resolve(s))),
@@ -3454,8 +3501,21 @@ fn js_value_to_sema_value_with_callbacks(
         return Ok(Value::bool(b));
     }
 
+    if let Some(bigint) = value.dyn_ref::<js_sys::BigInt>() {
+        let decimal = JsValue::from(
+            bigint
+                .to_string(10)
+                .map_err(|e| JsValue::from_str(&format!("Failed to convert JS BigInt: {e:?}")))?,
+        )
+        .as_string()
+        .ok_or_else(|| JsValue::from_str("Failed to read JS BigInt digits"))?;
+        return sema_reader::read(&decimal)
+            .map_err(|e| JsValue::from_str(&format!("Failed to parse JS BigInt: {e}")));
+    }
+
     if let Some(n) = value.as_f64() {
-        if n.fract() == 0.0 && n >= i64::MIN as f64 && n <= i64::MAX as f64 {
+        if n.fract() == 0.0 && n >= -(JS_MAX_SAFE_INTEGER as f64) && n <= JS_MAX_SAFE_INTEGER as f64
+        {
             return Ok(Value::int(n as i64));
         }
         return Ok(Value::float(n));
@@ -3653,5 +3713,28 @@ mod tests {
         .unwrap_err();
 
         assert!(format!("{}", err.inner()).contains("entry point not found"));
+    }
+
+    #[test]
+    fn nested_file_parents_are_registered() {
+        VFS_DIRS.with(|dirs| {
+            let mut dirs = dirs.borrow_mut();
+            dirs.clear();
+            dirs.insert("/".to_string());
+        });
+
+        vfs_register_parent_dirs("/workspace/src/main.sema");
+
+        VFS_DIRS.with(|dirs| {
+            let dirs = dirs.borrow();
+            assert!(dirs.contains("/workspace"));
+            assert!(dirs.contains("/workspace/src"));
+            assert!(!dirs.contains("/workspace/src/main.sema"));
+        });
+    }
+
+    #[test]
+    fn normalize_path_rejects_parent_traversal() {
+        assert!(normalize_path("/workspace/../secret").is_err());
     }
 }

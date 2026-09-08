@@ -2258,11 +2258,7 @@ fn streaming_line_limit_counts_content_bytes_not_crlf_terminators() {
 
 #[cfg(unix)]
 #[test]
-fn special_file_delivers_each_completed_line_before_waiting_for_the_next() {
-    use std::io::Write as _;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
-
+fn line_operations_reject_fifo_before_opening_it() {
     let fifo = TempFile::new("line-fifo");
     let fifo_c = std::ffi::CString::new(fifo.path()).expect("FIFO path has no NUL");
     let created = unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) };
@@ -2272,55 +2268,23 @@ fn special_file_delivers_each_completed_line_before_waiting_for_the_next() {
         "create FIFO: {}",
         std::io::Error::last_os_error()
     );
-    let marker = TempFile::new("line-fifo-marker");
-    let marker_path = marker.path();
-    let callback_seen = Arc::new(AtomicBool::new(false));
-    let writer_seen = Arc::clone(&callback_seen);
-    let fifo_path = fifo.path();
-    let writer = std::thread::spawn(move || {
-        let mut pipe = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&fifo_path)
-            .expect("open FIFO writer");
-        pipe.write_all(b"first\n").expect("write first FIFO line");
-        pipe.flush().expect("flush first FIFO line");
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !std::path::Path::new(&marker_path).exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        writer_seen.store(
-            std::path::Path::new(&marker_path).exists(),
-            Ordering::SeqCst,
-        );
-        pipe.write_all(b"second\n").expect("write second FIFO line");
-    });
-
     let interp = Interpreter::new();
-    let result = interp
-        .eval_str_compiled(&format!(
-            r#"
-            (let ((seen (mutable-array/new)))
-              (file/for-each-line "{fifo}"
-                (fn (line)
-                  (mutable-array/push! seen line)
-                  (when (= line "first") (file/write "{marker}" "ready"))))
-              (mutable-array/->vector seen))
-            "#,
-            fifo = fifo.path(),
-            marker = marker.path(),
-        ))
-        .expect("FIFO line callbacks should run incrementally");
-    writer.join().expect("FIFO writer exits");
-
-    assert!(
-        callback_seen.load(Ordering::SeqCst),
-        "the first callback must run before the writer supplies the second line"
-    );
-    assert_eq!(
-        result,
-        Value::vector(vec![Value::string("first"), Value::string("second")])
-    );
+    for call in [
+        format!(r#"(file/for-each-line "{}" (fn (line) nil))"#, fifo.path()),
+        format!(
+            r#"(file/fold-lines "{}" (fn (acc line) acc) nil)"#,
+            fifo.path()
+        ),
+        format!(
+            r#"(file/fold-lines-bytes "{}" (fn (acc line) acc) nil)"#,
+            fifo.path()
+        ),
+    ] {
+        let error = interp
+            .eval_str_compiled(&call)
+            .expect_err("line operations must reject FIFOs before opening them");
+        assert!(error.to_string().contains("named pipe (FIFO)"), "{error}");
+    }
 }
 
 #[test]

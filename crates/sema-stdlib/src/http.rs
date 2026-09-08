@@ -164,9 +164,16 @@ fn build_request(
                 }
             }
             if let Some(timeout_val) = opts_map.get(&Value::keyword("timeout")) {
-                if let Some(ms) = timeout_val.as_int() {
-                    builder = builder.timeout(Duration::from_millis(ms as u64));
+                let ms = timeout_val.as_int().ok_or_else(|| {
+                    SemaError::type_error(
+                        "integer timeout in milliseconds",
+                        timeout_val.type_name(),
+                    )
+                })?;
+                if ms < 0 {
+                    return Err(SemaError::eval("http: :timeout must be non-negative"));
                 }
+                builder = builder.timeout(Duration::from_millis(ms as u64));
             }
             multipart_val = opts_map.get(&Value::keyword("multipart")).cloned();
         }
@@ -420,4 +427,33 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             http_request(&method, url, body, opts)
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn negative_timeout_is_rejected_before_duration_conversion() {
+        ensure_crypto_provider();
+        let client = reqwest::Client::new();
+        let opts = Value::map(BTreeMap::from([(
+            Value::keyword("timeout"),
+            Value::int(-1),
+        )]));
+        let err = build_request(&client, "GET", "http://example.test", None, Some(&opts))
+            .expect_err("negative timeout must fail");
+        assert!(err.to_string().contains("non-negative"));
+    }
+
+    #[test]
+    fn timeout_requires_an_integer() {
+        ensure_crypto_provider();
+        let client = reqwest::Client::new();
+        let opts = Value::map(BTreeMap::from([(
+            Value::keyword("timeout"),
+            Value::string("soon"),
+        )]));
+        assert!(build_request(&client, "GET", "http://example.test", None, Some(&opts)).is_err());
+    }
 }

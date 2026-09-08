@@ -538,6 +538,22 @@ fn register_promise_ops(env: &Env) {
         }))
     });
 
+    // Internal owned counterpart to `async/all`. The runtime cancels unfinished
+    // producer tasks before it resumes the waiter on a failure, so an already
+    // ready sibling cannot run between observing the failure and cancellation.
+    register_runtime_only_fn(env, "__async-owned-all", &[], |args| {
+        check_arity!(args, "__async-owned-all", 1);
+        let items = expect_list_or_vector(&args[0], "__async-owned-all")?;
+        let promises = collect_promise_ids(items, "__async-owned-all")?;
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::PromiseSet(PromiseSetWait {
+                promises,
+                mode: PromiseSetMode::OwnedAll,
+            }),
+            continuation: Box::new(AllCont),
+        }))
+    });
+
     // async/race — OBSERVE the supplied promises; resume with the first (lowest-
     // settlement) winner, returned/failed/cancelled alike. Losers CONTINUE.
     register_runtime_only_fn(env, "async/race", &[], |args| {
@@ -551,6 +567,26 @@ fn register_promise_ops(env: &Env) {
             wait: WaitKind::PromiseSet(PromiseSetWait {
                 promises,
                 mode: PromiseSetMode::Race,
+            }),
+            continuation: Box::new(RaceCont),
+        }))
+    });
+
+    // Internal owned counterpart to `async/race`. The winner is preserved, but
+    // the runtime cancels every unfinished producer before resuming the waiter.
+    register_runtime_only_fn(env, "__async-owned-race", &[], |args| {
+        check_arity!(args, "__async-owned-race", 1);
+        let items = expect_list_or_vector(&args[0], "__async-owned-race")?;
+        if items.is_empty() {
+            return Err(SemaError::eval(
+                "__async-owned-race: requires at least one promise",
+            ));
+        }
+        let promises = collect_promise_ids(items, "__async-owned-race")?;
+        Ok(NativeOutcome::Suspend(NativeSuspend {
+            wait: WaitKind::PromiseSet(PromiseSetWait {
+                promises,
+                mode: PromiseSetMode::OwnedRace,
             }),
             continuation: Box::new(RaceCont),
         }))

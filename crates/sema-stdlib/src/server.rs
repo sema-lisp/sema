@@ -339,6 +339,10 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         std::any::TypeId::of::<ToolRouteHandlerPayload>(),
         tool_route_payload_tracer,
     );
+    sema_core::register_payload_tracer(
+        std::any::TypeId::of::<RouterDispatchPayload>(),
+        router_dispatch_payload_tracer,
+    );
 
     register_fn(env, "http/ok", |args| {
         check_arity!(args, "http/ok", 1);
@@ -1058,22 +1062,53 @@ impl sema_core::runtime::NativeContinuation for RouteHandlerContinuation {
 /// External wait; the synchronous value callback canonicalizes inline. A matched
 /// runtime handler is returned as a structural `NativeOutcome::Call`; the host
 /// value ABI uses its explicit `EvalContext` callback.
-fn build_router_dispatch_fn(routes: std::rc::Rc<Vec<(String, String, Value)>>) -> Value {
-    use sema_core::{call_callback, EvalContext, NativeFn};
+struct RouterDispatchPayload {
+    routes: Vec<(String, String, Value)>,
+}
 
-    let routes_value = std::rc::Rc::clone(&routes);
-    Value::native_fn(NativeFn::with_ctx_runtime(
+fn router_dispatch_payload_tracer(
+    payload: &std::rc::Rc<dyn std::any::Any>,
+    sink: &mut dyn FnMut(sema_core::GcEdge),
+) -> bool {
+    let Some(payload) = payload.downcast_ref::<RouterDispatchPayload>() else {
+        return false;
+    };
+    for (_, _, handler) in &payload.routes {
+        sink(sema_core::GcEdge::Value(handler));
+    }
+    true
+}
+
+fn router_dispatch_legacy(
+    payload: &RouterDispatchPayload,
+    ctx: &sema_core::EvalContext,
+    args: &[Value],
+) -> Result<Value, SemaError> {
+    let invoke = |handler: &Value, req: Value| sema_core::call_callback(ctx, handler, &[req]);
+    match dispatch_body(&payload.routes, args, Some(&invoke), false)? {
+        NativeOutcome::Return(value) => Ok(value),
+        _ => Err(SemaError::eval(
+            "http/router/dispatch: native suspended outside the cooperative runtime",
+        )),
+    }
+}
+
+fn router_dispatch_runtime(
+    payload: &RouterDispatchPayload,
+    _ctx: &mut sema_core::runtime::NativeCallContext<'_>,
+    args: &[Value],
+) -> sema_core::runtime::NativeResult {
+    dispatch_body(&payload.routes, args, None, true)
+}
+
+fn build_router_dispatch_fn(routes: std::rc::Rc<Vec<(String, String, Value)>>) -> Value {
+    Value::native_fn(sema_core::NativeFn::with_payload_ctx_runtime(
         "http/router/dispatch",
-        move |ctx: &EvalContext, args: &[Value]| {
-            let invoke = |handler: &Value, req: Value| call_callback(ctx, handler, &[req]);
-            match dispatch_body(&routes, args, Some(&invoke), false)? {
-                NativeOutcome::Return(value) => Ok(value),
-                _ => Err(SemaError::eval(
-                    "http/router/dispatch: native suspended outside the cooperative runtime",
-                )),
-            }
-        },
-        move |_ctx, args| dispatch_body(&routes_value, args, None, true),
+        std::rc::Rc::new(RouterDispatchPayload {
+            routes: routes.as_ref().clone(),
+        }),
+        router_dispatch_legacy,
+        router_dispatch_runtime,
     ))
 }
 
@@ -1096,22 +1131,25 @@ fn method_keyword(method: &str) -> Value {
     Value::keyword(&method.to_ascii_lowercase())
 }
 
-/// Parse a query string like "a=1&b=2" into a Sema map {:a "1" :b "2"}.
+/// Parse a form-encoded query string like "a=1&b=2" into a Sema map.
 fn parse_query_string(query: Option<&str>) -> Value {
     let mut map = BTreeMap::new();
     if let Some(qs) = query {
-        for pair in qs.split('&') {
-            if pair.is_empty() {
-                continue;
-            }
-            let (key, val) = match pair.split_once('=') {
-                Some((k, v)) => (k, v),
-                None => (pair, ""),
-            };
-            map.insert(Value::keyword(key), Value::string(val));
+        for (key, value) in url::form_urlencoded::parse(qs.as_bytes()) {
+            map.insert(Value::keyword(&key), Value::string(&value));
         }
     }
     Value::map(map)
+}
+
+/// True for the JSON media types defined by RFC 8259 and structured suffixes.
+fn content_type_is_json(value: &str) -> bool {
+    let media_type = value.split_once(';').map_or(value, |(ty, _)| ty).trim();
+    let Some((kind, subtype)) = media_type.split_once('/') else {
+        return false;
+    };
+    kind.eq_ignore_ascii_case("application")
+        && (subtype.eq_ignore_ascii_case("json") || subtype.to_ascii_lowercase().ends_with("+json"))
 }
 
 /// Convert a RawRequest into a Sema Value map on the main (evaluator) thread.
@@ -1229,12 +1267,12 @@ async fn handle_axum_request(
     let query = uri.query().map(|q| q.to_string());
 
     let mut headers = Vec::new();
-    let mut content_type_is_json = false;
+    let mut body_content_type_is_json = false;
     for (name, value) in req.headers().iter() {
         let v = value.to_str().unwrap_or("").to_string();
         let n = name.as_str().to_string();
-        if n == "content-type" && v.contains("json") {
-            content_type_is_json = true;
+        if n == "content-type" && content_type_is_json(&v) {
+            body_content_type_is_json = true;
         }
         headers.push((n, v));
     }
@@ -1264,7 +1302,7 @@ async fn handle_axum_request(
         headers,
         query,
         body,
-        content_type_is_json,
+        content_type_is_json: body_content_type_is_json,
     };
 
     // Create oneshot channel for the response
@@ -1508,10 +1546,13 @@ fn handle_file_response(
         let _ = respond.send(malformed_response("file", "__file_path"));
         return;
     };
-    let path_str = map
+    let Some(path_str) = map
         .get(&Value::keyword("__file_path"))
         .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_default();
+    else {
+        let _ = respond.send(malformed_response("file", "__file_path"));
+        return;
+    };
     let content_type = map
         .get(&Value::keyword("__file_content_type"))
         .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -3116,6 +3157,31 @@ mod tests {
     }
 
     #[test]
+    fn router_dispatch_payload_traces_each_handler() {
+        let payload: std::rc::Rc<dyn std::any::Any> = std::rc::Rc::new(RouterDispatchPayload {
+            routes: vec![
+                (
+                    "get".to_string(),
+                    "/a".to_string(),
+                    Value::string("handler-one"),
+                ),
+                (
+                    "post".to_string(),
+                    "/b".to_string(),
+                    Value::string("handler-two"),
+                ),
+            ],
+        });
+        let mut edges = 0;
+        assert!(router_dispatch_payload_tracer(&payload, &mut |edge| {
+            if matches!(edge, sema_core::GcEdge::Value(_)) {
+                edges += 1;
+            }
+        }));
+        assert_eq!(edges, 2, "dispatch must retain both route handlers");
+    }
+
+    #[test]
     fn route_handler_continuation_traces_no_edges() {
         use sema_core::runtime::Trace;
         let mut edges = 0;
@@ -3563,6 +3629,47 @@ mod tests {
         );
         assert_eq!(parse_port(3000).unwrap(), 3000);
         assert_eq!(parse_port(65535).unwrap(), 65535);
+    }
+
+    #[test]
+    fn query_parser_decodes_percent_escapes_and_plus() {
+        let query = parse_query_string(Some("name=Ada+Lovelace&path=a%2Fb&empty"));
+        let map = query.as_map_ref().expect("query map");
+        assert_eq!(
+            map.get(&Value::keyword("name")).and_then(Value::as_str),
+            Some("Ada Lovelace")
+        );
+        assert_eq!(
+            map.get(&Value::keyword("path")).and_then(Value::as_str),
+            Some("a/b")
+        );
+        assert_eq!(
+            map.get(&Value::keyword("empty")).and_then(Value::as_str),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn json_content_type_matches_media_type_case_and_suffix() {
+        assert!(content_type_is_json("Application/JSON; charset=utf-8"));
+        assert!(content_type_is_json("application/problem+json"));
+        assert!(!content_type_is_json("text/notjson"));
+        assert!(!content_type_is_json("application/jsonish"));
+    }
+
+    #[test]
+    fn malformed_file_marker_returns_server_error() {
+        let response = Value::map(BTreeMap::from([(
+            Value::keyword("__file"),
+            Value::bool(true),
+        )]));
+        let (send, mut receive) = tokio::sync::oneshot::channel();
+        handle_file_response(&response, send);
+        let ServerResponse::Raw(raw) = receive.try_recv().expect("response sent") else {
+            panic!("malformed file marker must not become a file response");
+        };
+        assert_eq!(raw.status, 500);
+        assert!(raw.body.contains("__file_path"));
     }
 
     #[test]

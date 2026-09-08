@@ -170,6 +170,50 @@ fn async_append_copy_delete_parity() {
     );
 }
 
+#[test]
+fn async_misc_file_operations_do_not_block_siblings() {
+    let _guard = timing_guard();
+    let dir = TempDir::new("misc-offload");
+    let input = dir.path("input.txt");
+    let output = dir.path("output.txt");
+    let copied = dir.path("copied.txt");
+    std::fs::write(&input, "one\ntwo\n").unwrap();
+
+    sema_stdlib::reset_fs_inflight();
+    sema_stdlib::set_fs_test_delay_ms(30);
+    let interp = Interpreter::new();
+    let result = interp.eval_str_compiled(&format!(
+        r#"
+        (begin
+          (define ticks 0)
+          (define ticker
+            (async/spawn (fn ()
+              (let loop ((remaining 1000))
+                (when (> remaining 0)
+                  (async/sleep 1)
+                  (set! ticks (+ ticks 1))
+                  (loop (- remaining 1)))))))
+          (define worker
+            (async/spawn (fn ()
+              (file/read-lines "{input}")
+              (file/append "{output}" "first")
+              (file/write-lines "{output}" '("second" "third"))
+              (file/copy "{input}" "{copied}")
+              (file/delete "{copied}"))))
+          (await worker)
+          (async/cancel ticker)
+          ticks)
+        "#
+    ));
+    sema_stdlib::set_fs_test_delay_ms(0);
+
+    let ticks = result.expect("miscellaneous file operations complete without blocking");
+    assert!(
+        ticks.as_int().is_some_and(|count| count > 0),
+        "a sleeping sibling must advance while runtime file operations are in flight: {ticks}"
+    );
+}
+
 // === Error parity: async rejections carry the sync path's exact IO message ===
 
 #[test]

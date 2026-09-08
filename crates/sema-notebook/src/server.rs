@@ -115,6 +115,7 @@ pub async fn serve(notebook_path: Option<PathBuf>, host: &str, port: u16) {
         .route("/api/eval-all", post(eval_all))
         .route("/api/env", get(get_env))
         .route("/api/reset", post(reset))
+        .route("/api/cancel", post(cancel_cell))
         .route("/api/title", post(set_title))
         .route("/api/undo", post(undo_cell))
         .route("/api/save", post(save_notebook))
@@ -329,6 +330,12 @@ async fn reset(
         .await
         .map(|_| Json(serde_json::json!({"ok": true})))
         .map_err(|e| bridge_err(e, StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+async fn cancel_cell(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "cancelled": state.engine.cancel_running(),
+    }))
 }
 
 #[derive(Deserialize)]

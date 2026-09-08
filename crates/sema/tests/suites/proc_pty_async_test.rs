@@ -616,6 +616,88 @@ fn interpreter_drop_reaps_live_proc_and_pty_children() {
     }
 }
 
+/// `proc/kill` and `proc/close` must terminate the whole group created by
+/// `proc/spawn`, not only the shell leader. A leader-only kill lets this
+/// background `sleep` outlive its handle.
+#[cfg(unix)]
+#[test]
+fn proc_kill_reaps_background_descendants() {
+    let pidfile = std::env::temp_dir().join(format!(
+        "sema-proc-group-{}-{:?}.pid",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&pidfile);
+    let interp = Interpreter::new();
+    let handle = interp
+        .eval_str_compiled(&format!(
+            r#"(proc/spawn (list "sh" "-c" "sleep 30 & echo $! > '{path}'; wait"))"#,
+            path = pidfile.display()
+        ))
+        .expect("spawn shell with a background child")
+        .as_int()
+        .expect("proc handle");
+    let descendant = read_child_pid(&pidfile);
+    interp
+        .eval_str_compiled(&format!(
+            "(begin (proc/kill {handle}) (proc/wait {handle}) (proc/close {handle}))"
+        ))
+        .expect("kill and reap process group");
+    let dead = wait_until_dead(descendant);
+    if !dead {
+        unsafe {
+            libc::kill(descendant, libc::SIGKILL);
+        }
+    }
+    let _ = std::fs::remove_file(&pidfile);
+    assert!(
+        dead,
+        "proc/kill left background descendant {descendant} alive"
+    );
+}
+
+/// `pty/kill` uses the same process-group contract as `proc/kill`.
+#[cfg(unix)]
+#[test]
+fn pty_kill_reaps_background_descendants() {
+    if !pty_available() {
+        eprintln!("skipping pty_kill_reaps_background_descendants: no pty available");
+        return;
+    }
+    let pidfile = std::env::temp_dir().join(format!(
+        "sema-pty-group-{}-{:?}.pid",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_file(&pidfile);
+    let interp = Interpreter::new();
+    let handle = interp
+        .eval_str_compiled(&format!(
+            r#"(pty/spawn (list "sh" "-c" "sleep 30 & echo $! > '{path}'; wait"))"#,
+            path = pidfile.display()
+        ))
+        .expect("spawn pty shell with a background child")
+        .as_int()
+        .expect("pty handle");
+    let descendant = read_child_pid(&pidfile);
+    interp
+        .eval_str_compiled(&format!(
+            "(begin (pty/kill {handle}) (pty/wait {handle}) (pty/close {handle}))"
+        ))
+        .expect("kill and reap pty process group");
+    let dead = wait_until_dead(descendant);
+    if !dead {
+        unsafe {
+            libc::kill(descendant, libc::SIGKILL);
+        }
+    }
+    let _ = std::fs::remove_file(&pidfile);
+    assert!(
+        dead,
+        "pty/kill left background descendant {descendant} alive"
+    );
+}
+
 /// `pty/wait` called twice (sequentially) on the same handle inside one async
 /// task returns the same exit code both times — matches
 /// `pty.rs::tests::double_wait_returns_same_code_sync` through the offload.

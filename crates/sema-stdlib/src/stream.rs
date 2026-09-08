@@ -53,9 +53,99 @@ use crate::{register_fn, register_runtime_fn};
 /// pass a smaller or larger explicit maximum as the final argument, but no
 /// aggregation path is ever unbounded.
 const STREAM_AGGREGATION_BYTE_CAP_DEFAULT: usize = 256 * 1024 * 1024;
-#[cfg(not(target_arch = "wasm32"))]
+/// `stream/read` always materializes its result, so one request must have a
+/// fixed upper bound. Callers that need more data can make repeated reads.
+const STREAM_READ_BYTE_CAP_DEFAULT: usize = 8 * 1024 * 1024;
+/// A line reader also materializes its result. The limit excludes a trailing
+/// newline and its optional carriage return.
 const STREAM_LINE_BYTE_CAP_DEFAULT: usize = 256 * 1024;
 const STREAM_CHUNK_BYTES: usize = 8192;
+
+fn read_count(value: i64) -> Result<usize, SemaError> {
+    let count = usize::try_from(value).map_err(|_| {
+        SemaError::eval(format!(
+            "stream/read: count must be non-negative, got {value}"
+        ))
+    })?;
+    if count > STREAM_READ_BYTE_CAP_DEFAULT {
+        return Err(SemaError::eval(format!(
+            "stream/read: count exceeds the configured {STREAM_READ_BYTE_CAP_DEFAULT}-byte cap"
+        ))
+        .with_hint("read the stream in bounded chunks"));
+    }
+    Ok(count)
+}
+
+fn read_buffer(count: usize) -> Result<Vec<u8>, SemaError> {
+    let mut buffer = Vec::new();
+    buffer.try_reserve_exact(count).map_err(|error| {
+        SemaError::eval(format!(
+            "stream/read: could not reserve {count} bytes: {error}"
+        ))
+    })?;
+    buffer.resize(count, 0);
+    Ok(buffer)
+}
+
+fn line_cap_error(op: &str, cap: usize) -> SemaError {
+    SemaError::eval(format!("{op}: line exceeds the configured {cap}-byte cap"))
+        .with_hint("process the stream with stream/read in bounded chunks")
+}
+
+/// Content currently known to belong to an unfinished line. A trailing CR is
+/// provisional until the next byte establishes whether it begins CRLF.
+fn pending_line_content_len(bytes: &[u8]) -> usize {
+    bytes
+        .len()
+        .saturating_sub(usize::from(bytes.last() == Some(&b'\r')))
+}
+
+fn extended_line_content_len(bytes: &[u8], chunk: &[u8]) -> usize {
+    let total = bytes.len().saturating_add(chunk.len());
+    let Some(&last) = chunk.last().or_else(|| bytes.last()) else {
+        return 0;
+    };
+    if last == b'\n' {
+        let before_last = if chunk.len() >= 2 {
+            chunk.get(chunk.len() - 2)
+        } else if chunk.len() == 1 {
+            bytes.last()
+        } else {
+            bytes.get(bytes.len().saturating_sub(2))
+        };
+        return total
+            .saturating_sub(1)
+            .saturating_sub(usize::from(before_last == Some(&b'\r')));
+    }
+    total.saturating_sub(usize::from(last == b'\r'))
+}
+
+fn finished_line_content_len(bytes: &[u8], strip_bare_carriage_return: bool) -> usize {
+    if let Some(without_newline) = bytes.strip_suffix(b"\n") {
+        return without_newline
+            .strip_suffix(b"\r")
+            .unwrap_or(without_newline)
+            .len();
+    }
+    if strip_bare_carriage_return {
+        return bytes.strip_suffix(b"\r").unwrap_or(bytes).len();
+    }
+    bytes.len()
+}
+
+fn extend_line(bytes: &mut Vec<u8>, chunk: &[u8], cap: usize, op: &str) -> Result<(), SemaError> {
+    if extended_line_content_len(bytes, chunk) > cap {
+        return Err(line_cap_error(op, cap));
+    }
+    bytes.try_reserve(chunk.len()).map_err(|error| {
+        SemaError::eval(format!(
+            "{op}: could not reserve {} line bytes within the {cap}-byte cap: {error}",
+            chunk.len()
+        ))
+    })?;
+    bytes.extend_from_slice(chunk);
+    Ok(())
+}
 
 fn aggregation_cap(args: &[Value], index: usize, op: &str) -> Result<usize, SemaError> {
     let Some(value) = args.get(index) else {
@@ -276,19 +366,14 @@ pub fn register(env: &sema_core::Env) {
     register_runtime_fn(env, "stream/read", |args| {
         check_arity!(args, "stream/read", 2);
         let s = expect_stream(args, "stream/read", 0)?;
-        let n = args.int_at(1, "stream/read")?;
-        if n < 0 {
-            return Err(SemaError::eval(format!(
-                "stream/read: count must be non-negative, got {n}"
-            )));
-        }
+        let n = read_count(args.int_at(1, "stream/read")?)?;
 
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(outcome) = io_streams::maybe_async_read(&s, n as usize)? {
+        if let Some(outcome) = io_streams::maybe_async_read(&s, n)? {
             return Ok(outcome);
         }
 
-        let mut buf = vec![0u8; n as usize];
+        let mut buf = read_buffer(n)?;
         let bytes_read = s.read(&mut buf)?;
         buf.truncate(bytes_read);
         Ok(NativeOutcome::Return(Value::bytevector(buf)))
@@ -484,7 +569,12 @@ pub fn register(env: &sema_core::Env) {
             if buf[0] == b'\n' {
                 break;
             }
-            line.push(buf[0]);
+            extend_line(
+                &mut line,
+                &buf,
+                STREAM_LINE_BYTE_CAP_DEFAULT,
+                "stream/read-line",
+            )?;
         }
         // Strip trailing \r if present
         if line.last() == Some(&b'\r') {
@@ -626,11 +716,9 @@ mod io_streams {
     /// The checkout slot lives directly on the stream object rather than in
     /// a separate keyed registry (unlike `sqlite.rs`/`proc.rs`): the
     /// `Rc<StreamBox>` holding this stream already IS the unique handle.
-    /// Closing an input stream needs no I/O (the default `SemaStream::close`
-    /// is a no-op — the fd is released when the `Rc` finally drops), so
-    /// `FileInSlot` tracks only busy/tombstoned, never "closed"; `stream/read`
-    /// and `stream/read-line`'s async paths consult `StreamBox::is_closed()`
-    /// directly before ever attempting a checkout.
+    /// Closing an input stream drops the owned reader and releases its file
+    /// descriptor immediately. `StreamBox` also records the closed state so
+    /// all ordinary read paths reject the handle before a checkout.
     #[derive(Debug)]
     pub struct FileInputStream {
         slot: RefCell<FileInSlot>,
@@ -643,6 +731,7 @@ mod io_streams {
     #[derive(Debug)]
     enum FileInSlot {
         Available(BufReader<std::fs::File>),
+        Closed,
         CheckedOut,
         Tombstone(String),
     }
@@ -661,6 +750,17 @@ mod io_streams {
         }
     }
 
+    #[cfg(all(test, unix))]
+    pub(super) fn file_input_fd_for_test(stream: &FileInputStream) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+
+        let slot = stream.slot.borrow();
+        match &*slot {
+            FileInSlot::Available(reader) => reader.get_ref().as_raw_fd(),
+            _ => panic!("test stream must have an available reader"),
+        }
+    }
+
     impl Drop for FileInputStream {
         fn drop(&mut self) {
             if let Some(gate) = self.gate.get_mut().take() {
@@ -673,6 +773,7 @@ mod io_streams {
         fn read(&self, buf: &mut [u8]) -> Result<usize, SemaError> {
             match &mut *self.slot.borrow_mut() {
                 FileInSlot::Available(r) => r.read(buf).eval_ctx("stream/read: I/O error"),
+                FileInSlot::Closed => Err(SemaError::eval("stream/read: file stream is closed")),
                 FileInSlot::CheckedOut => Err(busy_err("stream/read")),
                 FileInSlot::Tombstone(msg) => Err(tombstone_err("stream/read", msg)),
             }
@@ -691,7 +792,21 @@ mod io_streams {
             // trait's `available` being a best-effort, never-failing probe.
             match &*self.slot.borrow() {
                 FileInSlot::Available(r) => Ok(!r.buffer().is_empty()),
-                FileInSlot::CheckedOut | FileInSlot::Tombstone(_) => Ok(false),
+                FileInSlot::Closed | FileInSlot::CheckedOut | FileInSlot::Tombstone(_) => Ok(false),
+            }
+        }
+
+        fn close(&self) -> Result<(), SemaError> {
+            let mut slot = self.slot.borrow_mut();
+            match &mut *slot {
+                FileInSlot::Available(_) => {
+                    // Replacing the reader drops its File immediately.
+                    *slot = FileInSlot::Closed;
+                    Ok(())
+                }
+                FileInSlot::Closed => Ok(()),
+                FileInSlot::CheckedOut => Err(busy_err("stream/close")),
+                FileInSlot::Tombstone(msg) => Err(tombstone_err("stream/close", msg)),
             }
         }
 
@@ -919,7 +1034,7 @@ mod io_streams {
                 .expect("caller already verified stream_type() == \"file-input\"");
             let result = match &*input.slot.borrow() {
                 FileInSlot::Tombstone(message) => Some(message.clone()),
-                FileInSlot::Available(_) => None,
+                FileInSlot::Available(_) | FileInSlot::Closed => None,
                 FileInSlot::CheckedOut => unreachable!("busy state checked before owner close"),
             };
             result
@@ -1076,6 +1191,7 @@ mod io_streams {
                 };
                 Ok(r)
             }
+            FileInSlot::Closed => Err(SemaError::eval(format!("{op}: stream is closed"))),
             FileInSlot::CheckedOut => Err(busy_err(op)),
             FileInSlot::Tombstone(msg) => Err(tombstone_err(op, msg)),
         }
@@ -1663,9 +1779,11 @@ mod io_streams {
         let mut line = Vec::new();
         let mut terminated = false;
         loop {
-            // The value ABI predates the runtime continuation cap and remains
-            // unbounded for embedders that invoke the native function directly.
-            let read_len = STDIN_OWNER_CHUNK_BYTES;
+            let read_len = capped_read_len(
+                pending_line_content_len(&line),
+                STREAM_LINE_BYTE_CAP_DEFAULT,
+            )
+            .min(STDIN_OWNER_CHUNK_BYTES);
             let Some(chunk) = lease.blocking_read(read_len, Some(b'\n'), op)? else {
                 if line.is_empty() {
                     return Ok(None);
@@ -1673,13 +1791,7 @@ mod io_streams {
                 break;
             };
             let complete = chunk.last() == Some(&b'\n');
-            line.try_reserve(chunk.len()).map_err(|error| {
-                SemaError::eval(format!(
-                    "{op}: could not reserve {} line bytes: {error}",
-                    chunk.len()
-                ))
-            })?;
-            line.extend_from_slice(&chunk);
+            extend_line(&mut line, &chunk, STREAM_LINE_BYTE_CAP_DEFAULT, op)?;
             if complete {
                 line.pop();
                 terminated = true;
@@ -1779,7 +1891,7 @@ mod io_streams {
             "stream/read",
             stream,
             move |reader: &mut BufReader<std::fs::File>| -> Result<Vec<u8>, String> {
-                let mut buf = vec![0u8; n];
+                let mut buf = read_buffer(n).map_err(|error| render(error.to_string()))?;
                 let read = reader
                     .read(&mut buf)
                     .map_err(|e| render(format!("stream/read: I/O error: {e}")))?;
@@ -1915,8 +2027,8 @@ mod io_streams {
                     cap,
                     strip_bare_carriage_return,
                 } => {
-                    if finished_stdin_line_content_len(&bytes, strip_bare_carriage_return) > cap {
-                        return Err(stdin_line_cap_error(op, cap));
+                    if finished_line_content_len(&bytes, strip_bare_carriage_return) > cap {
+                        return Err(line_cap_error(op, cap));
                     }
                     finish_stdin_line(bytes, op, strip_bare_carriage_return)
                 }
@@ -1956,71 +2068,6 @@ mod io_streams {
         let text = String::from_utf8(bytes)
             .map_err(|error| SemaError::eval(format!("{op}: invalid UTF-8: {error}")))?;
         Ok(NativeOutcome::Return(Value::string_owned(text)))
-    }
-
-    fn extend_stdin_line(
-        bytes: &mut Vec<u8>,
-        chunk: &[u8],
-        cap: usize,
-        op: &str,
-    ) -> Result<(), SemaError> {
-        if extended_stdin_line_content_len(bytes, chunk) > cap {
-            return Err(stdin_line_cap_error(op, cap));
-        }
-        bytes.try_reserve(chunk.len()).map_err(|error| {
-            SemaError::eval(format!(
-                "{op}: could not reserve {} line bytes within the {cap}-byte cap: {error}",
-                chunk.len()
-            ))
-        })?;
-        bytes.extend_from_slice(chunk);
-        Ok(())
-    }
-
-    fn stdin_line_cap_error(op: &str, cap: usize) -> SemaError {
-        SemaError::eval(format!("{op}: line exceeds the configured {cap}-byte cap"))
-            .with_hint("process standard input with stream/read in bounded chunks")
-    }
-
-    /// Content currently known to belong to an unfinished line. A trailing CR
-    /// is provisional until the next byte establishes whether it begins CRLF.
-    fn pending_stdin_line_content_len(bytes: &[u8]) -> usize {
-        bytes
-            .len()
-            .saturating_sub(usize::from(bytes.last() == Some(&b'\r')))
-    }
-
-    fn extended_stdin_line_content_len(bytes: &[u8], chunk: &[u8]) -> usize {
-        let total = bytes.len().saturating_add(chunk.len());
-        let Some(&last) = chunk.last().or_else(|| bytes.last()) else {
-            return 0;
-        };
-        if last == b'\n' {
-            let before_last = if chunk.len() >= 2 {
-                chunk.get(chunk.len() - 2)
-            } else if chunk.len() == 1 {
-                bytes.last()
-            } else {
-                bytes.get(bytes.len().saturating_sub(2))
-            };
-            return total
-                .saturating_sub(1)
-                .saturating_sub(usize::from(before_last == Some(&b'\r')));
-        }
-        total.saturating_sub(usize::from(last == b'\r'))
-    }
-
-    fn finished_stdin_line_content_len(bytes: &[u8], strip_bare_carriage_return: bool) -> usize {
-        if let Some(without_newline) = bytes.strip_suffix(b"\n") {
-            return without_newline
-                .strip_suffix(b"\r")
-                .unwrap_or(without_newline)
-                .len();
-        }
-        if strip_bare_carriage_return {
-            return bytes.strip_suffix(b"\r").unwrap_or(bytes).len();
-        }
-        bytes.len()
     }
 
     fn finish_stdin_text(bytes: Vec<u8>, op: &str) -> NativeResult {
@@ -2138,8 +2185,7 @@ mod io_streams {
         let (read_len, delimiter) = match &state.kind {
             StdinOperationKind::Bytes { max, .. } => (*max, None),
             StdinOperationKind::Line { bytes, cap, .. } => (
-                capped_read_len(pending_stdin_line_content_len(bytes), *cap)
-                    .min(STDIN_OWNER_CHUNK_BYTES),
+                capped_read_len(pending_line_content_len(bytes), *cap).min(STDIN_OWNER_CHUNK_BYTES),
                 Some(b'\n'),
             ),
             StdinOperationKind::Text { bytes, cap } => (capped_read_len(bytes.len(), *cap), None),
@@ -2156,7 +2202,7 @@ mod io_streams {
                 }
                 StdinOperationKind::Line { bytes, cap, .. } => {
                     let complete = chunk.last() == Some(&b'\n');
-                    extend_stdin_line(bytes, &chunk, *cap, op)?;
+                    extend_line(bytes, &chunk, *cap, op)?;
                     if complete {
                         let StdinOperation { lease, kind, .. } = state;
                         drop(lease);
@@ -2292,22 +2338,7 @@ mod io_streams {
             "stream/read-line",
             stream,
             move |reader: &mut BufReader<std::fs::File>| -> Result<Option<String>, String> {
-                let mut line = Vec::new();
-                let n = reader
-                    .read_until(b'\n', &mut line)
-                    .map_err(|e| render(format!("stream/read-line: I/O error: {e}")))?;
-                if n == 0 {
-                    return Ok(None); // EOF, nothing read at all
-                }
-                if line.last() == Some(&b'\n') {
-                    line.pop();
-                }
-                if line.last() == Some(&b'\r') {
-                    line.pop();
-                }
-                String::from_utf8(line)
-                    .map(Some)
-                    .map_err(|e| render(format!("stream/read-line: invalid UTF-8: {e}")))
+                read_file_line(reader, STREAM_LINE_BYTE_CAP_DEFAULT)
             },
             |line: Option<String>| -> Result<Value, SemaError> {
                 Ok(match line {
@@ -2316,6 +2347,49 @@ mod io_streams {
                 })
             },
         )?))
+    }
+
+    /// Read one line without allowing `BufRead::read_until` to grow an
+    /// unbounded destination buffer. `fill_buf` lets us consume exactly one
+    /// line while preserving any following bytes in the reader.
+    fn read_file_line(
+        reader: &mut BufReader<std::fs::File>,
+        cap: usize,
+    ) -> Result<Option<String>, String> {
+        let mut line = Vec::new();
+        loop {
+            let (consumed, complete) = {
+                let available = reader
+                    .fill_buf()
+                    .map_err(|error| render(format!("stream/read-line: I/O error: {error}")))?;
+                if available.is_empty() {
+                    if line.is_empty() {
+                        return Ok(None);
+                    }
+                    break;
+                }
+                let consumed = available
+                    .iter()
+                    .position(|byte| *byte == b'\n')
+                    .map_or(available.len(), |position| position + 1);
+                extend_line(&mut line, &available[..consumed], cap, "stream/read-line")
+                    .map_err(|error| render(error.to_string()))?;
+                (consumed, available[consumed - 1] == b'\n')
+            };
+            reader.consume(consumed);
+            if complete {
+                break;
+            }
+        }
+        if line.last() == Some(&b'\n') {
+            line.pop();
+        }
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        String::from_utf8(line)
+            .map(Some)
+            .map_err(|error| render(format!("stream/read-line: invalid UTF-8: {error}")))
     }
 
     pub(super) fn maybe_async_write(
@@ -2841,6 +2915,59 @@ pub fn register_io(env: &Env, sandbox: &Sandbox) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_count_is_bounded_before_allocation() {
+        assert_eq!(
+            read_count(STREAM_READ_BYTE_CAP_DEFAULT as i64).unwrap(),
+            STREAM_READ_BYTE_CAP_DEFAULT
+        );
+        let error = read_count(STREAM_READ_BYTE_CAP_DEFAULT as i64 + 1)
+            .expect_err("one byte above the cap must not allocate");
+        assert!(error.to_string().contains("8388608-byte cap"));
+    }
+
+    #[test]
+    fn line_growth_respects_content_cap_and_crlf_boundary() {
+        let cap = 4;
+        let mut line = b"abcd".to_vec();
+        extend_line(&mut line, b"\r\n", cap, "stream/read-line")
+            .expect("CRLF does not count toward the line cap");
+        assert_eq!(finished_line_content_len(&line, true), cap);
+
+        let mut line = b"abcd".to_vec();
+        let error = extend_line(&mut line, b"e", cap, "stream/read-line")
+            .expect_err("content above the cap must be rejected before growth");
+        assert!(error.to_string().contains("4-byte cap"));
+        assert_eq!(line, b"abcd");
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), unix))]
+    #[test]
+    fn closing_file_input_releases_the_descriptor() {
+        use std::os::fd::RawFd;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "sema-stream-close-fd-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"stream close regression").unwrap();
+        let stream = io_streams::FileInputStream::open(path.to_str().unwrap()).unwrap();
+        let fd: RawFd = io_streams::file_input_fd_for_test(&stream);
+        stream.close().expect("close input stream");
+        assert_eq!(
+            // SAFETY: `fd` was retrieved from this stream while it was open.
+            // `F_GETFD` only queries descriptor flags after close.
+            unsafe { libc::fcntl(fd, libc::F_GETFD) },
+            -1,
+            "stream/close must release the file descriptor while the stream value remains alive"
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn aggregate_growth_stays_within_cap_and_rejects_without_reserving() {

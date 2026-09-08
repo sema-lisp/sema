@@ -2081,17 +2081,17 @@ impl VM {
                 }
                 Ok(crate::debug::DebugCommand::StepInto) => {
                     debug.step_mode = crate::debug::StepMode::StepInto;
-                    debug.step_frame_depth = self.frames.len();
+                    debug.step_frame_depth = debug.parent_frame_depth + self.frames.len();
                     return DebugStopResume::Resume;
                 }
                 Ok(crate::debug::DebugCommand::StepOver) => {
                     debug.step_mode = crate::debug::StepMode::StepOver;
-                    debug.step_frame_depth = self.frames.len();
+                    debug.step_frame_depth = debug.parent_frame_depth + self.frames.len();
                     return DebugStopResume::Resume;
                 }
                 Ok(crate::debug::DebugCommand::StepOut) => {
                     debug.step_mode = crate::debug::StepMode::StepOut;
-                    debug.step_frame_depth = self.frames.len();
+                    debug.step_frame_depth = debug.parent_frame_depth + self.frames.len();
                     return DebugStopResume::Resume;
                 }
                 Ok(crate::debug::DebugCommand::Pause) => {}
@@ -3073,7 +3073,7 @@ impl VM {
                                 }
                             }
                             if !dbg.resume_skip {
-                                let frame_depth = self.frames.len();
+                                let frame_depth = dbg.parent_frame_depth + self.frames.len();
                                 if dbg.should_stop(file.as_ref(), line, frame_depth)
                                     && self.debug_condition_allows_stop(
                                         file.as_ref(),
@@ -5350,7 +5350,7 @@ impl VM {
         debug: &crate::debug::DebugState,
         ctx: &EvalContext,
     ) -> bool {
-        let frame_depth = self.frames.len();
+        let frame_depth = debug.parent_frame_depth + self.frames.len();
         if !debug.is_pure_breakpoint_stop(file, line, frame_depth) {
             return true;
         }
@@ -6427,14 +6427,11 @@ pub fn compile_program_with_spans_and_natives(
     // foldable builtin, and the folder must see the whole program (the
     // compiler's redefined_globals scan is likewise program-wide).
     let redefined = crate::optimize::redefined_foldable_names(&cores);
-    let mut resolved = Vec::new();
-    let mut total_locals: u16 = 0;
-    for core in cores {
-        let core = crate::optimize::optimize_with_redefined(core, &redefined);
-        let (res, n) = crate::resolve::resolve_with_locals(&core)?;
-        total_locals = total_locals.max(n);
-        resolved.push(res);
-    }
+    let cores: Vec<_> = cores
+        .into_iter()
+        .map(|core| crate::optimize::optimize_with_redefined(core, &redefined))
+        .collect();
+    let (resolved, total_locals) = crate::resolve::resolve_program_with_locals(&cores)?;
     let result = crate::compiler::compile(&resolved, total_locals, known_natives)?;
 
     let functions: Vec<Rc<Function>> = result
@@ -6457,9 +6454,9 @@ pub fn compile_program_with_spans_and_natives(
             arity: 0,
             has_rest: false,
             param_names: Vec::new().into(),
-            local_names: Vec::new(),
+            local_names: result.local_names,
             source_file,
-            local_scopes: Vec::new(),
+            local_scopes: result.local_scopes,
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
         }),
@@ -6563,14 +6560,11 @@ pub fn compile_program(
     // Sibling top-level redefinitions of foldable builtins suppress folding
     // program-wide (see compile_program_with_spans_and_natives).
     let redefined = crate::optimize::redefined_foldable_names(&cores);
-    let mut resolved = Vec::new();
-    let mut total_locals: u16 = 0;
-    for core in cores {
-        let core = crate::optimize::optimize_with_redefined(core, &redefined);
-        let (res, n) = crate::resolve::resolve_with_locals(&core)?;
-        total_locals = total_locals.max(n);
-        resolved.push(res);
-    }
+    let cores: Vec<_> = cores
+        .into_iter()
+        .map(|core| crate::optimize::optimize_with_redefined(core, &redefined))
+        .collect();
+    let (resolved, total_locals) = crate::resolve::resolve_program_with_locals(&cores)?;
     let result = crate::compiler::compile(&resolved, total_locals, known_natives)?;
 
     let functions: Vec<Rc<Function>> = result.functions.into_iter().map(Rc::new).collect();
@@ -6584,9 +6578,9 @@ pub fn compile_program(
             arity: 0,
             has_rest: false,
             param_names: Vec::new().into(),
-            local_names: Vec::new(),
+            local_names: result.local_names,
             source_file: None,
-            local_scopes: Vec::new(),
+            local_scopes: result.local_scopes,
             cache_offset: 0,
             suspend_cache: std::cell::Cell::new(None),
         }),

@@ -17,6 +17,9 @@ pub struct CompileResult {
     /// Used by CallNative opcode for direct dispatch without env lookup.
     /// Empty when no known_natives were provided to the compiler.
     pub native_table: Vec<Spur>,
+    /// Debug names and live ranges for the top-level chunk's local slots.
+    pub local_names: Vec<(u16, Spur)>,
+    pub local_scopes: Vec<(u16, u32, u32)>,
 }
 
 impl CompileResult {
@@ -25,6 +28,8 @@ impl CompileResult {
             chunk,
             functions,
             native_table: Vec::new(),
+            local_names: Vec::new(),
+            local_scopes: Vec::new(),
         }
     }
 }
@@ -88,11 +93,13 @@ pub fn compile(
         compiler.emit.emit_op(Op::Nil);
     }
     compiler.emit.emit_op(Op::Return);
-    let (chunk, functions, native_table, _local_names, _local_scopes) = compiler.finish();
+    let (chunk, functions, native_table, local_names, local_scopes) = compiler.finish();
     Ok(CompileResult {
         chunk,
         functions,
         native_table,
+        local_names,
+        local_scopes,
     })
 }
 

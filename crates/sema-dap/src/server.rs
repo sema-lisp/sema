@@ -60,7 +60,7 @@ struct FrontendState {
 
 pub async fn run() {
     let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin);
+    let mut reader = transport::MessageReader::new(BufReader::new(stdin));
     let mut stdout = tokio::io::stdout();
 
     let mut seq: u64 = 1;
@@ -84,7 +84,7 @@ pub async fn run() {
 
     loop {
         tokio::select! {
-            msg = transport::read_message(&mut reader) => {
+            msg = reader.read_message() => {
                 match msg {
                     Ok(Some(text)) => {
                         let parsed: Result<DapMessage, _> = serde_json::from_str(&text);
@@ -1017,6 +1017,51 @@ struct LaunchedProgram {
     interp: sema_eval::Interpreter,
 }
 
+/// Keep macro-expansion output and runtime output off the protocol stream.
+struct OutputRedirect;
+
+impl OutputRedirect {
+    fn new(events: &std_mpsc::Sender<DebugEvent>) -> Self {
+        let stdout = events.clone();
+        sema_core::set_host_stdout_hook(Some(Box::new(move |text| {
+            let _ = stdout.send(DebugEvent::Output {
+                category: "stdout".into(),
+                output: text.into(),
+            });
+        })));
+        let stderr = events.clone();
+        sema_core::set_host_stderr_hook(Some(Box::new(move |text| {
+            let _ = stderr.send(DebugEvent::Output {
+                category: "stderr".into(),
+                output: text.into(),
+            });
+        })));
+        Self
+    }
+}
+
+impl Drop for OutputRedirect {
+    fn drop(&mut self) {
+        sema_core::set_host_stdout_hook(None);
+        sema_core::set_host_stderr_hook(None);
+    }
+}
+
+fn prepare_program(
+    interpreter: &sema_eval::Interpreter,
+    source: &str,
+    program: &std::path::Path,
+) -> Result<sema_vm::CompiledProgram, sema_core::SemaError> {
+    let (vals, spans) = sema_reader::read_many_with_spans(source)?;
+    interpreter.ctx.merge_span_table(spans);
+    let expanded = interpreter.expand_for_vm_batch(&vals)?;
+    sema_vm::compile_program_with_spans(
+        &expanded,
+        &interpreter.ctx.span_table.borrow(),
+        Some(program.to_path_buf()),
+    )
+}
+
 fn backend_thread(
     mut rx: tokio_mpsc::Receiver<BackendRequest>,
     event_tx: tokio_mpsc::Sender<BackendEvent>,
@@ -1047,31 +1092,21 @@ fn backend_thread(
                     }
                 };
 
-                let (vals, span_map) = match sema_reader::read_many_with_spans(&source) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = reply.send(Err(format!("parse error: {e}")));
-                        continue;
-                    }
-                };
-
-                let prog = match sema_vm::compile_program_with_spans(
-                    &vals,
-                    &span_map,
-                    Some(program.clone()),
-                ) {
+                // Use the same macro expansion as normal execution. Compiling
+                // raw forms treats prelude macros such as for-range as calls.
+                let interpreter = sema_eval::Interpreter::new();
+                interpreter.ctx.push_file_path(program.clone());
+                let (dbg_event_tx, dbg_event_rx) = std_mpsc::channel::<DebugEvent>();
+                let compilation_output = OutputRedirect::new(&dbg_event_tx);
+                let prepared = prepare_program(&interpreter, &source, &program);
+                drop(compilation_output);
+                let prog = match prepared {
                     Ok(v) => v,
                     Err(e) => {
                         let _ = reply.send(Err(format!("compile error: {e}")));
                         continue;
                     }
                 };
-
-                // Set up the interpreter environment (provides stdlib, LLM, prelude)
-                let interpreter = sema_eval::Interpreter::new();
-
-                // Create the event channel (VM → frontend)
-                let (dbg_event_tx, dbg_event_rx) = std_mpsc::channel::<DebugEvent>();
 
                 // Use the command receiver from the frontend
                 let mut ds = DebugState::new(dbg_event_tx, cmd_rx);
@@ -1209,20 +1244,7 @@ fn backend_thread(
                     let interpreter = &interp;
                     // Redirect program stdout/stderr into DAP Output events so they
                     // don't corrupt the JSON-RPC protocol stream on the server's stdout.
-                    let event_tx_stdout = ds.event_tx.clone();
-                    sema_core::set_host_stdout_hook(Some(Box::new(move |s: &str| {
-                        let _ = event_tx_stdout.send(DebugEvent::Output {
-                            category: "stdout".to_string(),
-                            output: s.to_string(),
-                        });
-                    })));
-                    let event_tx_stderr = ds.event_tx.clone();
-                    sema_core::set_host_stderr_hook(Some(Box::new(move |s: &str| {
-                        let _ = event_tx_stderr.send(DebugEvent::Output {
-                            category: "stderr".to_string(),
-                            output: s.to_string(),
-                        });
-                    })));
+                    let output = OutputRedirect::new(&ds.event_tx);
 
                     // Mark a debug session active so that load/import
                     // (which currently bypass the VM debug loop) can emit a
@@ -1256,8 +1278,7 @@ fn backend_thread(
                     // Clear the hooks immediately after execution so any server-side
                     // prints (e.g. error logging) go back to the real stdout/stderr.
                     sema_eval::set_debug_session_active(false);
-                    sema_core::set_host_stdout_hook(None);
-                    sema_core::set_host_stderr_hook(None);
+                    drop(output);
 
                     // An uncaught top-level error settles the root Failed. With the
                     // uncaught-exception filter enabled, stop and let the user
@@ -1403,6 +1424,45 @@ fn hex_to_byte(h1: char, h2: char) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepare_program_expands_user_and_prelude_macros() {
+        let interpreter = sema_eval::Interpreter::new();
+        let program = prepare_program(&interpreter,
+            "(defmacro twice (x) `(+ ,x ,x))\n(define total 0)\n(for-range (i 0 5) (set! total (+ total i)))\n(twice total)",
+            std::path::Path::new("macros.sema")).unwrap();
+        let mut vm = sema_vm::VM::new(
+            interpreter.global_env.clone(),
+            program.functions,
+            &program.native_table,
+            program.main_cache_slots,
+        )
+        .unwrap();
+        vm.seed_main_frame(program.closure);
+        assert_eq!(
+            interpreter.drive_vm_on_runtime(vm).unwrap(),
+            sema_core::Value::int(20)
+        );
+    }
+
+    #[test]
+    fn macro_expansion_output_is_captured_before_launch() {
+        let interpreter = sema_eval::Interpreter::new();
+        let (tx, rx) = std_mpsc::channel();
+        {
+            let _output = OutputRedirect::new(&tx);
+            prepare_program(
+                &interpreter,
+                "(defmacro noisy () (println \"expanding\") 42)\n(noisy)",
+                std::path::Path::new("noisy.sema"),
+            )
+            .unwrap();
+        }
+        assert!(
+            matches!(rx.try_recv().unwrap(), DebugEvent::Output { category, output }
+            if category == "stdout" && output == "expanding\n")
+        );
+    }
 
     #[test]
     fn decode_percent_ascii() {

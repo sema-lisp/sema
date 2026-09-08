@@ -16,6 +16,20 @@ pub fn resolve_with_locals(expr: &CoreExpr) -> Result<(ResolvedExpr, u16), SemaE
     Ok((resolved, n_locals))
 }
 
+/// Resolve one program with distinct local slots across its top-level forms.
+/// Reusing slot zero in each form loses the debugger's name-to-slot mapping.
+pub(crate) fn resolve_program_with_locals(
+    exprs: &[CoreExpr],
+) -> Result<(Vec<ResolvedExpr>, u16), SemaError> {
+    let mut resolver = Resolver::new();
+    let resolved = exprs
+        .iter()
+        .map(|expr| resolve_expr(expr, &mut resolver))
+        .collect::<Result<Vec<_>, _>>()?;
+    let n_locals = resolver.current().next_slot;
+    Ok((resolved, n_locals))
+}
+
 /// A local variable in a scope.
 #[derive(Debug, Clone)]
 struct LocalVar {

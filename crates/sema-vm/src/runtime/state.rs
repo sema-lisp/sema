@@ -2558,6 +2558,15 @@ impl Runtime {
             // identical non-debug quantum.
             let quantum = if crate::vm::is_debug_session_active_for(root) {
                 crate::vm::with_active_debug_for_root(root, |debug| {
+                    // A native step-over must not enter a callback whose VM
+                    // has a shallow physical stack but deeper logical callers.
+                    // Headless hosts still set their step depth from the local
+                    // VM frame count, so leave their existing depth contract.
+                    debug.parent_frame_depth = if debug.is_headless() {
+                        0
+                    } else {
+                        task.vm_owner.as_ref().map_or(0, ReturnOwner::frame_depth)
+                    };
                     vm.run_quantum_debug(&context, remaining_budget, cancellation, debug)
                 })
                 .expect("debug session active for root but no DebugState registered")
@@ -4352,6 +4361,11 @@ impl Runtime {
             let cancellation_view = CancellationView::default();
             let quantum = if crate::vm::is_debug_session_active_for(root) {
                 crate::vm::with_active_debug_for_root(root, |debug| {
+                    debug.parent_frame_depth = if debug.is_headless() {
+                        0
+                    } else {
+                        owner.frame_depth()
+                    };
                     vm.run_quantum_debug(&eval_context, remaining_budget, cancellation_view, debug)
                 })
                 .expect("debug session active for root but no DebugState registered")
@@ -7013,6 +7027,21 @@ pub(super) enum ReturnOwner {
 }
 
 impl ReturnOwner {
+    fn frame_depth(&self) -> usize {
+        let mut depth = 0;
+        let mut owner = self;
+        loop {
+            match owner {
+                Self::Root => return depth,
+                Self::Continuation(parent, _) => owner = parent,
+                Self::VmResume { vm, parent } => {
+                    depth += vm.frame_count();
+                    owner = parent;
+                }
+            }
+        }
+    }
+
     fn call_env(&self) -> Option<Rc<Env>> {
         match self {
             ReturnOwner::VmResume { vm, .. } => Some(vm.active_globals()),

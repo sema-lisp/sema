@@ -1880,6 +1880,145 @@ fn stack_frames(
 const STEP_PROG: &str = "(define (f n)\n  (+ n 1))\n(define a 1)\n(f 10)\n(define b 2)\n";
 
 #[test]
+fn test_dap_next_steps_over_cooperative_callbacks() {
+    let dir = unique_temp_dir("step-over-callback");
+    let path = dir.join("callback.sema");
+    std::fs::write(&path, "(define (work n)\n  (map (fn (x)\n    (+ x n))\n    '(1 2)))\n(define result (work 10))\n(println result)\n").unwrap();
+    let (mut child, mut stdin, mut reader) = session_stopped_at(&path, &[5]);
+    send_dap(&mut stdin, 5, "next", None);
+    read_dap(&mut reader).unwrap();
+    assert!(wait_for_event(&mut reader, "stopped", 50));
+    let frames = stack_frames(&mut stdin, &mut reader, 6);
+    assert_eq!(
+        frames[0]["line"], 6,
+        "step-over must skip the callback: {frames:?}"
+    );
+    send_dap(&mut stdin, 7, "disconnect", None);
+    read_dap(&mut reader).unwrap();
+    assert!(child.wait().unwrap().success());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_dap_top_level_block_locals_keep_their_names_across_forms() {
+    let dir = unique_temp_dir("top-level-locals");
+    let path = dir.join("locals.sema");
+    std::fs::write(
+        &path,
+        "(let ((first 11))\n  (println first))\n(let ((second 22))\n  (println second))\n",
+    )
+    .unwrap();
+    let (mut child, mut stdin, mut reader) = session_stopped_at(&path, &[2, 4]);
+    for (seq, name, expected) in [(5, "first", "11"), (9, "second", "22")] {
+        send_dap(
+            &mut stdin,
+            seq,
+            "evaluate",
+            Some(serde_json::json!({
+                "expression": name, "frameId": 0,
+            })),
+        );
+        let response = read_dap(&mut reader).unwrap();
+        assert_eq!(response["success"], true, "{response:?}");
+        assert_eq!(response["body"]["result"], expected);
+        send_dap(
+            &mut stdin,
+            seq + 1,
+            "scopes",
+            Some(serde_json::json!({"frameId": 0})),
+        );
+        let scopes = read_dap(&mut reader).unwrap();
+        let locals = scopes["body"]["scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|scope| scope["name"] == "Locals")
+            .unwrap();
+        send_dap(
+            &mut stdin,
+            seq + 2,
+            "variables",
+            Some(serde_json::json!({
+                "variablesReference": locals["variablesReference"],
+            })),
+        );
+        let variables = read_dap(&mut reader).unwrap();
+        let locals = variables["body"]["variables"].as_array().unwrap();
+        assert_eq!(
+            locals.len(),
+            1,
+            "out-of-scope locals must be hidden: {locals:?}"
+        );
+        assert_eq!(locals[0]["name"], name);
+        assert_eq!(locals[0]["value"], expected);
+        send_dap(&mut stdin, seq + 3, "continue", None);
+        read_dap(&mut reader).unwrap();
+        assert!(wait_for_event(
+            &mut reader,
+            if seq == 5 { "stopped" } else { "terminated" },
+            50
+        ));
+    }
+    send_dap(&mut stdin, 14, "disconnect", None);
+    read_dap(&mut reader).unwrap();
+    assert!(child.wait().unwrap().success());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_dap_step_out_of_a_suspended_callback_returns_to_its_caller() {
+    let dir = unique_temp_dir("step-out-callback");
+    let path = dir.join("callback.sema");
+    std::fs::write(&path, "(define (work n)\n  (map (fn (x)\n    (async/sleep 1)\n    (+ x n))\n    '(1 2)))\n(define result (work 10))\n(println result)\n").unwrap();
+    let (mut child, mut stdin, mut reader) = session_stopped_at(&path, &[4]);
+    send_dap(
+        &mut stdin,
+        5,
+        "setBreakpoints",
+        Some(serde_json::json!({
+            "source": {"path": path}, "breakpoints": [],
+        })),
+    );
+    read_dap(&mut reader).unwrap();
+    send_dap(&mut stdin, 6, "stepOut", None);
+    read_dap(&mut reader).unwrap();
+    assert!(wait_for_event(&mut reader, "stopped", 50));
+    let frames = stack_frames(&mut stdin, &mut reader, 7);
+    assert_eq!(
+        frames[0]["line"], 7,
+        "step-out must return past the callback: {frames:?}"
+    );
+    send_dap(&mut stdin, 8, "disconnect", None);
+    read_dap(&mut reader).unwrap();
+    assert!(child.wait().unwrap().success());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn test_dap_expands_prelude_macros_before_running() {
+    let dir = unique_temp_dir("macro-program");
+    let path = dir.join("macros.sema");
+    std::fs::write(
+        &path,
+        "(define total 0)\n(for-range (i 1 4) (set! total (+ total i)))\n(println total)\n",
+    )
+    .unwrap();
+    let (mut child, mut stdin, mut reader) = session_stopped_at(&path, &[3]);
+    send_dap(
+        &mut stdin,
+        5,
+        "evaluate",
+        Some(serde_json::json!({"expression": "total"})),
+    );
+    let response = read_dap(&mut reader).unwrap();
+    assert_eq!(response["body"]["result"], "6", "{response:?}");
+    send_dap(&mut stdin, 6, "disconnect", None);
+    read_dap(&mut reader).unwrap();
+    assert!(child.wait().unwrap().success());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn test_dap_breakpoint_stops_on_requested_line() {
     // Pin the 1-based stop LINE (not just "some frame"): a 1-vs-0-based regression in the
     // stop location would otherwise pass.

@@ -195,6 +195,8 @@ pub struct DebugState {
     pub step_mode: StepMode,
     /// Frame depth when stepping was initiated
     pub step_frame_depth: usize,
+    /// Parked caller frames outside the running callback VM (native DAP).
+    pub(crate) parent_frame_depth: usize,
     /// Last source location we stopped at (file, line)
     pub last_stop_line: Option<(PathBuf, u32)>,
     /// External pause request (set by DAP frontend, checked by VM)
@@ -233,6 +235,7 @@ impl DebugState {
             valid_breakpoint_lines: BTreeMap::new(),
             step_mode: StepMode::Continue,
             step_frame_depth: 0,
+            parent_frame_depth: 0,
             last_stop_line: None,
             pause_requested: false,
             resume_skip: false,
@@ -258,6 +261,7 @@ impl DebugState {
             valid_breakpoint_lines: BTreeMap::new(),
             step_mode: StepMode::Continue,
             step_frame_depth: 0,
+            parent_frame_depth: 0,
             last_stop_line: None,
             pause_requested: false,
             resume_skip: false,

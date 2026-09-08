@@ -52,16 +52,19 @@ fn default_max_blank_lines() -> usize {
 }
 
 /// Walk up from cwd to find sema.toml
-pub(crate) fn find_config() -> Option<SemaConfig> {
-    let mut dir = std::env::current_dir().ok()?;
+pub(crate) fn find_config() -> Result<Option<SemaConfig>, String> {
+    let mut dir = std::env::current_dir().map_err(|error| error.to_string())?;
     loop {
         let candidate = dir.join("sema.toml");
         if candidate.is_file() {
-            let text = std::fs::read_to_string(&candidate).ok()?;
-            return toml::from_str(&text).ok();
+            let text = std::fs::read_to_string(&candidate)
+                .map_err(|error| format!("could not read {}: {error}", candidate.display()))?;
+            let config = toml::from_str(&text)
+                .map_err(|error| format!("could not parse {}: {error}", candidate.display()))?;
+            return Ok(Some(config));
         }
         if !dir.pop() {
-            return None;
+            return Ok(None);
         }
     }
 }
@@ -121,16 +124,21 @@ pub(crate) fn run_fmt(
         }
         match sema_fmt::format_source(&source, opts) {
             Ok(formatted) => {
+                let changed = formatted != source;
                 if json {
                     println!(
                         "{}",
                         serde_json::json!({
                             "formatted": true,
+                            "changed": changed,
                             "source": formatted
                         })
                     );
-                } else {
+                } else if !check {
                     print!("{formatted}");
+                }
+                if check && changed {
+                    std::process::exit(1);
                 }
             }
             Err(e) => {
@@ -168,8 +176,24 @@ pub(crate) fn run_fmt(
         // Expand each pattern
         let mut all_files = Vec::new();
         for pattern in patterns {
-            // If it contains glob characters, expand it
-            if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
+            let path = std::path::Path::new(pattern);
+            if path.is_file() {
+                all_files.push(pattern.clone());
+            } else if path.is_dir() {
+                let literal_dir = glob::Pattern::escape(pattern.trim_end_matches(['/', '\\']));
+                let dir_glob = format!("{literal_dir}/**/*.sema");
+                match glob::glob_with(&dir_glob, match_opts) {
+                    Ok(paths) => {
+                        for path in paths.filter_map(|p| p.ok()) {
+                            let path = path.to_string_lossy().to_string();
+                            if !is_ignored(&path) {
+                                all_files.push(path);
+                            }
+                        }
+                    }
+                    Err(e) => die(format!("invalid glob pattern '{dir_glob}': {e}")),
+                }
+            } else if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
                 match glob::glob_with(pattern, match_opts) {
                     Ok(paths) => {
                         for path in paths.filter_map(|p| p.ok()) {
@@ -181,22 +205,6 @@ pub(crate) fn run_fmt(
                     }
                     Err(e) => {
                         die(format!("invalid glob pattern '{pattern}': {e}"));
-                    }
-                }
-            } else if std::path::Path::new(pattern).is_dir() {
-                // A directory means every .sema file under it (`sema fmt .`).
-                let dir_glob = format!("{}/**/*.sema", pattern.trim_end_matches(['/', '\\']));
-                match glob::glob_with(&dir_glob, match_opts) {
-                    Ok(paths) => {
-                        for path in paths.filter_map(|p| p.ok()) {
-                            let path = path.to_string_lossy().to_string();
-                            if !is_ignored(&path) {
-                                all_files.push(path);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        die(format!("invalid glob pattern '{dir_glob}': {e}"));
                     }
                 }
             } else {

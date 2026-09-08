@@ -4,7 +4,12 @@ use sema_core::{SemaError, Span};
 #[derive(Debug, Clone, PartialEq)]
 pub enum FStringPart {
     Literal(String),
-    Expr(String),
+    /// The expression source and the position of its first non-whitespace
+    /// character in the containing source file.
+    Expr {
+        source: String,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -35,6 +40,8 @@ pub enum Token {
     Bool(bool),
     Char(char),
     BytevectorStart,
+    F64ArrayStart,
+    I64ArrayStart,
     Dot,
     Comment(String),
     Newline,
@@ -213,6 +220,26 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                 let token_start = i;
                 if i + 1 < chars.len() {
                     match chars[i + 1] {
+                        'f' if chars.get(i + 2..i + 5) == Some(&['6', '4', '(']) => {
+                            i += 5;
+                            col += 5;
+                            tokens.push(SpannedToken {
+                                token: Token::F64ArrayStart,
+                                span: span.with_end(line, col),
+                                byte_start: byte_offsets[token_start],
+                                byte_end: byte_offsets[i],
+                            });
+                        }
+                        'i' if chars.get(i + 2..i + 5) == Some(&['6', '4', '(']) => {
+                            i += 5;
+                            col += 5;
+                            tokens.push(SpannedToken {
+                                token: Token::I64ArrayStart,
+                                span: span.with_end(line, col),
+                                byte_start: byte_offsets[token_start],
+                                byte_end: byte_offsets[i],
+                            });
+                        }
                         't' | 'f' => {
                             // `#t` / `#f`, plus the R7RS long forms `#true` /
                             // `#false`. The literal must end at a delimiter so
@@ -378,6 +405,7 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                             // followed by the number body. Bignum-capable; the
                             // result is lowered to the tightest token.
                             let (token, len) = read_hash_number(&chars[i..], &span)?;
+                            ensure_number_delimiter(&chars, i, i + len, span, line, col)?;
                             col += len;
                             i += len;
                             tokens.push(SpannedToken {
@@ -447,7 +475,14 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                         if chars[i] == '\\' && i + 1 < chars.len() {
                             i += 1;
                             col += 1;
+                            let escape_start = i;
                             read_string_escape(&chars, &mut i, &mut col, &mut current, span)?;
+                            let consumed = &chars[escape_start..=i.min(chars.len() - 1)];
+                            let breaks = consumed.iter().filter(|c| **c == '\n').count();
+                            if breaks > 0 {
+                                line += breaks;
+                                col = 0;
+                            }
                         } else if chars[i] == '$' && i + 1 < chars.len() && chars[i + 1] == '{' {
                             // Start interpolation
                             if !current.is_empty() {
@@ -455,33 +490,28 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                             }
                             i += 2; // skip "${"
                             col += 2;
-                            let mut expr = String::new();
-                            let mut depth = 1;
-                            while i < chars.len() && depth > 0 {
-                                if chars[i] == '{' {
-                                    depth += 1;
-                                } else if chars[i] == '}' {
-                                    depth -= 1;
-                                    if depth == 0 {
-                                        break;
+                            let expr_start = i;
+                            let expr_span = Span::point(line, col);
+                            let expr_end = find_fstring_interpolation_end(&chars, expr_start)
+                                .ok_or_else(|| {
+                                    SemaError::Reader {
+                                        message: "unterminated interpolation in f-string"
+                                            .to_string(),
+                                        span,
                                     }
-                                }
-                                if chars[i] == '\n' {
+                                    .with_hint("add a closing `}` to end the ${...} interpolation")
+                                })?;
+                            for expr_char in &chars[expr_start..expr_end] {
+                                if *expr_char == '\n' {
                                     line += 1;
-                                    col = 0;
+                                    col = 1;
+                                } else {
+                                    col += 1;
                                 }
-                                expr.push(chars[i]);
-                                i += 1;
-                                col += 1;
                             }
-                            if depth != 0 {
-                                return Err(SemaError::Reader {
-                                    message: "unterminated interpolation in f-string".to_string(),
-                                    span,
-                                }
-                                .with_hint("add a closing `}` to end the ${...} interpolation"));
-                            }
-                            let trimmed = expr.trim().to_string();
+                            let expr: String = chars[expr_start..expr_end].iter().collect();
+                            i = expr_end;
+                            let trimmed = expr.trim();
                             if trimmed.is_empty() {
                                 return Err(SemaError::Reader {
                                     message: "empty interpolation in f-string".to_string(),
@@ -489,7 +519,12 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                                 }
                                 .with_hint("${} must contain an expression, e.g. ${name}"));
                             }
-                            parts.push(FStringPart::Expr(trimmed));
+                            let leading = expr.len() - expr.trim_start().len();
+                            let trimmed_span = advance_span(expr_span, &expr[..leading]);
+                            parts.push(FStringPart::Expr {
+                                source: trimmed.to_string(),
+                                span: trimmed_span,
+                            });
                             // i points to closing '}', outer i+=1 will skip past it
                         } else {
                             if chars[i] == '\n' {
@@ -651,6 +686,20 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
     }
 
     Ok(tokens)
+}
+
+fn advance_span(start: Span, source: &str) -> Span {
+    let mut line = start.line;
+    let mut col = start.col;
+    for ch in source.chars() {
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    Span::point(line, col)
 }
 
 /// Process a string escape sequence. `chars[*i]` is the character after `\`.
@@ -828,8 +877,18 @@ fn read_hash_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaE
     let (num, body_len) = match radix {
         Some(r) if r != 10 => read_radix_integer(&chars[i..], r, span)?,
         _ => {
-            let (tok, len) = read_number(&chars[i..], span)?;
-            (token_to_number(tok, span)?, len)
+            if let Some((im, end)) = try_imaginary_tail(chars, i, span)? {
+                (
+                    SemaNumber::Complex(Box::new(sema_core::number::Complex {
+                        re: SemaNumber::from_i64(0),
+                        im,
+                    })),
+                    end - i,
+                )
+            } else {
+                let (tok, len) = read_number(&chars[i..], span)?;
+                (token_to_number(tok, span)?, len)
+            }
         }
     };
     // Apply the exactness override, then lower to the tightest token.
@@ -904,8 +963,14 @@ fn number_to_token(n: SemaNumber) -> Token {
 }
 
 fn read_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaError> {
+    if chars.is_empty() {
+        return Err(SemaError::Reader {
+            message: "expected a number".to_string(),
+            span: *span,
+        });
+    }
     let mut i = 0;
-    if chars[i] == '-' {
+    if chars[i] == '-' || chars[i] == '+' {
         i += 1;
     }
     while i < chars.len() && chars[i].is_ascii_digit() {
@@ -1036,6 +1101,123 @@ fn parse_real_component(s: &str, is_float: bool, span: &Span) -> Result<SemaNumb
 /// as imaginary when it is not part of a longer identifier like `pi`/`list`).
 fn is_delimiter_at(chars: &[char], idx: usize) -> bool {
     idx >= chars.len() || is_delimiter(chars[idx])
+}
+
+fn ensure_number_delimiter(
+    chars: &[char],
+    start: usize,
+    end: usize,
+    span: Span,
+    line: usize,
+    col: usize,
+) -> Result<(), SemaError> {
+    if is_delimiter_at(chars, end) {
+        return Ok(());
+    }
+
+    let mut stop = end;
+    while !is_delimiter_at(chars, stop) {
+        stop += 1;
+    }
+    let text: String = chars[start..stop].iter().collect();
+    Err(SemaError::Reader {
+        message: format!("invalid number literal: {text}"),
+        span: span.with_end(line, col + (stop - start)),
+    }
+    .with_hint("a number must be followed by whitespace or a bracket"))
+}
+
+#[derive(Clone, Copy)]
+enum FStringScanContext {
+    Interpolation { brace_depth: usize },
+    String,
+    Regex,
+    FString,
+    Comment,
+}
+
+/// Find the `}` that closes an f-string interpolation. Reader syntax inside the
+/// interpolation keeps its own braces: strings, regexes, character literals,
+/// comments, and nested f-strings cannot close the outer interpolation.
+fn find_fstring_interpolation_end(chars: &[char], start: usize) -> Option<usize> {
+    let mut contexts = vec![FStringScanContext::Interpolation { brace_depth: 1 }];
+    let mut i = start;
+
+    while i < chars.len() {
+        match contexts.last_mut()? {
+            FStringScanContext::Interpolation { brace_depth } => match chars[i] {
+                '"' => {
+                    contexts.push(FStringScanContext::String);
+                    i += 1;
+                }
+                '#' if chars.get(i + 1) == Some(&'"') => {
+                    contexts.push(FStringScanContext::Regex);
+                    i += 2;
+                }
+                'f' if chars.get(i + 1) == Some(&'"') => {
+                    contexts.push(FStringScanContext::FString);
+                    i += 2;
+                }
+                ';' => {
+                    contexts.push(FStringScanContext::Comment);
+                    i += 1;
+                }
+                '#' if chars.get(i + 1) == Some(&'\\') => {
+                    i += 2;
+                    if i < chars.len() && chars[i].is_alphabetic() {
+                        while i < chars.len() && is_symbol_char(chars[i]) {
+                            i += 1;
+                        }
+                    } else if i < chars.len() {
+                        i += 1;
+                    }
+                }
+                '{' => {
+                    *brace_depth += 1;
+                    i += 1;
+                }
+                '}' => {
+                    *brace_depth -= 1;
+                    if *brace_depth == 0 {
+                        contexts.pop();
+                        if contexts.is_empty() {
+                            return Some(i);
+                        }
+                    }
+                    i += 1;
+                }
+                _ => i += 1,
+            },
+            FStringScanContext::String | FStringScanContext::Regex => match chars[i] {
+                '\\' if i + 1 < chars.len() => i += 2,
+                '"' => {
+                    contexts.pop();
+                    i += 1;
+                }
+                _ => i += 1,
+            },
+            FStringScanContext::FString => match chars[i] {
+                '\\' if i + 1 < chars.len() => i += 2,
+                '"' => {
+                    contexts.pop();
+                    i += 1;
+                }
+                '$' if chars.get(i + 1) == Some(&'{') => {
+                    contexts.push(FStringScanContext::Interpolation { brace_depth: 1 });
+                    i += 2;
+                }
+                _ => i += 1,
+            },
+            FStringScanContext::Comment => {
+                if chars[i] == '\n' {
+                    contexts.pop();
+                }
+                i += 1;
+            }
+        }
+    }
+
+    None
 }
 
 fn is_delimiter(ch: char) -> bool {
@@ -1280,6 +1462,44 @@ mod tests {
         // `+` alone, and `+` followed by a non-digit, stay symbols.
         assert!(matches!(first("+"), Token::Symbol(s) if s == "+"));
         assert!(matches!(first("+foo"), Token::Symbol(s) if s == "+foo"));
+    }
+
+    #[test]
+    fn test_prefixed_numbers_use_the_same_sign_and_boundary_rules() {
+        let first = |src: &str| tokenize(src).unwrap().into_iter().next().unwrap().token;
+
+        assert_eq!(first("#d+42"), Token::Int(42));
+        assert!(matches!(first("#e+1.5"), Token::Rational(_)));
+        assert_eq!(first("#i+2"), Token::Float(2.0));
+        assert_eq!(first("#x+ff"), Token::Int(255));
+        assert_eq!(
+            first("#e+i"),
+            Token::Complex(SemaNumber::from_i64(0), SemaNumber::from_i64(1))
+        );
+        assert_eq!(
+            first("#i-i"),
+            Token::Complex(SemaNumber::from_f64(0.0), SemaNumber::from_f64(-1.0))
+        );
+
+        for bad in ["#e1abc", "#d1.5.6", "#i1/2foo", "#x1+foo", "#b1-a"] {
+            let err = tokenize(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("invalid number literal"),
+                "{bad}: expected invalid-number error, got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_escaped_newlines_advance_string_token_locations() {
+        for source in ["\"\\\n\"\n)", "f\"\\\n\"\n)"] {
+            let tokens = tokenize(source).unwrap();
+            let close = tokens
+                .iter()
+                .find(|token| matches!(token.token, Token::RParen))
+                .expect("source contains a closing parenthesis");
+            assert_eq!(close.span.line, 3, "wrong span for {source:?}");
+        }
     }
 
     #[test]

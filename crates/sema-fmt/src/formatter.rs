@@ -50,6 +50,10 @@ enum Node {
     ShortLambda(Vec<Node>),
     /// `#u8(` ... `)`
     ByteVector(Vec<Node>),
+    /// `#f64(` ... `)`
+    F64Array(Vec<Node>),
+    /// `#i64(` ... `)`
+    I64Array(Vec<Node>),
     /// Quote / quasiquote / unquote / unquote-splice prefix attached to the
     /// following node.
     Prefix(Token, Box<Node>),
@@ -59,13 +63,11 @@ enum Node {
 // Building the node tree from the flat token stream
 // ---------------------------------------------------------------------------
 
-/// Maximum nesting depth for parsing and formatting. Keeps the recursive node
-/// builder and formatter from overflowing the stack on adversarial input.
-/// Deliberately lower than the reader's 1024: the formatter's stack frames
-/// are much larger than the reader's, and 2 MiB threads (Rust test/worker
-/// default) overflow well below 400 levels in debug builds. No real program
-/// nests anywhere near this deep.
-const MAX_DEPTH: usize = 200;
+/// Maximum nesting depth for parsing and formatting.
+///
+/// Keep this aligned with the reader so every source file the reader accepts
+/// within its nesting contract can also be formatted.
+const MAX_DEPTH: usize = 1024;
 
 /// Build the [`Node`] tree for a whole token stream (one node per top-level
 /// form, comment, or newline). `source` is needed to recover the original
@@ -83,6 +85,15 @@ fn build_nodes(tokens: &[SpannedToken], source: &str) -> Result<Vec<Node>, SemaE
 
 /// Parse one node starting at `pos`, returning `(node, next_pos)`.
 fn build_one(
+    tokens: &[SpannedToken],
+    pos: usize,
+    source: &str,
+    depth: usize,
+) -> Result<(Node, usize), SemaError> {
+    sema_core::stack::maybe_grow(|| build_one_inner(tokens, pos, source, depth))
+}
+
+fn build_one_inner(
     tokens: &[SpannedToken],
     pos: usize,
     source: &str,
@@ -124,7 +135,7 @@ fn build_one(
             if next_pos >= tokens.len() {
                 return Err(SemaError::eval("prefix token at end of input"));
             }
-            let (inner, next) = build_one(tokens, next_pos, source, depth + 1)?;
+            let (inner, next) = build_one(tokens, next_pos, source, depth)?;
             Ok((Node::Prefix(prefix_tok, Box::new(inner)), next))
         }
 
@@ -154,6 +165,22 @@ fn build_one(
             source,
             depth,
             Node::ByteVector,
+        ),
+        Token::F64ArrayStart => build_group(
+            tokens,
+            pos + 1,
+            Token::RParen,
+            source,
+            depth,
+            Node::F64Array,
+        ),
+        Token::I64ArrayStart => build_group(
+            tokens,
+            pos + 1,
+            Token::RParen,
+            source,
+            depth,
+            Node::I64Array,
         ),
 
         // Closing delimiters — should not appear here at top-level
@@ -324,7 +351,9 @@ fn has_any_comments(node: &Node) -> bool {
         | Node::Vector(children)
         | Node::Map(children)
         | Node::ShortLambda(children)
-        | Node::ByteVector(children) => children.iter().any(has_any_comments),
+        | Node::ByteVector(children)
+        | Node::F64Array(children)
+        | Node::I64Array(children) => children.iter().any(has_any_comments),
         Node::Prefix(_, inner) => has_any_comments(inner),
         _ => false,
     }
@@ -338,7 +367,9 @@ fn has_any_newlines(node: &Node) -> bool {
         | Node::Vector(children)
         | Node::Map(children)
         | Node::ShortLambda(children)
-        | Node::ByteVector(children) => children.iter().any(has_any_newlines),
+        | Node::ByteVector(children)
+        | Node::F64Array(children)
+        | Node::I64Array(children) => children.iter().any(has_any_newlines),
         Node::Prefix(_, inner) => has_any_newlines(inner),
         _ => false,
     }
@@ -484,6 +515,9 @@ fn measure_width(node: &Node, budget: usize) -> Option<usize> {
         Node::Map(children) => grouped_measure_width(children, 1, 1, budget),
         Node::ShortLambda(children) => grouped_measure_width(children, 2, 1, budget),
         Node::ByteVector(children) => grouped_measure_width(children, 4, 1, budget),
+        Node::F64Array(children) | Node::I64Array(children) => {
+            grouped_measure_width(children, 5, 1, budget)
+        }
         Node::Prefix(tok, inner) => {
             let prefix_w = prefix_text(tok).len();
             if prefix_w > budget {
@@ -557,6 +591,7 @@ fn token_width(tok: &Token) -> usize {
         Token::Deref => 1,
         Token::ShortLambdaStart => 2,
         Token::BytevectorStart => 4,
+        Token::F64ArrayStart | Token::I64ArrayStart => 5,
         Token::Comment(text) => text.len(),
         Token::Newline => 1,
         // FString, Regex, and Complex have variable-length formatted output —
@@ -603,6 +638,8 @@ fn token_text(tok: &Token) -> Cow<'_, str> {
         Token::Deref => Cow::Borrowed("@"),
         Token::ShortLambdaStart => Cow::Borrowed("#("),
         Token::BytevectorStart => Cow::Borrowed("#u8("),
+        Token::F64ArrayStart => Cow::Borrowed("#f64("),
+        Token::I64ArrayStart => Cow::Borrowed("#i64("),
         Token::Comment(text) => Cow::Borrowed(text.as_str()),
         Token::Newline => Cow::Borrowed("\n"),
     }
@@ -659,9 +696,9 @@ fn format_fstring(parts: &[FStringPart]) -> String {
                     }
                 }
             }
-            FStringPart::Expr(expr) => {
+            FStringPart::Expr { source, .. } => {
                 out.push_str("${");
-                out.push_str(expr);
+                out.push_str(source);
                 out.push('}');
             }
         }
@@ -856,6 +893,10 @@ impl Formatter {
     }
 
     fn format_node(&mut self, node: &Node, indent: usize) {
+        sema_core::stack::maybe_grow(|| self.format_node_inner(node, indent));
+    }
+
+    fn format_node_inner(&mut self, node: &Node, indent: usize) {
         match node {
             Node::Atom(tok) => {
                 self.output.push_str(&token_text(tok));
@@ -883,6 +924,12 @@ impl Formatter {
             }
             Node::ByteVector(children) => {
                 self.format_collection(children, indent, "#u8(", ")");
+            }
+            Node::F64Array(children) => {
+                self.format_collection(children, indent, "#f64(", ")");
+            }
+            Node::I64Array(children) => {
+                self.format_collection(children, indent, "#i64(", ")");
             }
             Node::Prefix(tok, inner) => {
                 self.output.push_str(prefix_text(tok));
@@ -2395,6 +2442,8 @@ fn node_to_flat_string(node: &Node) -> String {
         Node::Map(children) => flat_string(children, "{", "}"),
         Node::ShortLambda(children) => flat_string(children, "#(", ")"),
         Node::ByteVector(children) => flat_string(children, "#u8(", ")"),
+        Node::F64Array(children) => flat_string(children, "#f64(", ")"),
+        Node::I64Array(children) => flat_string(children, "#i64(", ")"),
         Node::Prefix(tok, inner) => {
             format!("{}{}", prefix_text(tok), node_to_flat_string(inner))
         }
@@ -2572,7 +2621,9 @@ fn format_with_fences(src: &str, opts: &FormatOptions) -> Result<String, SemaErr
             | Token::LBracket
             | Token::LBrace
             | Token::ShortLambdaStart
-            | Token::BytevectorStart => depth += 1,
+            | Token::BytevectorStart
+            | Token::F64ArrayStart
+            | Token::I64ArrayStart => depth += 1,
             Token::RParen | Token::RBracket | Token::RBrace => depth -= 1,
             Token::Comment(text) if depth == 0 => {
                 let t = text.trim_start_matches(';').trim();

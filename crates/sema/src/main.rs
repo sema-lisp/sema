@@ -270,8 +270,8 @@ enum Commands {
         indent: Option<usize>,
 
         /// Align consecutive similar forms (defines, cond clauses, let bindings)
-        #[arg(long)]
-        align: bool,
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        align: Option<bool>,
 
         /// Max consecutive blank lines to keep (default: 1, or value from sema.toml)
         #[arg(long)]
@@ -1318,11 +1318,13 @@ fn main() {
                 max_blank_lines,
                 json,
             } => {
-                let config = fmt::find_config().unwrap_or_default();
+                let config = fmt::find_config()
+                    .unwrap_or_else(|error| die(error))
+                    .unwrap_or_default();
                 let opts = sema_fmt::FormatOptions {
                     width: width.unwrap_or(config.fmt.width),
                     indent: indent.unwrap_or(config.fmt.indent),
-                    align: align || config.fmt.align,
+                    align: align.unwrap_or(config.fmt.align),
                     max_blank_lines: max_blank_lines.unwrap_or(config.fmt.max_blank_lines),
                 };
                 fmt::run_fmt(&files, check, diff, &opts, &config.fmt.ignore, json);

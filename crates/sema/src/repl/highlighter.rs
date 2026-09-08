@@ -122,7 +122,10 @@ fn style_for(
         | Token::UnquoteSplice
         | Token::Deref
         | Token::Dot => Style::new().fg(TERTIARY),
-        Token::ShortLambdaStart | Token::BytevectorStart => Style::new().fg(GOLD),
+        Token::ShortLambdaStart
+        | Token::BytevectorStart
+        | Token::F64ArrayStart
+        | Token::I64ArrayStart => Style::new().fg(GOLD),
         Token::LParen
         | Token::RParen
         | Token::LBracket

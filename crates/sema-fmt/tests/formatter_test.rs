@@ -1550,6 +1550,15 @@ fn test_moderately_deep_nesting_formats() {
     assert_eq!(fmt(&result), result, "should be idempotent");
 }
 
+#[test]
+fn test_reader_compatible_nesting_formats() {
+    let deep = format!("'{}x{}", "(".repeat(1024), ")".repeat(1024));
+    assert!(
+        format_source(&deep, &FormatOptions::default()).is_ok(),
+        "reader-valid nesting should format"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Delimiter preservation in aligned pairs: a [..] pair must never be
 // re-emitted as (..) — that turns a vector literal into a call form.

@@ -1,5 +1,6 @@
+use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use sema_core::{resolve, SemaError, Span, SpanMap, Value, ValueView};
 
@@ -15,6 +16,77 @@ const MAX_PARSE_DEPTH: usize = 1024;
 /// this bound is what keeps a tiny malicious input from forcing a huge
 /// allocation at read time.
 const MAX_SHORT_LAMBDA_ARG: usize = 255;
+
+type OrderedMapEntry = (Weak<BTreeMap<Value, Value>>, Vec<(Value, Value)>);
+
+thread_local! {
+    static ORDERED_MAP_LITERALS: RefCell<Vec<OrderedMapEntry>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Build a sorted map while retaining the source-order entries for code
+/// lowering. The `Value` payload keeps normal map semantics: later equal keys
+/// replace earlier values.
+pub fn ordered_map_literal(entries: Vec<(Value, Value)>) -> Value {
+    let mut map = BTreeMap::new();
+    for (key, value) in &entries {
+        map.insert(key.clone(), value.clone());
+    }
+    let rc = Rc::new(map);
+    ORDERED_MAP_LITERALS.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        registry.retain(|(map, _)| map.strong_count() > 0);
+        registry.push((Rc::downgrade(&rc), entries));
+    });
+    Value::map_from_rc(rc)
+}
+
+/// Return source-order entries for a map literal produced by this reader.
+pub fn ordered_map_literal_entries(value: &Value) -> Option<Vec<(Value, Value)>> {
+    let map = value.as_map_rc()?;
+    ORDERED_MAP_LITERALS.with(|registry| {
+        let mut registry = registry.borrow_mut();
+        registry.retain(|(candidate, _)| candidate.strong_count() > 0);
+        registry.iter().find_map(|(candidate, entries)| {
+            candidate
+                .upgrade()
+                .filter(|candidate| Rc::ptr_eq(candidate, &map))
+                .map(|_| entries.clone())
+        })
+    })
+}
+
+fn rebase_span(span: Span, origin: Span) -> Span {
+    fn rebase_position(line: usize, col: usize, origin: Span) -> (usize, usize) {
+        if line <= 1 {
+            (origin.line, origin.col + col.saturating_sub(1))
+        } else {
+            (origin.line + line - 1, col)
+        }
+    }
+
+    let (line, col) = rebase_position(span.line, span.col, origin);
+    let (end_line, end_col) = rebase_position(span.end_line, span.end_col, origin);
+    Span::new(line, col, end_line, end_col)
+}
+
+fn rebase_reader_error(error: SemaError, origin: Span) -> SemaError {
+    match error {
+        SemaError::Reader { message, span } => SemaError::Reader {
+            message,
+            span: rebase_span(span, origin),
+        },
+        SemaError::WithContext { inner, hint, note } => SemaError::WithContext {
+            inner: Box::new(rebase_reader_error(*inner, origin)),
+            hint,
+            note,
+        },
+        SemaError::WithTrace { inner, trace } => SemaError::WithTrace {
+            inner: Box::new(rebase_reader_error(*inner, origin)),
+            trace,
+        },
+        other => other,
+    }
+}
 
 struct Parser {
     tokens: Vec<SpannedToken>,
@@ -177,6 +249,8 @@ impl Parser {
                 self.make_list_with_span(vec![Value::symbol("deref"), inner], span)
             }
             Some(Token::BytevectorStart) => self.parse_bytevector(),
+            Some(Token::F64ArrayStart) => self.parse_f64_array(),
+            Some(Token::I64ArrayStart) => self.parse_i64_array(),
             Some(Token::ShortLambdaStart) => self.parse_short_lambda(),
             Some(_) => {
                 let val = self.parse_atom()?;
@@ -193,6 +267,40 @@ impl Parser {
         let ptr = Rc::as_ptr(&rc) as usize;
         self.span_map.insert(ptr, span);
         Ok(Value::list_from_rc(rc))
+    }
+
+    fn preserve_compound_span(&mut self, original: &Value, rewritten: Value) -> Value {
+        let span = if let Some(items) = original.as_list_rc() {
+            self.span_map.get(&(Rc::as_ptr(&items) as usize)).copied()
+        } else if let Some(items) = original.as_vector_rc() {
+            self.span_map.get(&(Rc::as_ptr(&items) as usize)).copied()
+        } else {
+            None
+        };
+
+        let Some(span) = span else {
+            return rewritten;
+        };
+
+        if let Some(items) = rewritten.as_list_rc() {
+            self.span_map.insert(Rc::as_ptr(&items) as usize, span);
+        } else if let Some(items) = rewritten.as_vector_rc() {
+            self.span_map.insert(Rc::as_ptr(&items) as usize, span);
+        }
+        rewritten
+    }
+
+    fn merge_rebased_subparser(&mut self, sub: &mut Parser, origin: Span) {
+        self.span_map.extend(
+            std::mem::take(&mut sub.span_map)
+                .into_iter()
+                .map(|(ptr, span)| (ptr, rebase_span(span, origin))),
+        );
+        self.symbol_spans.extend(
+            std::mem::take(&mut sub.symbol_spans)
+                .into_iter()
+                .map(|(name, span)| (name, rebase_span(span, origin))),
+        );
     }
 
     /// Get the span of the previously consumed token (the one at pos-1).
@@ -301,7 +409,7 @@ impl Parser {
     fn parse_map(&mut self) -> Result<Value, SemaError> {
         let open_span = self.span();
         self.expect(&Token::LBrace)?;
-        let mut map = BTreeMap::new();
+        let mut entries = Vec::new();
         while self.peek() != Some(&Token::RBrace) {
             if self.peek().is_none() {
                 return Err(SemaError::Reader {
@@ -324,10 +432,10 @@ impl Parser {
                 });
             }
             let val = self.parse_expr()?;
-            map.insert(key, val);
+            entries.push((key, val));
         }
         self.expect(&Token::RBrace)?;
-        Ok(Value::map(map))
+        Ok(ordered_map_literal(entries))
     }
 
     fn parse_bytevector(&mut self) -> Result<Value, SemaError> {
@@ -367,6 +475,72 @@ impl Parser {
         Ok(Value::bytevector(bytes))
     }
 
+    fn parse_f64_array(&mut self) -> Result<Value, SemaError> {
+        let open_span = self.span();
+        self.advance();
+        let mut values = Vec::new();
+        while self.peek() != Some(&Token::RParen) {
+            if self.peek().is_none() {
+                return Err(SemaError::Reader {
+                    message: "unterminated f64 array".to_string(),
+                    span: open_span,
+                }
+                .with_hint("add a closing `)`"));
+            }
+            let span = self.span();
+            let value = match self.peek() {
+                Some(Token::Int(n)) => *n as f64,
+                Some(Token::BigInt(n)) => {
+                    n.to_string()
+                        .parse::<f64>()
+                        .map_err(|_| SemaError::Reader {
+                            message: "#f64(...): value cannot be represented as f64".to_string(),
+                            span,
+                        })?
+                }
+                Some(Token::Float(n)) => *n,
+                _ => {
+                    return Err(SemaError::Reader {
+                        message: "#f64(...): expected a real number".to_string(),
+                        span,
+                    });
+                }
+            };
+            self.advance();
+            values.push(value);
+        }
+        self.expect(&Token::RParen)?;
+        Ok(Value::f64_array(values))
+    }
+
+    fn parse_i64_array(&mut self) -> Result<Value, SemaError> {
+        let open_span = self.span();
+        self.advance();
+        let mut values = Vec::new();
+        while self.peek() != Some(&Token::RParen) {
+            if self.peek().is_none() {
+                return Err(SemaError::Reader {
+                    message: "unterminated i64 array".to_string(),
+                    span: open_span,
+                }
+                .with_hint("add a closing `)`"));
+            }
+            let span = self.span();
+            match self.peek() {
+                Some(Token::Int(n)) => values.push(*n),
+                _ => {
+                    return Err(SemaError::Reader {
+                        message: "#i64(...): expected an i64 integer".to_string(),
+                        span,
+                    });
+                }
+            }
+            self.advance();
+        }
+        self.expect(&Token::RParen)?;
+        Ok(Value::i64_array(values))
+    }
+
     fn parse_short_lambda(&mut self) -> Result<Value, SemaError> {
         let open_span = self.span();
         if self.short_lambda_depth > 0 {
@@ -398,14 +572,16 @@ impl Parser {
         }
         self.short_lambda_depth -= 1;
         self.expect(&Token::RParen)?;
+        let close_span = self.prev_span();
+        let full_span = open_span.to(&close_span);
 
         // Build the body as a single list form: (fn-name arg1 arg2 ...)
-        let body = Value::list(body_items);
+        let body = self.make_list_with_span(body_items, full_span)?;
 
         // Scan body for % / %1 / %2 etc., rewrite % → %1
         let mut max_arg: usize = 0;
         let mut has_rest = false;
-        let body = rewrite_percent_args(&body, &mut max_arg, &mut has_rest);
+        let body = self.rewrite_percent_args(&body, &mut max_arg, &mut has_rest);
 
         // The parameter list below materializes one interned symbol per slot up
         // to the highest placeholder, so an unbounded `%N` lets a 12-byte input
@@ -437,11 +613,10 @@ impl Parser {
             params.push(Value::symbol("%&"));
         }
 
-        Ok(Value::list(vec![
-            Value::symbol("lambda"),
-            Value::list(params),
-            body,
-        ]))
+        self.make_list_with_span(
+            vec![Value::symbol("lambda"), Value::list(params), body],
+            full_span,
+        )
     }
 
     /// After a parse error, skip tokens until we reach a position that
@@ -561,22 +736,28 @@ impl Parser {
                                 items.push(Value::string(s));
                             }
                         }
-                        FStringPart::Expr(src) => {
+                        FStringPart::Expr {
+                            source: src,
+                            span: expr_span,
+                        } => {
                             // Parse the interpolation as a sub-expression. Thread
                             // the current depth through so nested f-strings can't
                             // bypass MAX_PARSE_DEPTH by starting a fresh parser at
                             // depth 0 (READ-1).
-                            let sub_tokens = tokenize(src)?;
+                            let sub_tokens = tokenize(src)
+                                .map_err(|error| rebase_reader_error(error, *expr_span))?;
                             let mut sub = Parser::new(sub_tokens);
                             sub.depth = self.depth;
                             if sub.peek().is_none() {
                                 return Err(SemaError::Reader {
                                     message: "f-string interpolation is empty".to_string(),
-                                    span,
+                                    span: *expr_span,
                                 }
                                 .with_hint("put an expression inside ${...}"));
                             }
-                            let val = sub.parse_expr()?;
+                            let val = sub
+                                .parse_expr()
+                                .map_err(|error| rebase_reader_error(error, *expr_span))?;
                             // An interpolation must hold exactly one expression;
                             // silently dropping extra forms hides bugs (READ-2).
                             if sub.peek().is_some() {
@@ -584,15 +765,16 @@ impl Parser {
                                     message:
                                         "f-string interpolation must contain exactly one expression"
                                             .to_string(),
-                                    span,
+                                    span: rebase_span(sub.span(), *expr_span),
                                 }
                                 .with_hint("wrap multiple forms, e.g. ${(do a b)}"));
                             }
+                            self.merge_rebased_subparser(&mut sub, *expr_span);
                             items.push(val);
                         }
                     }
                 }
-                Ok(Value::list(items))
+                self.make_list_with_span(items, span)
             }
             Some(t) => {
                 let (name, hint) = match &t.token {
@@ -644,6 +826,8 @@ fn token_display(tok: &Token) -> &'static str {
         Token::Deref => "@",
         Token::Dot => ".",
         Token::BytevectorStart => "#u8(",
+        Token::F64ArrayStart => "#f64(",
+        Token::I64ArrayStart => "#i64(",
         Token::Int(_) => "integer",
         Token::BigInt(_) => "integer",
         Token::Rational(_) => "rational",
@@ -665,59 +849,72 @@ fn token_display(tok: &Token) -> &'static str {
 /// Recursively scan a Value AST for `%`, `%1`, `%2`, etc. symbols.
 /// Rewrites bare `%` to `%1`. Tracks the highest numbered arg in `max_arg`.
 /// Recurses into nested `(lambda ...)` / `(fn ...)` bodies so their placeholders bind to the enclosing `#()`. Sets `has_rest` when `%&` appears.
-fn rewrite_percent_args(expr: &Value, max_arg: &mut usize, has_rest: &mut bool) -> Value {
-    match expr.view() {
-        ValueView::Symbol(spur) => {
-            let name = resolve(spur);
-            if name == "%" {
-                *max_arg = (*max_arg).max(1);
-                Value::symbol("%1")
-            } else if name == "%&" {
-                *has_rest = true;
-                expr.clone()
-            } else if let Some(rest) = name.strip_prefix('%') {
-                if let Ok(n) = rest.parse::<usize>() {
-                    if n > 0 {
-                        *max_arg = (*max_arg).max(n);
+impl Parser {
+    fn rewrite_percent_args(
+        &mut self,
+        expr: &Value,
+        max_arg: &mut usize,
+        has_rest: &mut bool,
+    ) -> Value {
+        match expr.view() {
+            ValueView::Symbol(spur) => {
+                let name = resolve(spur);
+                if name == "%" {
+                    *max_arg = (*max_arg).max(1);
+                    Value::symbol("%1")
+                } else if name == "%&" {
+                    *has_rest = true;
+                    expr.clone()
+                } else if let Some(rest) = name.strip_prefix('%') {
+                    if let Ok(n) = rest.parse::<usize>() {
+                        if n > 0 {
+                            *max_arg = (*max_arg).max(n);
+                        }
                     }
+                    expr.clone()
+                } else {
+                    expr.clone()
                 }
-                expr.clone()
-            } else {
-                expr.clone()
             }
+            ValueView::List(items) => {
+                let new_items: Vec<Value> = items
+                    .iter()
+                    .map(|item| self.rewrite_percent_args(item, max_arg, has_rest))
+                    .collect();
+                self.preserve_compound_span(expr, Value::list(new_items))
+            }
+            ValueView::Vector(items) => {
+                let new_items: Vec<Value> = items
+                    .iter()
+                    .map(|item| self.rewrite_percent_args(item, max_arg, has_rest))
+                    .collect();
+                self.preserve_compound_span(expr, Value::vector(new_items))
+            }
+            // Map literals are scanned too. Without this arm `%` inside `{...}` was
+            // neither rewritten to `%1` nor counted, so `#({:n %})` built a
+            // zero-argument lambda and calling it failed with a misleading arity
+            // error that never mentioned the `%`. Keys as well as values: `{% 1}`
+            // is as legitimate as `{:k %}`.
+            ValueView::Map(entries) => {
+                let source_entries = ordered_map_literal_entries(expr).unwrap_or_else(|| {
+                    entries
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                });
+                let rewritten = source_entries
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            self.rewrite_percent_args(k, max_arg, has_rest),
+                            self.rewrite_percent_args(v, max_arg, has_rest),
+                        )
+                    })
+                    .collect();
+                ordered_map_literal(rewritten)
+            }
+            _ => expr.clone(),
         }
-        ValueView::List(items) => {
-            let new_items: Vec<Value> = items
-                .iter()
-                .map(|item| rewrite_percent_args(item, max_arg, has_rest))
-                .collect();
-            Value::list(new_items)
-        }
-        ValueView::Vector(items) => {
-            let new_items: Vec<Value> = items
-                .iter()
-                .map(|item| rewrite_percent_args(item, max_arg, has_rest))
-                .collect();
-            Value::vector(new_items)
-        }
-        // Map literals are scanned too. Without this arm `%` inside `{...}` was
-        // neither rewritten to `%1` nor counted, so `#({:n %})` built a
-        // zero-argument lambda and calling it failed with a misleading arity
-        // error that never mentioned the `%`. Keys as well as values: `{% 1}`
-        // is as legitimate as `{:k %}`.
-        ValueView::Map(entries) => {
-            let rewritten: std::collections::BTreeMap<Value, Value> = entries
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        rewrite_percent_args(k, max_arg, has_rest),
-                        rewrite_percent_args(v, max_arg, has_rest),
-                    )
-                })
-                .collect();
-            Value::map(rewritten)
-        }
-        _ => expr.clone(),
     }
 }
 
@@ -830,6 +1027,24 @@ mod tests {
     #[test]
     fn test_read_negative_int() {
         assert_eq!(read("-7").unwrap(), Value::int(-7));
+    }
+
+    #[test]
+    fn test_read_prefixed_pure_imaginary_literals() {
+        use sema_core::number::SemaNumber;
+
+        assert_eq!(
+            read("#e+i").unwrap(),
+            Value::complex(SemaNumber::from_i64(0), SemaNumber::from_i64(1))
+        );
+        assert_eq!(
+            read("#i-i").unwrap(),
+            Value::complex(SemaNumber::from_f64(0.0), SemaNumber::from_f64(-1.0))
+        );
+        assert_eq!(
+            read("#d+i").unwrap(),
+            Value::complex(SemaNumber::from_i64(0), SemaNumber::from_i64(1))
+        );
     }
 
     #[test]
@@ -1398,6 +1613,39 @@ mod tests {
     }
 
     #[test]
+    fn fstring_interpolation_spans_and_symbols_use_outer_coordinates() {
+        let (exprs, spans, symbols) =
+            read_many_with_symbol_spans(r#"f"head ${(+ value 2)}""#).unwrap();
+        let fstring = exprs[0].as_list().unwrap();
+        let interpolation = fstring[2].as_list_rc().unwrap();
+        let interpolation_span = spans.get(&(Rc::as_ptr(&interpolation) as usize)).unwrap();
+        assert_eq!((interpolation_span.line, interpolation_span.col), (1, 10));
+
+        let value_span = symbols.iter().find(|(name, _)| name == "value").unwrap().1;
+        assert_eq!((value_span.line, value_span.col), (1, 13));
+    }
+
+    #[test]
+    fn fstring_interpolation_reader_errors_use_outer_coordinates() {
+        let err = read("f\"before\n${(}\"").unwrap_err();
+        let span = match err.inner() {
+            SemaError::Reader { span, .. } => *span,
+            other => panic!("expected reader error, got {other:?}"),
+        };
+        assert_eq!((span.line, span.col), (2, 3));
+    }
+
+    #[test]
+    fn short_lambda_rewrite_preserves_nested_expression_spans() {
+        let (exprs, spans) = read_many_with_spans("#(+ % (foo))").unwrap();
+        let lambda = exprs[0].as_list().unwrap();
+        let body = lambda[2].as_list().unwrap();
+        let nested = body[2].as_list_rc().unwrap();
+        let nested_span = spans.get(&(Rc::as_ptr(&nested) as usize)).unwrap();
+        assert_eq!((nested_span.line, nested_span.col), (1, 7));
+    }
+
+    #[test]
     fn test_read_unexpected_char() {
         assert!(read("$").is_err());
     }
@@ -1491,6 +1739,18 @@ mod tests {
                 Value::bytevector(vec![3]),
             ])
         );
+    }
+
+    #[test]
+    fn test_readable_array_values_round_trip() {
+        for value in [
+            Value::bytevector(vec![0, 127, 255]),
+            Value::f64_array(vec![0.0, -1.5, f64::INFINITY]),
+            Value::i64_array(vec![i64::MIN, 0, i64::MAX]),
+        ] {
+            let printed = value.to_string();
+            assert_eq!(read(&printed).unwrap(), value, "failed to read {printed}");
+        }
     }
 
     #[test]
@@ -1699,6 +1959,26 @@ mod tests {
                 Value::list(vec![Value::symbol("+"), Value::int(1), Value::int(2),]),
             ])
         );
+    }
+
+    #[test]
+    fn test_read_fstring_interpolation_honors_reader_lexical_boundaries() {
+        let cases = [
+            (r#"f"${"}"}""#, Value::string("}")),
+            (r##"f"${#"}"}""##, Value::string("}")),
+            (
+                "f\"${(do ; } in comment\n 1)}\"",
+                Value::list(vec![Value::symbol("do"), Value::int(1)]),
+            ),
+        ];
+
+        for (source, expression) in cases {
+            assert_eq!(
+                read(source).unwrap(),
+                Value::list(vec![Value::symbol("__vm-str"), expression]),
+                "failed to read {source:?}"
+            );
+        }
     }
 
     #[test]

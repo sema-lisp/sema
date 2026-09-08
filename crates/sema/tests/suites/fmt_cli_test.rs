@@ -3,8 +3,10 @@
 //! Driven through the real binary so config discovery (walk up to sema.toml)
 //! and glob expansion are exercised exactly as a user hits them.
 
+use std::io::Write;
 use std::path::Path;
 use std::process::Command;
+use std::process::Stdio;
 
 const UGLY: &str = "(define   x   1)\n";
 const PRETTY: &str = "(define x 1)\n";
@@ -107,4 +109,84 @@ fn fmt_default_walk_skips_hidden_directories() {
         UGLY,
         "the recursive walk must not enter hidden directories"
     );
+}
+
+#[test]
+fn fmt_check_stdin_reports_unformatted_input() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["fmt", "--check", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(UGLY.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn fmt_check_stdin_json_reports_success_and_change() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["fmt", "--check", "--json", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(UGLY.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(!output.status.success());
+
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["formatted"], true);
+    assert_eq!(result["changed"], true);
+    assert_eq!(result["source"], PRETTY);
+}
+
+#[test]
+fn fmt_rejects_malformed_config() {
+    let dir = tempdir("bad-config");
+    write(&dir, "sema.toml", "[fmt\nwidth = 80\n");
+    write(&dir, "main.sema", UGLY);
+    let status = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["fmt", "main.sema"])
+        .current_dir(dir)
+        .status()
+        .unwrap();
+    assert!(!status.success());
+}
+
+#[test]
+fn fmt_accepts_literal_paths_with_glob_characters() {
+    let dir = tempdir("literal-glob");
+    write(&dir, "name[1].sema", UGLY);
+    run_fmt(&dir, &["name[1].sema"]);
+    assert_eq!(read(&dir, "name[1].sema"), PRETTY);
+}
+
+#[test]
+fn fmt_accepts_literal_directories_with_glob_characters() {
+    let dir = tempdir("literal-glob-directory");
+    write(&dir, "name[1]/nested/main.sema", UGLY);
+    run_fmt(&dir, &["name[1]"]);
+    assert_eq!(read(&dir, "name[1]/nested/main.sema"), PRETTY);
+}
+
+#[test]
+fn fmt_cli_can_disable_configured_alignment() {
+    let dir = tempdir("disable-align");
+    write(&dir, "sema.toml", "[fmt]\nalign = true\n");
+    write(&dir, "main.sema", "(define x 1)\n(define longer 2)\n");
+    run_fmt(&dir, &["--align=false", "main.sema"]);
+    assert_eq!(read(&dir, "main.sema"), "(define x 1)\n(define longer 2)\n");
 }

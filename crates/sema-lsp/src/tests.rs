@@ -117,6 +117,72 @@ fn builtin_doc_names_are_all_registered() {
 
 // ── formatting ───────────────────────────────────────────────
 
+#[test]
+fn deferred_close_precedes_a_queued_reopen() {
+    use crate::server::{next_backend_request, LspRequest};
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let uri = Url::parse("file:///reopened.sema").unwrap();
+    let mut deferred =
+        std::collections::VecDeque::from([LspRequest::DocumentClosed { uri: uri.clone() }]);
+    tx.send(LspRequest::DocumentChanged {
+        uri,
+        text: "(define reopened 1)".into(),
+    })
+    .unwrap();
+    assert!(matches!(
+        next_backend_request(&mut rx, &mut deferred),
+        Some(LspRequest::DocumentClosed { .. })
+    ));
+    assert!(matches!(
+        next_backend_request(&mut rx, &mut deferred),
+        Some(LspRequest::DocumentChanged { .. })
+    ));
+}
+
+#[test]
+fn deferred_request_precedes_later_document_changes() {
+    use crate::server::{next_backend_request, LspRequest};
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let uri = Url::parse("file:///requested.sema").unwrap();
+    let (reply, _response) = tokio::sync::oneshot::channel();
+    let mut deferred = std::collections::VecDeque::from([LspRequest::Hover {
+        uri: uri.clone(),
+        position: Position::new(0, 1),
+        reply,
+    }]);
+    tx.send(LspRequest::DocumentChanged {
+        uri,
+        text: String::new(),
+    })
+    .unwrap();
+    assert!(matches!(
+        next_backend_request(&mut rx, &mut deferred),
+        Some(LspRequest::Hover { .. })
+    ));
+}
+
+#[test]
+fn deferred_workspace_scan_yields_to_document_changes() {
+    use crate::server::{next_backend_request, LspRequest};
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut deferred = std::collections::VecDeque::from([LspRequest::ScanWorkspaceContinue {
+        scanner: crate::state::WorkspaceScanner::new(std::path::Path::new("/workspace")),
+    }]);
+    tx.send(LspRequest::DocumentChanged {
+        uri: Url::parse("file:///workspace/main.sema").unwrap(),
+        text: String::new(),
+    })
+    .unwrap();
+    assert!(matches!(
+        next_backend_request(&mut rx, &mut deferred),
+        Some(LspRequest::DocumentChanged { .. })
+    ));
+    assert!(matches!(
+        next_backend_request(&mut rx, &mut deferred),
+        Some(LspRequest::ScanWorkspaceContinue { .. })
+    ));
+}
+
 fn format_state(uri: &str, source: &str) -> (BackendState, Url) {
     let mut docs = HashMap::new();
     docs.insert(uri.to_string(), source.to_string());
@@ -3868,6 +3934,96 @@ fn goto_definition_still_prefers_local_scope_over_workspace() {
 }
 
 // ── scan-cache identity and invalidation ─────────────────────
+
+#[test]
+fn builtin_highlights_exclude_quoted_local_and_redefined_names() {
+    let source = "(map inc '(1))\n(let ((map list)) (map 2))\n'(map)\n(map dec '(3))\n(define map list)\n(map 4)\n";
+    let (mut state, uri) = parsed_state("file:///builtin-highlights.sema", source);
+    state.builtin_names.insert("map".into());
+    let highlights = state
+        .handle_document_highlight(&uri, &Position::new(0, 2))
+        .unwrap();
+    let lines: Vec<_> = highlights
+        .iter()
+        .map(|highlight| highlight.range.start.line)
+        .collect();
+    assert_eq!(lines, vec![0, 3]);
+    let local = state
+        .handle_document_highlight(&uri, &Position::new(1, 19))
+        .unwrap();
+    assert_eq!(local.len(), 2);
+    assert!(local
+        .iter()
+        .all(|highlight| highlight.range.start.line == 1));
+}
+
+#[test]
+fn unchanged_content_refreshes_cache_and_index_timestamps() {
+    for cache_budget in [1, 64 * 1024 * 1024] {
+        let dir = unique_temp_dir("cache-touched");
+        let path = dir.join("library.sema");
+        let mut state = BackendState::new_without_builtins(HashMap::new(), "sema".into());
+        state.import_cache = crate::byte_lru::ByteLruCache::new(cache_budget);
+        insert_scanned_file(&mut state, &path, "(define unchanged 1)\n");
+        bump_mtime(&path);
+        state.refresh_stale_workspace_index();
+        assert!(state.get_import_cache(&path).unwrap().is_fresh(&path));
+        assert_eq!(state.handle_workspace_symbols("unchanged").len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn closing_an_unsaved_overlay_restores_the_cached_disk_index() {
+    for cache_budget in [1, 64 * 1024 * 1024] {
+        let dir = unique_temp_dir("close-overlay");
+        let path = dir.join("library.sema");
+        let uri = Url::from_file_path(&path).unwrap();
+        let mut state = BackendState::new_without_builtins(HashMap::new(), "sema".into());
+        state.import_cache = crate::byte_lru::ByteLruCache::new(cache_budget);
+        insert_scanned_file(&mut state, &path, "(define on-disk 1)\n");
+        insert_parsed_doc(&mut state, uri.as_str(), "(define unsaved 2)\n");
+        state.documents.remove(uri.as_str());
+        state.cached_parses.remove(uri.as_str());
+        state.get_import_cache(&path).unwrap();
+        let symbols = state.handle_workspace_symbols("");
+        assert!(
+            symbols.iter().any(|symbol| symbol.name == "on-disk"),
+            "cache budget {cache_budget}: {symbols:?}"
+        );
+        assert!(!symbols.iter().any(|symbol| symbol.name == "unsaved"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn disk_invalidation_preserves_the_open_document_index() {
+    for scenario in ["deleted", "invalid", "watcher-deleted"] {
+        let dir = unique_temp_dir(scenario);
+        let path = dir.join("library.sema");
+        let uri = Url::from_file_path(&path).unwrap();
+        let mut state = BackendState::new_without_builtins(HashMap::new(), "sema".into());
+        insert_scanned_file(&mut state, &path, "(define on-disk 1)\n");
+        insert_parsed_doc(&mut state, uri.as_str(), "(define unsaved 2)\n");
+        if scenario == "invalid" {
+            std::fs::write(&path, "(define broken").unwrap();
+        } else {
+            std::fs::remove_file(&path).unwrap();
+        }
+        if scenario == "watcher-deleted" {
+            state.apply_workspace_file_change(&FileEvent {
+                uri,
+                typ: FileChangeType::DELETED,
+            });
+        } else {
+            assert!(state.get_import_cache(&path).is_none());
+        }
+        state.refresh_stale_workspace_index();
+        let symbols = state.handle_workspace_symbols("unsaved");
+        assert_eq!(symbols.len(), 1, "scenario {scenario}: {symbols:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
 
 #[test]
 fn get_import_cache_uses_one_key_per_file() {

@@ -9,6 +9,7 @@
 //! LSP protocol.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -194,6 +195,28 @@ pub(crate) struct Backend {
     tx: tokio::sync::mpsc::UnboundedSender<LspRequest>,
     /// Workspace root extracted from InitializeParams, used for workspace scanning.
     workspace_roots: tokio::sync::Mutex<Vec<PathBuf>>,
+    supports_file_watching: AtomicBool,
+}
+
+pub(crate) fn next_backend_request(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<LspRequest>,
+    deferred: &mut std::collections::VecDeque<LspRequest>,
+) -> Option<LspRequest> {
+    if deferred.is_empty() {
+        rx.blocking_recv()
+    } else if !matches!(
+        deferred.front(),
+        Some(LspRequest::ScanWorkspaceContinue { .. })
+    ) {
+        // Batching can defer any request or notification, including didClose.
+        // Only background scans may yield to messages that arrived later.
+        deferred.pop_front()
+    } else {
+        match rx.try_recv() {
+            Ok(msg) => Some(msg),
+            Err(_) => deferred.pop_front(),
+        }
+    }
 }
 
 impl Backend {
@@ -202,6 +225,7 @@ impl Backend {
             client,
             tx,
             workspace_roots: tokio::sync::Mutex::new(Vec::new()),
+            supports_file_watching: AtomicBool::new(false),
         }
     }
 }
@@ -209,6 +233,16 @@ impl Backend {
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        self.supports_file_watching.store(
+            params
+                .capabilities
+                .workspace
+                .as_ref()
+                .and_then(|workspace| workspace.did_change_watched_files.as_ref())
+                .and_then(|watching| watching.dynamic_registration)
+                .unwrap_or(false),
+            Ordering::Relaxed,
+        );
         // Extract sema binary path from initializationOptions
         if let Some(opts) = &params.initialization_options {
             if let Some(path) = opts.get("semaPath").and_then(|v| v.as_str()) {
@@ -321,6 +355,10 @@ impl LanguageServer for Backend {
     async fn initialized(&self, _: InitializedParams) {
         for root in self.workspace_roots.lock().await.clone() {
             let _ = self.tx.send(LspRequest::ScanWorkspace { root });
+        }
+        // Clients without dynamic registration rely on workspace reconciliation.
+        if !self.supports_file_watching.load(Ordering::Relaxed) {
+            return;
         }
         let _ = self
             .client
@@ -861,28 +899,7 @@ pub async fn run_server() {
         let mut deferred: std::collections::VecDeque<LspRequest> =
             std::collections::VecDeque::new();
 
-        while let Some(req) = if deferred.is_empty() {
-            rx.blocking_recv()
-        } else {
-            // Process deferred DocumentChanged events first to ensure
-            // interactive requests always see the latest AST. Only
-            // yield to new interactive requests when the deferred queue
-            // contains non-document-change items (e.g. scan continuations).
-            let front_is_doc_change =
-                matches!(deferred.front(), Some(LspRequest::DocumentChanged { .. }));
-            if front_is_doc_change {
-                // Must process document updates before any interactive
-                // request to prevent stale-AST responses.
-                deferred.pop_front()
-            } else {
-                // Deferred item is a scan continuation or similar low-priority
-                // work — yield to interactive requests if any arrived.
-                match rx.try_recv() {
-                    Ok(msg) => Some(msg),
-                    Err(_) => deferred.pop_front(),
-                }
-            }
-        } {
+        while let Some(req) = next_backend_request(&mut rx, &mut deferred) {
             // Workspace scans run only at initialization. Refresh files whose
             // on-disk mtime changed before serving the next request so the
             // scan cache cannot keep stale definitions or ranges indefinitely.

@@ -81,6 +81,12 @@ where
         self.entries.get(key).map(|entry| &entry.value)
     }
 
+    /// Updates metadata without changing the value's accounted memory size.
+    pub(crate) fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.touch(key)?;
+        self.entries.get_mut(key).map(|entry| &mut entry.value)
+    }
+
     /// Borrows an entry without changing recency. Use this only for complete
     /// cache scans and other bookkeeping, not to serve an interactive hit.
     pub(crate) fn peek(&self, key: &K) -> Option<&V> {

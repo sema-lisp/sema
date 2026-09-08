@@ -211,12 +211,26 @@ impl WorkspaceIndex {
             .retain(|path, _| roots.iter().any(|root| path.starts_with(root)));
     }
 
-    pub(crate) fn remove_missing_files(&mut self) {
-        self.files.retain(|path, _| path.is_file());
-    }
-
     pub(crate) fn get(&self, path: &Path) -> Option<&IndexedFile> {
         self.files.get(path)
+    }
+
+    /// Refresh disk metadata only after the caller has verified the content.
+    pub(crate) fn refresh_disk_metadata(
+        &mut self,
+        path: &Path,
+        digest: &[u8; 32],
+        modified: std::time::SystemTime,
+        len: u64,
+    ) {
+        if let Some(file) = self
+            .files
+            .get_mut(path)
+            .filter(|file| &file.digest == digest)
+        {
+            file.modified = Some(modified);
+            file.disk_len = Some(len);
+        }
     }
 
     pub(crate) fn digest_matches(&self, path: &Path, digest: &[u8; 32]) -> bool {

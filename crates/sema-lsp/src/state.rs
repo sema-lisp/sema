@@ -428,8 +428,7 @@ impl BackendState {
             Err(_) => {
                 // File deleted or unreadable — drop any stale entry so the
                 // iterating handlers stop seeing it.
-                self.import_cache.remove(&path);
-                self.workspace_index.remove(&path);
+                self.invalidate_disk_cache(&path);
                 return None;
             }
         };
@@ -440,17 +439,43 @@ impl BackendState {
         // entry: it describes content that is gone, and serving it to the
         // iterating handlers would point them at stale offsets.
         let Ok(text) = std::fs::read_to_string(&path) else {
-            self.import_cache.remove(&path);
-            self.workspace_index.remove(&path);
+            self.invalidate_disk_cache(&path);
             return None;
         };
         let digest: [u8; 32] = Sha256::digest(text.as_bytes()).into();
+        let has_open_overlay = self.has_open_document(&path);
+        if !has_open_overlay {
+            self.workspace_index
+                .refresh_disk_metadata(&path, &digest, mtime, text.len() as u64);
+        }
+        // Closing an unsaved document leaves its overlay in the compact index.
+        // Restore disk semantics even when the disk parse is already cached.
+        if !has_open_overlay && !self.workspace_index.digest_matches(&path, &digest) {
+            let cached = self
+                .oversized_parse
+                .as_ref()
+                .filter(|(cached_path, cached)| cached_path == &path && cached.digest == digest)
+                .map(|(_, cached)| cached)
+                .or_else(|| {
+                    self.import_cache
+                        .peek(&path)
+                        .filter(|cached| cached.digest == digest)
+                });
+            if let Some(indexed) =
+                cached.and_then(|cached| IndexedFile::from_parsed(path.clone(), &cached.parsed))
+            {
+                self.workspace_index.insert(indexed);
+            }
+        }
         let oversized_hit = self
             .oversized_parse
             .as_ref()
             .filter(|(cached_path, cached)| cached_path == &path && cached.digest == digest)
             .is_some();
         if oversized_hit {
+            if let Some((_, cached)) = self.oversized_parse.as_mut() {
+                cached.mtime = mtime;
+            }
             return self.oversized_parse.as_ref().map(|(_, cached)| cached);
         }
         if self
@@ -458,12 +483,14 @@ impl BackendState {
             .peek(&path)
             .is_some_and(|cached| cached.digest == digest)
         {
-            return self.import_cache.get(&path);
+            return self.import_cache.get_mut(&path).map(|cached| {
+                cached.mtime = mtime;
+                &*cached
+            });
         }
         let Ok((ast, span_map, symbol_spans)) = sema_reader::read_many_with_symbol_spans(&text)
         else {
-            self.import_cache.remove(&path);
-            self.workspace_index.remove(&path);
+            self.invalidate_disk_cache(&path);
             return None;
         };
         // Drop quoted (data) symbol occurrences (see filter_quoted_symbol_spans).
@@ -481,12 +508,6 @@ impl BackendState {
             mtime,
             digest,
         };
-        let has_open_overlay = self.cached_parses.keys().any(|uri| {
-            Url::parse(uri)
-                .ok()
-                .and_then(|uri| uri.to_file_path().ok())
-                .is_some_and(|open_path| canonicalize_or_raw(&open_path) == path)
-        });
         if !has_open_overlay && !self.workspace_index.digest_matches(&path, &digest) {
             if let Some(indexed) = IndexedFile::from_parsed(path.clone(), &entry.parsed) {
                 self.workspace_index.insert(indexed);
@@ -505,6 +526,30 @@ impl BackendState {
             }
         }
         self.import_cache.get(&path)
+    }
+
+    fn has_open_document(&self, path: &Path) -> bool {
+        self.cached_parses.keys().any(|uri| {
+            Url::parse(uri)
+                .ok()
+                .and_then(|uri| uri.to_file_path().ok())
+                .is_some_and(|open_path| canonicalize_or_raw(&open_path) == path)
+        })
+    }
+
+    fn invalidate_disk_cache(&mut self, path: &PathBuf) {
+        self.import_cache.remove(path);
+        if self
+            .oversized_parse
+            .as_ref()
+            .is_some_and(|(cached_path, _)| cached_path == path)
+        {
+            self.oversized_parse = None;
+        }
+        // Disk notifications do not change the editor's authoritative text.
+        if !self.has_open_document(path) {
+            self.workspace_index.remove(path);
+        }
     }
 
     /// Refresh files discovered by the workspace scan after they change on
@@ -529,7 +574,10 @@ impl BackendState {
         let stale_paths: Vec<PathBuf> = self
             .workspace_index
             .iter()
-            .filter(|file| !file.digest_is_current_on_disk())
+            .filter(|file| {
+                !self.has_open_document(&file.path)
+                    && (!file.is_current_on_disk() || !file.digest_is_current_on_disk())
+            })
             .map(|file| file.path.clone())
             .collect();
         for path in stale_paths {
@@ -547,7 +595,6 @@ impl BackendState {
         self.next_reconciliation = Instant::now() + Duration::from_secs(30);
         self.refresh_stale_import_cache();
         self.refresh_stale_workspace_index();
-        self.workspace_index.remove_missing_files();
         self.workspace_roots.iter().cloned().collect()
     }
 
@@ -579,15 +626,7 @@ impl BackendState {
         };
         let path = canonicalize_or_raw(&path);
         if change.typ == FileChangeType::DELETED {
-            self.import_cache.remove(&path);
-            if self
-                .oversized_parse
-                .as_ref()
-                .is_some_and(|(cached_path, _)| cached_path == &path)
-            {
-                self.oversized_parse = None;
-            }
-            self.workspace_index.remove(&path);
+            self.invalidate_disk_cache(&path);
         } else if path.extension().and_then(|extension| extension.to_str()) == Some("sema") {
             let _ = self.get_import_cache(&path);
         }
@@ -606,13 +645,7 @@ impl BackendState {
     }
 
     pub(crate) fn indexed_file_is_current(&self, file: &crate::workspace::IndexedFile) -> bool {
-        let is_open = self.cached_parses.keys().any(|uri| {
-            Url::parse(uri)
-                .ok()
-                .and_then(|uri| uri.to_file_path().ok())
-                .is_some_and(|path| canonicalize_or_raw(&path) == file.path)
-        });
-        is_open || file.is_current_on_disk()
+        self.has_open_document(&file.path) || file.is_current_on_disk()
     }
 
     /// Index every top-level definition across open documents and still-fresh

@@ -477,7 +477,32 @@ impl BackendState {
         // references and rename, then keep occurrences in this document.
         let symbol = symbol.to_string();
         self.prepare_navigation_index(uri);
-        let owner = self.global_symbol_owner(uri, &symbol, Some(*position))?;
+        let Some(owner) = self.global_symbol_owner(uri, &symbol, Some(*position)) else {
+            // Builtins have no source module. Keep their document occurrences,
+            // excluding quoted data and bindings that shadow the builtin.
+            if !self.builtin_names.contains(&symbol) {
+                return None;
+            }
+            let parsed = self.cached_parses.get(uri.as_str())?;
+            let lines: Vec<&str> = parsed.source.lines().collect();
+            let highlights: Vec<_> = parsed
+                .symbol_spans
+                .iter()
+                .filter(|(name, span)| {
+                    name == &symbol
+                        && parsed
+                            .scope_tree
+                            .resolves_to_top_level(name, span.line, span.col)
+                })
+                .map(|(_, span)| span_to_range(span, &lines))
+                .filter(|range| {
+                    self.global_symbol_owner(uri, &symbol, Some(range.start))
+                        .is_none()
+                })
+                .map(|range| DocumentHighlight { range, kind: None })
+                .collect();
+            return (!highlights.is_empty()).then_some(highlights);
+        };
         let current_module = module_identity(uri);
         let highlights: Vec<DocumentHighlight> = self
             .workspace_top_level_occurrences(&owner, &symbol)

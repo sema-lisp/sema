@@ -8,8 +8,9 @@ use crate::lexer::{tokenize, FStringPart, SpannedToken, Token};
 
 /// Maximum nesting depth for parsing. Untrusted input (files, the WASM
 /// playground, f-string interpolations) must not be able to overflow the thread
-/// stack via thousands of nested forms. 1024 is far beyond any real program.
-const MAX_PARSE_DEPTH: usize = 1024;
+/// stack via thousands of nested forms. 256 is far beyond ordinary source and
+/// matches the compiler's lowering limit.
+const MAX_PARSE_DEPTH: usize = 256;
 
 /// Highest positional placeholder (`%N`) a short lambda may use. The desugar
 /// materializes a parameter symbol for every slot up to the highest index, so
@@ -240,12 +241,18 @@ impl Parser {
                 self.advance();
                 let inner =
                     self.parse_prefix_operand("quote (')", "e.g. '(1 2 3) or 'foo", span)?;
-                self.make_list_with_span(vec![Value::symbol("quote"), inner], span)
+                self.make_list_with_span(
+                    vec![Value::symbol("quote"), inner],
+                    span.to(&self.prev_span()),
+                )
             }
             Some(Token::Quasiquote) => {
                 self.advance();
                 let inner = self.parse_prefix_operand("quasiquote (`)", "e.g. `(list ,x)", span)?;
-                self.make_list_with_span(vec![Value::symbol("quasiquote"), inner], span)
+                self.make_list_with_span(
+                    vec![Value::symbol("quasiquote"), inner],
+                    span.to(&self.prev_span()),
+                )
             }
             Some(Token::Unquote) => {
                 self.advance();
@@ -254,7 +261,10 @@ impl Parser {
                     "use inside quasiquote, e.g. `(list ,x)",
                     span,
                 )?;
-                self.make_list_with_span(vec![Value::symbol("unquote"), inner], span)
+                self.make_list_with_span(
+                    vec![Value::symbol("unquote"), inner],
+                    span.to(&self.prev_span()),
+                )
             }
             Some(Token::UnquoteSplice) => {
                 self.advance();
@@ -263,12 +273,18 @@ impl Parser {
                     "use inside quasiquote, e.g. `(list ,@xs)",
                     span,
                 )?;
-                self.make_list_with_span(vec![Value::symbol("unquote-splicing"), inner], span)
+                self.make_list_with_span(
+                    vec![Value::symbol("unquote-splicing"), inner],
+                    span.to(&self.prev_span()),
+                )
             }
             Some(Token::Deref) => {
                 self.advance();
                 let inner = self.parse_prefix_operand("deref (@)", "e.g. @x or @(atom)", span)?;
-                self.make_list_with_span(vec![Value::symbol("deref"), inner], span)
+                self.make_list_with_span(
+                    vec![Value::symbol("deref"), inner],
+                    span.to(&self.prev_span()),
+                )
             }
             Some(Token::BytevectorStart) => self.parse_bytevector(),
             Some(Token::F64ArrayStart) => self.parse_f64_array(),
@@ -500,7 +516,13 @@ impl Parser {
             }
         }
         self.expect(&Token::RParen)?;
-        Ok(Value::bytevector(bytes))
+        let close = self.prev_span();
+        let value = Value::bytevector(bytes);
+        if let Some(items) = value.as_bytevector_rc() {
+            self.span_map
+                .insert(Rc::as_ptr(&items) as usize, open_span.to(&close));
+        }
+        Ok(value)
     }
 
     fn parse_f64_array(&mut self) -> Result<Value, SemaError> {
@@ -538,7 +560,13 @@ impl Parser {
             values.push(value);
         }
         self.expect(&Token::RParen)?;
-        Ok(Value::f64_array(values))
+        let close = self.prev_span();
+        let value = Value::f64_array(values);
+        if let Some(items) = value.as_f64_array_rc() {
+            self.span_map
+                .insert(Rc::as_ptr(&items) as usize, open_span.to(&close));
+        }
+        Ok(value)
     }
 
     fn parse_i64_array(&mut self) -> Result<Value, SemaError> {
@@ -566,7 +594,13 @@ impl Parser {
             self.advance();
         }
         self.expect(&Token::RParen)?;
-        Ok(Value::i64_array(values))
+        let close = self.prev_span();
+        let value = Value::i64_array(values);
+        if let Some(items) = value.as_i64_array_rc() {
+            self.span_map
+                .insert(Rc::as_ptr(&items) as usize, open_span.to(&close));
+        }
+        Ok(value)
     }
 
     fn parse_short_lambda(&mut self) -> Result<Value, SemaError> {
@@ -998,10 +1032,9 @@ pub fn read_many_with_symbol_spans(
 /// On parse errors, skips to the next top-level form and continues.
 /// Returns (successfully parsed forms, span map, collected errors).
 /// Tokenizer errors are returned as a single error with no parsed forms.
-#[allow(clippy::type_complexity)]
-pub fn read_many_with_spans_recover(
-    input: &str,
-) -> (Vec<Value>, SpanMap, Vec<(String, Span)>, Vec<SemaError>) {
+pub type RecoveredParse = (Vec<Value>, SpanMap, Vec<(String, Span)>, Vec<SemaError>);
+
+pub fn read_many_with_spans_recover(input: &str) -> RecoveredParse {
     let tokens = match tokenize(input) {
         Ok(t) => t,
         Err(e) => return (vec![], SpanMap::new(), vec![], vec![e]),
@@ -1020,6 +1053,49 @@ pub fn read_many_with_spans_recover(
     }
     let span_map = parser.take_span_map();
     (exprs, span_map, parser.symbol_spans, errors)
+}
+
+/// Parse editor text with normal diagnostics and a syntax tree for an
+/// unfinished trailing container. The repair only appends missing closing
+/// delimiters that the lexer proves are unmatched; other syntax errors keep the
+/// ordinary recovery result.
+pub fn read_many_with_spans_tolerant(input: &str) -> RecoveredParse {
+    let recovered = read_many_with_spans_recover(input);
+    if recovered.3.is_empty() {
+        return recovered;
+    }
+    let Ok(tokens) = tokenize(input) else {
+        return recovered;
+    };
+    let mut closers = Vec::new();
+    for token in tokens {
+        match token.token {
+            Token::LParen
+            | Token::ShortLambdaStart
+            | Token::BytevectorStart
+            | Token::F64ArrayStart
+            | Token::I64ArrayStart => closers.push(Token::RParen),
+            Token::LBracket => closers.push(Token::RBracket),
+            Token::LBrace => closers.push(Token::RBrace),
+            Token::RParen | Token::RBracket | Token::RBrace
+                if closers.pop().as_ref() != Some(&token.token) =>
+            {
+                return recovered;
+            }
+            _ => {}
+        }
+    }
+    if closers.is_empty() {
+        return recovered;
+    }
+    let mut repaired = input.to_string();
+    for closer in closers.iter().rev() {
+        repaired.push_str(token_display(closer));
+    }
+    match read_many_with_symbol_spans(&repaired) {
+        Ok((ast, spans, symbols)) => (ast, spans, symbols, recovered.3),
+        Err(_) => recovered,
+    }
 }
 
 #[cfg(test)]
@@ -1640,6 +1716,41 @@ mod tests {
         let span = spans.get(&ptr).expect("second list should have span");
         assert_eq!(span.line, 2);
         assert_eq!(span.col, 1);
+    }
+
+    #[test]
+    fn compound_syntax_keeps_its_complete_source_span() {
+        let sources = ["'(value)", "#u8(1 2)", "#f64(1.0 2.0)", "#i64(1 2)"];
+        for source in sources {
+            let (values, spans) = read_many_with_spans(source).unwrap();
+            let value = &values[0];
+            let pointer = if let Some(value) = value.as_list_rc() {
+                Rc::as_ptr(&value) as usize
+            } else if let Some(value) = value.as_bytevector_rc() {
+                Rc::as_ptr(&value) as usize
+            } else if let Some(value) = value.as_f64_array_rc() {
+                Rc::as_ptr(&value) as usize
+            } else {
+                let value = value.as_i64_array_rc().expect("compound test value");
+                Rc::as_ptr(&value) as usize
+            };
+            let span = spans.get(&pointer).expect("compound span");
+            assert_eq!((span.line, span.col), (1, 1), "{source}");
+            assert_eq!(span.end_col, source.chars().count() + 1, "{source}");
+        }
+    }
+
+    #[test]
+    fn tolerant_parse_only_repairs_unclosed_containers() {
+        let (values, _, symbols, errors) =
+            read_many_with_spans_tolerant("(defun pending (value)\n  (+ value 1)");
+        assert_eq!(values.len(), 1);
+        assert!(!errors.is_empty());
+        assert!(symbols.iter().any(|(name, _)| name == "pending"));
+
+        let (values, _, _, errors) = read_many_with_spans_tolerant("(value]");
+        assert!(values.is_empty());
+        assert!(!errors.is_empty());
     }
 
     #[test]

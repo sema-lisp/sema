@@ -413,7 +413,7 @@ fn resolve_authenticated_http_send(
             return SendResolution::Failed {
                 alias: decl.alias.clone(),
                 reason,
-            }
+            };
         }
     };
 
@@ -828,7 +828,7 @@ fn resolve_authenticated_http(
             return ServerResolution::Failed {
                 alias: decl.alias.clone(),
                 reason,
-            }
+            };
         }
     };
 

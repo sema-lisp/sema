@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use sema_core::{
@@ -130,7 +130,9 @@ fn lower_expr_inner(expr: &Value, tail: bool) -> Result<CoreExpr, SemaError> {
         }
 
         ValueView::Map(map) => {
-            let pairs = map
+            let source_pairs = sema_reader::ordered_map_literal_entries(expr)
+                .unwrap_or_else(|| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+            let pairs = source_pairs
                 .iter()
                 .map(|(k, v)| Ok((lower_expr(k, false)?, lower_expr(v, false)?)))
                 .collect::<Result<Vec<_>, SemaError>>()?;
@@ -400,6 +402,39 @@ fn parse_params(names: &[Spur]) -> (Vec<Spur>, Option<Spur>) {
     }
 }
 
+fn validate_unique_params(
+    params: &[Spur],
+    rest: Option<Spur>,
+    context: &str,
+) -> Result<(), SemaError> {
+    validate_unique_names(params.iter().copied().chain(rest), context, "parameter")
+}
+
+fn validate_unique_bindings(bindings: &[(Spur, CoreExpr)], context: &str) -> Result<(), SemaError> {
+    validate_unique_names(bindings.iter().map(|(name, _)| *name), context, "binding")
+}
+
+fn validate_unique_pattern_bindings(pattern: &Value, context: &str) -> Result<(), SemaError> {
+    validate_unique_names(collect_pattern_vars(pattern), context, "binding")
+}
+
+fn validate_unique_names(
+    names: impl IntoIterator<Item = Spur>,
+    context: &str,
+    kind: &str,
+) -> Result<(), SemaError> {
+    let mut seen = HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            return Err(SemaError::eval(format!(
+                "{context}: duplicate {kind} `{}`",
+                resolve(name)
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn extract_param_spurs(param_list: &[Value], context: &str) -> Result<Vec<Spur>, SemaError> {
     param_list
         .iter()
@@ -527,6 +562,7 @@ fn parse_bindings(bindings_val: &Value, context: &str) -> Result<Vec<(Spur, Core
         if let Some(name) = pair[0].as_symbol_spur() {
             bindings.push((name, init));
         } else if is_destructuring_pattern(&pair[0]) {
+            validate_unique_pattern_bindings(&pair[0], context)?;
             bindings.extend(lower_destructuring_bindings(&pair[0], init)?);
         } else {
             return Err(SemaError::eval(format!(
@@ -635,6 +671,7 @@ fn lower_define(args: &[Value]) -> Result<CoreExpr, SemaError> {
             let name_spur = require_symbol(&sig[0], "define")?;
             let param_spurs = extract_param_spurs(&sig[1..], "define")?;
             let (params, rest) = parse_params(&param_spurs);
+            validate_unique_params(&params, rest, "define")?;
             let body = lower_body(&args[1..], true)?;
             if body.is_empty() {
                 return Err(SemaError::eval("define: function body cannot be empty"));
@@ -657,6 +694,7 @@ fn lower_define(args: &[Value]) -> Result<CoreExpr, SemaError> {
             if args.len() != 2 {
                 return Err(SemaError::arity("define", "2", args.len()));
             }
+            validate_unique_pattern_bindings(&args[0], "define")?;
             let init = lower_expr(&args[1], false)?;
             let destr_bindings = lower_destructuring_bindings(&args[0], init)?;
             let mut defines: Vec<CoreExpr> = Vec::new();
@@ -680,6 +718,7 @@ fn lower_defun(args: &[Value]) -> Result<CoreExpr, SemaError> {
     let param_list = require_list(&args[1], "defun")?;
     let param_spurs = extract_param_spurs(param_list, "defun")?;
     let (params, rest) = parse_params(&param_spurs);
+    validate_unique_params(&params, rest, "defun")?;
     let body = lower_body(&args[2..], true)?;
     Ok(CoreExpr::Define(
         name_spur,
@@ -723,6 +762,7 @@ fn lower_lambda(args: &[Value], name: Option<Spur>) -> Result<CoreExpr, SemaErro
         // Desugar: generate temp param names, wrap body in let*
         let mut temp_spurs = Vec::new();
         let mut let_bindings = Vec::new();
+        let mut bound_names = Vec::new();
         let mut hit_dot = false;
         let mut rest_spur = None;
 
@@ -734,16 +774,21 @@ fn lower_lambda(args: &[Value], name: Option<Spur>) -> Result<CoreExpr, SemaErro
                 }
                 if hit_dot {
                     rest_spur = Some(s);
+                    bound_names.push(s);
                     continue;
                 }
                 temp_spurs.push(s);
+                bound_names.push(s);
             } else {
                 let tmp = gensym(&format!("arg{idx}"));
                 temp_spurs.push(tmp);
+                bound_names.extend(collect_pattern_vars(p));
                 let destr = lower_destructuring_bindings(p, CoreExpr::Var(tmp))?;
                 let_bindings.extend(destr);
             }
         }
+
+        validate_unique_names(bound_names, "lambda", "parameter")?;
 
         let orig_body = lower_body(&args[1..], true)?;
         let body = if let_bindings.is_empty() {
@@ -768,6 +813,7 @@ fn lower_lambda(args: &[Value], name: Option<Spur>) -> Result<CoreExpr, SemaErro
         // Fast path: all params are symbols
         let param_spurs = extract_param_spurs(&param_vals, "lambda")?;
         let (params, rest) = parse_params(&param_spurs);
+        validate_unique_params(&params, rest, "lambda")?;
         let body = lower_body(&args[1..], true)?;
         Ok(CoreExpr::Lambda(LambdaDef {
             name,
@@ -808,6 +854,7 @@ fn lower_let(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
         // (the last expression in a lambda body is a tail call).
         let body = lower_body(&args[2..], true)?;
         let (params, inits): (Vec<Spur>, Vec<CoreExpr>) = bindings.into_iter().unzip();
+        validate_unique_params(&params, None, "named let")?;
         return Ok(CoreExpr::Letrec {
             bindings: vec![(
                 loop_name,
@@ -872,6 +919,7 @@ fn lower_let(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
             }
         }
 
+        validate_unique_bindings(&sequential_bindings, "let")?;
         let body = lower_body(&args[1..], tail)?;
         Ok(CoreExpr::Let {
             bindings: parallel_bindings,
@@ -882,6 +930,7 @@ fn lower_let(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
         })
     } else {
         let bindings = parse_bindings(&args[0], "let")?;
+        validate_unique_bindings(&bindings, "let")?;
         let body = lower_body(&args[1..], tail)?;
         Ok(CoreExpr::Let { bindings, body })
     }
@@ -901,6 +950,7 @@ fn lower_letrec(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
         return Err(SemaError::arity("letrec", "2+", args.len()));
     }
     let bindings = parse_bindings(&args[0], "letrec")?;
+    validate_unique_bindings(&bindings, "letrec")?;
     let body = lower_body(&args[1..], tail)?;
     Ok(CoreExpr::Letrec { bindings, body })
 }
@@ -1108,7 +1158,9 @@ fn parse_values_formals(
     }
     let param_list = require_list(formals, context)?;
     let param_spurs = extract_param_spurs(param_list, context)?;
-    Ok(parse_params(&param_spurs))
+    let (params, rest) = parse_params(&param_spurs);
+    validate_unique_params(&params, rest, context)?;
+    Ok((params, rest))
 }
 
 /// Build a zero-arg thunk lambda around a lowered producer expression, mirroring
@@ -1409,7 +1461,9 @@ fn expand_quasiquote(
             // isn't meaningful, so only `(unquote x)` is handled (via recursion);
             // a top-level `(unquote-splicing ...)` key/value errors clearly rather
             // than leaking literal `(unquote-splicing ...)` data.
-            let entries = map
+            let source_entries = sema_reader::ordered_map_literal_entries(val)
+                .unwrap_or_else(|| map.iter().map(|(k, v)| (k.clone(), v.clone())).collect());
+            let entries = source_entries
                 .iter()
                 .map(|(k, v)| {
                     reject_splice_in_map(k)?;
@@ -1773,40 +1827,9 @@ fn lower_match_clauses(
         }
     };
 
-    // If guard present, wrap in additional check
-    let then_with_guard = if has_guard {
-        let guard = lower_expr(&clause[guard_idx], false)?;
-        // If guard fails, fall through to remaining clauses
-        let else_clauses = lower_match_clauses(
-            &clauses[1..],
-            scrut_var,
-            try_match_spur,
-            match_failed_spur,
-            get_spur,
-            nil_q_spur,
-            when_spur,
-            tail,
-            lenient,
-        )?;
-        // Need var bindings available for guard eval too
-        let guard_body = CoreExpr::If {
-            test: Box::new(guard),
-            then: Box::new(then_expr),
-            else_: Box::new(else_clauses),
-        };
-        if var_bindings.is_empty() {
-            guard_body
-        } else {
-            CoreExpr::LetStar {
-                bindings: var_bindings,
-                body: vec![guard_body],
-            }
-        }
-    } else {
-        then_expr
-    };
-
-    // Else: try remaining clauses (always needed — pattern may fail even with guard)
+    // Lower the remaining clause chain once. Guard and pattern failures both
+    // reach this expression, but duplicating it here makes N guarded clauses
+    // grow as 2^N before the compiler sees them.
     let else_expr = lower_match_clauses(
         &clauses[1..],
         scrut_var,
@@ -1819,17 +1842,41 @@ fn lower_match_clauses(
         lenient,
     )?;
 
-    // Build: (let ((map_tmp (try-match ...))) (if (nil? map_tmp) else then))
-    let test = CoreExpr::Call {
+    let pattern_failed = CoreExpr::Call {
         func: Box::new(CoreExpr::Var(nil_q_spur)),
         args: vec![CoreExpr::Var(map_tmp)],
         tail: false,
     };
 
-    let if_expr = CoreExpr::If {
-        test: Box::new(test),
-        then: Box::new(else_expr),
-        else_: Box::new(then_with_guard),
+    let if_expr = if has_guard {
+        let guard = lower_expr(&clause[guard_idx], false)?;
+        let guard = if var_bindings.is_empty() {
+            guard
+        } else {
+            CoreExpr::LetStar {
+                bindings: var_bindings,
+                body: vec![guard],
+            }
+        };
+        // Test pattern success before evaluating the guard. The body creates
+        // its own pure extraction bindings, so the shared fallback appears only
+        // once in the CoreExpr tree.
+        let matched_and_guard = CoreExpr::If {
+            test: Box::new(pattern_failed),
+            then: Box::new(CoreExpr::Const(Value::bool(false))),
+            else_: Box::new(guard),
+        };
+        CoreExpr::If {
+            test: Box::new(matched_and_guard),
+            then: Box::new(then_expr),
+            else_: Box::new(else_expr),
+        }
+    } else {
+        CoreExpr::If {
+            test: Box::new(pattern_failed),
+            then: Box::new(else_expr),
+            else_: Box::new(then_expr),
+        }
     };
 
     Ok(CoreExpr::Let {

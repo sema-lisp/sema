@@ -1912,10 +1912,8 @@ fn test_type_errors() {
     assert!(matches!(err.inner(), SemaError::Type { .. }));
     let err = eval_err("(car 42)");
     assert!(matches!(err.inner(), SemaError::Type { .. }));
-    // NOTE: `(< "a" "b")` supports lexicographic string comparison, returning #t.
-    // That VM capability is the canonical behavior now, so this is no longer a
-    // type-error case.
-    assert_eq!(eval(r#"(< "a" "b")"#), Value::bool(true));
+    let err = eval_err(r#"(< "a" "b")"#);
+    assert!(matches!(err.inner(), SemaError::Type { .. }));
 }
 
 #[test]
@@ -14035,11 +14033,12 @@ fn test_compile_multifile_imports_resolve_from_fs() {
         String::from_utf8_lossy(&compiled.stderr)
     );
 
-    // Run the .semac from its directory; the (still-present) source imports
-    // resolve from the filesystem.
+    // Run the .semac from a different directory. Relative imports must resolve
+    // from the bytecode file, not the process working directory.
+    let runner_dir = build_test_dir("compile-mf-runner");
     let run = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
-        .current_dir(&dir)
-        .arg("app.semac")
+        .current_dir(&runner_dir)
+        .arg(dir.join("app.semac"))
         .output()
         .expect("failed to run .semac");
     assert!(
@@ -14048,6 +14047,131 @@ fn test_compile_multifile_imports_resolve_from_fs() {
         String::from_utf8_lossy(&run.stderr)
     );
     assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "42");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&runner_dir);
+}
+
+#[test]
+fn test_compile_literal_relative_macro_load() {
+    let dir = build_test_dir("compile-relative-macro-load");
+    std::fs::write(
+        dir.join("base-macros.sema"),
+        "(defmacro twice (x) `(+ ,x ,x))",
+    )
+    .unwrap();
+    std::fs::write(dir.join("macros.sema"), "(load \"./base-macros.sema\")").unwrap();
+    std::fs::write(
+        dir.join("app.sema"),
+        "(begin (load \"./macros.sema\") (println (twice 21)))",
+    )
+    .unwrap();
+
+    let compiled = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["compile", dir.join("app.sema").to_str().unwrap()])
+        .output()
+        .expect("failed to run sema compile");
+    assert!(
+        compiled.status.success(),
+        "sema compile failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let runner_dir = build_test_dir("compile-relative-macro-load-runner");
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .current_dir(&runner_dir)
+        .arg(dir.join("app.semac"))
+        .output()
+        .expect("failed to run compiled macro program");
+    assert!(
+        run.status.success(),
+        "compiled macro program failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "42");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&runner_dir);
+}
+
+#[test]
+fn test_compile_begin_macro_use_before_load_is_not_expanded() {
+    let dir = build_test_dir("compile-begin-macro-use-before-load");
+    std::fs::write(dir.join("macros.sema"), "(defmacro twice (x) `(+ ,x ,x))").unwrap();
+    std::fs::write(
+        dir.join("app.sema"),
+        "(begin (println (twice 21)) (load \"./macros.sema\"))",
+    )
+    .unwrap();
+
+    let compiled = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["compile", dir.join("app.sema").to_str().unwrap()])
+        .output()
+        .expect("failed to run sema compile");
+    assert!(
+        compiled.status.success(),
+        "sema compile failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg(dir.join("app.semac"))
+        .output()
+        .expect("failed to run compiled program");
+    assert!(
+        !run.status.success(),
+        "macro use before its load must remain an unbound runtime call"
+    );
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("Unbound variable: twice"),
+        "unexpected error: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_compile_macro_load_does_not_run_loaded_side_effects() {
+    let dir = build_test_dir("compile-macro-load-side-effect");
+    let marker = dir.join("load-ran.txt");
+    let marker_source = marker.to_string_lossy().replace('\\', "\\\\");
+    std::fs::write(
+        dir.join("macros.sema"),
+        format!("(file/append \"{marker_source}\" \"run\") (defmacro twice (x) `(+ ,x ,x))"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("app.sema"),
+        "(begin (load \"./macros.sema\") (println (twice 21)))",
+    )
+    .unwrap();
+
+    let compiled = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["compile", dir.join("app.sema").to_str().unwrap()])
+        .output()
+        .expect("failed to run sema compile");
+    assert!(
+        compiled.status.success(),
+        "sema compile failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "compile must not execute ordinary loaded forms"
+    );
+
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg(dir.join("app.semac"))
+        .output()
+        .expect("failed to run compiled macro program");
+    assert!(
+        run.status.success(),
+        "compiled macro program failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "42");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "run");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

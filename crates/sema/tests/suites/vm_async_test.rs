@@ -560,6 +560,72 @@ fn timeout_task_completes_in_time() {
 }
 
 #[test]
+fn fanout_accepts_vector_inputs() {
+    assert_eq!(
+        eval("(parallel [(fn () 1) (fn () 2)])"),
+        Value::list(vec![Value::int(1), Value::int(2)]),
+    );
+    assert_eq!(
+        eval("(pipeline [1 2] (fn (x) (+ x 10)))"),
+        Value::list(vec![Value::int(11), Value::int(12)]),
+    );
+}
+
+#[test]
+fn owned_fanout_apis_accept_vector_inputs() {
+    assert_eq!(
+        eval("(async/spawn-all [(fn () 1) (fn () 2)])"),
+        Value::list(vec![Value::int(1), Value::int(2)]),
+    );
+    assert_eq!(
+        eval("(async/map (fn (x) (* x 10)) [1 2])"),
+        Value::list(vec![Value::int(10), Value::int(20)]),
+    );
+    assert_eq!(
+        eval("(async/pool-map (fn (x) (* x 10)) [1 2] 1)"),
+        Value::list(vec![Value::int(10), Value::int(20)]),
+    );
+    assert_eq!(
+        eval("(async/race-owned [(fn () :winner)])"),
+        Value::keyword("winner"),
+    );
+}
+
+#[test]
+fn with_timeout_preserves_values_matching_the_old_timer_sentinel() {
+    assert_eq!(
+        eval("(async/with-timeout 1000 (fn () :__with-timeout-elapsed))"),
+        Value::keyword("__with-timeout-elapsed"),
+    );
+}
+
+#[test]
+fn with_timeout_validates_duration_before_spawning_work() {
+    assert_eq!(
+        eval(
+            r#"
+            (let ((ran #f))
+              (list (try (async/with-timeout -1 (fn () (set! ran #t) 42))
+                         (catch e :caught))
+                    ran))
+            "#,
+        ),
+        Value::list(vec![Value::keyword("caught"), Value::bool(false)]),
+    );
+    assert_eq!(
+        eval(
+            r#"
+            (let ((ran #f))
+              (list (try (async/with-timeout 86400001 (fn () (set! ran #t) 42))
+                         (catch e :caught))
+                    ran))
+            "#,
+        ),
+        Value::list(vec![Value::keyword("caught"), Value::bool(false)]),
+    );
+}
+
+#[test]
 fn timeout_already_rejected() {
     // An already-rejected promise wins the timeout race; its PRESERVED failure
     // cause surfaces (not a `task rejected:` wrapper).

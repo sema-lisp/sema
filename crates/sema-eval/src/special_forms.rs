@@ -556,6 +556,7 @@ fn eval_bytes_in_env(
     ctx: &EvalContext,
 ) -> Result<Value, SemaError> {
     ctx.push_file_path(exec_path.to_path_buf());
+    ctx.clear_module_exports();
     let eval_result = (|| {
         if sema_vm::is_bytecode_file(bytes) {
             let result = sema_vm::deserialize_from_bytes(bytes)?;
@@ -569,6 +570,7 @@ fn eval_bytes_in_env(
 
         eval::eval_module_body_vm(ctx, env, &exprs, &spans, Some(exec_path.to_path_buf()))
     })();
+    ctx.take_module_exports();
     ctx.pop_file_path();
     eval_result
 }

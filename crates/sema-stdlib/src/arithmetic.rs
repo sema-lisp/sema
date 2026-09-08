@@ -173,7 +173,15 @@ fn mod_impl(args: &[Value]) -> Result<Value, SemaError> {
 }
 
 pub fn register(env: &sema_core::Env) {
-    register_fn(env, "+", |args| sum_through_tower(args.iter()));
+    register_fn(env, "+", |args| {
+        if let [a, b] = args {
+            if let (Some(a), Some(b)) = (a.as_str(), b.as_str()) {
+                let combined = format!("{a}{b}");
+                return Ok(Value::string(&combined));
+            }
+        }
+        sum_through_tower(args.iter())
+    });
 
     register_fn(env, "-", |args| {
         check_arity!(args, "-", 1..);

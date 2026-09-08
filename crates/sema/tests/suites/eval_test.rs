@@ -84,6 +84,8 @@ eval_error_tests! {
 eval_tests! {
     int_of_bignum_is_identity: "(int 9223372036854775808)"
         => common::eval("9223372036854775808"),
+    int_of_bignum_string: "(int \"9223372036854775808\")"
+        => common::eval("9223372036854775808"),
     float_of_rational_projects: "(float 1/2)" => Value::float(0.5),
     float_of_bignum_projects: "(float 9223372036854775808)"
         => Value::float(9223372036854775808.0),
@@ -201,6 +203,12 @@ eval_tests! {
             ([x] c)))
     "# => Value::int(1),
 
+    // Guard lowering must remain linear in the number of clauses. This used to
+    // duplicate the remaining decision tree for both pattern and guard failure.
+    match_many_guarded_clauses:
+        "(match 0 (x when #f 1) (x when #f 2) (x when #f 3) (x when #f 4) (x when #f 5) (x when #f 6) (x when #f 7) (x when #f 8) (x when #f 9) (x when #f 10) (x when #f 11) (x when #f 12) (x when #f 13) (x when #f 14) (x when #f 15) (x when #f 16) (_ :done))"
+        => Value::keyword("done"),
+
     // Overlapping patterns — guards determine which fires
     match_overlapping_guards: r#"
         (match {:x 5}
@@ -294,6 +302,79 @@ eval_tests! {
           ([a b] (+ a b))
           ([x] x))
     "# => Value::int(1),
+}
+
+eval_tests! {
+    macro_quasiquote_keeps_data:
+        "(begin (defmacro m () 42) `(m))" => Value::list(vec![Value::symbol("m")]),
+    macro_quasiquote_expands_unquote:
+        "(begin (defmacro m () 42) `(,(m)))" => Value::list(vec![Value::int(42)]),
+    macro_expansion_in_map_keeps_source_evaluation_order:
+        r#"(begin
+            (defmacro id (x) x)
+            (define seen (list))
+            {"b" (id (begin (set! seen (cons "b" seen)) 1))
+             "a" (begin (set! seen (cons "a" seen)) 2)}
+            seen)"# => Value::list(vec![Value::string("a"), Value::string("b")]),
+    macro_expansion_in_quasiquoted_map_keeps_source_evaluation_order:
+        r#"(begin
+            (defmacro id (x) x)
+            (define seen (list))
+            `{"b" ,(id (begin (set! seen (cons "b" seen)) 1))
+              "a" ,(begin (set! seen (cons "a" seen)) 2)}
+            seen)"# => Value::list(vec![Value::string("a"), Value::string("b")]),
+    macro_scope_ignores_map_literal_keys:
+        "(begin (defmacro m (x) (list (quote +) x 1)) (let (({m x} {'m 2})) (m x)))"
+        => Value::int(3),
+    macro_scope_ignores_quoted_match_literals:
+        "(begin (defmacro foo () 42) (match 'foo ('foo (foo))))" => Value::int(42),
+    macro_scope_keeps_list_shaped_lambda_parameters:
+        "(begin (defmacro x () 42) ((fn (quote x) (x)) 1 (fn () 7)))" => Value::int(7),
+    macro_scope_keeps_ordinary_amp_binding:
+        "(begin (defmacro & () 42) (let ((& (fn () 7))) (&)))" => Value::int(7),
+    macro_scope_keeps_ordinary_underscore_binding:
+        "(begin (defmacro _ () 42) (let ((_ (fn () 7))) (_)))" => Value::int(7),
+    macro_scope_ignores_match_wildcard:
+        "(begin (defmacro _ () 42) (match 1 (_ (_))))" => Value::int(42),
+    macro_scope_ignores_match_rest_marker:
+        "(begin (defmacro & () 42) (match '(1) ([x & rest] (&))))" => Value::int(42),
+    macro_scope_ignores_record_field_labels:
+        "(begin (defmacro field () 42) (define-record-type point (make-point field) point? (field point-field)) (field))" => Value::int(42),
+    defun_parameters_are_macro_binding_positions:
+        "(begin (defmacro p () 99) (defun f (p) p) (f 2))" => Value::int(2),
+    defun_definition_shadows_macro:
+        "(begin (defmacro m (x) 99) (defun m (x) x) (m 2))" => Value::int(2),
+    syntax_rules_does_not_rename_quoted_data:
+        "(begin (define-syntax q (syntax-rules () ((_) '(let ((x 1)) x)))) (q))"
+        => common::eval("'(let ((x 1)) x)"),
+    syntax_rules_keeps_quoted_data_after_a_binder:
+        "(begin (define-syntax q (syntax-rules () ((_) (begin (let ((x 1)) x) '(x))))) (q))"
+        => Value::list(vec![Value::symbol("x")]),
+    syntax_rules_renames_values_binders:
+        "(begin (define tmp 99) (define-syntax m (syntax-rules () ((_ x) (let-values (((tmp) (values 1))) x)))) (m tmp))"
+        => Value::int(99),
+    syntax_rules_renames_catch_binders:
+        "(begin (define err 42) (define-syntax m (syntax-rules () ((_ x) (try (throw \"boom\") (catch err x))))) (m err))"
+        => Value::int(42),
+    syntax_rules_keeps_quoted_match_patterns:
+        "(begin (define-syntax m (syntax-rules () ((_ x) (match x ('foo 1) (_ 2))))) (m 'foo))"
+        => Value::int(1),
+    for_range_negative_step:
+        "(let ((seen (mutable-array/new))) (for-range (i 5 0 -1) (mutable-array/push! seen i)) (mutable-array/->vector seen))"
+        => Value::vector(vec![Value::int(5), Value::int(4), Value::int(3), Value::int(2), Value::int(1)]),
+    dotimes_nonpositive_skips_body:
+        "(begin (define n 0) (dotimes (i -1) (set! n (+ n 1))) n)" => Value::int(0),
+}
+
+eval_error_tests! {
+    match_rejects_multiple_rest_patterns:
+        "(match '(1 2) ([a & rest ignored] :bad) (_ :ok))" => "only one pattern allowed after `&`",
+    dotimes_rejects_extra_binding_fields:
+        "(dotimes (i 2 ignored) nil)" => "dotimes",
+    for_range_rejects_extra_binding_fields:
+        "(for-range (i 0 2 1 ignored) nil)" => "for-range",
+    for_range_rejects_zero_step:
+        "(for-range (i 1 0 0) nil)" => "step must not be zero",
 }
 
 // ============================================================
@@ -2069,6 +2150,12 @@ eval_tests! {
            (define (pick x) (if (not x) 'not-was-truthy 'not-was-falsy))
            (define not (lambda (x) x))
            (list (pick 1) (pick #f)))" => common::eval("'(not-was-truthy not-was-falsy)"),
+    // Dynamic eval can also replace `not`, so it must disable the branch
+    // peephole and dispatch through the runtime global binding.
+    if_not_redefined_by_eval:
+        "(begin
+           (eval '(define not (lambda (x) x)))
+           (if (not #t) 'then 'else))" => common::eval("'then"),
     // A lexically shadowed `not` resolves as a local, never as the global
     // intrinsic — no fold, the local binding is called.
     if_not_lexically_shadowed:
@@ -2169,6 +2256,12 @@ eval_tests! {
         r#"(let ((a 1) (b (try (throw a) (catch e 7)))) (+ a b))"# => Value::int(8),
     let_binding_nonthrowing_try_unaffected:
         r#"(let ((a 1) (b (try 5 (catch e 2)))) (+ a b))"# => Value::int(6),
+    constructor_operands_survive_caught_throw:
+        "(list [1 (try (throw :x) (catch e 2))] `(3 ,(try (throw :y) (catch e 4))))"
+        => common::eval("'([1 2] (3 4))"),
+    do_step_operands_survive_caught_throw:
+        "(do ((a 0 (+ a 1)) (b 0 (try (throw :x) (catch e (+ b 2))))) ((= a 1) b))"
+        => Value::int(2),
 }
 
 // ============================================================
@@ -3013,11 +3106,54 @@ eval_tests! {
     call_self_internal_define_mix: "(define (f n) (define (g k) (if (= k 0) 0 (+ 1 (g (- k 1))))) (+ (g n) (if (= n 0) 0 (f (- n 1))))) (f 2)" => Value::int(3),
     call_self_internal_define_shadows: "(define (f n) (define (f k) (* k 2)) (f n)) (f 5)" => Value::int(10),
     call_self_letrec_shadows: "(define (f n) (letrec ((f (lambda (k) (if (= k 0) 0 (+ 1 (f (- k 1))))))) (f n))) (f 4)" => Value::int(4),
+    saved_recursive_closure_observes_later_rebinding: "(define (f n) (if (= n 0) 0 (+ 1 (f (- n 1))))) (define saved f) (eval '(set! f (fn (n) 40))) (saved 1)" => Value::int(41),
+    same_unit_set_disables_constant_folding: "(set! + (fn (a b) 99)) (+ 1 2)" => Value::int(99),
+    same_unit_set_disables_native_dispatch: "(set! list (fn () :rebound)) (list)" => Value::keyword("rebound"),
+    nested_define_disables_constant_folding: "(if #t (define + (fn (a b) 77)) nil) (+ 1 2)" => Value::int(77),
+    eval_rebinding_disables_constant_folding: "(eval '(set! + (fn (a b) 88))) (+ 1 2)" => Value::int(88),
+    eval_rebinding_disables_native_dispatch: "(eval '(set! list (fn () :dynamic))) (list)" => Value::keyword("dynamic"),
+    apply_plus_matches_direct_string_concatenation: "(apply + '(\"foo\" \"bar\"))" => Value::string("foobar"),
+    nan_is_not_less_equal: "(<= (/ 0.0 0.0) 1.0)" => Value::bool(false),
+    nan_is_not_greater_equal: "(>= (/ 0.0 0.0) 1.0)" => Value::bool(false),
+    list_min_accepts_full_real_tower: "(list/min (list 5/2 2 9223372036854775808))" => Value::int(2),
+    list_max_accepts_full_real_tower: "(list/max (list 5/2 2 9223372036854775808))" => common::eval("9223372036854775808"),
+    complex_with_inexact_zero_imaginary_equals_real: "(= 3+0.0i 3)" => Value::bool(true),
+    complex_with_inexact_zero_imaginary_is_zero: "(zero? 0+0.0i)" => Value::bool(true),
+    string_take_min_count_is_bounded: "(string/take \"abc\" -9223372036854775808)" => Value::string("abc"),
+    map_literals_evaluate_all_entries_in_source_order: "(define seen (list)) {(begin (set! seen (cons 1 seen)) :k) (begin (set! seen (cons 2 seen)) 10) (begin (set! seen (cons 3 seen)) :k) (begin (set! seen (cons 4 seen)) 20)} seen" => common::eval("'(4 3 2 1)"),
 }
 
 eval_error_tests! {
     // Arity is still checked on the self-call frame path.
     call_self_arity_error: "(define (f n) (if (= n 0) 0 (+ 1 (f)))) (f 1)" => "expects 1 argument, got 0",
+    intrinsic_less_rejects_strings: "(< \"a\" \"b\")" => "number",
+    intrinsic_greater_rejects_strings: "(> \"b\" \"a\")" => "number",
+    integer_to_char_rejects_wrapped_codepoint: "(integer->char 4294967361)" => "invalid codepoint",
+    string_from_codepoints_rejects_wrapped_codepoint: "(string/from-codepoints '(4294967361))" => "invalid codepoint",
+    lambda_rejects_duplicate_parameters: "((fn (x x) x) 1 2)" => "duplicate parameter",
+    lambda_rejects_duplicate_destructured_parameters:
+        "((fn ([x x]) x) '(1 2))" => "duplicate parameter",
+    lambda_rejects_duplicate_across_plain_and_destructured_parameters:
+        "((fn (x [x]) x) 1 '(2))" => "duplicate parameter",
+    let_rejects_duplicate_bindings: "(let ((x 1) (x 2)) x)" => "duplicate binding",
+    let_rejects_duplicate_destructured_bindings:
+        "(let (([x x] '(1 2))) x)" => "duplicate binding",
+    letrec_rejects_duplicate_bindings: "(letrec ((x 1) (x 2)) x)" => "duplicate binding",
+    letrec_rejects_duplicate_destructured_bindings:
+        "(letrec (([x x] '(1 2))) x)" => "duplicate binding",
+    let_star_rejects_duplicate_bindings_in_one_destructuring_pattern:
+        "(let* (([x x] '(1 2))) x)" => "duplicate binding",
+    define_rejects_duplicate_destructured_bindings:
+        "(define [x x] '(1 2)) x" => "duplicate binding",
+    let_values_rejects_duplicate_parameters:
+        "(let-values (((x x) (values 1 2))) x)" => "duplicate parameter",
+    define_values_rejects_duplicate_parameters:
+        "(define-values (x x) (values 1 2)) x" => "duplicate parameter",
+}
+
+eval_tests! {
+    let_star_allows_sequential_shadowing:
+        "(let* ((x 1) (x 2)) x)" => Value::int(2),
 }
 
 // ============================================================

@@ -387,10 +387,9 @@ pub fn register(env: &sema_core::Env) {
             // other rounding builtin (floor/ceil/round/truncate) — a raw cast
             // would saturate and silently return garbage.
             ValueViewRef::Float(f) => float_to_int(f.trunc(), "int"),
-            ValueViewRef::String(s) => s
-                .parse::<i64>()
-                .map(Value::int)
-                .map_err(|_| SemaError::eval(format!("cannot convert '{s}' to int"))),
+            ValueViewRef::String(s) => SemaNumber::parse_int_radix(s, 10)
+                .map(Value::from_number)
+                .ok_or_else(|| SemaError::eval(format!("cannot convert '{s}' to int"))),
             _ => Err(SemaError::type_error(
                 "number or string",
                 args[0].type_name(),

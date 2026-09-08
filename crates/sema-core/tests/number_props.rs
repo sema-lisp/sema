@@ -150,15 +150,11 @@ fn mul_is_associative_over_exact() {
     }
 }
 
-/// A number that is zero-valued. A complex whose components are both inexact
-/// zeros (`0.0+0.0i`, e.g. from subtracting an inexact complex from itself)
-/// stays complex per R7RS, so it is not `num_eq` to the exact integer 0 — but
-/// it is still zero-valued component-wise.
+/// A number that is numerically equal to zero. A complex whose components are
+/// both inexact zeros (`0.0+0.0i`, e.g. from subtracting an inexact complex
+/// from itself) stays complex per R7RS and is numerically equal to zero.
 fn is_numeric_zero(n: &SemaNumber) -> bool {
-    match n {
-        SemaNumber::Complex(c) => c.re.num_eq(&int(0)) && c.im.num_eq(&int(0)),
-        other => other.num_eq(&int(0)),
-    }
+    n.num_eq(&int(0))
 }
 
 #[test]

@@ -3591,16 +3591,16 @@ impl VM {
                     op::LE => {
                         let b = unsafe { pop_unchecked(&mut self.stack) };
                         let a = unsafe { pop_unchecked(&mut self.stack) };
-                        match vm_lt(&b, &a) {
-                            Ok(v) => self.stack.push(Value::bool(!v)),
+                        match vm_le(&a, &b) {
+                            Ok(v) => self.stack.push(Value::bool(v)),
                             Err(err) => handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch),
                         }
                     }
                     op::GE => {
                         let b = unsafe { pop_unchecked(&mut self.stack) };
                         let a = unsafe { pop_unchecked(&mut self.stack) };
-                        match vm_lt(&a, &b) {
-                            Ok(v) => self.stack.push(Value::bool(!v)),
+                        match vm_le(&b, &a) {
+                            Ok(v) => self.stack.push(Value::bool(v)),
                             Err(err) => handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch),
                         }
                     }
@@ -6176,7 +6176,6 @@ fn vm_lt(a: &Value, b: &Value) -> Result<bool, SemaError> {
         (ValueViewRef::Float(x), ValueViewRef::Int(y)) => {
             Ok(sema_core::num::cmp_int_float(y, x) == Some(std::cmp::Ordering::Greater))
         }
-        (ValueViewRef::String(x), ValueViewRef::String(y)) => Ok(x < y),
         _ => match (a.as_number(), b.as_number()) {
             (Some(x), Some(y)) if !x.is_real() || !y.is_real() => {
                 Err(SemaError::eval("cannot order complex numbers")
@@ -6184,11 +6183,15 @@ fn vm_lt(a: &Value, b: &Value) -> Result<bool, SemaError> {
             }
             (Some(x), Some(y)) => Ok(x.cmp_real(&y) == Some(std::cmp::Ordering::Less)),
             _ => Err(SemaError::type_error(
-                "comparable values",
+                "number",
                 format!("{} and {}", a.type_name(), b.type_name()),
             )),
         },
     }
+}
+
+fn vm_le(a: &Value, b: &Value) -> Result<bool, SemaError> {
+    Ok(vm_lt(a, b)? || vm_eq(a, b))
 }
 
 /// `mod`/`modulo` intrinsic: floored division (result takes the sign of the

@@ -87,9 +87,7 @@ pub fn register(env: &sema_core::Env) {
         let n = args[0]
             .as_number()
             .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-        Ok(Value::bool(
-            n.cmp_real(&SemaNumber::from_i64(0)) == Some(Ordering::Equal),
-        ))
+        Ok(Value::bool(n.num_eq(&SemaNumber::from_i64(0))))
     });
 
     register_fn(env, "positive?", |args| {

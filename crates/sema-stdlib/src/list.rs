@@ -3277,13 +3277,15 @@ fn flatten_recursive(val: &Value, out: &mut Vec<Value>) {
 }
 
 fn num_lt(a: &Value, b: &Value) -> Result<bool, SemaError> {
-    match (a.view_ref(), b.view_ref()) {
-        (ValueViewRef::Int(a), ValueViewRef::Int(b)) => Ok(a < b),
-        (ValueViewRef::Float(a), ValueViewRef::Float(b)) => Ok(a < b),
-        (ValueViewRef::Int(a), ValueViewRef::Float(b)) => Ok((a as f64) < b),
-        (ValueViewRef::Float(a), ValueViewRef::Int(b)) => Ok(a < (b as f64)),
-        _ => Err(SemaError::type_error("number", a.type_name())),
-    }
+    let a = a
+        .as_number()
+        .ok_or_else(|| SemaError::type_error("number", a.type_name()))?;
+    let b = b
+        .as_number()
+        .ok_or_else(|| SemaError::type_error("number", b.type_name()))?;
+    a.cmp_real(&b)
+        .map(|ordering| ordering == std::cmp::Ordering::Less)
+        .ok_or_else(|| SemaError::eval("cannot order complex numbers or NaN"))
 }
 
 /// True when `v` is a genuinely runtime-only native — its legacy value ABI is

@@ -117,12 +117,9 @@ pub enum Op {
     // keep all preceding opcode numbers stable for `.semac` compatibility.
     SelfTailCall, // u16 argc → tail call reusing the current frame's closure
 
-    // Direct self-call — the non-tail counterpart of `SelfTailCall`: the callee
-    // is the current frame's own closure, so no callee value is on the stack and
-    // no global lookup / callable dispatch happens. Emitted inside a top-level
-    // `(define (f ...))` lambda for direct calls to `f` when nothing else in the
-    // program rebinds the name (see `Compiler::self_global`). Appended last to
-    // keep all preceding opcode numbers stable for `.semac` compatibility.
+    // Legacy direct self-call. Retained so existing serialized bytecode keeps
+    // its opcode numbering; the compiler no longer emits it because a global
+    // function may outlive a later rebinding of its name.
     CallSelf, // u16 argc → push a frame for the current frame's own closure
 
     // Moving load — like `LoadLocal`, but MOVES the slot value onto the operand

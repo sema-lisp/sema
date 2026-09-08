@@ -33,25 +33,130 @@ pub fn optimize_with_redefined(expr: CoreExpr, redefined: &[String]) -> CoreExpr
     optimize_inner(expr, redefined)
 }
 
-/// Collect the FOLDABLE_NAMES (re)defined at the top level of any program
-/// form. Top-level `begin`s splice, so they are scanned too; deeper defines
-/// are local bindings the Begin/Let shadow scans already handle.
+/// Collect the FOLDABLE_NAMES (re)defined anywhere in a program. The scan is
+/// deliberately conservative: a rebind in any branch or nested lambda keeps
+/// folding from observing a stale global binding.
 pub fn redefined_foldable_names(exprs: &[CoreExpr]) -> Vec<String> {
+    fn note(spur: sema_core::Spur, out: &mut Vec<String>) {
+        let name = resolve_spur(spur);
+        if FOLDABLE_NAMES.contains(&name.as_str()) && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    fn note_all(out: &mut Vec<String>) {
+        for name in FOLDABLE_NAMES {
+            if !out.iter().any(|item| item == name) {
+                out.push((*name).to_string());
+            }
+        }
+    }
     fn scan(e: &CoreExpr, out: &mut Vec<String>) {
         match e {
-            CoreExpr::Define(spur, _) => {
-                let name = resolve_spur(*spur);
-                if FOLDABLE_NAMES.contains(&name.as_str()) && !out.contains(&name) {
-                    out.push(name);
+            CoreExpr::Define(spur, value) | CoreExpr::Set(spur, value) => {
+                note(*spur, out);
+                scan(value, out);
+            }
+            CoreExpr::Eval(value) | CoreExpr::Load(value) => {
+                note_all(out);
+                scan(value, out);
+            }
+            CoreExpr::DefineRecordType {
+                ctor_name,
+                pred_name,
+                field_specs,
+                ..
+            } => {
+                note(*ctor_name, out);
+                note(*pred_name, out);
+                for (_, accessor_name) in field_specs {
+                    note(*accessor_name, out);
                 }
             }
-            CoreExpr::Begin(exprs) => {
+            CoreExpr::Begin(exprs)
+            | CoreExpr::And(exprs)
+            | CoreExpr::Or(exprs)
+            | CoreExpr::MakeList(exprs)
+            | CoreExpr::MakeVector(exprs) => {
                 for x in exprs {
                     scan(x, out);
                 }
             }
+            CoreExpr::If { test, then, else_ } => {
+                scan(test, out);
+                scan(then, out);
+                scan(else_, out);
+            }
+            CoreExpr::Lambda(def) => def.body.iter().for_each(|expr| scan(expr, out)),
+            CoreExpr::Call { func, args, .. } => {
+                scan(func, out);
+                args.iter().for_each(|expr| scan(expr, out));
+            }
+            CoreExpr::Let { bindings, body }
+            | CoreExpr::LetStar { bindings, body }
+            | CoreExpr::Letrec { bindings, body } => {
+                bindings.iter().for_each(|(_, expr)| scan(expr, out));
+                body.iter().for_each(|expr| scan(expr, out));
+            }
+            CoreExpr::Do(do_loop) => {
+                for var in &do_loop.vars {
+                    scan(&var.init, out);
+                    if let Some(step) = &var.step {
+                        scan(step, out);
+                    }
+                }
+                scan(&do_loop.test, out);
+                do_loop.result.iter().for_each(|expr| scan(expr, out));
+                do_loop.body.iter().for_each(|expr| scan(expr, out));
+            }
+            CoreExpr::Try { body, handler, .. } => {
+                body.iter().for_each(|expr| scan(expr, out));
+                handler.iter().for_each(|expr| scan(expr, out));
+            }
+            CoreExpr::Throw(value)
+            | CoreExpr::Delay(value)
+            | CoreExpr::Force(value)
+            | CoreExpr::Macroexpand(value) => scan(value, out),
+            CoreExpr::MakeMap(pairs) => pairs.iter().for_each(|(key, value)| {
+                scan(key, out);
+                scan(value, out);
+            }),
+            CoreExpr::Defmacro { body, .. } | CoreExpr::Module { body, .. } => {
+                body.iter().for_each(|expr| scan(expr, out));
+            }
+            CoreExpr::Import { path, .. } => {
+                note_all(out);
+                scan(path, out);
+            }
+            CoreExpr::Prompt(entries) => entries.iter().for_each(|entry| match entry {
+                PromptEntry::RoleContent { parts, .. } => {
+                    parts.iter().for_each(|expr| scan(expr, out));
+                }
+                PromptEntry::Expr(expr) => scan(expr, out),
+            }),
+            CoreExpr::Message { role, parts } => {
+                scan(role, out);
+                parts.iter().for_each(|expr| scan(expr, out));
+            }
+            CoreExpr::Deftool {
+                name,
+                description,
+                parameters,
+                options,
+                handler,
+                ..
+            } => {
+                note(*name, out);
+                scan(description, out);
+                scan(parameters, out);
+                scan(options, out);
+                scan(handler, out);
+            }
+            CoreExpr::Defagent { name, options } => {
+                note(*name, out);
+                scan(options, out);
+            }
             CoreExpr::Spanned(_, inner) => scan(inner, out),
-            _ => {}
+            CoreExpr::Const(_) | CoreExpr::Var(_) | CoreExpr::Quote(_) => {}
         }
     }
     let mut out = Vec::new();
@@ -502,6 +607,15 @@ mod tests {
         crate::lower::lower(&val, None).unwrap()
     }
 
+    fn redefined_names(input: &str) -> Vec<String> {
+        let vals = sema_reader::read_many(input).unwrap();
+        let cores = vals
+            .iter()
+            .map(|val| crate::lower::lower(val, None).unwrap())
+            .collect::<Vec<_>>();
+        redefined_foldable_names(&cores)
+    }
+
     #[test]
     fn test_shadow_define_in_begin() {
         let core = lower_str("(begin (define + *) (+ 3 4))");
@@ -517,6 +631,39 @@ mod tests {
                 );
             }
             other => panic!("expected Begin, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_record_generated_bindings_suppress_folding() {
+        let names = redefined_names("(define-record-type rec (+ x) - (x *))");
+        for name in ["+", "-", "*"] {
+            assert!(
+                names.iter().any(|found| found == name),
+                "record-generated `{name}` must suppress folding: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_and_agent_bindings_suppress_folding() {
+        for source in ["(deftool + \"tool\" {} (fn () nil))", "(defagent + {})"] {
+            let names = redefined_names(source);
+            assert!(
+                names.iter().any(|name| name == "+"),
+                "generated `+` binding must suppress folding: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_and_import_suppress_all_folding() {
+        for source in [r#"(load "module.sema")"#, r#"(import "module.sema")"#] {
+            let names = redefined_names(source);
+            assert_eq!(names.len(), FOLDABLE_NAMES.len(), "{source}: {names:?}");
+            for name in FOLDABLE_NAMES {
+                assert!(names.iter().any(|found| found == name), "{source}: {name}");
+            }
         }
     }
 }

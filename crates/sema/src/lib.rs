@@ -258,6 +258,8 @@ impl Interpreter {
     /// Load and evaluate a `.sema` file.
     ///
     /// Definitions persist in the global environment, just like [`eval_str`].
+    /// Top-level forms run in source order, so a loaded macro is available to
+    /// later forms in the same file.
     ///
     /// ```no_run
     /// # use sema::Interpreter;
@@ -267,9 +269,29 @@ impl Interpreter {
     /// ```
     pub fn load_file(&self, path: impl AsRef<std::path::Path>) -> EvalResult {
         let path = path.as_ref();
-        let content = std::fs::read_to_string(path)
+        let canonical = path
+            .canonicalize()
             .map_err(|e| SemaError::eval(format!("load_file {}: {e}", path.display())))?;
-        self.eval_str(&content)
+        let content = std::fs::read_to_string(&canonical)
+            .map_err(|e| SemaError::eval(format!("load_file {}: {e}", path.display())))?;
+        self.inner.ctx.push_file_path(canonical);
+        let result = (|| {
+            let (exprs, spans) = sema_reader::read_many_with_spans(&content)?;
+            self.inner.ctx.merge_span_table(spans);
+
+            let mut value = Value::nil();
+            for expr in &exprs {
+                value = self.inner.eval_in_global(expr)?;
+            }
+            Ok(value)
+        })();
+        self.inner.ctx.pop_file_path();
+        result
+    }
+
+    /// Run bytecode with relative imports resolved from `path`'s directory.
+    pub fn run_bytecode_file(&self, path: &std::path::Path, bytes: &[u8]) -> EvalResult {
+        self.inner.run_bytecode_file(path, bytes)
     }
 
     /// Pre-load a module into the module cache so that `(import "name")`

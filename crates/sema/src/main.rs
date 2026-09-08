@@ -1497,7 +1497,7 @@ fn main() {
         // Auto-detect .semac bytecode files
         if let Ok(bytes) = std::fs::read(path) {
             if sema_vm::is_bytecode_file(&bytes) {
-                match interpreter.run_bytecode_bytes(&bytes) {
+                match interpreter.run_bytecode_file(path, &bytes) {
                     Ok(_) => {
                         drain_async_scheduler(&interpreter);
                     }

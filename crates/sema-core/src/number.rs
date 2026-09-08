@@ -394,7 +394,12 @@ impl SemaNumber {
             (SemaNumber::Complex(a), SemaNumber::Complex(b)) => {
                 a.re.num_eq(&b.re) && a.im.num_eq(&b.im)
             }
-            (SemaNumber::Complex(_), _) | (_, SemaNumber::Complex(_)) => false,
+            (SemaNumber::Complex(a), real) => {
+                a.im.num_eq(&SemaNumber::from_i64(0)) && a.re.num_eq(real)
+            }
+            (real, SemaNumber::Complex(b)) => {
+                b.im.num_eq(&SemaNumber::from_i64(0)) && real.num_eq(&b.re)
+            }
             _ => self.cmp_real(other) == Some(std::cmp::Ordering::Equal),
         }
     }

@@ -17,9 +17,9 @@
 //!   slots already taken by the partially-executed body.
 //! - `do` loops: the back-edge re-reads loop-variable slots stored in a
 //!   *previous* iteration, which a straight-line liveness walk cannot see.
-//! - self-frame-reuse (`SelfTailCall` via `VarResolution::SelfFn`, or an armed
-//!   `Compiler::self_global`): the frame restarts at pc 0 with only the params
-//!   rebound, so "after the call" is not the end of the slot's life.
+//! - self-frame-reuse (`SelfTailCall` via `VarResolution::SelfFn`): the frame
+//!   restarts at pc 0 with only the params rebound, so "after the call" is not
+//!   the end of the slot's life.
 //! - any form outside the core allowlist (modules, macros, eval/load, LLM
 //!   constructors, ...): these lower to runtime calls whose evaluation order
 //!   is not worth modeling — they never appear in hot lambdas.
@@ -86,60 +86,6 @@ pub(crate) fn takeable_loads(def: &LambdaDef<VarRef>) -> HashSet<LoadSite> {
     } else {
         a.takes
     }
-}
-
-/// True iff any call in `exprs` is a tail call to the global `target` —
-/// i.e. a site the compiler will emit as a frame-reusing `SelfTailCall` when
-/// `target` is the armed `Compiler::self_global`. Nested lambda bodies are
-/// skipped: their tail flags refer to their own frames, and their self-call
-/// arming is decided independently.
-pub(crate) fn has_tail_self_call(exprs: &[ResolvedExpr], target: sema_core::Spur) -> bool {
-    fn peel(e: &ResolvedExpr) -> &ResolvedExpr {
-        match e {
-            Expr::Spanned(_, inner) => peel(inner),
-            other => other,
-        }
-    }
-    fn walk(e: &ResolvedExpr, target: sema_core::Spur) -> bool {
-        match e {
-            Expr::Call { func, args, tail } => {
-                if *tail {
-                    if let Expr::Var(vr) = peel(func) {
-                        if matches!(vr.resolution, VarResolution::Global { spur } if spur == target)
-                        {
-                            return true;
-                        }
-                    }
-                }
-                walk(func, target) || args.iter().any(|a| walk(a, target))
-            }
-            Expr::Lambda(_) | Expr::Const(_) | Expr::Quote(_) | Expr::Var(_) => false,
-            Expr::Spanned(_, inner) => walk(inner, target),
-            Expr::If { test, then, else_ } => {
-                walk(test, target) || walk(then, target) || walk(else_, target)
-            }
-            Expr::Begin(v)
-            | Expr::And(v)
-            | Expr::Or(v)
-            | Expr::MakeList(v)
-            | Expr::MakeVector(v) => v.iter().any(|e| walk(e, target)),
-            Expr::MakeMap(pairs) => pairs
-                .iter()
-                .any(|(k, v)| walk(k, target) || walk(v, target)),
-            Expr::Set(_, val) | Expr::Define(_, val) | Expr::Throw(val) => walk(val, target),
-            Expr::Let { bindings, body }
-            | Expr::LetStar { bindings, body }
-            | Expr::Letrec { bindings, body } => {
-                bindings.iter().any(|(_, init)| walk(init, target))
-                    || body.iter().any(|e| walk(e, target))
-            }
-            // Every other construct already opts the function out of the
-            // analysis in PreScan, so its answer here is irrelevant — return
-            // true (the conservative direction) rather than modeling it.
-            _ => true,
-        }
-    }
-    exprs.iter().any(|e| walk(e, target))
 }
 
 struct PreScan {

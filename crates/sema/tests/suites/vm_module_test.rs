@@ -62,6 +62,46 @@ fn vm_load_returns_last_expr() {
 }
 
 #[test]
+fn vm_load_rebinding_disables_fold_and_native_dispatch() {
+    let dir = temp_dir("load-rebind");
+    let module = write(
+        &dir,
+        "rebind.sema",
+        "(define + (fn (a b) 99))\n(define list (fn () :loaded-list))",
+    );
+
+    assert_vm_eq(
+        &format!(r#"(begin (load "{module}") (+ 1 2))"#),
+        Value::int(99),
+    );
+    assert_vm_eq(
+        &format!(r#"(begin (load "{module}") (list))"#),
+        Value::keyword("loaded-list"),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn vm_import_rebinding_disables_fold_and_native_dispatch() {
+    let dir = temp_dir("import-rebind");
+    let module = write(
+        &dir,
+        "rebind.sema",
+        "(module rebind (export + list) (define + (fn (a b) 99)) (define list (fn () :imported-list)))",
+    );
+
+    assert_vm_eq(
+        &format!(r#"(begin (import "{module}") (+ 1 2))"#),
+        Value::int(99),
+    );
+    assert_vm_eq(
+        &format!(r#"(begin (import "{module}") (list))"#),
+        Value::keyword("imported-list"),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn vm_nested_transitive_load() {
     let dir = temp_dir("load-nested");
     let c = write(&dir, "c.sema", "(define c-val 3)");

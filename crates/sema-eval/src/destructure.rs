@@ -213,6 +213,9 @@ fn match_seq(out: &mut Bindings, elems: &[Value], value: &Value) -> Result<bool,
             ));
         }
         let rest_pattern = &elems[pos + 1];
+        if pos + 2 < elems.len() {
+            return Err(SemaError::eval("match: only one pattern allowed after `&`"));
+        }
 
         if items.len() < fixed.len() {
             return Ok(false);

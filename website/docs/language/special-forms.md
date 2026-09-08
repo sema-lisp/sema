@@ -725,12 +725,16 @@ Evaluate a body `count` times with `var` bound to integers from `0` through
 
 ### `for-range`
 
-Iterate from an inclusive start to an exclusive end. The optional positive
-step defaults to `1`. Backward iteration is not supported.
+Iterate from an inclusive start to an exclusive end. The optional step defaults
+to `1`. A positive step iterates upward, a negative step iterates downward, and
+a zero step raises an error.
 
 ```sema
 (for-range (i 0 6 2)
   (println i))                         ; prints 0, 2, 4
+
+(for-range (i 5 0 -1)
+  (println i))                         ; prints 5, 4, 3, 2, 1
 ```
 
 ## Lazy Evaluation

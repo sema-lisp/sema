@@ -171,6 +171,92 @@ fn embedding_load_file_roundtrips() {
 }
 
 #[test]
+fn embedding_load_file_resolves_relative_modules_and_macro_loads() {
+    let interp = Interpreter::new();
+    let dir = std::env::temp_dir().join(format!("sema_embed_relative_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("helper.sema"),
+        "(module helper (export answer) (define answer 41))",
+    )
+    .unwrap();
+    std::fs::write(dir.join("macros.sema"), "(defmacro add-one (x) `(+ ,x 1))").unwrap();
+    std::fs::write(
+        dir.join("main.sema"),
+        "(import \"helper.sema\") (load \"macros.sema\") (define result (add-one answer))",
+    )
+    .unwrap();
+    interp.load_file(dir.join("main.sema")).unwrap();
+    assert_eq!(interp.eval_str("result").unwrap(), Value::int(42));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn embedding_dynamic_top_level_load_keeps_runtime_argument_evaluation() {
+    let interp = Interpreter::new();
+    let dir = std::env::temp_dir().join(format!("sema_embed_dynamic_load_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("loaded.sema"), "(define loaded-answer 42)").unwrap();
+    std::fs::write(
+        dir.join("main.sema"),
+        "(define loaded-path \"loaded.sema\") (load loaded-path) (define result loaded-answer)",
+    )
+    .unwrap();
+
+    interp.load_file(dir.join("main.sema")).unwrap();
+    assert_eq!(interp.eval_str("result").unwrap(), Value::int(42));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn bytecode_file_resolves_relative_imports() {
+    let interp = Interpreter::new();
+    let dir = std::env::temp_dir().join(format!("sema_bytecode_relative_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("helper.sema"),
+        "(module helper (export bytecode-answer) (define bytecode-answer 42))",
+    )
+    .unwrap();
+    let compiler = sema_eval::Interpreter::new();
+    let compiled = compiler
+        .compile_to_bytecode("(import \"helper.sema\") bytecode-answer")
+        .unwrap();
+    let bytes = sema_vm::serialize_to_bytes(&compiled, 0).unwrap();
+    let path = dir.join("main.semac");
+    std::fs::write(&path, &bytes).unwrap();
+    assert_eq!(
+        interp.run_bytecode_file(&path, &bytes).unwrap(),
+        Value::int(42)
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn loaded_module_does_not_replace_importing_module_exports() {
+    let interp = Interpreter::new();
+    let dir = std::env::temp_dir().join(format!("sema_nested_exports_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("inner.sema"),
+        "(module inner (export hidden) (define hidden 1))",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("outer.sema"),
+        "(module outer (export public) (load \"inner.sema\") (define public 42) (define private 9))",
+    )
+    .unwrap();
+    let entry = dir.join("entry.sema");
+    std::fs::write(&entry, "(import \"outer.sema\")").unwrap();
+    interp.load_file(&entry).unwrap();
+    assert_eq!(interp.eval_str("public").unwrap(), Value::int(42));
+    assert!(interp.eval_str("private").is_err());
+    assert!(interp.eval_str("hidden").is_err());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn embedding_preload_module_all_bindings_when_no_export() {
     // With no `(export ...)`, every top-level binding is importable.
     let interp = Interpreter::new();

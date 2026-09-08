@@ -255,23 +255,32 @@ pub const PRELUDE: &str = r#"
 ;; dotimes: execute body n times with a counter variable
 ;; (dotimes (i 10) (println i)) — prints 0..9
 (defmacro dotimes (binding . body)
-  (let ((var (car binding))
-        (count (cadr binding)))
-    `(do ((,var 0 (+ ,var 1)))
-       ((= ,var ,count))
-       ,@body)))
+  (if (not (= (length binding) 2))
+      (error "dotimes: expected (variable count)")
+      (let ((var (car binding))
+            (count (cadr binding)))
+        `(do ((,var 0 (+ ,var 1)))
+           ((>= ,var ,count))
+           ,@body))))
 
 ;; for-range: loop from start to end (exclusive) with optional step
 ;; (for-range (i 0 10) (println i)) — prints 0..9
 ;; (for-range (i 0 10 2) (println i)) — prints 0,2,4,6,8
 (defmacro for-range (binding . body)
-  (let ((var (car binding))
-        (start (cadr binding))
-        (end (caddr binding))
-        (step (if (null? (cdddr binding)) 1 (car (cdddr binding)))))
-    `(do ((,var ,start (+ ,var ,step)))
-       ((>= ,var ,end))
-       ,@body)))
+  (if (or (< (length binding) 3) (> (length binding) 4))
+      (error "for-range: expected (variable start end [step])")
+      (let ((var (car binding))
+            (start (cadr binding))
+            (end (caddr binding))
+            (step (if (null? (cdddr binding)) 1 (car (cdddr binding)))))
+        `(let ((fr-start# ,start)
+               (fr-end# ,end)
+               (fr-step# ,step))
+           (if (= fr-step# 0)
+               (error "for-range: step must not be zero")
+               (do ((,var fr-start# (+ ,var fr-step#)))
+                   ((if (> fr-step# 0) (>= ,var fr-end#) (<= ,var fr-end#)))
+                   ,@body))))))
 
 ;; with-span: run body inside a named tracing span carrying an attributes map.
 ;; Ends the span on exit (Error status if the body throws); returns the body's value.
@@ -550,10 +559,11 @@ pub const PRELUDE: &str = r#"
 ;; __spawn-thunks: spawn each zero-arg thunk into its own task, returning the
 ;; promises in INPUT order. Bytecode-level recursion preserves the runtime request.
 (define (__spawn-thunks thunks)
-  (if (null? thunks)
+  (let ((items (if (vector? thunks) (vector->list thunks) thunks)))
+    (if (null? items)
       (list)
-      (let ((p (async/spawn (car thunks))))
-        (cons p (__spawn-thunks (cdr thunks))))))
+      (let ((p (async/spawn (car items))))
+        (cons p (__spawn-thunks (cdr items)))))))
 
 ;; __spawn-apply: spawn one task per item that computes `(wf item)`, returning
 ;; the promises in INPUT order. Bytecode-level recursion — the per-item worker
@@ -561,11 +571,12 @@ pub const PRELUDE: &str = r#"
 ;; closure created during a higher-order native's re-entrant nested call would
 ;; index the wrong function table.
 (define (__spawn-apply wf items)
-  (if (null? items)
+  (let ((normalized-items (if (vector? items) (vector->list items) items)))
+    (if (null? normalized-items)
       (list)
-      (let ((item (car items)))
+      (let ((item (car normalized-items)))
         (let ((p (async/spawn (fn () (wf item)))))
-          (cons p (__spawn-apply wf (cdr items)))))))
+          (cons p (__spawn-apply wf (cdr normalized-items))))))))
 
 ;; __cancel-all: request cancellation of every promise in a list (best-effort
 ;; reap of owned children on a fail-fast path). Bytecode-level dispatch preserves
@@ -656,9 +667,10 @@ pub const PRELUDE: &str = r#"
 ;; handed to `__spawn-apply`, which wraps and spawns each `(fo-worker# item)`
 ;; directly.
 (defmacro __fanout-tagged (wf items n)
-  `(let ((fo-f# ,wf)
-         (fo-items# ,items)
-         (fo-sem# (channel/new ,n)))
+  `(let* ((fo-f# ,wf)
+          (fo-input# ,items)
+          (fo-items# (if (vector? fo-input#) (vector->list fo-input#) fo-input#))
+          (fo-sem# (channel/new ,n)))
      (for-range (i# 0 ,n) (channel/send fo-sem# #t))   ; n concurrency tokens
      (let ((fo-worker#
              (fn (item#)
@@ -877,22 +889,36 @@ pub const PRELUDE: &str = r#"
 ;; reaped, then a structured `{:type :timeout}` condition is raised.
 ;;
 ;;   (async/with-timeout 30000 (fn () (llm/complete prompt)))
+(define (__validate-async-timeout-ms ms)
+  (cond
+    ((not (or (exact-integer? ms) (float? ms)))
+     (error "async/with-timeout: duration must be a number"))
+    ((or (math/nan? ms) (math/infinite? ms))
+     (error "async/with-timeout: duration must be a finite number"))
+    ((< ms 0)
+     (error "async/with-timeout: duration must be non-negative"))
+    ((> ms 86400000)
+     (error "async/with-timeout: duration exceeds maximum 86400000 ms (1 day)"))
+    (else ms)))
+
 (define (async/with-timeout ms thunk)
-  (let ((child (async/spawn thunk))
-        ;; A deadline task resolving to a distinct sentinel; racing it against the
-        ;; child tells the two apart without relying on `async/timeout` (which
-        ;; can't distinguish a timeout from a child rejection from its catch).
-        (timer (async/spawn (fn () (async/sleep ms) :__with-timeout-elapsed))))
-    (let ((outcome (try {:v (async/race (list child timer))}
-                        (catch e {:e e}))))       ; child errored before the deadline
-      ;; Owned cleanup: cancel BOTH — the child on a timeout, the timer on settle.
-      (async/cancel child)
-      (async/cancel timer)
-      (cond
-        ((contains? outcome :e) (throw (:e outcome)))          ; preserve child error
-        ((eq? (:v outcome) :__with-timeout-elapsed)
-         (throw {:type :timeout :message (str "operation exceeded " ms " ms")}))
-        (else (:v outcome))))))                                 ; child value
+  (let ((duration (__validate-async-timeout-ms ms)))
+    ;; The wrappers own the outer tag, so a child may return any Sema value,
+    ;; including a map or keyword that resembles an implementation detail.
+    (let ((child (async/spawn (fn () {:child (thunk)})))
+          (timer (async/spawn (fn ()
+                                (async/sleep duration)
+                                {:timer #t}))))
+      (let ((outcome (try {:v (async/race (list child timer))}
+                          (catch e {:e e}))))       ; child errored before the deadline
+        ;; Owned cleanup: cancel BOTH — the child on a timeout, the timer on settle.
+        (async/cancel child)
+        (async/cancel timer)
+        (cond
+          ((contains? outcome :e) (throw (:e outcome)))          ; preserve child error
+          ((contains? (:v outcome) :timer)
+           (throw {:type :timeout :message (str "operation exceeded " duration " ms")}))
+          (else (:child (:v outcome))))))))                         ; child value
 
 ;; ── Non-blocking multi-round agent loop (issue #61 §3a, ADR #68) ──────────────
 ;; In a runtime task, drive the agent conversation from bytecode: each provider

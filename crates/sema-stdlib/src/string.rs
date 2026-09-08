@@ -764,7 +764,9 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "integer->char", |args| {
         check_arity!(args, "integer->char", 1);
         let n = args.int_at(0, "integer->char")?;
-        let c = char::from_u32(n as u32)
+        let codepoint = u32::try_from(n)
+            .map_err(|_| SemaError::eval(format!("integer->char: invalid codepoint {n}")))?;
+        let c = char::from_u32(codepoint)
             .ok_or_else(|| SemaError::eval(format!("integer->char: invalid codepoint {n}")))?;
         Ok(Value::char(c))
     });
@@ -994,7 +996,10 @@ pub fn register(env: &sema_core::Env) {
             let n = item
                 .as_int()
                 .ok_or_else(|| SemaError::type_error("integer", item.type_name()))?;
-            let c = char::from_u32(n as u32).ok_or_else(|| {
+            let codepoint = u32::try_from(n).map_err(|_| {
+                SemaError::eval(format!("string/from-codepoints: invalid codepoint {n}"))
+            })?;
+            let c = char::from_u32(codepoint).ok_or_else(|| {
                 SemaError::eval(format!("string/from-codepoints: invalid codepoint {n}"))
             })?;
             s.push(c);
@@ -1207,7 +1212,9 @@ pub fn register(env: &sema_core::Env) {
                 s.chars().take(take).collect::<String>(),
             ))
         } else {
-            let take = ((-n) as usize).min(char_count as usize);
+            let take = usize::try_from(n.unsigned_abs())
+                .unwrap_or(usize::MAX)
+                .min(char_count as usize);
             let skip = char_count as usize - take;
             Ok(Value::string_owned(
                 s.chars().skip(skip).collect::<String>(),

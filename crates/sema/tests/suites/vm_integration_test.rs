@@ -247,6 +247,17 @@ fn test_vm_define_record_type() {
     assert_eq!(result2, Value::int(4));
     let result3 = eval_vm("(begin (define-record-type point (make-point x y) point? (x point-x) (y point-y)) (point? (make-point 1 2)))");
     assert_eq!(result3, Value::bool(true));
+
+    // Constructor names are global bindings. They must suppress the inline
+    // arithmetic and native-call paths used by later calls in this unit.
+    let result4 = eval_vm(
+        "(begin (define-record-type plus-record (+ x y) plus-record? (x plus-x) (y plus-y)) (plus-record? (+ 1 2)))",
+    );
+    assert_eq!(result4, Value::bool(true));
+    let result5 = eval_vm(
+        "(begin (define-record-type list-record (list) list-record?) (list-record? (list)))",
+    );
+    assert_eq!(result5, Value::bool(true));
 }
 
 #[test]

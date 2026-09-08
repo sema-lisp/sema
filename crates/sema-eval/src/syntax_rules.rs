@@ -259,9 +259,60 @@ fn note_param_binders(
             }
         }
         ValueView::Map(map) => {
-            for (k, v) in map.iter() {
-                note_param_binders(k, bindings, sr, out);
-                note_param_binders(v, bindings, sr, out);
+            let keys = Value::keyword("keys");
+            if let Some(names) = map.get(&keys) {
+                note_param_binders(names, bindings, sr, out);
+            }
+            for (key, value) in map.iter() {
+                if key != &keys {
+                    note_param_binders(value, bindings, sr, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect binders from a `match` pattern. A quoted list is a literal pattern,
+/// not a nested binding pattern.
+fn note_match_pattern_binders(
+    pattern: &Value,
+    bindings: &Bindings,
+    sr: &sema_core::SyntaxRules,
+    out: &mut HashSet<Spur>,
+) {
+    if let Some(s) = pattern.as_symbol_spur() {
+        note_binder(s, bindings, sr, out);
+        return;
+    }
+    if let Some(items) = pattern.as_list() {
+        if items.len() == 2
+            && items[0]
+                .as_symbol_spur()
+                .is_some_and(|s| resolve(s) == "quote")
+        {
+            return;
+        }
+        for item in items {
+            note_match_pattern_binders(item, bindings, sr, out);
+        }
+        return;
+    }
+    match pattern.view() {
+        ValueView::Vector(items) => {
+            for item in items.iter() {
+                note_match_pattern_binders(item, bindings, sr, out);
+            }
+        }
+        ValueView::Map(map) => {
+            let keys = Value::keyword("keys");
+            if let Some(names) = map.get(&keys) {
+                note_match_pattern_binders(names, bindings, sr, out);
+            }
+            for (key, value) in map.iter() {
+                if key != &keys {
+                    note_match_pattern_binders(value, bindings, sr, out);
+                }
             }
         }
         _ => {}
@@ -297,13 +348,17 @@ fn collect_template_binders(
     };
 
     if let Some(head) = items.first().and_then(|h| h.as_symbol_spur()) {
-        match resolve(head).as_str() {
-            "let" | "let*" | "letrec" | "letrec*" => {
+        let head_name = resolve(head);
+        if matches!(head_name.as_str(), "quote" | "quasiquote") {
+            return;
+        }
+        match head_name.as_str() {
+            "let" | "let*" | "letrec" | "letrec*" | "let-values" | "let*-values" => {
                 // Named let `(let name ((v e) ...) body ...)` also binds `name`;
                 // distinguish it from `(let ((v e) ...) ...)` by a symbol in the
                 // 2nd slot (a plain let has a binding *list* there).
                 let mut idx = 1;
-                if resolve(head) == "let" {
+                if head_name == "let" {
                     if let Some(n) = items.get(1).and_then(|x| x.as_symbol_spur()) {
                         note_binder(n, bindings, sr, out);
                         idx = 2;
@@ -311,12 +366,8 @@ fn collect_template_binders(
                 }
                 if let Some(binds) = items.get(idx).and_then(|b| b.as_list()) {
                     for pair in binds {
-                        if let Some(v) = pair
-                            .as_list()
-                            .and_then(|pl| pl.first())
-                            .and_then(|x| x.as_symbol_spur())
-                        {
-                            note_binder(v, bindings, sr, out);
+                        if let Some(pattern) = pair.as_list().and_then(|pl| pl.first()) {
+                            note_param_binders(pattern, bindings, sr, out);
                         }
                     }
                 }
@@ -334,6 +385,19 @@ fn collect_template_binders(
                 Some(target) => note_param_binders(target, bindings, sr, out),
                 None => {}
             },
+            "defun" | "defn" => {
+                if let Some(name) = items.get(1).and_then(|item| item.as_symbol_spur()) {
+                    note_binder(name, bindings, sr, out);
+                }
+                if let Some(params) = items.get(2) {
+                    note_param_binders(params, bindings, sr, out);
+                }
+            }
+            "define-values" => {
+                if let Some(formals) = items.get(1) {
+                    note_param_binders(formals, bindings, sr, out);
+                }
+            }
             "do" => {
                 // (do ((v init step) ...) ...) → each v.
                 if let Some(specs) = items.get(1).and_then(|b| b.as_list()) {
@@ -345,6 +409,33 @@ fn collect_template_binders(
                         {
                             note_binder(v, bindings, sr, out);
                         }
+                    }
+                }
+            }
+            "try" => {
+                for clause in &items[1..] {
+                    let Some(parts) = clause.as_list() else {
+                        continue;
+                    };
+                    if parts
+                        .first()
+                        .and_then(|part| part.as_symbol_spur())
+                        .is_some_and(|s| resolve(s) == "catch")
+                    {
+                        if let Some(binding) = parts.get(1) {
+                            note_param_binders(binding, bindings, sr, out);
+                        }
+                    }
+                }
+            }
+            "match" | "match*" => {
+                for clause in &items[2..] {
+                    let pattern = clause
+                        .as_list()
+                        .and_then(|parts| parts.first())
+                        .or_else(|| clause.as_vector().and_then(|parts| parts.first()));
+                    if let Some(pattern) = pattern {
+                        note_match_pattern_binders(pattern, bindings, sr, out);
                     }
                 }
             }
@@ -396,6 +487,13 @@ fn instantiate(
 
     match tmpl.view() {
         ValueView::List(elems) => {
+            if elems
+                .first()
+                .and_then(|item| item.as_symbol_spur())
+                .is_some_and(|head| matches!(resolve(head).as_str(), "quote" | "quasiquote"))
+            {
+                return Ok(tmpl.clone());
+            }
             let out = instantiate_seq(&elems, bindings, sr, binders, rename)?;
             Ok(Value::list(out))
         }

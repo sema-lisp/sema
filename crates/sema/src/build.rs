@@ -26,7 +26,7 @@ pub(crate) fn run_compile(file: &str, output: Option<&str>) {
     let sandbox = sema_core::Sandbox::allow_all();
     let interpreter = build_interpreter(&sandbox);
 
-    let result = match interpreter.compile_to_bytecode(&source) {
+    let result = match interpreter.compile_file_to_bytecode(path, &source) {
         Ok(r) => r,
         Err(e) => {
             die(format!("compilation failed: {}", e.format_plain()));
@@ -398,7 +398,7 @@ fn build_archive(
     let interpreter = build_interpreter(&sandbox);
 
     let result = interpreter
-        .compile_to_bytecode(&source)
+        .compile_file_to_bytecode(path, &source)
         .map_err(|e| format!("compile failed: {}", e.format_plain()))?;
     let bytecode = sema_vm::serialize_to_bytes(&result, source_hash)
         .map_err(|e| format!("serialization failed: {}", e.format_plain()))?;

@@ -1212,6 +1212,32 @@ fn test_indent_default_is_2() {
 }
 
 #[test]
+fn test_tab_indentation_uses_tab_stops_for_wrapping() {
+    let options = FormatOptions {
+        width: 32,
+        indent: 4,
+        use_tabs: true,
+        ..Default::default()
+    };
+    let output = format_source(
+        "(defun f (value) (if value (some-function alpha beta gamma delta)))",
+        &options,
+    )
+    .unwrap();
+    assert!(output.lines().any(|line| line.starts_with('\t')));
+    for line in output.lines() {
+        let width = line.chars().fold(0, |column, ch| {
+            if ch == '\t' {
+                column + 4 - column % 4
+            } else {
+                column + unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
+            }
+        });
+        assert!(width <= options.width, "line exceeds width: {line:?}");
+    }
+}
+
+#[test]
 fn test_indent_idempotent_4() {
     let input =
         "(define (f x)\n    (when (> x 0)\n        (println x)\n        (println (+ x 1))))";

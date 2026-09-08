@@ -1326,6 +1326,7 @@ fn main() {
                     indent: indent.unwrap_or(config.fmt.indent),
                     align: align.unwrap_or(config.fmt.align),
                     max_blank_lines: max_blank_lines.unwrap_or(config.fmt.max_blank_lines),
+                    use_tabs: false,
                 };
                 if let Err(error) = opts.validate() {
                     die(error);

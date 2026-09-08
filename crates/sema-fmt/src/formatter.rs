@@ -19,7 +19,7 @@ use std::borrow::Cow;
 
 use sema_core::SemaError;
 use sema_reader::lexer::{tokenize, FStringPart, SpannedToken, Token};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // ---------------------------------------------------------------------------
 // Node tree — lightweight structure built from the flat token stream
@@ -740,6 +740,8 @@ struct Formatter {
     width: usize,
     /// Spaces per indentation level for body forms.
     indent_size: usize,
+    /// Emit leading indentation with tabs at `indent_size` column stops.
+    use_tabs: bool,
     /// When true, column-align consecutive defines, cond clauses, and let bindings.
     align: bool,
     /// Longest run of consecutive blank lines to preserve.
@@ -753,6 +755,7 @@ impl Formatter {
         Self {
             width: opts.width,
             indent_size: opts.indent,
+            use_tabs: opts.use_tabs,
             align: opts.align,
             max_blank_lines: opts.max_blank_lines,
             output: String::new(),
@@ -761,10 +764,11 @@ impl Formatter {
 
     /// Column where the next character will land on the current output line.
     fn current_col(&self) -> usize {
-        match self.output.rfind('\n') {
-            Some(pos) => display_width(&self.output[pos + 1..]),
-            None => display_width(&self.output),
-        }
+        let line = self
+            .output
+            .rfind('\n')
+            .map_or(self.output.as_str(), |pos| &self.output[pos + 1..]);
+        display_width_with_tabs(line, self.indent_size)
     }
 
     /// Emit up to `max_blank_lines` blank lines for a run of `newlines`
@@ -2418,13 +2422,30 @@ impl Formatter {
     // -----------------------------------------------------------------------
 
     fn push_indent(&mut self, n: usize) {
-        self.output.extend(std::iter::repeat_n(' ', n));
+        if self.use_tabs {
+            self.output
+                .extend(std::iter::repeat_n('\t', n / self.indent_size));
+            self.output
+                .extend(std::iter::repeat_n(' ', n % self.indent_size));
+        } else {
+            self.output.extend(std::iter::repeat_n(' ', n));
+        }
     }
 }
 
 /// Terminal column width of a rendered fragment.
 fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
+}
+
+fn display_width_with_tabs(s: &str, tab_size: usize) -> usize {
+    s.chars().fold(0, |column, ch| {
+        if ch == '\t' {
+            column + tab_size - (column % tab_size)
+        } else {
+            column + UnicodeWidthChar::width(ch).unwrap_or(0)
+        }
+    })
 }
 
 /// Render a single node as a flat (single-line) string.
@@ -2490,6 +2511,8 @@ pub struct FormatOptions {
     pub width: usize,
     /// Spaces per indentation level for body forms.
     pub indent: usize,
+    /// Use tabs for complete indentation levels and spaces for any remainder.
+    pub use_tabs: bool,
     /// Column-align consecutive similar forms (defines, cond clauses,
     /// let bindings) for readability.
     pub align: bool,
@@ -2527,6 +2550,7 @@ impl Default for FormatOptions {
         Self {
             width: 80,
             indent: 2,
+            use_tabs: false,
             align: false,
             max_blank_lines: 1,
         }

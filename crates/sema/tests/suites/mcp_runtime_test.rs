@@ -461,7 +461,9 @@ fn assert_cancelled_before_server_fallback(
     let entered = markers.entered.clone();
     let emergency_release = markers.release.clone();
     let canceller = thread::spawn(move || {
-        let saw_entry = wait_for_path(&entered, Duration::from_secs(6));
+        // 30 s: the python peer is a cold process spawn; under host memory
+        // pressure spawns have taken 7 s. A passing run sees the marker in <1 s.
+        let saw_entry = wait_for_path(&entered, Duration::from_secs(30));
         if !saw_entry {
             let _ = std::fs::write(emergency_release, b"release");
             return (false, false);

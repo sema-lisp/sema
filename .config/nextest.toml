@@ -14,6 +14,16 @@ slow-timeout = { period = "60s", terminate-after = 3 }
 filter = "test(fuzz_async_shutdown)"
 slow-timeout = { period = "300s", terminate-after = 2 }
 
+# Tests that spawn a `sema` or python child per test. Twelve cold 160 MB
+# spawns at once stall for >10 s when the host is swapping (2026-09-09 flake:
+# all 12 sema-dap integration tests timed out together). Cap their concurrency.
+[test-groups]
+process-spawners = { max-threads = 4 }
+
+[[profile.default.overrides]]
+filter = 'binary_id(sema-dap::integration_test) | test(/runtime_mcp_.*_cancellable/)'
+test-group = 'process-spawners'
+
 [profile.ci]
 # Emit JUnit XML for CI test reporting.
 retries = 1

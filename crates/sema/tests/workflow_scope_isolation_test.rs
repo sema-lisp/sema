@@ -304,10 +304,12 @@ fn nested_runs_restore_exact_outer_scope_across_interleaved_teardown() {
 
 struct FakeResolver {
     close_calls: Rc<Cell<u32>>,
+    resolved: Rc<Cell<bool>>,
 }
 
 impl WorkflowMcpResolver for FakeResolver {
     fn resolve(&self, decls: &[McpDecl], _workflow: &str, _run_id: &str) -> Vec<ServerResolution> {
+        self.resolved.set(true);
         decls
             .iter()
             .map(|d| ServerResolution::Connected {
@@ -327,8 +329,10 @@ impl WorkflowMcpResolver for FakeResolver {
 fn cancelled_run_removes_scope_token_and_closes_mcp_handles_once() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let close_calls = Rc::new(Cell::new(0u32));
+    let resolved = Rc::new(Cell::new(false));
     set_workflow_mcp_resolver(Rc::new(FakeResolver {
         close_calls: Rc::clone(&close_calls),
+        resolved: Rc::clone(&resolved),
     }));
 
     let dir = std::env::temp_dir().join(format!("sema-wfiso-{}-cancel", std::process::id()));
@@ -338,10 +342,18 @@ fn cancelled_run_removes_scope_token_and_closes_mcp_handles_once() {
     std::env::set_var("SEMA_WORKFLOW_RUN_DIR", &dir);
 
     let interp = Interpreter::new();
+    interp.global_env.set(
+        sema_core::intern("test/mcp-resolved?"),
+        Value::native_fn(sema_core::NativeFn::simple(
+            "test/mcp-resolved?",
+            move |_| Ok(Value::bool(resolved.get())),
+        )),
+    );
     // Spawn a run that resolves its MCP server (connected) then parks forever in its body;
     // cancel it mid-body. The teardown must close the handle exactly once and remove the
-    // scope, leaving a fresh checkpoint call "outside a workflow/run".
-    let _ = interp.eval_str_compiled(
+    // scope, leaving a fresh checkpoint call "outside a workflow/run". Wait for
+    // actual resolution so cancellation cannot happen before the run owns a handle.
+    let result = interp.eval_str_compiled(
         r#"
         (def r
           (async/spawn
@@ -349,7 +361,11 @@ fn cancelled_run_removes_scope_token_and_closes_mcp_handles_once() {
               (workflow/run "cancelme" "doc"
                 {:mcp (quote {asana {:url "https://example.test/mcp"}})}
                 (fn () (async/sleep 100000) :never)))))
-        (async/sleep 60)
+        (let wait ((remaining 6000))
+          (cond
+            ((test/mcp-resolved?) #t)
+            ((= remaining 0) (error "MCP resolver did not become ready"))
+            (else (async/sleep 5) (wait (- remaining 1)))))
         (async/cancel r)
         (try (async/await r) (catch error nil))
         (try (workflow/checkpoint :after (fn () 1)) (catch error :outside))
@@ -366,6 +382,10 @@ fn cancelled_run_removes_scope_token_and_closes_mcp_handles_once() {
     clear_workflow_mcp_resolver();
     let _ = std::fs::remove_dir_all(&dir);
 
+    assert_eq!(
+        result.expect("cancelled workflow settles"),
+        Value::keyword("outside")
+    );
     assert_eq!(
         close_calls.get(),
         1,

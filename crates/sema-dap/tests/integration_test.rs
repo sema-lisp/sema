@@ -104,8 +104,10 @@ fn read_frame_timeout(
     serde_json::from_slice(&body).ok()
 }
 
-/// Default read timeout for DAP messages (10 seconds).
-const DAP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default read timeout for DAP messages. Generous on purpose: every test
+/// spawns a 160 MB debug `sema` child, and under host memory pressure a
+/// cold spawn alone has been measured at 7 s. Only a hung server pays this.
+const DAP_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn read_dap(reader: &mut BufReader<impl Read>) -> Option<serde_json::Value> {
     read_dap_timeout(reader, DAP_TIMEOUT)

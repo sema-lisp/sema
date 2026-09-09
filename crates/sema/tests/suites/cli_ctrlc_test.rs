@@ -159,10 +159,11 @@ fn sigint_tears_down_parked_subprocess() {
     // The teardown of the External wait's resource (killpg on the shell's
     // process group) is synchronous with root cancellation in the drive loop,
     // so by the time `sema` itself has exited the marker process must be gone
-    // too. A short grace poll absorbs OS scheduling jitter without masking a
-    // real leak (it would still be running seconds later).
+    // too. A grace poll absorbs OS scheduling jitter without masking a real
+    // leak (it would still be running seconds later). 10 s: on a swapping host
+    // the killed child and each `pgrep` spawn have taken over 2 s to complete.
     let started = Instant::now();
-    while pgrep_running(marker) && started.elapsed() < Duration::from_secs(2) {
+    while pgrep_running(marker) && started.elapsed() < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(

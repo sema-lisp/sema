@@ -1019,8 +1019,16 @@ fn extract_reask_charges_spawn_captured_budget() {
 #[test]
 #[serial]
 fn extract_reask_uses_spawn_captured_cache_scope() {
+    // The model participates in the cache key. A unique model prevents disk
+    // entries from another test from turning this test's first miss into a hit.
+    // Replay uses the in-memory cache, so no shared disk-cache clear is needed.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let model = format!("fake-cache-reask-{}-{stamp}", std::process::id());
     let fake = FakeProvider::builder("fake")
-        .model("fake-chat")
+        .model(model.as_str())
         .reply(r#"{"n":"invalid"}"#)
         .reply(r#"{"n":2}"#)
         .build();
@@ -1032,7 +1040,6 @@ fn extract_reask_uses_spawn_captured_cache_scope() {
     let primed = interp
         .eval_str_compiled(
             r#"
-            (llm/cache-clear)
             (define pending
               (llm/with-cache {:ttl 3600}
                 (fn ()
@@ -1050,7 +1057,7 @@ fn extract_reask_uses_spawn_captured_cache_scope() {
     assert_eq!(recorder.call_count(), 2);
 
     let fail = FakeProvider::builder("fake")
-        .model("fake-chat")
+        .model(model.as_str())
         .error(sema_llm::types::LlmError::Api {
             status: 500,
             message: "provider must not be called on extraction cache replay".into(),
@@ -1082,9 +1089,7 @@ fn extract_reask_uses_spawn_captured_cache_scope() {
     assert_eq!(items[1].as_int(), Some(2));
     assert_eq!(items[2].as_int(), Some(2));
     assert_eq!(fail_recorder.call_count(), 0);
-    interp
-        .eval_str_compiled("(llm/cache-clear)")
-        .expect("clean extraction cache fixture");
+    reset_runtime_state();
 }
 
 /// A spawned recording scope owns both extraction attempts, and replay can

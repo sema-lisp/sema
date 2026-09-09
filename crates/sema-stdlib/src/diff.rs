@@ -324,11 +324,14 @@ fn parse_hunk_header(line: &str) -> Option<(i64, i64, i64, i64, String)> {
 /// headers and any `diff`/`index` preamble lines that appear before a hunk.
 fn parse_hunks(patch: &str) -> Vec<Hunk> {
     let mut hunks: Vec<Hunk> = Vec::new();
+    let mut remaining = None;
     for line in patch.lines() {
         if line.starts_with("@@") {
+            remaining = None;
             if let Some((old_start, old_count, new_start, new_count, header_text)) =
                 parse_hunk_header(line)
             {
+                remaining = Some((old_count, new_count));
                 hunks.push(Hunk {
                     header: header_text,
                     old_start,
@@ -338,22 +341,36 @@ fn parse_hunks(patch: &str) -> Vec<Hunk> {
                     lines: Vec::new(),
                 });
             }
-        } else if let Some(h) = hunks.last_mut() {
-            // Lines belonging to the current hunk: context (' '), additions ('+'),
-            // deletions ('-'), or "\ No newline at end of file" ('\').
-            if line.starts_with(' ')
-                || line.starts_with('+')
-                || line.starts_with('-')
-                || line.starts_with('\\')
-            {
+        } else if hunk_body_line(line, &mut remaining) {
+            if let Some(h) = hunks.last_mut() {
                 h.lines.push(line.to_string());
-            } else {
-                // A non-diff line ends the current hunk run (e.g. start of a new
-                // file section's `diff --git`). Stop attaching to this hunk.
             }
         }
     }
     hunks
+}
+
+/// Consume only the line counts declared by the current hunk. A final newline
+/// marker belongs to the hunk even after its last content line. Subsequent file
+/// headers do not, while header-like text within the counts remains content.
+fn hunk_body_line(line: &str, remaining: &mut Option<(i64, i64)>) -> bool {
+    let Some((old, new)) = remaining.as_mut() else {
+        return false;
+    };
+    match line.as_bytes().first() {
+        Some(b'\\') => return true,
+        Some(b' ') if *old > 0 && *new > 0 => {
+            *old -= 1;
+            *new -= 1;
+        }
+        Some(b'-') if *old > 0 => *old -= 1,
+        Some(b'+') if *new > 0 => *new -= 1,
+        _ => {
+            *remaining = None;
+            return false;
+        }
+    }
+    true
 }
 
 /// Build the Sema map representation of a single hunk.
@@ -375,9 +392,8 @@ fn hunk_to_value(h: &Hunk) -> Value {
 /// deleted lines match what the diff expects at the recorded 1-based position
 /// (with a small search window to tolerate drift), then splice the new lines in.
 fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, SemaError> {
-    // Preserve whether the original ended with a trailing newline so the result
-    // round-trips. `lines()` drops it; we re-add on join unless told otherwise.
     let had_trailing_newline = content.ends_with('\n');
+    let mut target_trailing_newline = had_trailing_newline;
     let mut lines: Vec<String> = if content.is_empty() {
         Vec::new()
     } else {
@@ -396,21 +412,27 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, SemaError> {
         // Expected old lines (context + deletions) in original order.
         let mut expected: Vec<&str> = Vec::new();
         let mut replacement: Vec<String> = Vec::new();
+        let mut previous_marker = "";
+        let mut replacement_trailing_newline = true;
         for raw in &h.lines {
             let (marker, rest) = raw.split_at(1);
             match marker {
                 " " => {
                     expected.push(rest);
                     replacement.push(rest.to_string());
+                    replacement_trailing_newline = true;
                 }
                 "-" => {
                     expected.push(rest);
                 }
                 "+" => {
                     replacement.push(rest.to_string());
+                    replacement_trailing_newline = true;
                 }
                 "\\" => {
-                    // "\ No newline at end of file" — metadata, not content.
+                    if matches!(previous_marker, " " | "+") {
+                        replacement_trailing_newline = false;
+                    }
                 }
                 _ => {
                     return Err(SemaError::eval(format!(
@@ -418,6 +440,12 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, SemaError> {
                     )));
                 }
             }
+            previous_marker = marker;
+        }
+        if expected.len() as i64 != h.old_count || replacement.len() as i64 != h.new_count {
+            return Err(SemaError::eval(
+                "diff/apply: hunk line counts do not match its header",
+            ));
         }
 
         // Locate the splice point. The diff records a 1-based old_start; adjust by
@@ -492,6 +520,13 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, SemaError> {
 
         // Splice: remove the matched old lines, insert the replacement.
         let remove_count = expected.len();
+        if splice_at + remove_count == lines.len() {
+            target_trailing_newline = if replacement.is_empty() {
+                splice_at > 0
+            } else {
+                replacement_trailing_newline
+            };
+        }
         lines.splice(
             splice_at..splice_at + remove_count,
             replacement.iter().cloned(),
@@ -502,11 +537,8 @@ fn apply_hunks(content: &str, hunks: &[Hunk]) -> Result<String, SemaError> {
     }
 
     let mut result = lines.join("\n");
-    if had_trailing_newline && !result.is_empty() {
+    if target_trailing_newline && !lines.is_empty() {
         result.push('\n');
-    } else if had_trailing_newline && result.is_empty() {
-        // Original was just newlines that got fully consumed; keep a newline only
-        // if some content remains. Empty result stays empty.
     }
     Ok(result)
 }
@@ -557,25 +589,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         check_diff_patch_caps("diff/stat", patch)?;
         let mut added = 0i64;
         let mut removed = 0i64;
-        let mut hunks = 0i64;
-        // Track hunk-body state so a content line that happens to start with
-        // `---`/`+++` (e.g. a removed `--` line renders as `---`) is counted,
-        // not mistaken for a file header. File headers only appear in the
-        // preamble before a hunk; `diff ` (git) starts a new file's preamble.
-        let mut in_hunk = false;
-        for line in patch.lines() {
-            if line.starts_with("diff ") {
-                in_hunk = false;
-                continue;
-            }
-            if line.starts_with("@@") {
-                hunks += 1;
-                in_hunk = true;
-                continue;
-            }
-            if !in_hunk {
-                continue; // preamble, incl. ---/+++ file headers and index lines
-            }
+        let hunks = parse_hunks(patch);
+        for line in hunks.iter().flat_map(|h| &h.lines) {
             match line.as_bytes().first() {
                 Some(b'+') => added += 1,
                 Some(b'-') => removed += 1,
@@ -585,7 +600,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let mut m = BTreeMap::new();
         m.insert(Value::keyword("added"), Value::int(added));
         m.insert(Value::keyword("removed"), Value::int(removed));
-        m.insert(Value::keyword("hunks"), Value::int(hunks));
+        m.insert(Value::keyword("hunks"), Value::int(hunks.len() as i64));
         Ok(Value::map(m))
     });
 
@@ -616,6 +631,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             hunks: Vec<Hunk>,
         }
         let mut files: Vec<FileSection> = Vec::new();
+        let mut remaining = None;
 
         let strip_path = |s: &str| -> String {
             // Drop a leading "a/" or "b/" prefix and any trailing tab-delimited
@@ -625,7 +641,11 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         };
 
         for line in patch.lines() {
-            if let Some(rest) = line.strip_prefix("--- ") {
+            if hunk_body_line(line, &mut remaining) {
+                if let Some(hunk) = files.last_mut().and_then(|file| file.hunks.last_mut()) {
+                    hunk.lines.push(line.to_string());
+                }
+            } else if let Some(rest) = line.strip_prefix("--- ") {
                 files.push(FileSection {
                     old_path: Some(strip_path(rest)),
                     new_path: None,
@@ -645,6 +665,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 if let Some((old_start, old_count, new_start, new_count, header_text)) =
                     parse_hunk_header(line)
                 {
+                    remaining = Some((old_count, new_count));
                     if files.is_empty() {
                         files.push(FileSection {
                             old_path: None,
@@ -660,16 +681,6 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                         new_count,
                         lines: Vec::new(),
                     });
-                }
-            } else if line.starts_with(' ')
-                || line.starts_with('+')
-                || line.starts_with('-')
-                || line.starts_with('\\')
-            {
-                if let Some(f) = files.last_mut() {
-                    if let Some(h) = f.hunks.last_mut() {
-                        h.lines.push(line.to_string());
-                    }
                 }
             }
         }
@@ -785,6 +796,48 @@ fn patch_apply_file_work(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn newline_round_trip_matrix() {
+        let inputs = ["", "a", "a\n", "\n", "a\nb", "a\nb\n", "x\n\n"];
+        for old in inputs {
+            for new in inputs {
+                for context in [0, 1, 3] {
+                    let patch = super::diff_unified_text(old, new, context);
+                    let actual = super::apply_hunks(old, &super::parse_hunks(&patch)).unwrap();
+                    assert_eq!(
+                        actual, new,
+                        "{old:?} -> {new:?}, context {context}, patch {patch:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multifile_hunks_exclude_headers() {
+        let patch = "--- a/one\n+++ b/one\n@@ -1 +1 @@\n-old\n+new\n--- a/two\n+++ b/two\n@@ -1 +1 @@\n--- content\n+++ content\n";
+        let hunks = super::parse_hunks(patch);
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].lines, ["-old", "+new"]);
+        assert_eq!(hunks[1].lines, ["--- content", "+++ content"]);
+        let env = make_env();
+        let stat = call(&env, "diff/stat", &[Value::string(patch)]);
+        assert_eq!(map_get(&stat, "added"), Value::int(2));
+        assert_eq!(map_get(&stat, "removed"), Value::int(2));
+        let parsed = call(&env, "diff/parse", &[Value::string(patch)]);
+        let files = map_get(&parsed, "files");
+        let files = files.as_list().unwrap();
+        assert_eq!(files.len(), 2);
+        let parsed_hunks = map_get(&files[1], "hunks");
+        let parsed_hunks = parsed_hunks.as_list().unwrap();
+        assert_eq!(
+            map_get(&parsed_hunks[0], "lines"),
+            Value::list(vec![
+                Value::string("--- content"),
+                Value::string("+++ content")
+            ])
+        );
+    }
     use super::*;
     use sema_core::{Env, Sandbox};
 

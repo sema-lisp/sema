@@ -424,6 +424,10 @@ eval_tests! {
     string_wrap_words: r#"(string/word-wrap "the quick brown fox" 10)"# => common::eval(r#"'("the quick" "brown fox")"#),
     string_wrap_hard_break: r#"(string/word-wrap "abcdefghij k" 5)"# => common::eval(r#"'("abcde" "fghij" "k")"#),
     string_wrap_keeps_newlines: r#"(string/word-wrap "a\nb" 10)"# => common::eval(r#"'("a" "b")"#),
+    string_wrap_ansi_hard_break: r#"(string/word-wrap (term/style "hello" :red) 3)"# => Value::list(vec![Value::string("\x1b[31mhel"), Value::string("lo\x1b[0m")]),
+    string_wrap_ansi_cjk: r#"(string/word-wrap (term/style "日本語" :red) 4)"# => Value::list(vec![Value::string("\x1b[31m日本"), Value::string("語\x1b[0m")]),
+    string_wrap_osc_payload_space: r#"(string/word-wrap "\x1b;]0;a b\x07;hello" 3)"# => Value::list(vec![Value::string("\x1b]0;a b\x07hel"), Value::string("lo")]),
+    string_wrap_osc_payload_newline: r#"(string/word-wrap "\x1b;]0;a\nb\x07;hello" 3)"# => Value::list(vec![Value::string("\x1b]0;a\nb\x07hel"), Value::string("lo")]),
     // string/truncate-width — clamp to display columns, grapheme-safe, optional ellipsis.
     string_truncate_width_unchanged: r#"(string/truncate-width "hello" 10)"# => Value::string("hello"),
     string_truncate_width_exact: r#"(string/truncate-width "hello" 5)"# => Value::string("hello"),
@@ -434,6 +438,16 @@ eval_tests! {
     string_truncate_width_ellipsis_unchanged: r#"(string/truncate-width "hi" 6 "…")"# => Value::string("hi"),
     string_truncate_width_ellipsis_too_wide: r#"(string/truncate-width "hello world" 1 "…")"# => Value::string("…"),
     string_truncate_width_zero: r#"(string/truncate-width "hello" 0)"# => Value::string(""),
+    string_truncate_width_ansi: r#"(string/truncate-width (term/style "hello" :red) 3)"# => Value::string("\x1b[31mhel\x1b[0m"),
+    string_truncate_width_ansi_ellipsis: r#"(string/truncate-width (term/style "hello" :red) 3 "…")"# => Value::string("\x1b[31mhe…\x1b[0m"),
+    string_truncate_width_ansi_ellipsis_too_wide: r#"(string/truncate-width "hello" 1 (term/style ".." :red))"# => Value::string("\x1b[31m.\x1b[0m"),
+    string_truncate_width_ansi_zero: r#"(string/truncate-width (term/style "hello" :red) 0)"# => Value::string("\x1b[0m"),
+    string_truncate_width_discards_screen_clear: r#"(string/truncate-width "ab\x1b;[2Jcd" 2)"# => Value::string("ab"),
+    string_truncate_width_discards_cursor_move: r#"(string/truncate-width "abc\x1b;[Hdef" 2)"# => Value::string("ab"),
+    string_truncate_width_discards_osc_title: r#"(string/truncate-width "ab\x1b;]0;title\x07;cd" 2)"# => Value::string("ab"),
+    string_truncate_width_osc: r#"(string/truncate-width "\x1b;]8;;https://example.test/\x1b;\\hello\x1b;]8;;\x1b;\\" 3)"# => Value::string("\x1b]8;;https://example.test/\x1b\\hel\x1b]8;;\x1b\\"),
+    string_truncate_width_styled_grapheme: r#"(string/truncate-width "e\x1b;[31m\x301;abc\x1b;[0m" 1)"# => Value::string("e\x1b[31m\u{301}\x1b[0m"),
+    string_wrap_styled_grapheme: r#"(string/word-wrap "e\x1b;[31m\x301;ab\x1b;[0m" 1)"# => Value::list(vec![Value::string("e\x1b[31m\u{301}"), Value::string("a"), Value::string("b\x1b[0m")]),
     // Terminal setup/teardown guard macros return the body value and re-raise
     // after restoring (teardown always runs — the emitted escapes go to stdout).
     guard_alt_screen_returns_body: "(term/with-alt-screen 1 2 3)" => Value::int(3),

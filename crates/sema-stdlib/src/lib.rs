@@ -202,39 +202,74 @@ pub(crate) fn check_bulk_len(func: &str, count: usize) -> Result<(), sema_core::
     Ok(())
 }
 
+/// Length of the escape at the start of `s`, including its terminator.
+/// An unfinished escape consumes the remaining input, as in `term/strip`.
+pub(crate) fn ansi_escape_len(s: &str) -> usize {
+    let mut chars = s.chars();
+    if chars.next() != Some('\x1b') {
+        return 0;
+    }
+    match chars.next() {
+        // CSI: ESC [ (params/intermediates) final-byte in 0x40..=0x7E.
+        Some('[') => {
+            for inner in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&inner) {
+                    break;
+                }
+            }
+        }
+        // OSC: ESC ] … terminated by BEL (0x07) or ST (ESC \).
+        Some(']') => {
+            while let Some(inner) = chars.next() {
+                if inner == '\x07' {
+                    break;
+                }
+                if inner == '\x1b' {
+                    if chars.as_str().starts_with('\\') {
+                        chars.next();
+                    }
+                    break;
+                }
+            }
+        }
+        // Other two-char escapes (ESC 7, ESC 8, …): drop the byte after ESC.
+        _ => {}
+    }
+    s.len() - chars.as_str().len()
+}
+
+pub(crate) enum AnsiPart<'a> {
+    Text(&'a str),
+    Escape(&'a str),
+}
+
+/// Split terminal text without separating the bytes of an escape sequence.
+pub(crate) fn ansi_parts(mut s: &str) -> impl Iterator<Item = AnsiPart<'_>> {
+    std::iter::from_fn(move || {
+        if s.is_empty() {
+            return None;
+        }
+        let escape_len = ansi_escape_len(s);
+        let len = if escape_len == 0 {
+            s.find('\x1b').unwrap_or(s.len())
+        } else {
+            escape_len
+        };
+        let (part, rest) = s.split_at(len);
+        s = rest;
+        Some(if escape_len == 0 {
+            AnsiPart::Text(part)
+        } else {
+            AnsiPart::Escape(part)
+        })
+    })
+}
+
 pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\x1b' {
-            out.push(ch);
-            continue;
-        }
-        match chars.next() {
-            // CSI: ESC [ (params/intermediates) final-byte in 0x40..=0x7E.
-            Some('[') => {
-                for inner in chars.by_ref() {
-                    if ('\u{40}'..='\u{7e}').contains(&inner) {
-                        break;
-                    }
-                }
-            }
-            // OSC: ESC ] … terminated by BEL (0x07) or ST (ESC \).
-            Some(']') => {
-                while let Some(inner) = chars.next() {
-                    if inner == '\x07' {
-                        break;
-                    }
-                    if inner == '\x1b' {
-                        if chars.peek() == Some(&'\\') {
-                            chars.next();
-                        }
-                        break;
-                    }
-                }
-            }
-            // Other two-char escapes (ESC 7, ESC 8, …): drop the byte after ESC.
-            _ => {}
+    for part in ansi_parts(s) {
+        if let AnsiPart::Text(text) = part {
+            out.push_str(text);
         }
     }
     out

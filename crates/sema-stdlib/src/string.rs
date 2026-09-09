@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -15,6 +16,93 @@ use crate::register_fn;
 /// combining marks as 0. Shared by `string/width` and `string/word-wrap`.
 fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(crate::strip_ansi(s).as_str())
+}
+
+/// Graphemes are determined from visible text, then mapped back to the source.
+/// ANSI codes inside a combining sequence must not create a new boundary.
+fn display_graphemes(mut source: &str) -> impl Iterator<Item = (&str, usize)> {
+    let plain = if source.contains('\x1b') {
+        Cow::Owned(crate::strip_ansi(source))
+    } else {
+        Cow::Borrowed(source)
+    };
+    let mut plain_offset = 0;
+    std::iter::from_fn(move || {
+        if source.is_empty() {
+            return None;
+        }
+        let grapheme = plain[plain_offset..].graphemes(true).next().unwrap_or("");
+        let width = UnicodeWidthStr::width(grapheme);
+        let mut remaining = grapheme.len();
+        plain_offset += remaining;
+        let start = source;
+        while !source.is_empty() {
+            let escape_len = crate::ansi_escape_len(source);
+            if escape_len > 0 {
+                source = &source[escape_len..];
+            } else if remaining == 0 {
+                break;
+            } else {
+                let len = source
+                    .as_bytes()
+                    .iter()
+                    .take(remaining)
+                    .position(|&byte| byte == 0x1b)
+                    .unwrap_or(remaining);
+                source = &source[len..];
+                remaining -= len;
+                if remaining == 0 {
+                    break;
+                }
+            }
+        }
+        Some((&start[..start.len() - source.len()], width))
+    })
+}
+
+/// Split visible spaces/newlines without splitting an OSC payload containing them.
+fn split_display_text(s: &str, delimiter: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut offset = 0;
+    let mut start = 0;
+    for part in crate::ansi_parts(s) {
+        let text = match part {
+            crate::AnsiPart::Escape(escape) => {
+                offset += escape.len();
+                continue;
+            }
+            crate::AnsiPart::Text(text) => text,
+        };
+        for (index, _) in text.match_indices(delimiter) {
+            parts.push(&s[start..offset + index]);
+            start = offset + index + delimiter.len_utf8();
+        }
+        offset += text.len();
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+/// Only closing style controls may survive discarded visible text. Replaying
+/// cursor moves, screen clears, or OSC titles would change unrelated output.
+fn closes_terminal_style(escape: &str) -> bool {
+    if let Some(parameters) = escape
+        .strip_prefix("\x1b[")
+        .and_then(|s| s.strip_suffix('m'))
+    {
+        return parameters.split(';').all(|parameter| {
+            parameter.is_empty()
+                || matches!(
+                    parameter.parse::<u8>(),
+                    Ok(0 | 22..=25 | 27..=29 | 39 | 49 | 54 | 55 | 59)
+                )
+        });
+    }
+    escape
+        .strip_prefix("\x1b]8;")
+        .and_then(|s| s.strip_suffix('\x07').or_else(|| s.strip_suffix("\x1b\\")))
+        .and_then(|s| s.split_once(';'))
+        .is_some_and(|(_, uri)| uri.is_empty())
 }
 
 /// Pad `s` to a target *display width* (not codepoint count) with `pad_char`,
@@ -56,15 +144,25 @@ fn truncate_to_width(s: &str, target: usize, ellipsis: &str) -> String {
     let budget = target - ellipsis_w;
     let mut out = String::new();
     let mut w = 0usize;
-    for g in s.graphemes(true) {
-        let gw = UnicodeWidthStr::width(g);
-        if w + gw > budget {
-            break;
+    let mut truncated = false;
+    for (g, gw) in display_graphemes(s) {
+        if !truncated && w + gw <= budget {
+            out.push_str(g);
+            w += gw;
+        } else {
+            if !truncated {
+                out.push_str(ellipsis);
+                truncated = true;
+            }
+            for part in crate::ansi_parts(g) {
+                if let crate::AnsiPart::Escape(escape) = part {
+                    if closes_terminal_style(escape) {
+                        out.push_str(escape);
+                    }
+                }
+            }
         }
-        out.push_str(g);
-        w += gw;
     }
-    out.push_str(ellipsis);
     out
 }
 
@@ -75,9 +173,8 @@ fn grapheme_chunks(word: &str, width: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut cur = String::new();
     let mut cur_w = 0usize;
-    for g in word.graphemes(true) {
-        let gw = UnicodeWidthStr::width(g);
-        if cur_w + gw > width && !cur.is_empty() {
+    for (g, gw) in display_graphemes(word) {
+        if cur_w + gw > width && cur_w > 0 {
             chunks.push(std::mem::take(&mut cur));
             cur_w = 0;
         }
@@ -114,7 +211,7 @@ fn wrap_paragraph(para: &str, width: usize) -> Vec<String> {
             (last, lw)
         }
     };
-    for word in para.split(' ') {
+    for word in split_display_text(para, ' ') {
         if word.is_empty() {
             continue; // collapse runs of spaces
         }
@@ -1416,7 +1513,7 @@ pub fn register(env: &sema_core::Env) {
         let text = args.str_at(0, "string/word-wrap")?;
         let width = args[1].as_index("string/word-wrap")?.max(1);
         let mut out = Vec::new();
-        for para in text.split('\n') {
+        for para in split_display_text(text, '\n') {
             for line in wrap_paragraph(para, width) {
                 out.push(Value::string(&line));
             }

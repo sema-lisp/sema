@@ -225,11 +225,26 @@ pub fn register(env: &sema_core::Env) {
             None => Ok(Value::nil()),
             Some(byte_idx) => {
                 let chars: Vec<char> = text.chars().collect();
-                let char_idx = text[..byte_idx].chars().count();
-                let query_char_len = query.chars().count();
+                let mut lowered_offset = 0;
+                let mut char_idx = 0;
+                let mut match_end = 0;
+                let byte_end = byte_idx + lower_query.len();
+                // Lowercasing can expand one character or change its byte
+                // length. Map both match boundaries back to whole source
+                // characters, including a match within an expansion.
+                for (index, ch) in chars.iter().enumerate() {
+                    let lowered_len: usize = ch.to_lowercase().map(char::len_utf8).sum();
+                    if lowered_offset + lowered_len <= byte_idx {
+                        char_idx = index + 1;
+                    }
+                    if lowered_offset < byte_end {
+                        match_end = index + 1;
+                    }
+                    lowered_offset += lowered_len;
+                }
 
                 let start = char_idx.saturating_sub(radius);
-                let end = (char_idx + query_char_len + radius).min(chars.len());
+                let end = match_end.saturating_add(radius).min(chars.len());
 
                 let snippet: String = chars[start..end].iter().collect();
 

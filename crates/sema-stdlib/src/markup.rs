@@ -109,8 +109,7 @@ fn html_select_work(html: &str, sel: &str) -> Result<Vec<String>, SemaError> {
 fn html_text_work(html: &str) -> Result<String, SemaError> {
     let doc = Html::parse_document(html);
     check_markup_nodes("html/text", &doc)?;
-    let text = doc.root_element().text().collect::<Vec<_>>().join(" ");
-    Ok(collapse_whitespace(&text))
+    Ok(html_element_text(doc.root_element()))
 }
 
 /// `html/select-text` work: text of every element matching `sel`.
@@ -119,13 +118,27 @@ fn html_select_text_work(html: &str, sel: &str) -> Result<Vec<String>, SemaError
         Selector::parse(sel).map_err(|e| SemaError::eval(format!("invalid selector: {e:?}")))?;
     let doc = Html::parse_document(html);
     check_markup_nodes("html/select-text", &doc)?;
-    Ok(doc
-        .select(&selector)
-        .map(|el| {
-            let text = el.text().collect::<Vec<_>>().join(" ");
-            collapse_whitespace(&text)
-        })
-        .collect())
+    Ok(doc.select(&selector).map(html_element_text).collect())
+}
+
+fn html_element_text(element: scraper::ElementRef<'_>) -> String {
+    let mut pending = vec![*element];
+    let mut text = String::new();
+    while let Some(node) = pending.pop() {
+        if node
+            .value()
+            .as_element()
+            .is_some_and(|element| matches!(element.name(), "script" | "style" | "template"))
+        {
+            continue;
+        }
+        if let Some(value) = node.value().as_text() {
+            text.push(' ');
+            text.push_str(value);
+        }
+        pending.extend(node.children().rev());
+    }
+    collapse_whitespace(&text)
 }
 
 /// Build a list-of-strings `Value`. A plain `fn` (no captures) so it fits
@@ -383,6 +396,19 @@ fn split_closing_fence(rest: &str) -> Option<(&str, &str)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn html_text_excludes_script_style_and_template() {
+        let html = "<div>before<script>script source</script><style>style source</style><template>template text</template><b>after</b></div>";
+        assert_eq!(super::html_text_work(html).unwrap(), "before after");
+        assert_eq!(
+            super::html_select_text_work(html, "div").unwrap(),
+            ["before after"]
+        );
+        assert_eq!(
+            super::html_select_text_work(html, "script, style, template").unwrap(),
+            ["", "", ""]
+        );
+    }
     use super::*;
     use sema_core::{Env, OptionsExt};
 

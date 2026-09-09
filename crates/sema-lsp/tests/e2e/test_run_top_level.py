@@ -14,7 +14,7 @@ Two things make this an integration test rather than a unit test, and both are
 the point:
 
 1. The server shells out to its own `current_exe()` with
-   `eval --stdin --json --sandbox strict --no-llm`, so a regression in the
+   `eval --stdin --json`, so a regression in the
    `sema eval --json` envelope (a renamed field, a changed error shape) breaks
    the lens even though nothing in `sema-lsp` changed.
 2. `executeCommand` returns immediately — the work happens on the backend
@@ -23,6 +23,7 @@ the point:
 """
 
 import asyncio
+import json
 
 import pytest
 from lsprotocol.types import ExecuteCommandParams
@@ -31,7 +32,7 @@ from pytest_lsp import LanguageClient
 
 from helpers import open_doc
 
-# The eval is a real subprocess spawn (cold binary, sandbox setup), so allow
+# The eval is a real subprocess spawn (cold binary, interpreter setup), so allow
 # generously more than it needs. A wrong payload fails fast on the assert; only
 # a genuinely missing notification burns the full budget.
 EVAL_TIMEOUT = 30.0
@@ -150,6 +151,36 @@ async def test_run_top_level_captures_stdout(client: LanguageClient, eval_result
 
     assert field(result, "ok") is True, f"expected a successful eval, got {result}"
     assert "hello from the lens" in field(result, "stdout")
+
+
+@pytest.mark.asyncio
+async def test_run_top_level_allows_file_writes(
+    client: LanguageClient, eval_results, tmp_path
+):
+    """Run permits file writes, matching the normal CLI defaults."""
+    output = tmp_path / "lens-output.txt"
+    uri = await open_doc(
+        client, f'(file/write {json.dumps(str(output))} "written by the lens")'
+    )
+
+    await run_top_level(client, uri, 0)
+    result = await next_result(eval_results)
+
+    assert field(result, "ok") is True, f"expected file/write to succeed, got {result}"
+    assert output.read_text() == "written by the lens"
+
+
+@pytest.mark.asyncio
+async def test_run_top_level_auto_configures_llm(client: LanguageClient, eval_results):
+    """Run configures providers without requiring API keys or making LLM requests."""
+    # Auto-configuration always registers Ollama, even when it is not running.
+    uri = await open_doc(client, "(list/contains? (llm/providers) :ollama)")
+
+    await run_top_level(client, uri, 0)
+    result = await next_result(eval_results)
+
+    assert field(result, "ok") is True, f"expected llm/providers to succeed, got {result}"
+    assert field(result, "value") == "#t"
 
 
 @pytest.mark.asyncio

@@ -96,8 +96,9 @@ Rename a user-defined symbol across all open documents:
 ### Code Lenses
 
 Every top-level expression shows a **▶ Run** code lens above it. Clicking it evaluates all forms up to and including
-that expression in a sandboxed subprocess using `sema eval`, and reports the result (value, stdout, stderr, timing) back
-to the editor via a custom `sema/evalResult` notification.
+that expression in a subprocess using `sema eval`, with the normal CLI defaults: no sandbox restrictions and LLM
+auto-configuration enabled. It reports the result (value, stdout, stderr, timing) to the editor via a custom
+`sema/evalResult` notification.
 
 ### Formatting
 
@@ -188,7 +189,7 @@ The LSP server uses [tower-lsp](https://github.com/ebkalderon/tower-lsp) and a d
   cache). This avoids `Send`/`Sync` constraints while keeping the server responsive.
 - **Import cache** — parsed results for imported files are cached by file path and modification time, avoiding redundant
   re-parsing on every request.
-- **Subprocess execution** — code lens "Run" commands spawn a separate `sema eval` process in a sandboxed environment,
+- **Subprocess execution** — code lens "Run" commands spawn a separate `sema eval` process with the normal CLI defaults,
   keeping the backend thread free for diagnostics and completions.
 
 ### Custom Notifications

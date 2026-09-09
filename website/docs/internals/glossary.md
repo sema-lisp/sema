@@ -354,7 +354,7 @@ This page defines the technical vocabulary used across Sema's documentation — 
 
 **Batch span processor** — the background mechanism that queues finished spans and exports them in batches so telemetry never blocks the program; tuned by `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BSP_SCHEDULE_DELAY` ("BSP"). Network export batches; file export is synchronous.
 
-**Code lens** — an LSP feature: every top-level expression shows a ▶ Run lens that, when clicked, evaluates all forms up to and including it in a sandboxed `sema eval` subprocess and reports value/stdout/stderr/timing via the custom `sema/evalResult` notification. Subprocess execution keeps the LSP backend thread free.
+**Code lens** — an LSP feature: every top-level expression shows a ▶ Run lens that, when clicked, evaluates all forms up to and including it in a `sema eval` subprocess with no sandbox restrictions and LLM auto-configuration enabled. It reports value/stdout/stderr/timing via the custom `sema/evalResult` notification. Subprocess execution keeps the LSP backend thread free.
 
 **Compatibility mode** — a `SEMA_OTEL_COMPAT` setting (`openinference`, `langfuse`, `traceloop`, `langsmith`, `braintrust`, or `all`) that makes Sema write extra, tool-specific attribute names alongside the standard `gen_ai.*` ones so backends keying off their own names read the data. Purely additive and self-healing (unknown modes ignored). Distinct from the OpenAI request-compat "mode" (drop-temperature etc.).
 

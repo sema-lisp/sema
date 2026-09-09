@@ -252,9 +252,6 @@ async fn run_eval_process(
         "eval".to_string(),
         "--stdin".to_string(),
         "--json".to_string(),
-        "--sandbox".to_string(),
-        "strict".to_string(),
-        "--no-llm".to_string(),
     ];
     if let Ok(path) = uri.to_file_path() {
         args.push("--path".to_string());

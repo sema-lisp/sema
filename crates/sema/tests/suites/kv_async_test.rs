@@ -33,6 +33,76 @@ use crate::common::sema_path;
 /// panic.
 struct TempKv(std::path::PathBuf);
 
+#[test]
+fn kv_failed_flush_restores_live_and_persisted_values() {
+    struct ResetBounds;
+    impl Drop for ResetBounds {
+        fn drop(&mut self) {
+            sema_stdlib::set_kv_bounds_override(None);
+        }
+    }
+    let _reset = ResetBounds;
+    for legacy in [true, false] {
+        let kv = TempKv::new("flush-rollback");
+        let interp = Interpreter::new();
+        interp
+            .eval_str(&format!(
+                "(kv/open \"rollback\" {:?}) (kv/set \"rollback\" \"a\" 1)",
+                kv.path()
+            ))
+            .unwrap();
+        let before = std::fs::read(&kv.0).unwrap();
+        sema_stdlib::set_kv_bounds_override(Some((32, 100)));
+        let set = |key: &str, value: &str| {
+            if legacy {
+                let callable = interp.global_env.get(sema_core::intern("kv/set")).unwrap();
+                (callable.as_native_fn_ref().unwrap().func)(
+                    &interp.ctx,
+                    &[
+                        Value::string("rollback"),
+                        Value::string(key),
+                        Value::string(value),
+                    ],
+                )
+            } else {
+                interp.eval_str(&format!("(kv/set \"rollback\" {key:?} {value:?})"))
+            }
+        };
+        for (key, value) in [
+            ("long-key-that-exceeds-the-whole-store-limit", "x"),
+            ("a", "a value within the value cap"),
+        ] {
+            let err = set(key, value).unwrap_err();
+            assert!(err.to_string().contains("kv store limit"), "{err}");
+            assert_eq!(
+                interp.eval_str("(kv/get \"rollback\" \"a\")").unwrap(),
+                Value::int(1)
+            );
+            assert_eq!(
+                interp.eval_str("(count (kv/keys \"rollback\"))").unwrap(),
+                Value::int(1)
+            );
+            assert_eq!(std::fs::read(&kv.0).unwrap(), before);
+        }
+        set("b", "ok").unwrap();
+        interp
+            .eval_str(&format!(
+                "(kv/close \"rollback\") (kv/open \"rollback\" {:?})",
+                kv.path()
+            ))
+            .unwrap();
+        assert_eq!(
+            interp.eval_str("(kv/get \"rollback\" \"a\")").unwrap(),
+            Value::int(1)
+        );
+        assert_eq!(
+            interp.eval_str("(kv/get \"rollback\" \"b\")").unwrap(),
+            Value::string("ok")
+        );
+        sema_stdlib::set_kv_bounds_override(None);
+    }
+}
+
 impl TempKv {
     fn new(tag: &str) -> Self {
         let nanos = std::time::SystemTime::now()

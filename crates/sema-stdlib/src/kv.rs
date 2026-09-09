@@ -406,10 +406,9 @@ fn checkout_runtime<R: Send + 'static>(
     op_name: &'static str,
     name: String,
     admit: impl FnOnce(&KvStore) -> Result<(), String> + Send + 'static,
-    mutate: impl FnOnce(&mut KvStore) -> R + Send + 'static,
+    mutate: impl FnOnce(&mut KvStore) -> Result<R, SemaError> + Send + 'static,
     decode: impl FnOnce(R) -> Value + 'static,
     success_value: Option<Value>,
-    bounds: KvBounds,
 ) -> NativeResult {
     let kind =
         CompletionKind::try_from_raw(KV_COMPLETION_KIND).expect("kv completion kind is nonzero");
@@ -441,10 +440,7 @@ fn checkout_runtime<R: Send + 'static>(
             // Item-count admission runs on the exclusively-owned store before the
             // mutation, so an over-cap rejection reinstalls the store unchanged.
             admit(store)?;
-            let r = mutate(store);
-            flush_store(store, bounds)
-                .map(|()| r)
-                .map_err(|e| e.to_string())
+            mutate(store).map_err(|e| e.to_string())
         }),
         reinstall: Box::new(move |store| {
             KV_STORES.with(|s| {
@@ -580,19 +576,15 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                         check_item_cap("kv/set", &name_admit, store, &key_admit, bounds)
                             .map_err(|e| e.to_string())
                     },
-                    move |store| {
-                        store.data.insert(key, val);
-                    },
+                    move |store| mutate_store(store, key, Some(val), bounds).map(|_| ()),
                     |()| Value::nil(),
                     Some(ret_val),
-                    bounds,
                 );
             }
 
             with_store_mut("kv/set", &name, |store| {
                 check_item_cap("kv/set", &name, store, &key, bounds)?;
-                store.data.insert(key, val);
-                flush_store(store, bounds)
+                mutate_store(store, key, Some(val), bounds).map(|_| ())
             })?;
             Ok(NativeOutcome::Return(args[2].clone()))
         },
@@ -617,16 +609,14 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     name,
                     // Delete only shrinks the store — no admission needed.
                     |_: &KvStore| Ok(()),
-                    move |store| store.data.remove(&key).is_some(),
+                    move |store| mutate_store(store, key, None, bounds),
                     Value::bool,
                     None,
-                    bounds,
                 );
             }
 
             with_store_mut("kv/delete", &name, |store| {
-                let existed = store.data.remove(&key).is_some();
-                flush_store(store, bounds)?;
+                let existed = mutate_store(store, key, None, bounds)?;
                 Ok(Value::bool(existed))
             })
             .map(NativeOutcome::Return)
@@ -705,9 +695,70 @@ fn flush_store(store: &KvStore, bounds: KvBounds) -> Result<(), SemaError> {
     Ok(())
 }
 
+/// Apply one entry change and restore it if persistence fails. Retaining only
+/// the previous entry avoids cloning the entire store for write-through updates.
+fn mutate_store(
+    store: &mut KvStore,
+    key: String,
+    value: Option<serde_json::Value>,
+    bounds: KvBounds,
+) -> Result<bool, SemaError> {
+    let previous = match value {
+        Some(value) => store.data.insert(key.clone(), value),
+        None => store.data.remove(&key),
+    };
+    let existed = previous.is_some();
+    if let Err(error) = flush_store(store, bounds) {
+        match previous {
+            Some(value) => {
+                store.data.insert(key, value);
+            }
+            None => {
+                store.data.remove(&key);
+            }
+        }
+        return Err(error);
+    }
+    Ok(existed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_disk_write_restores_insert_update_and_delete() {
+        struct ScratchFile(std::path::PathBuf);
+        impl Drop for ScratchFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "sema-kv-write-failure-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut file = std::fs::File::create_new(&path).unwrap();
+        std::io::Write::write_all(&mut file, b"not a directory").unwrap();
+        drop(file);
+        let parent = ScratchFile(path);
+        let mut store = KvStore {
+            path: parent.0.join("store.json").to_string_lossy().into_owned(),
+            data: serde_json::Map::from_iter([("existing".into(), serde_json::json!(1))]),
+        };
+        let original = store.data.clone();
+        for (key, value) in [
+            ("new", Some(serde_json::json!(2))),
+            ("existing", Some(serde_json::json!(3))),
+            ("existing", None),
+        ] {
+            let error = mutate_store(&mut store, key.into(), value, KV_RUNTIME_BOUNDS).unwrap_err();
+            assert!(error.to_string().contains("kv/flush"), "{error}");
+            assert_eq!(store.data, original);
+            assert_eq!(std::fs::read(&parent.0).unwrap(), b"not a directory");
+        }
+    }
 
     /// Bounds-presence guard: the shipped ceilings are finite and nonzero, and an
     /// override can only *lower* them — never raise a store past the hard cap.

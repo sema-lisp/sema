@@ -14,6 +14,65 @@ use sema_eval::Interpreter;
 /// A unique temp base dir for one test's memory files, removed on drop.
 struct TempMemDir(std::path::PathBuf);
 
+#[test]
+fn memory_append_rejects_cumulative_encoded_size_before_mutation() {
+    struct ResetBounds;
+    impl Drop for ResetBounds {
+        fn drop(&mut self) {
+            sema_stdlib::set_memory_bounds_override(None);
+        }
+    }
+    let _reset = ResetBounds;
+    let content = "line\n\"quoted\"";
+    let line = serde_json::json!({"role":"user", "content":content}).to_string();
+    let cap = 2 * (line.len() as u64 + 1);
+    for legacy in [true, false] {
+        let dir = TempMemDir::new("cumulative-size");
+        sema_stdlib::set_memory_bounds_override(Some((cap, 1024)));
+        let interp = Interpreter::new();
+        let handle = interp
+            .eval_str("(define mem (memory/open {:id \"cap\"})) mem")
+            .unwrap();
+        let message = Value::map(std::collections::BTreeMap::from([
+            (Value::keyword("role"), Value::string("user")),
+            (Value::keyword("content"), Value::string(content)),
+        ]));
+        let append = || {
+            if legacy {
+                let callable = interp
+                    .global_env
+                    .get(sema_core::intern("memory/append"))
+                    .unwrap();
+                (callable.as_native_fn_ref().unwrap().func)(
+                    &interp.ctx,
+                    &[handle.clone(), message.clone()],
+                )
+            } else {
+                interp.eval_str(&format!("(memory/append mem {{:content {content:?}}})"))
+            }
+        };
+        append().unwrap();
+        append().unwrap();
+        let error = append().expect_err("third encoded line exceeds file cap");
+        assert!(error.to_string().contains("byte cap"), "{error}");
+        assert_eq!(
+            interp
+                .eval_str("(length (conversation/messages (memory/messages mem)))")
+                .unwrap(),
+            Value::int(2)
+        );
+        drop(interp);
+        let reopened = Interpreter::new();
+        assert_eq!(reopened.eval_str("(length (conversation/messages (memory/messages (memory/open {:id \"cap\"}))))").unwrap(), Value::int(2));
+        assert_eq!(
+            std::fs::metadata(dir.0.join("default/cap.jsonl"))
+                .unwrap()
+                .len(),
+            cap
+        );
+    }
+}
+
 impl TempMemDir {
     fn new(tag: &str) -> Self {
         let nanos = std::time::SystemTime::now()
@@ -328,6 +387,40 @@ fn agent_run_with_memory_writes_back_on_completion() {
     assert_eq!(items[1].as_str(), Some("the question"));
     assert_eq!(items[2], Value::keyword("assistant"));
     assert_eq!(items[3].as_str(), Some("the answer"));
+}
+
+#[test]
+fn agent_memory_writeback_obeys_cumulative_size_cap() {
+    let _dir = TempMemDir::new("agent-byte-cap");
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .reply("answer")
+        .build();
+    let (interp, recorder) = interp_with_fake(fake);
+    sema_stdlib::set_memory_bounds_override(Some((40, 1024)));
+    // The first turn fits; the second must not make the transcript impossible
+    // to reopen. Agent completion may report the writeback error to the caller.
+    let _ = interp.eval_str(
+        r#"
+        (defagent bot {:model "fake-model" :max-turns 3})
+        (define mem (memory/open {:id "bounded"}))
+        (agent/run bot "question" {:memory mem})
+    "#,
+    );
+    assert_eq!(recorder.requests().len(), 1);
+    assert_eq!(
+        interp
+            .eval_str("(length (conversation/messages (memory/messages mem)))")
+            .unwrap(),
+        Value::int(1)
+    );
+    drop(interp);
+    let reopened = Interpreter::new();
+    let result = reopened.eval_str(
+        "(length (conversation/messages (memory/messages (memory/open {:id \"bounded\"}))))",
+    );
+    sema_stdlib::set_memory_bounds_override(None);
+    assert_eq!(result.unwrap(), Value::int(1));
 }
 
 /// Issue #87's persistence leg: a spawned `agent/run {:memory h}` cancelled

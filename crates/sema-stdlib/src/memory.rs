@@ -111,6 +111,8 @@ struct StoredTurn {
 struct MemoryThread {
     path: PathBuf,
     messages: Vec<StoredTurn>,
+    /// Existing sidecar bytes plus every admitted, not-yet-durable JSONL turn.
+    encoded_bytes: u64,
     /// Length of the tail of `messages` not yet durably on disk.
     unflushed: usize,
     /// Identity of this working set. A reopened (tombstone-recovered) thread
@@ -155,6 +157,12 @@ struct FlushJob {
     generation: u64,
     /// Fault-injection seam value captured on the VM thread pre-dispatch.
     fail_after: Option<usize>,
+    max_file_bytes: u64,
+}
+
+struct LoadedThread {
+    messages: Vec<StoredTurn>,
+    bytes: u64,
 }
 
 thread_local! {
@@ -242,7 +250,9 @@ fn teardown_threads() {
                 } => {
                     if !preserved.is_empty() {
                         let lines: Vec<String> = preserved.iter().map(encode_turn).collect();
-                        if write_lines(path, &lines, None).is_ok() {
+                        if write_lines(path, &lines, None, effective_bounds().max_file_bytes)
+                            .is_ok()
+                        {
                             preserved.clear();
                         }
                     }
@@ -346,10 +356,15 @@ fn decode_turn(line: &str) -> Option<StoredTurn> {
 /// Read a sidecar into turns through a capped reader; runs on whichever thread
 /// owns the read (worker under a quantum, VM thread at top level). A missing
 /// file is an empty thread, not an error.
-fn read_sidecar(path: &PathBuf, bounds: MemoryBounds) -> Result<Vec<StoredTurn>, String> {
+fn read_sidecar(path: &PathBuf, bounds: MemoryBounds) -> Result<LoadedThread, String> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(LoadedThread {
+                messages: Vec::new(),
+                bytes: 0,
+            })
+        }
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
     let mut text = String::new();
@@ -364,7 +379,10 @@ fn read_sidecar(path: &PathBuf, bounds: MemoryBounds) -> Result<Vec<StoredTurn>,
             bounds.max_file_bytes
         ));
     }
-    Ok(text.lines().filter_map(decode_turn).collect())
+    Ok(LoadedThread {
+        messages: text.lines().filter_map(decode_turn).collect(),
+        bytes: text.len() as u64,
+    })
 }
 
 /// Synchronously flush the unflushed tail (top level / teardown). Skips while
@@ -380,7 +398,13 @@ fn flush_tail(thread: &mut MemoryThread) -> Result<(), SemaError> {
         .map(encode_turn)
         .collect();
     let fail_after = MEMORY_FLUSH_PARTIAL_FAIL.with(Cell::take);
-    write_lines(&thread.path, &lines, fail_after).map_err(SemaError::eval)?;
+    write_lines(
+        &thread.path,
+        &lines,
+        fail_after,
+        effective_bounds().max_file_bytes,
+    )
+    .map_err(SemaError::eval)?;
     thread.unflushed = 0;
     Ok(())
 }
@@ -389,7 +413,12 @@ fn flush_tail(thread: &mut MemoryThread) -> Result<(), SemaError> {
 /// [`FlushJob`]: one buffer, one `write_all`, and on ANY write error the file
 /// is truncated back to its pre-write length so a partial tail (ENOSPC
 /// mid-write) can never duplicate on retry or tear the next line.
-fn write_lines(path: &PathBuf, lines: &[String], fail_after: Option<usize>) -> Result<(), String> {
+fn write_lines(
+    path: &PathBuf,
+    lines: &[String],
+    fail_after: Option<usize>,
+    max_file_bytes: u64,
+) -> Result<(), String> {
     let io_err = |e: std::io::Error| format!("memory/append: cannot write {}: {e}", path.display());
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(io_err)?;
@@ -400,7 +429,17 @@ fn write_lines(path: &PathBuf, lines: &[String], fail_after: Option<usize>) -> R
         .open(path)
         .map_err(io_err)?;
     let pre_len = file.metadata().map_err(io_err)?.len();
-    let mut buf = String::with_capacity(lines.iter().map(|l| l.len() + 1).sum());
+    let bytes = lines
+        .iter()
+        .try_fold(0u64, |sum, line| sum.checked_add(line.len() as u64 + 1));
+    let bytes = bytes
+        .filter(|&bytes| {
+            pre_len
+                .checked_add(bytes)
+                .is_some_and(|total| total <= max_file_bytes)
+        })
+        .ok_or_else(|| format!("memory/append: sidecar exceeds the {max_file_bytes} byte cap"))?;
+    let mut buf = String::with_capacity(bytes as usize);
     for line in lines {
         buf.push_str(line);
         buf.push('\n');
@@ -481,13 +520,17 @@ fn normalize_role(role: &str) -> Role {
 fn install_loaded(
     key: (String, String),
     path: PathBuf,
-    turns: Vec<StoredTurn>,
+    loaded: LoadedThread,
     preserved: Vec<StoredTurn>,
-) {
+    bounds: MemoryBounds,
+) -> Result<(), SemaError> {
     MEMORY_THREADS.with(|t| {
         let mut threads = t.borrow_mut();
         if !matches!(threads.get(&key), Some(MemSlot::Live(_))) {
-            let mut messages = turns;
+            let encoded_bytes = preserved.iter().try_fold(loaded.bytes, |bytes, turn| {
+                checked_memory_size(bytes, encode_turn(turn).len() as u64 + 1, bounds)
+            })?;
+            let mut messages = loaded.messages;
             let unflushed = preserved.len();
             messages.extend(preserved);
             threads.insert(
@@ -495,6 +538,7 @@ fn install_loaded(
                 MemSlot::Live(MemoryThread {
                     path,
                     messages,
+                    encoded_bytes,
                     unflushed,
                     generation: next_generation(),
                     snapshot_len: None,
@@ -502,7 +546,43 @@ fn install_loaded(
                 }),
             );
         }
-    });
+        Ok(())
+    })
+}
+
+fn checked_memory_size(
+    bytes: u64,
+    additional: u64,
+    bounds: MemoryBounds,
+) -> Result<u64, SemaError> {
+    bytes
+        .checked_add(additional)
+        .filter(|&size| size <= bounds.max_file_bytes)
+        .ok_or_else(|| {
+            SemaError::eval(format!(
+                "memory/append: sidecar exceeds the {} byte cap",
+                bounds.max_file_bytes
+            ))
+        })
+}
+
+fn append_turn(
+    thread: &mut MemoryThread,
+    turn: StoredTurn,
+    bounds: MemoryBounds,
+) -> Result<(), SemaError> {
+    if turn.role.len().saturating_add(turn.content.len()) > bounds.max_turn_bytes {
+        return Err(SemaError::eval(format!(
+            "memory/append: turn exceeds the {} byte cap",
+            bounds.max_turn_bytes
+        )));
+    }
+    let bytes = encode_turn(&turn).len() as u64 + 1;
+    let total = checked_memory_size(thread.encoded_bytes, bytes, bounds)?;
+    thread.messages.push(turn);
+    thread.encoded_bytes = total;
+    thread.unflushed += 1;
+    Ok(())
 }
 
 /// `(memory/open {:id id :namespace ns})` → handle. Idempotent per process;
@@ -574,8 +654,8 @@ fn memory_open(
             "memory/open",
             kind,
             "memory sidecar load",
-            move |turns: Vec<StoredTurn>| {
-                install_loaded(key, path, turns, preserved);
+            move |turns: LoadedThread| {
+                install_loaded(key, path, turns, preserved, bounds)?;
                 Ok(handle)
             },
             move || async move { read_sidecar(&worker_path, bounds) },
@@ -583,14 +663,14 @@ fn memory_open(
     }
 
     let turns = read_sidecar(&path, bounds).map_err(SemaError::eval)?;
-    install_loaded(key, path, turns, preserved);
+    install_loaded(key, path, turns, preserved, bounds)?;
     Ok(NativeOutcome::Return(handle_value(&id, &namespace)))
 }
 
 /// Offload the current unflushed tail through the thread's FIFO flush gate.
 /// The working-set push already happened on the VM thread; this parks the
 /// caller until the tail is durable.
-fn checkout_flush(key: (String, String)) -> NativeResult {
+fn checkout_flush(key: (String, String), bounds: MemoryBounds) -> NativeResult {
     let kind = CompletionKind::try_from_raw(MEMORY_COMPLETION_KIND)
         .expect("memory completion kind is nonzero");
     let gate = MEMORY_GATES.with(|g| g.borrow().get(&key).cloned());
@@ -639,6 +719,7 @@ fn checkout_flush(key: (String, String)) -> NativeResult {
                         count,
                         generation: thread.generation,
                         fail_after: MEMORY_FLUSH_PARTIAL_FAIL.with(Cell::take),
+                        max_file_bytes: bounds.max_file_bytes,
                     })
                 }
                 Some(MemSlot::Tombstone { msg, .. }) => Err(SemaError::eval(format!(
@@ -657,7 +738,8 @@ fn checkout_flush(key: (String, String)) -> NativeResult {
             if job.lines.is_empty() {
                 return Ok((0, job.generation));
             }
-            write_lines(&job.path, &job.lines, job.fail_after).map(|()| (job.count, job.generation))
+            write_lines(&job.path, &job.lines, job.fail_after, job.max_file_bytes)
+                .map(|()| (job.count, job.generation))
         }),
         // Runs on success AND on a recoverable op error: the flight is over
         // either way. Generation-guarded so a stale flight cannot touch a
@@ -750,13 +832,11 @@ fn memory_append(args: &[Value]) -> NativeResult {
     // synchronously at top level.
     let key = parse_handle("memory/append", &args[0])?;
     with_thread_key("memory/append", &key, |thread| {
-        thread.messages.push(StoredTurn { role, content });
-        thread.unflushed += 1;
-        Ok(())
+        append_turn(thread, StoredTurn { role, content }, bounds)
     })?;
 
     if in_runtime_quantum() {
-        return checkout_flush(key);
+        return checkout_flush(key, bounds);
     }
     with_thread_key("memory/append", &key, flush_tail)?;
     Ok(NativeOutcome::Return(args[0].clone()))
@@ -816,11 +896,14 @@ fn agent_append_back(
             if content.is_empty() {
                 continue;
             }
-            thread.messages.push(StoredTurn {
-                role: msg.role.clone(),
-                content,
-            });
-            thread.unflushed += 1;
+            append_turn(
+                thread,
+                StoredTurn {
+                    role: msg.role.clone(),
+                    content,
+                },
+                effective_bounds(),
+            )?;
         }
         if in_runtime_quantum() {
             Ok(())

@@ -289,6 +289,7 @@ fn eval_msg(op: &str, e: impl std::fmt::Display) -> String {
 /// `Available` under `key`. Shared by `db/open`/`db/open-memory` (sync path and
 /// async decode).
 fn finish_open(op: &'static str, key: String, conn: Connection) -> Result<Value, SemaError> {
+    check_reopen_available(op, &key)?;
     conn.busy_timeout(Duration::from_millis(DB_BUSY_TIMEOUT_MS))
         .map_err(|e| SemaError::eval(format!("{op}: {e}")))?;
     let interrupt = Arc::new(conn.get_interrupt_handle());
@@ -301,19 +302,38 @@ fn finish_open(op: &'static str, key: String, conn: Connection) -> Result<Value,
     Ok(Value::string(&key))
 }
 
+fn check_reopen_available(op: &'static str, key: &str) -> Result<(), SemaError> {
+    if DB_CONNECTIONS.with(|c| matches!(c.borrow().get(key), Some(DbSlot::CheckedOut))) {
+        return Err(busy_err(op, key));
+    }
+    Ok(())
+}
+
+type CheckoutInterrupt = Rc<RefCell<Option<Arc<InterruptHandle>>>>;
+
+fn checkout_owns_handle(handle: &str, interrupt: &CheckoutInterrupt) -> bool {
+    DB_INTERRUPTS.with(
+        |m| match (m.borrow().get(handle), interrupt.borrow().as_ref()) {
+            (Some(current), Some(owned)) => Arc::ptr_eq(current, owned),
+            _ => false,
+        },
+    )
+}
+
 /// Build the checkout abort hook: flag the op interrupted (so the worker rolls
 /// back an open transaction before releasing the connection) and fire the
 /// connection's SQLite interrupt handle so a blocked statement returns
 /// `SQLITE_INTERRUPT` promptly. Always returns a closure, so every sqlite
 /// `CheckoutOp` carries a real `abort: Some(_)`.
-fn checkout_interrupt_abort(handle: String, interrupted: Arc<AtomicBool>) -> Box<dyn FnOnce()> {
+fn checkout_interrupt_abort(
+    interrupt: CheckoutInterrupt,
+    interrupted: Arc<AtomicBool>,
+) -> Box<dyn FnOnce()> {
     Box::new(move || {
         interrupted.store(true, Ordering::SeqCst);
-        DB_INTERRUPTS.with(|m| {
-            if let Some(interrupt) = m.borrow().get(&handle) {
-                interrupt.interrupt();
-            }
-        });
+        if let Some(interrupt) = interrupt.borrow().as_ref() {
+            interrupt.interrupt();
+        }
     })
 }
 
@@ -392,13 +412,20 @@ fn checkout_runtime<T: Send + 'static>(
     // transaction before it releases the reclaimed connection.
     let interrupted = Arc::new(AtomicBool::new(false));
     let interrupted_op = Arc::clone(&interrupted);
+    // Capture the identity when the connection is taken, not when the call
+    // queues for its gate. Reopen/close cannot redirect a stale cancellation or
+    // let a late completion restore a retired connection under the same name.
+    let interrupt: CheckoutInterrupt = Rc::new(RefCell::new(None));
+    let interrupt_take = Rc::clone(&interrupt);
+    let interrupt_reinstall = Rc::clone(&interrupt);
+    let interrupt_reclaim = Rc::clone(&interrupt);
+    let interrupt_tomb = Rc::clone(&interrupt);
 
     let h_take = handle.clone();
     let h_reinstall = handle.clone();
     let h_reclaim = handle.clone();
     let h_tomb = handle.clone();
     let h_remove = handle.clone();
-    let h_abort = handle.clone();
     let h_store = handle;
 
     checkout_external(CheckoutOp {
@@ -420,6 +447,7 @@ fn checkout_runtime<T: Send + 'static>(
         }),
         take: Box::new(move || {
             let conn = take_conn(op_name, &h_take)?;
+            *interrupt_take.borrow_mut() = DB_INTERRUPTS.with(|m| m.borrow().get(&h_take).cloned());
             *shared_take.lock().unwrap_or_else(PoisonError::into_inner) = Some(conn);
             Ok(shared_take)
         }),
@@ -448,20 +476,25 @@ fn checkout_runtime<T: Send + 'static>(
         ),
         reinstall: Box::new(move |res: Arc<Mutex<Option<Connection>>>| {
             if let Some(conn) = res.lock().unwrap_or_else(PoisonError::into_inner).take() {
-                DB_CONNECTIONS.with(|c| {
-                    c.borrow_mut().insert(h_reinstall, DbSlot::Available(conn));
-                });
+                if checkout_owns_handle(&h_reinstall, &interrupt_reinstall) {
+                    DB_CONNECTIONS.with(|c| {
+                        c.borrow_mut().insert(h_reinstall, DbSlot::Available(conn));
+                    });
+                }
             }
         }),
         decode: Box::new(move |t| Ok(decode(t))),
         success_value: None,
         tombstone: Rc::new(move |msg| {
+            if !checkout_owns_handle(&h_tomb, &interrupt_tomb) {
+                return;
+            }
             DB_CONNECTIONS.with(|c| {
                 c.borrow_mut()
                     .insert(h_tomb.clone(), DbSlot::Tombstone(msg));
             });
         }),
-        abort: Some(checkout_interrupt_abort(h_abort, interrupted)),
+        abort: Some(checkout_interrupt_abort(interrupt, interrupted)),
         reclaim: Some(Box::new(move || -> bool {
             // On cancel the interrupted worker op is either still running (lock
             // held → retry next reap) or has returned the connection into the
@@ -470,20 +503,24 @@ fn checkout_runtime<T: Send + 'static>(
             match shared_reclaim.try_lock() {
                 Ok(mut guard) => {
                     if let Some(conn) = guard.take() {
-                        DB_CONNECTIONS.with(|c| {
-                            c.borrow_mut()
-                                .insert(h_reclaim.clone(), DbSlot::Available(conn));
-                        });
+                        if checkout_owns_handle(&h_reclaim, &interrupt_reclaim) {
+                            DB_CONNECTIONS.with(|c| {
+                                c.borrow_mut()
+                                    .insert(h_reclaim.clone(), DbSlot::Available(conn));
+                            });
+                        }
                     }
                     true
                 }
                 Err(TryLockError::WouldBlock) => false,
                 Err(TryLockError::Poisoned(poison)) => {
                     if let Some(conn) = poison.into_inner().take() {
-                        DB_CONNECTIONS.with(|c| {
-                            c.borrow_mut()
-                                .insert(h_reclaim.clone(), DbSlot::Available(conn));
-                        });
+                        if checkout_owns_handle(&h_reclaim, &interrupt_reclaim) {
+                            DB_CONNECTIONS.with(|c| {
+                                c.borrow_mut()
+                                    .insert(h_reclaim.clone(), DbSlot::Available(conn));
+                            });
+                        }
                     }
                     true
                 }
@@ -655,6 +692,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 }
                 _ => return Err(SemaError::arity("db/open", "1 or 2", args.len())),
             };
+            check_reopen_available("db/open", &key)?;
 
             if in_runtime_quantum() {
                 let kind = CompletionKind::try_from_raw(DB_COMPLETION_KIND)
@@ -698,6 +736,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             } else {
                 return Err(SemaError::arity("db/open-memory", "0 or 1", args.len()));
             };
+            check_reopen_available("db/open-memory", &name)?;
 
             if in_runtime_quantum() {
                 let kind = CompletionKind::try_from_raw(DB_COMPLETION_KIND)
@@ -956,6 +995,46 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reopen_rejects_an_outstanding_checkout() {
+        let key = "reopen-checkout".to_string();
+        finish_open(
+            "db/open-memory",
+            key.clone(),
+            Connection::open_in_memory().unwrap(),
+        )
+        .unwrap();
+        let interrupt = DB_INTERRUPTS.with(|m| m.borrow().get(&key).unwrap().clone());
+        let ownership = Rc::new(RefCell::new(Some(interrupt.clone())));
+        assert!(checkout_owns_handle(&key, &ownership));
+        let checked_out = take_conn("db/query", &key).unwrap();
+        let error = finish_open(
+            "db/open-memory",
+            key.clone(),
+            Connection::open_in_memory().unwrap(),
+        )
+        .expect_err("reopen must not replace a checked-out connection");
+        assert!(error.to_string().contains("busy"), "{error}");
+        assert!(DB_CONNECTIONS.with(|c| matches!(c.borrow().get(&key), Some(DbSlot::CheckedOut))));
+        assert!(DB_INTERRUPTS.with(|m| Arc::ptr_eq(m.borrow().get(&key).unwrap(), &interrupt)));
+        DB_CONNECTIONS.with(|c| {
+            c.borrow_mut()
+                .insert(key.clone(), DbSlot::Available(checked_out));
+        });
+        finish_open(
+            "db/open-memory",
+            key.clone(),
+            Connection::open_in_memory().unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !checkout_owns_handle(&key, &ownership),
+            "a retired checkout must not own the reopened handle"
+        );
+        DB_CONNECTIONS.with(|c| c.borrow_mut().remove(&key));
+        DB_INTERRUPTS.with(|m| m.borrow_mut().remove(&key));
+    }
+
     /// Every sqlite `CheckoutOp` is built by `checkout_runtime`, which wraps
     /// `checkout_interrupt_abort` in `abort: Some(_)` unconditionally — so every
     /// exec/exec-batch/query/query-one/tables checkout carries a real interrupt
@@ -986,7 +1065,10 @@ mod tests {
         );
 
         let interrupted = Arc::new(AtomicBool::new(false));
-        let abort = checkout_interrupt_abort(key.clone(), Arc::clone(&interrupted));
+        let interrupt = Rc::new(RefCell::new(
+            DB_INTERRUPTS.with(|m| m.borrow().get(&key).cloned()),
+        ));
+        let abort = checkout_interrupt_abort(interrupt, Arc::clone(&interrupted));
         abort();
         assert!(
             interrupted.load(Ordering::SeqCst),

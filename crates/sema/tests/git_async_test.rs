@@ -167,8 +167,13 @@ impl ScratchRepo {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("sema-git-async-{tag}-{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "sema-git-async-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        // Nextest runs tests in separate processes; timestamps can coincide.
+        // Atomic creation must never let two fixtures share an existing repo.
+        std::fs::create_dir(&dir).unwrap();
 
         let git = |args: &[&str]| {
             let out = std::process::Command::new("git")
@@ -196,17 +201,13 @@ impl ScratchRepo {
     }
 
     #[cfg(unix)]
-    fn install_blocking_external_diff(&self) -> (PathBuf, PathBuf) {
+    fn install_external_diff(&self, source: &str) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
 
         let helper = self.dir.join("external-diff-helper.sh");
         let started = self.dir.join("external-diff-started");
         let descendant = self.dir.join("external-diff-descendant");
-        std::fs::write(
-            &helper,
-            "#!/bin/sh\nprintf started > external-diff-started\n( sleep 1; printf leaked > external-diff-descendant ) &\nwait\n",
-        )
-        .unwrap();
+        std::fs::write(&helper, source).unwrap();
         let mut permissions = std::fs::metadata(&helper).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&helper, permissions).unwrap();
@@ -523,12 +524,30 @@ fn git_async_error_matches_sync_outside_repo() {
 #[test]
 #[serial]
 fn git_diff_cancel_kills_external_diff_descendant() {
+    assert_git_diff_cancellation_kills_descendant(
+        "#!/bin/sh\n( printf started > external-diff-started; sleep 1; printf leaked > external-diff-descendant ) &\nwait\n",
+    );
+}
+
+/// Readiness before the fork exercises cancellation while a descendant joins
+/// the group, which can require another group signal while draining the pipes.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn git_diff_cancel_racing_fork_kills_external_diff_descendant() {
+    assert_git_diff_cancellation_kills_descendant(
+        "#!/bin/sh\nprintf started > external-diff-started\n( sleep 1; printf leaked > external-diff-descendant ) &\nwait\n",
+    );
+}
+
+#[cfg(unix)]
+fn assert_git_diff_cancellation_kills_descendant(helper_source: &str) {
     if !git_available() {
         eprintln!("skipping git_diff_cancel_kills_external_diff_descendant: no git on PATH");
         return;
     }
     let repo = ScratchRepo::new("cancel-descendant");
-    let (started, descendant) = repo.install_blocking_external_diff();
+    let (started, descendant) = repo.install_external_diff(helper_source);
     let _cwd = TestDir::enter(&repo.dir);
 
     let interp = Interpreter::new();
@@ -641,7 +660,18 @@ fn git_cancel_bounds_drains_held_by_escaped_descendant() {
     let _cwd = TestDir::enter(&repo.dir);
 
     let interp = Interpreter::new();
-    let started = std::time::Instant::now();
+    let cancellation_started = std::rc::Rc::new(std::cell::Cell::new(None));
+    let started_for_callback = std::rc::Rc::clone(&cancellation_started);
+    interp.global_env.set(
+        sema_core::intern("test/start-cancellation-timer"),
+        Value::native_fn(sema_core::NativeFn::simple(
+            "test/start-cancellation-timer",
+            move |_| {
+                started_for_callback.set(Some(std::time::Instant::now()));
+                Ok(Value::nil())
+            },
+        )),
+    );
     let result = interp
         .eval_str_compiled(
             r#"
@@ -653,6 +683,7 @@ fn git_cancel_bounds_drains_held_by_escaped_descendant() {
                   (else
                     (async/sleep 5)
                     (wait-for-escaped-helper (- remaining 1)))))
+              (test/start-cancellation-timer)
               (let ((requested (async/cancel pending))
                     (settled (try (async/await pending) (catch error :cancelled))))
                 (list requested settled)))
@@ -660,7 +691,11 @@ fn git_cancel_bounds_drains_held_by_escaped_descendant() {
         )
         .expect("cancelled git with escaped descendant settles");
     drop(interp);
-    let elapsed = started.elapsed();
+    // Helper startup is not part of the cancellation/shutdown bound.
+    let elapsed = cancellation_started
+        .get()
+        .expect("cancellation timer was started")
+        .elapsed();
 
     let helper_pid: i32 = std::fs::read_to_string(&pid_path).unwrap().parse().unwrap();
     // SAFETY: the helper writes its own pid after successfully entering a new

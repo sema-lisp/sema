@@ -38,6 +38,10 @@ const GIT_COMPLETION_KIND: u64 = 0x6769_7400; // "git\0"
 /// foreign descendant escaped the group but retained an output descriptor.
 const GIT_CANCEL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Retry while pipes remain open: a group signal can miss a descendant whose
+/// fork overlaps the kernel's process-group traversal.
+const GIT_CANCEL_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Hard ceiling on the bytes a single offloaded `git` invocation may buffer from
 /// EACH of stdout/stderr before the process group is killed. The offload's
 /// `decode` closure materializes the whole output into a `Value` on the VM
@@ -313,6 +317,37 @@ fn terminate_git_child(child: &mut tokio::process::Child, pid: u32) {
     let _ = child.start_kill();
 }
 
+/// Terminate the group and join its pipe drains within the cleanup grace.
+/// The callback must not reap the child: its pid must stay reserved until the
+/// final signal, including when a descendant keeps an inherited pipe open.
+async fn terminate_git_and_drain<F>(
+    drains: F,
+    stdout_abort: &tokio::task::AbortHandle,
+    stderr_abort: &tokio::task::AbortHandle,
+    mut terminate: impl FnMut(),
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    let deadline = tokio::time::Instant::now() + GIT_CANCEL_DRAIN_GRACE;
+    tokio::pin!(drains);
+    loop {
+        terminate();
+        let retry_at = (tokio::time::Instant::now() + GIT_CANCEL_RETRY_INTERVAL).min(deadline);
+        if let Ok(result) = tokio::time::timeout_at(retry_at, &mut drains).await {
+            return result;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            // Make a final attempt before abandoning pipes held by a descendant
+            // that escaped the group. Both aborted tasks must still be joined.
+            terminate();
+            stdout_abort.abort();
+            stderr_abort.abort();
+            return drains.await;
+        }
+    }
+}
+
 /// The over-cap signal shared by both pipe drains and the invocation future: the
 /// first drain to exceed the cap sets the flag and wakes the future so it can
 /// kill the process group promptly (which lets the sibling drain read EOF).
@@ -433,15 +468,9 @@ async fn git_run_future(
             // the drains already finished — just await them.
             if over.is_some() && over_cap.load(Ordering::Acquire) {
                 over_capped = true;
-                terminate_git_child(&mut child, pid);
-                match tokio::time::timeout(GIT_CANCEL_DRAIN_GRACE, &mut drains).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        stdout_abort.abort();
-                        stderr_abort.abort();
-                        drains.await
-                    }
-                }
+                terminate_git_and_drain(&mut drains, &stdout_abort, &stderr_abort, || {
+                    terminate_git_child(&mut child, pid);
+                }).await
             } else {
                 drains.await
             }
@@ -450,15 +479,9 @@ async fn git_run_future(
             cancel_resolved = true;
             if signal.is_ok() {
                 cancelled = true;
-                terminate_git_child(&mut child, pid);
-                match tokio::time::timeout(GIT_CANCEL_DRAIN_GRACE, &mut drains).await {
-                    Ok(result) => result,
-                    Err(_) => {
-                        stdout_abort.abort();
-                        stderr_abort.abort();
-                        drains.await
-                    }
-                }
+                terminate_git_and_drain(&mut drains, &stdout_abort, &stderr_abort, || {
+                    terminate_git_child(&mut child, pid);
+                }).await
             } else {
                 drains.await
             }
@@ -807,6 +830,13 @@ mod tests {
     use super::*;
     use sema_core::runtime::{CancelDisposition, CancelHook};
 
+    fn test_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime")
+    }
+
     /// True when a `git` binary is available; tests early-return otherwise so a
     /// machine without git doesn't hard-fail the suite.
     fn git_available() -> bool {
@@ -916,6 +946,61 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_git_drains_retry_until_both_pipes_close() {
+        test_runtime().block_on(async {
+            let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+            let stdout = tokio::spawn(async move {
+                close_rx.await.expect("a retry closes the inherited pipe");
+                b"stdout"
+            });
+            let stderr = tokio::spawn(async { b"stderr" });
+            let stdout_abort = stdout.abort_handle();
+            let stderr_abort = stderr.abort_handle();
+            let mut attempts = 0;
+            let mut close_tx = Some(close_tx);
+            let (stdout, stderr) = terminate_git_and_drain(
+                async { tokio::join!(stdout, stderr) },
+                &stdout_abort,
+                &stderr_abort,
+                || {
+                    attempts += 1;
+                    // Model a descendant missed by the first group signal.
+                    if attempts == 2 {
+                        close_tx.take().unwrap().send(()).unwrap();
+                    }
+                },
+            )
+            .await;
+
+            assert!(attempts >= 2, "the first signal must not end cleanup");
+            assert_eq!(stdout.expect("stdout was joined, not aborted"), b"stdout");
+            assert_eq!(stderr.expect("stderr was joined, not aborted"), b"stderr");
+        });
+    }
+
+    #[test]
+    fn cancelled_git_drains_abort_and_join_after_grace() {
+        test_runtime().block_on(async {
+            let stdout = tokio::spawn(std::future::pending::<()>());
+            let stderr = tokio::spawn(std::future::pending::<()>());
+            let stdout_abort = stdout.abort_handle();
+            let stderr_abort = stderr.abort_handle();
+            let mut attempts = 0;
+            let (stdout, stderr) = terminate_git_and_drain(
+                async { tokio::join!(stdout, stderr) },
+                &stdout_abort,
+                &stderr_abort,
+                || attempts += 1,
+            )
+            .await;
+
+            assert!(attempts >= 2, "cleanup must retry before abandoning drains");
+            assert!(stdout.expect_err("stdout task was aborted").is_cancelled());
+            assert!(stderr.expect_err("stderr task was aborted").is_cancelled());
+        });
+    }
+
+    #[test]
     fn cancel_hook_reports_reaped_when_worker_already_finished() {
         let completion = GitCompletionGuard::default();
         completion.mark_reaped();
@@ -966,10 +1051,7 @@ mod tests {
 
     #[test]
     fn drain_git_pipe_caps_output_and_signals_over_cap() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("current-thread runtime");
+        let runtime = test_runtime();
 
         // Over-cap: the drain truncates to the cap, sets the flag, and wakes the
         // invocation future exactly once.

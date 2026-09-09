@@ -35,6 +35,83 @@ fn git_available() -> bool {
         .unwrap_or(false)
 }
 
+#[test]
+#[serial]
+fn git_ignore_checks_accept_leading_dash_paths_in_both_abis() {
+    if !git_available() {
+        return;
+    }
+    let repo = ScratchRepo::new("dash-paths");
+    let _dir = TestDir::enter(&repo.dir);
+    std::fs::write(repo.dir.join(".gitignore"), "-ignored\n").unwrap();
+    let env = sema_core::Env::new();
+    sema_stdlib::register_stdlib(&env, &sema_core::Sandbox::allow_all());
+    let callable = env.get(sema_core::intern("git/ignore-matches?")).unwrap();
+    let native = callable.as_native_fn_ref().unwrap();
+    let ctx = sema_core::EvalContext::new();
+    let interp = Interpreter::new();
+    for (path, expected) in [("-ignored", true), ("--no-such-option", false)] {
+        assert_eq!(
+            (native.func)(&ctx, &[Value::string(path)]).unwrap(),
+            Value::bool(expected)
+        );
+        assert_eq!(
+            interp
+                .eval_str(&format!("(git/ignore-matches? {path:?})"))
+                .unwrap(),
+            Value::bool(expected)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn git_filename_lists_preserve_literal_names_in_both_abis() {
+    if !git_available() {
+        return;
+    }
+    let repo = ScratchRepo::new("literal-names");
+    let _dir = TestDir::enter(&repo.dir);
+    let names = ["line\nbreak", "tab\tname", "back\\slash", "\nleading"];
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?}: {:?}", output.stderr);
+    };
+    for name in names {
+        std::fs::write(repo.dir.join(name), "before\n").unwrap();
+        git(&["add", "--", name]);
+    }
+    git(&["commit", "-q", "-m", "literal names"]);
+    for name in names {
+        std::fs::write(repo.dir.join(name), "after\n").unwrap();
+    }
+    let env = sema_core::Env::new();
+    sema_stdlib::register_stdlib(&env, &sema_core::Sandbox::allow_all());
+    let ctx = sema_core::EvalContext::new();
+    let interp = Interpreter::new();
+    for op in ["git/diff-files", "git/recent-files"] {
+        let callable = env.get(sema_core::intern(op)).unwrap();
+        let native = callable.as_native_fn_ref().unwrap();
+        for result in [
+            (native.func)(&ctx, &[]).unwrap(),
+            interp.eval_str(&format!("({op})")).unwrap(),
+        ] {
+            let files = result.as_list().unwrap();
+            for name in names {
+                assert_eq!(
+                    files.iter().filter(|v| v.as_str() == Some(name)).count(),
+                    1,
+                    "{op}: {result}"
+                );
+            }
+        }
+    }
+}
+
 /// chdir into `dir` for the guard's lifetime, restoring the original cwd on
 /// drop (also on panic/early return).
 struct TestDir {

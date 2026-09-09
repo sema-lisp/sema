@@ -608,25 +608,57 @@ fn shell_program_args(cmd: &str, cmd_args: &[&str]) -> (String, Vec<String>) {
 /// Shared by `shell` and `proc/spawn` so both interpret the options map
 /// identically; owning `String`s (not borrows) lets the async `shell` path move
 /// them across the I/O-pool thread boundary.
-pub(crate) fn command_opts(
-    opts: &std::collections::BTreeMap<Value, Value>,
-) -> (Option<String>, Vec<(String, String)>) {
+#[derive(Default)]
+pub(crate) struct CommandOptions {
+    pub cwd: Option<String>,
+    pub env: Vec<(String, String)>,
+}
+
+pub(crate) fn command_opts(opts: Option<&Value>) -> Result<CommandOptions, SemaError> {
+    let Some(opts) = opts else {
+        return Ok(CommandOptions::default());
+    };
+    let opts = opts
+        .as_map_ref()
+        .ok_or_else(|| SemaError::type_error("map (command options)", opts.type_name()))?;
     let cwd = opts
         .get(&Value::keyword("cwd"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let mut env = Vec::new();
-    if let Some(em) = opts
-        .get(&Value::keyword("env"))
-        .and_then(|v| v.as_map_ref())
-    {
-        for (k, val) in em.iter() {
-            if let (Some(k), Some(val)) = (k.as_str(), val.as_str()) {
-                env.push((k.to_string(), val.to_string()));
+        .map(|v| {
+            let cwd = v
+                .as_str()
+                .ok_or_else(|| SemaError::eval("command options: :cwd must be a string"))?;
+            if cwd.contains('\0') {
+                return Err(SemaError::eval(
+                    "command options: :cwd must not contain NUL",
+                ));
             }
+            Ok(cwd.to_string())
+        })
+        .transpose()?;
+    let mut env = Vec::new();
+    if let Some(value) = opts.get(&Value::keyword("env")) {
+        let em = value
+            .as_map_ref()
+            .ok_or_else(|| SemaError::eval("command options: :env must be a map"))?;
+        for (k, val) in em.iter() {
+            let k = k.as_str().ok_or_else(|| {
+                SemaError::eval("command options: environment key must be a string")
+            })?;
+            let val = val.as_str().ok_or_else(|| {
+                SemaError::eval("command options: environment value must be a string")
+            })?;
+            if k.is_empty() || k.contains(['=', '\0']) {
+                return Err(SemaError::eval("command options: invalid environment key"));
+            }
+            if val.contains('\0') {
+                return Err(SemaError::eval(
+                    "command options: environment value must not contain NUL",
+                ));
+            }
+            env.push((k.to_string(), val.to_string()));
         }
     }
-    (cwd, env)
+    Ok(CommandOptions { cwd, env })
 }
 
 /// POSIX single-quote a string so it survives `sh -c` as one literal word. Wrap
@@ -838,7 +870,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         // the LAST arg qualifies, and only when it is actually a map; a string in
         // that slot still means an argv element.
         let (argv, opts) = match args[1..].split_last() {
-            Some((last, rest)) if last.as_map_ref().is_some() => (rest, last.as_map_ref()),
+            Some((last, rest)) if last.as_map_ref().is_some() => (rest, Some(last)),
             _ => (&args[1..], None),
         };
         let cmd_args: Vec<&str> = argv
@@ -848,7 +880,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     .ok_or_else(|| SemaError::type_error("string", a.type_name()))
             })
             .collect::<Result<_, _>>()?;
-        let (cwd, env_vars) = opts.map(command_opts).unwrap_or_default();
+        let CommandOptions { cwd, env: env_vars } = command_opts(opts)?;
 
         // Resolve the program + argv exactly once, shared by both paths so they
         // launch byte-identical commands.

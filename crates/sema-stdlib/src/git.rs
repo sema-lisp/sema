@@ -172,22 +172,23 @@ fn changed_files_value(entries: Vec<(String, String)>) -> Value {
     )
 }
 
-/// Build `git/diff-files`'s result list from raw `git diff --name-only` stdout.
+/// Build `git/diff-files`'s result list from NUL-delimited filenames.
 fn diff_files_value(out: &str) -> Value {
     Value::list(
-        out.lines()
+        out.split('\0')
             .filter(|l| !l.is_empty())
             .map(Value::string)
             .collect(),
     )
 }
 
-/// Build `git/recent-files`'s result list from raw `git log --name-only
-/// --pretty=format:` stdout, deduped preserving first-seen order.
+/// Decode `git log --name-only -z --pretty=format:` output. Empty NUL records
+/// separate commits; nonempty records are literal filenames, even when they
+/// contain newlines. Deduplicate while preserving first-seen order.
 fn recent_files_value(out: &str) -> Value {
     let mut seen = std::collections::HashSet::new();
     let mut files = Vec::new();
-    for line in out.lines() {
+    for line in out.split('\0') {
         if line.is_empty() {
             continue;
         }
@@ -581,7 +582,12 @@ fn git_stdout_runtime(
 /// path bypasses `git()`.
 fn git_ignore_matches_runtime(path: String) -> NativeResult {
     let path_for_msg = path.clone();
-    let full_args = vec!["check-ignore".to_string(), "-q".to_string(), path];
+    let full_args = vec![
+        "check-ignore".to_string(),
+        "-q".to_string(),
+        "--".to_string(),
+        path,
+    ];
     git_external_runtime(
         full_args,
         move |raw: RawGitOutput| -> Result<Value, SemaError> {
@@ -710,11 +716,15 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             check_arity!(args, "git/diff-files", 0);
             if in_runtime_quantum() {
                 return git_stdout_runtime(
-                    vec!["diff".to_string(), "--name-only".to_string()],
+                    vec![
+                        "diff".to_string(),
+                        "--name-only".to_string(),
+                        "-z".to_string(),
+                    ],
                     |out| diff_files_value(&out),
                 );
             }
-            let out = git(&["diff", "--name-only"])?;
+            let out = git(&["diff", "--name-only", "-z"])?;
             Ok(NativeOutcome::Return(diff_files_value(&out)))
         },
     );
@@ -737,6 +747,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 vec![
                     "log".to_string(),
                     "--name-only".to_string(),
+                    "-z".to_string(),
                     "--pretty=format:".to_string(),
                     "-n".to_string(),
                     n_str.clone(),
@@ -745,7 +756,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             if in_runtime_quantum() {
                 return git_stdout_runtime(log_args(), |out| recent_files_value(&out));
             }
-            let out = git(&["log", "--name-only", "--pretty=format:", "-n", &n_str])?;
+            let out = git(&["log", "--name-only", "-z", "--pretty=format:", "-n", &n_str])?;
             Ok(NativeOutcome::Return(recent_files_value(&out)))
         },
     );
@@ -767,7 +778,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 return git_ignore_matches_runtime(path);
             }
             let output = std::process::Command::new("git")
-                .args(["check-ignore", "-q", &path])
+                .args(["check-ignore", "-q", "--", &path])
                 .output()
                 .map_err(|e| {
                     SemaError::Io(format!(

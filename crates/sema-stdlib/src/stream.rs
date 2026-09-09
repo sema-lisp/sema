@@ -2785,8 +2785,8 @@ mod io_streams {
         }
 
         fn write(&self, data: &[u8]) -> Result<usize, SemaError> {
-            let text = String::from_utf8_lossy(data);
-            sema_core::write_stdout(&text);
+            sema_core::output_hook::write_stdout_bytes(data)
+                .map_err(|e| SemaError::eval(format!("stream/write *stdout*: {e}")))?;
             Ok(data.len())
         }
 
@@ -2818,8 +2818,8 @@ mod io_streams {
         }
 
         fn write(&self, data: &[u8]) -> Result<usize, SemaError> {
-            let text = String::from_utf8_lossy(data);
-            sema_core::write_stderr(&text);
+            sema_core::output_hook::write_stderr_bytes(data)
+                .map_err(|e| SemaError::eval(format!("stream/write *stderr*: {e}")))?;
             Ok(data.len())
         }
 

@@ -310,14 +310,12 @@ fn spawn(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value, SemaErro
 
     // Optional opts map: {:cwd "path" :env {"KEY" "val" ...}}. Shared extraction
     // with `shell` so both APIs interpret the map identically.
-    if let Some(m) = args.get(1).and_then(|v| v.as_map_ref()) {
-        let (cwd, env_vars) = crate::system::command_opts(m);
-        if let Some(dir) = &cwd {
-            cmd.current_dir(dir);
-        }
-        for (k, val) in &env_vars {
-            cmd.env(k, val);
-        }
+    let opts = crate::system::command_opts(args.get(1))?;
+    if let Some(dir) = &opts.cwd {
+        cmd.current_dir(dir);
+    }
+    for (k, val) in &opts.env {
+        cmd.env(k, val);
     }
 
     let mut child = cmd
@@ -425,14 +423,12 @@ fn run(args: &[Value]) -> Result<Value, SemaError> {
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    if let Some(m) = args.get(1).and_then(|v| v.as_map_ref()) {
-        let (cwd, env_vars) = crate::system::command_opts(m);
-        if let Some(dir) = &cwd {
-            cmd.current_dir(dir);
-        }
-        for (k, val) in &env_vars {
-            cmd.env(k, val);
-        }
+    let opts = crate::system::command_opts(args.get(1))?;
+    if let Some(dir) = &opts.cwd {
+        cmd.current_dir(dir);
+    }
+    for (k, val) in &opts.env {
+        cmd.env(k, val);
     }
 
     // Flush first: buffered Sema output would otherwise appear after the child's.

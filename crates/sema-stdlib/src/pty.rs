@@ -233,6 +233,7 @@ fn spawn(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value, SemaErro
         );
     }
 
+    let command_opts = crate::system::command_opts(args.get(1))?;
     let opts = args.get(1).and_then(|o| o.as_map_ref());
     let (rows, cols) = match opts {
         Some(m) => (u16_opt(m, "rows", 24), u16_opt(m, "cols", 80)),
@@ -253,17 +254,11 @@ fn spawn(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value, SemaErro
     for a in &parts[1..] {
         cmd.arg(a);
     }
-    if let Some(m) = opts {
-        if let Some(cwd) = m.get(&Value::keyword("cwd")).and_then(|v| v.as_str()) {
-            cmd.cwd(cwd);
-        }
-        if let Some(em) = m.get(&Value::keyword("env")).and_then(|v| v.as_map_ref()) {
-            for (k, val) in em.iter() {
-                if let (Some(k), Some(val)) = (k.as_str(), val.as_str()) {
-                    cmd.env(k, val);
-                }
-            }
-        }
+    if let Some(cwd) = command_opts.cwd {
+        cmd.cwd(cwd);
+    }
+    for (k, val) in command_opts.env {
+        cmd.env(k, val);
     }
 
     let child = pair

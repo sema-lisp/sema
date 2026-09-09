@@ -158,28 +158,32 @@ pub fn current_root() -> Option<RootId> {
     CURRENT_ROOT.with(Cell::get)
 }
 
-/// Append to the capture sink if the current quantum's root is capturing.
-/// Returns `true` if the text was captured (caller must not also print it).
+type OutputCaptureSink = Rc<RefCell<Vec<CapturedOutput>>>;
+
+/// Find the capture sink if the current quantum's root is capturing.
 /// The `CAPTURING_COUNT == 0` check is a single cheap `Cell` read that keeps
 /// this a no-op branch for the default (non-capturing) path — no hash-set
 /// lookup, no allocation, unless at least one root on this thread actually
 /// opted in.
-fn try_capture(is_stderr: bool, s: &str) -> bool {
+fn current_capture_sink() -> Option<(RootId, OutputCaptureSink)> {
     if CAPTURING_COUNT.with(Cell::get) == 0 {
-        return false;
+        return None;
     }
-    let Some(root) = CURRENT_ROOT.with(Cell::get) else {
-        return false;
-    };
+    let root = CURRENT_ROOT.with(Cell::get)?;
     if !CAPTURING_ROOTS.with(|set| set.borrow().contains(&root)) {
-        return false;
+        return None;
     }
-    let route = OUTPUT_CAPTURE_ROUTES.with(|routes| routes.borrow().get(&root.runtime()).cloned());
-    let Some(route) = route else {
-        return false;
-    };
+    let route =
+        OUTPUT_CAPTURE_ROUTES.with(|routes| routes.borrow().get(&root.runtime()).cloned())?;
     let Some(sink) = route.upgrade() else {
         unregister_output_capture_sink(root.runtime());
+        return None;
+    };
+    Some((root, sink))
+}
+
+fn try_capture(is_stderr: bool, s: &str) -> bool {
+    let Some((root, sink)) = current_capture_sink() else {
         return false;
     };
     sink.borrow_mut().push(CapturedOutput {
@@ -188,6 +192,61 @@ fn try_capture(is_stderr: bool, s: &str) -> bool {
         text: s.to_string(),
     });
     true
+}
+
+/// Write bytes unchanged to stdout. Text-only host and root capture routes
+/// accept UTF-8 and reject other bytes without emitting replacement characters.
+pub fn write_stdout_bytes(bytes: &[u8]) -> std::io::Result<()> {
+    write_output_bytes(false, bytes)
+}
+
+/// Write bytes unchanged to stderr, with the same capture rules as stdout.
+pub fn write_stderr_bytes(bytes: &[u8]) -> std::io::Result<()> {
+    write_output_bytes(true, bytes)
+}
+
+fn capture_text(bytes: &[u8]) -> std::io::Result<&str> {
+    std::str::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "captured output must be valid UTF-8",
+        )
+    })
+}
+
+fn write_output_bytes(is_stderr: bool, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Some((root, sink)) = current_capture_sink() {
+        sink.borrow_mut().push(CapturedOutput {
+            root,
+            is_stderr,
+            text: capture_text(bytes)?.to_string(),
+        });
+        return Ok(());
+    }
+    if let Some(_guard) = HostHookGuard::enter() {
+        let send = |cell: &RefCell<OutputHook>| -> std::io::Result<bool> {
+            if let Some(hook) = cell.borrow().as_ref() {
+                hook(capture_text(bytes)?);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        };
+        let captured = if is_stderr {
+            HOST_STDERR_HOOK.with(send)
+        } else {
+            HOST_STDOUT_HOOK.with(send)
+        }?;
+        if captured {
+            return Ok(());
+        }
+    }
+    if is_stderr {
+        std::io::stderr().lock().write_all(bytes)
+    } else {
+        std::io::stdout().lock().write_all(bytes)
+    }
 }
 
 #[cfg(test)]
@@ -275,6 +334,41 @@ mod tests {
             .allocate()
             .expect("root identity available");
         (runtime, root)
+    }
+
+    #[test]
+    fn byte_output_preserves_text_capture_and_rejects_invalid_utf8() {
+        let (runtime, root) = runtime_and_root();
+        let sink = Rc::new(RefCell::new(Vec::new()));
+        register_output_capture_sink(runtime, &sink);
+        mark_root_capturing(root);
+        set_current_root(Some(root));
+        write_stdout_bytes("héllo".as_bytes()).unwrap();
+        write_stderr_bytes(b"error").unwrap();
+        assert!(write_stdout_bytes(&[255]).is_err());
+        assert!(write_stderr_bytes(&[128]).is_err());
+        set_current_root(None);
+        unregister_output_capture_sink(runtime);
+        let events = sink.borrow();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].text, "héllo");
+        assert!(!events[0].is_stderr);
+        assert_eq!(events[1].text, "error");
+        assert!(events[1].is_stderr);
+    }
+
+    #[test]
+    fn byte_output_rejects_invalid_utf8_for_host_hooks() {
+        set_host_stdout_hook(Some(Box::new(|s| assert_eq!(s, "output"))));
+        set_host_stderr_hook(Some(Box::new(|s| assert_eq!(s, "error"))));
+        write_stdout_bytes(b"output").unwrap();
+        write_stderr_bytes(b"error").unwrap();
+        let out = write_stdout_bytes(&[255]);
+        let err = write_stderr_bytes(&[128]);
+        set_host_stdout_hook(None);
+        set_host_stderr_hook(None);
+        assert!(out.is_err());
+        assert!(err.is_err());
     }
 
     #[test]

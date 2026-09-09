@@ -1,5 +1,57 @@
 use sema_core::Value;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn standard_stream_writes_preserve_raw_bytes() {
+    for stream in ["stdout", "stderr"] {
+        let source = format!("(stream/write *{stream}* (bytevector 0 255 128 10))");
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+            .args(["--no-llm", "-e", &source])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{stream}: {:?}", output.stderr);
+        if stream == "stdout" {
+            assert_eq!(output.stdout, [0, 255, 128, 10, b'4', b'\n']);
+            assert!(output.stderr.is_empty());
+        } else {
+            assert_eq!(output.stderr, [0, 255, 128, 10]);
+            assert_eq!(output.stdout, b"4\n");
+        }
+    }
+}
+
+#[cfg(unix)]
+eval_error_tests! {
+    read_key_timeout_rejects_negative: "(io/read-key-timeout -1)" => "non-negative",
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn process_options_are_validated_before_spawn() {
+    for op in ["shell", "proc/spawn", "pty/spawn"] {
+        for (opts, expected) in [
+            ("{:cwd 1}", ":cwd"),
+            ("{:env 1}", ":env"),
+            ("{:env {1 \"value\"}}", "environment key"),
+            ("{:env {\"KEY\" 1}}", "environment value"),
+        ] {
+            let command = if op == "shell" {
+                "\"sema-test-command-that-does-not-exist\""
+            } else {
+                "[\"sema-test-command-that-does-not-exist\"]"
+            };
+            let source = format!("({op} {command} {opts})");
+            let err = sema_eval::Interpreter::new().eval_str(&source).unwrap_err();
+            assert!(err.to_string().contains(expected), "{source}: {err}");
+        }
+    }
+    for op in ["proc/spawn", "pty/spawn"] {
+        let source = format!("({op} [\"sema-test-command-that-does-not-exist\"] 1)");
+        let err = sema_eval::Interpreter::new().eval_str(&source).unwrap_err();
+        assert!(err.to_string().contains("expected map"), "{source}: {err}");
+    }
+}
+
 // ============================================================
 // Path operations (pure string manipulation)
 // ============================================================

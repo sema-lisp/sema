@@ -2650,9 +2650,15 @@ fn terminal_query_runtime_with_timeout(kind: TerminalQueryKind, timeout: Duratio
 #[cfg(unix)]
 fn read_key_timeout_value(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "io/read-key-timeout", 1);
-    let ms = args.int_at(0, "io/read-key-timeout")? as u64;
+    let ms = read_key_timeout_ms(args)?;
 
     read_key_from_owner(Some(Duration::from_millis(ms)))
+}
+
+#[cfg(unix)]
+fn read_key_timeout_ms(args: &[Value]) -> Result<u64, SemaError> {
+    u64::try_from(args.int_at(0, "io/read-key-timeout")?)
+        .map_err(|_| SemaError::eval("io/read-key-timeout: timeout must be non-negative"))
 }
 
 #[cfg(unix)]
@@ -2711,7 +2717,7 @@ fn register_read_key_timeout(env: &sema_core::Env) {
             |_ctx, args| {
                 if sema_core::in_runtime_quantum() {
                     check_arity!(args, "io/read-key-timeout", 1);
-                    let ms = args.int_at(0, "io/read-key-timeout")? as u64;
+                    let ms = read_key_timeout_ms(args)?;
                     let started = std::time::Instant::now();
                     return await_runtime_until(Box::new(KeyProbe::new()), started, ms);
                 }
@@ -3735,6 +3741,13 @@ mod file_info_tests {
 #[cfg(all(test, unix))]
 mod within_tests {
     use super::*;
+
+    #[test]
+    fn read_key_timeout_value_rejects_negative_before_stdin_access() {
+        let error = read_key_timeout_value(&[Value::int(-1)]).unwrap_err();
+        assert!(error.to_string().contains("non-negative"));
+        assert_eq!(read_key_timeout_ms(&[Value::int(0)]).unwrap(), 0);
+    }
 
     fn call(env: &sema_core::Env, name: &str, args: &[Value]) -> Value {
         let f = env

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{
     channel, sync_channel, Receiver, Sender, SyncSender, TryRecvError, TrySendError,
 };
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use sema_core::ArgsExt;
@@ -29,6 +29,7 @@ const EVENT_QUEUE_CAPACITY: usize = 1_024;
 struct Watch {
     rx: Receiver<Event>,
     dropped: Arc<AtomicUsize>,
+    failure: Arc<Mutex<Option<String>>>,
     // Dropping this wakes the worker once platform construction or registration
     // returns. Those platform calls have no cancellation interface, so teardown
     // deliberately never joins the worker.
@@ -52,6 +53,7 @@ impl Watch {
 struct EventSink {
     tx: SyncSender<Event>,
     dropped: Arc<AtomicUsize>,
+    failure: Arc<Mutex<Option<String>>>,
 }
 
 impl EventSink {
@@ -62,6 +64,7 @@ impl EventSink {
             Self {
                 tx,
                 dropped: Arc::clone(&dropped),
+                failure: Arc::new(Mutex::new(None)),
             },
             rx,
             dropped,
@@ -79,6 +82,13 @@ impl EventSink {
                     });
             }
         }
+    }
+
+    fn fail(&self, error: impl std::fmt::Display) {
+        *self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
     }
 }
 
@@ -186,10 +196,21 @@ impl WatchRegistry {
     }
 
     fn drain_events(&self, id: i64) -> Result<Vec<Value>, SemaError> {
-        let watchers = self.watchers.borrow();
+        let mut watchers = self.watchers.borrow_mut();
         let watch = watchers
             .get(&id)
             .ok_or_else(|| SemaError::eval(format!("fs/watch-events: no such watcher {id}")))?;
+        let failure = watch
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(error) = failure {
+            watchers.remove(&id);
+            return Err(SemaError::eval(format!(
+                "fs/watch-events: watcher {id} failed: {error}"
+            )));
+        }
         Ok(watch.drain_events())
     }
 
@@ -275,14 +296,23 @@ fn run_watch_worker<F, B>(
     B: WatchBackend,
 {
     let _lease = lease;
+    let failure = Arc::clone(&sink.failure);
     let mut watcher = match make_watcher(sink) {
         Ok(watcher) => watcher,
-        Err(_) => return,
+        Err(error) => {
+            *failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
+            return;
+        }
     };
     if stop_requested(&stop_rx) {
         return;
     }
-    if watcher.register(Path::new(&path), mode).is_err() {
+    if let Err(error) = watcher.register(Path::new(&path), mode) {
+        *failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
         return;
     }
     if !stop_requested(&stop_rx) {
@@ -310,6 +340,20 @@ where
 }
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
+    register_with_factory(env, sandbox, |sink| {
+        notify::recommended_watcher(move |result: notify::Result<Event>| match result {
+            Ok(event) => sink.send(event),
+            Err(error) => sink.fail(error),
+        })
+    });
+}
+
+fn register_with_factory<F, B>(env: &sema_core::Env, sandbox: &sema_core::Sandbox, make_watcher: F)
+where
+    F: Fn(EventSink) -> notify::Result<B> + Send + Sync + 'static,
+    B: WatchBackend + 'static,
+{
+    let make_watcher = Arc::new(make_watcher);
     let registry = Rc::new(WatchRegistry::new());
     let watch_registry = Rc::clone(&registry);
     let watch_sandbox = sandbox.clone();
@@ -328,8 +372,8 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             watch_sandbox.check(Caps::FS_READ, "fs/watch")?;
             watch_sandbox.check_path(path, "fs/watch")?;
 
-            // Surface the common error (bad path) synchronously; the actual
-            // registration below runs off-thread and can't report back.
+            // Reject a missing path synchronously. Backend startup runs off-thread;
+            // fs/watch-events reports any startup failure and retires the handle.
             if !std::path::Path::new(path).exists() {
                 return Err(SemaError::Io(format!(
                     "fs/watch {path}: no such file or directory"
@@ -342,9 +386,11 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             };
 
             let path = path.to_string();
-            let (rx, dropped, stop_tx) = watch_registry.with_available_handle(|| {
+            let (rx, dropped, failure, stop_tx) = watch_registry.with_available_handle(|| {
                 let lease = watch_registry.capacity.try_acquire()?;
                 let (sink, rx, dropped) = EventSink::bounded(EVENT_QUEUE_CAPACITY);
+                let failure = Arc::clone(&sink.failure);
+                let make_watcher = Arc::clone(&make_watcher);
                 let (stop_tx, stop_rx) = channel::<()>();
                 // Establish the watch on a background thread: a recursive registration
                 // over a large tree (or a filesystem root) can take a long time and must
@@ -364,23 +410,18 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     stop_rx,
                     path.clone(),
                     mode,
-                    |sink| {
-                        notify::recommended_watcher(move |result: notify::Result<Event>| {
-                            if let Ok(event) = result {
-                                sink.send(event);
-                            }
-                        })
-                    },
+                    move |sink| make_watcher(sink),
                 )
                 .map_err(|error| {
                     SemaError::Io(format!("fs/watch {path}: failed to start watcher: {error}"))
                 })?;
-                Ok((rx, dropped, stop_tx))
+                Ok((rx, dropped, failure, stop_tx))
             })?;
 
             let id = watch_registry.insert(Watch {
                 rx,
                 dropped,
+                failure,
                 _stop: stop_tx,
             })?;
             watch_registry.ensure_teardown_hook(ctx);
@@ -450,6 +491,51 @@ mod tests {
     }
 
     #[test]
+    fn fs_watch_public_api_reports_backend_failure_and_retires_handle() {
+        for construction_failure in [true, false] {
+            let env = sema_core::Env::new();
+            register_with_factory(&env, &sema_core::Sandbox::allow_all(), move |_sink| {
+                if construction_failure {
+                    Err(notify::Error::generic("injected construction failure"))
+                } else {
+                    Ok(FakeBackend {
+                        registration_error: Some(notify::Error::generic(
+                            "injected registration failure",
+                        )),
+                        ready: None,
+                        event_sink: None,
+                        dropped: None,
+                    })
+                }
+            });
+            let ctx = sema_core::EvalContext::new();
+            let watch = env.get(sema_core::intern("fs/watch")).unwrap();
+            let events = env.get(sema_core::intern("fs/watch-events")).unwrap();
+            let handle =
+                (watch.as_native_fn_ref().unwrap().func)(&ctx, &[Value::string(".")]).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match (events.as_native_fn_ref().unwrap().func)(&ctx, std::slice::from_ref(&handle))
+                {
+                    Err(error) => {
+                        assert!(error.to_string().contains("injected"), "{error}");
+                        break;
+                    }
+                    Ok(_) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "backend failure was not reported"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+            let retired = (events.as_native_fn_ref().unwrap().func)(&ctx, &[handle]).unwrap_err();
+            assert!(retired.to_string().contains("no such watcher"));
+        }
+    }
+
+    #[test]
     fn fs_watch_worker_capacity_is_bounded_and_released_by_lease_drop() {
         let capacity = Arc::new(WorkerCapacity::new(MAX_WATCH_WORKERS));
         let mut leases = (0..MAX_WATCH_WORKERS)
@@ -483,6 +569,7 @@ mod tests {
             Watch {
                 rx: event_rx,
                 dropped: Arc::new(AtomicUsize::new(0)),
+                failure: Arc::new(Mutex::new(None)),
                 _stop: stop_tx,
             },
         );
@@ -504,6 +591,7 @@ mod tests {
         let watch = Watch {
             rx,
             dropped: Arc::clone(&dropped),
+            failure: Arc::clone(&sink.failure),
             _stop: channel().0,
         };
 
@@ -613,6 +701,7 @@ mod tests {
                 .try_acquire()
                 .expect("worker slot available");
             let (sink, rx, dropped) = EventSink::bounded(EVENT_QUEUE_CAPACITY);
+            let failure = Arc::clone(&sink.failure);
             let (stop_tx, stop_rx) = channel();
             spawn_watch_worker(
                 |job| {
@@ -638,6 +727,7 @@ mod tests {
             Watch {
                 rx,
                 dropped,
+                failure,
                 _stop: stop_tx,
             }
         }
@@ -690,6 +780,7 @@ mod tests {
         let lease = capacity.try_acquire().expect("slot available");
         let registry = WatchRegistry::with_capacity(Arc::clone(&capacity));
         let (sink, rx, dropped) = EventSink::bounded(EVENT_QUEUE_CAPACITY);
+        let failure = Arc::clone(&sink.failure);
         let (stop_tx, stop_rx) = channel();
         let (ready_tx, ready_rx) = channel();
         let (backend_dropped_tx, backend_dropped_rx) = channel();
@@ -725,6 +816,7 @@ mod tests {
             Watch {
                 rx,
                 dropped,
+                failure,
                 _stop: stop_tx,
             },
         );

@@ -5876,9 +5876,9 @@ fn test_define_record_type_record_predicate() {
 }
 
 #[test]
-fn test_define_record_type_mutator_ignored() {
+fn test_define_record_type_mutator_rejected() {
     let interp = Interpreter::new();
-    let result = interp
+    let error = interp
         .eval_str(
             "
         (define-record-type point
@@ -5889,8 +5889,13 @@ fn test_define_record_type_mutator_ignored() {
         (point-x (make-point 7 8))
     ",
         )
-        .unwrap();
-    assert_eq!(result, Value::int(7));
+        .expect_err("immutable records do not accept mutator field specs");
+    assert!(
+        error
+            .to_string()
+            .contains("define-record-type: field spec must be (field accessor)"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

@@ -110,7 +110,8 @@ fn map_traversals_preserve_map_kind_and_support_a_runtime_native_callback() {
 }
 
 #[test]
-fn hashmap_nan_entries_survive_every_async_map_traversal() {
+fn hashmap_nan_values_survive_every_async_map_traversal() {
+    // NaN is a valid value, but not a key: map keys must compare equal to themselves.
     let result = eval(
         r#"
         (let ((out (channel/new 8)))
@@ -120,48 +121,83 @@ fn hashmap_nan_entries_survive_every_async_map_traversal() {
                       (channel/send out value)
                       (async/sleep 1)
                       (+ value 1))
-                    (hashmap/new math/nan 7)))
+                    (hashmap/new :source math/nan)))
                 (filtered
                   (map/filter
                     (fn (key value)
                       (channel/send out value)
                       (async/sleep 1)
                       #t)
-                    (hashmap/new math/nan 7)))
+                    (hashmap/new :source math/nan)))
                 (rekeyed
                   (map/map-keys
                     (fn (key)
                       (channel/send out "key")
                       (async/sleep 1)
                       :safe)
-                    (hashmap/new math/nan 7))))
+                    (hashmap/new :source math/nan))))
             (list
-              (first (vals mapped))
-              (first (vals filtered))
-              (:safe rekeyed)
+              (math/nan? (:source mapped))
+              (math/nan? (:source filtered))
+              (math/nan? (:safe rekeyed))
               (count mapped)
               (count filtered)
               (count rekeyed)
               (list
-                (channel/recv out)
-                (channel/recv out)
+                (math/nan? (channel/recv out))
+                (math/nan? (channel/recv out))
                 (channel/recv out)))))
         "#,
     )
-    .expect("hashmap traversal should not re-lookup non-reflexive keys");
+    .expect("hashmap traversal should preserve NaN values across callback suspension");
 
     assert_eq!(
         result,
         Value::list(vec![
-            Value::int(8),
-            Value::int(7),
-            Value::int(7),
+            Value::bool(true),
+            Value::bool(true),
+            Value::bool(true),
             Value::int(1),
             Value::int(1),
             Value::int(1),
-            Value::list(vec![Value::int(7), Value::int(7), Value::string("key"),]),
+            Value::list(vec![
+                Value::bool(true),
+                Value::bool(true),
+                Value::string("key")
+            ]),
         ])
     );
+}
+
+#[test]
+fn map_keys_rejects_nan_after_callback_suspension_before_later_entries() {
+    for constructor in ["hash-map", "hashmap/new"] {
+        for key in ["math/nan", "[math/nan]"] {
+            let interpreter = Interpreter::new();
+            interpreter.eval_str_compiled("(define seen 0)").unwrap();
+            let source = format!(
+                "(map/map-keys
+                   (fn (key)
+                     (set! seen (+ seen 1))
+                     (async/sleep 1)
+                     {key})
+                   ({constructor} :a 1 :b 2))"
+            );
+            let error = interpreter
+                .eval_str_compiled(&source)
+                .expect_err("NaN must not become a map key after callback suspension");
+            assert!(
+                error.to_string().contains("reflexive map key"),
+                "{constructor} with {key}: {error}"
+            );
+            let seen = interpreter.eval_str_compiled("seen").unwrap();
+            assert_eq!(
+                seen.as_int(),
+                Some(1),
+                "{constructor} with {key}: later callbacks must not run"
+            );
+        }
+    }
 }
 
 #[test]

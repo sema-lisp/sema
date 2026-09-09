@@ -175,6 +175,7 @@ struct RawRequest {
     query: Option<String>,
     body: String,
     content_type_is_json: bool,
+    websocket_upgrade: bool,
 }
 
 /// Raw HTTP response data that is Send-safe for crossing thread boundaries.
@@ -610,7 +611,10 @@ pub fn match_path(pattern: &str, path: &str) -> Option<Vec<(String, String)>> {
     }
 
     let pat_segs = segments(pattern);
-    let path_segs = segments(path);
+    let path_segs = segments(path)
+        .into_iter()
+        .map(decode_path_segment)
+        .collect::<Option<Vec<_>>>()?;
 
     let mut params = Vec::new();
 
@@ -618,12 +622,15 @@ pub fn match_path(pattern: &str, path: &str) -> Option<Vec<(String, String)>> {
         if *pat_seg == "*" {
             // Wildcard: capture the rest of the path from this segment onward
             let rest = if i < path_segs.len() {
-                path_segs[i..].join("/")
+                path_segs[i..]
+                    .iter()
+                    .skip_while(|segment| segment.is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("/")
             } else {
                 String::new()
             };
-            // Strip leading slash that may appear from the join of segments starting with ""
-            let rest = rest.trim_start_matches('/').to_string();
             params.push(("*".to_string(), rest));
             return Some(params);
         }
@@ -648,6 +655,23 @@ pub fn match_path(pattern: &str, path: &str) -> Option<Vec<(String, String)>> {
     }
 
     Some(params)
+}
+
+/// Decode percent escapes within one segment. Splitting before decoding keeps
+/// escaped slashes inside parameter values, and a literal '+' stays a plus.
+fn decode_path_segment(segment: &str) -> Option<String> {
+    let mut decoded = Vec::with_capacity(segment.len());
+    let mut bytes = segment.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let high = char::from(bytes.next()?).to_digit(16)?;
+            let low = char::from(bytes.next()?).to_digit(16)?;
+            decoded.push(((high << 4) | low) as u8);
+        } else {
+            decoded.push(byte);
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 /// Resolves a `:static` route's `Vec<(index, absolute-dir)>` off the VM thread,
@@ -895,6 +919,19 @@ fn dispatch_body(
         if let Some(params) = match_path(pattern, &req_path) {
             // For static routes, resolve the file and return a file marker
             if is_static_route {
+                // Decoded separators must not turn one URL segment into a
+                // filesystem path. Validate before joining decoded captures.
+                let invalid_segment = req_path
+                    .split('/')
+                    .filter_map(decode_path_segment)
+                    .any(|segment| segment.contains(['/', '\\', '\0']));
+                if invalid_segment {
+                    return Ok(NativeOutcome::Return(raw_response(
+                        400,
+                        &[("content-type", "text/plain")],
+                        "Bad Request",
+                    )));
+                }
                 let dir_path = handler.as_str().unwrap_or("");
                 let rel_path = params
                     .iter()
@@ -1303,6 +1340,7 @@ async fn handle_axum_request(
         query,
         body,
         content_type_is_json: body_content_type_is_json,
+        websocket_upgrade: ws_upgrade.is_some(),
     };
 
     // Create oneshot channel for the response
@@ -2179,7 +2217,15 @@ struct ServeSetup {
     on_listen: Option<(Value, Value)>,
 }
 
-/// Parse options, bind + spawn the axum server, and wait for it to come up.
+struct PendingServe {
+    setup: ServeSetup,
+    host_name: String,
+    on_listen: Option<Value>,
+}
+
+type ServeReady = tokio::sync::oneshot::Receiver<Result<u16, String>>;
+
+/// Parse options and start the axum server without waiting for bind readiness.
 ///
 /// Registered as `__http-serve-run`, NOT `http/serve` directly — see
 /// prelude.rs's `http/serve` wrapper for why: `args[0]` is the user's
@@ -2188,10 +2234,9 @@ struct ServeSetup {
 /// persistent — see that doc comment for the leak a cached version of this
 /// had), and `args[2]` is the optional options map.
 ///
-/// The returned setup retains an optional `:on-listen` callback and its info
-/// argument. The value ABI invokes it directly; the runtime ABI yields a
-/// structural `NativeOutcome::Call` before entering the accept loop.
-fn http_serve_setup(args: &[Value]) -> Result<ServeSetup, SemaError> {
+/// Each ABI waits for readiness separately. The runtime ABI parks the task,
+/// then calls `:on-listen` before entering the accept loop.
+fn http_serve_setup(args: &[Value]) -> Result<(PendingServe, ServeReady), SemaError> {
     // `http/serve`'s sync dispatch path below runs its own blocking accept
     // loop on THIS thread (`rx.blocking_recv()`) for the life of the server —
     // by design at top level, where it's the only thing this thread will ever
@@ -2252,9 +2297,8 @@ fn http_serve_setup(args: &[Value]) -> Result<ServeSetup, SemaError> {
     let (lifecycle_tx, lifecycle_rx) =
         tokio::sync::mpsc::unbounded_channel::<Arc<ServeRequestLifecycle>>();
 
-    // Create a std sync channel for the ready signal, carrying the port the
-    // server actually bound to (may differ from `port` when fallback kicks in).
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u16, String>>();
+    // Carry the actual bound port without blocking the runtime's VM thread.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<u16, String>>();
 
     let bind_host = host.clone();
     let bind_port = port;
@@ -2320,25 +2364,38 @@ fn http_serve_setup(args: &[Value]) -> Result<ServeSetup, SemaError> {
     });
     let host_guard = ServerHostGuard::new(abort);
 
-    // Wait for the ready signal (carrying the actual bound port) from the thread
-    let actual_port = match ready_rx.recv() {
-        Ok(Ok(p)) => p,
-        Ok(Err(e)) => {
-            return Err(SemaError::Io(e));
-        }
-        Err(_) => {
-            return Err(SemaError::eval(
-                "http/serve: server thread died before binding",
-            ));
-        }
-    };
+    Ok((
+        PendingServe {
+            setup: ServeSetup {
+                handler,
+                factory,
+                receivers: ServeReceivers {
+                    requests: request_rx,
+                    lifecycle: lifecycle_rx,
+                },
+                host: host_guard,
+                on_listen: None,
+            },
+            host_name: host,
+            on_listen,
+        },
+        ready_rx,
+    ))
+}
+
+fn finish_serve_setup(pending: PendingServe, actual_port: u16) -> ServeSetup {
+    let PendingServe {
+        mut setup,
+        host_name: host,
+        on_listen,
+    } = pending;
 
     eprintln!("Listening on {host}:{actual_port}");
 
     // Hand the caller the address actually bound (host/port may differ from the
     // request when :port-fallback picked the next free port) so it can print a
     // URL or open a browser.
-    let on_listen = on_listen.map(|callback| {
+    setup.on_listen = on_listen.map(|callback| {
         let mut info = BTreeMap::new();
         info.insert(Value::keyword("host"), Value::string(&host));
         info.insert(Value::keyword("port"), Value::int(actual_port as i64));
@@ -2349,16 +2406,7 @@ fn http_serve_setup(args: &[Value]) -> Result<ServeSetup, SemaError> {
         (callback, Value::map(info))
     });
 
-    Ok(ServeSetup {
-        handler,
-        factory,
-        receivers: ServeReceivers {
-            requests: request_rx,
-            lifecycle: lifecycle_rx,
-        },
-        host: host_guard,
-        on_listen,
-    })
+    setup
 }
 
 /// Legacy/non-quantum dispatch path: serially drains `rx` on this thread. Used
@@ -2371,13 +2419,18 @@ fn http_serve_setup(args: &[Value]) -> Result<ServeSetup, SemaError> {
 fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value, SemaError> {
     use sema_core::call_callback;
 
+    let (pending, ready) = http_serve_setup(args)?;
+    let port = ready
+        .blocking_recv()
+        .map_err(|_| SemaError::eval("http/serve: server task ended before binding"))?
+        .map_err(SemaError::Io)?;
     let ServeSetup {
         handler,
         factory: _,
         receivers,
         host,
         on_listen,
-    } = http_serve_setup(args)?;
+    } = finish_serve_setup(pending, port);
     let _host = host;
     if let Some((callback, info)) = on_listen {
         if let Err(error) = call_callback(ctx, &callback, &[info]) {
@@ -2420,7 +2473,11 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
                         if is_stream_response(&response_val) {
                             handle_sse_response(ctx, &response_val, respond);
                         } else if is_websocket_response(&response_val) {
-                            handle_ws_response(ctx, &response_val, respond);
+                            if raw.websocket_upgrade {
+                                handle_ws_response(ctx, &response_val, respond);
+                            } else {
+                                let _ = respond.send(websocket_upgrade_required());
+                            }
                         } else if is_file_response(&response_val) {
                             handle_file_response(&response_val, respond);
                         } else {
@@ -2476,6 +2533,14 @@ struct ServeLoopState {
 
 type ServeLoopStateRef = std::rc::Rc<ServeLoopState>;
 
+fn websocket_upgrade_required() -> ServerResponse {
+    ServerResponse::Raw(RawResponse {
+        status: 400,
+        headers: vec![("content-type".to_string(), "text/plain".to_string())],
+        body: "WebSocket upgrade required".to_string(),
+    })
+}
+
 /// Build the per-request `responder` native: consumes the handler's return
 /// value exactly once and routes it to the connection's `respond` channel —
 /// the same raw/SSE/WebSocket/file dispatch the legacy serial loop did inline
@@ -2504,6 +2569,7 @@ type ServeLoopStateRef = std::rc::Rc<ServeLoopState>;
 fn make_responder_native(
     respond: tokio::sync::oneshot::Sender<ServerResponse>,
     lifecycle: Arc<ServeRequestLifecycle>,
+    websocket_upgrade: bool,
 ) -> Value {
     use sema_core::runtime::NativeResult;
     use sema_core::NativeFn;
@@ -2526,7 +2592,11 @@ fn make_responder_native(
             if is_stream_response(response_val) {
                 handle_sse_response(ctx, response_val, respond);
             } else if is_websocket_response(response_val) {
-                handle_ws_response(ctx, response_val, respond);
+                if websocket_upgrade {
+                    handle_ws_response(ctx, response_val, respond);
+                } else {
+                    let _ = respond.send(websocket_upgrade_required());
+                }
             } else if is_file_response(response_val) {
                 handle_file_response(response_val, respond);
             } else {
@@ -2543,6 +2613,10 @@ fn make_responder_native(
                 SemaError::eval("http/serve: internal: handler response already sent")
             })?;
             if is_websocket_response(&response_val) {
+                if !websocket_upgrade {
+                    let _ = respond.send(websocket_upgrade_required());
+                    return Ok(NativeOutcome::Return(Value::nil()));
+                }
                 return handle_ws_response_runtime(&response_val, respond);
             }
             if is_stream_response(&response_val) {
@@ -2684,7 +2758,11 @@ impl sema_core::runtime::NativeContinuation for AcceptLoopContinuation {
                             })
                             .or_insert(RequestOwner::AwaitingPromise { disconnected });
                         let request_val = raw_request_to_value(&raw);
-                        let responder_val = make_responder_native(respond, Arc::clone(&lifecycle));
+                        let responder_val = make_responder_native(
+                            respond,
+                            Arc::clone(&lifecycle),
+                            raw.websocket_upgrade,
+                        );
                         Ok(NativeOutcome::Call(NativeCall {
                             callable: self.factory.clone(),
                             args: vec![self.handler.clone(), request_val, responder_val],
@@ -2938,7 +3016,74 @@ impl sema_core::runtime::NativeContinuation for OnListenContinuation {
 }
 
 fn http_serve_runtime_impl(args: &[Value]) -> sema_core::runtime::NativeResult {
-    let mut setup = http_serve_setup(args)?;
+    let (pending, ready) = http_serve_setup(args)?;
+    wait_for_serve_ready(pending, ready)
+}
+
+const SERVE_BIND_COMPLETION_KIND: u64 = 0x7376_6264;
+
+fn wait_for_serve_ready(
+    pending: PendingServe,
+    ready: ServeReady,
+) -> sema_core::runtime::NativeResult {
+    let kind = sema_core::runtime::CompletionKind::try_from_raw(SERVE_BIND_COMPLETION_KIND)
+        .expect("http/serve bind completion kind is nonzero");
+    crate::runtime_offload::external_io_async_try_with_continuation(
+        "http/serve",
+        kind,
+        "http/serve/bind",
+        |port: u16| Ok(Value::int(i64::from(port))),
+        Box::new(BindContinuation { pending }),
+        move || async move {
+            ready
+                .await
+                .map_err(|_| "http/serve: server task ended before binding".to_string())?
+        },
+    )
+}
+
+struct BindContinuation {
+    pending: PendingServe,
+}
+
+impl sema_core::runtime::Trace for BindContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        sink(sema_core::cycle::GcEdge::Value(&self.pending.setup.handler));
+        sink(sema_core::cycle::GcEdge::Value(&self.pending.setup.factory));
+        if let Some(callback) = &self.pending.on_listen {
+            sink(sema_core::cycle::GcEdge::Value(callback));
+        }
+        true
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for BindContinuation {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::ResumeInput;
+        match input {
+            ResumeInput::Returned(value) => {
+                let port = value
+                    .as_int()
+                    .and_then(|port| u16::try_from(port).ok())
+                    .ok_or_else(|| SemaError::eval("http/serve: invalid bind completion"))?;
+                notify_runtime_serve(finish_serve_setup(self.pending, port))
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "http/serve: binding was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "http/serve: binding received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+fn notify_runtime_serve(mut setup: ServeSetup) -> sema_core::runtime::NativeResult {
     let Some((callback, info)) = setup.on_listen.take() else {
         return start_runtime_serve(setup);
     };
@@ -2952,6 +3097,159 @@ fn http_serve_runtime_impl(args: &[Value]) -> sema_core::runtime::NativeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bind_readiness_parks_and_retains_callbacks_until_drop() {
+        let aborts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let aborts_from_hook = aborts.clone();
+        let mut setup = empty_serve_setup(Value::string("handler"), Value::string("factory"));
+        setup.host = ServerHostGuard::new(Box::new(move || {
+            aborts_from_hook.fetch_add(1, Ordering::SeqCst);
+        }));
+        let pending = PendingServe {
+            setup,
+            host_name: "127.0.0.1".into(),
+            on_listen: Some(Value::string("on-listen")),
+        };
+        // Keep readiness unsignalled: building the native result must not wait.
+        let (_ready_tx, ready) = tokio::sync::oneshot::channel();
+        let outcome = wait_for_serve_ready(pending, ready).unwrap();
+        let continuation = take_server_ws_external_continuation(outcome);
+        let mut edges = 0;
+        assert!(continuation.trace(&mut |edge| {
+            if matches!(edge, sema_core::cycle::GcEdge::Value(_)) {
+                edges += 1;
+            }
+        }));
+        assert_eq!(edges, 3);
+        assert_eq!(aborts.load(Ordering::SeqCst), 0);
+        drop(continuation);
+        assert_eq!(aborts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn plain_http_requests_cannot_supply_websocket_upgrade_validity() {
+        for method in ["GET", "HEAD"] {
+            let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(1);
+            let (lifecycle_tx, _lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+            let request = axum::extract::Request::builder()
+                .method(method)
+                .uri("/ws")
+                .header("upgrade", "websocket")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let task = tokio::spawn(handle_axum_request(None, request, request_tx, lifecycle_tx));
+            let ServerRequest::Http {
+                raw,
+                respond,
+                lifecycle,
+            } = request_rx.recv().await.unwrap();
+            assert!(!raw.websocket_upgrade);
+            let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let handler_calls = calls.clone();
+            let handler =
+                Value::native_fn(sema_core::NativeFn::simple("ws-test-handler", move |_| {
+                    handler_calls.set(handler_calls.get() + 1);
+                    Ok(Value::nil())
+                }));
+            let response = Value::map(BTreeMap::from([
+                (Value::keyword("__websocket"), Value::bool(true)),
+                (Value::keyword("__ws_handler"), handler),
+            ]));
+            let responder = make_responder_native(respond, lifecycle, raw.websocket_upgrade);
+            (responder.as_native_fn_ref().unwrap().func)(
+                &sema_core::EvalContext::new(),
+                &[response],
+            )
+            .unwrap();
+            assert_eq!(calls.get(), 0);
+            assert_eq!(task.await.unwrap().status(), 400);
+        }
+    }
+
+    #[test]
+    fn websocket_responder_rejects_requests_without_upgrade_before_handler() {
+        use sema_core::runtime::{CancellationView, NativeCallContext, TaskContextHandle};
+        for runtime_abi in [false, true] {
+            let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+            let calls_handler = calls.clone();
+            let handler =
+                Value::native_fn(sema_core::NativeFn::simple("ws-test-handler", move |_| {
+                    calls_handler.set(calls_handler.get() + 1);
+                    Ok(Value::nil())
+                }));
+            let response = Value::map(BTreeMap::from([
+                (Value::keyword("__websocket"), Value::bool(true)),
+                (Value::keyword("__ws_handler"), handler.clone()),
+            ]));
+            let ctx = sema_core::EvalContext::new();
+            let mut native_context = NativeCallContext {
+                hof_host: None,
+                eval_context: &ctx,
+                task_context: TaskContextHandle::default(),
+                call_env: None,
+                cancellation: CancellationView::default(),
+            };
+            let (lifecycle_tx, _lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+            let lifecycle = ServeRequestLifecycle::new(ServeRequestId(1), lifecycle_tx);
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            let responder = make_responder_native(tx, lifecycle.clone(), false);
+            let native = responder.as_native_fn_ref().unwrap();
+            if runtime_abi {
+                let result = native
+                    .invoke_runtime(&mut native_context, std::slice::from_ref(&response))
+                    .unwrap();
+                assert!(matches!(result, NativeOutcome::Return(_)));
+            } else {
+                (native.func)(&ctx, std::slice::from_ref(&response)).unwrap();
+            }
+            assert_eq!(calls.get(), 0);
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(ServerResponse::Raw(RawResponse { status: 400, .. }))
+            ));
+
+            // A validated upgrade still produces the handler call in the runtime ABI.
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            let responder = make_responder_native(tx, lifecycle, true);
+            let result = responder
+                .as_native_fn_ref()
+                .unwrap()
+                .invoke_runtime(&mut native_context, &[response])
+                .unwrap();
+            let NativeOutcome::Call(call) = result else {
+                panic!("valid upgrade must call the handler");
+            };
+            assert_eq!(call.callable, handler);
+            assert!(matches!(
+                rx.try_recv(),
+                Ok(ServerResponse::WebSocket { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn path_segments_decode_without_changing_route_boundaries() {
+        assert_eq!(
+            match_path("/search/:q", "/search/hello%20world"),
+            Some(vec![("q".into(), "hello world".into())])
+        );
+        assert_eq!(
+            match_path("/search/:q", "/search/a+b"),
+            Some(vec![("q".into(), "a+b".into())])
+        );
+        assert_eq!(
+            match_path("/search/:q", "/search/a%2Fb"),
+            Some(vec![("q".into(), "a/b".into())])
+        );
+        assert!(match_path("/search/:q/:extra", "/search/a%2Fb").is_none());
+        assert_eq!(
+            match_path("/search/:q", "/search/%C3%A9"),
+            Some(vec![("q".into(), "é".into())])
+        );
+        assert!(match_path("/hello world", "/hello%20world").is_some());
+        assert!(match_path("/search/:q", "/search/%FF").is_none());
+    }
 
     fn empty_serve_loop_state() -> ServeLoopStateRef {
         std::rc::Rc::new(ServeLoopState {

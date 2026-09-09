@@ -925,6 +925,60 @@ fn test_http_file_nonexistent() {
 }
 
 #[test]
+fn static_route_decodes_filenames_without_changing_path_boundaries() {
+    struct ScratchDirectory(std::path::PathBuf);
+    impl Drop for ScratchDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tmp = ScratchDirectory(
+        std::env::temp_dir().join(format!("sema-static-decode-{}-{stamp}", std::process::id())),
+    );
+    std::fs::create_dir(&tmp.0).unwrap();
+    let filename = "hello world+é.txt";
+    std::fs::write(tmp.0.join(filename), "hello").unwrap();
+    let interp = Interpreter::new();
+    interp
+        .eval_str(&format!(
+            r#"(define router (http/router [[:static "/assets" "{}"]]))"#,
+            crate::common::sema_path(&tmp.0),
+        ))
+        .unwrap();
+    let value = interp
+        .eval_str(r#"(router {:method :get :path "/assets/hello%20world+%C3%A9.txt"})"#)
+        .unwrap();
+    let map = value.as_map_rc().unwrap();
+    assert_eq!(map.get(&Value::keyword("__file")), Some(&Value::bool(true)));
+    let resolved = map
+        .get(&Value::keyword("__file_path"))
+        .unwrap()
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        std::path::Path::new(resolved),
+        tmp.0.join(filename).canonicalize().unwrap()
+    );
+    for path in [
+        "/assets/a%2Fb.txt",
+        "/assets/a%5Cb.txt",
+        "/assets/a%00b.txt",
+    ] {
+        let value = interp
+            .eval_str(&format!(r#"(router {{:method :get :path "{path}"}})"#))
+            .unwrap();
+        assert_eq!(
+            value.as_map_rc().unwrap().get(&Value::keyword("status")),
+            Some(&Value::int(400))
+        );
+    }
+}
+
+#[test]
 fn test_http_router_static_route() {
     // Create a temp directory with a test file
     let tmp = std::env::temp_dir().join("sema-static-route-test");

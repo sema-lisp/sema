@@ -213,13 +213,34 @@ fn encode_jmp(map: &BTreeMap<Value, Value>, labels: &HashMap<String, u8>) -> Res
 }
 
 fn encode_wait(map: &BTreeMap<Value, Value>) -> Result<u8, SemaError> {
-    let polarity = get_int_field(map, "polarity")? as u8;
+    let polarity = get_int_field(map, "polarity")?;
     let source_kw = get_keyword_field(map, "source")?;
     let source = wait_source(&source_kw)?;
-    let index = get_int_field(map, "index")? as u8;
+    let index = get_int_field(map, "index")?;
     let rel = get_optional_bool_field(map, "rel")?.unwrap_or(false);
+    validate_wait(polarity, &source_kw, index, rel)?;
+    let index = index as u8;
     let idx = if rel { index | 0x10 } else { index & 0x1F };
-    Ok((polarity << 7) | (source << 5) | idx)
+    Ok(((polarity as u8) << 7) | (source << 5) | idx)
+}
+
+fn validate_wait(polarity: i64, source: &str, index: i64, rel: bool) -> Result<(), SemaError> {
+    wait_source(source)?;
+    if !(0..=1).contains(&polarity) {
+        return Err(SemaError::eval(format!(
+            "pio/wait: polarity must be 0 or 1, got {polarity}"
+        )));
+    }
+    if rel && source != "irq" {
+        return Err(SemaError::eval("pio/wait: :rel is only valid for IRQ"));
+    }
+    let max_index = if source == "irq" { 7 } else { 31 };
+    if !(0..=max_index).contains(&index) {
+        return Err(SemaError::eval(format!(
+            "pio/wait: index {index} out of range 0..{max_index} for :{source}"
+        )));
+    }
+    Ok(())
 }
 
 fn encode_in(map: &BTreeMap<Value, Value>) -> Result<u8, SemaError> {
@@ -321,6 +342,12 @@ fn encode_instruction(
     let delay = get_optional_int_field(map, "delay")?.unwrap_or(0);
     let side_set_val = get_optional_int_field(map, "side-set")?;
     let side_set = side_set_val.unwrap_or(0);
+
+    if side_set_val.is_some() && side_set_bits == 0 {
+        return Err(SemaError::eval(
+            "pio/assemble: side-set operand requires configured side-set bits",
+        ));
+    }
 
     let max_delay = (1u16 << delay_bits) - 1;
     if delay < 0 || delay > max_delay as i64 {
@@ -543,19 +570,9 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "pio/wait", |args| {
         check_arity!(args, "pio/wait", 3..=4);
         let polarity = args.int_at(0, "pio/wait")?;
-        if polarity != 0 && polarity != 1 {
-            return Err(SemaError::eval(format!(
-                "pio/wait: polarity must be 0 or 1, got {polarity}"
-            )));
-        }
         let source = args.keyword_at(1, "pio/wait")?;
-        wait_source(&source)?;
         let index = args.int_at(2, "pio/wait")?;
-        if !(0..=31).contains(&index) {
-            return Err(SemaError::eval(format!(
-                "pio/wait: index {index} out of range 0..31"
-            )));
-        }
+        validate_wait(polarity, &source, index, args.len() == 4)?;
         let mut fields: Vec<(&str, Value)> = vec![
             ("polarity", Value::int(polarity)),
             ("source", Value::keyword(&source)),

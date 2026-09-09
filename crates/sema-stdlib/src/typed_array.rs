@@ -32,6 +32,53 @@ fn array_length(arg: &Value, op: &str) -> Result<usize, SemaError> {
     Ok(n as usize)
 }
 
+const F64_RANGE_MAX_LEN: usize = 8 * 1024 * 1024;
+
+fn f64_range(start: f64, end: f64, step: f64) -> Result<Vec<f64>, SemaError> {
+    if !start.is_finite() || !end.is_finite() || !step.is_finite() {
+        return Err(SemaError::eval("f64-array/range: arguments must be finite"));
+    }
+    if step == 0.0 {
+        return Err(SemaError::eval("f64-array/range: step cannot be zero"));
+    }
+    let in_range = |value| if step > 0.0 { value < end } else { value > end };
+    if !in_range(start) {
+        return Ok(Vec::new());
+    }
+    if start + step == start {
+        return Err(SemaError::eval("f64-array/range: step makes no progress"));
+    }
+    let count = ((end - start) / step).ceil();
+    if !count.is_finite() || count > F64_RANGE_MAX_LEN as f64 {
+        return Err(SemaError::eval(format!(
+            "f64-array/range: length exceeds maximum {F64_RANGE_MAX_LEN}"
+        )));
+    }
+    let mut data = Vec::new();
+    data.try_reserve_exact(count as usize)
+        .map_err(|e| SemaError::eval(format!("f64-array/range: allocation failed: {e}")))?;
+    let mut value = start;
+    while in_range(value) {
+        // Repeated addition can produce more items than the rounded estimate.
+        if data.len() == F64_RANGE_MAX_LEN {
+            return Err(SemaError::eval(format!(
+                "f64-array/range: length exceeds maximum {F64_RANGE_MAX_LEN}"
+            )));
+        }
+        if data.len() == data.capacity() {
+            data.try_reserve_exact(1)
+                .map_err(|e| SemaError::eval(format!("f64-array/range: allocation failed: {e}")))?;
+        }
+        data.push(value);
+        let next = value + step;
+        if next == value {
+            return Err(SemaError::eval("f64-array/range: step makes no progress"));
+        }
+        value = next;
+    }
+    Ok(data)
+}
+
 pub fn register(env: &sema_core::Env) {
     // (f64-array/make n) or (f64-array/make n fill) — create f64 array
     register_fn(env, "f64-array/make", |args| {
@@ -335,24 +382,7 @@ pub fn register(env: &sema_core::Env) {
         } else {
             1.0
         };
-        if step == 0.0 {
-            return Err(SemaError::eval("f64-array/range: step cannot be zero"));
-        }
-        let n = ((end - start) / step).ceil().max(0.0) as usize;
-        let mut data = Vec::with_capacity(n);
-        let mut v = start;
-        if step > 0.0 {
-            while v < end {
-                data.push(v);
-                v += step;
-            }
-        } else {
-            while v > end {
-                data.push(v);
-                v += step;
-            }
-        }
-        Ok(Value::f64_array(data))
+        Ok(Value::f64_array(f64_range(start, end, step)?))
     });
 
     // (i64-array/range start end) — integer range as array
@@ -374,12 +404,18 @@ pub fn register(env: &sema_core::Env) {
         if step > 0 {
             while v < end {
                 data.push(v);
-                v += step;
+                let Some(next) = v.checked_add(step) else {
+                    break;
+                };
+                v = next;
             }
         } else {
             while v > end {
                 data.push(v);
-                v += step;
+                let Some(next) = v.checked_add(step) else {
+                    break;
+                };
+                v = next;
             }
         }
         Ok(Value::i64_array(data))

@@ -932,7 +932,7 @@ impl NativeContinuation for SortByContinuation {
             }
             None => {
                 let mut keyed = std::mem::take(&mut self.keyed);
-                keyed.sort_by(|(ka, _), (kb, _)| ka.cmp(kb));
+                keyed.sort_by(|(ka, _), (kb, _)| sort_key_ordering(ka, kb));
                 let result: Vec<Value> = keyed.into_iter().map(|(_, v)| v).collect();
                 Ok(NativeOutcome::Return(Value::list(result)))
             }
@@ -1191,6 +1191,7 @@ impl NativeContinuation for KeyProjectionContinuation {
         input: ResumeInput,
     ) -> NativeResult {
         let key = resume_value(input, self.hof)?;
+        crate::map::check_map_key(&key, self.hof)?;
         let item = std::mem::replace(&mut self.current, Value::nil());
         self.mode.accept(key, item);
         self.continue_or_finish()
@@ -1781,28 +1782,27 @@ fn sort_default(mut items: Vec<Value>) -> Result<Value, SemaError> {
             );
         }
     }
-    // All-number lists compare by numeric value. `Value`'s `Ord` orders every
-    // int before every float regardless of magnitude; `cmp_real` instead spans
-    // the real tower exactly, with NaN values ordered after non-NaN values.
-    if matches!(items.first().map(sort_category), Some(SortCategory::Number)) {
-        items.sort_by(|a, b| {
-            let x = a.as_number().expect("number category checked");
-            let y = b.as_number().expect("number category checked");
-            x.cmp_real(&y).unwrap_or_else(|| {
-                let x_nan = matches!(x, SemaNumber::Real(f) if f.is_nan());
-                let y_nan = matches!(y, SemaNumber::Real(f) if f.is_nan());
-                match (x_nan, y_nan) {
-                    (true, true) => std::cmp::Ordering::Equal,
-                    (true, false) => std::cmp::Ordering::Greater,
-                    (false, true) => std::cmp::Ordering::Less,
-                    (false, false) => std::cmp::Ordering::Equal,
-                }
-            })
-        });
-    } else {
-        items.sort();
-    }
+    items.sort_by(sort_key_ordering);
     Ok(Value::list(items))
+}
+
+fn sort_key_ordering(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (
+        a.as_number().filter(SemaNumber::is_real),
+        b.as_number().filter(SemaNumber::is_real),
+    ) {
+        (Some(x), Some(y)) => x.cmp_real(&y).unwrap_or_else(|| {
+            let x_nan = matches!(x, SemaNumber::Real(f) if f.is_nan());
+            let y_nan = matches!(y, SemaNumber::Real(f) if f.is_nan());
+            x_nan.cmp(&y_nan)
+        }),
+        // All real types occupy the integer rank relative to other types.
+        // Keeping separate rational/float ranks here would make comparisons
+        // non-transitive when sort-by keys include both numbers and other values.
+        (Some(_), None) => Value::int(0).cmp(b),
+        (None, Some(_)) => a.cmp(&Value::int(0)),
+        (None, None) => a.cmp(b),
+    }
 }
 
 fn sort_legacy(args: &[Value]) -> Result<Value, SemaError> {
@@ -2644,6 +2644,7 @@ pub fn register(env: &sema_core::Env) {
         let items = get_sequence(&args[0], "frequencies")?;
         let mut counts: std::collections::BTreeMap<Value, i64> = std::collections::BTreeMap::new();
         for item in items.iter() {
+            crate::map::check_map_key(item, "frequencies")?;
             *counts.entry(item.clone()).or_insert(0) += 1;
         }
         let map: std::collections::BTreeMap<Value, Value> = counts

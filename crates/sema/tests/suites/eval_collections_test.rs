@@ -85,6 +85,10 @@ eval_tests! {
     list_sort_mixed_numbers: "(sort (list 3 1.5 2))" => common::eval("'(1.5 2 3)"),
     list_sort_strings: r#"(sort (list "banana" "apple" "cherry"))"# => common::eval(r#"'("apple" "banana" "cherry")"#),
     list_sort_by: "(sort-by (fn (x) (- 0 x)) '(3 1 2))" => common::eval("'(3 2 1)"),
+    list_sort_by_mixed_numbers: "(sort-by (fn (x) x) (list 10 2.0 3/2 -1))" => common::eval("'(-1 3/2 2.0 10)"),
+    list_sort_by_numeric_stability: "(map (fn (x) (nth x 1)) (sort-by first '((2.0 :a) (1 :b) (2 :c) (4/2 :d))))" => common::eval("'(:b :a :c :d)"),
+    list_sort_by_mixed_key_categories: "(sort-by (fn (x) x) (list :z 2/3 0.5 1 :a))" => common::eval("'(0.5 2/3 1 :a :z)"),
+    list_sort_by_nan_last: "(map math/nan? (sort-by (fn (x) x) (list math/nan 1 0.5 math/nan)))" => common::eval("'(#f #f #t #t)"),
     list_flatten: "(flatten '(1 (2 3) (4 5)))" => common::eval("'(1 2 3 4 5)"),
     list_flatten_deep: "(flatten-deep '(1 (2 3) (4 (5))))" => common::eval("'(1 2 3 4 5)"),
     list_zip: "(zip '(1 2 3) '(4 5 6))" => common::eval("'((1 4) (2 5) (3 6))"),
@@ -586,6 +590,14 @@ eval_tests! {
     freq_empty: "(length (keys (frequencies '())))" => Value::int(0),
     freq_all_same: "(hashmap/get (frequencies '(5 5 5)) 5)" => Value::int(3),
     freq_count_keys: "(length (keys (frequencies '(1 2 2 3 3 3))))" => Value::int(3),
+}
+
+eval_error_tests! {
+    freq_rejects_nan: "(frequencies (list math/nan))" => "reflexive map key",
+    freq_rejects_nested_nan: "(frequencies (list [math/nan]))" => "reflexive map key",
+    freq_rejects_mutable_key: "(frequencies (list (mutable-cell/new 1)))" => "immutable map key",
+    freq_rejects_mutable_array_key: "(frequencies (list (mutable-array/new 1 1)))" => "immutable map key",
+    freq_rejects_nested_mutable_key: "(frequencies (list [(mutable-array/new)]))" => "immutable map key",
 }
 
 // ============================================================

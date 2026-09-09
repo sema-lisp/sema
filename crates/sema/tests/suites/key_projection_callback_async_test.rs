@@ -8,6 +8,13 @@ fn eval(source: &str) -> Result<Value, sema_core::SemaError> {
 }
 
 #[test]
+fn sort_by_suspending_keys_use_numeric_order() {
+    let result = eval("(sort-by (fn (x) (async/sleep 1) x) (list 10 2.0 3/2 -1))")
+        .expect("sort-by key collection may suspend");
+    assert_eq!(result, eval("'(-1 3/2 2.0 10)").unwrap());
+}
+
+#[test]
 fn group_by_callback_suspends_and_preserves_group_order() {
     let result = eval(
         r#"
@@ -108,34 +115,53 @@ fn key_projectors_support_a_direct_runtime_native_callback() {
 }
 
 #[test]
-fn key_projectors_preserve_nan_key_collision_semantics() {
+fn key_projectors_reject_invalid_keys_before_later_callbacks() {
+    for projector in ["list/group-by", "list/key-by"] {
+        for suspension in ["", "(async/sleep 1)"] {
+            for (key, expected_error) in [
+                ("math/nan", "reflexive map key"),
+                ("[math/nan]", "reflexive map key"),
+                ("(mutable-cell/new 1)", "immutable map key"),
+                ("[(mutable-array/new)]", "immutable map key"),
+            ] {
+                let interp = Interpreter::new();
+                let source = format!(
+                    "(define seen 0)
+                     ({projector} (fn (item)
+                       (set! seen (+ seen 1)) {suspension} {key}) (list 1 2))"
+                );
+                let error = interp
+                    .eval_str_compiled(&source)
+                    .expect_err("invalid map keys must be rejected");
+                assert!(
+                    error.to_string().contains(expected_error),
+                    "{source}: {error}"
+                );
+                assert_eq!(interp.eval_str_compiled("seen").unwrap(), Value::int(1));
+            }
+        }
+    }
+}
+
+#[test]
+fn key_projectors_preserve_nan_items_with_valid_keys() {
     let result = eval(
         r#"
-        (let ((grouped
-                (list/group-by
-                  (fn (item) (async/sleep 1) math/nan)
-                  (list 1 2)))
-              (keyed
-                (list/key-by
-                  (fn (item) (async/sleep 1) math/nan)
-                  (list 1 2))))
-          (list
-            (count grouped)
-            (first (vals grouped))
-            (count keyed)
-            (first (vals keyed))))
+        (let ((grouped (list/group-by
+                         (fn (item) (async/sleep 1) :key)
+                         (list math/nan math/nan)))
+              (keyed (list/key-by
+                       (fn (item) (async/sleep 1) :key)
+                       (list math/nan))))
+          (list (count (:key grouped))
+                (every? math/nan? (:key grouped))
+                (math/nan? (:key keyed))))
         "#,
     )
-    .expect("NaN keys should follow the legacy explicit-insertion path");
-
+    .expect("NaN items are valid when their projected keys are valid");
     assert_eq!(
         result,
-        Value::list(vec![
-            Value::int(1),
-            Value::list(vec![Value::int(2)]),
-            Value::int(1),
-            Value::int(2),
-        ])
+        Value::list(vec![Value::int(2), Value::bool(true), Value::bool(true)])
     );
 }
 

@@ -1276,6 +1276,25 @@ eval_tests! {
 }
 
 eval_error_tests! {
+    // PIO validation applies to builders and direct instruction maps.
+    f64_range_rejects_non_progress: "(f64-array/range 9007199254740992.0 9007199254740994.0 1.0)" => "no progress",
+    f64_range_rejects_later_non_progress: "(f64-array/range 9007199254740991.0 9007199254740994.0 1.0)" => "no progress",
+    f64_range_rejects_non_finite: "(f64-array/range 0 math/infinity 1)" => "finite",
+    f64_range_rejects_nan: "(f64-array/range math/nan 1 1)" => "finite",
+    f64_range_rejects_oversize: "(f64-array/range 0 8388609 1)" => "exceeds maximum",
+    make_bytevector_rejects_oversize: "(make-bytevector 67108865)" => "exceeds maximum",
+    make_bytevector_rejects_unrepresentable: "(make-bytevector 9223372036854775807)" => "exceeds maximum",
+
+    pio_side_requires_configuration: "(pio/assemble (list (pio/side 1 (pio/nop))))" => "side-set bits",
+    pio_side_rejects_zero_bits: "(pio/assemble (list (pio/side 0 (pio/nop))) {:side-set-bits 0})" => "side-set bits",
+    pio_wait_gpio_rejects_rel: "(pio/wait 1 :gpio 2 :rel)" => "only valid for IRQ",
+    pio_wait_pin_rejects_rel: "(pio/wait 1 :pin 2 :rel)" => "only valid for IRQ",
+    pio_wait_irq_rejects_large_index: "(pio/wait 1 :irq 8)" => "0..7",
+    pio_wait_map_rejects_rel: "(pio/assemble (list {:op :wait :polarity 1 :source :gpio :index 2 :rel #t}))" => "only valid for IRQ",
+    pio_wait_map_rejects_large_irq: "(pio/assemble (list {:op :wait :polarity 1 :source :irq :index 8}))" => "0..7",
+    pio_wait_map_rejects_negative_index: "(pio/assemble (list {:op :wait :polarity 1 :source :pin :index -1}))" => "0..31",
+    pio_wait_map_rejects_polarity: "(pio/assemble (list {:op :wait :polarity 2 :source :gpio :index 2}))" => "polarity",
+
     // & without rest pattern name
     destructure_err_amp_no_rest: "(let (([a &] '(1 2))) a)" => "`&` must be followed by a rest pattern",
 
@@ -1356,6 +1375,8 @@ eval_tests! {
     // f64-array: range
     f64_array_range: "(f64-array/length (f64-array/range 0 5))" => Value::int(5),
     f64_array_range_sum: "(f64-array/sum (f64-array/range 1 4))" => Value::float(6.0),
+    f64_array_range_descending: "(f64-array/range 1 0 -0.25)" => Value::f64_array(vec![1.0, 0.75, 0.5, 0.25]),
+    f64_array_range_wrong_direction: "(f64-array/range 1 0 0.25)" => Value::f64_array(vec![]),
 
     // i64-array: make + ref
     i64_array_make_and_ref: "(i64-array/ref (i64-array/make 3 7) 2)" => Value::int(7),
@@ -1399,6 +1420,10 @@ eval_tests! {
     i64_array_range_negative_step_last: "(i64-array/ref (i64-array/range 5 0 -1) 4)" => Value::int(1),
     // Negative step with start < end → empty
     i64_array_range_negative_step_empty: "(i64-array/length (i64-array/range 0 5 -1))" => Value::int(0),
+    i64_array_range_upper_bound: "(i64-array/range 9223372036854775806 9223372036854775807 2)" => Value::i64_array(vec![i64::MAX - 1]),
+    i64_array_range_lower_bound: "(i64-array/range -9223372036854775807 -9223372036854775808 -2)" => Value::i64_array(vec![i64::MIN + 1]),
+    i64_array_range_max_step: "(i64-array/range 1 9223372036854775807 9223372036854775807)" => Value::i64_array(vec![1]),
+    i64_array_range_min_step: "(i64-array/range -1 -9223372036854775808 -9223372036854775808)" => Value::i64_array(vec![-1]),
 
     // i64-array/set!: in-bounds write observed via ref
     i64_array_set_in_bounds_ref: "(i64-array/ref (i64-array/set! (i64-array 10 20 30) 1 99) 1)" => Value::int(99),
@@ -2961,14 +2986,12 @@ eval_tests! {
     mutable_array_not_equal_to_vector: "(equal? (mutable-array/new 1 0) [0])" => Value::bool(false),
     // Cyclic comparison terminates (coinductive equality, no infinite loop).
     mutable_array_cyclic_equal_terminates: "(let ((a (mutable-array/new)) (b (mutable-array/new))) (mutable-array/push! a a) (mutable-array/push! b b) (equal? a b))" => Value::bool(true),
-    // Ord agrees with equality (content-based): distinct mutable containers
-    // are distinct BTreeMap/BTreeSet keys, so the transient-collection
-    // helpers (frequencies, list/unique, list/group-by) group by content at
-    // call time instead of aliasing every mutable container to one key.
-    mutable_array_frequencies_distinct: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 2))) (vals (frequencies (list a b))))" => common::eval("'(1 1)"),
-    mutable_array_frequencies_merges_equal_contents: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 1))) (vals (frequencies (list a b))))" => common::eval("'(2)"),
+    // Map-producing helpers require frozen keys; their contents determine
+    // grouping without allowing later mutations to change lookup order.
+    mutable_array_frequencies_frozen_distinct: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 2))) (vals (frequencies (map mutable-array/->vector (list a b)))))" => common::eval("'(1 1)"),
+    mutable_array_frequencies_frozen_equal_contents: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 1))) (vals (frequencies (map mutable-array/->vector (list a b)))))" => common::eval("'(2)"),
     mutable_array_unique_keeps_distinct: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 2))) (length (list/unique (list a b))))" => Value::int(2),
-    mutable_array_group_by_keeps_groups: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 2))) (length (keys (list/group-by (lambda (x) x) (list a b)))))" => Value::int(2),
+    mutable_array_group_by_frozen_keys: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 2))) (length (keys (list/group-by mutable-array/->vector (list a b)))))" => Value::int(2),
     mutable_array_vs_cell_distinct_keys: "(length (list/unique (list (mutable-array/new) (mutable-cell/new nil))))" => Value::int(2),
     mutable_array_sort_by_content: "(map (lambda (x) (mutable-array/get x 0)) (sort-by (lambda (x) x) (list (mutable-array/new 1 2) (mutable-array/new 1 1))))" => common::eval("'(1 2)"),
     // Cyclic ordering terminates: an in-flight pair compares Equal (the same
@@ -3072,6 +3095,8 @@ eval_tests! {
     bytes_parse_int10_decimal: "(bytes/parse-int10 (string->utf8 \"-12.3\"))" => Value::int(-123),
     bytes_parse_int10_no_decimal: "(bytes/parse-int10 (string->utf8 \"5\"))" => Value::int(50),
     bytes_parse_int10_negative_zero: "(bytes/parse-int10 (string->utf8 \"-0.0\"))" => Value::int(0),
+    bytes_parse_int10_minimum: "(bytes/parse-int10 (string->utf8 \"-922337203685477580.8\"))" => Value::int(i64::MIN),
+    bytes_parse_int10_maximum: "(bytes/parse-int10 (string->utf8 \"922337203685477580.7\"))" => Value::int(i64::MAX),
     bytes_parse_int10_start_offset: "(bytes/parse-int10 (string->utf8 \"Oslo;-12.3\") 5)" => Value::int(-123),
 }
 
@@ -3083,6 +3108,8 @@ eval_error_tests! {
     bytes_parse_int10_bad_digit: "(bytes/parse-int10 (string->utf8 \"12x\"))" => "invalid digit",
     bytes_parse_int10_two_decimals: "(bytes/parse-int10 (string->utf8 \"1.23\"))" => "one digit",
     bytes_parse_int10_empty: "(bytes/parse-int10 (string->utf8 \"\"))" => "digit",
+    bytes_parse_int10_underflow: "(bytes/parse-int10 (string->utf8 \"-922337203685477580.9\"))" => "overflows",
+    bytes_parse_int10_overflow: "(bytes/parse-int10 (string->utf8 \"922337203685477580.8\"))" => "overflows",
     bytes_to_string_invalid_utf8: "(bytes/->string (bytevector 255 254))" => "invalid UTF-8",
 }
 

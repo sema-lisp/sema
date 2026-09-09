@@ -1071,8 +1071,12 @@ pub fn register(env: &sema_core::Env) {
             }
             Ok(Value::map(result))
         }
-        let mut result = args[0].clone();
-        for arg in &args[1..] {
+        let mut result = Value::map(BTreeMap::new());
+        for arg in args {
+            if !is_map(arg) {
+                return Err(SemaError::type_error("map", arg.type_name())
+                    .with_hint("deep-merge: each argument must be a map"));
+            }
             result = merge_two(&result, arg)?;
         }
         Ok(result)

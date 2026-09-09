@@ -346,6 +346,14 @@ eval_tests! {
     deep_merge_non_map: r#"(:a (deep-merge {:a {:b 1}} {:a 42}))"# => Value::int(42),
     deep_merge_multiple: r#"(get-in (deep-merge {:a 1} {:b 2} {:c 3}) [:c])"# => Value::int(3),
     deep_merge_single: r#"(:a (deep-merge {:a 1}))"# => Value::int(1),
+    deep_merge_single_hashmap_is_ordered: "(type (deep-merge (hashmap/new :a 1)))" => Value::keyword("map"),
+    deep_merge_mixed_maps_are_ordered: "(type (deep-merge (hashmap/new :a 1) {:b 2}))" => Value::keyword("map"),
+}
+
+eval_error_tests! {
+    deep_merge_rejects_single_scalar: "(deep-merge 1)" => "map",
+    deep_merge_rejects_first_scalar: "(deep-merge 1 {:a 2})" => "map",
+    deep_merge_rejects_later_scalar: "(deep-merge {:a 2} 1)" => "map",
 }
 
 // ============================================================

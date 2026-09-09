@@ -2,6 +2,8 @@ use sema_core::{check_arity, ArgsExt, SemaError, Value};
 
 use crate::register_fn;
 
+const MAX_BYTEVECTOR_LEN: usize = 64 * 1024 * 1024;
+
 /// Coerce a `bytes/*` argument to its byte slice.
 fn as_bytes<'a>(v: &'a Value, name: &str) -> Result<&'a [u8], SemaError> {
     v.as_bytevector().ok_or_else(|| {
@@ -64,9 +66,16 @@ fn parse_int10(bytes: &[u8]) -> Result<i64, String> {
         if !b.is_ascii_digit() {
             return Err(format!("invalid digit {:?} at byte {i}", b as char));
         }
+        let digit = i64::from(b - b'0');
         n = n
             .checked_mul(10)
-            .and_then(|n| n.checked_add((b - b'0') as i64))
+            .and_then(|n| {
+                if neg {
+                    n.checked_sub(digit)
+                } else {
+                    n.checked_add(digit)
+                }
+            })
             .ok_or_else(overflow)?;
         i += 1;
     }
@@ -78,14 +87,21 @@ fn parse_int10(bytes: &[u8]) -> Result<i64, String> {
         if i + 2 != rest.len() || !rest[i + 1].is_ascii_digit() {
             return Err("expected exactly one digit after '.'".to_string());
         }
+        let digit = i64::from(rest[i + 1] - b'0');
         n = n
             .checked_mul(10)
-            .and_then(|n| n.checked_add((rest[i + 1] - b'0') as i64))
+            .and_then(|n| {
+                if neg {
+                    n.checked_sub(digit)
+                } else {
+                    n.checked_add(digit)
+                }
+            })
             .ok_or_else(overflow)?;
     } else {
         n = n.checked_mul(10).ok_or_else(overflow)?;
     }
-    Ok(if neg { -n } else { n })
+    Ok(n)
 }
 
 pub fn register(env: &sema_core::Env) {
@@ -97,6 +113,14 @@ pub fn register(env: &sema_core::Env) {
                 "make-bytevector: size must be non-negative, got {size}"
             )));
         }
+        let size = usize::try_from(size)
+            .ok()
+            .filter(|&size| size <= MAX_BYTEVECTOR_LEN)
+            .ok_or_else(|| {
+                SemaError::eval(format!(
+                    "make-bytevector: size exceeds maximum {MAX_BYTEVECTOR_LEN}"
+                ))
+            })?;
         let fill = if args.len() == 2 {
             let f = args.int_at(1, "make-bytevector")?;
             if !(0..=255).contains(&f) {
@@ -108,7 +132,12 @@ pub fn register(env: &sema_core::Env) {
         } else {
             0
         };
-        Ok(Value::bytevector(vec![fill; size as usize]))
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(size)
+            .map_err(|e| SemaError::eval(format!("make-bytevector: allocation failed: {e}")))?;
+        bytes.resize(size, fill);
+        Ok(Value::bytevector(bytes))
     });
 
     register_fn(env, "bytevector", |args| {

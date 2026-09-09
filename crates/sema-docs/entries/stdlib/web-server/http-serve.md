@@ -7,9 +7,12 @@ returns: "nil"
 see_also: ["http/router", "http/ok", "http/websocket", "http/stream"]
 ---
 
-Start an HTTP server. Takes a handler function and an optional options map. The handler receives a request map and returns a response map. This function blocks — it becomes the server's run loop.
+Start an HTTP server. Takes a handler function and an optional options map. The handler receives a request map and returns a response map. The call runs until the server stops or its task is cancelled.
 
-Must be started from the top level: calling it from inside `async/spawn` (or any other async context) raises an error immediately instead of hanging — that thread is the VM thread the cooperative scheduler drives every task on, so a blocking accept loop there would otherwise freeze every sibling task forever with no error. Async, non-blocking serving is tracked as deferred work (`docs/deferred.md`, SRV-1). The dispatch loop is also single-consumer even at top level: a WebSocket handler idling in `(:recv conn)` blocks the loop from picking up any other connection's next request until that client sends something or disconnects (`docs/limitations.md`).
+The runtime waits cooperatively for binding and incoming requests. You can run
+the server inside `async/spawn`; each request handler runs as a separate task.
+A handler waiting for HTTP, WebSocket, or other async I/O does not block sibling
+tasks. Cancelling the server task also stops its host server.
 
 ```sema
 (http/serve handler)

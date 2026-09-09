@@ -8,6 +8,9 @@ see_also: ["bytevector/new", "bytevector/make", "bytevector"]
 
 Create a bytevector of `size` bytes, each initialized to `fill` (default `0`). `size` must be non-negative and `fill` must be in the range 0..255.
 
+The maximum size is 67,108,864 bytes (64 MiB). Larger sizes return an error
+before allocation.
+
 ```sema
 (make-bytevector 4)       ; => #u8(0 0 0 0)
 (make-bytevector 3 255)   ; => #u8(255 255 255)

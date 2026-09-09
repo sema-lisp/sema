@@ -950,7 +950,7 @@
       "examples": [
         "(make-bytevector 4)       ; => #u8(0 0 0 0)\n(make-bytevector 3 255)   ; => #u8(255 255 255)"
       ],
-      "body": "Create a bytevector of `size` bytes, each initialized to `fill` (default `0`). `size` must be non-negative and `fill` must be in the range 0..255.\n\n```sema\n(make-bytevector 4)       ; => #u8(0 0 0 0)\n(make-bytevector 3 255)   ; => #u8(255 255 255)\n```"
+      "body": "Create a bytevector of `size` bytes, each initialized to `fill` (default `0`). `size` must be non-negative and `fill` must be in the range 0..255.\n\nThe maximum size is 67,108,864 bytes (64 MiB). Larger sizes return an error\nbefore allocation.\n\n```sema\n(make-bytevector 4)       ; => #u8(0 0 0 0)\n(make-bytevector 3 255)   ; => #u8(255 255 255)\n```"
     },
     {
       "name": "string/to-utf8",
@@ -4455,7 +4455,7 @@
       "examples": [
         "(define w (fs/watch \"src\"))\n(for-each (fn (e) (println (:kind e) (:paths e)))\n          (fs/watch-events w))"
       ],
-      "body": "Drain the pending filesystem events for a watcher handle returned by `fs/watch`. The call does not block: it returns whatever the background thread has queued since the previous drain, or the empty list when nothing happened. Each event is a map `{:kind :paths}` where `:kind` is `:create`, `:modify`, `:remove`, `:access`, or `:other`, and `:paths` is a list of path strings. When the event queue overflowed between drains, one extra `{:kind :overflow}` map is appended, and some events were lost. An unknown handle raises an error.\n\n```sema\n(define w (fs/watch \"src\"))\n(for-each (fn (e) (println (:kind e) (:paths e)))\n          (fs/watch-events w))\n```"
+      "body": "Drain the pending filesystem events for a watcher handle returned by `fs/watch`. The call does not block: it returns whatever the background thread has queued since the previous drain, or the empty list when nothing happened. Each event is a map `{:kind :paths}` where `:kind` is `:create`, `:modify`, `:remove`, `:access`, or `:other`, and `:paths` is a list of path strings. When the event queue overflowed between drains, one extra `{:kind :overflow}` map is appended, and some events were lost. An unknown handle raises an error.\n\nWatcher startup is asynchronous. If backend creation, path registration, or\nevent delivery fails, this call raises the backend error and retires the handle.\nAn empty result can mean that startup is still pending.\n\n```sema\n(define w (fs/watch \"src\"))\n(for-each (fn (e) (println (:kind e) (:paths e)))\n          (fs/watch-events w))\n```"
     },
     {
       "name": "git/changed-files",
@@ -7260,7 +7260,7 @@
       "examples": [
         "(sort-by length '(\"bb\" \"a\" \"ccc\"))   ; => (\"a\" \"bb\" \"ccc\")\n(sort-by abs '(-3 1 -2))             ; => (1 -2 -3)\n\n(sort-by (fn (p) (get p :age))\n         (list {:name \"Alice\" :age 30} {:name \"Bob\" :age 25}))\n; => ({:age 25 :name \"Bob\"} {:age 30 :name \"Alice\"})"
       ],
-      "body": "Return a new list sorted by the value the key function produces for each element, in ascending order. The key is computed once per element and the *elements* are returned (not the keys), so this is the idiomatic way to sort maps/records by a field.\n\n```sema\n(sort-by length '(\"bb\" \"a\" \"ccc\"))   ; => (\"a\" \"bb\" \"ccc\")\n(sort-by abs '(-3 1 -2))             ; => (1 -2 -3)\n\n(sort-by (fn (p) (get p :age))\n         (list {:name \"Alice\" :age 30} {:name \"Bob\" :age 25}))\n; => ({:age 25 :name \"Bob\"} {:age 30 :name \"Alice\"})\n```\n\nSee also: `sort` (plain ascending or with a custom comparator)."
+      "body": "Return a new list sorted by the value the key function produces for each element, in ascending order. The key is computed once per element and the *elements* are returned (not the keys), so this is the idiomatic way to sort maps/records by a field.\n\nReal numeric keys compare by numeric value across integer, float, and rational\ntypes. NaN sorts after other real numbers. Equal keys retain their input order.\nFor mixed key types, real numbers form one group at the integer type's position;\nother values use Sema's total value order, including complex numbers.\n\n```sema\n(sort-by length '(\"bb\" \"a\" \"ccc\"))   ; => (\"a\" \"bb\" \"ccc\")\n(sort-by abs '(-3 1 -2))             ; => (1 -2 -3)\n\n(sort-by (fn (p) (get p :age))\n         (list {:name \"Alice\" :age 30} {:name \"Bob\" :age 25}))\n; => ({:age 25 :name \"Bob\"} {:age 30 :name \"Alice\"})\n```\n\nSee also: `sort` (plain ascending or with a custom comparator)."
     },
     {
       "name": "take",
@@ -9376,13 +9376,13 @@
         "(html/select-text \"<p class=x>alpha</p><p class=x>beta</p>\" \"p.x\")\n;; => (\"alpha\" \"beta\")",
         ";; Scrape the text of every list item\n(html/select-text \"<ul><li>one</li><li>two</li></ul>\" \"li\")\n;; => (\"one\" \"two\")"
       ],
-      "body": "Run a CSS selector against an HTML string and return a list of the matched elements' text content (one whitespace-collapsed string per match), with tags stripped. Like `html/select` but yields text rather than outer HTML. An invalid selector raises an error.\n\n```sema\n(html/select-text \"<p class=x>alpha</p><p class=x>beta</p>\" \"p.x\")\n;; => (\"alpha\" \"beta\")\n```\n\n```sema\n;; Scrape the text of every list item\n(html/select-text \"<ul><li>one</li><li>two</li></ul>\" \"li\")\n;; => (\"one\" \"two\")\n```"
+      "body": "Run a CSS selector against an HTML string and return a list of the matched elements' text content (one whitespace-collapsed string per match), with tags stripped. Like `html/select` but yields text rather than outer HTML. An invalid selector raises an error.\n\nText extraction excludes `script`, `style`, and `template` subtrees, including\nwhen those elements are selected directly. CSS-based visibility is not evaluated.\n\n```sema\n(html/select-text \"<p class=x>alpha</p><p class=x>beta</p>\" \"p.x\")\n;; => (\"alpha\" \"beta\")\n```\n\n```sema\n;; Scrape the text of every list item\n(html/select-text \"<ul><li>one</li><li>two</li></ul>\" \"li\")\n;; => (\"one\" \"two\")\n```"
     },
     {
       "name": "html/text",
       "module": "markup",
       "section": "Markdown & HTML",
-      "summary": "Extract the visible text content from an HTML string, stripping all tags. Text from every node is concatenated and whitespace-collapsed into a single trimmed string.",
+      "summary": "Extract text content from an HTML string, stripping tags and excluding `script`, `style`, and `template` subtrees. Remaining text is concatenated and whitespace-collapsed into a single trimmed string. This does not run CSS or JavaScript, so CSS-based visibility is not evaluated.",
       "params": [
         {
           "name": "html",
@@ -9399,7 +9399,7 @@
         "(html/text \"<div><p>hello</p> <p>world</p></div>\")\n;; => \"hello world\"",
         ";; Strip markup to get plain text for indexing or display\n(html/text \"<h1>Title</h1><p>Some <b>bold</b> body.</p>\")\n;; => \"Title Some bold body.\""
       ],
-      "body": "Extract the visible text content from an HTML string, stripping all tags. Text from every node is concatenated and whitespace-collapsed into a single trimmed string.\n\n```sema\n(html/text \"<div><p>hello</p> <p>world</p></div>\")\n;; => \"hello world\"\n```\n\n```sema\n;; Strip markup to get plain text for indexing or display\n(html/text \"<h1>Title</h1><p>Some <b>bold</b> body.</p>\")\n;; => \"Title Some bold body.\"\n```"
+      "body": "Extract text content from an HTML string, stripping tags and excluding `script`,\n`style`, and `template` subtrees. Remaining text is concatenated and\nwhitespace-collapsed into a single trimmed string. This does not run CSS or\nJavaScript, so CSS-based visibility is not evaluated.\n\n```sema\n(html/text \"<div><p>hello</p> <p>world</p></div>\")\n;; => \"hello world\"\n```\n\n```sema\n;; Strip markup to get plain text for indexing or display\n(html/text \"<h1>Title</h1><p>Some <b>bold</b> body.</p>\")\n;; => \"Title Some bold body.\"\n```"
     },
     {
       "name": "markdown/frontmatter",
@@ -11473,7 +11473,7 @@
       "examples": [
         "(define mem (memory/open {:id \"chat-1\"}))\n\n(memory/append mem {:role \"user\"     :content \"What files are in scope?\"})\n(memory/append mem {:role \"assistant\" :content \"Found auth.rs and config.rs.\"})\n\n;; pass the history to an agent — it sees the prior turns\n(agent/run bot \"Continue from where we left off.\" {:memory mem})"
       ],
-      "body": "Append one conversation turn to a memory thread. The message is pushed onto the in-process\nworking set (immediately visible to `memory/messages`) and persisted to the `.jsonl`\nsidecar before the call resolves (append-only, write-through). Inside async tasks the\nsidecar write happens off the scheduler, so sibling tasks keep running while it lands.\nReturns the `handle` so calls can be chained.\n\n- `:role` — `\"user\"` or `\"assistant\"` (defaults to `\"user\"` when absent).\n- `:content` — message text string.\n\n```sema\n(define mem (memory/open {:id \"chat-1\"}))\n\n(memory/append mem {:role \"user\"     :content \"What files are in scope?\"})\n(memory/append mem {:role \"assistant\" :content \"Found auth.rs and config.rs.\"})\n\n;; pass the history to an agent — it sees the prior turns\n(agent/run bot \"Continue from where we left off.\" {:memory mem})\n```\n\nSee also: `memory/open`, `memory/messages`.",
+      "body": "Append one conversation turn to a memory thread. The message is pushed onto the in-process\nworking set (immediately visible to `memory/messages`) and persisted to the `.jsonl`\nsidecar before the call resolves (append-only, write-through). Inside async tasks the\nsidecar write happens off the scheduler, so sibling tasks keep running while it lands.\nReturns the `handle` so calls can be chained.\n\nThe complete JSONL sidecar, including JSON escapes and line endings, is limited\nto 64 MiB. A turn that would exceed that limit is rejected before changing the\nworking set. Pending turns count toward the limit, including agent writeback.\n\n- `:role` — `\"user\"` or `\"assistant\"` (defaults to `\"user\"` when absent).\n- `:content` — message text string.\n\n```sema\n(define mem (memory/open {:id \"chat-1\"}))\n\n(memory/append mem {:role \"user\"     :content \"What files are in scope?\"})\n(memory/append mem {:role \"assistant\" :content \"Found auth.rs and config.rs.\"})\n\n;; pass the history to an agent — it sees the prior turns\n(agent/run bot \"Continue from where we left off.\" {:memory mem})\n```\n\nSee also: `memory/open`, `memory/messages`.",
       "syntax": "(memory/append handle {:role role :content text})"
     },
     {
@@ -16227,7 +16227,7 @@
         "(define s (stream/byte-buffer))\n(stream/write s (bytevector 72 105))     ; => 2\n(stream/write s (string->utf8 \"!\"))      ; => 1\n(stream/to-string s)                     ; => \"Hi!\"",
         ";; Copy a file in fixed-size chunks.\n(with-stream (in (stream/open-input \"in.bin\"))\n  (with-stream (out (stream/open-output \"out.bin\"))\n    (let loop ()\n      (let ((chunk (stream/read in 65536)))\n        (when chunk\n          (stream/write out chunk)\n          (loop))))))"
       ],
-      "body": "Write the bytes of `bytes` to an output stream and return the number of bytes\nwritten. The argument must be a bytevector; for text use `stream/write-string`,\nwhich encodes a string as UTF-8, or convert first with `string->utf8`. A\nsingle byte goes through `stream/write-byte`.\n\nOutput may be buffered by the stream; call `stream/flush` before another\nprocess reads the data, or close the stream (`with-stream` does this for\nyou). Writing to an input-only stream is an error.\n\n```sema\n(define s (stream/byte-buffer))\n(stream/write s (bytevector 72 105))     ; => 2\n(stream/write s (string->utf8 \"!\"))      ; => 1\n(stream/to-string s)                     ; => \"Hi!\"\n```\n\n```sema\n;; Copy a file in fixed-size chunks.\n(with-stream (in (stream/open-input \"in.bin\"))\n  (with-stream (out (stream/open-output \"out.bin\"))\n    (let loop ()\n      (let ((chunk (stream/read in 65536)))\n        (when chunk\n          (stream/write out chunk)\n          (loop))))))\n```"
+      "body": "Write the bytes of `bytes` to an output stream and return the number of bytes\nwritten. The argument must be a bytevector; for text use `stream/write-string`,\nwhich encodes a string as UTF-8, or convert first with `string->utf8`. A\nsingle byte goes through `stream/write-byte`.\n\nOutput may be buffered by the stream; call `stream/flush` before another\nprocess reads the data, or close the stream (`with-stream` does this for\nyou). Writing to an input-only stream is an error.\n\n`*stdout*` and `*stderr*` preserve raw bytes when writing to the process streams.\nWhen a host or runtime captures output as text, each write must be valid UTF-8;\ninvalid bytes raise an error without emitting replacement characters.\n\n```sema\n(define s (stream/byte-buffer))\n(stream/write s (bytevector 72 105))     ; => 2\n(stream/write s (string->utf8 \"!\"))      ; => 1\n(stream/to-string s)                     ; => \"Hi!\"\n```\n\n```sema\n;; Copy a file in fixed-size chunks.\n(with-stream (in (stream/open-input \"in.bin\"))\n  (with-stream (out (stream/open-output \"out.bin\"))\n    (let loop ()\n      (let ((chunk (stream/read in 65536)))\n        (when chunk\n          (stream/write out chunk)\n          (loop))))))\n```"
     },
     {
       "name": "stream/write-byte",
@@ -18327,11 +18327,16 @@
       ],
       "module": "strings",
       "section": "Type Conversions",
-      "summary": "Parse a string as a number, using the same rules as the reader: integers, floats, exponents (`1e3`), rationals (`1/2`), bignums, and an optional leading sign. Surrounding whitespace is ignored. Returns `#f` when the text is not a number.",
+      "summary": "Parse a string as a number. With no radix, it uses the reader's rules for integers, floats, exponents (`1e3`), rationals (`1/2`), and bignums. The optional radix accepts 2, 8, 10, or 16 for integer input. Surrounding whitespace is ignored. Returns `#f` when the text is not a number.",
       "params": [
         {
           "name": "s",
           "type": "string"
+        },
+        {
+          "name": "radix",
+          "type": "int",
+          "doc": "2, 8, 10, or 16"
         }
       ],
       "returns": "number",
@@ -18341,9 +18346,9 @@
         "number/to-string"
       ],
       "examples": [
-        "(string/to-number \"42\")     ; => 42\n(string/to-number \"3.14\")   ; => 3.14\n(string/to-number \"1e3\")    ; => 1000.0\n(string/to-number \"  42  \")  ; => 42\n(string/to-number \"+7\")      ; => 7\n(string/to-number \"abc\")     ; => #f"
+        "(string/to-number \"42\")     ; => 42\n(string/to-number \"3.14\")   ; => 3.14\n(string/to-number \"1e3\")    ; => 1000.0\n(string/to-number \"  42  \")  ; => 42\n(string/to-number \"+7\")      ; => 7\n(string/to-number \"ff\" 16)   ; => 255\n(string/to-number \"abc\")     ; => #f"
       ],
-      "body": "Parse a string as a number, using the same rules as the reader: integers, floats, exponents (`1e3`), rationals (`1/2`), bignums, and an optional leading sign. Surrounding whitespace is ignored. Returns `#f` when the text is not a number.\n\nUse `string/number?` to test parseability without raising, and `string->float` when you always want a float (even for integer text).\n\n```sema\n(string/to-number \"42\")     ; => 42\n(string/to-number \"3.14\")   ; => 3.14\n(string/to-number \"1e3\")    ; => 1000.0\n(string/to-number \"  42  \")  ; => 42\n(string/to-number \"+7\")      ; => 7\n(string/to-number \"abc\")     ; => #f\n```"
+      "body": "Parse a string as a number. With no radix, it uses the reader's rules for integers, floats, exponents (`1e3`), rationals (`1/2`), and bignums. The optional radix accepts 2, 8, 10, or 16 for integer input. Surrounding whitespace is ignored. Returns `#f` when the text is not a number.\n\nUse `string/number?` to test parseability without raising, and `string->float` when you always want a float (even for integer text).\n\n```sema\n(string/to-number \"42\")     ; => 42\n(string/to-number \"3.14\")   ; => 3.14\n(string/to-number \"1e3\")    ; => 1000.0\n(string/to-number \"  42  \")  ; => 42\n(string/to-number \"+7\")      ; => 7\n(string/to-number \"ff\" 16)   ; => 255\n(string/to-number \"abc\")     ; => #f\n```"
     },
     {
       "name": "string/to-symbol",
@@ -21228,7 +21233,7 @@
       "examples": [
         "(f64-array/range 0 5)        ; => #f64(0 1 2 3 4)\n(f64-array/range 0 1 0.25)   ; => #f64(0 0.25 0.5 0.75)"
       ],
-      "body": "Create an f64 array from a numeric range. `(f64-array/range start end)` or `(f64-array/range start end step)`.\n\n```sema\n(f64-array/range 0 5)        ; => #f64(0 1 2 3 4)\n(f64-array/range 0 1 0.25)   ; => #f64(0 0.25 0.5 0.75)\n```"
+      "body": "Create an f64 array from a numeric range. `(f64-array/range start end)` or `(f64-array/range start end step)`.\n\nArguments must be finite, and the step must be nonzero and change each value\nat f64 precision. The result is limited to 8,388,608 elements (64 MiB).\nNon-finite arguments and oversized length estimates fail before allocation.\nProgress and the element limit are also checked while constructing the range.\n\n```sema\n(f64-array/range 0 5)        ; => #f64(0 1 2 3 4)\n(f64-array/range 0 1 0.25)   ; => #f64(0 0.25 0.5 0.75)\n```"
     },
     {
       "name": "f64-array/ref",
@@ -21984,13 +21989,13 @@
       "examples": [
         "(define routes\n  [[:get  \"/\"            handle-home]\n   [:get  \"/users/:id\"   handle-user]\n   [:post \"/users\"       handle-create]\n   [:any  \"/echo\"        handle-echo]])\n\n(define app (http/router routes))\n(http/serve app {:port 3000})"
       ],
-      "body": "Create a handler function from a list of route definitions. Each route is a vector of `[method pattern handler]`.\n\n```sema\n(define routes\n  [[:get  \"/\"            handle-home]\n   [:get  \"/users/:id\"   handle-user]\n   [:post \"/users\"       handle-create]\n   [:any  \"/echo\"        handle-echo]])\n\n(define app (http/router routes))\n(http/serve app {:port 3000})\n```\n\nSupported methods: `:get`, `:post`, `:put`, `:patch`, `:delete`, `:any` (matches all methods), `:ws` (WebSocket upgrade), and `:static` (static file directory).\n\nRoutes are matched top-to-bottom — first match wins. Unmatched routes return 404."
+      "body": "Create a handler function from a list of route definitions. Each route is a vector of `[method pattern handler]`.\n\n```sema\n(define routes\n  [[:get  \"/\"            handle-home]\n   [:get  \"/users/:id\"   handle-user]\n   [:post \"/users\"       handle-create]\n   [:any  \"/echo\"        handle-echo]])\n\n(define app (http/router routes))\n(http/serve app {:port 3000})\n```\n\nSupported methods: `:get`, `:post`, `:put`, `:patch`, `:delete`, `:any` (matches all methods), `:ws` (WebSocket upgrade), and `:static` (static file directory).\n\nRoutes are matched top-to-bottom — first match wins. Unmatched routes return 404.\n\nRequest paths are split into segments before percent-decoding. Parameters and\nwildcard captures contain decoded UTF-8 text; a literal `+` remains `+`.\nAn encoded slash stays inside its segment and does not match an extra route\nsegment. Invalid percent escapes or invalid UTF-8 do not match. Static routes\nalso reject decoded slashes, backslashes, and NUL bytes before file lookup.\n\n`http/serve` requires a validated WebSocket upgrade before invoking a `:ws`\nhandler. Ordinary HTTP requests to that route receive 400 without running it."
     },
     {
       "name": "http/serve",
       "module": "web-server",
       "section": "Serving",
-      "summary": "Start an HTTP server. Takes a handler function and an optional options map. The handler receives a request map and returns a response map. This function blocks — it becomes the server's run loop.",
+      "summary": "Start an HTTP server. Takes a handler function and an optional options map. The handler receives a request map and returns a response map. The call runs until the server stops or its task is cancelled.",
       "returns": "nil",
       "see_also": [
         "http/router",
@@ -22002,7 +22007,7 @@
         "(http/serve handler)\n(http/serve handler {:port 3000})\n(http/serve handler {:port 8080 :host \"127.0.0.1\"})",
         "(http/serve handler\n  {:port 3000\n   :port-fallback true\n   :on-listen (fn (info)\n     (println (string-append \"Ready at \" (:url info))))})"
       ],
-      "body": "Start an HTTP server. Takes a handler function and an optional options map. The handler receives a request map and returns a response map. This function blocks — it becomes the server's run loop.\n\nMust be started from the top level: calling it from inside `async/spawn` (or any other async context) raises an error immediately instead of hanging — that thread is the VM thread the cooperative scheduler drives every task on, so a blocking accept loop there would otherwise freeze every sibling task forever with no error. Async, non-blocking serving is tracked as deferred work (`docs/deferred.md`, SRV-1). The dispatch loop is also single-consumer even at top level: a WebSocket handler idling in `(:recv conn)` blocks the loop from picking up any other connection's next request until that client sends something or disconnects (`docs/limitations.md`).\n\n```sema\n(http/serve handler)\n(http/serve handler {:port 3000})\n(http/serve handler {:port 8080 :host \"127.0.0.1\"})\n```\n\n| Option           | Default     | Description                                                         |\n| ---------------- | ----------- | ------------------------------------------------------------------- |\n| `:port`          | `3000`      | TCP port to bind                                                    |\n| `:host`          | `\"0.0.0.0\"` | Address to bind to                                                  |\n| `:port-fallback` | `false`     | If the port is taken, bind the next free port instead of failing    |\n| `:on-listen`     | —           | Function called once bound with `{:host :port :url}`                |\n\nThe handler is any function `(request-map -> response-map)`. This can be a plain function, a router, or a middleware-wrapped stack.\n\n### Automatic port fallback\n\nBy default `http/serve` fails fast when the port is already in use. Pass\n`:port-fallback true` to walk to the next free port instead — handy for dev\nservers and multiple instances. Because the actual port may then differ from the\none requested, use `:on-listen` to learn where the server ended up:\n\n```sema\n(http/serve handler\n  {:port 3000\n   :port-fallback true\n   :on-listen (fn (info)\n     (println (string-append \"Ready at \" (:url info))))})\n```\n\n`:on-listen` runs once, on the main thread, right after the socket binds and\nbefore the request loop starts.",
+      "body": "Start an HTTP server. Takes a handler function and an optional options map. The handler receives a request map and returns a response map. The call runs until the server stops or its task is cancelled.\n\nThe runtime waits cooperatively for binding and incoming requests. You can run\nthe server inside `async/spawn`; each request handler runs as a separate task.\nA handler waiting for HTTP, WebSocket, or other async I/O does not block sibling\ntasks. Cancelling the server task also stops its host server.\n\n```sema\n(http/serve handler)\n(http/serve handler {:port 3000})\n(http/serve handler {:port 8080 :host \"127.0.0.1\"})\n```\n\n| Option           | Default     | Description                                                         |\n| ---------------- | ----------- | ------------------------------------------------------------------- |\n| `:port`          | `3000`      | TCP port to bind                                                    |\n| `:host`          | `\"0.0.0.0\"` | Address to bind to                                                  |\n| `:port-fallback` | `false`     | If the port is taken, bind the next free port instead of failing    |\n| `:on-listen`     | —           | Function called once bound with `{:host :port :url}`                |\n\nThe handler is any function `(request-map -> response-map)`. This can be a plain function, a router, or a middleware-wrapped stack.\n\n### Automatic port fallback\n\nBy default `http/serve` fails fast when the port is already in use. Pass\n`:port-fallback true` to walk to the next free port instead — handy for dev\nservers and multiple instances. Because the actual port may then differ from the\none requested, use `:on-listen` to learn where the server ended up:\n\n```sema\n(http/serve handler\n  {:port 3000\n   :port-fallback true\n   :on-listen (fn (info)\n     (println (string-append \"Ready at \" (:url info))))})\n```\n\n`:on-listen` runs once, on the main thread, right after the socket binds and\nbefore the request loop starts.",
       "syntax": "(http/serve handler [opts])"
     },
     {

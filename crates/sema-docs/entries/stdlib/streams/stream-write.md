@@ -16,6 +16,10 @@ Output may be buffered by the stream; call `stream/flush` before another
 process reads the data, or close the stream (`with-stream` does this for
 you). Writing to an input-only stream is an error.
 
+`*stdout*` and `*stderr*` preserve raw bytes when writing to the process streams.
+When a host or runtime captures output as text, each write must be valid UTF-8;
+invalid bytes raise an error without emitting replacement characters.
+
 ```sema
 (define s (stream/byte-buffer))
 (stream/write s (bytevector 72 105))     ; => 2

@@ -13,6 +13,10 @@ sidecar before the call resolves (append-only, write-through). Inside async task
 sidecar write happens off the scheduler, so sibling tasks keep running while it lands.
 Returns the `handle` so calls can be chained.
 
+The complete JSONL sidecar, including JSON escapes and line endings, is limited
+to 64 MiB. A turn that would exceed that limit is rejected before changing the
+working set. Pending turns count toward the limit, including agent writeback.
+
 - `:role` — `"user"` or `"assistant"` (defaults to `"user"` when absent).
 - `:content` — message text string.
 

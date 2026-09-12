@@ -298,6 +298,9 @@
     padding: 13px 0 14px; box-shadow: inset 0 1px 0 var(--line-2); color: var(--fg-2);
   }
   .keygrid div .k { flex: none; width: 12ch; }
+  .keygrid.three { grid-template-columns: 1fr; gap: 0; }
+  .keygrid.three div .k { width: 6ch; }
+  .keygrid.three div .a { flex: none; width: 16ch; color: var(--gold); }
   @media (max-width: 900px) { .keygrid { grid-template-columns: 1fr; } }
 
   /* ============ definition rows ============ */
@@ -371,8 +374,13 @@
           It edits files, runs commands, and searches code from the terminal.
           The agent loop, the ten tools, the full-screen interface, the MCP
           client and the config language are <b>.sema</b> files in one
-          repository. Nothing is compiled. The only thing to install is the
-          <b>sema</b> binary.
+          repository, so you can read the whole agent and change it.
+        </p>
+        <p class="lede">
+          <a href="https://sema-lang.com">Sema</a> is a Lisp with LLM primitives
+          built in. You do not need to know it to use Sema Coder: install the
+          binary and type in English. You meet the language when you configure
+          it, which is twenty lines of data, and when you write a plugin.
         </p>
         <div class="facts">
           <span><b>~7,000 lines</b> of Sema</span><span class="s">·</span>
@@ -391,12 +399,22 @@
         </p>
         <div class="cmd"><span class="n">1</span><span class="p">$</span><span class="c" id="c1">curl -fsSL https://sema-lang.com/install.sh | sh</span><button onclick="cp('c1', this)">copy</button></div>
         <div class="cmd"><span class="n">2</span><span class="p">$</span><span class="c" id="c2">git clone https://github.com/sema-lisp/sema-coder &amp;&amp; cd sema-coder</span><button onclick="cp('c2', this)">copy</button></div>
-        <div class="cmd"><span class="n">3</span><span class="p">$</span><span class="c" id="c3">export ANTHROPIC_API_KEY=… &amp;&amp; ./coder.sema</span><button onclick="cp('c3', this)">copy</button></div>
+        <div class="cmd"><span class="n">3</span><span class="p">$</span><span class="c" id="c3">export ANTHROPIC_API_KEY="sk-ant-..."</span><button onclick="cp('c3', this)">copy</button></div>
+        <div class="cmd"><span class="n">4</span><span class="p">$</span><span class="c" id="c4">./coder.sema</span><button onclick="cp('c4', this)">copy</button></div>
         <p class="meta">
-          Needs sema 1.35 or newer, and one of ANTHROPIC_API_KEY or
-          OPENAI_API_KEY. Homebrew (<code>brew install helgesverre/tap/sema-lang</code>)
-          and <code>cargo install sema-lang</code> also work. Install
-          <code>rg</code> and the grep tool uses it instead of <code>grep</code>.
+          Needs sema 1.35 or newer, and a key from
+          <a href="https://console.anthropic.com">console.anthropic.com</a> or
+          <a href="https://platform.openai.com">platform.openai.com</a>. You pay
+          the provider per token; the header shows the running cost. Put the
+          export in your shell profile to keep it. Homebrew
+          (<code>brew install helgesverre/tap/sema-lang</code>) and
+          <code>cargo install sema-lang</code> also install the binary, and
+          <code>rg</code> makes the grep tool faster.
+        </p>
+        <p class="meta">
+          The agent works on the directory you start it in. To use it on your
+          own project, <code>cd</code> there first and run the clone's
+          <code>coder.sema</code> by path.
         </p>
       </section>
 
@@ -454,9 +472,14 @@
         </div>
         <p class="caption">
           Every frame is rebuilt as a list of rows and compared with the
-          previous frame. Only changed rows are rewritten, so there is no clear
-          and no flicker, and scrolling never re-parses the markdown.
+          previous frame, so only changed rows are rewritten and the screen
+          never flickers.
         </p>
+        <div class="defs">
+          <div><div class="n"><kbd>Enter</kbd></div><div class="d">Sends. If a turn is running it interrupts that turn first, so the agent starts on what you just typed.</div></div>
+          <div><div class="n"><kbd>Tab</kbd></div><div class="d">Queues what you typed instead of interrupting. It runs when the current turn finishes. <code>/queue</code> lists, edits, drops and resumes.</div></div>
+          <div><div class="n"><kbd>⌃C</kbd></div><div class="d">Cancels the running turn. The conversation stays valid: an interrupted tool call still gets a correlated result, the text written so far is kept, and a control message records that side effects may be half-done. The next turn continues from there.</div></div>
+        </div>
       </section>
 
       <section id="modes">
@@ -490,7 +513,7 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
           <div><div class="n">read-file</div><div class="d">Read a file with line numbers.</div><div class="cap">refuses binaries · 2 MB · 2,000 lines</div></div>
           <div><div class="n">write-file</div><div class="d">Create or overwrite, creating parent directories.</div><div class="cap">reports the previous size</div></div>
           <div><div class="n">edit-file</div><div class="d">Replace one exact string and return a diff.</div><div class="cap">unique match unless replace_all · 60-line diff</div></div>
-          <div><div class="n">bash</div><div class="d">Run a shell command in the workspace.</div><div class="cap">120 s default · background=true returns a task id</div></div>
+          <div><div class="n">bash</div><div class="d">Run a shell command in the workspace.</div><div class="cap">120 s default · 500 lines · 100 KB · background=true returns a task id</div></div>
           <div><div class="n">task-output</div><div class="d">Read a background task's output and status.</div><div class="cap">waits up to 30 s by default</div></div>
           <div><div class="n">task-list</div><div class="d">List background tasks in this process.</div><div class="cap">32 at a time</div></div>
           <div><div class="n">task-stop</div><div class="d">Terminate a background task.</div><div class="cap">kills the process group on Unix</div></div>
@@ -503,6 +526,12 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
           which resolves symlinks, so <code>../</code> and symlink escapes fail.
           The <code>bash</code> tool is not covered. It runs real commands with
           your privileges. This is accident prevention, not a sandbox.
+        </p>
+        <p class="caption">
+          There is no approval step. The agent edits files and runs commands
+          without asking, and there is no diff to accept before a write lands.
+          Work in a repository with a clean tree so <code>git diff</code> is
+          your review, and read the tool lines in the transcript as they settle.
         </p>
       </section>
 
@@ -543,8 +572,8 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
         </div>
 
         <div class="defs">
-          <div><div class="n">stdio<span class="tag">:command :args :env :cwd</span></div><div class="d">A local process speaking MCP over stdin and stdout.</div></div>
-          <div><div class="n">http<span class="tag">:url :headers</span></div><div class="d">A remote endpoint. OAuth is prompted when you connect.</div></div>
+          <div><div class="n">stdio<span class="tag">:command :args :env :cwd</span></div><div class="d">A local process speaking MCP over stdin and stdout. <code>:env</code> maps strings to strings; use <code>(env "NAME")</code> rather than writing a secret into the file.</div></div>
+          <div><div class="n">http<span class="tag">:url :headers</span></div><div class="d">A remote endpoint. <code>:headers</code> maps strings to strings. OAuth is prompted when you connect.</div></div>
           <div><div class="n">:autostart #t</div><div class="d">Connects at boot, before the full-screen interface opens, so a first sign-in is visible. Everything else connects on demand.</div></div>
           <div><div class="n">:connect-timeout-ms<span class="tag">15000</span></div><div class="d">Per server. A timeout cancels the connect and closes a late handle.</div></div>
           <div><div class="n">Statuses</div><div class="d">idle, connecting, connected, needs-auth, error. A 401 or an auth failure becomes needs-auth and the row shows <span class="gold">▲</span>.</div></div>
@@ -564,11 +593,11 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
 
         <h3 id="cfg-files">File locations</h3>
         <div class="defs">
-          <div><div class="n">init.sema</div><div class="d">The config itself, written on first run. The full-screen interface watches the directory and applies a valid save.</div></div>
-          <div><div class="n">tools/*.sema</div><div class="d">Persistent agent tools. Reconciled at boot and on every config apply, so deleting a file drops its tool.</div></div>
-          <div><div class="n">plugins/*.sema</div><div class="d">Global plugins, loaded once at boot after the config is applied.</div></div>
-          <div><div class="n">sessions/*.jsonl</div><div class="d">Saved sessions. 200 are kept and the oldest are pruned.</div></div>
-          <div><div class="n">.sema-coder/plugins/<span class="tag">in the project</span></div><div class="d">Project plugins, loaded after the global ones so they can shadow them.</div></div>
+          <div><div class="n">&lt;config-dir&gt;/init.sema</div><div class="d">The config itself, written on first run. The full-screen interface watches the directory and applies a valid save.</div></div>
+          <div><div class="n">&lt;config-dir&gt;/tools/*.sema</div><div class="d">Persistent agent tools. Reconciled at boot and on every config apply, so deleting a file drops its tool.</div></div>
+          <div><div class="n">&lt;config-dir&gt;/plugins/*.sema</div><div class="d">Global plugins, loaded once at boot after the config is applied.</div></div>
+          <div><div class="n">&lt;config-dir&gt;/sessions/*.jsonl</div><div class="d">One session per file: a meta line, then one message per line in the shape the runtime takes. Written to a temp file and renamed, so a crash mid-write cannot truncate the old file. 200 are kept and the oldest are pruned. <code>/resume</code> restores one verbatim. Only the full-screen interface writes them; one-shot and the plain REPL keep nothing.</div></div>
+          <div><div class="n">.sema-coder/plugins/<span class="tag">in the project</span></div><div class="d">Project plugins, loaded after the global ones so they can shadow them. This is the only project-scoped location: there is no project <code>init.sema</code>, so project commands and tools go here.</div></div>
         </div>
         <p class="caption">
           &lt;config-dir&gt; is <code>$SEMA_CODER_CONFIG_DIR</code> when set,
@@ -622,10 +651,18 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
        (<span class="kw">mcp-server</span> <span class="str">"sema"</span>
          {<span class="kw">:command</span> <span class="str">"sema"</span>
           <span class="kw">:args</span> [<span class="str">"mcp"</span> <span class="str">"--include"</span> <span class="str">"eval,docs,docs_search"</span>]
-          <span class="kw">:env</span> {} <span class="kw">:cwd</span> <span class="str">"."</span>
           <span class="kw">:autostart</span> #t
           <span class="kw">:connect-timeout-ms</span> 15000})
-       (<span class="kw">mcp-server</span> <span class="str">"asana"</span> {<span class="kw">:url</span> <span class="str">"https://mcp.asana.com/mcp"</span>}))
+       <span class="cm">; :env and :headers map strings to strings. Read a secret</span>
+       <span class="cm">; from the environment rather than writing it here.</span>
+       (<span class="kw">mcp-server</span> <span class="str">"github"</span>
+         {<span class="kw">:command</span> <span class="str">"npx"</span>
+          <span class="kw">:args</span> [<span class="str">"-y"</span> <span class="str">"@modelcontextprotocol/server-github"</span>]
+          <span class="kw">:env</span> {<span class="str">"GITHUB_TOKEN"</span> (env <span class="str">"GITHUB_TOKEN"</span>)}
+          <span class="kw">:cwd</span> <span class="str">"."</span>})
+       (<span class="kw">mcp-server</span> <span class="str">"asana"</span>
+         {<span class="kw">:url</span> <span class="str">"https://mcp.asana.com/mcp"</span>
+          <span class="kw">:headers</span> {<span class="str">"Authorization"</span> (str <span class="str">"Bearer "</span> (env <span class="str">"ASANA_TOKEN"</span>))}}))
 
      <span class="cm">; Slash commands. Exactly one of :run, :shell, :do.</span>
      <span class="kw">:commands</span>
@@ -667,19 +704,30 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
           <div><span class="ev">:turn-interrupted</span> <span class="ctx">{:input :messages :turn-id}</span><div class="note">when <kbd>⌃C</kbd> cancels, after the history is repaired</div></div>
         </div>
         <h3 id="cfg-keymap">Default key map</h3>
-        <div class="keygrid">
-          <div><span class="k"><kbd>⌃O</kbd></span> open the MCP manager</div>
-          <div><span class="k"><kbd>⌃R</kbd></span> open the session picker</div>
-          <div><span class="k"><kbd>⌃K</kbd></span> open the command palette</div>
-          <div><span class="k"><kbd>⌃X</kbd></span> expand tool results</div>
-          <div><span class="k"><kbd>⌃C</kbd></span> cancel the running turn</div>
-          <div><span class="k"><kbd>⌃D</kbd></span> exit</div>
-          <div><span class="k"><kbd>⌃U</kbd></span> clear the prompt</div>
-          <div><span class="k"><kbd>⌃W</kbd></span> delete the word before the caret</div>
-          <div><span class="k"><kbd>⌃Y</kbd></span> paste what was killed</div>
-          <div><span class="k"><kbd>⌃A</kbd> <kbd>⌃E</kbd></span> start and end of line</div>
-          <div><span class="k"><kbd>⌃L</kbd></span> redraw the screen</div>
+        <p class="sub">
+          The name in the middle column is what you put in <code>:keys</code>,
+          for example <code>{:palette "ctrl-p"}</code>.
+        </p>
+        <div class="keygrid three">
+          <div><span class="k"><kbd>⌃O</kbd></span><span class="a">:mcp</span> open the MCP manager</div>
+          <div><span class="k"><kbd>⌃R</kbd></span><span class="a">:resume</span> open the session picker</div>
+          <div><span class="k"><kbd>⌃K</kbd></span><span class="a">:palette</span> open the command palette</div>
+          <div><span class="k"><kbd>⌃X</kbd></span><span class="a">:expand-tools</span> expand tool results</div>
+          <div><span class="k"><kbd>⌃C</kbd></span><span class="a">:interrupt</span> cancel the running turn</div>
+          <div><span class="k"><kbd>⌃D</kbd></span><span class="a">:quit</span> exit</div>
+          <div><span class="k"><kbd>⌃U</kbd></span><span class="a">:clear-line</span> clear the prompt</div>
+          <div><span class="k"><kbd>⌃W</kbd></span><span class="a">:kill-word</span> delete the word before the caret</div>
+          <div><span class="k"><kbd>⌃Y</kbd></span><span class="a">:yank</span> paste what was killed</div>
+          <div><span class="k"><kbd>⌃A</kbd></span><span class="a">:line-start</span> start of line</div>
+          <div><span class="k"><kbd>⌃E</kbd></span><span class="a">:line-end</span> end of line</div>
+          <div><span class="k"><kbd>⌃L</kbd></span><span class="a">:repaint</span> redraw the screen</div>
         </div>
+        <p class="caption">
+          A key string is <code>ctrl-</code> and one character. There are no
+          alt, shift, or function-key bindings. Naming a command instead of an
+          action runs that command, so
+          <code>(bind-key! "ctrl-g" "lint")</code> runs <code>/lint</code>.
+        </p>
         <p class="caption">
           Four layers merge, weakest first: these defaults, a command's own
           <code>:key</code>, the config <code>:keys</code> map, then runtime
@@ -712,6 +760,14 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
           error; the agent still starts.
         </p>
         <p class="sub">
+          Config covers commands and keys. Reach for a plugin when you need a
+          tool the agent can call, argument completions, a hook, or an overlay.
+          Files in a directory load in name order, global first, then the
+          project's; a file that throws prints <code>name: message</code> and
+          the agent still starts. Tools that should outlive a plugin reload
+          belong in <code>tools/</code> instead.
+        </p>
+        <p class="sub">
           The example below builds one plugin that gives the agent a way to run
           the project's linter, and gives you a command and a key for it. Each
           step adds to the same file.
@@ -723,13 +779,18 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
             <code>deftool</code> declares the name, the description the model
             reads, and the parameters. <code>register-tool!</code> puts it in
             the agent's tool set. The handler returns the string the agent sees.
+            The model chooses the argument, so put it through
+            <code>resolve-path</code> before it reaches a shell. Your handler
+            can also be cancelled mid-run: the agent gets a synthesized result
+            and nothing is rolled back, so write it to be safe to run twice.
           </p>
           <div class="code">
             <div class="file"><b>&lt;config-dir&gt;/plugins/lint.sema</b></div>
 <pre>(<span class="kw">deftool</span> lint <span class="str">"Run the project linter and return its output."</span>
   {<span class="kw">:path</span> {<span class="kw">:type</span> <span class="kw">:string</span> <span class="kw">:description</span> <span class="str">"file or directory to lint"</span>}}
   (lambda (path)
-    (let ((r (<span class="kw">run-in-workspace</span> f<span class="str">"npx eslint ${path}"</span>)))
+    (let* ((file (<span class="kw">resolve-path</span> <span class="kw">workspace-root</span> path))
+           (r (<span class="kw">run-in-workspace</span> f<span class="str">"npx eslint ${file}"</span>)))
       (if (= (<span class="kw">:exit-code</span> r) 0)
         <span class="str">"clean"</span>
         (<span class="kw">:stdout</span> r)))))
@@ -761,9 +822,10 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
           <h4>Add completions</h4>
           <p>
             Completions feed the palette once the input reads
-            <code>/lint &lt;partial&gt;</code>. Return a list of maps; the
-            palette shows <code>:value</code> first and <code>:label</code> as
-            the description.
+            <code>/lint &lt;partial&gt;</code>. The handler takes the state and
+            nothing else: return every candidate and the palette filters them
+            against what has been typed. It shows <code>:value</code> first and
+            <code>:label</code> as the description.
           </p>
           <div class="code">
             <div class="file">same file, appended</div>
@@ -857,22 +919,6 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
           <div><div class="n">Workspace</div><div class="d"><code>workspace-root</code>, <code>run-in-workspace</code>, <code>resolve-path</code></div><div class="cap">resolve every tool path through these</div></div>
           <div><div class="n">Config</div><div class="d"><code>config-dir</code>, <code>config-path</code>, <code>tools-dir</code>, <code>*config*</code>, <code>*tui-active*</code></div><div class="cap">read-only from a plugin</div></div>
         </div>
-      </section>
-
-      <section id="turns">
-        <h2>Interrupts and sessions</h2>
-        <p class="sub">
-          Cancelling during a tool call is how an agent ends up with a
-          conversation the provider rejects: a tool call with no result. Sema
-          Coder repairs the history before the next turn starts.
-        </p>
-        <ul>
-          <li>The turn runs as an async task and a second task keeps drawing, so keys stay live and <kbd>⌃C</kbd> lands at once.</li>
-          <li>Every orphaned tool call gets a synthesized, correlated result, and the assistant text written so far is kept.</li>
-          <li>A typed control message records that you interrupted and that partial side effects are possible.</li>
-          <li><kbd>Tab</kbd> queues a follow-up instead of interrupting. <code>/queue</code> lists, edits, drops and resumes.</li>
-          <li>The full-screen interface appends each turn to a JSONL session: one meta line, then one message per line in the shape the runtime takes. It is written to a temp file and renamed, so a crash mid-write cannot truncate the old file. <code>/resume</code> restores a session verbatim. One-shot and the plain REPL do not persist.</li>
-        </ul>
       </section>
 
       <section id="commands">
@@ -991,7 +1037,6 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
               </div>
             </div>
           </div>
-          <div class="toc-item"><a href="#turns">Interrupts</a></div>
           <div class="toc-item">
             <a href="#commands">Commands</a>
             <div class="toc-sub">

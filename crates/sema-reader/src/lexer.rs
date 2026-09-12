@@ -1006,6 +1006,10 @@ fn read_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaError>
     // Rational tail: `/` immediately followed by ≥1 digit (optionally after the
     // integer body). `1/3`, `-22/7`. A `/` not followed by a digit is left to
     // the symbol lexer (so `/` and `a/b`-symbols are unaffected).
+    //
+    // A rational can be a complex component (`3/4i`, `1/2+3i`). Keep it until
+    // both complex cases have been checked.
+    let mut rational = None;
     if !is_float
         && i < chars.len()
         && chars[i] == '/'
@@ -1037,10 +1041,8 @@ fn read_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaError>
                 span: *span,
             });
         }
-        return Ok((
-            Token::Rational(num_rational::BigRational::new(numer, denom)),
-            j,
-        ));
+        rational = Some(num_rational::BigRational::new(numer, denom));
+        i = j;
     }
     let s: String = chars[..i].iter().collect();
     // Complex Case A: the leading real is the imaginary magnitude — `<real>i<delim>`
@@ -1056,6 +1058,10 @@ fn read_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaError>
             let re = parse_real_component(&s, is_float, span)?;
             return Ok((Token::Complex(re, im), consumed));
         }
+    }
+    // A standalone rational must return before the integer/float fallback.
+    if let Some(r) = rational {
+        return Ok((Token::Rational(r), i));
     }
     if is_float {
         let f: f64 = s.parse().map_err(|_| SemaError::Reader {
@@ -1726,6 +1732,30 @@ mod tests {
     }
 
     #[test]
+    fn complex_literals_with_rational_components() {
+        use num_bigint::BigInt;
+        use num_rational::BigRational;
+        use sema_core::number::SemaNumber;
+        let n = |v: i64| SemaNumber::from_i64(v);
+        let r = |a: i64, b: i64| {
+            SemaNumber::Rational(BigRational::new(BigInt::from(a), BigInt::from(b)))
+        };
+        let first = |src: &str| tokenize(src).unwrap().into_iter().next().unwrap().token;
+        // A rational imaginary magnitude with no real part (Complex Case A).
+        assert_eq!(first("3/4i"), Token::Complex(n(0), r(3, 4)));
+        // A rational real part (Complex Case B) — both with an integer and a
+        // rational imaginary magnitude.
+        assert_eq!(first("1/2+3i"), Token::Complex(r(1, 2), n(3)));
+        assert_eq!(first("1/2+3/4i"), Token::Complex(r(1, 2), r(3, 4)));
+        assert_eq!(first("1/2-3/4i"), Token::Complex(r(1, 2), r(-3, 4)));
+        // `7/2+4i` is what the printer emits for `(+ 1/2 3+4i)`, so the reader
+        // has to accept its own output.
+        assert_eq!(first("7/2+4i"), Token::Complex(r(7, 2), n(4)));
+        // Still supported: a rational magnitude on the imaginary side only.
+        assert_eq!(first("3+1/2i"), Token::Complex(n(3), r(1, 2)));
+    }
+
+    #[test]
     fn rational_literals() {
         use num_bigint::BigInt;
         use num_rational::BigRational;
@@ -1742,6 +1772,12 @@ mod tests {
         assert!(matches!(first("/"), Token::Symbol(s) if s == "/"));
         // 1.5/2 is NOT a rational (float numerator) — 1.5 then symbol
         assert_eq!(first("1.5"), Token::Float(1.5));
+        // A rational that reaches a delimiter rather than a complex tail still
+        // lexes as a rational, inside a form as well as alone.
+        assert_eq!(
+            tokenize("(1/3)").unwrap()[1].token,
+            Token::Rational(BigRational::new(BigInt::from(1), BigInt::from(3)))
+        );
     }
 
     #[test]

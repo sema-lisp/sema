@@ -1,0 +1,1111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Sema Coder — TUI draft v10</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0b0a09;
+    --pane: #100e0c;
+    --pane-2: #0d0b0a;
+    --line: #241f18;
+    --line-2: #191511;
+    --fg: #cfc9bb;
+    --fg-2: #9b9484;
+    --fg-3: #66604f;
+    --fg-4: #221f1a;
+    --gutter-lit: #6b6250;
+    --hi: #f2ece0;
+    --gold: #c8a855;
+    --gold-2: #8d7433;
+    --green: #9bb87a;
+    --red: #c97b6a;
+    --row: 27px;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14.5px/27px 'JetBrains Mono', ui-monospace, monospace;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--gold); text-decoration: none; }
+  a:hover { color: var(--hi); }
+  b, strong { color: var(--hi); font-weight: 500; }
+  .dim { color: var(--fg-3); }
+  .gold { color: var(--gold); }
+
+  /* ============ status bars ============ */
+  .statusbar {
+    position: fixed; left: 0; right: 0; z-index: 30;
+    display: flex; align-items: center; height: 34px;
+    font-size: 12px; letter-spacing: .03em;
+    background: #100d0a; border-bottom: 1px solid var(--line);
+  }
+  .statusbar.bottom { top: auto; bottom: 0; border-bottom: 0; border-top: 1px solid var(--line); }
+  .statusbar.top { top: 0; }
+  .seg { padding: 0 16px; height: 100%; display: flex; align-items: center; gap: 9px; color: var(--fg-3); }
+  .seg.brand { color: var(--hi); font-weight: 500; letter-spacing: 0; gap: 0; }
+  .seg.brand .p { color: var(--gold); }
+  .seg.right { margin-left: auto; }
+  .seg .k { color: var(--gold); }
+  .seg a { display: flex; align-items: center; gap: 8px; color: var(--fg-3); }
+  .seg a:hover { color: var(--gold); }
+  .seg a svg { width: 15px; height: 15px; fill: currentColor; display: block; }
+  @media (max-width: 820px) { .seg.hide { display: none; } }
+
+  /* ============ layout ============ */
+  .app { padding: 34px 0 0; }
+  .frame {
+    max-width: 1200px; margin: 0 auto;
+    display: grid; grid-template-columns: 62px minmax(0, 1fr) 240px;
+  }
+  .gutter {
+    border-right: 1px solid var(--line-2); padding: 54px 14px 81px 0; text-align: right;
+    color: var(--fg-4); font-size: 12px; line-height: var(--row); user-select: none; overflow: hidden;
+  }
+  .gutter span { display: block; transition: color .12s linear, text-shadow .12s linear; }
+  .gutter span.lit { color: var(--gutter-lit); text-shadow: 0 0 10px rgba(200, 168, 85, .28); }
+  .gutter span.near { color: #453f34; }
+  .body { padding: 54px 40px 81px; border-right: 1px solid var(--line-2); min-width: 0; }
+  .rail { padding: 54px 0 81px 22px; }
+  .rail-in { position: sticky; top: 62px; }
+  @media (max-width: 1040px) {
+    .frame { grid-template-columns: 1fr; }
+    .gutter { display: none; }
+    .body { border-right: 0; padding: 27px 22px 54px; }
+    .rail { padding: 0 22px 60px; border-top: 1px solid var(--line-2); }
+    .rail-in { position: static; }
+  }
+
+  /* ============ rail ============ */
+  .rail .h { font-size: 11px; letter-spacing: .18em; text-transform: uppercase; color: var(--fg-4); margin-bottom: 14px; }
+  .rail a { display: block; color: var(--fg-3); padding: 4px 0; font-size: 13px; }
+  .rail a:hover, .rail a.on { color: var(--gold); }
+  .rail .toc-item > a { display: block; color: var(--fg-3); padding: 0; line-height: var(--row); font-size: 13px; }
+  .rail .toc-item > a:hover, .rail .toc-item > a.on { color: var(--gold); }
+  .rail .toc-sub {
+    display: grid; grid-template-rows: 0fr; opacity: 0;
+    transition: grid-template-rows .28s cubic-bezier(.3,.7,.3,1), opacity .22s linear;
+  }
+  .rail .toc-item.open .toc-sub { grid-template-rows: 1fr; opacity: 1; }
+  .rail .toc-sub > div { overflow: hidden; }
+  .rail .toc-sub a {
+    display: block; font-size: 12.5px; line-height: var(--row); color: var(--fg-4);
+    padding-left: 14px; box-shadow: inset 1px 0 0 var(--line-2);
+    transform: translateX(-4px); opacity: 0;
+    transition: transform .26s cubic-bezier(.3,.7,.3,1), opacity .26s linear, color .12s;
+  }
+  .rail .toc-item.open .toc-sub a { transform: none; opacity: 1; }
+  .rail .toc-sub a:hover, .rail .toc-sub a.on { color: var(--gold); box-shadow: inset 1px 0 0 var(--gold-2); }
+  @media (prefers-reduced-motion: reduce) {
+    .rail .toc-sub, .rail .toc-sub a { transition: none; }
+  }
+
+  .rail .card {
+    margin-top: 27px; outline: 1px solid var(--line); outline-offset: -1px; border-radius: 3px;
+    padding: 13px 16px 14px; font-size: 12.5px; line-height: var(--row); color: var(--fg-3);
+  }
+  .rail .card-h {
+    color: var(--fg-4); font-size: 11px; letter-spacing: .18em; text-transform: uppercase;
+  }
+  .rail .kb { display: flex; gap: 10px; white-space: nowrap; }
+  .rail .kb span { color: var(--gold); width: 4ch; flex: none; }
+  .rail .kb.alt span { color: var(--fg-2); }
+  .rail .epigraph {
+    margin: 27px 0 0; color: var(--fg-4); font-size: 12px; line-height: var(--row);
+  }
+
+  /* ============ type ============ */
+  h1 {
+    font-weight: 700; font-size: clamp(26px, 3.4vw, 38px); line-height: 54px;
+    color: var(--hi); margin: 27px 0; letter-spacing: -.015em; max-width: 22ch;
+  }
+  h1 .g { color: var(--gold); }
+  .kicker { font-size: 12px; line-height: 27px; letter-spacing: .22em; text-transform: uppercase; color: var(--gold); margin: 0; }
+  .lede { color: var(--fg-2); max-width: 68ch; margin: 0 0 27px; font-size: 15px; line-height: 27px; }
+  .lede b { color: var(--fg); font-weight: 500; }
+
+  section { padding: 54px 0; box-shadow: inset 0 1px 0 var(--line-2); }
+  section:first-of-type { box-shadow: none; padding-top: 0; }
+  h2 { font-size: 19px; line-height: 27px; font-weight: 700; color: var(--hi); margin: 0 0 27px; letter-spacing: -.01em; }
+  h2::before { content: '# '; color: var(--gold-2); font-weight: 400; }
+  h3 {
+    font-size: 13px; line-height: 27px; font-weight: 700; color: var(--gold); margin: 27px 0 0;
+    letter-spacing: .14em; text-transform: uppercase;
+  }
+  .sub { color: var(--fg-2); max-width: 72ch; margin: 0 0 27px; line-height: 27px; }
+  .sub + .sub { margin-top: -13px; }
+
+  /* ============ facts line ============ */
+  .facts {
+    display: flex; flex-wrap: wrap; gap: 0 14px; margin: 0;
+    color: var(--fg-3); font-size: 13px; line-height: 27px;
+  }
+  .facts span b { color: var(--fg-2); font-weight: 400; }
+  .facts .s { color: var(--fg-4); }
+
+  /* ============ REAL terminal output ============ */
+  .shot { margin: 0 0 27px; }
+  .shot-label {
+    height: 27px; font-size: 12.5px; color: var(--fg-4); letter-spacing: .02em;
+  }
+  .screen {
+    outline: 1px solid var(--line); outline-offset: -1px; border-radius: 4px;
+    background: #070606; font-size: 13px; line-height: var(--row); overflow: hidden;
+  }
+  .screen .hdr, .screen .sts {
+    display: flex; gap: 18px; padding: 0 14px; height: var(--row); align-items: center;
+    color: var(--fg-3); font-size: 12.5px; white-space: nowrap; background: #0b0a09;
+  }
+  .screen .hdr { box-shadow: inset 0 -1px 0 var(--line-2); }
+  .screen .sts { box-shadow: inset 0 1px 0 var(--line-2); }
+  .screen .hdr .left { color: var(--hi); }
+  .screen .hdr .left .p { color: var(--gold); }
+  .screen .hdr .right, .screen .sts .right { margin-left: auto; }
+  .screen .rows { padding: 13px 14px 14px; overflow-x: auto; }
+  .screen .rows > div { white-space: pre; min-height: 1px; }
+  .screen .u { color: var(--hi); } .screen .u .bar { color: var(--gold); }
+  .screen .ok { color: var(--green); }
+  .screen .tool { color: var(--gold); font-weight: 500; }
+  .screen .arg { color: var(--fg-2); }
+  .screen .res, .screen .ms { color: var(--fg-3); }
+  .screen .add { color: var(--green); } .screen .del { color: var(--red); }
+  .screen .ep { color: var(--fg-4); }
+  .screen .say { color: var(--fg); }
+  .screen .g { color: var(--gold); }
+  .screen .behind { opacity: .28; }
+  .screen .rows > div.modal {
+    outline: 1px solid var(--gold-2); outline-offset: -1px; border-radius: 2px;
+    background: #0a0908; margin: 0 0 0 2ch; max-width: 62ch; position: relative;
+    padding: 13px 0 14px; white-space: normal;
+  }
+  .screen .modal-t {
+    position: absolute; top: -10px; left: 2ch; padding: 0 8px; background: #070606;
+    color: var(--gold); font-size: 12px;
+  }
+  .screen .modal-r, .screen .modal-f { padding: 0 14px; white-space: pre; line-height: var(--row); }
+  .screen .modal-f { margin-top: 13px; padding-top: 13px; box-shadow: inset 0 1px 0 var(--line); }
+  .screen .modal .pad { white-space: pre; }
+  .cursor {
+    display: inline-block; width: 8px; height: 15px; background: var(--gold);
+    vertical-align: -3px; animation: bl 1.15s steps(1) infinite;
+  }
+  @keyframes bl { 50% { opacity: 0 } }
+  @media (prefers-reduced-motion: reduce) { .cursor { animation: none } }
+  .caption { color: var(--fg-3); font-size: 12.5px; line-height: var(--row); max-width: 78ch; margin: 0; }
+
+  /* ============ code samples (never framed like a terminal) ============ */
+  .code { margin: 0 0 27px; }
+  .code .file {
+    font-size: 12px; line-height: 27px; color: var(--fg-3); letter-spacing: .04em;
+  }
+  .code .file b { color: var(--fg-2); font-weight: 500; }
+  .code pre {
+    margin: 0; padding: 0 0 0 18px; box-shadow: inset 1px 0 0 var(--line);
+    white-space: pre; overflow-x: auto; font: 13px/var(--row) inherit; color: #c9c3b6;
+  }
+  /* Inside a step the sample gets the editor treatment the UI library uses:
+     darker ground, faint border, padded like a frame. */
+  .step .code pre {
+    background: #070707; border-radius: 3px; padding: 13px 16px 14px;
+    box-shadow: inset 0 0 0 1px var(--line);
+  }
+  .step .code .file { color: var(--fg-4); }
+  .str { color: var(--green); } .kw { color: var(--gold); } .cm { color: var(--fg-3); }
+
+  /* ============ tables ============ */
+  table { width: 100%; border-collapse: collapse; margin: 0 0 27px; }
+  td, th { padding: 13px 20px 14px 0; vertical-align: top; box-shadow: inset 0 1px 0 var(--line-2); line-height: var(--row); text-align: left; }
+  th { color: var(--fg-3); font-weight: 400; font-size: 11.5px; letter-spacing: .12em; text-transform: uppercase; box-shadow: none; padding: 0 20px 0 0; }
+  thead + tbody tr:first-child td { box-shadow: inset 0 1px 0 var(--line-2); }
+  td:first-child { color: var(--gold); white-space: nowrap; font-size: 13.5px; }
+  td:last-child { color: var(--fg-2); }
+  td code, li code, .sub code, p code { color: var(--gold); }
+  table.k3 td:nth-child(2) { color: var(--fg-3); white-space: nowrap; font-size: 13px; }
+  /* the command reference: keep the description column wide */
+  table.cmds td:first-child { width: 13ch; }
+  table.cmds td:nth-child(2) { width: 24ch; white-space: normal; }
+  @media (max-width: 820px) {
+    table, tbody, tr, td, th { display: block; }
+    th { display: none; }
+    td { border-top: 0; padding: 2px 0; }
+    tr { border-top: 1px solid var(--line-2); padding: 10px 0; display: block; }
+  }
+
+  /* ============ lists ============ */
+  ul { list-style: none; padding: 0; }
+  ul { margin: 0 0 27px; }
+  ul li {
+    padding: 13px 0 13px 24px; position: relative; color: var(--fg-2);
+    box-shadow: inset 0 1px 0 var(--line-2); line-height: var(--row); max-width: 84ch;
+  }
+  ul li:first-child { box-shadow: none; }
+  ul li::before { content: '›'; position: absolute; left: 4px; top: 13px; line-height: var(--row); color: var(--gold-2); }
+
+  /* ============ steps (progressive example) ============ */
+  .step { box-shadow: inset 1px 0 0 var(--line); padding: 0 0 0 22px; margin: 0 0 27px; position: relative; }
+  .step::before {
+    content: attr(data-n); position: absolute; left: -14px; top: 0;
+    width: 26px; height: 26px; border-radius: 50%; background: var(--bg);
+    border: 1px solid var(--line); color: var(--gold); font-size: 12px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .step h4 { margin: 0; font-size: 15px; line-height: var(--row); color: var(--hi); font-weight: 500; }
+  .step p { margin: 0 0 27px; color: var(--fg-2); max-width: 74ch; font-size: 14px; line-height: var(--row); }
+
+  /* ============ commands ============ */
+  .cmd {
+    display: flex; align-items: center; gap: 14px; max-width: 100%;
+    outline: 1px solid var(--line); outline-offset: -1px; border-radius: 3px;
+    background: var(--pane-2); padding: 13px 15px 14px; margin: 0;
+    font-size: 13.5px; line-height: var(--row);
+  }
+  .cmd .n { color: var(--fg-4); flex: none; width: 2ch; }
+  .cmd .p { color: var(--gold); }
+  .cmd .c { overflow-x: auto; white-space: nowrap; flex: 1; }
+  .cmd button {
+    font: 11px/1 'JetBrains Mono', monospace; text-transform: uppercase; letter-spacing: .14em;
+    background: transparent; color: var(--fg-3); border: 1px solid var(--line);
+    border-radius: 3px; padding: 7px 11px; cursor: pointer; flex: none;
+  }
+  .cmd button:hover { color: var(--gold); border-color: var(--gold-2); }
+  .meta { color: var(--fg-3); font-size: 12.5px; margin: 27px 0 0; line-height: var(--row); }
+</style>
+</head>
+<body>
+
+<div class="statusbar top">
+  <span class="seg brand"><span class="p">(</span>sema<span class="p">)</span>&nbsp;coder</span>
+  <span class="seg right hide">v0.3.0 · MIT</span>
+  <span class="seg">
+    <a href="https://github.com/sema-lisp/sema-coder" aria-label="GitHub repository">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      github
+    </a>
+  </span>
+</div>
+
+<div class="app">
+  <div class="frame">
+
+    <div class="gutter" id="gutter" aria-hidden="true"></div>
+
+    <div class="body" id="body">
+
+      <section id="top">
+        <p class="kicker">sema-coder</p>
+        <h1>A coding agent, <span class="g">written in Sema.</span></h1>
+        <p class="lede">
+          It edits files, runs commands, and searches code from the terminal.
+          The agent loop, the ten tools, the full-screen interface, the MCP
+          client and the config language are <b>.sema</b> files in one
+          repository. Nothing is compiled. The only thing to install is the
+          <b>sema</b> binary.
+        </p>
+        <div class="facts">
+          <span><b>~7,000 lines</b> of Sema</span><span class="s">·</span>
+          <span><b>23</b> source files</span><span class="s">·</span>
+          <span><b>10</b> tools</span><span class="s">·</span>
+          <span><b>no</b> build step</span><span class="s">·</span>
+          <span><b>MIT</b></span>
+        </div>
+      </section>
+
+      <section id="start">
+        <h2>Get started</h2>
+        <p class="sub">
+          Three commands. The first installs the interpreter, the second gets
+          the agent, the third runs it.
+        </p>
+        <div class="cmd"><span class="n">1</span><span class="p">$</span><span class="c" id="c1">curl -fsSL https://sema-lang.com/install.sh | sh</span><button onclick="cp('c1', this)">copy</button></div>
+        <div class="cmd"><span class="n">2</span><span class="p">$</span><span class="c" id="c2">git clone https://github.com/sema-lisp/sema-coder &amp;&amp; cd sema-coder</span><button onclick="cp('c2', this)">copy</button></div>
+        <div class="cmd"><span class="n">3</span><span class="p">$</span><span class="c" id="c3">export ANTHROPIC_API_KEY=… &amp;&amp; ./coder.sema</span><button onclick="cp('c3', this)">copy</button></div>
+        <p class="meta">
+          Needs sema 1.35 or newer, and one of ANTHROPIC_API_KEY or
+          OPENAI_API_KEY. Homebrew (<code>brew install helgesverre/tap/sema-lang</code>)
+          and <code>cargo install sema-lang</code> also work. Install
+          <code>rg</code> and the grep tool uses it instead of <code>grep</code>.
+        </p>
+      </section>
+
+      <section id="session">
+        <h2>What a session looks like</h2>
+        <p class="sub">
+          The header shows the model and the running token and cost totals.
+          Each finished tool call is one line with its duration, followed by up
+          to five lines of its result. The bottom line reports what the agent is
+          doing now.
+        </p>
+
+        <div class="shot">
+          <div class="shot-label">; Sema Coder as it renders in a terminal</div>
+          <div class="screen">
+            <div class="hdr">
+              <span class="left"><span class="p">(</span>sema<span class="p">)</span> coder</span>
+              <span class="right">claude-opus-5 · ↑18.4k ↓2.1k · $0.0713</span>
+            </div>
+            <div class="rows">
+<div class="ep"> ; the parens never lie; the logic sometimes does.</div>
+<div> </div>
+<div class="u"> <span class="bar">▌</span> add a --version flag to the runner and a test for it</div>
+<div> </div>
+<div><span class="ok"> ✔</span> <span class="tool">read-file</span> <span class="arg">test.sema</span> <span class="ms">3ms</span></div>
+<div class="res">     1  #!/usr/bin/env sema</div>
+<div class="res">     2  ;; test.sema — sema-coder's test runner, written in Sema</div>
+<div class="res">     3  ;;</div>
+<div class="res">     4  ;; Usage:</div>
+<div class="res">     5  ;;   ./test.sema            run every tests/*_test.sema</div>
+<div class="res">     … +138 lines</div>
+<div> </div>
+<div><span class="ok"> ✔</span> <span class="tool">edit-file</span> <span class="arg">test.sema</span> <span class="ms">5ms</span></div>
+<div class="res">     <span class="del">- (defun main (argv)</span></div>
+<div class="res">     <span class="add">+ (defun main (argv)</span></div>
+<div class="res">     <span class="add">+   (when (member "--version" argv)</span></div>
+<div class="res">     <span class="add">+     (display f"test.sema ${VERSION}\n")</span></div>
+<div class="res">     … +6 lines</div>
+<div> </div>
+<div><span class="ok"> ✔</span> <span class="tool">bash</span> <span class="arg">./test.sema tests/cli_test.sema</span> <span class="ms">4212ms</span></div>
+<div class="res">     ok  tests/cli_test.sema — 14 checks</div>
+<div class="res">     312 checks, 0 failed</div>
+<div> </div>
+<div class="say"> Added the flag and a case in tests/cli_test.sema that runs the</div>
+<div class="say"> runner with --version and checks the output against VERSION.</div>
+<div class="say"> The suite is green: 312 checks, 0 failed.</div>
+<div> </div>
+<div> <span class="g">❯</span> <span class="cursor"></span></div>
+            </div>
+            <div class="sts">
+              <span>⠹ evaluating · 4.2s · tab queues · enter interrupts and sends</span>
+              <span class="right">↕ scrolled +0</span>
+            </div>
+          </div>
+        </div>
+        <p class="caption">
+          Every frame is rebuilt as a list of rows and compared with the
+          previous frame. Only changed rows are rewritten, so there is no clear
+          and no flicker, and scrolling never re-parses the markdown.
+        </p>
+      </section>
+
+      <section id="modes">
+        <h2>Ways to run it</h2>
+        <p class="sub">
+          Arguments for the interpreter come first. Everything after
+          <code>--</code> belongs to Sema Coder.
+        </p>
+        <div class="code">
+          <div class="file">shell</div>
+<pre>$ <span class="kw">./coder.sema</span>                                   <span class="cm">; full-screen interface</span>
+$ <span class="kw">./coder.sema</span> -- -p <span class="str">"explain this codebase"</span>     <span class="cm">; one shot, prose, exit</span>
+$ <span class="kw">./coder.sema</span> -- --json -p <span class="str">"..."</span>                <span class="cm">; one JSON document</span>
+$ <span class="kw">./coder.sema</span> -- -m claude-haiku-4-5            <span class="cm">; pick the model</span>
+$ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"review this"</span>    <span class="cm">; stdin in a &lt;stdin&gt; block</span></pre>
+        </div>
+        <table>
+          <tbody>
+            <tr><td>terminal</td><td>The full-screen interface: streamed turns, scrollback, selection, modal overlays.</td></tr>
+            <tr><td>no TTY</td><td>Without <code>--print</code> it falls back to a line-based REPL.</td></tr>
+            <tr><td>--print</td><td>Runs one prompt, prints prose to stdout, exits.</td></tr>
+            <tr><td>--json</td><td>Prints one JSON object: status, model, effort, usage, elapsed_ms, and response or error. Requires <code>--print</code>. A failure exits non-zero.</td></tr>
+            <tr><td>stdin</td><td>Appended to the prompt inside a <code>&lt;stdin&gt;</code> block when stdin is not a terminal.</td></tr>
+            <tr><td>AGENTS.md</td><td>An AGENTS.md or CLAUDE.md in the workspace is added to the system prompt, 32 KB each at most.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="tools">
+        <h2>Ten tools</h2>
+        <p class="sub">
+          Every result is capped, so one large file or one noisy command cannot
+          fill the context window.
+        </p>
+        <table>
+          <thead><tr><th>tool</th><th>what it does</th></tr></thead>
+          <tbody>
+            <tr><td>read-file</td><td>Line-numbered read. Refuses binaries and files over 2 MB. Caps at 2,000 lines.</td></tr>
+            <tr><td>write-file</td><td>Create or overwrite. Creates parent directories. Reports the previous size.</td></tr>
+            <tr><td>edit-file</td><td>Replace one exact string. Needs a unique match unless <code>replace_all</code>. Returns a diff, 60 lines at most.</td></tr>
+            <tr><td>bash</td><td>Shell command in the workspace. 120-second default timeout. <code>background=true</code> returns a task id at once.</td></tr>
+            <tr><td>task-output</td><td>Read a background task's retained output and status.</td></tr>
+            <tr><td>task-list</td><td>List background tasks in this process.</td></tr>
+            <tr><td>task-stop</td><td>Terminate one. On Unix the whole process group is killed.</td></tr>
+            <tr><td>grep</td><td>Prefers <code>rg</code>, falls back to <code>grep</code>. Run argv-style, so a pattern cannot reach a shell.</td></tr>
+            <tr><td>find-files</td><td>Glob search. Skips .git, node_modules and target.</td></tr>
+            <tr><td>list-dir</td><td>One directory, long format.</td></tr>
+          </tbody>
+        </table>
+        <p class="caption">
+          Every file and search path goes through <code>path/within?</code>,
+          which resolves symlinks, so <code>../</code> and symlink escapes fail.
+          The <code>bash</code> tool is not covered. It runs real commands with
+          your privileges. This is accident prevention, not a sandbox.
+        </p>
+      </section>
+
+      <section id="mcp">
+        <h2>MCP client</h2>
+        <p class="sub">
+          Sema Coder connects to MCP servers over stdio or HTTP and merges their
+          tools into the agent. <code>⌃O</code> opens the manager over the
+          transcript. The server configured by default is Sema's own, so the
+          agent can evaluate Sema and read Sema docs while it edits Sema.
+        </p>
+
+        <div class="shot">
+          <div class="shot-label">; the MCP manager, open over a session</div>
+          <div class="screen">
+            <div class="hdr">
+              <span class="left"><span class="p">(</span>sema<span class="p">)</span> coder</span>
+              <span class="right">claude-opus-5 · ↑18.4k ↓2.1k · $0.0713</span>
+            </div>
+            <div class="rows">
+<div class="behind"> <span class="ok">✔</span> <span class="tool">grep</span> <span class="arg">register-tool! src/</span> <span class="ms">11ms</span></div>
+<div class="behind">     src/tools.sema:741  (defun register-tool! (name)</div>
+<div class="behind">     … +3 lines</div>
+<div class="behind"> </div>
+<div> </div>
+<div class="modal">
+  <div class="modal-t">MCP servers</div>
+  <div class="modal-r"><span class="ok">●</span> sema<span class="pad">        </span><span class="res">connected · 3 tools</span></div>
+  <div class="modal-r"><span class="g">▲</span> asana<span class="pad">       </span><span class="res">needs auth — press c to sign in</span></div>
+  <div class="modal-r"><span class="res">◌</span> <span class="res">filesystem</span><span class="pad">  </span><span class="res">idle — press c to connect</span></div>
+  <div class="modal-f"><span class="res">↑↓ move · c connect · d disconnect · ⏎ tools · e edit</span></div>
+</div>
+<div class="behind"> </div>
+<div class="behind"> <span class="g">❯</span></div>
+            </div>
+            <div class="sts"><span>esc closes the overlay</span><span class="right">3 servers</span></div>
+          </div>
+        </div>
+
+        <table>
+          <tbody>
+            <tr><td>stdio</td><td><code>:command</code> and <code>:args</code>, with optional <code>:env</code> and <code>:cwd</code>.</td></tr>
+            <tr><td>http</td><td><code>:url</code>, with optional <code>:headers</code>. OAuth is prompted when you connect.</td></tr>
+            <tr><td>:autostart #t</td><td>Connects at boot, before the full-screen interface opens, so a first sign-in is visible.</td></tr>
+            <tr><td>timeout</td><td>15 seconds by default; <code>:connect-timeout-ms</code> overrides it per server.</td></tr>
+            <tr><td>statuses</td><td>idle, connecting, connected, needs-auth, error. A 401 or an auth error becomes needs-auth.</td></tr>
+            <tr><td>collisions</td><td>A built-in tool wins over an MCP tool of the same name. Between servers the first to connect wins. <code>/tools</code> shows which server each tool came from.</td></tr>
+            <tr><td>reload</td><td>A live connection survives a config reload only if its endpoint is unchanged. Removed or changed servers are closed.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="config">
+        <h2>Configuration</h2>
+        <p class="sub">
+          Config is Sema data, not JSON. <code>init.sema</code> calls
+          <code>(configure! (coder-config {…}))</code> and is written on first
+          run. Because it is code, a command can be a lambda and a hook can
+          close over state.
+        </p>
+
+        <h3 id="cfg-files">Where files live</h3>
+        <table class="k3">
+          <tbody>
+            <tr><td>init.sema</td><td>&lt;config-dir&gt;</td><td>The config itself. Watched by the full-screen interface.</td></tr>
+            <tr><td>tools/*.sema</td><td>&lt;config-dir&gt;</td><td>Persistent agent tools. Reconciled at boot and on every config apply.</td></tr>
+            <tr><td>plugins/*.sema</td><td>&lt;config-dir&gt;</td><td>Global plugins, loaded once at boot.</td></tr>
+            <tr><td>sessions/*.jsonl</td><td>&lt;config-dir&gt;</td><td>Saved sessions. 200 kept, oldest pruned.</td></tr>
+            <tr><td>.sema-coder/plugins/</td><td>project</td><td>Project plugins. Loaded after the global ones, so they can shadow.</td></tr>
+          </tbody>
+        </table>
+        <p class="caption">
+          &lt;config-dir&gt; is <code>$SEMA_CODER_CONFIG_DIR</code> when set,
+          otherwise the OS config directory plus <code>sema/sema-coder</code>:
+          <code>~/Library/Application Support/sema/sema-coder</code> on macOS,
+          <code>$XDG_CONFIG_HOME</code> or <code>~/.config</code> below it on
+          Linux. <code>/config</code> prints the path and <code>/config edit</code>
+          opens it.
+        </p>
+
+        <h3 id="cfg-keys">Every top-level key</h3>
+        <table class="k3">
+          <thead><tr><th>key</th><th>default</th><th>meaning and validation</th></tr></thead>
+          <tbody>
+            <tr><td>:model</td><td>"claude-opus-5"</td><td>String. An empty string auto-detects from whichever API key is set.</td></tr>
+            <tr><td>:effort</td><td>""</td><td>String: none, minimal, low, medium, high, xhigh. Empty means the provider default.</td></tr>
+            <tr><td>:max-turns</td><td>50</td><td>Positive integer. Tool-use rounds allowed in one user turn.</td></tr>
+            <tr><td>:tool-preview-lines</td><td>5</td><td>Positive integer. Result lines shown under each settled tool call.</td></tr>
+            <tr><td>:models</td><td>Anthropic + OpenAI</td><td>List of <code>(provider …)</code> groups holding <code>(model …)</code> records. Drives completion, API-key hints and provider routing.</td></tr>
+            <tr><td>:mcp-servers</td><td>'()</td><td>List of <code>(mcp-server …)</code> records. Transport must resolve to stdio or http.</td></tr>
+            <tr><td>:commands</td><td>'()</td><td>List of <code>(command …)</code> records. Exactly one of <code>:run</code>, <code>:shell</code>, <code>:do</code>.</td></tr>
+            <tr><td>:hooks</td><td>'()</td><td>List of <code>(hook …)</code> records. The event must be one of the seven below.</td></tr>
+            <tr><td>:keys</td><td>{}</td><td>Map of action keyword to a non-empty key string.</td></tr>
+          </tbody>
+        </table>
+        <p class="caption">
+          An unknown top-level key produces a warning and is ignored, never a
+          failure.
+        </p>
+
+        <h3 id="cfg-ctors">Constructors</h3>
+        <div class="code">
+          <div class="file"><b>init.sema</b> — the full surface</div>
+<pre>(<span class="kw">configure!</span>
+  (<span class="kw">coder-config</span>
+    {<span class="kw">:model</span>     <span class="str">"claude-opus-5"</span>     <span class="cm">; "" = detect from the API keys</span>
+     <span class="kw">:effort</span>    <span class="str">""</span>                  <span class="cm">; none|minimal|low|medium|high|xhigh</span>
+     <span class="kw">:max-turns</span> 50
+     <span class="kw">:tool-preview-lines</span> 5
+
+     <span class="cm">; Models offered by /model. Any id typed by hand still works.</span>
+     <span class="kw">:models</span>
+     (list
+       (<span class="kw">provider</span> <span class="str">"Anthropic"</span>
+         (list
+           (<span class="kw">model</span> <span class="str">"claude-opus-5"</span>    <span class="str">"Claude Opus 5"</span>)
+           (<span class="kw">model</span> <span class="str">"claude-haiku-4-5"</span> <span class="str">"Claude Haiku 4.5"</span> {<span class="kw">:effort</span> <span class="str">"low"</span>})))
+       (<span class="kw">provider</span> <span class="str">"OpenAI"</span>
+         (list (<span class="kw">model</span> <span class="str">"gpt-5.6-sol"</span> <span class="str">"GPT-5.6 Sol"</span>))))
+
+     <span class="cm">; MCP servers. stdio takes :command/:args, http takes :url.</span>
+     <span class="kw">:mcp-servers</span>
+     (list
+       (<span class="kw">mcp-server</span> <span class="str">"sema"</span>
+         {<span class="kw">:command</span> <span class="str">"sema"</span>
+          <span class="kw">:args</span> [<span class="str">"mcp"</span> <span class="str">"--include"</span> <span class="str">"eval,docs,docs_search"</span>]
+          <span class="kw">:env</span> {} <span class="kw">:cwd</span> <span class="str">"."</span>
+          <span class="kw">:autostart</span> #t
+          <span class="kw">:connect-timeout-ms</span> 15000})
+       (<span class="kw">mcp-server</span> <span class="str">"asana"</span> {<span class="kw">:url</span> <span class="str">"https://mcp.asana.com/mcp"</span>}))
+
+     <span class="cm">; Slash commands. Exactly one of :run, :shell, :do.</span>
+     <span class="kw">:commands</span>
+     (list
+       (<span class="kw">command</span> <span class="str">"test"</span> {<span class="kw">:desc</span> <span class="str">"run tests"</span> <span class="kw">:run</span> [<span class="str">"make"</span> <span class="str">"test"</span>] <span class="kw">:key</span> <span class="str">"ctrl-t"</span>})
+       (<span class="kw">command</span> <span class="str">"log"</span>  {<span class="kw">:desc</span> <span class="str">"git log"</span>   <span class="kw">:run</span> [<span class="str">"git"</span> <span class="str">"log"</span> <span class="str">"--oneline"</span> <span class="kw">:args</span>]})
+       (<span class="kw">command</span> <span class="str">"diff"</span> {<span class="kw">:desc</span> <span class="str">"wc diff"</span>   <span class="kw">:shell</span> <span class="str">"git diff $ARGS"</span>})
+       (<span class="kw">command</span> <span class="str">"hi"</span>   {<span class="kw">:desc</span> <span class="str">"greet"</span> <span class="kw">:keep-input</span> #t
+                       <span class="kw">:do</span> (lambda (state args)
+                             (emit <span class="kw">:info</span> <span class="str">"hi!"</span>)
+                             state)}))
+
+     <span class="cm">; Lifecycle observers. The return value is ignored.</span>
+     <span class="kw">:hooks</span>
+     (list
+       (<span class="kw">hook</span> <span class="kw">:turn-interrupted</span>
+         (lambda (ctx) (file/write <span class="str">"last-interrupted.txt"</span> (<span class="kw">:turn-id</span> ctx)))))
+
+     <span class="cm">; Rebind any action.</span>
+     <span class="kw">:keys</span> {<span class="kw">:mcp</span> <span class="str">"ctrl-p"</span> <span class="kw">:resume</span> <span class="str">"ctrl-j"</span>}}))</pre>
+        </div>
+
+        <h3 id="cfg-commands">Command forms</h3>
+        <table>
+          <tbody>
+            <tr><td>:run</td><td>An argv list, never passed to a shell. <code>:args</code> marks where the user's arguments splice in; it is dropped when empty and appended when absent.</td></tr>
+            <tr><td>:shell</td><td>A template string run through the shell. <code>$ARGS</code> is replaced with the user's arguments.</td></tr>
+            <tr><td>:do</td><td>A <code>(lambda (state args) …)</code> returning the next state, or <code>'quit</code> to exit.</td></tr>
+            <tr><td>:desc</td><td>The line shown by <code>/help</code> and the palette.</td></tr>
+            <tr><td>:key</td><td>A key binding for this command. Weaker than the <code>:keys</code> map.</td></tr>
+            <tr><td>:keep-input</td><td>Leaves the prompt text intact when the command runs from the palette.</td></tr>
+          </tbody>
+        </table>
+
+        <h3 id="cfg-hooks">Hook events</h3>
+        <table>
+          <tbody>
+            <tr><td>:session-start</td><td><code>{:cwd}</code></td></tr>
+            <tr><td>:pre-turn</td><td><code>{:input :messages}</code></td></tr>
+            <tr><td>:pre-tool-call</td><td><code>{:tool :args}</code></td></tr>
+            <tr><td>:post-turn</td><td><code>{:input :result}</code></td></tr>
+            <tr><td>:on-error</td><td><code>{:input :error}</code></td></tr>
+            <tr><td>:turn-queued</td><td><code>{:entry}</code></td></tr>
+            <tr><td>:turn-interrupted</td><td><code>{:input :messages :turn-id}</code></td></tr>
+          </tbody>
+        </table>
+        <p class="caption">
+          A handler that throws is caught and ignored, so a hook cannot break a
+          turn or the interface.
+        </p>
+
+        <h3 id="cfg-keymap">Default key map</h3>
+        <table class="k3">
+          <tbody>
+            <tr><td>:mcp</td><td>ctrl-o</td><td>Open the MCP manager.</td></tr>
+            <tr><td>:resume</td><td>ctrl-r</td><td>Open the session picker.</td></tr>
+            <tr><td>:palette</td><td>ctrl-k</td><td>Open the command palette.</td></tr>
+            <tr><td>:quit</td><td>ctrl-d</td><td>Exit.</td></tr>
+            <tr><td>:interrupt</td><td>ctrl-c</td><td>Cancel the running turn.</td></tr>
+            <tr><td>:clear-line</td><td>ctrl-u</td><td>Clear the prompt.</td></tr>
+            <tr><td>:kill-word</td><td>ctrl-w</td><td>Delete the word before the caret.</td></tr>
+            <tr><td>:yank</td><td>ctrl-y</td><td>Paste what was killed.</td></tr>
+            <tr><td>:expand-tools</td><td>ctrl-x</td><td>Show full tool results instead of the preview.</td></tr>
+            <tr><td>:line-start</td><td>ctrl-a</td><td>Move to the start of the line.</td></tr>
+            <tr><td>:line-end</td><td>ctrl-e</td><td>Move to the end of the line.</td></tr>
+            <tr><td>:repaint</td><td>ctrl-l</td><td>Redraw the screen.</td></tr>
+          </tbody>
+        </table>
+        <p class="caption">
+          Four layers merge, weakest first: these defaults, a command's own
+          <code>:key</code>, the config <code>:keys</code> map, then runtime
+          <code>bind-key!</code> calls. A key bound to two actions is reported at
+          boot and the first match wins. Tab, Enter, Shift-Enter, the arrow keys
+          and Page Up/Down are fixed.
+        </p>
+
+        <h3 id="cfg-precedence">Precedence and reload</h3>
+        <ul>
+          <li>Model: the <code>--model</code> flag or the current <code>/model</code> override, then <code>:model</code>, then detection from the API keys.</li>
+          <li>Effort: the current <code>/effort</code> override, then the selected model record's <code>:effort</code>, then the top-level <code>:effort</code>, then the provider default.</li>
+          <li>Loading is pure. A file that does not parse reconciles nothing and leaves the last good commands, servers, hooks and tools running.</li>
+          <li>One apply path is shared by boot, <code>/reload</code> and the file watch. It reconciles commands, MCP servers, hooks and the <code>tools/</code> directory, then autostarts servers.</li>
+          <li>The full-screen interface watches the config directory and applies a valid save. The plain REPL does not watch; use <code>/reload</code>.</li>
+          <li>The first-run template is generated from the provider table, so the model list in your config cannot drift from the code.</li>
+        </ul>
+
+        <h3 id="cfg-cmds">Related commands</h3>
+        <table>
+          <tbody>
+            <tr><td>/config</td><td>Print the active <code>init.sema</code> path. <code>/config edit</code> opens it.</td></tr>
+            <tr><td>/reload</td><td>Reload and validate, then reconcile commands, hooks, servers, tools and the agent.</td></tr>
+            <tr><td>/model, /effort</td><td>Show or change the model and reasoning effort for this session.</td></tr>
+            <tr><td>/tools</td><td>List built-in, autoloaded and MCP tools, with the server each MCP tool came from.</td></tr>
+            <tr><td>/debug doctor</td><td>Secret-safe checks: sema version against the 1.35 floor, which API keys are present, config validity, session directory, ripgrep, MCP status, resolved model.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="extend">
+        <h2>Extending it, step by step</h2>
+        <p class="sub">
+          A plugin is one <code>.sema</code> file. Global plugins live in
+          <code>&lt;config-dir&gt;/plugins/</code> and load first; project
+          plugins live in <code>.sema-coder/plugins/</code> and load after, so
+          they can shadow. A plugin is loaded once at boot, after
+          <code>init.sema</code> is applied. A plugin that throws prints an
+          error; the agent still starts.
+        </p>
+        <p class="sub">
+          The example below builds one plugin that gives the agent a way to run
+          the project's linter, and gives you a command and a key for it. Each
+          step adds to the same file.
+        </p>
+
+        <div class="step" id="step-1" data-n="1">
+          <h4>Give the agent a tool</h4>
+          <p>
+            <code>deftool</code> declares the name, the description the model
+            reads, and the parameters. <code>register-tool!</code> puts it in
+            the agent's tool set. The handler returns the string the agent sees.
+          </p>
+          <div class="code">
+            <div class="file"><b>&lt;config-dir&gt;/plugins/lint.sema</b></div>
+<pre>(<span class="kw">deftool</span> lint <span class="str">"Run the project linter and return its output."</span>
+  {<span class="kw">:path</span> {<span class="kw">:type</span> <span class="kw">:string</span> <span class="kw">:description</span> <span class="str">"file or directory to lint"</span>}}
+  (lambda (path)
+    (let ((r (<span class="kw">run-in-workspace</span> f<span class="str">"npx eslint ${path}"</span>)))
+      (if (= (<span class="kw">:exit-code</span> r) 0)
+        <span class="str">"clean"</span>
+        (<span class="kw">:stdout</span> r)))))
+
+(<span class="kw">register-tool!</span> lint)</pre>
+          </div>
+        </div>
+
+        <div class="step" id="step-2" data-n="2">
+          <h4>Add a slash command</h4>
+          <p>
+            The handler takes the state map and the text after the command, and
+            returns the next state. Write output with <code>emit</code>, never
+            with <code>display</code>, so the same command works in the
+            full-screen interface and in the plain REPL.
+          </p>
+          <div class="code">
+            <div class="file">same file, appended</div>
+<pre>(<span class="kw">register-command!</span> <span class="str">"lint"</span> <span class="str">"lint the file under discussion"</span>
+  (lambda (state args)
+    (let ((r (<span class="kw">run-in-workspace</span> f<span class="str">"npx eslint ${(if (= args "") "." args)}"</span>)))
+      (<span class="kw">emit</span> (if (= (<span class="kw">:exit-code</span> r) 0) <span class="kw">:ok</span> <span class="kw">:error</span>)
+            (if (= (<span class="kw">:exit-code</span> r) 0) <span class="str">"clean"</span> (<span class="kw">:stdout</span> r)))
+      state)))</pre>
+          </div>
+        </div>
+
+        <div class="step" id="step-3" data-n="3">
+          <h4>Complete its arguments</h4>
+          <p>
+            Completions feed the palette once the input reads
+            <code>/lint &lt;partial&gt;</code>. Return a list of maps; the
+            palette shows <code>:value</code> first and <code>:label</code> as
+            the description.
+          </p>
+          <div class="code">
+            <div class="file">same file, appended</div>
+<pre>(<span class="kw">register-completions!</span> <span class="str">"lint"</span>
+  (lambda (state)
+    (map (lambda (f) {<span class="kw">:value</span> f <span class="kw">:label</span> <span class="str">"changed file"</span>})
+         (string/split
+           (string/trim (<span class="kw">:stdout</span> (<span class="kw">run-in-workspace</span> <span class="str">"git diff --name-only"</span>)))
+           <span class="str">"\n"</span>))))</pre>
+          </div>
+        </div>
+
+        <div class="step" id="step-4" data-n="4">
+          <h4>Bind a key</h4>
+          <p>
+            A key can be bound to a built-in action or to a command name.
+            Runtime binds are the strongest layer and survive a config reload.
+          </p>
+          <div class="code">
+            <div class="file">same file, appended</div>
+<pre>(<span class="kw">bind-key!</span> <span class="str">"ctrl-g"</span> <span class="str">"lint"</span>)</pre>
+          </div>
+        </div>
+
+        <div class="step" id="step-5" data-n="5">
+          <h4>React to the turn lifecycle</h4>
+          <p>
+            Hooks observe; their return value is ignored and an exception is
+            swallowed. From a hook use <code>add-block!</code> rather than
+            <code>emit</code>, because a hook runs outside command dispatch.
+          </p>
+          <div class="code">
+            <div class="file">same file, appended</div>
+<pre>(<span class="kw">add-hook!</span> <span class="kw">:post-turn</span>
+  (lambda (ctx)
+    (let ((r (<span class="kw">run-in-workspace</span> <span class="str">"npx eslint ."</span>)))
+      (when (not (= (<span class="kw">:exit-code</span> r) 0))
+        (<span class="kw">add-block!</span> {<span class="kw">:kind</span> <span class="kw">:warn</span> <span class="kw">:text</span> <span class="str">"lint is failing"</span>})))))</pre>
+          </div>
+        </div>
+
+        <div class="step" id="step-6" data-n="6">
+          <h4>What it looks like in use</h4>
+          <p>
+            Restart the agent; plugin edits are not hot-reloaded, because a
+            plugin may add hooks and reloading would register them twice. The
+            tool is now in <code>/tools</code>, the command is in
+            <code>/help</code>, and <code>⌃G</code> runs it.
+          </p>
+          <div class="shot">
+            <div class="shot-label">; after restart</div>
+            <div class="screen">
+              <div class="hdr">
+                <span class="left"><span class="p">(</span>sema<span class="p">)</span> coder</span>
+                <span class="right">claude-opus-5 · ↑2.1k ↓310 · $0.0094</span>
+              </div>
+              <div class="rows">
+<div class="u"> <span class="bar">▌</span> /tools</div>
+<div class="res">   read-file   write-file   edit-file   bash   grep   find-files</div>
+<div class="res">   list-dir    task-output  task-list   task-stop</div>
+<div class="res">   lint        <span class="dim">· plugin</span></div>
+<div class="res">   eval  docs  docs_search   <span class="dim">· mcp:sema</span></div>
+<div> </div>
+<div class="u"> <span class="bar">▌</span> fix the lint errors in src/cli.sema</div>
+<div> </div>
+<div><span class="ok"> ✔</span> <span class="tool">lint</span> <span class="arg">src/cli.sema</span> <span class="ms">1840ms</span></div>
+<div class="res">     src/cli.sema:41:3  warning  unexpected console statement</div>
+<div class="res">     1 problem (0 errors, 1 warning)</div>
+<div> </div>
+<div><span class="ok"> ✔</span> <span class="tool">edit-file</span> <span class="arg">src/cli.sema</span> <span class="ms">4ms</span></div>
+<div class="res">     <span class="del">- (display f"debug: ${argv}\n")</span></div>
+<div> </div>
+<div><span class="ok"> ✔</span> <span class="tool">lint</span> <span class="arg">src/cli.sema</span> <span class="ms">1795ms</span></div>
+<div class="res">     clean</div>
+<div> </div>
+<div> <span class="g">❯</span> <span class="cursor"></span></div>
+              </div>
+              <div class="sts"><span>⌃G lint · ⌃O mcp · ⌃K palette</span><span class="right">11 tools</span></div>
+            </div>
+          </div>
+        </div>
+
+        <h3 id="ext-api">The rest of the API</h3>
+        <table>
+          <tbody>
+            <tr><td>Tools</td><td><code>deftool</code>, <code>register-tool!</code>. A file in <code>tools/</code> is the persistent form: it is reconciled on every config apply, so deleting the file drops the tool and editing it replaces the tool instead of duplicating it.</td></tr>
+            <tr><td>Commands</td><td><code>register-command!</code>, <code>register-completions!</code>. State carries <code>:messages :model :effort :cwd :agent :config</code>.</td></tr>
+            <tr><td>Keys</td><td><code>bind-key!</code>, <code>unbind-key!</code>.</td></tr>
+            <tr><td>Overlays</td><td><code>register-overlay!</code>, <code>open-overlay!</code>, <code>push-overlay!</code>, <code>close-overlay!</code>, <code>overlay-merge!</code>, <code>overlay-layout</code>. <code>list-modal</code> and <code>modal-cell</code> build the same widget the MCP manager uses. Key tests: <code>key-name=</code>, <code>key-char=</code>, <code>key-ctrl=</code>. Full-screen interface only.</td></tr>
+            <tr><td>Prompt</td><td><code>prompt-text</code>, <code>prompt-cursor</code>, <code>prompt-insert!</code>, <code>prompt-set!</code>, <code>prompt-clear!</code>. Full-screen interface only. To act on what the user is typing, bind a key rather than using the palette.</td></tr>
+            <tr><td>Output</td><td><code>emit</code> with <code>:info :ok :error :line :raw</code> from a command handler; <code>add-block!</code> from a hook or an overlay.</td></tr>
+            <tr><td>Helpers</td><td><code>workspace-root</code>, <code>run-in-workspace</code>, <code>resolve-path</code>, <code>config-dir</code>, <code>config-path</code>, <code>tools-dir</code>, <code>*tui-active*</code>, <code>*config*</code>.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section id="turns">
+        <h2>Interrupting a turn keeps the history valid</h2>
+        <p class="sub">
+          Cancelling during a tool call is how an agent ends up with a
+          conversation the provider rejects: a tool call with no result. Sema
+          Coder repairs the history before the next turn starts.
+        </p>
+        <ul>
+          <li>The turn runs as an async task and a second task keeps drawing, so keys stay live and <code>⌃C</code> lands at once.</li>
+          <li>Every orphaned tool call gets a synthesized, correlated result, and the assistant text written so far is kept.</li>
+          <li>A typed control message records that you interrupted and that partial side effects are possible.</li>
+          <li><code>Tab</code> queues a follow-up instead of interrupting. <code>/queue</code> lists, edits, drops and resumes.</li>
+          <li>The full-screen interface appends each turn to a JSONL session: one meta line, then one message per line in the shape the runtime takes. It is written to a temp file and renamed, so a crash mid-write cannot truncate the old file. <code>/resume</code> restores a session verbatim. One-shot and the plain REPL do not persist.</li>
+        </ul>
+      </section>
+
+      <section id="commands">
+        <h2>Slash commands</h2>
+        <p class="sub">
+          Type <code>/</code> in the prompt to complete a command. <code>⌃K</code>
+          opens the palette. <code>/model</code>, <code>/effort</code>,
+          <code>/queue</code>, <code>/debug</code>, <code>/resume</code> and
+          <code>/config</code> complete their arguments too.
+        </p>
+
+        <h3 id="cmd-builtin">Built in</h3>
+        <table class="k3 cmds">
+          <thead><tr><th>command</th><th>arguments</th><th>what it does</th></tr></thead>
+          <tbody>
+            <tr><td>/help</td><td></td><td>List every command, in registration order.</td></tr>
+            <tr><td>/model</td><td>[name]</td><td>Show or switch the model. Completes from <code>:models</code>; the active one is marked, a provider with no key is marked <code>· no key</code>. Any id typed by hand works.</td></tr>
+            <tr><td>/effort</td><td>[level|default]</td><td>Show or set reasoning effort: none, minimal, low, medium, high, xhigh, or default.</td></tr>
+            <tr><td>/clear</td><td></td><td>Clear the conversation history. Token totals are not reset.</td></tr>
+            <tr><td>/tools</td><td></td><td>List built-in, autoloaded and connected MCP tools. MCP tools carry their server name.</td></tr>
+            <tr><td>/mcp</td><td></td><td>Open the MCP manager, the same modal as <code>⌃O</code>. In the plain REPL it prints server status instead.</td></tr>
+            <tr><td>/queue</td><td>[resume | clear | drop ID | edit ID TEXT]</td><td>Inspect and manage follow-ups queued with <code>Tab</code>. Full-screen interface only.</td></tr>
+            <tr><td>/resume</td><td>[ID | rename ID TITLE | delete ID]</td><td>Open the session list, restore a session by id, retitle one, or delete one. The active session cannot be deleted.</td></tr>
+            <tr><td>/cwd</td><td></td><td>Print the workspace directory.</td></tr>
+            <tr><td>/config</td><td>[edit]</td><td>Print the active <code>init.sema</code> path. <code>edit</code> opens it with <code>$VISUAL</code>, <code>$EDITOR</code>, or the platform opener.</td></tr>
+            <tr><td>/reload</td><td></td><td>Reload and validate the config, then reconcile commands, hooks, MCP servers, tools and the agent.</td></tr>
+            <tr><td>/debug</td><td>[status | session | transcript | tasks | doctor]</td><td>Developer diagnostics. See below.</td></tr>
+            <tr><td>/quit, /exit</td><td></td><td>Exit.</td></tr>
+          </tbody>
+        </table>
+
+        <h3 id="cmd-debug">Diagnostics</h3>
+        <table>
+          <tbody>
+            <tr><td>/debug status</td><td>Model, effort, provider, turn and queue state.</td></tr>
+            <tr><td>/debug session</td><td>The session record as JSON, indented.</td></tr>
+            <tr><td>/debug transcript</td><td>Transcript storage and render-cache state.</td></tr>
+            <tr><td>/debug tasks</td><td>Background tasks with their retained output.</td></tr>
+            <tr><td>/debug doctor</td><td>Secret-safe checks: sema version against the 1.35 floor, which provider keys are present as booleans only, config path and validity, whether the sessions directory is writable, ripgrep and its version, MCP servers declared and their status, and the model that resolves.</td></tr>
+          </tbody>
+        </table>
+        <p class="caption">
+          <code>/debug session</code>, <code>/debug transcript</code> and
+          <code>/debug tasks</code> can include prompts, commands, tool arguments,
+          tool results and process output. Read them before sharing them.
+          <code>/debug doctor</code> never prints a key value.
+        </p>
+
+        <h3 id="cmd-keys">Prompt keys that are not rebindable</h3>
+        <table class="k3 cmds">
+          <tbody>
+            <tr><td>Enter</td><td></td><td>Interrupt the running turn and send. <code>⌃Enter</code> does the same.</td></tr>
+            <tr><td>Tab</td><td></td><td>Queue a follow-up mid-turn. Completes the entry when the palette is open.</td></tr>
+            <tr><td>Shift-Enter</td><td>⌥Enter</td><td>Insert a line break in the prompt.</td></tr>
+            <tr><td>↑ ↓</td><td></td><td>Walk the prompt history.</td></tr>
+            <tr><td>Page Up / Down</td><td>wheel</td><td>Scroll the transcript.</td></tr>
+          </tbody>
+        </table>
+        <p class="caption">
+          Everything else is rebindable. See the default key map under
+          <a href="#cfg-keymap">configuration</a>.
+        </p>
+
+        <h3 id="cmd-roadmap">Not built yet</h3>
+        <table>
+          <tbody>
+            <tr><td>Forge</td><td>Tools the agent writes and keeps. Designed, parked: the host primitive does not exist.</td></tr>
+            <tr><td>workflows</td><td>Designed, not started. No <code>/workflows</code> overlay and no workflow transcript block.</td></tr>
+            <tr><td>context gauge</td><td>Not in the header yet.</td></tr>
+            <tr><td>one-shot</td><td>No streaming and no slash commands with <code>--print</code>.</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+    </div>
+
+    <div class="rail">
+      <div class="rail-in">
+        <div class="h">Contents</div>
+        <nav class="toc">
+          <div class="toc-item"><a href="#start">get started</a></div>
+          <div class="toc-item"><a href="#session">the session</a></div>
+          <div class="toc-item"><a href="#modes">ways to run it</a></div>
+          <div class="toc-item"><a href="#tools">ten tools</a></div>
+          <div class="toc-item"><a href="#mcp">mcp client</a></div>
+          <div class="toc-item">
+            <a href="#config">configuration</a>
+            <div class="toc-sub">
+              <div>
+                <a href="#cfg-files">where files live</a>
+                <a href="#cfg-keys">every top-level key</a>
+                <a href="#cfg-ctors">constructors</a>
+                <a href="#cfg-commands">command forms</a>
+                <a href="#cfg-hooks">hook events</a>
+                <a href="#cfg-keymap">default key map</a>
+                <a href="#cfg-precedence">precedence and reload</a>
+                <a href="#cfg-cmds">related commands</a>
+              </div>
+            </div>
+          </div>
+          <div class="toc-item">
+            <a href="#extend">extending</a>
+            <div class="toc-sub">
+              <div>
+                <a href="#step-1">1 · a tool</a>
+                <a href="#step-2">2 · a command</a>
+                <a href="#step-3">3 · completions</a>
+                <a href="#step-4">4 · a key</a>
+                <a href="#step-5">5 · a hook</a>
+                <a href="#step-6">6 · in use</a>
+                <a href="#ext-api">the rest of the API</a>
+              </div>
+            </div>
+          </div>
+          <div class="toc-item"><a href="#turns">interrupts</a></div>
+          <div class="toc-item">
+            <a href="#commands">slash commands</a>
+            <div class="toc-sub">
+              <div>
+                <a href="#cmd-builtin">built in</a>
+                <a href="#cmd-debug">diagnostics</a>
+                <a href="#cmd-keys">fixed prompt keys</a>
+                <a href="#cmd-roadmap">not built yet</a>
+              </div>
+            </div>
+          </div>
+        </nav>
+
+        <div class="card">
+          <div class="card-h">Keys</div>
+          <div class="kb"><span>⌃O</span> mcp manager</div>
+          <div class="kb"><span>⌃R</span> resume a session</div>
+          <div class="kb"><span>⌃K</span> command palette</div>
+          <div class="kb"><span>⌃X</span> expand tool results</div>
+          <div class="kb"><span>⌃C</span> cancel the turn</div>
+          <div class="kb"><span>⌃D</span> quit</div>
+          <div class="kb alt"><span>tab</span> queue a follow-up</div>
+        </div>
+        <p class="epigraph" id="epigraph"></p>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<div class="statusbar bottom">
+  <span class="seg"><span class="k">⌃O</span> mcp</span>
+  <span class="seg hide"><span class="k">⌃R</span> resume</span>
+  <span class="seg hide"><span class="k">⌃K</span> palette</span>
+  <span class="seg"><span class="k">⌃D</span> quit</span>
+  <span class="seg right">draft 10 — tui</span>
+</div>
+
+<script>
+  function cp(id, btn) {
+    navigator.clipboard.writeText(document.getElementById(id).textContent.trim()).then(() => {
+      const t = btn.textContent; btn.textContent = 'copied';
+      setTimeout(() => btn.textContent = t, 1400);
+    });
+  }
+
+  const gutter = document.getElementById('gutter');
+  const body = document.getElementById('body');
+  function fillGutter() {
+    if (getComputedStyle(gutter).display === 'none') return;
+    const row = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--row'));
+    const n = Math.ceil((body.offsetHeight - 132) / row);
+    if (gutter.childElementCount === n) return;
+    gutter.textContent = '';
+    const frag = document.createDocumentFragment();
+    for (let i = 1; i <= n; i++) {
+      const s = document.createElement('span');
+      s.textContent = i;
+      frag.appendChild(s);
+    }
+    gutter.appendChild(frag);
+  }
+  // Snap each section to the 27px grid so the gutter numbers keep lining up
+  // with the text as content changes.
+  function snap() {
+    document.querySelectorAll('#body > section').forEach(s => {
+      s.style.paddingBottom = '';
+      const extra = (27 - (s.getBoundingClientRect().height % 27)) % 27;
+      if (extra) s.style.paddingBottom = (54 + extra) + 'px';
+    });
+  }
+  function relayout() { snap(); fillGutter(); }
+
+  relayout();
+  addEventListener('resize', relayout);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(relayout);
+
+  // The gutter row under the pointer lights up, its neighbours a little.
+  let lit = [];
+  let queued = false;
+  function clearLit() {
+    lit.forEach(el => el.classList.remove('lit', 'near'));
+    lit = [];
+  }
+  function light(y) {
+    const rect = gutter.getBoundingClientRect();
+    const padTop = parseFloat(getComputedStyle(gutter).paddingTop);
+    const row = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--row'));
+    const i = Math.floor((y - rect.top - padTop) / row);
+    const kids = gutter.children;
+    if (i < 0 || i >= kids.length) { clearLit(); return; }
+    const next = [];
+    for (let d = -1; d <= 1; d++) {
+      const el = kids[i + d];
+      if (el) { el.classList.add(d === 0 ? 'lit' : 'near'); next.push(el); }
+    }
+    lit.filter(el => !next.includes(el)).forEach(el => el.classList.remove('lit', 'near'));
+    lit = next;
+  }
+  addEventListener('pointermove', e => {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => { queued = false; light(e.clientY); });
+  }, { passive: true });
+  addEventListener('pointerleave', clearLit);
+  addEventListener('scroll', clearLit, { passive: true });
+
+  // Scrollspy: mark the section in view, reveal its subheadings, and mark the
+  // subheading in view.
+  const items = [...document.querySelectorAll('.toc-item')];
+  const topLinks = items.map(i => i.querySelector('a'));
+  const subLinks = [...document.querySelectorAll('.toc-sub a')];
+
+  function setActive(id) {
+    topLinks.forEach(a => a.classList.toggle('on', a.getAttribute('href') === '#' + id));
+    items.forEach(i => i.classList.toggle('open', i.querySelector('a').getAttribute('href') === '#' + id));
+  }
+  function setActiveSub(id) {
+    subLinks.forEach(a => a.classList.toggle('on', id && a.getAttribute('href') === '#' + id));
+  }
+
+  const secObs = new IntersectionObserver(es => {
+    es.forEach(e => { if (e.isIntersecting) setActive(e.target.id); });
+  }, { rootMargin: '-20% 0px -70% 0px' });
+  document.querySelectorAll('section[id]').forEach(s => secObs.observe(s));
+
+  const subObs = new IntersectionObserver(es => {
+    es.forEach(e => { if (e.isIntersecting) setActiveSub(e.target.id); });
+  }, { rootMargin: '-25% 0px -65% 0px' });
+  document.querySelectorAll('h3[id], .step[id]').forEach(el => subObs.observe(el));
+
+  // One epigraph per load, from the nine the agent ships with.
+  const epigraphs = [
+    'a name is a sign, make it carry its meaning.',
+    'the parens never lie; the logic sometimes does.',
+    'read before you write; the file was here before you.',
+    'state is a debt; pay it back where you borrowed it.',
+    'the smallest diff that tells the truth wins.',
+    'code is read far more often than it is run.',
+    'sixty years of parentheses; the good ideas kept their shape.',
+    'every program is a list; the good ones admit it.',
+    'a clear name spares a thousand comments.'
+  ];
+  document.getElementById('epigraph').textContent =
+    '; ' + epigraphs[Math.floor(Math.random() * epigraphs.length)];
+</script>
+</body>
+</html>

@@ -183,8 +183,7 @@ const copyText = (id, event) => {
 /* ---------- nav ---------- */
 .custom-home nav {
   position: sticky; top: 0; z-index: 50;
-  background: rgba(19, 17, 16, 0.86);
-  backdrop-filter: blur(10px);
+  background: var(--bg);
   border-bottom: 1px solid var(--border-lo);
 }
 .custom-home .nav-in { display: flex; align-items: center; gap: 26px; height: 58px; }
@@ -217,8 +216,7 @@ const copyText = (id, event) => {
   left: -12px;
   min-width: 200px;
   padding: 6px 0;
-  background: rgba(24, 21, 18, 0.98);
-  backdrop-filter: blur(14px);
+  background: var(--bg-raise);
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: 0 12px 40px -12px rgba(0, 0, 0, .5);
@@ -355,8 +353,7 @@ const copyText = (id, event) => {
     margin-left: 0;
     flex-direction: column; align-items: stretch; gap: 0;
     padding: 6px 0;
-    background: rgba(19, 17, 16, 0.97);
-    backdrop-filter: blur(10px);
+    background: var(--bg);
     border-bottom: 1px solid var(--border-lo);
     display: none;
   }

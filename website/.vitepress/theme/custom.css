@@ -18,6 +18,10 @@
   --vp-c-text-2: #968c79;
   --vp-c-text-3: #6b6354;
   --vp-c-divider: #221e19;
+  /* VitePress defaults this to #000000 in dark mode; it draws the navbar
+     divider line and the code-block divider, which read cold against the
+     warm #131110 background. */
+  --vp-c-gutter: #221e19;
   --vp-code-bg: #181512;
 }
 
@@ -59,6 +63,20 @@ html {
 .VPPage .container {
   max-width: none !important;
   padding: 0 !important;
+}
+
+/* Draw the navbar divider across the sidebar column too. VitePress indents it
+   by --vp-sidebar-width on doc pages, which leaves the line starting at the
+   content column and no border under the logo. !important because VitePress's
+   rule is scoped (`.divider[data-v-…]`) and outranks a plain class selector. */
+.VPNavBar.has-sidebar .divider {
+  padding-left: 0 !important;
+}
+
+/* The navbar title carries its own bottom border over the sidebar column, which
+   doubles up with the full-width divider above. The divider covers that span. */
+.VPNavBarTitle.has-sidebar .title {
+  border-bottom-color: transparent !important;
 }
 
 /* The VPContent wrapper for page layout */

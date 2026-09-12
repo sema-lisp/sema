@@ -83,6 +83,8 @@ const copyText = (id, event) => {
             </div>
           </div>
 
+          <a href="/coder" :class="{ 'nav-active': activeNav === 'coder' }">Coder</a>
+
           <a href="https://sema.run" target="_blank" rel="noopener" class="vp-external-link-icon">
             Playground
           </a>

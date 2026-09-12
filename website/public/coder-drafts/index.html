@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>/coder — design drafts</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 64px 28px; background: #131110; color: #e9e3d6;
+    font: 15px/1.6 'Inter', system-ui, sans-serif;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; }
+  h1 { font-weight: 400; font-size: 30px; margin: 0 0 6px; }
+  p.note { color: #968c79; margin: 0 0 40px; font-size: 14px; }
+  a.card {
+    display: block; padding: 20px 22px; margin-bottom: 14px; text-decoration: none;
+    border: 1px solid #221e19; border-radius: 10px; background: #181512; color: inherit;
+  }
+  a.card:hover { border-color: rgba(200,168,85,.4); }
+  .n { font: 12px/1 'JetBrains Mono', monospace; color: #c8a855; letter-spacing: .12em; text-transform: uppercase; }
+  .t { font-size: 18px; margin: 10px 0 4px; }
+  .d { color: #968c79; font-size: 14px; }
+  .grp { font: 12px/1 'JetBrains Mono', monospace; letter-spacing: .14em; text-transform: uppercase; color: #6b6354; margin: 34px 0 14px; }
+  .grp:first-of-type { margin-top: 0; }
+  a.card.muted { padding: 13px 22px; opacity: .55; }
+  a.card.muted .t { font-size: 14px; margin: 6px 0 0; }
+  .keep { color: #c8a855; font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>/coder — design drafts</h1>
+  <p class="note">Standalone HTML, not wired into the site. Delete this directory once one is picked.</p>
+
+  <p class="grp">Dark, terminal-family — newest</p>
+
+  <a class="card" href="./v5-tui.html">
+    <span class="n">Variant 5</span>
+    <div class="t">TUI application</div>
+    <div class="d">The page as a running terminal app: fixed status bars top and bottom, a line-number gutter, a buffer list in the right rail, tabbed panes for the run modes.</div>
+  </a>
+
+  <a class="card" href="./v6-transcript.html">
+    <span class="n">Variant 6</span>
+    <div class="t">Transcript</div>
+    <div class="d">The page as a session with the agent. Each section is a question, a tool call with a timing, and the answer. Mono headings, sans body.</div>
+  </a>
+
+  <a class="card" href="./v7-mono.html">
+    <span class="n">Variant 7</span>
+    <div class="t">Mono document</div>
+    <div class="d">Black, one column, everything monospace. Numbered rules, key/value rows, no boxes at all. The quietest of the three.</div>
+  </a>
+
+  <p class="grp">Earlier round</p>
+
+  <a class="card" href="./v2-terminal.html">
+    <span class="n">Variant 2</span>
+    <div class="t">Terminal manual <span class="keep">← the one you liked</span></div>
+    <div class="d">Man-page framing: SEMA-CODER(1) header, NAME/SYNOPSIS sections, ASCII rules, scanlines.</div>
+  </a>
+
+  <a class="card muted" href="./v1-spec.html"><span class="n">Variant 1</span><div class="t">Spec sheet (light — rejected)</div></a>
+  <a class="card muted" href="./v3-essay.html"><span class="n">Variant 3</span><div class="t">Editorial (light — rejected)</div></a>
+  <a class="card muted" href="./v4-panel.html"><span class="n">Variant 4</span><div class="t">Panel (dark — rejected)</div></a>
+
+</div>
+</body>
+</html>

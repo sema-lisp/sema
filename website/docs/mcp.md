@@ -20,6 +20,26 @@ Sema is also an MCP **client** — it can *consume* external MCP servers' tools 
 
 Register `sema mcp` as a stdio server with your client of choice. With no file arguments it serves the [default tools](#default-mcp-tools); append filepaths to any command below to also expose your own `deftool` definitions (see [Filepath Mode](#filepath-mode--custom-tools)).
 
+### Sema Coder
+
+::: tip Written in Sema
+The agent loop, the tools, the TUI, and the [MCP client runtime](https://github.com/sema-lisp/sema-coder/blob/main/src/mcp.sema) all live in `.sema` files; only terminal control and path safety are Rust, inside the `sema` binary. Config is Sema data, not JSON, so a command, hook, or tool can be a lambda.
+:::
+
+[Sema Coder](https://github.com/sema-lisp/sema-coder) is a terminal coding agent written in Sema. Its generated `init.sema` already autostarts a local Sema MCP server, so a fresh install needs no setup. To change which tools it exposes, edit the `:mcp-servers` entry:
+
+```sema
+(configure!
+  (coder-config
+    {:mcp-servers
+     (list
+       (mcp-server "sema" {:command "sema"
+                           :args ["mcp" "--include" "eval,docs,docs_search"]
+                           :autostart #t}))}))
+```
+
+`:autostart #t` connects at boot; without it you connect on demand in the `/mcp` modal (<kbd>Ctrl+O</kbd>), which also lists each server's tools.
+
 ### Claude Code
 
 ```bash
@@ -50,6 +70,23 @@ copilot mcp add sema -- sema mcp
 
 Written to `~/.copilot/mcp-config.json` (user-wide). Copilot also picks up a project-local `.mcp.json` in the same `mcpServers` format shown below.
 
+### Antigravity
+
+Google's [Antigravity](https://antigravity.google) CLI and IDE share one config file: `~/.gemini/config/mcp_config.json` (global) or `.agents/mcp_config.json` (workspace).
+
+```json
+{
+  "mcpServers": {
+    "sema": {
+      "command": "sema",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+In the CLI, `/mcp` opens the MCP manager overlay (status, reload, connection logs). In the IDE, the `…` menu at the top of the agent panel → MCP Servers → Manage MCP Servers → View raw config opens the same file.
+
 ### Gemini CLI
 
 ```bash
@@ -57,6 +94,32 @@ gemini mcp add sema sema mcp
 ```
 
 Registered for the current project by default (`.gemini/settings.json`); add `-s user` to make it available everywhere.
+
+Google [retired Gemini CLI on 18 June 2026](https://developers.googleblog.com/an-important-update-transitioning-gemini-cli-to-antigravity-cli/) for free and consumer subscription tiers; it still runs with a paid Gemini API key or a Gemini Code Assist Standard/Enterprise license. New setups should use Antigravity above.
+
+### Grok CLI
+
+```bash
+grok mcp add sema -- sema mcp
+```
+
+Written to `.grok/config.toml` in the current directory with `--scope project`, otherwise `~/.grok/config.toml`:
+
+```toml
+[mcp_servers.sema]
+command = "sema"
+args = ["mcp"]
+```
+
+Grok also reads `.mcp.json`, `.cursor/mcp.json`, and `~/.claude.json`, so an existing registration may already be picked up. `grok mcp doctor sema` checks the connection.
+
+### Qwen Code
+
+```bash
+qwen mcp add sema sema mcp
+```
+
+Written to `~/.qwen/settings.json` (`mcpServers`); add `-s project` for `.qwen/settings.json` in the project root.
 
 ### Amp
 
@@ -73,6 +136,52 @@ glue mcp add sema --transport stdio -- sema mcp
 ```
 
 Unlike the CLIs above, [Glue](https://getglue.dev) requires an explicit `--transport`. Written to `~/.glue/config.yaml`.
+
+### Goose
+
+Run `goose configure` → Add Extension → Command-line Extension, name it `sema`, and give `sema mcp` as the command. Or add it to `~/.config/goose/config.yaml` (`%APPDATA%\goose\config.yaml` on Windows) directly:
+
+```yaml
+extensions:
+  sema:
+    type: stdio
+    cmd: sema
+    args: ["mcp"]
+    enabled: true
+    timeout: 300
+```
+
+`goose list extensions` confirms the registration.
+
+### Crush
+
+[Crush](https://github.com/charmbracelet/crush) uses an `mcp` key, not `mcpServers`. Add it to `.crush.json` or `crush.json` in the project, or `~/.config/crush/crush.json`:
+
+```json
+{
+  "$schema": "https://charm.land/crush.json",
+  "mcp": {
+    "sema": {
+      "type": "stdio",
+      "command": "sema",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Crush reads the file at launch only — restart the TUI after editing. Its tools are then named `mcp_sema_<tool>`.
+
+### OpenHands
+
+Add an `[mcp]` section to `config.toml`, or use Settings → MCP in the UI:
+
+```toml
+[mcp]
+stdio_servers = [
+  { name = "sema", command = "sema", args = ["mcp"] }
+]
+```
 
 ### Cursor
 
@@ -123,6 +232,103 @@ Add to Zed's `settings.json` (also reachable via Settings → AI → MCP Servers
   }
 }
 ```
+
+### Junie
+
+Junie (the JetBrains coding agent, both the IDE plugin and the CLI) reads `mcp.json`. Create `.junie/mcp/mcp.json` in the project root, or `~/.junie/mcp/mcp.json` for all projects:
+
+```json
+{
+  "mcpServers": {
+    "sema": {
+      "command": "sema",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+In the IDE, Settings (<kbd>Ctrl+Alt+S</kbd>) → Tools → Junie → MCP Settings lists both scopes; the **Add** button opens the same `mcp.json`. The Status column shows the connection state, and expanding it lists the tools the server exposes. In the CLI, `/mcp` shows the configured servers.
+
+Junie's MCP settings are separate from JetBrains AI Assistant's. To reuse servers you already configured there, enable **Pass custom MCP servers** under Settings → Tools → AI Assistant → Agents and restart the IDE.
+
+### Cline
+
+Click the MCP Servers icon in the Cline sidebar → Configure MCP Servers, then add the [standard `mcpServers` entry](#cursor) shown for Cursor. The file is `cline_mcp_settings.json` in the extension's global storage:
+
+- macOS: `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
+- Windows: `%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json`
+
+Cline also accepts `disabled` and `alwaysAllow` keys per server.
+
+### Roo Code
+
+Roo Code reads a project file, `.roo/mcp.json`, which you can commit for the team:
+
+```json
+{
+  "mcpServers": {
+    "sema": {
+      "command": "sema",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+A global equivalent lives in the extension's `mcp_settings.json` (MCP Servers panel → Edit Global MCP). A project entry wins over a global one with the same name.
+
+### Kilo Code
+
+Kilo Code's config is JSONC with an `mcp` key and a single `command` array — `kilo.jsonc` or `.kilo/kilo.jsonc` in the project, or `~/.config/kilo/kilo.jsonc`:
+
+```jsonc
+{
+  "mcp": {
+    "sema": {
+      "type": "local",
+      "command": ["sema", "mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+The older VS Code extension format (`mcp_settings.json` with `mcpServers`, `command` + `args`) still works.
+
+### Continue
+
+[Continue](https://continue.dev) takes a YAML list. Add it to `config.yaml`, or as a block file under `.continue/mcpServers/`:
+
+```yaml
+mcpServers:
+  - name: sema
+    type: stdio
+    command: sema
+    args: ["mcp"]
+```
+
+### Windsurf
+
+Settings → Cascade → Manage MCPs → View raw config, or edit `~/.codeium/windsurf/mcp_config.json` (`%USERPROFILE%\.codeium\windsurf\mcp_config.json` on Windows) with the standard `mcpServers` JSON. Quit and reopen Windsurf for the change to apply.
+
+### Kiro
+
+Command palette → "Kiro: Open workspace MCP config (JSON)" writes `.kiro/settings/mcp.json` (user scope is `~/.kiro/settings/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "sema": {
+      "command": "sema",
+      "args": ["mcp"],
+      "autoApprove": ["docs", "docs_search"]
+    }
+  }
+}
+```
+
+Kiro reloads the config on save. `autoApprove` and `disabled` are Kiro settings, not part of the MCP spec.
 
 ### OpenCode
 
@@ -180,7 +386,18 @@ mcp_servers:
 
 ### Everything Else
 
-Any other client needs the same two facts: command `sema`, args `["mcp"]`. CLI agents mostly follow the `mcp add` pattern above (e.g. Factory's `droid mcp add sema "sema mcp"`), and GUI clients — Claude Desktop (`claude_desktop_config.json`), Cline, Roo Code, Windsurf, JetBrains AI Assistant, Warp, LM Studio — accept the standard `mcpServers` JSON shown for Cursor.
+Any other client needs the same two facts: command `sema`, args `["mcp"]`. CLI agents mostly follow the `mcp add` pattern above (e.g. Factory's `droid mcp add sema "sema mcp"`), and the clients below take the standard `mcpServers` JSON shown for [Cursor](#cursor):
+
+| Client | Where the config lives |
+| --- | --- |
+| Claude Desktop | Settings → Developer → Edit Config, i.e. `~/Library/Application Support/Claude/claude_desktop_config.json` (`%APPDATA%\Claude\` on Windows) |
+| Cursor CLI (`cursor-agent`) | the same `.cursor/mcp.json` / `~/.cursor/mcp.json` as the editor |
+| Warp | Settings → AI → MCP servers → Add, pasting the JSON; also reads `.warp/.mcp.json` |
+| JetBrains AI Assistant | Settings → Tools → AI Assistant → Model Context Protocol (separate from [Junie](#junie)) |
+| LM Studio | the Program tab → Install → Edit `mcp.json` |
+| Factory (`droid`) | `droid mcp add sema "sema mcp"` |
+
+[Aider](https://aider.chat) has no MCP support — use `/run sema …` there instead.
 
 ---
 

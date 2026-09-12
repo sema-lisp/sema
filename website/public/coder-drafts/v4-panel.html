@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Sema Coder — panel draft</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0e0d0c;
+    --cell: #141211;
+    --cell-2: #191614;
+    --line: #262119;
+    --fg: #e6e0d3;
+    --fg-2: #9a9182;
+    --fg-3: #645d51;
+    --gold: #c8a855;
+    --green: #9bb87a;
+    --mono: 'JetBrains Mono', ui-monospace, monospace;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.6 'Inter', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--gold); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .grid { max-width: 1240px; margin: 0 auto; padding: 20px; display: grid; grid-template-columns: repeat(12, 1fr); gap: 12px; }
+
+  .cell {
+    background: var(--cell); border: 1px solid var(--line); border-radius: 4px;
+    padding: 18px 20px; min-width: 0;
+  }
+  .cell.raised { background: var(--cell-2); }
+  .cell .lab {
+    font: 500 10.5px/1 var(--mono); letter-spacing: .18em; text-transform: uppercase;
+    color: var(--fg-3); display: block; margin-bottom: 14px;
+  }
+  .cell .lab i { color: var(--gold); font-style: normal; }
+
+  /* spans */
+  .s12 { grid-column: span 12 } .s8 { grid-column: span 8 } .s7 { grid-column: span 7 }
+  .s6 { grid-column: span 6 } .s5 { grid-column: span 5 } .s4 { grid-column: span 4 }
+  .s3 { grid-column: span 3 }
+
+  /* header cell */
+  .hd { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; padding: 16px 20px; }
+  .hd .mark { font: 500 15px/1 var(--mono); }
+  .hd .mark b { color: var(--gold); font-weight: 500; }
+  .hd .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
+  .hd .st { font: 11px/1 var(--mono); color: var(--fg-2); }
+  .hd .sp { margin-left: auto; }
+  .hd a { font: 11px/1 var(--mono); color: var(--fg-2); }
+
+  /* hero cell */
+  .hero { padding: 44px 40px 40px; }
+  .hero h1 {
+    font-weight: 500; font-size: clamp(30px, 4.2vw, 50px); line-height: 1.08;
+    letter-spacing: -.025em; margin: 0 0 18px; max-width: 20ch;
+  }
+  .hero h1 span { color: var(--gold); }
+  .hero p { color: var(--fg-2); max-width: 62ch; font-size: 16px; margin: 0 0 26px; }
+  .cmd {
+    display: inline-flex; align-items: center; gap: 14px; max-width: 100%;
+    background: #0a0908; border: 1px solid var(--line); border-radius: 4px;
+    padding: 11px 14px; font: 13px/1 var(--mono);
+  }
+  .cmd .p { color: var(--gold); }
+  .cmd .c { overflow-x: auto; white-space: nowrap; }
+  .cmd button {
+    font: 10.5px/1 var(--mono); text-transform: uppercase; letter-spacing: .12em;
+    background: transparent; color: var(--fg-3); border: 1px solid var(--line);
+    border-radius: 3px; padding: 6px 10px; cursor: pointer;
+  }
+  .cmd button:hover { color: var(--gold); border-color: rgba(200,168,85,.45); }
+
+  /* metric cells */
+  .metric .v { font: 500 38px/1 var(--mono); letter-spacing: -.03em; }
+  .metric .v.gold { color: var(--gold); }
+  .metric .k { color: var(--fg-3); font-size: 12.5px; margin-top: 10px; }
+
+  /* lists inside cells */
+  dl { margin: 0; }
+  dl div { display: grid; grid-template-columns: 150px 1fr; gap: 14px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  dl div:last-child { border-bottom: 0; }
+  dt { font: 12.5px/1.55 var(--mono); color: var(--gold); }
+  dd { margin: 0; color: var(--fg-2); font-size: 13.5px; line-height: 1.55; }
+  dd b { color: var(--fg); font-weight: 500; }
+
+  ul.tight { list-style: none; margin: 0; padding: 0; }
+  ul.tight li { padding: 7px 0; border-bottom: 1px solid var(--line); color: var(--fg-2); font-size: 13.5px; }
+  ul.tight li:last-child { border-bottom: 0; }
+  ul.tight li b { color: var(--fg); font-weight: 500; }
+  code { font: 12.5px var(--mono); color: var(--gold); }
+
+  pre { margin: 0; font: 12.5px/1.68 var(--mono); color: #cdc6b6; overflow-x: auto; white-space: pre; }
+  pre .gold { color: var(--gold) } pre .dim { color: var(--fg-3) } pre .str { color: var(--green) }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 7px; }
+  .chip { font: 12px/1 var(--mono); color: var(--fg-2); border: 1px solid var(--line); border-radius: 3px; padding: 7px 10px; }
+  .chip.on { color: var(--gold); border-color: rgba(200,168,85,.35); }
+
+  .bar { height: 5px; background: #0a0908; border-radius: 3px; overflow: hidden; margin-top: 12px; }
+  .bar i { display: block; height: 100%; background: var(--gold); }
+
+  .foot { color: var(--fg-3); font: 11.5px/1.8 var(--mono); }
+
+  @media (max-width: 1000px) {
+    .s8, .s7, .s6, .s5, .s4, .s3 { grid-column: span 12; }
+    dl div { grid-template-columns: 1fr; gap: 2px; }
+  }
+</style>
+</head>
+<body>
+<div class="grid">
+
+  <!-- header -->
+  <div class="cell s12 hd">
+    <span class="mark"><b>(</b>sema<b>)</b> coder</span>
+    <span class="dot"></span><span class="st">v0.3.0 · MIT · requires sema ≥ 1.35</span>
+    <span class="sp"></span>
+    <a href="https://github.com/sema-lisp/sema-coder">github ↗</a>
+    <a href="https://sema-lang.com/docs/mcp">mcp docs ↗</a>
+  </div>
+
+  <!-- hero -->
+  <div class="cell s8 hero raised">
+    <h1>A terminal coding agent, <span>written in Sema.</span></h1>
+    <p>
+      It edits files, runs commands, and searches code. The agent loop, the tools,
+      the interface, the MCP client and the config language are all Sema files in
+      one repository — no build step, and nothing to install but the
+      <code>sema</code> binary.
+    </p>
+    <span class="cmd">
+      <span class="p">$</span>
+      <span class="c" id="c1">git clone https://github.com/sema-lisp/sema-coder</span>
+      <button onclick="cp('c1', this)">copy</button>
+    </span>
+  </div>
+
+  <div class="cell s4 metric">
+    <span class="lab">Composition</span>
+    <div class="v gold">100%</div>
+    <div class="k">Sema. 6,703 lines across 23 files; no <code>.rs</code> file and no <code>Cargo.toml</code> in the repository.</div>
+    <div class="bar"><i style="width:100%"></i></div>
+  </div>
+
+  <!-- metric row -->
+  <div class="cell s3 metric"><span class="lab">Tools</span><div class="v">10</div><div class="k">callable by the model</div></div>
+  <div class="cell s3 metric"><span class="lab">Hook events</span><div class="v">7</div><div class="k">session, turn, tool, error</div></div>
+  <div class="cell s3 metric"><span class="lab">Tests</span><div class="v">36</div><div class="k">files · 3,400 lines · Sema</div></div>
+  <div class="cell s3 metric"><span class="lab">Dependencies</span><div class="v">1</div><div class="k">the <code>sema</code> binary</div></div>
+
+  <!-- session -->
+  <div class="cell s7">
+    <span class="lab"><i>●</i> Session · full-screen TUI</span>
+<pre><span class="gold">(sema)</span> coder — ~/code/sema · claude-opus-5
+<span class="dim">^O mcp · ^R resume · ^K palette · ^D quit</span>
+
+<span class="gold">▌</span> read test.sema and explain how the test runner works
+
+<span class="str">✓</span> <span class="gold">read-file</span> <span class="dim">test.sema · 0ms</span>
+<span class="dim">    …  +141 lines</span>
+
+Each file runs in a child sema interpreter, so a crash in
+one test cannot take the run down and no state leaks
+between files. Pass or fail comes from the exit code.
+
+<span class="str">✓</span> <span class="gold">bash</span> <span class="dim">./test.sema · 4.2s → 312 checks, 0 failed</span>
+
+<span class="gold">❯</span> <span class="dim">tab queues · enter sends · ^C cancels the turn</span></pre>
+  </div>
+
+  <!-- modes -->
+  <div class="cell s5">
+    <span class="lab">Modes</span>
+    <dl>
+      <div><dt>./coder.sema</dt><dd>Full-screen TUI when stdout is a terminal.</dd></div>
+      <div><dt>-- -p "…"</dt><dd>One-shot. Prints the answer and exits.</dd></div>
+      <div><dt>-- --json -p</dt><dd>Exactly one JSON document on stdout.</dd></div>
+      <div><dt>-- -m &lt;model&gt;</dt><dd>Override the model for this run.</dd></div>
+      <div><dt>stdin</dt><dd>Appended to the prompt in a <code>&lt;stdin&gt;</code> block.</dd></div>
+      <div><dt>no TTY</dt><dd>Falls back to a plain line-based REPL.</dd></div>
+    </dl>
+  </div>
+
+  <!-- tools -->
+  <div class="cell s6">
+    <span class="lab">Tools · each caps its own output</span>
+    <dl>
+      <div><dt>read-file</dt><dd>Line-numbered. Refuses binaries and files over 2 MB.</dd></div>
+      <div><dt>write-file</dt><dd>Create or overwrite; creates parent directories.</dd></div>
+      <div><dt>edit-file</dt><dd>One exact string; the result carries a diff.</dd></div>
+      <div><dt>bash</dt><dd>120 s default timeout, or <b>background=true</b> for a task id.</dd></div>
+      <div><dt>task-*</dt><dd>output · list · stop, for background commands.</dd></div>
+      <div><dt>grep</dt><dd>Prefers <b>rg</b>; argv-style, never through a shell.</dd></div>
+      <div><dt>find-files</dt><dd>Skips .git, node_modules, target.</dd></div>
+      <div><dt>list-dir</dt><dd>One directory, long format.</dd></div>
+    </dl>
+  </div>
+
+  <!-- config -->
+  <div class="cell s6">
+    <span class="lab">Config · <code>&lt;config-dir&gt;/sema/sema-coder/init.sema</code></span>
+<pre>(configure!
+  (coder-config
+    {<span class="gold">:model</span>     <span class="str">"claude-opus-5"</span>
+     <span class="gold">:max-turns</span> 50
+
+     <span class="gold">:mcp-servers</span>
+     (list
+       (mcp-server <span class="str">"sema"</span>
+         {<span class="gold">:command</span> <span class="str">"sema"</span> <span class="gold">:args</span> [<span class="str">"mcp"</span>] <span class="gold">:autostart</span> #t}))
+
+     <span class="gold">:commands</span>
+     (list
+       (command <span class="str">"hi"</span>
+         {<span class="gold">:desc</span> <span class="str">"greet"</span>
+          <span class="gold">:do</span> (lambda (state args)
+                (emit <span class="gold">:info</span> <span class="str">"hi!"</span>) state)}))}))</pre>
+    <ul class="tight" style="margin-top:14px">
+      <li><b>Pure loading.</b> A broken file keeps the last good commands, servers, hooks, and tools.</li>
+      <li><b>Hot reload.</b> The TUI watches the config dir; <code>/reload</code> does it by hand.</li>
+    </ul>
+  </div>
+
+  <!-- mcp -->
+  <div class="cell s5">
+    <span class="lab"><i>▲</i> MCP client · /mcp (⌃O)</span>
+<pre><span class="str">●</span> sema        connected · 3 tools
+<span class="gold">▲</span> asana       needs auth — press c to sign in
+<span class="dim">◌ filesystem  idle — press c to connect</span>
+
+<span class="dim">↑↓ move · c connect · d disconnect · ⏎ tools</span></pre>
+    <ul class="tight" style="margin-top:14px">
+      <li>stdio or HTTP, OAuth prompted on connect.</li>
+      <li><code>:autostart #t</code> connects before the alt-screen opens.</li>
+      <li>Built-ins win a name collision; <code>/tools</code> shows each tool's server.</li>
+    </ul>
+  </div>
+
+  <!-- extension -->
+  <div class="cell s7">
+    <span class="lab">Extension API · a .sema file in plugins/</span>
+    <div class="chips">
+      <span class="chip on">register-command!</span>
+      <span class="chip">register-completions!</span>
+      <span class="chip on">deftool</span>
+      <span class="chip">register-tool!</span>
+      <span class="chip on">add-hook!</span>
+      <span class="chip">bind-key!</span>
+      <span class="chip">unbind-key!</span>
+      <span class="chip on">register-overlay!</span>
+      <span class="chip">list-modal</span>
+      <span class="chip">open-overlay!</span>
+      <span class="chip">prompt-text</span>
+      <span class="chip">prompt-insert!</span>
+      <span class="chip">prompt-set!</span>
+      <span class="chip">emit</span>
+      <span class="chip">add-block!</span>
+      <span class="chip">workspace-root</span>
+    </div>
+    <ul class="tight" style="margin-top:16px">
+      <li><b>Seven hook events.</b> <code>:session-start</code> <code>:pre-turn</code> <code>:pre-tool-call</code> <code>:post-turn</code> <code>:on-error</code> <code>:turn-queued</code> <code>:turn-interrupted</code>. A handler that throws is caught.</li>
+      <li><b>Loaded at boot</b> from the config dir, then the project's <code>.sema-coder/plugins/</code>. A broken plugin prints an error and the agent still starts.</li>
+      <li><b>Tools in <code>tools/</code></b> are reconciled on every config apply: delete one and it goes away, edit one and it is replaced.</li>
+    </ul>
+  </div>
+
+  <!-- interrupts -->
+  <div class="cell s6">
+    <span class="lab">Interrupts</span>
+    <ul class="tight">
+      <li><b>The turn is an async task.</b> A second task keeps drawing, so keys stay live and <code>Ctrl-C</code> cancels cleanly.</li>
+      <li><b>History is repaired.</b> Every orphaned tool call gets a synthesized, correlated result; the assistant text so far is kept; a control message records the interruption.</li>
+      <li><b>Queue instead of interrupting.</b> <code>Tab</code> queues a follow-up mid-turn; <code>/queue</code> lists, edits, drops, resumes.</li>
+    </ul>
+  </div>
+
+  <!-- sessions -->
+  <div class="cell s6">
+    <span class="lab">Sessions</span>
+    <ul class="tight">
+      <li><b>JSONL.</b> One meta line, then one message per line in the shape <code>agent/run</code> takes.</li>
+      <li><b>Atomic.</b> Written to a temp file and renamed, so a crash mid-write cannot truncate the old one.</li>
+      <li><b>TUI only.</b> One-shot and the plain REPL do not persist. <code>/resume</code> restores a session verbatim.</li>
+    </ul>
+  </div>
+
+  <!-- status / honesty -->
+  <div class="cell s6">
+    <span class="lab">Status</span>
+    <dl>
+      <div><dt>shipped</dt><dd>Tools, TUI, MCP client, config + reload, hooks, overlays, plugins, sessions.</dd></div>
+      <div><dt>designed</dt><dd>Agent-authored persistent tools; workflows as a first-class feature.</dd></div>
+      <div><dt>missing</dt><dd>The context gauge in the header; streaming in one-shot mode.</dd></div>
+      <div><dt>upstream</dt><dd>Issues #82–#94 on the Sema repo: eight fixed and used here, five still open.</dd></div>
+    </dl>
+  </div>
+
+  <!-- install -->
+  <div class="cell s6 raised">
+    <span class="lab">Install</span>
+    <div style="display:flex;flex-direction:column;gap:9px">
+      <span class="cmd"><span class="p">$</span><span class="c" id="c2">curl -fsSL https://sema-lang.com/install.sh | sh</span><button onclick="cp('c2', this)">copy</button></span>
+      <span class="cmd"><span class="p">$</span><span class="c" id="c3">git clone https://github.com/sema-lisp/sema-coder</span><button onclick="cp('c3', this)">copy</button></span>
+      <span class="cmd"><span class="p">$</span><span class="c" id="c4">export ANTHROPIC_API_KEY=… &amp;&amp; ./coder.sema</span><button onclick="cp('c4', this)">copy</button></span>
+    </div>
+    <ul class="tight" style="margin-top:14px">
+      <li>Optional: install <code>rg</code> and the grep tool uses it instead of <code>grep</code>.</li>
+    </ul>
+  </div>
+
+  <div class="cell s12 foot">
+    sema-lisp/sema-coder · MIT · v0.3.0 — draft 4 of 4, panel.
+  </div>
+
+</div>
+
+<script>
+  function cp(id, btn) {
+    navigator.clipboard.writeText(document.getElementById(id).textContent.trim()).then(() => {
+      const t = btn.textContent; btn.textContent = 'copied';
+      setTimeout(() => btn.textContent = t, 1400);
+    });
+  }
+</script>
+</body>
+</html>

@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Sema Coder — mono draft</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #000000;
+    --fg: #d6d1c7;
+    --fg-2: #7e7a72;
+    --fg-3: #4b4843;
+    --hi: #ffffff;
+    --gold: #c8a855;
+    --green: #86a86a;
+    --rule: #1a1a19;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.8 'JetBrains Mono', ui-monospace, monospace;
+    padding: 0 22px 100px;
+  }
+  a { color: var(--gold); text-decoration: none; }
+  a:hover { color: var(--hi); }
+  b { color: var(--hi); font-weight: 500; }
+  .dim { color: var(--fg-3); }
+  main { max-width: 78ch; margin: 0 auto; }
+
+  /* ---------- rule-and-number section headers ---------- */
+  .rule {
+    display: flex; align-items: center; gap: 14px;
+    margin: 0 0 22px; color: var(--fg-3); font-size: 12px; letter-spacing: .2em; text-transform: uppercase;
+  }
+  .rule::after { content: ''; flex: 1; height: 1px; background: var(--rule); }
+  .rule .no { color: var(--gold); letter-spacing: .1em; }
+
+  /* ---------- opening ---------- */
+  header { padding: 90px 0 20px; }
+  .eyebrow { color: var(--fg-3); font-size: 12px; letter-spacing: .22em; text-transform: uppercase; margin: 0 0 30px; }
+  h1 {
+    font-weight: 400; font-size: clamp(22px, 3.1vw, 32px); line-height: 1.5;
+    margin: 0 0 34px; color: var(--fg-2); max-width: 52ch; letter-spacing: -.01em;
+  }
+  h1 b { color: var(--hi); font-weight: 500; }
+  h1 .g { color: var(--gold); }
+  .under { border-bottom: 1px solid var(--gold); padding-bottom: 1px; }
+
+  .kv { margin: 0 0 34px; }
+  .kv div { display: grid; grid-template-columns: 15ch 1fr; gap: 18px; padding: 3px 0; }
+  .kv .k { color: var(--fg-3); }
+  .kv .v { color: var(--fg); }
+
+  .run {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule);
+    padding: 16px 0; margin-bottom: 8px;
+  }
+  .run .p { color: var(--gold); }
+  .run .c { overflow-x: auto; white-space: nowrap; }
+  .run button {
+    margin-left: auto; font: 11px/1 inherit; letter-spacing: .14em; text-transform: uppercase;
+    background: none; border: 0; border-bottom: 1px solid var(--fg-3); color: var(--fg-3);
+    padding: 2px 0; cursor: pointer;
+  }
+  .run button:hover { color: var(--gold); border-color: var(--gold); }
+  .cursor { display: inline-block; width: 8px; height: 15px; background: var(--gold); vertical-align: -3px; animation: bl 1.1s steps(1) infinite; }
+  @keyframes bl { 50% { opacity: 0 } }
+  @media (prefers-reduced-motion: reduce) { .cursor { animation: none } }
+
+  /* ---------- sections ---------- */
+  section { padding: 62px 0 0; }
+  p { max-width: 72ch; margin: 0 0 16px; color: var(--fg-2); }
+  p.first { color: var(--fg); }
+
+  /* numbered fact rows */
+  ol { counter-reset: n; list-style: none; margin: 22px 0 0; padding: 0; }
+  ol li {
+    counter-increment: n; position: relative; padding: 12px 0 12px 46px;
+    border-top: 1px solid var(--rule); color: var(--fg-2); max-width: 76ch;
+  }
+  ol li:last-child { border-bottom: 1px solid var(--rule); }
+  ol li::before {
+    content: counter(n, decimal-leading-zero); position: absolute; left: 0; top: 12px;
+    color: var(--fg-3); font-size: 12px;
+  }
+  ol li b { display: inline; }
+
+  /* plain dl */
+  dl { margin: 22px 0 0; }
+  dl > div { display: grid; grid-template-columns: 24ch 1fr; gap: 20px; padding: 9px 0; border-top: 1px solid var(--rule); }
+  dl > div:last-child { border-bottom: 1px solid var(--rule); }
+  dt { color: var(--gold); }
+  dd { margin: 0; color: var(--fg-2); }
+  @media (max-width: 720px) {
+    dl > div, .kv div { grid-template-columns: 1fr; gap: 2px; }
+  }
+
+  /* code */
+  pre {
+    margin: 22px 0 0; padding: 18px 0 18px 20px; border-left: 1px solid var(--rule);
+    white-space: pre; overflow-x: auto; color: #cdc7bb; font: 13px/1.75 inherit;
+  }
+  pre .cm { color: var(--fg-3); } pre .str { color: var(--green); } pre .kw { color: var(--gold); }
+
+  /* big number band */
+  .nums { display: flex; flex-wrap: wrap; gap: 0 52px; margin: 30px 0 0; }
+  .nums div { padding: 10px 0; }
+  .nums .v { font-size: 30px; font-weight: 700; color: var(--hi); line-height: 1.2; }
+  .nums .v.g { color: var(--gold); }
+  .nums .k { color: var(--fg-3); font-size: 11.5px; letter-spacing: .1em; text-transform: uppercase; }
+
+  footer { margin-top: 80px; padding-top: 20px; border-top: 1px solid var(--rule); color: var(--fg-3); font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+
+  <header>
+    <p class="eyebrow">sema-lisp / sema-coder · v0.3.0 · MIT</p>
+    <h1>
+      <b>Sema Coder</b> is a terminal coding agent. It edits files, runs
+      commands, and searches code — and all of it, down to the config language,
+      is <span class="g under">written in Sema</span>.
+    </h1>
+
+    <div class="kv">
+      <div><span class="k">language</span><span class="v">Sema · 6,703 lines · 23 files</span></div>
+      <div><span class="k">rust in repo</span><span class="v">none — no .rs file, no Cargo.toml</span></div>
+      <div><span class="k">build step</span><span class="v">none</span></div>
+      <div><span class="k">dependencies</span><span class="v">the sema binary (≥ 1.35)</span></div>
+      <div><span class="k">keys</span><span class="v">ANTHROPIC_API_KEY or OPENAI_API_KEY</span></div>
+    </div>
+
+    <div class="run">
+      <span class="p">$</span>
+      <span class="c" id="c1">git clone https://github.com/sema-lisp/sema-coder</span>
+      <span class="cursor"></span>
+      <button onclick="cp('c1', this)">copy</button>
+    </div>
+    <p class="dim" style="margin-top:12px"><a href="https://github.com/sema-lisp/sema-coder">github.com/sema-lisp/sema-coder</a> · <a href="https://sema-lang.com/docs/mcp">MCP docs</a></p>
+  </header>
+
+  <section>
+    <p class="rule"><span class="no">01</span> What is Sema, what is Rust</p>
+    <p class="first">
+      A coding agent is a real program. It needs an interface that redraws
+      without flicker, a loop that survives a cancelled tool call, a supervisor
+      for background commands, a client for someone else's protocol, and a
+      config format people can live with.
+    </p>
+    <p>
+      Each of those is a Sema file here. What Rust there is lives one level down
+      in the <b>sema</b> binary, as the primitives the program calls —
+      <b>agent/run</b>, <b>async/*</b>, <b>term/*</b>, <b>proc/*</b>,
+      <b>file/*</b>, <b>mcp/connect</b>, <b>path/within?</b>. That is the whole
+      boundary.
+    </p>
+    <div class="nums">
+      <div><div class="v">6,703</div><div class="k">lines of Sema</div></div>
+      <div><div class="v g">0</div><div class="k">lines of Rust</div></div>
+      <div><div class="v">10</div><div class="k">tools</div></div>
+      <div><div class="v">36</div><div class="k">test files</div></div>
+      <div><div class="v">1</div><div class="k">dependency</div></div>
+    </div>
+    <pre><span class="cm">$ wc -l src/*.sema | sort -rn | head -6</span>
+1637  src/tui.sema             <span class="cm">frame diffing, async turns</span>
+ 773  src/tools.sema           <span class="cm">the ten tools</span>
+ 700  src/commands.sema        <span class="cm">slash commands, config apply</span>
+ 573  src/overlay.sema         <span class="cm">modal overlays</span>
+ 440  src/config.sema          <span class="cm">the config language</span>
+ 413  src/terminal_input.sema  <span class="cm">raw-mode input decoding</span></pre>
+  </section>
+
+  <section>
+    <p class="rule"><span class="no">02</span> Running it</p>
+    <p class="first">
+      On a terminal you get the full-screen interface. Pipe into it and you get
+      plain output fit for a script. Interpreter arguments come first;
+      everything after <b>--</b> is Sema Coder's.
+    </p>
+    <pre>$ <span class="kw">./coder.sema</span>                              <span class="cm"># full-screen TUI</span>
+$ <span class="kw">./coder.sema</span> -- -p <span class="str">"explain this codebase"</span>  <span class="cm"># prose, then exit</span>
+$ <span class="kw">./coder.sema</span> -- --json -p <span class="str">"..."</span>            <span class="cm"># one JSON document</span>
+$ <span class="kw">./coder.sema</span> -- -m claude-haiku-4-5        <span class="cm"># override the model</span>
+$ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"review"</span>     <span class="cm"># stdin → &lt;stdin&gt; block</span></pre>
+    <p style="margin-top:20px">
+      Without a TTY and without <b>--print</b> it falls back to a plain
+      line-based REPL. An <b>AGENTS.md</b> or <b>CLAUDE.md</b> in the workspace
+      is added to the system prompt, capped at 32 KB each.
+    </p>
+  </section>
+
+  <section>
+    <p class="rule"><span class="no">03</span> The session</p>
+    <pre><span class="kw">(sema)</span> coder — ~/code/sema · claude-opus-5
+<span class="cm">type / for commands · ^O mcp · ^R resume · ^K palette · ^D quit</span>
+<span class="cm">; the parens never lie; the logic sometimes does.</span>
+
+<span class="kw">▌</span> read test.sema and explain how the test runner works
+
+<span class="str">✓</span> <span class="kw">read-file</span> <span class="cm">test.sema · 0ms</span>
+<span class="cm">    …  +141 lines</span>
+
+Each file runs in a child sema interpreter, so a crash in one test
+cannot take the run down and no state leaks between files.
+
+<span class="str">✓</span> <span class="kw">bash</span> <span class="cm">./test.sema · 4.2s → 312 checks, 0 failed</span>
+
+<span class="kw">❯</span> <span class="cm">tab queues · enter interrupts and sends · ^C cancels the turn</span></pre>
+    <p style="margin-top:20px">
+      Every frame is rebuilt as a list of rows and diffed against the previous
+      one, so only changed rows are rewritten — no clear, no flicker.
+    </p>
+  </section>
+
+  <section>
+    <p class="rule"><span class="no">04</span> Tools</p>
+    <dl>
+      <div><dt>read-file</dt><dd>Line-numbered read. Refuses binaries and files over 2 MB; caps at 2,000 lines.</dd></div>
+      <div><dt>write-file</dt><dd>Create or overwrite, creating parent directories.</dd></div>
+      <div><dt>edit-file</dt><dd>Replace one exact string; the result carries a diff.</dd></div>
+      <div><dt>bash</dt><dd>120-second default timeout, or <b>background=true</b> for a task id.</dd></div>
+      <div><dt>task-output/list/stop</dt><dd>Read, list, terminate background commands. Stopping kills the process group.</dd></div>
+      <div><dt>grep</dt><dd>Prefers <b>rg</b>, falls back to <b>grep</b>. Argv-style, never through a shell.</dd></div>
+      <div><dt>find-files</dt><dd>Glob search, skipping .git, node_modules, target.</dd></div>
+      <div><dt>list-dir</dt><dd>One directory, long format.</dd></div>
+    </dl>
+    <p style="margin-top:20px">
+      Each caps its own output so one file or one noisy command cannot fill the
+      context window. Every file and search path goes through
+      <b>path/within?</b>, which resolves symlinks, so <b>../</b> and symlink
+      escapes both fail. The <b>bash</b> tool is not covered: it runs real
+      commands with your privileges. This is accident prevention, not a sandbox.
+    </p>
+  </section>
+
+  <section>
+    <p class="rule"><span class="no">05</span> Config as a program</p>
+    <pre>(<span class="kw">configure!</span>
+  (<span class="kw">coder-config</span>
+    {<span class="kw">:model</span>     <span class="str">"claude-opus-5"</span>
+     <span class="kw">:max-turns</span> 50
+
+     <span class="cm">;; MCP servers — stdio or http</span>
+     <span class="kw">:mcp-servers</span>
+     (list
+       (<span class="kw">mcp-server</span> <span class="str">"sema"</span> {<span class="kw">:command</span> <span class="str">"sema"</span> <span class="kw">:args</span> [<span class="str">"mcp"</span>] <span class="kw">:autostart</span> #t}))
+
+     <span class="cm">;; a slash command, as a lambda</span>
+     <span class="kw">:commands</span>
+     (list
+       (<span class="kw">command</span> <span class="str">"hi"</span> {<span class="kw">:desc</span> <span class="str">"greet"</span>
+                    <span class="kw">:do</span> (lambda (state args) (emit <span class="kw">:info</span> <span class="str">"hi!"</span>) state)}))}))</pre>
+    <ol>
+      <li><b>It is code.</b> A slash command can be a lambda and a hook can close over state, so no template syntax had to be invented.</li>
+      <li><b>Loading is pure.</b> A file that does not parse reconciles nothing and keeps the last good commands, servers, hooks, and tools.</li>
+      <li><b>Unknown keys warn.</b> A typo cannot lock you out of your own agent.</li>
+      <li><b>Hot reload.</b> The TUI watches the config directory and applies a valid save; <b>/reload</b> does the same by hand.</li>
+      <li><b>Generated on first run</b> from the provider table, so the model list cannot drift from the code.</li>
+    </ol>
+  </section>
+
+  <section>
+    <p class="rule"><span class="no">06</span> MCP client</p>
+    <pre><span class="cm">/mcp  —  ^O</span>
+
+<span class="str">●</span> sema        <span class="cm">connected · 3 tools</span>
+<span class="kw">▲</span> asana       <span class="cm">needs auth — press c to sign in</span>
+<span class="cm">◌ filesystem  idle — press c to connect</span>
+
+<span class="cm">↑↓ move · c connect · d disconnect · ⏎ tools · e edit · esc close</span></pre>
+    <ol>
+      <li><b>stdio or HTTP</b>, with OAuth prompted on connect.</li>
+      <li><b>:autostart #t</b> connects at boot, before the alt-screen opens, so a first sign-in is visible.</li>
+      <li><b>The default server is Sema's own</b>, so the agent can evaluate Sema and read Sema docs while editing Sema.</li>
+      <li><b>Collisions are reported.</b> Built-ins win; between servers the first to connect wins; <b>/tools</b> shows each tool's origin.</li>
+    </ol>
+  </section>
+
+  <section>
+    <p class="rule"><span class="no">07</span> Extending</p>
+    <p class="first">
+      A <b>.sema</b> file in <b>plugins/</b>, globally or per project, loaded at
+      boot with the full API. A broken plugin prints an error and the agent
+      still starts.
+    </p>
+    <dl>
+      <div><dt>register-command!</dt><dd>A slash command with a <b>(state args)</b> handler; <b>register-completions!</b> for its arguments.</dd></div>
+      <div><dt>deftool, register-tool!</dt><dd>A tool the model can call. Files in <b>tools/</b> are reconciled on every config apply.</dd></div>
+      <div><dt>add-hook!</dt><dd>session-start, pre-turn, pre-tool-call, post-turn, on-error, turn-queued, turn-interrupted.</dd></div>
+      <div><dt>bind-key!</dt><dd>Rebind any action over four merge layers; conflicts reported at boot.</dd></div>
+      <div><dt>register-overlay!</dt><dd>A modal with <b>:render</b> and <b>:on-key</b>, or reuse <b>list-modal</b>.</dd></div>
+      <div><dt>prompt-insert!</dt><dd>Read and rewrite what the user is typing, from inside a command.</dd></div>
+    </dl>
+  </section>
+
+  <section>
+    <p class="rule"><span class="no">08</span> Interrupting a turn</p>
+    <p class="first">
+      Cancelling during a tool call is how an agent ends up with a history the
+      provider rejects. The turn runs as an async task with a second task
+      drawing the interface, so the cancel lands immediately — then the history
+      is repaired.
+    </p>
+    <ol>
+      <li><b>Orphaned tool calls</b> get synthesized, correlated results.</li>
+      <li><b>In-flight assistant text</b> is kept rather than dropped.</li>
+      <li><b>A typed control message</b> records the interruption and that partial side effects are possible.</li>
+      <li><b>Tab queues</b> a follow-up instead of interrupting; <b>/queue</b> lists, edits, drops, resumes.</li>
+      <li><b>Sessions are JSONL</b>, written by the TUI to a temp file and renamed. <b>/resume</b> restores one verbatim; one-shot and the plain REPL do not persist.</li>
+    </ol>
+  </section>
+
+  <section>
+    <p class="rule"><span class="no">09</span> Tests, and what is missing</p>
+    <p class="first">
+      36 test files, 3,400 lines, run by a test runner that is itself Sema. Each
+      file runs in a child interpreter so a crash stays in that file, and a
+      passing child must print the harness summary, so a forgotten
+      <b>(done)</b> cannot report a false pass. CI runs the version floor and
+      the latest release.
+    </p>
+    <dl>
+      <div><dt>designed, not built</dt><dd>Agent-authored persistent tools; workflows as a first-class feature.</dd></div>
+      <div><dt>missing</dt><dd>The context gauge in the header; streaming in one-shot mode.</dd></div>
+      <div><dt>upstream</dt><dd>Issues #82–#94 on the Sema repository: eight fixed and used here through released APIs, five still open and worked around.</dd></div>
+    </dl>
+  </section>
+
+  <section>
+    <p class="rule"><span class="no">10</span> Install</p>
+    <div class="run"><span class="p">$</span><span class="c" id="c2">curl -fsSL https://sema-lang.com/install.sh | sh</span><button onclick="cp('c2', this)">copy</button></div>
+    <div class="run" style="border-top:0"><span class="p">$</span><span class="c" id="c3">git clone https://github.com/sema-lisp/sema-coder</span><button onclick="cp('c3', this)">copy</button></div>
+    <div class="run" style="border-top:0"><span class="p">$</span><span class="c" id="c4">export ANTHROPIC_API_KEY=… &amp;&amp; ./coder.sema</span><button onclick="cp('c4', this)">copy</button></div>
+    <p style="margin-top:18px">Install <b>rg</b> and the grep tool uses it instead of <b>grep</b>.</p>
+  </section>
+
+  <footer>
+    sema-lisp/sema-coder · MIT · v0.3.0 — draft 7, mono.
+  </footer>
+
+</main>
+<script>
+  function cp(id, btn) {
+    navigator.clipboard.writeText(document.getElementById(id).textContent.trim()).then(() => {
+      const t = btn.textContent; btn.textContent = 'copied';
+      setTimeout(() => btn.textContent = t, 1400);
+    });
+  }
+</script>
+</body>
+</html>

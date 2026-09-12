@@ -128,6 +128,7 @@ export default defineConfig({
         ]
       },
       { text: 'Internals', link: '/docs/internals/architecture' },
+      { text: 'Coder', link: '/coder' },
       { text: 'Playground', link: 'https://sema.run', target: '_blank' }
     ],
 

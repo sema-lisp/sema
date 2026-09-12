@@ -351,7 +351,7 @@
 
       <section id="top">
         <p class="kicker">sema-coder</p>
-        <h1>A coding agent, <span class="g">written in Sema.</span></h1>
+        <h1>A terminal coding agent, <span class="g">written in Sema.</span></h1>
         <p class="lede">
           It edits files, runs commands, and searches code from the terminal.
           The agent loop, the ten tools, the full-screen interface, the MCP
@@ -386,7 +386,7 @@
       </section>
 
       <section id="session">
-        <h2>What a session looks like</h2>
+        <h2>The interface</h2>
         <p class="sub">
           The header shows the model and the running token and cost totals.
           Each finished tool call is one line with its duration, followed by up
@@ -395,7 +395,7 @@
         </p>
 
         <div class="shot">
-          <div class="shot-label">; Sema Coder as it renders in a terminal</div>
+          <div class="shot-label">; the interface</div>
           <div class="screen">
             <div class="hdr">
               <span class="left"><span class="p">(</span>sema<span class="p">)</span> coder</span>
@@ -445,7 +445,7 @@
       </section>
 
       <section id="modes">
-        <h2>Ways to run it</h2>
+        <h2>Run modes</h2>
         <p class="sub">
           Arguments for the interpreter come first. Everything after
           <code>--</code> belongs to Sema Coder.
@@ -466,7 +466,7 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
       </section>
 
       <section id="tools">
-        <h2>Ten tools</h2>
+        <h2>Tools</h2>
         <p class="sub">
           Every result is capped, so one large file or one noisy command cannot
           fill the context window.
@@ -492,7 +492,7 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
       </section>
 
       <section id="mcp">
-        <h2>MCP client</h2>
+        <h2>MCP servers</h2>
         <p class="sub">
           Sema Coder connects to MCP servers over stdio or HTTP and merges their
           tools into the agent. <kbd>⌃O</kbd> opens the manager over the
@@ -501,7 +501,7 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
         </p>
 
         <div class="shot">
-          <div class="shot-label">; the MCP manager, open over a session</div>
+          <div class="shot-label">; /mcp</div>
           <div class="screen">
             <div class="hdr">
               <span class="left"><span class="p">(</span>sema<span class="p">)</span> coder</span>
@@ -547,7 +547,7 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
           close over state.
         </p>
 
-        <h3 id="cfg-files">Where files live</h3>
+        <h3 id="cfg-files">File locations</h3>
         <div class="defs">
           <div><div class="n">init.sema</div><div class="d">The config itself, written on first run. The full-screen interface watches the directory and applies a valid save.</div></div>
           <div><div class="n">tools/*.sema</div><div class="d">Persistent agent tools. Reconciled at boot and on every config apply, so deleting a file drops its tool.</div></div>
@@ -564,7 +564,7 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
           opens it.
         </p>
 
-        <h3 id="cfg-keys">Every top-level key</h3>
+        <h3 id="cfg-keys">Config keys</h3>
         <div class="defs">
           <div><div class="n">:model<span class="tag">"claude-opus-5"</span></div><div class="d">A string. An empty string detects the model from whichever API key is set.</div></div>
           <div><div class="n">:effort<span class="tag">""</span></div><div class="d">none, minimal, low, medium, high or xhigh. Empty means the provider default.</div></div>
@@ -687,7 +687,7 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
       </section>
 
       <section id="extend">
-        <h2>Extending it, step by step</h2>
+        <h2>Plugins</h2>
         <p class="sub">
           A plugin is one <code>.sema</code> file. Global plugins live in
           <code>&lt;config-dir&gt;/plugins/</code> and load first; project
@@ -703,7 +703,7 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
         </p>
 
         <div class="step" id="step-1" data-n="1">
-          <h4>Give the agent a tool</h4>
+          <h4>Add a tool</h4>
           <p>
             <code>deftool</code> declares the name, the description the model
             reads, and the parameters. <code>register-tool!</code> puts it in
@@ -743,7 +743,7 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
         </div>
 
         <div class="step" id="step-3" data-n="3">
-          <h4>Complete its arguments</h4>
+          <h4>Add completions</h4>
           <p>
             Completions feed the palette once the input reads
             <code>/lint &lt;partial&gt;</code>. Return a list of maps; the
@@ -774,7 +774,7 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
         </div>
 
         <div class="step" id="step-5" data-n="5">
-          <h4>React to the turn lifecycle</h4>
+          <h4>Add a hook</h4>
           <p>
             Hooks observe; their return value is ignored and an exception is
             swallowed. From a hook use <code>add-block!</code> rather than
@@ -791,7 +791,7 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
         </div>
 
         <div class="step" id="step-6" data-n="6">
-          <h4>What it looks like in use</h4>
+          <h4>Result</h4>
           <p>
             Restart the agent; plugin edits are not hot-reloaded, because a
             plugin may add hooks and reloading would register them twice. The
@@ -831,7 +831,7 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
           </div>
         </div>
 
-        <h3 id="ext-api">The rest of the API</h3>
+        <h3 id="ext-api">API reference</h3>
         <div class="tools-grid">
           <div><div class="n">Tools</div><div class="d"><code>deftool</code>, <code>register-tool!</code></div><div class="cap">a file in tools/ is the persistent form</div></div>
           <div><div class="n">Commands</div><div class="d"><code>register-command!</code>, <code>register-completions!</code></div><div class="cap">state: :messages :model :effort :cwd :agent :config</div></div>
@@ -845,7 +845,7 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
       </section>
 
       <section id="turns">
-        <h2>Interrupting a turn keeps the history valid</h2>
+        <h2>Interrupts and sessions</h2>
         <p class="sub">
           Cancelling during a tool call is how an agent ends up with a
           conversation the provider rejects: a tool call with no result. Sema
@@ -870,7 +870,7 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
           too.
         </p>
 
-        <h3 id="cmd-builtin">The whole list</h3>
+        <h3 id="cmd-builtin">Commands</h3>
         <div class="shot">
           <div class="shot-label">; /help</div>
           <div class="screen">
@@ -898,7 +898,7 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
           </div>
         </div>
 
-        <h3 id="cmd-notes">Worth knowing</h3>
+        <h3 id="cmd-notes">Notes</h3>
         <div class="defs">
           <div><div class="n">/model</div><div class="d">Completes from <code>:models</code>. The active model is marked, and a provider whose key is missing is marked <code>· no key</code>. Any id typed by hand still works, and switching to a model in another provider group switches the provider.</div></div>
           <div><div class="n">/clear</div><div class="d">Clears the conversation. Token and cost totals in the header keep counting.</div></div>
@@ -921,7 +921,7 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
           <code>/debug doctor</code> never prints a key value.
         </p>
 
-        <h3 id="cmd-keys">Keys the prompt keeps for itself</h3>
+        <h3 id="cmd-keys">Reserved keys</h3>
         <div class="keygrid">
           <div><span class="k"><kbd>Enter</kbd></span> interrupt the turn and send</div>
           <div><span class="k"><kbd>Tab</kbd></span> queue a follow-up instead</div>
@@ -943,46 +943,46 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
       <div class="rail-in">
         <div class="h">Contents</div>
         <nav class="toc">
-          <div class="toc-item"><a href="#start">Install it</a></div>
-          <div class="toc-item"><a href="#session">See it running</a></div>
-          <div class="toc-item"><a href="#modes">Run it three ways</a></div>
-          <div class="toc-item"><a href="#tools">What it can do</a></div>
-          <div class="toc-item"><a href="#mcp">Add MCP servers</a></div>
+          <div class="toc-item"><a href="#start">Install</a></div>
+          <div class="toc-item"><a href="#session">Interface</a></div>
+          <div class="toc-item"><a href="#modes">Run modes</a></div>
+          <div class="toc-item"><a href="#tools">Tools</a></div>
+          <div class="toc-item"><a href="#mcp">MCP servers</a></div>
           <div class="toc-item">
-            <a href="#config">Configure it</a>
+            <a href="#config">Configuration</a>
             <div class="toc-sub">
               <div>
                 <a href="#cfg-files">file locations</a>
                 <a href="#cfg-keys">config keys</a>
-                <a href="#cfg-ctors">a full init.sema</a>
-                <a href="#cfg-commands">custom commands</a>
+                <a href="#cfg-ctors">init.sema example</a>
+                <a href="#cfg-commands">command forms</a>
                 <a href="#cfg-hooks">hooks</a>
                 <a href="#cfg-keymap">key map</a>
-                <a href="#cfg-precedence">precedence, reload</a>
+                <a href="#cfg-precedence">precedence and reload</a>
               </div>
             </div>
           </div>
           <div class="toc-item">
-            <a href="#extend">Write a plugin</a>
+            <a href="#extend">Plugins</a>
             <div class="toc-sub">
               <div>
-                <a href="#step-1">1 · give it a tool</a>
+                <a href="#step-1">1 · add a tool</a>
                 <a href="#step-2">2 · add a command</a>
-                <a href="#step-3">3 · complete arguments</a>
+                <a href="#step-3">3 · add completions</a>
                 <a href="#step-4">4 · bind a key</a>
                 <a href="#step-5">5 · add a hook</a>
-                <a href="#step-6">6 · see it work</a>
-                <a href="#ext-api">the rest of the API</a>
+                <a href="#step-6">6 · result</a>
+                <a href="#ext-api">API reference</a>
               </div>
             </div>
           </div>
-          <div class="toc-item"><a href="#turns">Interrupt a turn</a></div>
+          <div class="toc-item"><a href="#turns">Interrupts</a></div>
           <div class="toc-item">
-            <a href="#commands">Command reference</a>
+            <a href="#commands">Commands</a>
             <div class="toc-sub">
               <div>
-                <a href="#cmd-builtin">the whole list</a>
-                <a href="#cmd-notes">worth knowing</a>
+                <a href="#cmd-builtin">commands</a>
+                <a href="#cmd-notes">notes</a>
                 <a href="#cmd-debug">diagnostics</a>
                 <a href="#cmd-keys">reserved keys</a>
               </div>

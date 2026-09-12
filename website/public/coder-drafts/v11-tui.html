@@ -198,23 +198,23 @@
   @media (prefers-reduced-motion: reduce) { .cursor { animation: none } }
   .caption { color: var(--fg-3); font-size: 12.5px; line-height: var(--row); max-width: 78ch; margin: 0; }
 
-  /* ============ code samples (never framed like a terminal) ============ */
-  .code { margin: 0 0 27px; }
+  /* ============ code samples ============ */
+  /* A panel, so a snippet never blends into the page: its own ground, a faint
+     border, and the filename in an attached bar. Distinct from a terminal
+     rendering, which carries the app's own header and status line. */
+  .code {
+    margin: 0 0 27px; border-radius: 3px; overflow: hidden;
+    box-shadow: inset 0 0 0 1px var(--line); background: #070707;
+  }
   .code .file {
     font-size: 12px; line-height: 27px; color: var(--fg-3); letter-spacing: .04em;
+    padding: 0 16px; background: #0c0b0a; box-shadow: inset 0 -1px 0 var(--line);
   }
   .code .file b { color: var(--fg-2); font-weight: 500; }
   .code pre {
-    margin: 0; padding: 0 0 0 18px; box-shadow: inset 1px 0 0 var(--line);
+    margin: 0; padding: 13px 16px 14px;
     white-space: pre; overflow-x: auto; font: 13px/var(--row) inherit; color: #c9c3b6;
   }
-  /* Inside a step the sample gets the editor treatment the UI library uses:
-     darker ground, faint border, padded like a frame. */
-  .step .code pre {
-    background: #070707; border-radius: 3px; padding: 13px 16px 14px;
-    box-shadow: inset 0 0 0 1px var(--line);
-  }
-  .step .code .file { color: var(--fg-4); }
   .str { color: var(--green); } .kw { color: var(--gold); } .cm { color: var(--fg-3); }
 
   /* ============ tables ============ */
@@ -935,13 +935,6 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
           <a href="#cfg-keymap">key map</a>.
         </p>
 
-        <h3 id="cmd-roadmap">Not built yet</h3>
-        <div class="defs">
-          <div><div class="n">Forge</div><div class="d">Tools the agent writes and keeps. Designed and parked: the host primitive does not exist.</div></div>
-          <div><div class="n">Workflows</div><div class="d">Designed, not started. No <code>/workflows</code> overlay and no workflow transcript block.</div></div>
-          <div><div class="n">Context gauge</div><div class="d">Not in the header yet.</div></div>
-          <div><div class="n">One-shot streaming</div><div class="d"><code>--print</code> answers in one go, with no slash commands.</div></div>
-        </div>
       </section>
 
     </div>
@@ -992,7 +985,6 @@ $ git diff | <span class="kw">./coder.sema</span> -- -p <span class="str">"revie
                 <a href="#cmd-notes">worth knowing</a>
                 <a href="#cmd-debug">diagnostics</a>
                 <a href="#cmd-keys">reserved keys</a>
-                <a href="#cmd-roadmap">not built yet</a>
               </div>
             </div>
           </div>

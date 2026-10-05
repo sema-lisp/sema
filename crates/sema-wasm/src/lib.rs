@@ -283,9 +283,17 @@ fn request_legacy_debug_stop(interp: &Rc<sema_eval::Interpreter>) -> LegacyStopA
             return LegacyStopAction::None;
         }
         match session {
-            LegacyDebugSlot::Starting { stop_requested, .. }
-            | LegacyDebugSlot::Driving { stop_requested, .. } => {
+            LegacyDebugSlot::Starting { stop_requested, .. } => {
                 *stop_requested = true;
+                LegacyStopAction::Requested
+            }
+            LegacyDebugSlot::Driving { stop_requested, .. } => {
+                *stop_requested = true;
+                // Return control before the next source expression can run.
+                let _ = sema_vm::with_active_debug(|debug| {
+                    debug.pause_requested = true;
+                    debug.instructions_remaining = debug.instructions_remaining.clamp(1, 128);
+                });
                 LegacyStopAction::Requested
             }
             LegacyDebugSlot::Active(_) => match slot.take() {
@@ -1958,6 +1966,9 @@ impl WasmInterpreter {
         vm.seed_main_frame(program.closure);
 
         let mut debug = sema_vm::DebugState::new_headless();
+        debug
+            .valid_breakpoint_lines
+            .insert(source_file.clone(), valid_lines.clone());
         if !snapped.is_empty() {
             debug.set_breakpoints(&source_file, &snapped);
         }
@@ -2118,6 +2129,9 @@ impl WasmInterpreter {
         }
 
         let mut debug = sema_vm::DebugState::new_headless();
+        debug
+            .valid_breakpoint_lines
+            .insert(source_file.clone(), valid_lines.clone());
 
         // Set snapped breakpoints
         if !snapped_bp_lines.is_empty() {

@@ -37,9 +37,10 @@ use sema_llm::builtins::{
 use sema_workflow::approval::{ApprovalRequest, ApprovalResolution, NewApprovalRequest};
 use sema_workflow::context;
 use sema_workflow::event::WorkflowEvent;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -1469,6 +1470,64 @@ struct McpClose {
     handles: Vec<Value>,
 }
 
+// The continuation owns these handles from decoding until body admission.
+// The decoder holds only a Weak reference: exactly one GC owner traces them.
+struct ResolutionCleanup(Rc<RefCell<Option<McpClose>>>);
+
+impl ResolutionCleanup {
+    fn disarm(&self) {
+        self.0.borrow_mut().take();
+    }
+}
+
+impl Drop for ResolutionCleanup {
+    fn drop(&mut self) {
+        if let Some(close) = self.0.borrow_mut().take() {
+            close.resolver.close(&close.handles);
+        }
+    }
+}
+
+struct TrackedResolutionDecoder {
+    inner: Box<dyn CompletionDecoder>,
+    cleanup: Weak<RefCell<Option<McpClose>>>,
+    resolver: Rc<dyn WorkflowMcpResolver>,
+}
+
+impl Trace for TrackedResolutionDecoder {
+    fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        self.inner.trace(sink)
+    }
+}
+
+impl CompletionDecoder for TrackedResolutionDecoder {
+    fn decode(
+        self: Box<Self>,
+        context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        let value = self.inner.decode(context, result)?;
+        let handles = workflow_mcp::decode_resolutions(&value)
+            .into_iter()
+            .filter_map(|r| match r {
+                ServerResolution::Connected { handle, .. } => Some(handle),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let Some(cleanup) = self.cleanup.upgrade() else {
+            self.resolver.close(&handles);
+            return Err(SemaError::eval(
+                "workflow/run: resolution owner was dropped",
+            ));
+        };
+        *cleanup.borrow_mut() = Some(McpClose {
+            resolver: self.resolver,
+            handles,
+        });
+        Ok(value)
+    }
+}
+
 impl RunTeardown {
     /// Close the run's MCP handles exactly once (idempotent — the `Drop` backstop calls
     /// this too). A run with no `:mcp` has nothing to close.
@@ -1864,10 +1923,19 @@ fn run_plan(
         // `io_block_on`'s active-quantum guard, so offload it structurally — the blocking
         // resolve runs on a plain worker; `ResolveContinuation` resumes here with the
         // encoded resolutions and runs the same gate/event logic as the host arm.
-        let prepared = resolver.resolve_prepared(&decls, &name, &run_id);
+        let cleanup = ResolutionCleanup(Rc::new(RefCell::new(None)));
+        let prepared = Rc::clone(&resolver).resolve_prepared(&decls, &name, &run_id);
+        let prepared = (*prepared).map_decoder(|inner| {
+            Box::new(TrackedResolutionDecoder {
+                inner,
+                cleanup: Rc::downgrade(&cleanup.0),
+                resolver: Rc::clone(&resolver),
+            })
+        });
         return Ok(ThunkPlan::Suspend(NativeSuspend {
-            wait: WaitKind::External(prepared),
+            wait: WaitKind::External(Box::new(prepared)),
             continuation: Box::new(ResolveContinuation {
+                cleanup,
                 guard,
                 thunk,
                 resolver,
@@ -2043,10 +2111,11 @@ fn trace_run_teardown(teardown: &RunTeardown, sink: &mut dyn FnMut(GcEdge<'_>)) 
 /// `Value` and runs the shared gate/event logic, then either returns the gate envelope or
 /// drives the body thunk (`NativeOutcome::Call`) with the run teardown.
 ///
-/// CORE-2 I2: the only `Value` it retains is `thunk`, which its `trace` emits. Cancellation
-/// or a worker failure tears the run down (drops `guard`, so the scope token is removed;
-/// any half-open connection was dropped inside the worker's drop-on-cancel select).
+/// Its trace hook exposes the body thunk and any decoded MCP handles. Cancellation
+/// drops the scope guard and closes handles not yet transferred to the run teardown.
+/// Connections still held by the worker are released by its cancellation resource.
 struct ResolveContinuation {
+    cleanup: ResolutionCleanup,
     guard: context::WorkflowGuard,
     thunk: Value,
     resolver: Rc<dyn WorkflowMcpResolver>,
@@ -2056,6 +2125,14 @@ struct ResolveContinuation {
 
 impl Trace for ResolveContinuation {
     fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        let Ok(cleanup) = self.cleanup.0.try_borrow() else {
+            return false;
+        };
+        if let Some(close) = cleanup.as_ref() {
+            for handle in &close.handles {
+                sink(GcEdge::Value(handle));
+            }
+        }
         sink(GcEdge::Value(&self.thunk));
         true
     }
@@ -2069,6 +2146,7 @@ impl NativeContinuation for ResolveContinuation {
     ) -> NativeResult {
         let task_context = context.task_context.clone();
         let ResolveContinuation {
+            cleanup,
             guard,
             thunk,
             resolver,
@@ -2078,7 +2156,7 @@ impl NativeContinuation for ResolveContinuation {
         match input {
             ResumeInput::Returned(value) => {
                 let resolutions = workflow_mcp::decode_resolutions(&value);
-                match apply_resolutions(
+                let gate = apply_resolutions(
                     Some(&task_context),
                     guard,
                     thunk,
@@ -2086,7 +2164,9 @@ impl NativeContinuation for ResolveContinuation {
                     resolutions,
                     policy,
                     workspace_root,
-                )? {
+                )?;
+                cleanup.disarm();
+                match gate {
                     ResolveGate::Exit { envelope, ack } => Ok(NativeOutcome::Suspend(
                         build_flush_ack_suspend(envelope, ack),
                     )),
@@ -2397,6 +2477,79 @@ pub fn register(env: &sema_core::Env) {
 #[cfg(test)]
 mod continuation_tests {
     use super::*;
+
+    struct ClosingResolver(Rc<RefCell<Vec<Value>>>);
+
+    impl WorkflowMcpResolver for ClosingResolver {
+        fn resolve(&self, _: &[workflow_mcp::McpDecl], _: &str, _: &str) -> Vec<ServerResolution> {
+            Vec::new()
+        }
+        fn close(&self, handles: &[Value]) {
+            self.0.borrow_mut().extend_from_slice(handles);
+        }
+    }
+
+    struct EncodedResolution(Value);
+    impl Trace for EncodedResolution {
+        fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+            sink(GcEdge::Value(&self.0));
+            true
+        }
+    }
+    impl CompletionDecoder for EncodedResolution {
+        fn decode(
+            self: Box<Self>,
+            _: &mut NativeCallContext<'_>,
+            _: Result<SendPayload, ExternalFailure>,
+        ) -> DecodedCompletion {
+            Ok(self.0)
+        }
+    }
+
+    #[test]
+    fn decoded_mcp_handles_close_on_cancellation_but_not_after_transfer() {
+        for transfer in [false, true] {
+            let closed = Rc::new(RefCell::new(Vec::new()));
+            let resolver: Rc<dyn WorkflowMcpResolver> =
+                Rc::new(ClosingResolver(Rc::clone(&closed)));
+            let handle = Value::string("connected-handle");
+            let encoded = workflow_mcp::encode_resolutions(&[ServerResolution::Connected {
+                alias: "test".into(),
+                handle: handle.clone(),
+                auth: None,
+            }]);
+            let cleanup = ResolutionCleanup(Rc::new(RefCell::new(None)));
+            let decoder = Box::new(TrackedResolutionDecoder {
+                inner: Box::new(EncodedResolution(encoded)),
+                cleanup: Rc::downgrade(&cleanup.0),
+                resolver,
+            });
+            let eval_context = sema_core::EvalContext::new();
+            let mut context = NativeCallContext {
+                hof_host: None,
+                eval_context: &eval_context,
+                task_context: TaskContextHandle::default(),
+                call_env: None,
+                cancellation: Default::default(),
+            };
+            let decoded = decoder.decode(&mut context, Ok(Box::new(()))).unwrap();
+            assert!(closed.borrow().is_empty());
+            // Cancellation can discard the completion before the continuation runs.
+            drop(decoded);
+            if transfer {
+                cleanup.disarm();
+            }
+            drop(cleanup);
+            if transfer {
+                assert!(
+                    closed.borrow().is_empty(),
+                    "run teardown owns transferred handles"
+                );
+            } else {
+                assert_eq!(*closed.borrow(), vec![handle]);
+            }
+        }
+    }
 
     /// A `ThunkContinuation` must expose exactly the GC edges its teardown state carries
     /// (a run's open MCP handles are the only `Value`s any workflow teardown holds; a

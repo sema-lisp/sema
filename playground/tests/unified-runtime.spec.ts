@@ -1229,7 +1229,7 @@ test('Promise debugger stop is reentrant-safe inside a registered JS callback', 
   expect(result.afterStop).toMatchObject({ value: null, error: null });
 });
 
-test('a detached foreign timer does not delay promise-root deadlock settlement', async ({ page }) => {
+test('a deadlocked Promise root rejects after detached timer work completes', async ({ page }) => {
   await page.goto('/');
 
   const result = await page.evaluate(async () => {
@@ -1250,10 +1250,10 @@ test('a detached foreign timer does not delay promise-root deadlock settlement',
   expect(result.foreign.error).toBeNull();
   expect(result.deadlocked.value).toBeNull();
   expect(result.deadlocked.error).toContain('deadlock');
-  expect(result.elapsed).toBeLessThan(250);
+  expect(result.elapsed).toBeLessThan(2000);
 });
 
-test('a detached foreign external wait does not suppress promise-root deadlock settlement', async ({ page }) => {
+test('a deadlocked Promise root rejects after detached external work completes', async ({ page }) => {
   await page.route('**/foreign-external-wait', async (route) => {
     await new Promise((resolve) => setTimeout(resolve, 800));
     await route.fulfill({ status: 200, body: 'ok' });
@@ -1281,7 +1281,7 @@ test('a detached foreign external wait does not suppress promise-root deadlock s
   expect(result.foreign).toBe('<async-promise>');
   expect(result.deadlocked.value).toBeNull();
   expect(result.deadlocked.error).toContain('deadlock');
-  expect(result.elapsed).toBeLessThan(250);
+  expect(result.elapsed).toBeLessThan(2000);
 });
 
 test('synchronous debugger rejects suspension and clears only its session', async ({ page }) => {
@@ -1399,4 +1399,37 @@ test('the shipped default worker protocol never reaches legacy Atomics/replay co
   // The default protocol's own reachable entry points call the new seam.
   expect(workerSrc).toContain('evalPromise');
   expect(workerSrc).toContain('cancelRoot');
+});
+
+
+test('a Promise root can await a detached promise from an earlier root', async ({ page }) => {
+  await page.goto('/');
+  const value = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+    await interp.evalPromise('(define pending (async/spawn (fn () (async/sleep 100) 42)))');
+    return await interp.evalPromise('(async/await pending)');
+  });
+  expect(value).toBe('42');
+});
+
+test('a Promise root receives from a detached sender from an earlier root', async ({ page }) => {
+  await page.goto('/');
+  const result = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+    await interp.evalPromise(`
+      (define shared-channel (channel/new 1))
+      (async/spawn (fn () (async/sleep 100) (channel/send shared-channel 42)))
+    `);
+    return await interp.evalPromise('(channel/recv shared-channel)').then(
+      (value: string) => ({ value, error: null }),
+      (error: Error) => ({ value: null, error: error.message }),
+    );
+  });
+  expect(result).toEqual({ value: '42', error: null });
 });

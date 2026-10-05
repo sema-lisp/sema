@@ -42,6 +42,19 @@ pub struct PreparedExternalOperation {
 }
 
 impl PreparedExternalOperation {
+    /// Wrap the VM-thread decoder while preserving the job and cancellation resource.
+    pub fn map_decoder(
+        mut self,
+        wrap: impl FnOnce(Box<dyn CompletionDecoder>) -> Box<dyn CompletionDecoder>,
+    ) -> Self {
+        let decoder = self
+            .decoder
+            .take()
+            .expect("prepared operation owns its decoder");
+        self.decoder = Some(wrap(decoder));
+        self
+    }
+
     #[doc(hidden)]
     pub fn completion_kind(&self) -> CompletionKind {
         self.kind

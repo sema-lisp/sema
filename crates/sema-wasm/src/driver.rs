@@ -901,6 +901,10 @@ fn drive_and_settle(driver: &Rc<PromiseDriver>) {
     settle_debug_action(driver, &drive_state);
     settle_retiring_debug_roots(driver);
 
+    // Earlier evaluations may send through shared channels or release resources
+    // after a timer or external operation completes. Root ownership alone does
+    // not prove those waits are unrelated to a foreground evaluation. Only the
+    // fully idle branch below can classify the driven roots as deadlocked.
     let ordinary_pending =
         !driver.promises.borrow().is_empty() || !driver.background_roots.borrow().is_empty();
     let retiring_debug_pending = !driver.retiring_debug_roots.borrow().is_empty();

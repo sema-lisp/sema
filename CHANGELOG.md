@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- Preserve agent memory when cancellation discards an active tool call.
+- Close MCP handles when a workflow is cancelled during connection setup.
+- Restore browser debugger breakpoints and Stop handling, with regression
+  coverage for cross-evaluation promise and channel dependencies.
+
 - **Reader: `#true`/`#false` lexed as `#t`/`#f` plus a stray symbol** (`Unbound
   variable: rue`). Both long forms now read as booleans, and `#tx` is a reader
   error.

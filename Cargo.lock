@@ -3380,7 +3380,7 @@ dependencies = [
 
 [[package]]
 name = "sema-core"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "atomic-write-file",
  "crc32fast",
@@ -3403,7 +3403,7 @@ dependencies = [
 
 [[package]]
 name = "sema-dap"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "sema-core",
  "sema-eval",
@@ -3417,7 +3417,7 @@ dependencies = [
 
 [[package]]
 name = "sema-docs"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "clap",
  "serde",
@@ -3427,7 +3427,7 @@ dependencies = [
 
 [[package]]
 name = "sema-eval"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "sema-core",
  "sema-io",
@@ -3440,7 +3440,7 @@ dependencies = [
 
 [[package]]
 name = "sema-fmt"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "sema-core",
  "sema-reader",
@@ -3449,7 +3449,7 @@ dependencies = [
 
 [[package]]
 name = "sema-io"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "sema-core",
  "tokio",
@@ -3457,7 +3457,7 @@ dependencies = [
 
 [[package]]
 name = "sema-lang"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "clap",
  "clap_complete",
@@ -3515,7 +3515,7 @@ dependencies = [
 
 [[package]]
 name = "sema-llm"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "base64",
  "futures",
@@ -3534,7 +3534,7 @@ dependencies = [
 
 [[package]]
 name = "sema-lsp"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "sema-core",
  "sema-docs",
@@ -3551,7 +3551,7 @@ dependencies = [
 
 [[package]]
 name = "sema-mcp"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -3581,7 +3581,7 @@ dependencies = [
 
 [[package]]
 name = "sema-notebook"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "axum",
  "chrono",
@@ -3598,7 +3598,7 @@ dependencies = [
 
 [[package]]
 name = "sema-otel"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "libc",
  "opentelemetry",
@@ -3613,7 +3613,7 @@ dependencies = [
 
 [[package]]
 name = "sema-policy"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "globset",
  "regex",
@@ -3626,7 +3626,7 @@ dependencies = [
 
 [[package]]
 name = "sema-reader"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "num-bigint",
  "num-rational",
@@ -3636,7 +3636,7 @@ dependencies = [
 
 [[package]]
 name = "sema-stdlib"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "axum",
  "base64",
@@ -3694,7 +3694,7 @@ dependencies = [
 
 [[package]]
 name = "sema-vm"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "divan",
  "hashbrown 0.17.1",
@@ -3714,7 +3714,7 @@ dependencies = [
 
 [[package]]
 name = "sema-wasm"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "futures-channel",
  "getrandom 0.4.3",
@@ -3734,7 +3734,7 @@ dependencies = [
 
 [[package]]
 name = "sema-workflow"
-version = "1.36.0"
+version = "1.37.0-rc.1"
 dependencies = [
  "base64",
  "libc",

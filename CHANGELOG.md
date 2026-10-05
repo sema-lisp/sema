@@ -30,14 +30,7 @@ production use until the cross-platform release gates pass.
 
 ### Fixed
 
-- Embed liblzma in macOS binaries and require notarization plus quarantined
-  launch checks before publication.
 - Isolate async fuzz fixtures and use native Windows paths in editor tests.
-
-- Preserve agent memory when cancellation discards an active tool call.
-- Close MCP handles when a workflow is cancelled during connection setup.
-- Restore browser debugger breakpoints and Stop handling, with regression
-  coverage for cross-evaluation promise and channel dependencies.
 
 - **Reader: `#true`/`#false` lexed as `#t`/`#f` plus a stray symbol** (`Unbound
   variable: rue`). Both long forms now read as booleans, and `#tx` is a reader
@@ -177,6 +170,19 @@ production use until the cross-platform release gates pass.
   `get`/`format` argument conventions, the `regex/replace` argument order, and
   JSON key decoding. `docs/limitations.md` records `do`-loop closure capture
   (#39) and closes #35.
+
+## 1.36.1
+
+### Fixed
+
+- macOS release binaries embed liblzma instead of loading Homebrew libraries
+  from the build machine. This fixes launch failures with hardened-runtime
+  library validation and on Macs without Homebrew xz (#163). Developer ID
+  signing and notarization remain enabled.
+- Release validation checks both macOS architectures and the universal MCP
+  executable for non-system library dependencies, valid hardened-runtime
+  signatures, CLI startup, and MCP initialization before publication.
+- Preserve agent memory when cancellation discards an active tool call.
 
 ## 1.36.0
 

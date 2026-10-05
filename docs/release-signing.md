@@ -1,9 +1,8 @@
 # Release binary trust: signing, notarization, attestations
 
 Release macOS binaries are Developer-ID-signed during `dist build` and
-notarized after the release is published (issue #109). Everything is automatic
-in CI once the six repo secrets below exist; without them, releases keep
-working exactly as before (ad-hoc-signed, not notarized). Independently of the
+notarized before the release is published. Everything is automatic
+in CI once the six repo secrets below exist; missing signing or notarization credentials fail the release gate. Independently of the
 secrets, every release binary archive gets a GitHub Artifact Attestation
 (issue #107) — see the last section.
 
@@ -18,15 +17,18 @@ secrets, every release binary archive gets a GitHub Artifact Attestation
   runtime), which notarization requires; the secure timestamp it also requires
   is added by `codesign` automatically for Developer ID identities (verified
   empirically — `codesign -dvv` shows `Timestamp=` even without `--timestamp`).
-- **Notarization** — dist has no built-in notarization (explicitly "future
-  work" in its `sign/macos.rs`), so `post-announce-jobs = ["./notarize"]` runs
-  `.github/workflows/notarize.yml` after the GitHub release exists: it
-  downloads the two `*-apple-darwin.tar.xz` assets, checks the signature
-  actually carries the hardened-runtime flag, zips each binary, and submits it
-  with `notarytool --wait`. Bare Mach-O binaries can't be stapled (only
-  .app/.dmg/.pkg can), so nothing is re-uploaded and no checksum changes;
-  Gatekeeper fetches the notarization ticket from Apple online on first launch
-  of a quarantined (browser-downloaded) copy.
+- **Notarization** — the `check-macos-artifacts` global-artifact job submits
+  both signed architecture binaries and the universal MCP executable to Apple
+  before cargo-dist can publish. It requires an Accepted result from notarytool.
+  ARM64 and Intel runners then verify signatures, dependencies, version and MCP
+  operation, and run `spctl --assess` on their native and universal executables.
+  Bare executables cannot be stapled; Apple registers their code hashes online.
+  Submission does not modify the archives or their checksums.
+- **Preflight** — `validate-release.yml` runs on release-branch pushes and manual
+  dispatch. It uses `dist plan` and the generated release build job, then the
+  same notarization and launch gate. It creates no tag, release, registry entry,
+  or Homebrew commit. After `dist generate`, run
+  `python3 scripts/generate-release-validation.py` to refresh that job.
 - `sema build` standalone executables are unaffected: libsui re-signs its
   output ad-hoc after embedding the archive, same as today.
 
@@ -62,14 +64,10 @@ gh secret set APPLE_API_KEY_ID    --repo sema-lisp/sema --body '<key id>'
 gh secret set APPLE_API_ISSUER_ID --repo sema-lisp/sema --body '<issuer uuid>'
 ```
 
-## Degradation matrix
+## Required credentials
 
-| Secrets present | Result |
-| --- | --- |
-| none | Ad-hoc binaries, notarize job skips with a notice — current behavior |
-| `CODESIGN_*` only | Signed + hardened runtime; notarize job skips with a notice |
-| `APPLE_API_*` only | Notarize job fails loudly at the hardened-runtime guard (binaries unsigned) |
-| all six | Signed and notarized |
+All six signing and notarization secrets are required. Missing credentials fail
+validation before publication; an unsigned build is not a release candidate.
 
 ## Verifying a release
 
@@ -126,6 +124,5 @@ Run the same check on an extracted release binary on its native architecture:
 python3 scripts/check-macos-release.py /path/to/sema 1.36.1
 ```
 
-Notarization is still a separate post-publication Apple service check. A passing
-launch test does not prove that a quarantined browser download has a valid
-notarization ticket. Confirm the notarization job succeeds before announcing.
+Signature verification alone does not prove notarization. The gate separately
+requires Apple acceptance and Gatekeeper assessment before publication.

@@ -18,9 +18,6 @@ global-artifacts-jobs = ["./check-macos-artifacts"]
 # Sign macOS binaries with a Developer ID certificate (CODESIGN_* repo secrets;
 # see docs/release-signing.md). Builds stay unsigned when the secrets are absent.
 macos-sign = true
-# Notarize the signed macOS binaries after the release is published
-# (.github/workflows/notarize.yml; APPLE_API_* repo secrets).
-post-announce-jobs = ["./notarize"]
 # Sigstore provenance for every release artifact (all targets, not just macOS):
 # proves it was built by this repo's release workflow at a specific commit.
 # Verify with `gh attestation verify <artifact> --owner sema-lisp`. No secrets

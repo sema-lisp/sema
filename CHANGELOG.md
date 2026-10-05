@@ -18,8 +18,8 @@ production use until the cross-platform release gates pass.
   libraries on macOS (also prepared for 1.36.1).
 - Validate signed macOS thin and universal binaries before distribution.
 - Restore browser breakpoint registration and prompt reentrant debugger Stop.
-- Keep unrelated background HTTP requests from delaying foreground deadlock
-  detection.
+- Preserve cross-evaluation promise and channel dependencies while detecting
+  deadlocks. Outstanding background work may still resolve a foreground wait.
 - Fix Windows compilation of the runtime watchdog tests.
 - Publish prerelease npm packages under `next`, preserving `latest`, and keep
   prereleases out of the stable MCP registry.

@@ -44,8 +44,11 @@ jobs:
           for target in aarch64-apple-darwin x86_64-apple-darwin; do
             tar -xJf "artifacts/sema-lang-$target.tar.xz" -C artifacts
           done
-          python3 scripts/check-macos-release.py "artifacts/sema-lang-$NATIVE_TARGET/sema" "${RELEASE_TAG#v}"
           lipo -create artifacts/sema-lang-{aarch64,x86_64}-apple-darwin/sema -output artifacts/sema-universal
-          python3 scripts/check-macos-release.py artifacts/sema-universal "${RELEASE_TAG#v}"
-          spctl --assess --type execute --verbose=4 "artifacts/sema-lang-$NATIVE_TARGET/sema"
-          spctl --assess --type execute --verbose=4 artifacts/sema-universal
+          for binary in "artifacts/sema-lang-$NATIVE_TARGET/sema" artifacts/sema-universal; do
+            # Apple's check for non-app code; spctl's execute assessment requires an app bundle.
+            codesign --verify --strict --all-architectures --verbose=4 --check-notarization -R=notarized "$binary"
+            # Exercise launch and MCP with the downloaded-file quarantine attribute.
+            xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");SemaReleaseValidation;" "$binary"
+            python3 scripts/check-macos-release.py "$binary" "${RELEASE_TAG#v}"
+          done

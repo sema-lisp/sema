@@ -161,7 +161,7 @@ jobs:
 
       - name: Publish @sema-lang/sema-wasm
         working-directory: packages/sema-wasm/pkg
-        run: npm publish --provenance --access public || echo "Already published, skipping"
+        run: bash "$GITHUB_WORKSPACE/scripts/publish-npm-package.sh"
 
       - name: Wait for npm registry propagation
         run: |
@@ -192,7 +192,7 @@ jobs:
 
       - name: Publish @sema-lang/sema
         working-directory: packages/sema
-        run: npm publish --provenance --access public || echo "Already published, skipping"
+        run: bash "$GITHUB_WORKSPACE/scripts/publish-npm-package.sh"
 
       # Standalone TS packages — version-locked to the workspace release, built and
       # published with provenance via the same OIDC trusted publisher.
@@ -202,7 +202,7 @@ jobs:
           npm version "${{ steps.version.outputs.version }}" --no-git-tag-version --allow-same-version
           npm install
           npm run build
-          npm publish --provenance --access public || echo "Already published, skipping"
+          bash "$GITHUB_WORKSPACE/scripts/publish-npm-package.sh"
 
       - name: Publish @sema-lang/sema-web
         working-directory: packages/sema-web
@@ -216,4 +216,4 @@ jobs:
           "
           npm install
           npm run build
-          npm publish --provenance --access public || echo "Already published, skipping"
+          bash "$GITHUB_WORKSPACE/scripts/publish-npm-package.sh"

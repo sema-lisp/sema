@@ -122,7 +122,7 @@ impl WorkflowMcpResolver for RealResolver {
     }
 
     fn resolve_prepared(
-        &self,
+        self: Rc<Self>,
         decls: &[McpDecl],
         workflow: &str,
         run_id: &str,

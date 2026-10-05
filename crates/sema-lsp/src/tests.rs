@@ -3987,7 +3987,7 @@ fn goto_definition_still_prefers_local_scope_over_workspace() {
         GotoDefinitionResponse::Scalar(location) => {
             assert_eq!(
                 location.uri.as_str(),
-                "file:///ws/main.sema",
+                main_uri.as_str(),
                 "local let-binding must win over the workspace definition"
             );
         }

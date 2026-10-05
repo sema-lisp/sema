@@ -20,6 +20,8 @@ production use until the cross-platform release gates pass.
 - Restore browser breakpoint registration and prompt reentrant debugger Stop.
 - Preserve cross-evaluation promise and channel dependencies while detecting
   deadlocks. Outstanding background work may still resolve a foreground wait.
+- Close MCP handles when a workflow is cancelled during connection setup.
+- Preserve agent memory when cancellation discards an active tool call.
 - Fix Windows compilation of the runtime watchdog tests.
 - Publish prerelease npm packages under `next`, preserving `latest`, and keep
   prereleases out of the stable MCP registry.

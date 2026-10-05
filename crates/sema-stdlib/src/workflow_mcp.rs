@@ -462,7 +462,7 @@ pub enum ServerResolution {
 
 /// Implemented by the binary crate over `sema-mcp`; the sole crossing point
 /// from the leaf runtime into MCP/OAuth territory.
-pub trait WorkflowMcpResolver {
+pub trait WorkflowMcpResolver: 'static {
     /// Resolve every declared server for one run. `workflow` is the
     /// `defworkflow` name and `run_id` the active run's id — both are for the
     /// resolver's own bookkeeping (e.g. naming a `:persist :workflow`/`:run`
@@ -491,13 +491,16 @@ pub trait WorkflowMcpResolver {
     /// (test fakes). The real, `sema-mcp`-backed resolver OVERRIDES this to move
     /// the OAuth/connect work off the quantum.
     fn resolve_prepared(
-        &self,
+        self: Rc<Self>,
         decls: &[McpDecl],
         workflow: &str,
         run_id: &str,
     ) -> Box<PreparedExternalOperation> {
         let resolutions = self.resolve(decls, workflow, run_id);
-        Box::new(ready_resolution_external(encode_resolutions(&resolutions)))
+        Box::new(ready_resolution_external(
+            self,
+            encode_resolutions(&resolutions),
+        ))
     }
 
     /// Best-effort close of every handle previously returned as `Connected`.
@@ -677,7 +680,10 @@ const READY_RESOLUTION_KIND: u64 = 0x7766_7230;
 /// For resolvers (test fakes) whose `resolve` does no `io_block_on`, so running
 /// it on the VM thread inside a quantum is safe; the offload wrapper exists only
 /// so `workflow/run`'s runtime arm has a uniform External wait to suspend on.
-fn ready_resolution_external(encoded: Value) -> PreparedExternalOperation {
+fn ready_resolution_external<R: WorkflowMcpResolver + ?Sized>(
+    resolver: Rc<R>,
+    encoded: Value,
+) -> PreparedExternalOperation {
     let kind = CompletionKind::try_from_raw(READY_RESOLUTION_KIND)
         .expect("ready-resolution completion kind is nonzero");
     let resource =
@@ -685,6 +691,7 @@ fn ready_resolution_external(encoded: Value) -> PreparedExternalOperation {
     PreparedExternalOperation::interruptible_blocking(
         kind,
         Box::new(ReadyResolutionDecoder {
+            resolver,
             value: Some(encoded),
         }),
         resource,
@@ -695,11 +702,12 @@ fn ready_resolution_external(encoded: Value) -> PreparedExternalOperation {
 /// Decoder for [`ready_resolution_external`]: ignores the (unit) job payload and
 /// returns the pre-encoded resolutions `Value` it captured on the VM thread. Not
 /// `Send`; the runtime keeps it on the VM thread, so holding a `Value` is sound.
-struct ReadyResolutionDecoder {
+struct ReadyResolutionDecoder<R: WorkflowMcpResolver + ?Sized> {
+    resolver: Rc<R>,
     value: Option<Value>,
 }
 
-impl Trace for ReadyResolutionDecoder {
+impl<R: WorkflowMcpResolver + ?Sized> Trace for ReadyResolutionDecoder<R> {
     fn trace(&self, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
         if let Some(value) = &self.value {
             sink(GcEdge::Value(value));
@@ -708,7 +716,22 @@ impl Trace for ReadyResolutionDecoder {
     }
 }
 
-impl CompletionDecoder for ReadyResolutionDecoder {
+impl<R: WorkflowMcpResolver + ?Sized> Drop for ReadyResolutionDecoder<R> {
+    fn drop(&mut self) {
+        if let Some(value) = self.value.take() {
+            let handles: Vec<_> = decode_resolutions(&value)
+                .into_iter()
+                .filter_map(|r| match r {
+                    ServerResolution::Connected { handle, .. } => Some(handle),
+                    _ => None,
+                })
+                .collect();
+            self.resolver.close(&handles);
+        }
+    }
+}
+
+impl<R: WorkflowMcpResolver + ?Sized> CompletionDecoder for ReadyResolutionDecoder<R> {
     fn decode(
         mut self: Box<Self>,
         _context: &mut NativeCallContext<'_>,
@@ -1084,6 +1107,28 @@ mod tests {
             e.to_string().contains("asana"),
             "error should name the alias"
         );
+    }
+
+    #[test]
+    fn prepared_resolution_closes_handles_when_cancelled_before_decode() {
+        struct Resolver(Rc<RefCell<Vec<Value>>>);
+        impl WorkflowMcpResolver for Resolver {
+            fn resolve(&self, _: &[McpDecl], _: &str, _: &str) -> Vec<ServerResolution> {
+                vec![ServerResolution::Connected {
+                    alias: "test".into(),
+                    handle: Value::string("handle"),
+                    auth: None,
+                }]
+            }
+            fn close(&self, handles: &[Value]) {
+                self.0.borrow_mut().extend_from_slice(handles);
+            }
+        }
+        let closed = Rc::new(RefCell::new(Vec::new()));
+        let prepared = Rc::new(Resolver(Rc::clone(&closed))).resolve_prepared(&[], "test", "run");
+        assert!(closed.borrow().is_empty());
+        drop(prepared);
+        assert_eq!(*closed.borrow(), vec![Value::string("handle")]);
     }
 
     // ── resolver seam ────────────────────────────────────────────────────

@@ -430,7 +430,7 @@ fn agent_memory_writeback_obeys_cumulative_size_cap() {
 #[test]
 fn cancelled_agent_run_writes_partial_turns_to_memory() {
     let _dir = TempMemDir::new("cancel-wb");
-    // 8 tool rounds (9 calls) at 100 ms each ⇒ ~900 ms full; cancel at 250 ms.
+    // Cancel after the first tool starts, independent of host startup time.
     let fake = FakeProvider::builder("fake")
         .model("fake-model")
         .chat_delay(100)
@@ -440,11 +440,14 @@ fn cancelled_agent_run_writes_partial_turns_to_memory() {
     let val = interp
         .eval_str_compiled(
             r#"
-            (deftool ping "ping" {:n {:type :number}} (fn (n) "pong"))
+            (define started (channel/new 1))
+            (deftool ping "ping" {:n {:type :number}}
+              (fn (n) (channel/send started :started) "pong"))
             (defagent bot {:model "fake-model" :tools [ping] :max-turns 12})
             (define mem (memory/open {:id "partial" :namespace "agents"}))
             (let ((p (async/spawn (fn () (agent/run bot "interrupted question" {:memory mem})))))
-              (async/spawn (fn () (async/sleep 250) (async/cancel p)))
+              (channel/recv started)
+              (async/cancel p)
               (try (async/await p) (catch e nil)))
             (let ((msgs (conversation/messages (memory/messages mem))))
               (list (length msgs) (message/content (first msgs))))

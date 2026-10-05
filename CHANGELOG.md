@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.36.1
+
+### Fixed
+
+- macOS release binaries embed liblzma instead of loading Homebrew libraries
+  from the build machine. This fixes launch failures with hardened-runtime
+  library validation and on Macs without Homebrew xz (#163). Developer ID
+  signing and notarization remain enabled.
+- Release validation checks both macOS architectures and the universal MCP
+  executable for non-system library dependencies, valid hardened-runtime
+  signatures, CLI startup, and MCP initialization before publication.
+
 ## 1.36.0
 
 ### Fixed

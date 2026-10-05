@@ -106,3 +106,26 @@ gh attestation verify sema-lang-aarch64-apple-darwin.tar.xz --owner sema-lisp
 Scope note: dist 0.30.4 attests the binary archives from `build-local-artifacts`
 only — installers (`.sh`/`.ps1`), the Homebrew formula and the source tarball
 are not attested.
+
+## macOS dependency and launch gate
+
+The CLI statically links the bundled liblzma through `lzma-sys/static`. Do not
+remove that feature: pkg-config can otherwise select a Homebrew dylib from the
+build machine, which hardened-runtime library validation rejects (#163).
+
+`check-macos-artifacts.yml` is a cargo-dist global-artifact job. Before the
+release is published it extracts the signed archives on ARM64 and Intel runners,
+rejects non-system dynamic dependencies, verifies signatures, and runs CLI and
+MCP initialization checks. It also checks a universal executable assembled from
+both slices, as used by `sema.mcpb`. `pack-mcpb.sh` repeats that check on the exact
+universal executable placed in a release bundle. No check re-signs the binary.
+
+Run the same check on an extracted release binary on its native architecture:
+
+```sh
+python3 scripts/check-macos-release.py /path/to/sema 1.36.1
+```
+
+Notarization is still a separate post-publication Apple service check. A passing
+launch test does not prove that a quarantined browser download has a valid
+notarization ticket. Confirm the notarization job succeeds before announcing.

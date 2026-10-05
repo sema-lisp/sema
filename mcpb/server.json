@@ -7,13 +7,13 @@
     "url": "https://github.com/sema-lisp/sema",
     "source": "github"
   },
-  "version": "1.36.0",
+  "version": "1.36.1",
   "packages": [
     {
       "registryType": "mcpb",
-      "identifier": "https://github.com/sema-lisp/sema/releases/download/v1.36.0/sema.mcpb",
-      "version": "1.36.0",
-      "fileSha256": "f4ebae19f9e2e85a552749ed834d0c94a9d4fa82b67d89d56cc276dd70cf6c7e",
+      "identifier": "https://github.com/sema-lisp/sema/releases/download/v1.36.1/sema.mcpb",
+      "version": "1.36.1",
+      "fileSha256": "e47a5077dcb7dbf5183d6227dc3df5ac73fbe8611512ca12a1f849c5c42c9ff4",
       "transport": {
         "type": "stdio"
       }

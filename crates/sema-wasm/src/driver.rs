@@ -901,6 +901,29 @@ fn drive_and_settle(driver: &Rc<PromiseDriver>) {
     settle_debug_action(driver, &drive_state);
     settle_retiring_debug_roots(driver);
 
+    // Settled roots keep their detached children alive, but their unrelated
+    // timers/HTTP requests cannot make a blocked foreground root runnable.
+    if matches!(drive_state, DriveState::Idle { .. }) {
+        let foreground: Vec<_> = driver.promises.borrow().keys().copied().collect();
+        if !foreground.is_empty() && !interp.runtime().roots_can_progress(&foreground) {
+            let pending: Vec<_> = driver.promises.borrow_mut().drain().collect();
+            for (root, entry) in pending {
+                let _ = interp.command_handle().cancel_root(root);
+                driver
+                    .background_roots
+                    .borrow_mut()
+                    .insert(root, entry.handle);
+                reject_with_message(
+                    &entry.reject,
+                    "runtime deadlocked: no pending timer or external wait for the evaluation",
+                );
+            }
+            // Drive cancellation cleanup even if the only other work is an
+            // external request with no timer to wake this driver.
+            schedule_drive(driver);
+        }
+    }
+
     let ordinary_pending =
         !driver.promises.borrow().is_empty() || !driver.background_roots.borrow().is_empty();
     let retiring_debug_pending = !driver.retiring_debug_roots.borrow().is_empty();

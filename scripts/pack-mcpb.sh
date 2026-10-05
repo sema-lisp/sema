@@ -126,6 +126,11 @@ mkdir -p "$BIN"
 
 # macOS: fuse both arch slices into one universal binary (see header).
 lipo -create "$BINS/sema-$MAC_ARM" "$BINS/sema-$MAC_X64" -output "$BIN/sema-macos-universal"
+# Validate the exact universal executable that will enter the published bundle.
+# Local fixtures may be unsigned; downloaded release binaries must be signed.
+if [[ -z "$FROM_DIR" ]]; then
+  python3 "$ROOT/scripts/check-macos-release.py" "$BIN/sema-macos-universal" "$VERSION"
+fi
 # Linux: ship both arches behind the committed uname-dispatch shim.
 cp "$BINS/sema-$LNX_X64" "$BIN/sema-linux-x64"
 cp "$BINS/sema-$LNX_ARM" "$BIN/sema-linux-arm64"

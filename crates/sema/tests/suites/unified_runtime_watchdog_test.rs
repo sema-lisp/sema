@@ -155,7 +155,7 @@ fn escaped_pipe_writer_helper() {
     std::process::exit(0);
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 /// libtest path of a `#[ignore]` helper test in this file, for re-invoking the
 /// test binary with `--exact`. Inside a suite binary the file is a module, so
 /// the path carries a module prefix; standalone it is the bare function name.
@@ -166,6 +166,7 @@ fn helper_test_path(name: &str) -> String {
     }
 }
 
+#[cfg(unix)]
 fn marked_pid(output: &str, marker: &str) -> libc::pid_t {
     output
         .split_whitespace()

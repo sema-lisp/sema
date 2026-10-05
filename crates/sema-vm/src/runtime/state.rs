@@ -4978,6 +4978,44 @@ impl Runtime {
         Ok(())
     }
 
+    /// Whether selected roots can make progress without a new host submission.
+    /// Call at an idle turn boundary. Detached work from other roots must not
+    /// hide a selected root's deadlock. Scope work with the same origin-root
+    /// predicate used by `drive_roots`.
+    pub fn roots_can_progress(&self, roots: &[RootId]) -> bool {
+        let state = self.state.borrow();
+        // A foreground root may explicitly await a detached promise created by
+        // an earlier root. Keep the normal drive loop responsible for those
+        // dependencies; only unrelated background work may be ignored here.
+        let awaits_foreign_promise = state.protocol_waits.values().any(|wait| {
+            task_belongs_to_roots(&state, wait.task, roots)
+                && matches!(&wait.kind, ProtocolWaitKind::Promises(set) if set.promises.iter().any(|id| {
+                    state.promises.task(*id).ok().flatten().is_some_and(|task| {
+                        state.tasks.contains_key(&task) && !task_belongs_to_roots(&state, task, roots)
+                    })
+                }))
+        });
+        awaits_foreign_promise
+            || state.tasks.iter().any(|(id, task)| {
+                matches!(
+                    task.record.state_name(),
+                    super::StateName::Ready | super::StateName::Running
+                ) && task_belongs_to_roots(&state, *id, roots)
+            })
+            || state
+                .timers
+                .next_deadline_for(|key| {
+                    state
+                        .protocol_waits
+                        .get(&key)
+                        .is_some_and(|wait| task_belongs_to_roots(&state, wait.task, roots))
+                })
+                .is_some()
+            || state.waits.as_ref().is_some_and(|waits| {
+                waits.has_active_for(|task| task_belongs_to_roots(&state, task, roots))
+            })
+    }
+
     /// Force-settle the requested `root` as `Failed` with the public deadlock
     /// diagnostic. Called by the host drive loop when the runtime has gone
     /// fully idle — `DriveState::Idle { next_deadline: None,

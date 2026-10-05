@@ -1400,3 +1400,17 @@ test('the shipped default worker protocol never reaches legacy Atomics/replay co
   expect(workerSrc).toContain('evalPromise');
   expect(workerSrc).toContain('cancelRoot');
 });
+
+
+test('a Promise root can await a detached promise from an earlier root', async ({ page }) => {
+  await page.goto('/');
+  const value = await page.evaluate(async () => {
+    // @ts-expect-error -- resolved by the dev server at runtime, not by tsc
+    const mod = await import('/pkg/sema_wasm.js');
+    await mod.default();
+    const interp = new mod.SemaInterpreter();
+    await interp.evalPromise('(define pending (async/spawn (fn () (async/sleep 100) 42)))');
+    return await interp.evalPromise('(async/await pending)');
+  });
+  expect(value).toBe('42');
+});

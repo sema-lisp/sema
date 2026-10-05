@@ -1,0 +1,43 @@
+name: Check macOS release artifacts
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: artifacts-build-local-*-apple-darwin
+          path: artifacts
+          merge-multiple: true
+      - name: Check signed archives and universal MCP executable
+        env:
+          RELEASE_TAG: ${{ fromJson(inputs.plan).announcement_tag }}
+          NATIVE_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            tar -xJf "artifacts/sema-lang-$target.tar.xz" -C artifacts
+          done
+          python3 scripts/check-macos-release.py "artifacts/sema-lang-$NATIVE_TARGET/sema" "${RELEASE_TAG#v}"
+          lipo -create artifacts/sema-lang-{aarch64,x86_64}-apple-darwin/sema -output artifacts/sema-universal
+          python3 scripts/check-macos-release.py artifacts/sema-universal "${RELEASE_TAG#v}"

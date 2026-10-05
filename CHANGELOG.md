@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+## 1.37.0-rc.1
+
+Release candidate for the editor and runtime update. Not recommended for
+production use until the cross-platform release gates pass.
+
+### Editor tooling
+
+- Expanded LSP completion, signature help, rename, formatting, and diagnostics.
+- DAP source breakpoints, stepping, scopes, variable inspection, and evaluation.
+
+### Release stabilization
+
+- Statically link liblzma in release binaries to avoid loading unsigned Homebrew
+  libraries on macOS (also prepared for 1.36.1).
+- Validate signed macOS thin and universal binaries before distribution.
+- Restore browser breakpoint registration and prompt reentrant debugger Stop.
+- Keep unrelated background HTTP requests from delaying foreground deadlock
+  detection.
+- Fix Windows compilation of the runtime watchdog tests.
+- Publish prerelease npm packages under `next`, preserving `latest`, and keep
+  prereleases out of the stable MCP registry.
+- Pin the shared CI toolchain to Rust 1.98.0 for reproducible lint checks.
+
+
 ### Fixed
 
 - **Reader: `#true`/`#false` lexed as `#t`/`#f` plus a stray symbol** (`Unbound

@@ -71,6 +71,9 @@ tar.workspace = true
 flate2.workspace = true
 crc32fast = "1"
 xz2 = "0.1"
+# Release binaries must not load the build machine's Homebrew liblzma.
+# Feature unification makes xz2 use lzma-sys's bundled static library.
+lzma-sys = { version = "0.1", features = ["static"] }
 zip = { workspace = true }
 # Embeds the `sema web` browser runtime (src/web/assets/**) into the binary at
 # compile time. `debug-embed` forces embedding in every profile so a build never

@@ -13,6 +13,8 @@ installers = ["shell", "powershell", "homebrew"]
 tap = "helgesverre/homebrew-tap"
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
+# Validate the signed macOS archives before GitHub/Homebrew publication.
+global-artifacts-jobs = ["./check-macos-artifacts"]
 # Sign macOS binaries with a Developer ID certificate (CODESIGN_* repo secrets;
 # see docs/release-signing.md). Builds stay unsigned when the secrets are absent.
 macos-sign = true

@@ -11,6 +11,7 @@
 - Release validation checks both macOS architectures and the universal MCP
   executable for non-system library dependencies, valid hardened-runtime
   signatures, CLI startup, and MCP initialization before publication.
+- Preserve agent memory when cancellation discards an active tool call.
 
 ## 1.36.0
 

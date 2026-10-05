@@ -11631,6 +11631,9 @@ fn reap_cancelled_agent_runs(task_id: RuntimeTaskId) {
         tokens.into_iter().filter_map(|t| slab.remove(&t)).collect()
     });
     for mut st in reaped {
+        // Cancellation can discard the driver before its catch calls finish.
+        // The slab entry is removed exactly once, so writeback cannot duplicate turns.
+        write_agent_memory(&st);
         if let Some(span) = st.agent_span.take() {
             span.record_error("cancelled", "agent run cancelled");
             span.end_unstacked();
@@ -12648,6 +12651,22 @@ fn exec_tools_cooperative_start(
     continuation.advance()
 }
 
+fn write_agent_memory(st: &AgentLoopState) {
+    // Memory writeback: append new turns (from pre_user_count) into the memory thread.
+    if let Some(ref h) = st.memory_handle {
+        let new_turns = if st.messages.len() > st.pre_user_count {
+            &st.messages[st.pre_user_count..]
+        } else {
+            &[]
+        };
+        MEMORY_CALLBACKS.with(|c| {
+            if let Some(ref cbs) = *c.borrow() {
+                let _ = (cbs.append_back)(h, new_turns);
+            }
+        });
+    }
+}
+
 /// `__agent-finish(token) → result`. Idempotent: appends the final assistant turn,
 /// records trace I/O, ends the agent span, writes back to memory, and builds the
 /// return value (`{:response :messages :session}` map with opts, else the string).
@@ -12688,19 +12707,7 @@ fn agent_finish(token: u64, finish_error: Option<String>) -> Result<Value, SemaE
         span.set_trace_io(&st.first_input, &st.last_content);
     }
 
-    // Memory writeback: append new turns (from pre_user_count) into the memory thread.
-    if let Some(ref h) = st.memory_handle {
-        let new_turns = if st.messages.len() > st.pre_user_count {
-            &st.messages[st.pre_user_count..]
-        } else {
-            &[]
-        };
-        MEMORY_CALLBACKS.with(|c| {
-            if let Some(ref cbs) = *c.borrow() {
-                let _ = (cbs.append_back)(h, new_turns);
-            }
-        });
-    }
+    write_agent_memory(&st);
 
     // A consecutive-tool-error abort surfaces as an error (matching the blocking path).
     if let Some(msg) = st.abort_error.take() {

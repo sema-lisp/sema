@@ -18,6 +18,10 @@ on:
       tag:
         description: "Release tag to build the bundle from (e.g. v1.30.0)"
         required: true
+      metadata_only:
+        description: "Recover default-branch metadata from an already published bundle"
+        type: boolean
+        default: false
 
 permissions:
   contents: write # upload the .mcpb asset to the release
@@ -40,14 +44,31 @@ jobs:
         with:
           node-version-file: ".nvmrc"
       - name: Build + upload sema.mcpb
+        if: ${{ !inputs.metadata_only }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ inputs.tag || github.event.workflow_run.head_branch }}"
           ./scripts/pack-mcpb.sh --tag "$TAG" --upload
 
+      - name: Recover metadata from the published bundle
+        if: ${{ inputs.metadata_only && !contains(inputs.tag, '-') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          mkdir -p dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern sema.mcpb --dir dist
+          SHA="$(shasum -a 256 dist/sema.mcpb | awk '{print $1}')"
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/sema.mcpb"
+          jq --arg v "${TAG#v}" --arg url "$URL" --arg sha "$SHA" '
+            .version = $v | .packages[0].version = $v
+            | .packages[0].identifier = $url | .packages[0].fileSha256 = $sha
+          ' mcpb/server.json > dist/server.json
+          cp dist/server.json mcpb/server.json
+
       - name: Publish to MCP registry
-        if: ${{ !contains(inputs.tag || github.event.workflow_run.head_branch, '-') }}
+        if: ${{ !inputs.metadata_only && !contains(inputs.tag || github.event.workflow_run.head_branch, '-') }}
         env:
           MCP_PRIVATE_KEY: ${{ secrets.MCP_PRIVATE_KEY }}
         run: |
@@ -71,6 +92,7 @@ jobs:
           TAG="${{ inputs.tag || github.event.workflow_run.head_branch }}"
           BR="${{ github.event.repository.default_branch }}"
           tmp="$(mktemp)"; cp mcpb/server.json "$tmp"
+          git restore --source=HEAD -- mcpb/server.json
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch --depth=1 origin "$BR"

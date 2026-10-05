@@ -11,6 +11,7 @@ name: CI
 # `!`-exception below; `paths` with negations, not `paths-ignore`, because
 # only `paths` supports exceptions).
 on:
+  workflow_dispatch:
   push:
     branches: [main, "release/**"]
     paths:

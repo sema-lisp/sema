@@ -95,10 +95,18 @@ fn repro(seed: u64, depth: u64) -> String {
 /// subprocess of the real `sema` binary. Emit resets the per-iteration state
 /// (`*cur-seed*`, `*file-ctr*`, RNG) exactly like check mode, so each entry is
 /// the program check mode would run for that seed.
-fn generate_programs(base: u64, count: u64, depth: u64) -> Vec<(u64, String)> {
+fn generate_programs(
+    base: u64,
+    count: u64,
+    depth: u64,
+) -> (sema_core::testing::TempDir, Vec<(u64, String)>) {
+    // Both harness tests use the same seeds concurrently. Keep their offload
+    // files separate so one test cannot delete another test's pending read.
+    let temp = sema_core::testing::TempDir::new("fuzz-offload");
     let fuzzer = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fuzz/grammar-fuzz.sema");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
         .arg(fuzzer)
+        .env("TMPDIR", temp.path())
         .env("SEMA_FUZZ_MODE", "emit")
         .env("SEMA_FUZZ_ASYNC", "1")
         .env("SEMA_FUZZ_SEED", base.to_string())
@@ -140,7 +148,7 @@ fn generate_programs(base: u64, count: u64, depth: u64) -> Vec<(u64, String)> {
         count as usize,
         "emit produced a different program count than requested"
     );
-    programs
+    (temp, programs)
 }
 
 /// Drive one submitted root to settlement using ONLY the selection-scoped
@@ -291,7 +299,8 @@ fn assert_clean_shutdown(interp: &Interpreter, gate_baseline: usize, what: &str)
 #[ignore = "nightly fuzz harness — run via jake fuzz.async-shutdown"]
 fn fuzz_async_shutdown_each_seed_clean() {
     let cfg = Config::from_env();
-    for (seed, program) in generate_programs(cfg.base, cfg.count, cfg.depth) {
+    let (_temp, programs) = generate_programs(cfg.base, cfg.count, cfg.depth);
+    for (seed, program) in programs {
         let what = format!("seed {seed} [{}]", repro(seed, cfg.depth));
         let interp = Interpreter::new();
         let gate_baseline = interp.runtime_resource_gate_count();
@@ -323,7 +332,7 @@ fn fuzz_async_shutdown_each_seed_clean() {
 fn fuzz_async_shutdown_paired_roots_drive_roots_clean() {
     let cfg = Config::from_env();
     let pair_count = (cfg.count / 2).max(1);
-    let programs = generate_programs(cfg.base, pair_count * 2, cfg.depth);
+    let (_temp, programs) = generate_programs(cfg.base, pair_count * 2, cfg.depth);
     for pair in programs.as_chunks::<2>().0 {
         let (seed_a, prog_a) = &pair[0];
         let (seed_b, prog_b) = &pair[1];

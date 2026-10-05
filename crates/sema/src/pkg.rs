@@ -3725,7 +3725,10 @@ name = "myproject"
 
         let error = find_package_dir(&tmp, "repo").unwrap_err();
         assert!(error.contains("ambiguous"), "got: {error}");
-        assert!(error.contains("github.com/a/repo"), "got: {error}");
+        assert!(
+            error.replace('\\', "/").contains("github.com/a/repo"),
+            "got: {error}"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

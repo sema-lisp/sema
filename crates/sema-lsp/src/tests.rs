@@ -366,8 +366,21 @@ fn range_formatting_in_blank_gap_overlaps_nothing() {
 
 // ── selection range ──────────────────────────────────────────
 
+fn fixture_uri(uri: &str) -> Url {
+    #[cfg(windows)]
+    if let Some(path) = uri.strip_prefix("file:///") {
+        if !path.as_bytes().get(1).is_some_and(|c| *c == b':') {
+            return Url::parse(&format!("file:///C:/{path}")).unwrap();
+        }
+    }
+    Url::parse(uri).unwrap()
+}
+
 /// Build a state with a populated parse cache for `source`, mirroring the dispatch path.
 fn parsed_state(uri: &str, source: &str) -> (BackendState, Url) {
+    // Scope indexing converts URIs to native paths. Windows requires a drive.
+    let normalized = fixture_uri(uri);
+    let uri = normalized.as_str();
     let mut state = BackendState::new_without_builtins(HashMap::new(), "sema".to_string());
     let (ast, span_map, symbol_spans) = sema_reader::read_many_with_symbol_spans(source).unwrap();
     // Mirror the production build path (server.rs / state.rs): drop quoted symbols.

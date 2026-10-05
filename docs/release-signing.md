@@ -21,7 +21,10 @@ secrets, every release binary archive gets a GitHub Artifact Attestation
   both signed architecture binaries and the universal MCP executable to Apple
   before cargo-dist can publish. It requires an Accepted result from notarytool.
   ARM64 and Intel runners then verify signatures, dependencies, version and MCP
-  operation, and run `spctl --assess` on their native and universal executables.
+  operation, and require `codesign --check-notarization -R=notarized` on their
+  native and universal executables. They also set the downloaded-file quarantine
+  attribute before launch and MCP checks. `spctl --type execute` is an app-bundle
+  assessment and rejects valid standalone executables as "not an app".
   Bare executables cannot be stapled; Apple registers their code hashes online.
   Submission does not modify the archives or their checksums.
 - **Preflight** — `validate-release.yml` runs on release-branch pushes and manual
@@ -125,4 +128,6 @@ python3 scripts/check-macos-release.py /path/to/sema 1.36.1
 ```
 
 Signature verification alone does not prove notarization. The gate separately
-requires Apple acceptance and Gatekeeper assessment before publication.
+requires Apple acceptance, the explicit `notarized` requirement, and quarantined
+launch checks before publication. This follows Apple’s [verification guidance
+for non-app code](https://developer.apple.com/videos/play/wwdc2019/703/?time=907).

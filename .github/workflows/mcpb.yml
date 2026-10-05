@@ -34,6 +34,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.event.workflow_run.head_branch }}
       - uses: actions/setup-node@v4
         with:
           node-version-file: ".nvmrc"
@@ -45,6 +47,7 @@ jobs:
           ./scripts/pack-mcpb.sh --tag "$TAG" --upload
 
       - name: Publish to MCP registry
+        if: ${{ !contains(inputs.tag || github.event.workflow_run.head_branch, '-') }}
         env:
           MCP_PRIVATE_KEY: ${{ secrets.MCP_PRIVATE_KEY }}
         run: |
@@ -60,6 +63,7 @@ jobs:
       # sha) in the tag checkout; commit that bump onto the default branch so the
       # repo mirrors what's live. No-ops if unchanged; never fails the run.
       - name: Commit bumped server.json to the default branch
+        if: ${{ !contains(inputs.tag || github.event.workflow_run.head_branch, '-') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

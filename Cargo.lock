@@ -3471,6 +3471,7 @@ dependencies = [
  "indicatif",
  "libc",
  "libsui",
+ "lzma-sys",
  "nu-ansi-term",
  "opentelemetry",
  "opentelemetry_sdk",

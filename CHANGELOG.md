@@ -4,6 +4,10 @@
 
 ### Fixed
 
+- Embed liblzma in macOS binaries and require notarization plus quarantined
+  launch checks before publication.
+- Isolate async fuzz fixtures and use native Windows paths in editor tests.
+
 - Preserve agent memory when cancellation discards an active tool call.
 - Close MCP handles when a workflow is cancelled during connection setup.
 - Restore browser debugger breakpoints and Stop handling, with regression

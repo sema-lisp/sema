@@ -1592,8 +1592,9 @@ mod tests {
 
     #[test]
     fn clean_path_decodes_file_uri_multibyte() {
-        let p = clean_path("file:///tmp/caf%C3%A9/main.sema");
-        assert_eq!(p, PathBuf::from("/tmp/café/main.sema"));
+        let expected = std::env::temp_dir().join("café").join("main.sema");
+        let uri = url::Url::from_file_path(&expected).unwrap();
+        assert_eq!(clean_path(uri.as_str()), expected);
     }
 
     #[test]

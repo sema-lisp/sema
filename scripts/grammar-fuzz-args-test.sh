@@ -34,12 +34,15 @@ assert_usage_error "DEPTH must be a non-negative decimal integer" check -d -1
 # Leading zeroes are valid decimal input and must not reach Bash as octal.
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
+# Isolate binary lookup from target/debug and target/release in this checkout.
+mkdir -p "$TEST_ROOT/scripts"
+cp "$DRIVER" "$TEST_ROOT/scripts/grammar-fuzz.sh"
 cat >"$TEST_ROOT/sema" <<'EOF'
 #!/usr/bin/env bash
-exit 0
+[ "$SEMA_FUZZ_COUNT" = 1 ] && [ "$SEMA_FUZZ_DEPTH" = 0 ] && [ "$SEMA_FUZZ_SEED" = -8 ]
 EOF
 chmod +x "$TEST_ROOT/sema"
 PATH="$TEST_ROOT:$PATH" \
-  "$DRIVER" check --async -n 01 -d 00 -s -08 -b 01 -t 01 >/dev/null
+  "$TEST_ROOT/scripts/grammar-fuzz.sh" check --async -n 01 -d 00 -s -08 -b 01 -t 01 >/dev/null
 
 echo "grammar-fuzz argument tests: clean"

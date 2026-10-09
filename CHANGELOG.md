@@ -2,7 +2,14 @@
 
 ## Unreleased
 
+## 1.37.0-rc.2
+
+Second release candidate for 1.37. Not recommended for production use.
+
 ### Fixed
+
+- Shell concurrency tests use a child-process barrier to prove overlap instead
+  of a two-second wall-clock limit that can fail on busy Windows runners.
 
 - Update `chacha20` to 0.10.2. Its RNG implementation no longer uses an SSE4.1
   instruction in the SSE2 backend, which could crash on older x86 CPUs.

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 1.37.0-rc.2
+
+Second release candidate for 1.37. Not recommended for production use.
+
 ### Fixed
 
 - Update `chacha20` to 0.10.2. Its RNG implementation no longer uses an SSE4.1

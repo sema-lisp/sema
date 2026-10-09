@@ -8,12 +8,12 @@
 //! `http/*` slice) and yields `AwaitIo`, so several children overlap on the
 //! single VM thread.
 //!
-//! These tests are pure local subprocess (no network) and fully deterministic:
-//! `sh -c "sleep 0.5; echo done"` is the unit of overlap.
+//! These tests use local subprocesses and no network.
 //!
-//! - Overlap: five 0.5 s shells via `async/all`+`async/spawn`+`map` complete in
-//!   ~0.5-1.0 s (overlapped), decisively below the ~2.5 s serial floor, and each
-//!   result's stdout/exit is correct & in input order.
+//! - Overlap: each of five Python children publishes a ready marker and waits
+//!   for a shared release file. The controller releases the children only after
+//!   all five markers exist, proving overlap without a wall-clock speed limit.
+//!   Each result's stdout/exit is correct and in input order.
 //! - Non-zero exit: a concurrent `sh -c "exit 3"` returns exit-code 3 in its
 //!   result map (not an error / hang).
 //! - Spawn error: a concurrent shell of a nonexistent program fails that task
@@ -29,28 +29,70 @@ use sema_core::Value;
 use sema_eval::Interpreter;
 use serial_test::serial;
 
-/// Five 0.5 s shells run as five tasks via `async/all`+`async/spawn`+`map`.
-/// Overlap means ~0.5-1.0 s, not the ~2.5 s serial floor. Each result's stdout
-/// and exit code must be correct and in input order.
+struct ShellBarrierDir(std::path::PathBuf);
+
+impl Drop for ShellBarrierDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// All five children must be waiting at the barrier before any can finish.
 #[test]
 #[serial]
 fn shell_concurrent_overlap() {
-    let interp = Interpreter::new();
-    let program = r#"
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let dir = ShellBarrierDir(
+        std::env::temp_dir().join(format!("sema-shell-overlap-{}-{stamp}", std::process::id())),
+    );
+    std::fs::create_dir(&dir.0).expect("barrier directory");
+    let root = dir.0.clone();
+    let controller = std::thread::spawn(move || {
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let all_ready = loop {
+            if (0..5).all(|i| root.join(format!("ready-{i}")).exists()) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        // Release even on failure so the interpreter can reap its children.
+        std::fs::write(root.join("release"), b"").expect("release children");
+        all_ready
+    });
+    let script = r#"
+import pathlib, sys, time
+root = pathlib.Path(sys.argv[1])
+(root / ("ready-" + sys.argv[2])).touch()
+deadline = time.monotonic() + 60
+while not (root / "release").exists():
+    if time.monotonic() >= deadline:
+        raise RuntimeError("controller did not release the shell barrier")
+    time.sleep(0.01)
+sys.stdout.buffer.write(b"done\n")
+"#;
+    let script = serde_json::to_string(script).expect("encode child script");
+    let path = serde_json::to_string(dir.0.to_str().expect("UTF-8 fixture path"))
+        .expect("encode fixture path");
+    let program = format!(
+        r#"
         (async/all
           (map (fn (i)
                  (async/spawn
-                   (fn () (shell "sh" "-c" "sleep 0.5; echo done"))))
+                   (fn () (shell "python3" "-c" {script} {path} (number->string i)))))
                (list 0 1 2 3 4)))
-    "#;
+    "#
+    );
+    let interp = Interpreter::new();
+    let result = interp.eval_str_compiled(&program);
+    let all_ready = controller.join().expect("barrier controller joined");
+    let result = result.expect("concurrent shell program evaluated");
 
-    let t0 = Instant::now();
-    let result = interp
-        .eval_str_compiled(program)
-        .expect("concurrent shell program evaluated");
-    let elapsed_ms = t0.elapsed().as_millis();
-
-    // Correctness: five result maps, each {:stdout "done\n" :stderr "" :exit-code 0}.
     let one = || {
         let mut m = std::collections::BTreeMap::new();
         m.insert(Value::keyword("stdout"), Value::string("done\n"));
@@ -63,12 +105,9 @@ fn shell_concurrent_overlap() {
         result, expected,
         "expected five correct shell results in input order"
     );
-
-    // Overlap (timing): serial floor is ~2500 ms; overlapping ~500-1000 ms.
-    eprintln!("shell_concurrent_overlap: wall-clock {elapsed_ms} ms (serial floor ~2500 ms)");
     assert!(
-        elapsed_ms < 2000,
-        "expected overlapped wall-clock < 2000 ms (serial floor ~2500 ms), got {elapsed_ms} ms"
+        all_ready,
+        "all five shell children must start before the controller releases them"
     );
 }
 

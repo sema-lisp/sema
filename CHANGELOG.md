@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Fixed
+
+- Update `chacha20` to 0.10.2. Its RNG implementation no longer uses an SSE4.1
+  instruction in the SSE2 backend, which could crash on older x86 CPUs.
+- Editor highlighting recognizes `#true` and `#false`, classifies terminal
+  body macros and `parameterize` as keywords, and no longer recognizes
+  unsupported block comments or the unbound `eqv?` operator.
+- MCP cancellation tests wait for a complete peer outcome instead of racing
+  the fixture's marker write. Invalid PID markers and failed process probes
+  cannot count as successful cancellation.
+
 ## 1.37.0-rc.1
 
 Release candidate for the editor and runtime update. Not recommended for

@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 1.37.0
+
+Stable release of the editor and runtime update validated in RC1 and RC2.
+The release candidate notes below contain the full change list.
+
+### Editor tooling
+
+- Expand LSP completion, signature help, rename, formatting, and diagnostics.
+- Add DAP source breakpoints, stepping, scopes, variable inspection, and evaluation.
+- Align editor highlighting and indentation with the reader and body macros.
+
+### Runtime and distribution
+
+- Correct reader token boundaries, async dependency handling, MCP cancellation,
+  and agent memory preservation.
+- Update the ChaCha RNG dependency to fix an SSE4.1 instruction in its SSE2 backend.
+- Statically link liblzma and validate signed, notarized macOS distributions.
+- Publish stable crates, npm packages, platform archives, and the MCP bundle.
+
 ## 1.37.0-rc.2
 
 Second release candidate for 1.37. Not recommended for production use.

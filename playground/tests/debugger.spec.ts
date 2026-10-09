@@ -507,34 +507,34 @@ test.describe('Debugger', () => {
     }
   });
 
-  test('breakpoint snapping: bare literal line snaps to nearest expression', async ({ page }) => {
+  test('breakpoint on a bare literal stays on its executable line', async ({ page }) => {
     const result = await page.evaluate(async () => {
       const mod = await import('/pkg/sema_wasm.js');
       await mod.default();
       const interp = new mod.SemaInterpreter();
-
-      // Bare literals on lines 1-2, expression on line 3
       const code = '"hello"\n42\n(+ 1 2)';
 
-      // Set breakpoint on line 2 (bare literal 42) — should snap to line 3
-      const r = interp.debugStart(code, [2]);
-      const result = {
-        validLines: r.validLines,
-        breakpoints: r.breakpoints,
-      };
-      interp.debugStop();
-      return result;
+      try {
+        const stopped = interp.debugStart(code, [2]);
+        const finished = interp.debugContinue();
+        return {
+          validLines: stopped.validLines,
+          breakpoints: stopped.breakpoints,
+          status: stopped.status,
+          line: stopped.line,
+          finishedStatus: finished.status,
+        };
+      } finally {
+        interp.debugStop();
+        interp.free();
+      }
     });
 
-    console.log('Bare literal snap:', JSON.stringify(result));
-
-    // Only line 3 should be valid (the function call)
-    expect(result.validLines).toContain(3);
-    expect(result.validLines).not.toContain(1);
-    expect(result.validLines).not.toContain(2);
-
-    // Breakpoint on line 2 should snap to line 3
-    expect(result.breakpoints).toEqual([3]);
+    expect(result.validLines).toEqual([1, 2, 3]);
+    expect(result.breakpoints).toEqual([2]);
+    expect(result.status).toBe('stopped');
+    expect(result.line).toBe(2);
+    expect(result.finishedStatus).toBe('finished');
   });
 
   test('breakpoint snapping: clicking empty line immediately snaps dot to valid line', async ({ page }) => {

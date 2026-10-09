@@ -125,8 +125,10 @@ def finish(reason):
     # The REASON the stall ended is the signal the cancellation tests read:
     # "closed" means the transport went away (what cancellation must cause),
     # "released" means the test let it go, "leak-guard" means neither happened.
-    with open(finished, "w") as marker:
+    temporary = finished + ".tmp"
+    with open(temporary, "w") as marker:
         marker.write(reason)
+    os.replace(temporary, finished)
 
 def wait_for_release():
     with open(entered, "w") as marker:
@@ -218,8 +220,10 @@ def touch(path):
     open(path, "w").close()
 
 def finish(reason):
-    with open(finished, "w") as marker:
+    temporary = finished + ".tmp"
+    with open(temporary, "w") as marker:
         marker.write(reason)
+    os.replace(temporary, finished)
 
 def peer_closed(connection):
     readable, _, _ = select.select([connection], [], [], 0)
@@ -357,6 +361,12 @@ fn stdio_server_exited(entered: &std::path::Path) -> bool {
     let Ok(pid) = std::fs::read_to_string(entered) else {
         return false;
     };
+    let Ok(pid) = pid.trim().parse::<u32>() else {
+        return false;
+    };
+    if pid == 0 {
+        return false;
+    }
     let probe = r#"
 import sys
 pid = int(sys.argv[1])
@@ -375,34 +385,64 @@ if sys.platform == "win32":
         # No such pid opens nothing with ERROR_INVALID_PARAMETER; any other
         # failure (e.g. access denied) means the pid still exists.
         gone = ctypes.get_last_error() == ERROR_INVALID_PARAMETER
-        raise SystemExit(1 if gone else 0)
+        raise SystemExit(42 if gone else 0)
     try:
         code = ctypes.c_ulong()
         if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
             raise SystemExit(0)  # unknowable: report alive, keep the oracle honest
         # A killed-but-unreaped process still opens; anything but STILL_ACTIVE
         # in its exit code slot means it is dead.
-        raise SystemExit(0 if code.value == STILL_ACTIVE else 1)
+        raise SystemExit(0 if code.value == STILL_ACTIVE else 42)
     finally:
         kernel32.CloseHandle(handle)
 else:
     import os, subprocess
     try:
         os.kill(pid, 0)  # signal 0: existence check only, delivers nothing
+    except ProcessLookupError:
+        raise SystemExit(42)  # process gone
     except OSError:
-        raise SystemExit(1)  # process gone
+        raise SystemExit(0)  # unknowable: report alive
     state = subprocess.run(
         ["ps", "-o", "stat=", "-p", str(pid)],
         capture_output=True, text=True,
     ).stdout.strip()
     if not state or state.startswith("Z"):
-        raise SystemExit(1)  # reaped mid-probe, or a kill-pending zombie
+        raise SystemExit(42)  # reaped mid-probe, or a kill-pending zombie
     raise SystemExit(0)  # genuinely still running
 "#;
-    !Command::new("python3")
-        .args(["-c", probe, pid.trim()])
+    Command::new("python3")
+        .args(["-c", probe, &pid.to_string()])
         .status()
-        .is_ok_and(|status| status.success())
+        .is_ok_and(|status| status.code() == Some(42))
+}
+
+fn peer_terminal_reason(path: &std::path::Path) -> Option<String> {
+    let reason = std::fs::read_to_string(path).ok()?;
+    matches!(reason.trim(), "closed" | "released" | "leak-guard").then_some(reason)
+}
+
+#[test]
+fn incomplete_peer_markers_are_not_terminal() {
+    let markers = Markers::new("incomplete-outcome");
+    assert_eq!(peer_terminal_reason(&markers.finished), None);
+    for incomplete in ["", "clo", "unknown"] {
+        std::fs::write(&markers.finished, incomplete).unwrap();
+        assert_eq!(peer_terminal_reason(&markers.finished), None);
+    }
+    for reason in ["closed", "released", "leak-guard"] {
+        std::fs::write(&markers.finished, reason).unwrap();
+        assert_eq!(
+            peer_terminal_reason(&markers.finished).as_deref(),
+            Some(reason)
+        );
+    }
+    std::fs::write(&markers.entered, std::process::id().to_string()).unwrap();
+    assert!(!stdio_server_exited(&markers.entered));
+    for incomplete in ["", "not-a-pid", "0"] {
+        std::fs::write(&markers.entered, incomplete).unwrap();
+        assert!(!stdio_server_exited(&markers.entered));
+    }
 }
 
 /// Block until the transport peer reaches ANY terminal state, so the caller
@@ -425,8 +465,8 @@ fn wait_for_peer_outcome(markers: &Markers, oracle: CancellationResourceOracle) 
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut next_process_probe = Instant::now();
     while Instant::now() < deadline {
-        // Markers are a cheap stat(2) — poll them tightly.
-        if markers.finished.exists() || markers.timed_out.exists() {
+        // Read the complete outcome; file creation can precede its contents.
+        if peer_terminal_reason(&markers.finished).is_some() || markers.timed_out.exists() {
             return;
         }
         // The liveness probe forks a whole python (plus ps on POSIX), so it
@@ -475,7 +515,7 @@ fn assert_cancelled_before_server_fallback(
     let (saw_entry, cancel_accepted) = canceller.join().expect("canceller thread completes");
     wait_for_peer_outcome(markers, oracle);
     // Why the peer's stall ended, straight from the peer.
-    let peer_reason = std::fs::read_to_string(&markers.finished).unwrap_or_default();
+    let peer_reason = peer_terminal_reason(&markers.finished).unwrap_or_default();
     let peer_saw_close = peer_reason.trim() == "closed";
     // A SIGKILLed peer never gets to report anything, so its death is the report.
     let peer_killed = matches!(oracle, CancellationResourceOracle::StdioServerExit)

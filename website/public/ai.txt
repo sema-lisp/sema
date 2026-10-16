@@ -1,0 +1,42 @@
+---
+updated: 2026-10-16
+scope: /
+---
+
+# Sema
+
+Sema is a Scheme-like Lisp implemented in Rust. Its native runtime includes LLM
+providers, prompts, conversations, tools, agents, and workflows. This website at
+https://sema-lang.com contains the language documentation and installation links.
+
+## Choose the runtime
+
+- Native Sema runs scripts, a REPL, notebooks, and the `sema mcp` stdio server.
+  Use the native CLI for operating-system access and native LLM integrations.
+- The playground at https://sema.run runs Sema locally in WebAssembly. Its
+  virtual filesystem, networking, and available functions differ from native Sema.
+- Sema Web embeds Sema in web pages through `@sema-lang/sema-web`. Its JavaScript
+  bindings add DOM and reactive UI functions; do not assume those bindings are
+  installed in the playground or the native CLI.
+
+## Find authoritative information
+
+Read [documentation context](https://sema-lang.com/docs/ai.txt) before generating
+Sema code. Read [playground context](https://sema.run/ai.txt) before running code
+in the browser. These are separate contexts for the same language.
+
+- [Coding-agent guide](https://sema-lang.com/docs/for-agents.md): syntax,
+  semantics, naming rules, and common mistakes.
+- [Documentation index](https://sema-lang.com/llms.txt): links to individual
+  Markdown documentation pages.
+- [AI Catalog](https://sema-lang.com/.well-known/ai-catalog.json): inventory of
+  MCP, WebMCP, and documentation resources.
+- [Source and issues](https://github.com/sema-lisp/sema): implementation,
+  releases, and bug reports.
+
+## Limits and verification
+
+Sema is its own language. Do not infer function names or behavior from Scheme,
+Common Lisp, or Clojure. Check the documented signature and target runtime.
+Format and execute generated code before reporting that it works. Consult the
+current documentation for capabilities; this context file is a short guide.

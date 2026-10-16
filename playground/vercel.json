@@ -4,6 +4,14 @@
   "outputDirectory": ".",
   "headers": [
     {
+      "source": "/ai.txt",
+      "headers": [
+        { "key": "Content-Type", "value": "text/plain; charset=utf-8" },
+        { "key": "Access-Control-Allow-Origin", "value": "*" },
+        { "key": "Cache-Control", "value": "public, max-age=300, s-maxage=3600" }
+      ]
+    },
+    {
       "source": "/pkg/(.*).wasm",
       "headers": [
         { "key": "Content-Type", "value": "application/wasm" }

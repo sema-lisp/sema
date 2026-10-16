@@ -1,0 +1,46 @@
+---
+updated: 2026-10-16
+scope: /docs/
+parent: https://sema-lang.com/ai.txt
+---
+
+# Sema documentation context
+
+These docs describe Sema's language, standard library, native LLM integrations,
+developer tools, and browser packages. Check which runtime a page describes.
+
+## Read documentation on demand
+
+Start with [Sema for LLM agents](https://sema-lang.com/docs/for-agents.md).
+Use the [documentation index](https://sema-lang.com/llms.txt) to select individual
+Markdown pages. For example, `/docs/stdlib/http-json.md` is the text version of
+the HTTP and JSON reference. HTML documentation URLs are extensionless.
+Avoid loading `/llms-full.txt`, the full manual, into one context.
+
+With an installed CLI, use `sema doc SYMBOL` or `sema doc search "QUERY"` to
+check names and signatures. The native `sema mcp` server exposes documentation,
+evaluation, formatting, compilation, build, and notebook tools; see the
+[MCP guide](https://sema-lang.com/docs/mcp.md) and
+[AI Catalog](https://sema-lang.com/.well-known/ai-catalog.json).
+
+## Rules that often cause incorrect generated code
+
+- New functions use slash namespaces, such as `file/read` and `string/split`.
+  Check the reference before choosing a name.
+- Only `#f` and `nil` are falsy. The empty list, zero, and empty strings are truthy.
+- `nil` and `()` are distinct values. Lists and vectors are distinct types.
+- `let` uses `((name value) ...)` bindings. Do not substitute Clojure's flat vector.
+- Use `define` and `set!` for mutable bindings; do not invent `atom` or `swap!`.
+
+## Verify in the intended runtime
+
+Format native files with `sema fmt script.sema` and run them with
+`sema script.sema`. In the playground, format the editor, run the program, and
+inspect output and errors. A successful native run does not prove browser
+compatibility. Sema Web's DOM bindings require the separate browser package.
+
+## Related contexts
+
+- [Sema website](https://sema-lang.com/ai.txt): project and runtime overview.
+- [Sema playground](https://sema.run/ai.txt): browser capabilities, virtual
+  filesystem persistence, network restrictions, and agent tools.

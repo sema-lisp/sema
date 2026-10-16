@@ -1,0 +1,52 @@
+---
+updated: 2026-10-16
+scope: /
+parent: https://sema-lang.com/ai.txt
+---
+
+# Sema playground context
+
+https://sema.run is a browser editor, evaluator, debugger, examples library, and
+virtual filesystem for Sema. Programs execute locally in WebAssembly. Running
+a program does not send its source to a Sema evaluation server. Programs can
+make network requests through the browser.
+
+## Browser capabilities and limits
+
+- File operations access the playground's virtual filesystem, not the host OS.
+  The default memory backend loses files on reload. Optional localStorage and
+  IndexedDB backends persist across reloads; sessionStorage lasts for the tab
+  session. Editor contents and preferences are stored separately in localStorage.
+- HTTP operations use browser fetch and follow CORS restrictions. A URL that
+  works in native Sema may fail in the browser. There is no automatic CORS proxy.
+- Shell and subprocess execution are unavailable. Native LLM provider builtins
+  such as `llm/complete` are not registered in this playground. Use native Sema
+  for those integrations. Sema Web's DOM bindings are a separate package.
+- Execution normally uses a worker when cross-origin isolation is available.
+  Cancellation is available for worker evaluation. A main-thread fallback exists.
+
+## Use examples and agent tools
+
+Open [Hello World](https://sema.run/?example=getting-started/hello.sema) or
+[HTTP basics](https://sema.run/?example=http/fetch-basics.sema).
+The `example` query parameter selects a bundled example and replaces restored
+editor content; it does not execute the program.
+
+When `document.modelContext.registerTool` is available, the page registers
+experimental WebMCP tools. Prefer those tools for editor, evaluator, debugger,
+example, and virtual-file operations. Browsers without the API retain the UI.
+
+Start with `read_editor` or `find_examples`. Use `write_editor` or `load_example`
+to choose code, then `format_editor`, `run_editor`, and `read_output`. Loading
+or writing source does not execute it. Read existing user source before replacing
+it. Inspect errors and returned debugger status before reporting success.
+
+The [playground agent guide](https://sema.run/llms.txt) describes the tool
+workflow. The [AI Catalog](https://sema-lang.com/.well-known/ai-catalog.json)
+links the browser tools to the separate native MCP server.
+
+## Related contexts
+
+- [Sema website](https://sema-lang.com/ai.txt): project and runtime overview.
+- [Sema documentation](https://sema-lang.com/docs/ai.txt): code-generation
+  guidance and links to individual reference pages.

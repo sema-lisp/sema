@@ -6,6 +6,22 @@
   "cleanUrls": true,
   "headers": [
     {
+      "source": "/ai.txt",
+      "headers": [
+        { "key": "Content-Type", "value": "text/plain; charset=utf-8" },
+        { "key": "Access-Control-Allow-Origin", "value": "*" },
+        { "key": "Cache-Control", "value": "public, max-age=300, s-maxage=3600" }
+      ]
+    },
+    {
+      "source": "/docs/ai.txt",
+      "headers": [
+        { "key": "Content-Type", "value": "text/plain; charset=utf-8" },
+        { "key": "Access-Control-Allow-Origin", "value": "*" },
+        { "key": "Cache-Control", "value": "public, max-age=300, s-maxage=3600" }
+      ]
+    },
+    {
       "source": "/.well-known/ai-catalog.json",
       "headers": [
         { "key": "Access-Control-Allow-Origin", "value": "*" },

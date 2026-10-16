@@ -67,6 +67,8 @@ export default defineConfig({
         // Surfaced at the top of llms.txt (before the table of contents): the
         // Fast-start rules + a link to the full agent page.
         details: [
+          '[Sema context](https://sema-lang.com/ai.txt) describes the project and runtimes; [documentation context](https://sema-lang.com/docs/ai.txt) explains how to use this reference.',
+          '',
           '**Coding agents: read [Sema for LLM agents](https://sema-lang.com/docs/for-agents.md) first** — a compact working guide to the rules most likely to cause incorrect generated code. The essentials:',
           '',
           '- New functions are slash-namespaced (`file/read`, `string/split`, `regex/match?`); predicates end in `?`; conversions use `->`. Legacy Scheme string ops are kept (`string-append`).',
@@ -386,6 +388,13 @@ export default defineConfig({
   },
 
   srcExclude: ['**/node_modules/**'],
+
+  // Context discovery runs in dev and production. Keep each page's existing head.
+  transformPageData(pageData) {
+    const href = pageData.relativePath.startsWith('docs/') ? '/docs/ai.txt' : '/ai.txt'
+    pageData.frontmatter.head ??= []
+    pageData.frontmatter.head.push(['link', { rel: 'prefetch', type: 'text/plain', href }])
+  },
 
   // Per-page OpenGraph: point each page at its generated card
   // (public/og/<slug>.<ext>) and its canonical URL, replacing the global

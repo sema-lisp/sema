@@ -6,6 +6,8 @@ The playground at https://sema.run exposes an experimental WebMCP tool surface i
 
 ## Agent resources
 
+- [Playground context](https://sema.run/ai.txt): browser capabilities, runtime limits, persistence, and example links.
+- [Documentation context](https://sema-lang.com/docs/ai.txt): how to find and verify Sema documentation for the intended runtime.
 - [Sema for LLM agents](https://sema-lang.com/docs/for-agents.md): compact syntax and semantic differences agents should know before writing Sema.
 - [LLM documentation index](https://sema-lang.com/llms.txt): links to the complete Sema documentation, grouped by topic.
 - [Model Context Protocol](https://sema-lang.com/docs/mcp): install and use the native `sema mcp` server, including notebook and user-defined `deftool` tools.

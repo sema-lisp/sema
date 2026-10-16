@@ -21,6 +21,10 @@ The online [`/llms.txt`](/llms.txt) file indexes the individual Markdown pages.
 Fetch only the page you need. Do not load [`/llms-full.txt`](/llms-full.txt), the
 large concatenation of all documentation, into one context.
 
+Read [documentation context](/docs/ai.txt) for reference usage and runtime scope.
+For browser execution, read [playground context](https://sema.run/ai.txt) for
+virtual filesystem persistence, network restrictions, and available agent tools.
+
 ## Install, run, and verify
 
 ```bash

@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 struct Server {
     url: String,
-    requests: mpsc::Receiver<(String, Value)>,
+    requests: mpsc::Receiver<(String, Vec<String>, Value)>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -26,6 +26,31 @@ impl Server {
     }
 
     fn delayed(delay: Duration) -> Self {
+        Self::responding(
+            |path, body| {
+                let count = body["input"]
+                    .as_array()
+                    .or_else(|| body["texts"].as_array())
+                    .map_or(1, Vec::len);
+                let vectors = vec![vec![0.25, 0.75]; count];
+                let response = json!({
+                    "model": body["model"],
+                    "data": if path.ends_with("/rerank") { json!([{"index":1,"relevance_score":0.9}]) } else { json!(vectors.iter().enumerate().map(|(index, embedding)| json!({"index":index,"embedding":embedding})).collect::<Vec<_>>()) },
+                    "embeddings": if path.ends_with("/api/embed") { json!(vectors) } else { json!({"float":vectors}) },
+                    "usage": {"prompt_tokens": 7}, "prompt_eval_count": 7,
+                    "choices": [{"message":{"role":"assistant","content":"wire chat"},"finish_reason":"stop"}],
+                    "results": [{"index":1,"relevance_score":0.9}]
+                });
+                (200, response)
+            },
+            delay,
+        )
+    }
+
+    fn responding(
+        respond: impl Fn(&str, &Value) -> (u16, Value) + Send + 'static,
+        delay: Duration,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
@@ -53,12 +78,14 @@ impl Server {
                 }
                 let path = line.split_whitespace().nth(1).unwrap().to_string();
                 let mut size = 0;
+                let mut headers = Vec::new();
                 loop {
                     line.clear();
                     reader.read_line(&mut line).unwrap();
                     if line == "\r\n" {
                         break;
                     }
+                    headers.push(line.trim().to_ascii_lowercase());
                     if let Some((key, value)) = line.split_once(':') {
                         if key.eq_ignore_ascii_case("content-length") {
                             size = value.trim().parse().unwrap();
@@ -68,22 +95,11 @@ impl Server {
                 let mut bytes = vec![0; size];
                 reader.read_exact(&mut bytes).unwrap();
                 let body: Value = serde_json::from_slice(&bytes).unwrap();
-                let count = body["input"]
-                    .as_array()
-                    .or_else(|| body["texts"].as_array())
-                    .map_or(1, Vec::len);
-                let vectors = vec![vec![0.25, 0.75]; count];
-                let response = json!({
-                    "model": body["model"],
-                    "data": if path.ends_with("/rerank") { json!([{"index":1,"relevance_score":0.9}]) } else { json!(vectors.iter().enumerate().map(|(index, embedding)| json!({"index":index,"embedding":embedding})).collect::<Vec<_>>()) },
-                    "embeddings": if path.ends_with("/api/embed") { json!(vectors) } else { json!({"float":vectors}) },
-                    "usage": {"prompt_tokens": 7}, "prompt_eval_count": 7,
-                    "choices": [{"message":{"role":"assistant","content":"wire chat"},"finish_reason":"stop"}],
-                    "results": [{"index":1,"relevance_score":0.9}]
-                }).to_string();
-                tx.send((path, body)).unwrap();
+                let (status, response) = respond(&path, &body);
+                let response = response.to_string();
+                tx.send((path, headers, body)).unwrap();
                 thread::sleep(delay);
-                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response);
+                let _ = write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response);
             }
         });
         Self {
@@ -95,6 +111,11 @@ impl Server {
     }
 
     fn request(&self) -> (String, Value) {
+        let (path, _, body) = self.full_request();
+        (path, body)
+    }
+
+    fn full_request(&self) -> (String, Vec<String>, Value) {
         self.requests
             .recv_timeout(Duration::from_secs(5))
             .expect("captured request")
@@ -114,6 +135,468 @@ fn interpreter() -> Interpreter {
     let interp = Interpreter::new();
     reset_runtime_state();
     interp
+}
+
+#[test]
+fn new_embedding_presets_use_documented_defaults() {
+    for (provider, model) in [
+        ("openrouter", "openai/text-embedding-3-small"),
+        ("deepinfra", "Qwen/Qwen3-Embedding-0.6B"),
+        ("cloudflare", "@cf/baai/bge-m3"),
+        ("alibaba", "text-embedding-v4"),
+    ] {
+        let server = Server::new();
+        let interp = interpreter();
+        let result = interp
+            .eval_str_compiled(&format!(
+                r#"
+            (llm/configure-embeddings :{provider} {{:api-key "test" :base-url "{}/v1/"}})
+            (map embedding/length (llm/embed ["hello" "hei"]))
+            (async/await (async/spawn (fn () (llm/embed "override" {{:model "custom-model"}}))))
+        "#,
+                server.url
+            ))
+            .unwrap();
+        assert!(result.as_bytevector().is_some());
+        let (path, body) = server.request();
+        assert_eq!(path, "/v1/embeddings");
+        assert_eq!(body["model"], model, "{provider}");
+        assert_eq!(body["input"], json!(["hello", "hei"]));
+        assert_eq!(server.request().1["model"], "custom-model");
+    }
+}
+
+#[test]
+fn new_embedding_presets_auto_configure_from_environment() {
+    for (provider, key_env, model_env, model) in [
+        (
+            "openrouter",
+            "OPENROUTER_API_KEY",
+            "OPENROUTER_EMBEDDING_MODEL",
+            "router-model",
+        ),
+        (
+            "deepinfra",
+            "DEEPINFRA_API_KEY",
+            "DEEPINFRA_EMBEDDING_MODEL",
+            "deepinfra-model",
+        ),
+        (
+            "azure",
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_EMBEDDING_DEPLOYMENT",
+            "deployment-name",
+        ),
+        (
+            "cloudflare",
+            "CLOUDFLARE_API_TOKEN",
+            "CLOUDFLARE_EMBEDDING_MODEL",
+            "cloudflare-model",
+        ),
+        (
+            "alibaba",
+            "DASHSCOPE_API_KEY",
+            "ALIBABA_EMBEDDING_MODEL",
+            "alibaba-model",
+        ),
+        ("tei", "TEI_API_KEY", "TEI_MODEL", "served-model"),
+    ] {
+        let server = Server::new();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+            .env_clear()
+            .env(key_env, "test")
+            .env(model_env, model)
+            .env(
+                format!("{}_BASE_URL", provider.to_ascii_uppercase()),
+                format!("{}/v1/", server.url),
+            )
+            .env("SEMA_EMBEDDING_PROVIDER", provider)
+            .args([
+                "-e",
+                r#"(map embedding/length (llm/embed ["hello" "hei"]))"#,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{provider}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "(2 2)");
+        let (path, body) = server.request();
+        assert_eq!(path, "/v1/embeddings");
+        assert_eq!(body["model"], model);
+    }
+}
+
+#[test]
+fn mistral_dimensions_use_output_dimension() {
+    let server = Server::new();
+    interpreter()
+        .eval_str_compiled(&format!(
+            r#"
+        (llm/configure-embeddings :mistral {{:api-key "test" :base-url "{}" :dimensions 64}})
+        (llm/embed "hello")
+        (async/await (async/spawn (fn () (llm/embed "hello" {{:dimensions 32}}))))
+    "#,
+            server.url
+        ))
+        .unwrap();
+    for dimension in [64, 32] {
+        let body = server.request().1;
+        assert_eq!(body["output_dimension"], dimension);
+        assert!(body.get("dimensions").is_none());
+    }
+}
+
+#[test]
+fn alibaba_batches_follow_the_requested_model_limit() {
+    let server = Server::new();
+    let interp = interpreter();
+    interp.eval_str_compiled(&format!(r#"
+        (llm/configure-embeddings :alibaba {{:api-key "test" :base-url "{}"}})
+        (llm/embed (map number->string (range 23)))
+        (async/await (async/spawn (fn () (llm/embed (map number->string (range 23)) {{:model "qwen3.7-text-embedding"}}))))
+    "#, server.url)).unwrap();
+    for expected in [10, 10, 3, 20, 3] {
+        assert_eq!(
+            server.request().1["input"].as_array().unwrap().len(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn preset_authentication_and_chat_are_independent() {
+    for provider in [
+        "openrouter",
+        "deepinfra",
+        "azure",
+        "cloudflare",
+        "alibaba",
+        "tei",
+    ] {
+        let server = Server::new();
+        let interp = interpreter();
+        let chat = FakeProvider::builder(provider)
+            .reply("chat preserved")
+            .build();
+        let recorder = chat.recorder();
+        register_test_provider(Box::new(chat));
+        let result = interp
+            .eval_str_compiled(&format!(
+                r#"
+            (llm/configure-embeddings :{provider} {{:api-key "test" :base-url "{}" :model "model"}})
+            (llm/embed "hello")
+            (llm/complete "hello")
+        "#,
+                server.url
+            ))
+            .unwrap();
+        assert_eq!(result.as_str(), Some("chat preserved"));
+        assert_eq!(recorder.call_count(), 1);
+        let (_, headers, _) = server.full_request();
+        assert!(headers.iter().any(|h| h == "authorization: bearer test"));
+    }
+    let server = Server::new();
+    interpreter()
+        .eval_str_compiled(&format!(
+            r#"
+        (llm/configure-embeddings :tei {{:api-key "" :base-url "{}/v1" :model "served-model"}})
+        (llm/embed "hello")
+    "#,
+            server.url
+        ))
+        .unwrap();
+    let (path, headers, body) = server.full_request();
+    assert_eq!(path, "/v1/embeddings");
+    assert!(!headers.iter().any(|h| h.starts_with("authorization:")));
+    assert_eq!(body["encoding_format"], "float");
+}
+
+#[test]
+fn unsupported_preset_options_fail_without_http() {
+    for (provider, option) in [
+        ("openrouter", ":task \"query\""),
+        ("deepinfra", ":keep-alive 0"),
+        ("azure", ":input-type \"query\""),
+        ("cloudflare", ":dimensions 64"),
+        ("alibaba", ":truncate #t"),
+        ("mistral", ":long-text-mode \"mean\""),
+        ("tei", ":dimensions 64"),
+    ] {
+        let server = Server::new();
+        let interp = interpreter();
+        interp.eval_str_compiled(&format!(r#"(llm/configure-embeddings :{provider} {{:api-key "test" :base-url "{}" :model "model"}})"#, server.url)).unwrap();
+        for asynchronous in [false, true] {
+            let call = format!(r#"(llm/embed "hello" {{{option}}})"#);
+            let call = if asynchronous {
+                format!("(async/await (async/spawn (fn () {call})))")
+            } else {
+                call
+            };
+            let error = interp.eval_str_compiled(&call).unwrap_err().to_string();
+            assert!(error.contains("does not support"), "{provider}: {error}");
+        }
+        assert!(server.requests.try_recv().is_err());
+    }
+}
+
+#[test]
+fn partial_accounts_do_not_change_existing_automatic_selection() {
+    let server = Server::new();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .env_clear()
+        .env("OPENAI_API_KEY", "test")
+        .env("OPENAI_BASE_URL", &server.url)
+        .env("OPENROUTER_API_KEY", "test")
+        .env("OPENROUTER_BASE_URL", &server.url)
+        .env("AZURE_OPENAI_API_KEY", "partial")
+        .env("CLOUDFLARE_API_TOKEN", "partial")
+        .env("DASHSCOPE_API_KEY", "partial")
+        .args(["-e", r#"(embedding/length (llm/embed "hello"))"#])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(server.request().1["model"], "text-embedding-3-small");
+
+    for provider in ["azure", "cloudflare", "alibaba", "tei"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+            .env_clear()
+            .env("AZURE_OPENAI_API_KEY", "partial")
+            .env("CLOUDFLARE_API_TOKEN", "partial")
+            .env("DASHSCOPE_API_KEY", "partial")
+            .args(["--embedding-provider", provider, "-e", "42"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "partial {provider} configuration succeeded"
+        );
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("requires"), "{provider}: {error}");
+    }
+}
+
+#[test]
+fn explicitly_selected_hosted_presets_require_environment_credentials() {
+    for provider in ["openai", "jina", "cohere", "voyage", "mistral", "gemini"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+            .env_clear()
+            .args(["--embedding-provider", provider, "-e", "42"])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{provider} ran the program without credentials"
+        );
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[test]
+fn compatible_chunks_preserve_order_and_sum_usage() {
+    use sema_llm::embeddings::OpenAiCompatEmbeddingProvider;
+    use sema_llm::provider::LlmProvider;
+    use sema_llm::types::{EmbedOptions, EmbedRequest};
+    for (name, count, batches) in [("alibaba", 23, vec![10, 10, 3]), ("tei", 35, vec![32, 3])] {
+        for asynchronous in [false, true] {
+            let server = Server::responding(
+                |_, body| {
+                    let texts = body["input"].as_array().unwrap();
+                    let data: Vec<_> = texts.iter().enumerate().rev().map(|(index, text)| {
+                json!({"index":index,"embedding":vec![text.as_str().unwrap().parse::<f64>().unwrap(); 64]})
+            }).collect();
+                    (
+                        200,
+                        json!({"model":body["model"],"data":data,"usage":{"prompt_tokens":texts.len()*2}}),
+                    )
+                },
+                Duration::ZERO,
+            );
+            let provider = OpenAiCompatEmbeddingProvider::new(
+                name.into(),
+                "test".into(),
+                server.url.clone(),
+                "text-embedding-v4".into(),
+            )
+            .unwrap();
+            let request = EmbedRequest {
+                texts: (0..count).map(|n| n.to_string()).collect(),
+                options: EmbedOptions {
+                    dimensions: (name == "alibaba").then_some(64),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let response = if asynchronous {
+                sema_io::io_block_on(provider.embed_future(request).unwrap()).unwrap()
+            } else {
+                provider.embed(request).unwrap()
+            };
+            assert_eq!(
+                response.usage.prompt_tokens,
+                u32::try_from(count * 2).unwrap()
+            );
+            assert_eq!(
+                response
+                    .embeddings
+                    .iter()
+                    .map(|v| v[0] as usize)
+                    .collect::<Vec<_>>(),
+                (0..count).collect::<Vec<_>>()
+            );
+            for expected in &batches {
+                let body = server.request().1;
+                assert_eq!(body["input"].as_array().unwrap().len(), *expected);
+                if name == "alibaba" {
+                    assert_eq!(body["dimensions"], 64);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn alibaba_rejects_later_chunk_errors_and_invalid_aggregation() {
+    use sema_llm::embeddings::OpenAiCompatEmbeddingProvider;
+    use sema_llm::provider::LlmProvider;
+    use sema_llm::types::EmbedRequest;
+    for failure in ["http", "width", "model", "usage", "malformed"] {
+        let server = Server::responding(
+            move |_, body| {
+                let texts = body["input"].as_array().unwrap();
+                let later = texts[0] == "10";
+                if later && failure == "http" {
+                    return (503, json!({"error":{"message":"unavailable"}}));
+                }
+                let width = if later && failure == "width" { 3 } else { 2 };
+                let mut data: Vec<_> = texts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, _)| json!({"index":index,"embedding":vec![0.5;width]}))
+                    .collect();
+                if later && failure == "malformed" {
+                    data[0]["embedding"][0] = json!("not a number");
+                }
+                (
+                    200,
+                    json!({"model":if later && failure == "model" {json!("other-model")} else {body["model"].clone()},"data":data,"usage":{"prompt_tokens": if failure == "usage" {u32::MAX} else {1}}}),
+                )
+            },
+            Duration::ZERO,
+        );
+        let provider = OpenAiCompatEmbeddingProvider::new(
+            "alibaba".into(),
+            "test".into(),
+            server.url.clone(),
+            "text-embedding-v4".into(),
+        )
+        .unwrap();
+        assert!(
+            provider
+                .embed(EmbedRequest {
+                    texts: (0..11).map(|n| n.to_string()).collect(),
+                    ..Default::default()
+                })
+                .is_err(),
+            "{failure}"
+        );
+        server.request();
+        server.request();
+    }
+}
+
+const LIVE_PRESET_PROGRAM: &str = r#"
+    (define docs (llm/embed ["Cats are mammals. Katter er pattedyr." "Cats are mammals. Katter er pattedyr."]))
+    (define single
+      (async/await
+        (async/spawn
+          (fn () (llm/embed "A small embedding smoke test.")))))
+    (list (length docs) (> (embedding/length single) 0)
+          (= (embedding/length (first docs)) (embedding/length single))
+          (> (llm/similarity (first docs) (nth docs 1)) 0.999))
+"#;
+
+#[test]
+fn live_smoke_program_runs_without_credentials_in_ci() {
+    let server = Server::new();
+    let interp = interpreter();
+    interp
+        .eval_str_compiled(&format!(
+            r#"(llm/configure-embeddings :openrouter {{:api-key "test" :base-url "{}"}})"#,
+            server.url
+        ))
+        .unwrap();
+    assert_eq!(
+        interp
+            .eval_str_compiled(LIVE_PRESET_PROGRAM)
+            .unwrap()
+            .to_string(),
+        "(2 #t #t #t)"
+    );
+    server.request();
+    server.request();
+}
+
+fn live_preset(provider: &str) {
+    let interp = interpreter();
+    interp
+        .eval_str_compiled(&format!(
+            r#"(llm/configure-embeddings :{provider} {{:timeout 60000}})"#
+        ))
+        .unwrap();
+    let result = interp.eval_str_compiled(LIVE_PRESET_PROGRAM).unwrap();
+    assert_eq!(result.to_string(), "(2 #t #t #t)");
+    if matches!(provider, "openrouter" | "azure" | "alibaba") {
+        assert_eq!(
+            interp
+                .eval_str_compiled(
+                    r#"(embedding/length (llm/embed "Reduced dimensions." {:dimensions 64}))"#,
+                )
+                .unwrap()
+                .as_int(),
+            Some(64)
+        );
+    }
+    if provider == "tei" {
+        assert_eq!(
+            interp
+                .eval_str_compiled(r#"(length (llm/embed (map number->string (range 35))))"#)
+                .unwrap()
+                .as_int(),
+            Some(35)
+        );
+    }
+    if provider == "alibaba" {
+        assert_eq!(
+            interp
+                .eval_str_compiled(r#"(length (llm/embed (map number->string (range 23))))"#)
+                .unwrap()
+                .as_int(),
+            Some(23)
+        );
+    }
+}
+
+macro_rules! live_preset_tests {
+    ($($name:ident: $provider:literal;)*) => {$(
+        #[test]
+        #[ignore = "requires configured provider credentials/endpoint or a running TEI server; fails if missing"]
+        fn $name() { live_preset($provider); }
+    )*};
+}
+live_preset_tests! {
+    live_openrouter_embedding_release_gate: "openrouter";
+    live_deepinfra_embedding_release_gate: "deepinfra";
+    live_azure_embedding_release_gate: "azure";
+    live_cloudflare_embedding_release_gate: "cloudflare";
+    live_alibaba_embedding_release_gate: "alibaba";
+    live_tei_embedding_release_gate: "tei";
 }
 
 #[test]

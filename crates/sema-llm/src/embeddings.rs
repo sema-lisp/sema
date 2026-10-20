@@ -4,6 +4,117 @@ use crate::types::{
     RerankResponse, RerankResult, Usage,
 };
 
+/// Request differences belong to the provider adapter, not Sema builtins.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmbeddingDialect {
+    /// Preserve extension fields for custom OpenAI-compatible endpoints.
+    Compatible,
+    OpenAi,
+    Jina,
+    Voyage,
+    Mistral,
+    Cloudflare,
+    Alibaba,
+    Tei,
+}
+
+impl EmbeddingDialect {
+    fn batch_limit(self, model: &str) -> Option<usize> {
+        match (self, model) {
+            (Self::Alibaba, "text-embedding-v3" | "text-embedding-v4") => Some(10),
+            (Self::Alibaba, "qwen3.7-text-embedding") => Some(20),
+            // TEI's default --max-client-batch-size; the setup recipe pins it.
+            (Self::Tei, _) => Some(32),
+            _ => None,
+        }
+    }
+
+    fn request_body(
+        self,
+        texts: &[String],
+        model: &str,
+        options: &crate::types::EmbedOptions,
+    ) -> Result<serde_json::Value, LlmError> {
+        let unsupported = [
+            (
+                "dimensions",
+                options.dimensions.is_some(),
+                !matches!(self, Self::Cloudflare | Self::Tei),
+            ),
+            (
+                "input-type",
+                options.input_type.is_some(),
+                matches!(self, Self::Compatible | Self::Voyage),
+            ),
+            (
+                "task",
+                options.task.is_some(),
+                matches!(self, Self::Compatible | Self::Jina),
+            ),
+            (
+                "truncate",
+                options.truncate.is_some(),
+                matches!(self, Self::Compatible | Self::Voyage | Self::Jina),
+            ),
+            (
+                "keep-alive",
+                options.keep_alive.is_some(),
+                self == Self::Compatible,
+            ),
+            ("long-text-mode", options.long_text_mode.is_some(), false),
+            (
+                "max-tokens-per-text",
+                options.max_tokens_per_text.is_some(),
+                false,
+            ),
+        ];
+        for (name, supplied, supported) in unsupported {
+            if supplied && !supported {
+                return Err(LlmError::Config(format!(
+                    "this embedding protocol does not support :{name}"
+                )));
+            }
+        }
+        if options.dimensions == Some(0) || options.timeout_ms == Some(0) {
+            return Err(LlmError::Config(
+                "embedding dimensions and timeout must be positive".into(),
+            ));
+        }
+        let mut body = serde_json::json!({"input": texts, "model": model});
+        if matches!(
+            self,
+            Self::OpenAi | Self::Mistral | Self::Alibaba | Self::Tei
+        ) {
+            body["encoding_format"] = serde_json::json!("float");
+        }
+        if let Some(n) = options.dimensions {
+            let field = if matches!(self, Self::Voyage | Self::Mistral) {
+                "output_dimension"
+            } else {
+                "dimensions"
+            };
+            body[field] = serde_json::json!(n);
+        }
+        if let Some(s) = &options.input_type {
+            body["input_type"] = serde_json::json!(s);
+        }
+        if let Some(s) = &options.task {
+            body["task"] = serde_json::json!(s);
+        }
+        if let Some(b) = options.truncate {
+            body[if self == Self::Voyage {
+                "truncation"
+            } else {
+                "truncate"
+            }] = serde_json::json!(b);
+        }
+        if let Some(v) = &options.keep_alive {
+            body["keep_alive"] = v.clone();
+        }
+        Ok(body)
+    }
+}
+
 /// The hosted-rerank wire dialects behind the OpenAI-compatible embedding providers.
 /// They share `POST {base}/rerank` + `{model, query, documents}` but differ in the
 /// top-K parameter name, the results array key, or the default model.
@@ -90,6 +201,7 @@ pub struct OpenAiCompatEmbeddingProvider {
     rerank_model: Option<String>,
     rerank_top_k: Option<usize>,
     client: reqwest::Client,
+    dialect: EmbeddingDialect,
 }
 
 impl OpenAiCompatEmbeddingProvider {
@@ -100,6 +212,8 @@ impl OpenAiCompatEmbeddingProvider {
         default_model: String,
     ) -> Result<Self, LlmError> {
         Ok(Self {
+            dialect: crate::embedding_presets::find(&name)
+                .map_or(EmbeddingDialect::Compatible, |preset| preset.dialect),
             name,
             api_key,
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -184,16 +298,14 @@ impl OpenAiCompatEmbeddingProvider {
             model,
             request.texts,
             &request.options.with_defaults(&self.embedding_options),
-            self.name == "voyage",
+            self.dialect,
         )
         .await
     }
 }
 
-/// One `POST {base_url}/embeddings` in the OpenAI wire format, shared by the
-/// OpenAI provider and every OpenAI-compatible embedding host (Jina, Voyage,
-/// Mistral, ...). `usage.prompt_tokens` falls back to `total_tokens`, which
-/// some hosts report instead.
+/// Execute compatible embedding requests with documented model-specific limits.
+/// Chunks are sequential; cancellation drops the current and remaining work.
 pub(crate) async fn openai_compat_embed(
     client: &reqwest::Client,
     base_url: &str,
@@ -201,44 +313,75 @@ pub(crate) async fn openai_compat_embed(
     model: String,
     texts: Vec<String>,
     options: &crate::types::EmbedOptions,
-    voyage: bool,
+    dialect: EmbeddingDialect,
 ) -> Result<EmbedResponse, LlmError> {
-    let input_count = texts.len();
-    let mut body = serde_json::json!({
-        "input": texts,
-        "model": model,
-    });
-
-    if let Some(n) = options.dimensions {
-        body[if voyage {
-            "output_dimension"
+    // Validate even empty requests without making an HTTP call.
+    dialect.request_body(&[], &model, options)?;
+    let mut combined = EmbedResponse {
+        embeddings: Vec::with_capacity(texts.len()),
+        model: model.clone(),
+        usage: Usage {
+            model: model.clone(),
+            ..Default::default()
+        },
+    };
+    let mut width = None;
+    let limit = dialect.batch_limit(&model).unwrap_or(texts.len().max(1));
+    for chunk in texts.chunks(limit) {
+        let body = dialect.request_body(chunk, &model, options)?;
+        let response = openai_compat_embed_chunk(
+            client,
+            base_url,
+            api_key,
+            &model,
+            body,
+            chunk.len(),
+            options,
+        )
+        .await?;
+        let chunk_width = response.embeddings.first().map(Vec::len);
+        if let Some(expected) = width {
+            if chunk_width != Some(expected) || response.model != combined.model {
+                return Err(LlmError::Parse(
+                    "embedding model or dimensions changed between batches".into(),
+                ));
+            }
         } else {
-            "dimensions"
-        }] = serde_json::json!(n);
+            width = chunk_width;
+            combined.model = response.model.clone();
+            combined.usage.model = response.model;
+        }
+        combined.usage.prompt_tokens = combined
+            .usage
+            .prompt_tokens
+            .checked_add(response.usage.prompt_tokens)
+            .ok_or_else(|| LlmError::Parse("embedding input usage exceeds u32".into()))?;
+        combined.embeddings.extend(response.embeddings);
     }
-    if let Some(s) = &options.input_type {
-        body["input_type"] = serde_json::json!(s);
-    }
-    if let Some(s) = &options.task {
-        body["task"] = serde_json::json!(s);
-    }
-    if let Some(b) = options.truncate {
-        body[if voyage { "truncation" } else { "truncate" }] = serde_json::json!(b);
-    }
-    if let Some(v) = &options.keep_alive {
-        body["keep_alive"] = v.clone();
-    }
+    Ok(combined)
+}
 
-    let resp = crate::http::with_timeout(
+async fn openai_compat_embed_chunk(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    body: serde_json::Value,
+    input_count: usize,
+    options: &crate::types::EmbedOptions,
+) -> Result<EmbedResponse, LlmError> {
+    let mut call = crate::http::with_timeout(
         client.post(format!("{}/embeddings", base_url.trim_end_matches('/'))),
         options.timeout_ms,
-    )
-    .header("Authorization", format!("Bearer {api_key}"))
-    .header("Content-Type", "application/json")
-    .json(&body)
-    .send()
-    .await
-    .map_err(|e| LlmError::Http(e.to_string()))?;
+    );
+    if !api_key.is_empty() {
+        call = call.bearer_auth(api_key);
+    }
+    let resp = call
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| LlmError::Http(e.to_string()))?;
 
     let resp = crate::http::check_status(resp).await?;
 
@@ -250,24 +393,31 @@ pub(crate) async fn openai_compat_embed(
     let resp_model = api_resp
         .get("model")
         .and_then(|m| m.as_str())
-        .unwrap_or(&model)
+        .unwrap_or(model)
         .to_string();
 
     let embeddings = parse_embedding_data(&api_resp)?;
 
-    let usage = api_resp
+    let prompt_tokens = api_resp
         .get("usage")
-        .map(|u| Usage {
-            prompt_tokens: u
+        .and_then(|usage| {
+            usage
                 .get("prompt_tokens")
-                .or(u.get("total_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32,
-            completion_tokens: 0,
-            model: resp_model.clone(),
-            ..Default::default()
+                .or_else(|| usage.get("total_tokens"))
         })
-        .unwrap_or_default();
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| LlmError::Parse("invalid embedding input usage".into()))
+        })
+        .transpose()?
+        .unwrap_or(0);
+    let usage = Usage {
+        prompt_tokens,
+        model: resp_model.clone(),
+        ..Default::default()
+    };
 
     EmbedResponse {
         embeddings,

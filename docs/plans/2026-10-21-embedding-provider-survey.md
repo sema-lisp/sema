@@ -229,3 +229,56 @@ cover error cases that the live smoke does not exercise. The adapter currently
 does not retry embedding requests automatically. See the validation plan for
 the SDK/source cross-check, recorded results, and the repeat test required on
 the final combined release commit.
+
+## Implementation and validation — 2026-10-21
+
+The provider round implements the registry and protocol refactor above.
+`embedding_presets.rs` owns names, environment aliases, defaults, endpoint
+construction, protocol selection, and rerank availability. Explicit configuration
+and automatic discovery use that registry. `EmbeddingDialect` owns request
+translation and the documented model batch limits. Native Nomic, Cohere, and
+Ollama adapters remain in place. No public Rust request fields or trait methods
+were added. New compatible providers generally require a registry entry, contract
+tests, and setup documentation; a distinct wire protocol also needs a dialect.
+
+Alibaba v3/v4 requests split at ten texts, qwen3.7 at twenty, and TEI at 32.
+The common compatible executor preserves input order, checks model/vector width
+across chunks, checks token-total overflow, and returns no partial result on
+failure. It uses the strict response parser from PR #173. Automatic retry remains
+deferred; timeout applies to each request. Custom compatible endpoints retain
+their extension fields. Known protocols reject unsupported options before HTTP.
+
+Validation includes 163 passing LLM integration tests and 133 passing LLM library
+tests. The fixtures cover URL/auth construction, option translation, environment
+selection, chat isolation, sync/spawned calls, reordered indices, batching,
+malformed responses, and failure after an earlier successful chunk. Initial
+regressions reproduced the missing provider defaults/discovery, wrong Mistral
+dimension field, and unbounded Alibaba batch. Review also caught and fixed an
+automatic-selection regression that admitted a selected legacy provider without
+credentials. Formatting, focused Clippy checks, builtin-doc checks, runtime
+source policy, and rebuilt embedded-runtime freshness passed. Clippy locally
+allows the existing Rust 1.99 `fetch_update` deprecation in unrelated crates.
+
+| Provider | Live model/setup | Result |
+| --- | --- | --- |
+| OpenRouter | `openai/text-embedding-3-small` | Passed sync batch, Unicode/duplicate similarity, spawned single, and 64 dimensions |
+| Azure OpenAI v1 | `text-embedding-3-small` version 1, deployment name supplied as model | Passed the same checks, including bearer resource-key auth and 64 dimensions |
+| Cloudflare Workers AI | `@cf/baai/bge-m3` | Passed sync batch, Unicode/duplicate similarity, and spawned single |
+| TEI | Native Metal server 1.9.4, `BAAI/bge-small-en-v1.5` | Passed common checks and 35 texts across the 32-item boundary |
+| Nomic (regression) | `nomic-embed-text-v1.5` | Existing live release gate passed after the refactor |
+| DeepInfra | `Qwen/Qwen3-Embedding-0.6B` | API returned HTTP 402: account needs positive balance; vector smoke pending |
+| Alibaba | `text-embedding-v4` | Mock contract tests passed; live key and matching regional/workspace endpoint pending |
+
+To repeat an individual new-provider gate, configure its documented environment
+variables and run (replace `azure` with the preset name):
+
+```bash
+cargo test -p sema-lang --test llm_suite \
+  embedding_config_test::live_azure_embedding_release_gate -- --ignored --exact
+```
+
+The six ignored live tests fail when configuration is missing; they do not report
+a skipped request as success. The common smoke program also runs against a mock
+server in ordinary CI. DeepInfra and Alibaba still need live verification before
+the provider round is released. Repeat the live gates and the full `jake ci`
+release suite on the final combined commit. No release was cut by this work.

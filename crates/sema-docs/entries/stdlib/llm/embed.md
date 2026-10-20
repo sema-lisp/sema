@@ -11,7 +11,9 @@ Compute embeddings — dense vectors that place semantically similar text near e
 Embeddings are the foundation of semantic search and RAG: embed your documents
 once, then at query time embed the question and rank documents by `llm/similarity`
 (cosine). Batch your inputs (pass a list) rather than calling `llm/embed` per
-string — it is one provider request instead of N, far cheaper and faster.
+string. Providers with documented item limits split large inputs into ordered
+requests and aggregate token usage. Timeouts apply to each HTTP request;
+embedding requests do not retry automatically.
 
 Nomic additionally accepts `:long-text-mode` (`"truncate"` or `"mean"`) and
 `:max-tokens-per-text` (positive integer). Use `:task "search_document"` for

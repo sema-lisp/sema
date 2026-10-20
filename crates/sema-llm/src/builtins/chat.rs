@@ -547,33 +547,18 @@ pub(super) fn register(env: &Env, sandbox: &sema_core::Sandbox, unrestricted: bo
             let rerank_model = std::env::var("SEMA_RERANK_MODEL")
                 .ok()
                 .filter(|s| !s.is_empty());
-            for (name, key_env) in [
-                ("jina", "JINA_API_KEY"),
-                ("voyage", "VOYAGE_API_KEY"),
-                ("cohere", "COHERE_API_KEY"),
-                ("nomic", "NOMIC_API_KEY"),
-                ("openai", "OPENAI_API_KEY"),
-                ("mistral", "MISTRAL_API_KEY"),
-                ("fireworks", "FIREWORKS_API_KEY"),
-                ("together", "TOGETHER_API_KEY"),
-                ("gemini", "GEMINI_API_KEY"),
-                ("ollama", ""),
-            ] {
-                let key = std::env::var(key_env)
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| {
-                        (name == "gemini")
-                            .then(|| {
-                                std::env::var("GOOGLE_API_KEY")
-                                    .ok()
-                                    .filter(|s| !s.is_empty())
-                            })
-                            .flatten()
-                    });
-                if name != "ollama" && key.is_none() {
+            for preset in crate::embedding_presets::PRESETS {
+                let name = preset.name;
+                let explicitly_selected = target_embed_provider.is_some_and(|target| {
+                    target == name || (target == "openai-embeddings" && name == "openai")
+                }) || rerank_provider.as_deref() == Some(name);
+                if !preset.auto_credentials_available(&crate::embedding_presets::environment)
+                    || (!explicitly_selected
+                        && !preset.auto_available(&crate::embedding_presets::environment))
+                {
                     continue;
                 }
+                let key = preset.key(&crate::embedding_presets::environment);
                 let mut opts = BTreeMap::new();
                 if let Some(key) = key {
                     opts.insert(Value::keyword("api-key"), Value::string(&key));
@@ -590,12 +575,7 @@ pub(super) fn register(env: &Env, sandbox: &sema_core::Sandbox, unrestricted: bo
                 let selected_rerank = rerank_provider
                     .as_deref()
                     .map_or(reg.rerank_provider().is_none(), |target| target == name);
-                if selected_rerank
-                    && matches!(
-                        name,
-                        "jina" | "voyage" | "cohere" | "fireworks" | "together"
-                    )
-                {
+                if selected_rerank && preset.supports_rerank() {
                     if let Some(model) = &rerank_model {
                         opts.insert(Value::keyword("rerank-model"), Value::string(model));
                     }
@@ -610,10 +590,9 @@ pub(super) fn register(env: &Env, sandbox: &sema_core::Sandbox, unrestricted: bo
                 }
             }
             if let Some(requested) = rerank_provider {
-                if !matches!(
-                    requested.as_str(),
-                    "jina" | "voyage" | "cohere" | "fireworks" | "together"
-                ) || reg.get_embedding(&requested).is_none()
+                if !crate::embedding_presets::find(&requested)
+                    .is_some_and(|preset| preset.supports_rerank())
+                    || reg.get_embedding(&requested).is_none()
                 {
                     return Err(SemaError::Llm(format!(
                         "requested rerank provider is not configured: {requested}"

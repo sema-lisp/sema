@@ -570,7 +570,10 @@ impl OpenAiProvider {
             model,
             request.texts,
             &request.options,
-            false,
+            crate::embedding_presets::find(&self.name)
+                .map_or(crate::embeddings::EmbeddingDialect::Compatible, |preset| {
+                    preset.dialect
+                }),
         )
         .await
     }

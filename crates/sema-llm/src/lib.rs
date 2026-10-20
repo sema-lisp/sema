@@ -2,6 +2,7 @@
 pub mod anthropic;
 pub mod builtins;
 pub mod cassette;
+mod embedding_presets;
 pub mod embeddings;
 pub mod fake;
 pub mod gemini;

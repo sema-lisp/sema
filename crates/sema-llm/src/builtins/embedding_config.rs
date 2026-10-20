@@ -34,7 +34,9 @@ pub(super) fn build(
     name: &str,
     opts: &BTreeMap<Value, Value>,
 ) -> Result<(Box<dyn LlmProvider>, bool), SemaError> {
-    use crate::embeddings::RerankDialect;
+    use crate::embedding_presets::{self, environment, ProviderKind};
+    let preset = embedding_presets::find(name);
+    let kind = preset.map_or(ProviderKind::Compatible, |p| p.kind);
     let model = string_option(opts, "default-model")?.or(string_option(opts, "model")?);
     let base = string_option(opts, "base-url")?;
     let embedding_options = embed_options(opts)?;
@@ -48,103 +50,58 @@ pub(super) fn build(
         })
         .transpose()?;
     let rerank_model = string_option(opts, "rerank-model")?;
-    if name == "ollama" {
+    let model = match model {
+        Some(model) => model,
+        None => match preset {
+            Some(preset) => preset
+                .model(&environment)
+                .map_err(|e| SemaError::Llm(e.to_string()))?,
+            None => "text-embedding-3-small".to_string(),
+        },
+    };
+    if kind == ProviderKind::Ollama {
         if rerank_model.is_some() {
             return Err(SemaError::eval("Ollama has no native reranking API"));
         }
         let host = base.or(string_option(opts, "host")?);
         let provider = OllamaProvider::new(host, None)
             .map_err(|e| SemaError::Llm(e.to_string()))?
-            .with_embedding_model(model.unwrap_or_else(|| "embeddinggemma".to_string()))
+            .with_embedding_model(model)
             .with_embedding_options(embedding_options);
         return Ok((Box::new(provider), false));
     }
-    let (key_env, default_url, default_model, rerank) = match name {
-        "openai" => (
-            "OPENAI_API_KEY",
-            "https://api.openai.com/v1",
-            "text-embedding-3-small",
-            None,
-        ),
-        "jina" => (
-            "JINA_API_KEY",
-            "https://api.jina.ai/v1",
-            "jina-embeddings-v3",
-            Some(RerankDialect::Jina),
-        ),
-        "voyage" => (
-            "VOYAGE_API_KEY",
-            "https://api.voyageai.com/v1",
-            "voyage-3",
-            Some(RerankDialect::Voyage),
-        ),
-        "cohere" => (
-            "COHERE_API_KEY",
-            "https://api.cohere.com/v2",
-            "embed-english-v3.0",
-            None,
-        ),
-        "nomic" => (
-            "NOMIC_API_KEY",
-            "https://api-atlas.nomic.ai/v1",
-            "nomic-embed-text-v1.5",
-            None,
-        ),
-        "mistral" => (
-            "MISTRAL_API_KEY",
-            "https://api.mistral.ai/v1",
-            "mistral-embed",
-            None,
-        ),
-        "fireworks" => (
-            "FIREWORKS_API_KEY",
-            "https://api.fireworks.ai/inference/v1",
-            "fireworks/qwen3-embedding-8b",
-            Some(RerankDialect::Fireworks),
-        ),
-        "together" => (
-            "TOGETHER_API_KEY",
-            "https://api.together.ai/v1",
-            "BAAI/bge-base-en-v1.5",
-            Some(RerankDialect::Together),
-        ),
-        "gemini" => (
-            "GEMINI_API_KEY",
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-            "gemini-embedding-001",
-            None,
-        ),
-        _ => ("", "", "text-embedding-3-small", None),
-    };
+    let rerank = preset.and_then(|preset| preset.rerank);
     let key = match opts.get(&Value::keyword("api-key")) {
         Some(v) => v
             .as_str()
             .map(str::to_string)
             .ok_or_else(|| SemaError::type_error("string", v.type_name()))?,
-        None => std::env::var(key_env)
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                (name == "gemini")
-                    .then(|| std::env::var("GOOGLE_API_KEY").ok())
-                    .flatten()
-            })
+        None => preset
+            .and_then(|preset| preset.key(&environment))
             .unwrap_or_default(),
     };
-    let base = base
-        .or_else(|| {
-            std::env::var(format!("{}_BASE_URL", name.to_ascii_uppercase()))
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| default_url.to_string());
-    if base.is_empty() {
-        return Err(SemaError::eval(format!(
-            "unknown embedding provider '{name}': provide :base-url"
-        )));
+    if let Some(preset) = preset {
+        preset
+            .check_key(&key)
+            .map_err(|e| SemaError::Llm(e.to_string()))?;
     }
-    let model = model.unwrap_or_else(|| default_model.to_string());
-    if name == "nomic" {
+    let base = match preset {
+        Some(preset) => preset
+            .base_url(base, string_option(opts, "account-id")?, &environment)
+            .map_err(|e| SemaError::Llm(e.to_string()))?,
+        None => base
+            .or_else(|| {
+                std::env::var(format!("{}_BASE_URL", name.to_ascii_uppercase()))
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+            .ok_or_else(|| {
+                SemaError::eval(format!(
+                    "unknown embedding provider '{name}': provide :base-url"
+                ))
+            })?,
+    };
+    if kind == ProviderKind::Nomic {
         if rerank_model.is_some() || top_k.is_some() {
             return Err(SemaError::eval(
                 "Nomic has no configured hosted reranking API",
@@ -155,7 +112,7 @@ pub(super) fn build(
                 .map_err(|e| SemaError::Llm(e.to_string()))?;
         return Ok((Box::new(provider), false));
     }
-    if name == "cohere" {
+    if kind == ProviderKind::Cohere {
         let provider = CohereEmbeddingProvider::new(key, Some(model))
             .map_err(|e| SemaError::Llm(e.to_string()))?
             .with_base_url(base)
@@ -169,7 +126,7 @@ pub(super) fn build(
     if let Some(dialect) = rerank {
         provider = provider.with_rerank(dialect);
     }
-    if rerank_model.is_some() && rerank.is_none() {
+    if (rerank_model.is_some() || top_k.is_some()) && rerank.is_none() {
         return Err(SemaError::eval(format!(
             "provider '{name}' has no reranking API"
         )));

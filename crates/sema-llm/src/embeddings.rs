@@ -384,7 +384,8 @@ impl LlmProvider for CohereEmbeddingProvider {
 }
 
 /// Compatible hosts may omit indices entirely; indexed responses must identify
-/// every input exactly once. Mixed or invalid indices must never reorder silently.
+/// every input exactly once. Gemini omits the zero index; assigning only that
+/// default still rejects ambiguous omissions through duplicate/range checks.
 fn parse_embedding_data(response: &serde_json::Value) -> Result<Vec<Vec<f64>>, LlmError> {
     let data = response
         .get("data")
@@ -394,10 +395,13 @@ fn parse_embedding_data(response: &serde_json::Value) -> Result<Vec<Vec<f64>>, L
     let mut vectors = vec![None; data.len()];
     for (position, row) in data.iter().enumerate() {
         let index = if indexed {
-            row.get("index")
-                .and_then(|v| v.as_u64())
-                .and_then(|v| usize::try_from(v).ok())
-                .ok_or_else(|| LlmError::Parse("missing or invalid embedding index".into()))?
+            match row.get("index") {
+                None => 0,
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|v| usize::try_from(v).ok())
+                    .ok_or_else(|| LlmError::Parse("invalid embedding index".into()))?,
+            }
         } else {
             position
         };
@@ -478,7 +482,25 @@ mod response_tests {
     }
 
     #[test]
-    fn compatible_hosts_can_omit_all_indices_but_cannot_mix_them() {
+    fn gemini_may_omit_the_zero_index_in_an_indexed_batch() {
+        // Captured shape from the live Gemini OpenAI-compatible endpoint.
+        for data in [
+            json!([{"embedding":[1.0]},{"index":1,"embedding":[2.0]}]),
+            json!([{"index":1,"embedding":[2.0]},{"embedding":[1.0]}]),
+        ] {
+            assert_eq!(
+                parse_embedding_data(&json!({"data":data})).unwrap(),
+                vec![vec![1.0], vec![2.0]]
+            );
+        }
+        assert!(parse_embedding_data(
+            &json!({"data":[{"embedding":[1.0]},{"index":2,"embedding":[2.0]},{"embedding":[3.0]}]})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn compatible_hosts_can_omit_indices_but_not_ambiguously() {
         assert_eq!(
             parse_embedding_data(&json!({"data":[{"embedding":[1.0]},{"embedding":[2.0]}]}))
                 .unwrap(),

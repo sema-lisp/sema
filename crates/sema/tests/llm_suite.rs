@@ -18,3 +18,6 @@ mod llm_fake_test;
 mod llm_root_nonblocking_test;
 #[path = "suites/memory_test.rs"]
 mod memory_test;
+
+#[path = "suites/retrieval_validation_test.rs"]
+mod retrieval_validation_test;

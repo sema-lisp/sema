@@ -60,14 +60,21 @@ fn parse_rerank_results(
         .get(key)
         .and_then(|r| r.as_array())
         .ok_or_else(|| LlmError::Parse(format!("missing {key} in rerank response")))?;
-    Ok(arr
-        .iter()
-        .filter_map(|item| {
-            let index = item.get("index").and_then(|v| v.as_u64())? as usize;
-            let score = item.get("relevance_score").and_then(|v| v.as_f64())?;
-            Some(RerankResult { index, score })
+    #[derive(serde::Deserialize)]
+    struct Row {
+        index: usize,
+        relevance_score: f64,
+    }
+    arr.iter()
+        .map(|item| {
+            let row: Row = serde_json::from_value(item.clone())
+                .map_err(|e| LlmError::Parse(format!("invalid rerank result: {e}")))?;
+            Ok(RerankResult {
+                index: row.index,
+                score: row.relevance_score,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// An embedding-only provider that uses OpenAI-compatible embed API.
@@ -113,6 +120,8 @@ impl OpenAiCompatEmbeddingProvider {
         let model = request
             .model
             .unwrap_or_else(|| dialect.default_model().to_string());
+        let document_count = request.documents.len();
+        let top_k = request.top_k;
         let mut body = serde_json::json!({
             "model": model,
             "query": request.query,
@@ -136,7 +145,7 @@ impl OpenAiCompatEmbeddingProvider {
             .await
             .map_err(|e| LlmError::Parse(e.to_string()))?;
         let results = parse_rerank_results(&api_resp, dialect.results_key())?;
-        Ok(RerankResponse { results, model })
+        RerankResponse { results, model }.validated(document_count, top_k)
     }
 
     async fn embed_async(&self, request: EmbedRequest) -> Result<EmbedResponse, LlmError> {
@@ -163,6 +172,7 @@ pub(crate) async fn openai_compat_embed(
     model: String,
     texts: Vec<String>,
 ) -> Result<EmbedResponse, LlmError> {
+    let input_count = texts.len();
     let body = serde_json::json!({
         "input": texts,
         "model": model,
@@ -190,17 +200,7 @@ pub(crate) async fn openai_compat_embed(
         .unwrap_or(&model)
         .to_string();
 
-    let embeddings = api_resp
-        .get("data")
-        .and_then(|d| d.as_array())
-        .ok_or_else(|| LlmError::Parse("missing data in embedding response".to_string()))?
-        .iter()
-        .filter_map(|item| {
-            item.get("embedding")
-                .and_then(|e| e.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect::<Vec<f64>>())
-        })
-        .collect::<Vec<Vec<f64>>>();
+    let embeddings = parse_embedding_data(&api_resp)?;
 
     let usage = api_resp
         .get("usage")
@@ -216,11 +216,12 @@ pub(crate) async fn openai_compat_embed(
         })
         .unwrap_or_default();
 
-    Ok(EmbedResponse {
+    EmbedResponse {
         embeddings,
         model: resp_model,
         usage,
-    })
+    }
+    .validated(input_count)
 }
 
 impl LlmProvider for OpenAiCompatEmbeddingProvider {
@@ -285,6 +286,7 @@ impl CohereEmbeddingProvider {
     }
 
     async fn embed_async(&self, request: EmbedRequest) -> Result<EmbedResponse, LlmError> {
+        let input_count = request.texts.len();
         let model = request.model.unwrap_or_else(|| self.default_model.clone());
         let body = serde_json::json!({
             "model": model,
@@ -310,34 +312,13 @@ impl CohereEmbeddingProvider {
             .await
             .map_err(|e| LlmError::Parse(e.to_string()))?;
 
-        // Cohere nests under embeddings.float
-        let embeddings = api_resp
-            .pointer("/embeddings/float")
-            .and_then(|e| e.as_array())
-            .ok_or_else(|| {
-                LlmError::Parse("missing embeddings.float in Cohere response".to_string())
-            })?
-            .iter()
-            .filter_map(|item| {
-                item.as_array()
-                    .map(|arr| arr.iter().filter_map(|v| v.as_f64()).collect::<Vec<f64>>())
-            })
-            .collect::<Vec<Vec<f64>>>();
-
-        Ok(EmbedResponse {
-            embeddings,
-            model: model.clone(),
-            usage: Usage {
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                model,
-                ..Default::default()
-            },
-        })
+        parse_cohere_response(&api_resp, model, input_count)
     }
 
     async fn rerank_async(&self, request: RerankRequest) -> Result<RerankResponse, LlmError> {
         let model = request.model.unwrap_or_else(|| "rerank-v3.5".to_string());
+        let document_count = request.documents.len();
+        let top_k = request.top_k;
         let mut body = serde_json::json!({
             "model": model,
             "query": request.query,
@@ -361,7 +342,7 @@ impl CohereEmbeddingProvider {
             .await
             .map_err(|e| LlmError::Parse(e.to_string()))?;
         let results = parse_rerank_results(&api_resp, "results")?;
-        Ok(RerankResponse { results, model })
+        RerankResponse { results, model }.validated(document_count, top_k)
     }
 }
 
@@ -399,5 +380,138 @@ impl LlmProvider for CohereEmbeddingProvider {
         request: RerankRequest,
     ) -> Option<crate::provider::BoxRerankFuture<'_>> {
         Some(Box::pin(self.rerank_async(request)))
+    }
+}
+
+/// Compatible hosts may omit indices entirely; indexed responses must identify
+/// every input exactly once. Gemini omits the zero index; assigning only that
+/// default still rejects ambiguous omissions through duplicate/range checks.
+fn parse_embedding_data(response: &serde_json::Value) -> Result<Vec<Vec<f64>>, LlmError> {
+    let data = response
+        .get("data")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| LlmError::Parse("missing data in embedding response".into()))?;
+    let indexed = data.iter().any(|row| row.get("index").is_some());
+    let mut vectors = vec![None; data.len()];
+    for (position, row) in data.iter().enumerate() {
+        let index = if indexed {
+            match row.get("index") {
+                None => 0,
+                Some(value) => value
+                    .as_u64()
+                    .and_then(|v| usize::try_from(v).ok())
+                    .ok_or_else(|| LlmError::Parse("invalid embedding index".into()))?,
+            }
+        } else {
+            position
+        };
+        let slot = vectors
+            .get_mut(index)
+            .ok_or_else(|| LlmError::Parse("embedding index out of range".into()))?;
+        if slot.is_some() {
+            return Err(LlmError::Parse("duplicate embedding index".into()));
+        }
+        let vector: Vec<f64> = serde_json::from_value(
+            row.get("embedding")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        )
+        .map_err(|e| LlmError::Parse(format!("invalid embedding vector: {e}")))?;
+        *slot = Some(vector);
+    }
+    vectors
+        .into_iter()
+        .map(|v| v.ok_or_else(|| LlmError::Parse("missing embedding index".into())))
+        .collect()
+}
+
+fn parse_cohere_response(
+    response: &serde_json::Value,
+    model: String,
+    input_count: usize,
+) -> Result<EmbedResponse, LlmError> {
+    let embeddings =
+        serde_json::from_value(response.pointer("/embeddings/float").cloned().ok_or_else(
+            || LlmError::Parse("missing embeddings.float in Cohere response".into()),
+        )?)
+        .map_err(|e| LlmError::Parse(format!("invalid Cohere embeddings: {e}")))?;
+    let tokens = response
+        .pointer("/meta/billed_units/input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32;
+    EmbedResponse {
+        embeddings,
+        model: model.clone(),
+        usage: Usage {
+            prompt_tokens: tokens,
+            model,
+            ..Default::default()
+        },
+    }
+    .validated(input_count)
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn cohere_response_keeps_billed_input_tokens() {
+        let response = parse_cohere_response(&json!({"embeddings":{"float":[[0.5,1.0]]}, "meta":{"billed_units":{"input_tokens":17}}}), "embed-model".into(), 1).unwrap();
+        assert_eq!(response.usage.prompt_tokens, 17);
+        assert_eq!(response.usage.model, "embed-model");
+    }
+
+    #[test]
+    fn cohere_rejects_invalid_vectors_and_counts() {
+        for vectors in [
+            json!([[1.0, "bad"]]),
+            json!([null]),
+            json!([[]]),
+            json!([]),
+            json!([[1.0], [1.0, 2.0]]),
+        ] {
+            assert!(
+                parse_cohere_response(&json!({"embeddings":{"float":vectors}}), "model".into(), 1)
+                    .is_err(),
+                "{vectors}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_may_omit_the_zero_index_in_an_indexed_batch() {
+        // Captured shape from the live Gemini OpenAI-compatible endpoint.
+        for data in [
+            json!([{"embedding":[1.0]},{"index":1,"embedding":[2.0]}]),
+            json!([{"index":1,"embedding":[2.0]},{"embedding":[1.0]}]),
+        ] {
+            assert_eq!(
+                parse_embedding_data(&json!({"data":data})).unwrap(),
+                vec![vec![1.0], vec![2.0]]
+            );
+        }
+        assert!(parse_embedding_data(
+            &json!({"data":[{"embedding":[1.0]},{"index":2,"embedding":[2.0]},{"embedding":[3.0]}]})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn compatible_hosts_can_omit_indices_but_not_ambiguously() {
+        assert_eq!(
+            parse_embedding_data(&json!({"data":[{"embedding":[1.0]},{"embedding":[2.0]}]}))
+                .unwrap(),
+            vec![vec![1.0], vec![2.0]]
+        );
+        for data in [
+            json!([{"index":0,"embedding":[1.0]},{"embedding":[2.0]}]),
+            json!([{"index":0,"embedding":[1.0]},{"index":0,"embedding":[2.0]}]),
+            json!([{"index":null,"embedding":[1.0]}]),
+        ] {
+            assert!(parse_embedding_data(&json!({"data":data})).is_err());
+        }
     }
 }

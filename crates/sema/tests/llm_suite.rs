@@ -22,3 +22,6 @@ mod llm_root_nonblocking_test;
 mod memory_test;
 #[path = "suites/nomic_test.rs"]
 mod nomic_test;
+
+#[path = "suites/retrieval_validation_test.rs"]
+mod retrieval_validation_test;

@@ -377,6 +377,31 @@ pub struct EmbedResponse {
     pub usage: Usage,
 }
 
+impl EmbedResponse {
+    /// Validate the provider contract before returning vectors or recording a tape.
+    pub(crate) fn validated(self, input_count: usize) -> Result<Self, LlmError> {
+        if self.embeddings.len() != input_count {
+            return Err(LlmError::Parse(format!(
+                "expected {input_count} embeddings, received {}",
+                self.embeddings.len()
+            )));
+        }
+        if let Some(first) = self.embeddings.first() {
+            let dimensions = first.len();
+            if dimensions == 0
+                || self.embeddings.iter().any(|vector| {
+                    vector.len() != dimensions || vector.iter().any(|v| !v.is_finite())
+                })
+            {
+                return Err(LlmError::Parse(
+                    "embeddings must be nonempty, finite vectors of equal dimension".into(),
+                ));
+            }
+        }
+        Ok(self)
+    }
+}
+
 /// Canonical rerank request (one shape Sema produces; each provider translates it).
 #[derive(Debug, Clone)]
 pub struct RerankRequest {
@@ -401,6 +426,32 @@ pub struct RerankResult {
 pub struct RerankResponse {
     pub results: Vec<RerankResult>,
     pub model: String,
+}
+
+impl RerankResponse {
+    /// Check document identity, then honor Sema's descending-score/top-K contract.
+    pub(crate) fn validated(
+        mut self,
+        document_count: usize,
+        top_k: Option<usize>,
+    ) -> Result<Self, LlmError> {
+        let mut seen = std::collections::HashSet::new();
+        for result in &self.results {
+            if result.index >= document_count
+                || !seen.insert(result.index)
+                || !result.score.is_finite()
+            {
+                return Err(LlmError::Parse(
+                    "rerank results must have unique in-range indices and finite scores".into(),
+                ));
+            }
+        }
+        self.results.sort_by(|a, b| b.score.total_cmp(&a.score));
+        if let Some(limit) = top_k {
+            self.results.truncate(limit);
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

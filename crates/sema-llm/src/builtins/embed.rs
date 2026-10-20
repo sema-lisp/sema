@@ -57,6 +57,7 @@ pub(super) struct EmbedDecoder {
     key: String,
     cassette_scope: Option<CassetteScope>,
     single: bool,
+    input_count: usize,
     usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
     budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
 }
@@ -95,7 +96,7 @@ impl sema_core::runtime::CompletionDecoder for EmbedDecoder {
                 return Err(SemaError::eval(format!("embed: {}", failure.message())));
             }
         };
-        match wire {
+        match wire.and_then(|response| response.validated(self.input_count)) {
             Ok(resp) => {
                 if let Some(span) = self.span.take() {
                     span.set_dispatch(&self.provider_name, &self.req_model);
@@ -158,6 +159,7 @@ pub(super) const RERANK_COMPLETION_KIND: u64 = 0x7272_6e6b; // "rrnk"
 pub(super) struct RerankDecoder {
     span: Option<sema_otel::RerankerSpan>,
     documents: Vec<String>,
+    top_k: Option<usize>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -194,7 +196,7 @@ impl sema_core::runtime::CompletionDecoder for RerankDecoder {
                 return Err(SemaError::eval(format!("rerank: {}", failure.message())));
             }
         };
-        match wire {
+        match wire.and_then(|response| response.validated(self.documents.len(), self.top_k)) {
             Ok(resp) => {
                 if let Some(span) = self.span.take() {
                     let out_docs: Vec<(String, f64)> = resp
@@ -399,6 +401,10 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
             options,
         };
         apply_input_policy_to_texts(&mut request.texts, "embedding.input")?;
+        let input_count = request.texts.len();
+        if input_count == 0 {
+            return Ok(NativeOutcome::Return(Value::list(vec![])));
+        }
         let req_model = request.model.clone().unwrap_or_default();
         let cassette_key = compute_embed_key(provider.as_ref(), &request);
 
@@ -437,6 +443,10 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
                             ..Default::default()
                         },
                     };
+                    let resp = resp.validated(input_count).map_err(|e| {
+                        span.record_error(llm_error_kind(&e), &e.to_string());
+                        SemaError::Llm(e.to_string())
+                    })?;
                     span.set_dispatch("cassette", &req_model);
                     span.set_response(&sema_otel::ResponseFacts {
                         input_tokens: resp.usage.prompt_tokens,
@@ -488,6 +498,7 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
                     key: cassette_key.clone(),
                     cassette_scope,
                     single,
+                    input_count,
                     usage_accum_slot: usage_accum_slot.clone(),
                     budget_slot: budget_slot.clone(),
                 });
@@ -546,6 +557,10 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
                         ..Default::default()
                     },
                 };
+                let resp = resp.validated(input_count).map_err(|e| {
+                    span.record_error(llm_error_kind(&e), &e.to_string());
+                    SemaError::Llm(e.to_string())
+                })?;
                 span.set_dispatch("cassette", &req_model);
                 span.set_response(&sema_otel::ResponseFacts {
                     input_tokens: resp.usage.prompt_tokens,
@@ -565,7 +580,10 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
                         .as_deref()
                         .unwrap_or_else(|| p.default_model());
                     model_target_allowed(p.name(), model, PolicySource::Request, false)?;
-                    let resp = match p.embed(request) {
+                    let resp = match p
+                        .embed(request)
+                        .and_then(|response| response.validated(input_count))
+                    {
                         Ok(r) => r,
                         Err(e) => {
                             span.record_error(llm_error_kind(&e), &e.to_string());
@@ -631,9 +649,6 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
                 })
             })
             .collect::<Result<_, _>>()?;
-        if documents.is_empty() {
-            return Ok(NativeOutcome::Return(Value::list(vec![])));
-        }
         query = apply_text_policy(
             &query,
             PolicyBoundary::LlmInput,
@@ -670,6 +685,9 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
             provider = embedding_config::provider_option(&opts)?;
         }
 
+        if documents.is_empty() {
+            return Ok(NativeOutcome::Return(Value::list(vec![])));
+        }
         let resolved_provider = PROVIDER_REGISTRY.with(|reg| {
             let reg = reg.borrow();
             match provider.as_deref() {
@@ -738,6 +756,7 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
                 let decoder = Box::new(RerankDecoder {
                     span: Some(span),
                     documents: documents.clone(),
+                    top_k,
                 });
                 let kind = CompletionKind::try_from_raw(RERANK_COMPLETION_KIND)
                     .expect("rerank completion kind is nonzero");
@@ -791,10 +810,12 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
                     .as_deref()
                     .unwrap_or_else(|| p.default_rerank_model());
                 model_target_allowed(p.name(), resolved_model, PolicySource::Request, false)?;
-                p.rerank(request).map_err(|e| {
-                    span.record_error(llm_error_kind(&e), &e.to_string());
-                    SemaError::Llm(e.to_string())
-                })
+                p.rerank(request)
+                    .and_then(|response| response.validated(documents.len(), top_k))
+                    .map_err(|e| {
+                        span.record_error(llm_error_kind(&e), &e.to_string());
+                        SemaError::Llm(e.to_string())
+                    })
             })()
         }?;
 

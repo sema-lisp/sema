@@ -13,9 +13,7 @@ pub enum RerankDialect {
     Jina,
     /// Voyage: `top_k` parameter, `data` array. Default model `rerank-2.5`.
     Voyage,
-    /// Nomic: `top_n` parameter, `results` array. Default model `nomic-rerank-v1.5`.
-    Nomic,
-    /// Together AI: `top_n` parameter, `results` array. Default model `BAAI/bge-reranker-v2-m3`.
+    /// Together AI: `top_n` parameter, `results` array. Default model `mixedbread-ai/mxbai-rerank-large-v2`.
     Together,
     /// Fireworks AI: `top_n` parameter, `data` array. Default model `fireworks/qwen3-reranker-8b`.
     Fireworks,
@@ -26,8 +24,7 @@ impl RerankDialect {
         match self {
             RerankDialect::Jina => "jina-reranker-v2-base-multilingual",
             RerankDialect::Voyage => "rerank-2.5",
-            RerankDialect::Nomic => "nomic-rerank-v1.5",
-            RerankDialect::Together => "BAAI/bge-reranker-v2-m3",
+            RerankDialect::Together => "mixedbread-ai/mxbai-rerank-large-v2",
             RerankDialect::Fireworks => "fireworks/qwen3-reranker-8b",
         }
     }
@@ -35,7 +32,6 @@ impl RerankDialect {
         match self {
             RerankDialect::Jina => "top_n",
             RerankDialect::Voyage => "top_k",
-            RerankDialect::Nomic => "top_n",
             RerankDialect::Together => "top_n",
             RerankDialect::Fireworks => "top_n",
         }
@@ -44,7 +40,6 @@ impl RerankDialect {
         match self {
             RerankDialect::Jina => "results",
             RerankDialect::Voyage => "data",
-            RerankDialect::Nomic => "results",
             RerankDialect::Together => "results",
             RerankDialect::Fireworks => "data",
         }
@@ -77,8 +72,11 @@ pub struct OpenAiCompatEmbeddingProvider {
     api_key: String,
     base_url: String,
     default_model: String,
+    embedding_options: crate::types::EmbedOptions,
     /// Set for providers that also offer a hosted reranker (Jina, Voyage).
     rerank: Option<RerankDialect>,
+    rerank_model: Option<String>,
+    rerank_top_k: Option<usize>,
     client: reqwest::Client,
 }
 
@@ -92,9 +90,12 @@ impl OpenAiCompatEmbeddingProvider {
         Ok(Self {
             name,
             api_key,
-            base_url,
+            base_url: base_url.trim_end_matches('/').to_string(),
             default_model,
+            embedding_options: Default::default(),
             rerank: None,
+            rerank_model: None,
+            rerank_top_k: None,
             client: crate::http::create_client(None)?,
         })
     }
@@ -105,31 +106,46 @@ impl OpenAiCompatEmbeddingProvider {
         self
     }
 
+    /// Set a default result limit for reranking.
+    pub fn with_rerank_top_k(mut self, top_k: Option<usize>) -> Self {
+        self.rerank_top_k = top_k;
+        self
+    }
+
+    /// Override the reranker model independently of the embedding model.
+    pub fn with_rerank_model(mut self, model: Option<String>) -> Self {
+        self.rerank_model = model;
+        self
+    }
+
     async fn rerank_async(
         &self,
         request: RerankRequest,
         dialect: RerankDialect,
     ) -> Result<RerankResponse, LlmError> {
-        let model = request
-            .model
-            .unwrap_or_else(|| dialect.default_model().to_string());
+        let model = request.model.unwrap_or_else(|| {
+            self.rerank_model
+                .clone()
+                .unwrap_or_else(|| dialect.default_model().to_string())
+        });
         let mut body = serde_json::json!({
             "model": model,
             "query": request.query,
             "documents": request.documents,
         });
-        if let Some(k) = request.top_k {
+        if let Some(k) = request.top_k.or(self.rerank_top_k) {
             body[dialect.top_k_param()] = serde_json::json!(k);
         }
-        let resp = self
-            .client
-            .post(format!("{}/rerank", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LlmError::Http(e.to_string()))?;
+        let resp = crate::http::with_timeout(
+            self.client.post(format!("{}/rerank", self.base_url)),
+            request.timeout_ms.or(self.embedding_options.timeout_ms),
+        )
+        .header("Authorization", format!("Bearer {}", self.api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| LlmError::Http(e.to_string()))?;
         let resp = crate::http::check_status(resp).await?;
         let api_resp: serde_json::Value = resp
             .json()
@@ -137,6 +153,12 @@ impl OpenAiCompatEmbeddingProvider {
             .map_err(|e| LlmError::Parse(e.to_string()))?;
         let results = parse_rerank_results(&api_resp, dialect.results_key())?;
         Ok(RerankResponse { results, model })
+    }
+
+    /// Set defaults for options that individual embedding requests may override.
+    pub fn with_embedding_options(mut self, options: crate::types::EmbedOptions) -> Self {
+        self.embedding_options = options;
+        self
     }
 
     async fn embed_async(&self, request: EmbedRequest) -> Result<EmbedResponse, LlmError> {
@@ -147,6 +169,8 @@ impl OpenAiCompatEmbeddingProvider {
             &self.api_key,
             model,
             request.texts,
+            &request.options.with_defaults(&self.embedding_options),
+            self.name == "voyage",
         )
         .await
     }
@@ -162,20 +186,44 @@ pub(crate) async fn openai_compat_embed(
     api_key: &str,
     model: String,
     texts: Vec<String>,
+    options: &crate::types::EmbedOptions,
+    voyage: bool,
 ) -> Result<EmbedResponse, LlmError> {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "input": texts,
         "model": model,
     });
 
-    let resp = client
-        .post(format!("{base_url}/embeddings"))
-        .header("Authorization", format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| LlmError::Http(e.to_string()))?;
+    if let Some(n) = options.dimensions {
+        body[if voyage {
+            "output_dimension"
+        } else {
+            "dimensions"
+        }] = serde_json::json!(n);
+    }
+    if let Some(s) = &options.input_type {
+        body["input_type"] = serde_json::json!(s);
+    }
+    if let Some(s) = &options.task {
+        body["task"] = serde_json::json!(s);
+    }
+    if let Some(b) = options.truncate {
+        body[if voyage { "truncation" } else { "truncate" }] = serde_json::json!(b);
+    }
+    if let Some(v) = &options.keep_alive {
+        body["keep_alive"] = v.clone();
+    }
+
+    let resp = crate::http::with_timeout(
+        client.post(format!("{}/embeddings", base_url.trim_end_matches('/'))),
+        options.timeout_ms,
+    )
+    .header("Authorization", format!("Bearer {api_key}"))
+    .header("Content-Type", "application/json")
+    .json(&body)
+    .send()
+    .await
+    .map_err(|e| LlmError::Http(e.to_string()))?;
 
     let resp = crate::http::check_status(resp).await?;
 
@@ -224,8 +272,26 @@ pub(crate) async fn openai_compat_embed(
 }
 
 impl LlmProvider for OpenAiCompatEmbeddingProvider {
+    fn embedding_endpoint(&self) -> Option<&str> {
+        Some(&self.base_url)
+    }
+
+    fn default_rerank_top_k(&self) -> Option<usize> {
+        self.rerank_top_k
+    }
+
+    fn default_rerank_model(&self) -> &str {
+        self.rerank_model
+            .as_deref()
+            .unwrap_or_else(|| self.rerank.map_or("", RerankDialect::default_model))
+    }
+
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn embedding_options(&self) -> crate::types::EmbedOptions {
+        self.embedding_options.clone()
     }
 
     fn default_model(&self) -> &str {
@@ -271,7 +337,11 @@ impl LlmProvider for OpenAiCompatEmbeddingProvider {
 /// Cohere embedding provider — unique API format.
 pub struct CohereEmbeddingProvider {
     api_key: String,
+    base_url: String,
+    rerank_model: String,
+    rerank_top_k: Option<usize>,
     default_model: String,
+    embedding_options: crate::types::EmbedOptions,
     client: reqwest::Client,
 }
 
@@ -279,29 +349,67 @@ impl CohereEmbeddingProvider {
     pub fn new(api_key: String, default_model: Option<String>) -> Result<Self, LlmError> {
         Ok(Self {
             api_key,
+            base_url: "https://api.cohere.com/v2".to_string(),
+            rerank_model: "rerank-v3.5".to_string(),
+            rerank_top_k: None,
+            embedding_options: Default::default(),
             default_model: default_model.unwrap_or_else(|| "embed-english-v3.0".to_string()),
             client: crate::http::create_client(None)?,
         })
     }
 
+    /// Override the Cohere-compatible API root (without /embed or /rerank).
+    pub fn with_base_url(mut self, base_url: String) -> Self {
+        self.base_url = base_url.trim_end_matches('/').to_string();
+        self
+    }
+
+    /// Set a default result limit for reranking.
+    pub fn with_rerank_top_k(mut self, top_k: Option<usize>) -> Self {
+        self.rerank_top_k = top_k;
+        self
+    }
+
+    /// Override the reranker model independently of the embedding model.
+    pub fn with_rerank_model(mut self, model: Option<String>) -> Self {
+        if let Some(model) = model {
+            self.rerank_model = model;
+        }
+        self
+    }
+
+    /// Set defaults for options that individual embedding requests may override.
+    pub fn with_embedding_options(mut self, options: crate::types::EmbedOptions) -> Self {
+        self.embedding_options = options;
+        self
+    }
+
     async fn embed_async(&self, request: EmbedRequest) -> Result<EmbedResponse, LlmError> {
         let model = request.model.unwrap_or_else(|| self.default_model.clone());
-        let body = serde_json::json!({
+        let options = request.options.with_defaults(&self.embedding_options);
+        let mut body = serde_json::json!({
             "model": model,
             "texts": request.texts,
-            "input_type": "search_document",
+            "input_type": options.input_type.as_deref().unwrap_or("search_document"),
             "embedding_types": ["float"],
         });
 
-        let resp = self
-            .client
-            .post("https://api.cohere.com/v2/embed")
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LlmError::Http(e.to_string()))?;
+        if let Some(n) = options.dimensions {
+            body["output_dimension"] = serde_json::json!(n);
+        }
+        if let Some(b) = options.truncate {
+            body["truncate"] = serde_json::json!(if b { "END" } else { "NONE" });
+        }
+        let resp = crate::http::with_timeout(
+            self.client.post(format!("{}/embed", self.base_url)),
+            options.timeout_ms,
+        )
+        .header("Authorization", format!("Bearer {}", self.api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| LlmError::Http(e.to_string()))?;
 
         let resp = crate::http::check_status(resp).await?;
 
@@ -337,24 +445,25 @@ impl CohereEmbeddingProvider {
     }
 
     async fn rerank_async(&self, request: RerankRequest) -> Result<RerankResponse, LlmError> {
-        let model = request.model.unwrap_or_else(|| "rerank-v3.5".to_string());
+        let model = request.model.unwrap_or_else(|| self.rerank_model.clone());
         let mut body = serde_json::json!({
             "model": model,
             "query": request.query,
             "documents": request.documents,
         });
-        if let Some(k) = request.top_k {
+        if let Some(k) = request.top_k.or(self.rerank_top_k) {
             body["top_n"] = serde_json::json!(k);
         }
-        let resp = self
-            .client
-            .post("https://api.cohere.com/v2/rerank")
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LlmError::Http(e.to_string()))?;
+        let resp = crate::http::with_timeout(
+            self.client.post(format!("{}/rerank", self.base_url)),
+            request.timeout_ms.or(self.embedding_options.timeout_ms),
+        )
+        .header("Authorization", format!("Bearer {}", self.api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| LlmError::Http(e.to_string()))?;
         let resp = crate::http::check_status(resp).await?;
         let api_resp: serde_json::Value = resp
             .json()
@@ -366,8 +475,23 @@ impl CohereEmbeddingProvider {
 }
 
 impl LlmProvider for CohereEmbeddingProvider {
+    fn embedding_endpoint(&self) -> Option<&str> {
+        Some(&self.base_url)
+    }
+
+    fn default_rerank_top_k(&self) -> Option<usize> {
+        self.rerank_top_k
+    }
+
+    fn default_rerank_model(&self) -> &str {
+        &self.rerank_model
+    }
     fn name(&self) -> &str {
         "cohere"
+    }
+
+    fn embedding_options(&self) -> crate::types::EmbedOptions {
+        self.embedding_options.clone()
     }
 
     fn default_model(&self) -> &str {

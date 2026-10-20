@@ -663,6 +663,8 @@ sema --sandbox=no-shell,no-network --allowed-paths=./data script.sema
 | `SEMA_CHAT_PROVIDER` | Preferred chat provider                               |
 | `SEMA_EMBEDDING_MODEL` | Default embedding model name                        |
 | `SEMA_EMBEDDING_PROVIDER` | Preferred embedding provider                    |
+| `SEMA_RERANK_MODEL` | Default reranking model name |
+| `SEMA_RERANK_PROVIDER` | Preferred reranking provider |
 | `SEMA_REGISTRY_URL`  | Override default package registry URL                 |
 | `SEMA_RUNTIME_BASE_URL` | Override base URL for cross-compilation runtime downloads |
 | `SEMA_MCP_TOKEN_STORE` | MCP client token backend: `file` (0600 file) or `keychain` (OS keychain). Default: keychain when available, else file. |

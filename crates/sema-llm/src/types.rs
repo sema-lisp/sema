@@ -325,10 +325,42 @@ impl Usage {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Optional embedding parameters. Per-call values take precedence over configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EmbedOptions {
+    pub dimensions: Option<u32>,
+    pub input_type: Option<String>,
+    pub task: Option<String>,
+    pub truncate: Option<bool>,
+    pub keep_alive: Option<serde_json::Value>,
+    pub timeout_ms: Option<u64>,
+}
+
+impl EmbedOptions {
+    /// Fill unspecified options from provider configuration.
+    pub fn with_defaults(&self, defaults: &Self) -> Self {
+        Self {
+            dimensions: self.dimensions.or(defaults.dimensions),
+            input_type: self
+                .input_type
+                .clone()
+                .or_else(|| defaults.input_type.clone()),
+            task: self.task.clone().or_else(|| defaults.task.clone()),
+            truncate: self.truncate.or(defaults.truncate),
+            keep_alive: self
+                .keep_alive
+                .clone()
+                .or_else(|| defaults.keep_alive.clone()),
+            timeout_ms: self.timeout_ms.or(defaults.timeout_ms),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct EmbedRequest {
     pub texts: Vec<String>,
     pub model: Option<String>,
+    pub options: EmbedOptions,
 }
 
 #[derive(Debug, Clone)]
@@ -346,6 +378,8 @@ pub struct RerankRequest {
     /// Keep only the top-K most relevant (provider-side); `None` returns all, reordered.
     pub top_k: Option<usize>,
     pub model: Option<String>,
+    /// Per-request network timeout in milliseconds.
+    pub timeout_ms: Option<u64>,
 }
 
 /// One reranked result: an index back into the original `documents` plus its relevance score.

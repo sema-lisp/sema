@@ -569,6 +569,8 @@ impl OpenAiProvider {
             &self.api_key,
             model,
             request.texts,
+            &request.options,
+            false,
         )
         .await
     }
@@ -699,8 +701,16 @@ const USAGE_FIELDS: crate::types::UsageFields = crate::types::UsageFields {
 };
 
 impl LlmProvider for OpenAiProvider {
+    fn embedding_endpoint(&self) -> Option<&str> {
+        Some(&self.base_url)
+    }
+
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn default_embedding_model(&self) -> &str {
+        "text-embedding-3-small"
     }
 
     fn default_model(&self) -> &str {

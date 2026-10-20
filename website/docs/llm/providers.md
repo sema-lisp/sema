@@ -254,10 +254,12 @@ All providers are auto-configured from environment variables. Use `(llm/configur
 | Provider | Embeddings | Reranking | Env Var |
 |----------|:----------:|:---------:|---------|
 | **OpenAI** | ✅ | — | `OPENAI_API_KEY` |
+| **Ollama** | ✅ | — | `OLLAMA_HOST` (optional) |
+| **Mistral** | ✅ | — | `MISTRAL_API_KEY` |
+| **Gemini** | ✅ | — | `GEMINI_API_KEY` / `GOOGLE_API_KEY` |
 | **Jina** | ✅ | ✅ | `JINA_API_KEY` |
 | **Voyage** | ✅ | ✅ | `VOYAGE_API_KEY` |
 | **Cohere** | ✅ | ✅ | `COHERE_API_KEY` |
-| **Nomic** | ✅ | ✅ | `NOMIC_API_KEY` |
 | **Together AI** | ✅ | ✅ | `TOGETHER_API_KEY` |
 | **Fireworks AI** | ✅ | ✅ | `FIREWORKS_API_KEY` |
 
@@ -294,10 +296,12 @@ When you don't pass `:default-model` to `llm/configure` (or pin `:model` on a ca
 | Provider | Default model |
 |----------|---------------|
 | `:openai` | `text-embedding-3-small` |
+| `:ollama` | `embeddinggemma` |
+| `:mistral` | `mistral-embed` |
+| `:gemini` | `gemini-embedding-001` |
 | `:jina` | `jina-embeddings-v3` |
 | `:voyage` | `voyage-3` |
 | `:cohere` | `embed-english-v3.0` |
-| `:nomic` | `nomic-embed-text-v1.5` |
 | `:together` | `BAAI/bge-base-en-v1.5` |
 | `:fireworks` | `fireworks/qwen3-embedding-8b` |
 
@@ -308,11 +312,14 @@ When you don't pass `:default-model` to `llm/configure` (or pin `:model` on a ca
 | `:jina` | `jina-reranker-v2-base-multilingual` |
 | `:voyage` | `rerank-2.5` |
 | `:cohere` | `rerank-v3.5` |
-| `:nomic` | `nomic-rerank-v1.5` |
-| `:together` | `BAAI/bge-reranker-v2-m3` |
+| `:together` | `mixedbread-ai/mxbai-rerank-large-v2` |
 | `:fireworks` | `fireworks/qwen3-reranker-8b` |
 
-Override any of these per provider with `:default-model`, globally via `SEMA_CHAT_MODEL`, or per call with `:model`.
+Chat uses `:default-model` / `SEMA_CHAT_MODEL`; embeddings use `:default-model` or
+`:model` / `SEMA_EMBEDDING_MODEL`; reranking uses `:rerank-model` / `SEMA_RERANK_MODEL`.
+All three accept per-call `:model` overrides. Retrieval configuration is independent
+of chat. See [embedding configuration](./embeddings.md#configuration) for endpoint
+and request options.
 
 ## Environment Variables
 
@@ -336,9 +343,10 @@ Override any of these per provider with `:default-model`, globally via `SEMA_CHA
 | `JINA_API_KEY` | Jina embeddings + reranking API key |
 | `VOYAGE_API_KEY` | Voyage embeddings + reranking API key |
 | `COHERE_API_KEY` | Cohere embeddings + reranking API key |
-| `NOMIC_API_KEY` | Nomic embeddings + reranking API key |
 | `SEMA_CHAT_MODEL` | Default chat model name |
 | `SEMA_CHAT_PROVIDER` | Preferred chat provider |
 | `SEMA_EMBEDDING_MODEL` | Default embedding model name |
 | `SEMA_EMBEDDING_PROVIDER` | Preferred embedding provider |
+| `SEMA_RERANK_MODEL` | Default reranking model name |
+| `SEMA_RERANK_PROVIDER` | Preferred reranking provider |
 

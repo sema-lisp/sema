@@ -5,7 +5,7 @@ outline: [2, 3]
 # Embeddings & Similarity
 
 Generate vector embeddings from text and compute similarity between them. On startup, `(llm/auto-configure)` registers available providers and selects the first
-in this order: Jina, Voyage, Cohere, OpenAI, Mistral, Fireworks, Together, Gemini,
+in this order: Jina, Voyage, Cohere, Nomic, OpenAI, Mistral, Fireworks, Together, Gemini,
 then local Ollama. Set `SEMA_EMBEDDING_PROVIDER` / `SEMA_EMBEDDING_MODEL` or
 `--embedding-provider` / `--embedding-model` to override that selection.
 Reranking has independent `SEMA_RERANK_PROVIDER` / `SEMA_RERANK_MODEL` and
@@ -52,7 +52,9 @@ These options can be set at configuration time and overridden by each `llm/embed
 |--------|---------|
 | `:dimensions` | Positive output dimension, where supported by the model |
 | `:input-type` | Cohere / Voyage input type, such as `"search_query"` / `"query"` |
-| `:task` | Jina task, such as `"retrieval.query"` |
+| `:task` | Jina task, such as `"retrieval.query"`, or Nomic task, such as `"search_query"` |
+| `:long-text-mode` | Nomic: `"truncate"` or `"mean"` |
+| `:max-tokens-per-text` | Nomic: positive token limit per text |
 | `:truncate` | Boolean; Ollama truncation, Voyage truncation, or Cohere END/NONE |
 | `:keep-alive` | Ollama model lifetime, e.g. `"5m"` or `0` |
 | `:timeout` | Positive request timeout in milliseconds |
@@ -64,8 +66,34 @@ and `:top-k` separately for reranking; calls can override them with `:model`,
 Ollama uses its native [embedding API](https://docs.ollama.com/api/embed),
 `POST /api/embed`. Install the default model first with `ollama pull embeddinggemma`.
 Omitting `:truncate` and `:keep-alive` preserves the server defaults. Ollama has no
-native reranking endpoint. Nomic's hosted API is not currently implemented; it
-is not an OpenAI-compatible preset.
+native reranking endpoint.
+
+### Nomic hosted embeddings
+
+The `:nomic` preset uses Nomic's native
+[text embedding API](https://docs.nomic.ai/reference/api/embed-text-v-1-embedding-text-post),
+`POST https://api-atlas.nomic.ai/v1/embedding/text`. It reads `NOMIC_API_KEY`,
+defaults to `nomic-embed-text-v1.5`, and accepts `NOMIC_BASE_URL` or `:base-url`
+as an API root ending in `/v1`. It supports embeddings only; no hosted Nomic
+reranking endpoint is configured.
+
+```sema
+(llm/configure-embeddings :nomic
+  {:api-key (env "NOMIC_API_KEY") :task "search_document"})
+(define docs (llm/embed ["Cats are mammals." "Rocks are minerals."]))
+(define query (llm/embed "Which animals are mammals?" {:task "search_query"}))
+```
+
+Use `:task` with `"search_document"`, `"search_query"`, `"classification"`, or
+`"clustering"`. The default is `"search_document"`. `:dimensions` maps to
+`dimensionality` (supported by v1.5); `:long-text-mode` maps to `long_text_mode`,
+and `:max-tokens-per-text` maps to the token limit. Omitted long-text settings
+use the API defaults. `:truncate #t` is accepted as an alias for
+`:long-text-mode "truncate"`; `#f` does not mean `"mean"` and is rejected.
+Use `:task`, not `:input-type`. `:keep-alive` applies to Ollama, not Nomic.
+
+The adapter has deterministic tests against the documented schema. Live API
+verification is pending account approval; the release is held until it passes.
 
 Embedding cassette keys include the resolved provider, endpoint, model, and options.
 Re-record older embedding tapes after upgrading.
@@ -183,6 +211,7 @@ Returns a detailed estimate map with the token count and the estimation method u
 | Jina | `JINA_API_KEY` | ✅ | `jina-embeddings-v3` |
 | Voyage | `VOYAGE_API_KEY` | ✅ | `voyage-3` |
 | Cohere | `COHERE_API_KEY` | ✅ | `embed-english-v3.0` |
+| Nomic | `NOMIC_API_KEY` | — | `nomic-embed-text-v1.5` |
 | Together AI | `TOGETHER_API_KEY` | ✅ | `BAAI/bge-base-en-v1.5` |
 | Fireworks AI | `FIREWORKS_API_KEY` | ✅ | `fireworks/qwen3-embedding-8b` |
 | OpenAI | `OPENAI_API_KEY` | — | `text-embedding-3-small` |

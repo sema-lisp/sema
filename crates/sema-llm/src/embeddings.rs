@@ -13,6 +13,8 @@ pub enum RerankDialect {
     Jina,
     /// Voyage: `top_k` parameter, `data` array. Default model `rerank-2.5`.
     Voyage,
+    /// Legacy custom-host dialect. Nomic's hosted embedding adapter does not use it.
+    Nomic,
     /// Together AI: `top_n` parameter, `results` array. Default model `mixedbread-ai/mxbai-rerank-large-v2`.
     Together,
     /// Fireworks AI: `top_n` parameter, `data` array. Default model `fireworks/qwen3-reranker-8b`.
@@ -24,6 +26,7 @@ impl RerankDialect {
         match self {
             RerankDialect::Jina => "jina-reranker-v2-base-multilingual",
             RerankDialect::Voyage => "rerank-2.5",
+            RerankDialect::Nomic => "nomic-rerank-v1.5",
             RerankDialect::Together => "mixedbread-ai/mxbai-rerank-large-v2",
             RerankDialect::Fireworks => "fireworks/qwen3-reranker-8b",
         }
@@ -32,6 +35,7 @@ impl RerankDialect {
         match self {
             RerankDialect::Jina => "top_n",
             RerankDialect::Voyage => "top_k",
+            RerankDialect::Nomic => "top_n",
             RerankDialect::Together => "top_n",
             RerankDialect::Fireworks => "top_n",
         }
@@ -40,6 +44,7 @@ impl RerankDialect {
         match self {
             RerankDialect::Jina => "results",
             RerankDialect::Voyage => "data",
+            RerankDialect::Nomic => "results",
             RerankDialect::Together => "results",
             RerankDialect::Fireworks => "data",
         }

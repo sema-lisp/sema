@@ -551,6 +551,7 @@ pub(super) fn register(env: &Env, sandbox: &sema_core::Sandbox, unrestricted: bo
                 ("jina", "JINA_API_KEY"),
                 ("voyage", "VOYAGE_API_KEY"),
                 ("cohere", "COHERE_API_KEY"),
+                ("nomic", "NOMIC_API_KEY"),
                 ("openai", "OPENAI_API_KEY"),
                 ("mistral", "MISTRAL_API_KEY"),
                 ("fireworks", "FIREWORKS_API_KEY"),

@@ -120,7 +120,7 @@ struct Cli {
     #[arg(long)]
     embedding_model: Option<String>,
 
-    /// Set embedding provider (openai, ollama, jina, voyage, cohere, mistral, gemini, together, fireworks)
+    /// Set embedding provider (openai, ollama, jina, voyage, cohere, nomic, mistral, gemini, together, fireworks)
     #[arg(long)]
     embedding_provider: Option<String>,
 

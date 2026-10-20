@@ -13,6 +13,11 @@ once, then at query time embed the question and rank documents by `llm/similarit
 (cosine). Batch your inputs (pass a list) rather than calling `llm/embed` per
 string — it is one provider request instead of N, far cheaper and faster.
 
+Nomic additionally accepts `:long-text-mode` (`"truncate"` or `"mean"`) and
+`:max-tokens-per-text` (positive integer). Use `:task "search_document"` for
+documents and `:task "search_query"` for queries; `:dimensions` selects the
+output dimensionality with `nomic-embed-text-v1.5`.
+
 The result is an opaque bytevector, not a list of numbers, so use the
 `embedding/*` helpers to inspect or convert: `embedding/->list` for the raw floats,
 `embedding/length` for the dimension count, `embedding/list->embedding` to go back.

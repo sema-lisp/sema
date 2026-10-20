@@ -331,6 +331,8 @@ pub struct EmbedOptions {
     pub dimensions: Option<u32>,
     pub input_type: Option<String>,
     pub task: Option<String>,
+    pub long_text_mode: Option<String>,
+    pub max_tokens_per_text: Option<u32>,
     pub truncate: Option<bool>,
     pub keep_alive: Option<serde_json::Value>,
     pub timeout_ms: Option<u64>,
@@ -346,6 +348,11 @@ impl EmbedOptions {
                 .clone()
                 .or_else(|| defaults.input_type.clone()),
             task: self.task.clone().or_else(|| defaults.task.clone()),
+            long_text_mode: self
+                .long_text_mode
+                .clone()
+                .or_else(|| defaults.long_text_mode.clone()),
+            max_tokens_per_text: self.max_tokens_per_text.or(defaults.max_tokens_per_text),
             truncate: self.truncate.or(defaults.truncate),
             keep_alive: self
                 .keep_alive

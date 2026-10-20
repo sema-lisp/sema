@@ -84,6 +84,12 @@ pub(super) fn build(
             "embed-english-v3.0",
             None,
         ),
+        "nomic" => (
+            "NOMIC_API_KEY",
+            "https://api-atlas.nomic.ai/v1",
+            "nomic-embed-text-v1.5",
+            None,
+        ),
         "mistral" => (
             "MISTRAL_API_KEY",
             "https://api.mistral.ai/v1",
@@ -138,6 +144,17 @@ pub(super) fn build(
         )));
     }
     let model = model.unwrap_or_else(|| default_model.to_string());
+    if name == "nomic" {
+        if rerank_model.is_some() || top_k.is_some() {
+            return Err(SemaError::eval(
+                "Nomic has no configured hosted reranking API",
+            ));
+        }
+        let provider =
+            crate::nomic::NomicEmbeddingProvider::new(key, base, model, embedding_options)
+                .map_err(|e| SemaError::Llm(e.to_string()))?;
+        return Ok((Box::new(provider), false));
+    }
     if name == "cohere" {
         let provider = CohereEmbeddingProvider::new(key, Some(model))
             .map_err(|e| SemaError::Llm(e.to_string()))?
@@ -208,6 +225,13 @@ pub(super) fn embed_options(
         dimensions,
         input_type: string_option(opts, "input-type")?,
         task: string_option(opts, "task")?,
+        long_text_mode: string_option(opts, "long-text-mode")?,
+        max_tokens_per_text: positive("max-tokens-per-text")?
+            .map(|n| {
+                u32::try_from(n)
+                    .map_err(|_| SemaError::eval("option :max-tokens-per-text is too large"))
+            })
+            .transpose()?,
         truncate,
         keep_alive,
         timeout_ms: positive("timeout")?,

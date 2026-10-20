@@ -7,6 +7,7 @@ pub mod fake;
 pub mod gemini;
 pub mod http;
 pub mod ndjson;
+pub mod nomic;
 pub mod ollama;
 pub mod openai;
 pub mod pricing;

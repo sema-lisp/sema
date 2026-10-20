@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- Native Nomic hosted text embeddings with task selection, dimensionality,
+  long-text options, endpoint overrides, and `NOMIC_API_KEY` detection. The
+  public `RerankDialect::Nomic` variant remains available for existing custom
+  hosts; the hosted preset supports embeddings only.
+- Nomic schema-based mock tests and an opt-in live smoke test. Release is held
+  pending approved API access and a passing live test; see
+  `docs/plans/nomic-api-validation.md`.
+
 ## 1.37.0
 
 Stable release of the editor and runtime update validated in RC1 and RC2.

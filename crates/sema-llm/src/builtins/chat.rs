@@ -292,52 +292,11 @@ pub(super) fn register(env: &Env, sandbox: &sema_core::Sandbox, unrestricted: bo
                     reg.register(Box::new(provider));
                     reg.set_default("ollama");
                 }
-                "jina" => {
-                    let api_key = api_key
-                        .clone()
-                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
-                    let model = opts.opt_str("default-model")
-                        .unwrap_or_else(|| "jina-embeddings-v3".to_string());
-                    let provider = OpenAiCompatEmbeddingProvider::new(
-                        "jina".to_string(),
-                        api_key,
-                        "https://api.jina.ai/v1".to_string(),
-                        model,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?
-                    .with_rerank(crate::embeddings::RerankDialect::Jina);
-                    reg.register(Box::new(provider));
-                    reg.set_embedding_provider("jina");
-                    reg.set_rerank_provider("jina");
-                }
-                "voyage" => {
-                    let api_key = api_key
-                        .clone()
-                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
-                    let model = opts.opt_str("default-model")
-                        .unwrap_or_else(|| "voyage-3-lite".to_string());
-                    let provider = OpenAiCompatEmbeddingProvider::new(
-                        "voyage".to_string(),
-                        api_key,
-                        "https://api.voyageai.com/v1".to_string(),
-                        model,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?
-                    .with_rerank(crate::embeddings::RerankDialect::Voyage);
-                    reg.register(Box::new(provider));
-                    reg.set_embedding_provider("voyage");
-                    reg.set_rerank_provider("voyage");
-                }
-                "cohere" => {
-                    let api_key = api_key
-                        .clone()
-                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
-                    let model = opts.opt_str("default-model");
-                    let provider = CohereEmbeddingProvider::new(api_key, model)
-                        .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    reg.set_embedding_provider("cohere");
-                    reg.set_rerank_provider("cohere");
+                "jina" | "voyage" | "cohere" => {
+                    let (provider, rerank) = embedding_config::build(&provider_name, &opts)?;
+                    reg.register_embedding(provider);
+                    reg.set_embedding_provider(&provider_name);
+                    if rerank { reg.set_rerank_provider(&provider_name); }
                 }
                 other => {
                     // Treat unknown providers as OpenAI-compatible if base-url and api-key are provided
@@ -578,97 +537,68 @@ pub(super) fn register(env: &Env, sandbox: &sema_core::Sandbox, unrestricted: bo
                 }
             }
 
-            // Auto-configure embedding providers
-            // Determine the embedding model override for the target embedding provider.
-            // If --embedding-provider is set, only that provider gets the model override.
-            // Otherwise, the first successfully configured embedding provider gets it.
+            // Register all available retrieval providers before applying selection.
+            // Explicit selection must not resolve to an identically named chat provider.
             let target_embed_provider = embedding_provider.as_deref();
-
-            // Helper: should this embedding provider get the model override?
-            // Inline to avoid borrow conflicts with reg.
-            macro_rules! embed_model_for {
-                ($name:expr, $default:expr) => {{
-                    let model_override = match target_embed_provider {
-                        Some(target) if target == $name => embedding_model.clone(),
-                        None if reg.embedding_provider().is_none() => embedding_model.clone(),
-                        _ => None,
-                    };
-                    model_override.unwrap_or_else(|| $default.to_string())
-                }};
-            }
-
-            if let Ok(key) = std::env::var("JINA_API_KEY") {
-                if !key.is_empty() {
-                    let model = embed_model_for!("jina", "jina-embeddings-v3");
-                    let provider = OpenAiCompatEmbeddingProvider::new(
-                        "jina".to_string(),
-                        key,
-                        "https://api.jina.ai/v1".to_string(),
-                        model,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?
-                    .with_rerank(crate::embeddings::RerankDialect::Jina);
-                    reg.register(Box::new(provider));
-                    reg.set_embedding_provider("jina");
-                    reg.set_rerank_provider("jina");
+            let rerank_provider = std::env::var("SEMA_RERANK_PROVIDER")
+                .ok()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty());
+            let rerank_model = std::env::var("SEMA_RERANK_MODEL")
+                .ok()
+                .filter(|s| !s.is_empty());
+            for preset in crate::embedding_presets::PRESETS {
+                let name = preset.name;
+                let explicitly_selected = target_embed_provider.is_some_and(|target| {
+                    target == name || (target == "openai-embeddings" && name == "openai")
+                }) || rerank_provider.as_deref() == Some(name);
+                if !preset.auto_credentials_available(&crate::embedding_presets::environment)
+                    || (!explicitly_selected
+                        && !preset.auto_available(&crate::embedding_presets::environment))
+                {
+                    continue;
                 }
-            }
-            if let Ok(key) = std::env::var("VOYAGE_API_KEY") {
-                if !key.is_empty() {
-                    let model = embed_model_for!("voyage", "voyage-3");
-                    let provider = OpenAiCompatEmbeddingProvider::new(
-                        "voyage".to_string(),
-                        key,
-                        "https://api.voyageai.com/v1".to_string(),
-                        model,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?
-                    .with_rerank(crate::embeddings::RerankDialect::Voyage);
-                    reg.register(Box::new(provider));
-                    // Only set as embedding provider if not already set
-                    if reg.embedding_provider().is_none() {
-                        reg.set_embedding_provider("voyage");
-                    }
-                    if reg.rerank_provider().is_none() {
-                        reg.set_rerank_provider("voyage");
+                let key = preset.key(&crate::embedding_presets::environment);
+                let mut opts = BTreeMap::new();
+                if let Some(key) = key {
+                    opts.insert(Value::keyword("api-key"), Value::string(&key));
+                }
+                let selected = target_embed_provider
+                    .map_or(reg.embedding_provider().is_none(), |target| {
+                        target == name || (target == "openai-embeddings" && name == "openai")
+                    });
+                if selected {
+                    if let Some(model) = &embedding_model {
+                        opts.insert(Value::keyword("model"), Value::string(model));
                     }
                 }
-            }
-            if let Ok(key) = std::env::var("COHERE_API_KEY") {
-                if !key.is_empty() {
-                    let model_override = match target_embed_provider {
-                        Some("cohere") => embedding_model.clone(),
-                        None if reg.embedding_provider().is_none() => embedding_model.clone(),
-                        _ => None,
-                    };
-                    let provider = CohereEmbeddingProvider::new(key, model_override)
-                        .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    if reg.embedding_provider().is_none() {
-                        reg.set_embedding_provider("cohere");
-                    }
-                    if reg.rerank_provider().is_none() {
-                        reg.set_rerank_provider("cohere");
+                let selected_rerank = rerank_provider
+                    .as_deref()
+                    .map_or(reg.rerank_provider().is_none(), |target| target == name);
+                if selected_rerank && preset.supports_rerank() {
+                    if let Some(model) = &rerank_model {
+                        opts.insert(Value::keyword("rerank-model"), Value::string(model));
                     }
                 }
-            }
-            // Fallback: use OpenAI for embeddings if no dedicated provider was configured.
-            // Use a distinct name to avoid overwriting the OpenAI chat provider.
-            if reg.embedding_provider().is_none() {
-                if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-                    if !key.is_empty() {
-                        let model = embed_model_for!("openai", "text-embedding-3-small");
-                        let provider = OpenAiCompatEmbeddingProvider::new(
-                            "openai-embeddings".to_string(),
-                            key,
-                            "https://api.openai.com/v1".to_string(),
-                            model,
-                        )
-                        .map_err(|e| SemaError::Llm(e.to_string()))?;
-                        reg.register(Box::new(provider));
-                        reg.set_embedding_provider("openai-embeddings");
-                    }
+                let (provider, rerank) = embedding_config::build(name, &opts)?;
+                reg.register_embedding(provider);
+                if reg.embedding_provider().is_none() {
+                    reg.set_embedding_provider(name);
                 }
+                if rerank && reg.rerank_provider().is_none() {
+                    reg.set_rerank_provider(name);
+                }
+            }
+            if let Some(requested) = rerank_provider {
+                if !crate::embedding_presets::find(&requested)
+                    .is_some_and(|preset| preset.supports_rerank())
+                    || reg.get_embedding(&requested).is_none()
+                {
+                    return Err(SemaError::Llm(format!(
+                        "requested rerank provider is not configured: {requested}"
+                    )));
+                }
+                reg.set_rerank_provider(&requested);
             }
 
             // Apply forced chat provider override
@@ -685,7 +615,7 @@ pub(super) fn register(env: &Env, sandbox: &sema_core::Sandbox, unrestricted: bo
 
             // Apply forced embedding provider override
             if let Some(requested_embed) = target_embed_provider {
-                if reg.get(requested_embed).is_some() {
+                if reg.get_embedding(requested_embed).is_some() {
                     reg.set_embedding_provider(requested_embed);
                 } else {
                     return Err(SemaError::Llm(format!(

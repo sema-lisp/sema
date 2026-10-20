@@ -55,9 +55,10 @@ IO_BLOCK_ON	crates/sema-io/src/lib.rs	1	the io_block_on public wrapper that forw
 IO_BLOCK_ON	crates/sema-llm/src/anthropic.rs	2	sync LlmProvider impl (complete/stream) drives reqwest off the quantum; batch_complete is the trait default; the runtime path offloads via complete_future/interruptible_async
 IO_BLOCK_ON	crates/sema-llm/src/openai.rs	5	sync LlmProvider impl (complete with two sequential 400-compat retries, stream, embed) drives reqwest off the quantum; batch_complete is the trait default
 IO_BLOCK_ON	crates/sema-llm/src/gemini.rs	2	sync LlmProvider impl (complete/stream) drives reqwest off the quantum; batch_complete is the trait default
-IO_BLOCK_ON	crates/sema-llm/src/ollama.rs	2	sync LlmProvider impl (complete/stream) drives reqwest off the quantum; batch_complete is the trait default
+IO_BLOCK_ON	crates/sema-llm/src/ollama.rs	3	sync LlmProvider impl (complete/stream/embed) drives reqwest off the quantum; runtime embeddings suspend via embed_future
 IO_BLOCK_ON	crates/sema-llm/src/provider.rs	1	LlmProvider::batch_complete default joins complete_future off the quantum for every provider
 IO_BLOCK_ON	crates/sema-llm/src/embeddings.rs	4	sync embed/rerank provider impls drive reqwest off the quantum
+IO_BLOCK_ON	crates/sema-llm/src/nomic.rs	1	sync LlmProvider::embed drives reqwest off the quantum; runtime embeddings suspend via embed_future
 IO_BLOCK_ON	crates/sema-stdlib/src/runtime_offload.rs	2	offload machinery drives its future via io_block_on on a plain executor worker (blocking tier), never the VM thread
 IO_BLOCK_ON	crates/sema-stdlib/src/http.rs	1	top-level synchronous http path on a host thread (non-quantum); runtime http suspends structurally
 IO_BLOCK_ON	crates/sema-stdlib/src/ws.rs	5	host synchronous websocket connect/send/recv/close on a host thread (non-quantum)

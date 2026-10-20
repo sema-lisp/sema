@@ -325,10 +325,49 @@ impl Usage {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Optional embedding parameters. Per-call values take precedence over configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EmbedOptions {
+    pub dimensions: Option<u32>,
+    pub input_type: Option<String>,
+    pub task: Option<String>,
+    pub long_text_mode: Option<String>,
+    pub max_tokens_per_text: Option<u32>,
+    pub truncate: Option<bool>,
+    pub keep_alive: Option<serde_json::Value>,
+    pub timeout_ms: Option<u64>,
+}
+
+impl EmbedOptions {
+    /// Fill unspecified options from provider configuration.
+    pub fn with_defaults(&self, defaults: &Self) -> Self {
+        Self {
+            dimensions: self.dimensions.or(defaults.dimensions),
+            input_type: self
+                .input_type
+                .clone()
+                .or_else(|| defaults.input_type.clone()),
+            task: self.task.clone().or_else(|| defaults.task.clone()),
+            long_text_mode: self
+                .long_text_mode
+                .clone()
+                .or_else(|| defaults.long_text_mode.clone()),
+            max_tokens_per_text: self.max_tokens_per_text.or(defaults.max_tokens_per_text),
+            truncate: self.truncate.or(defaults.truncate),
+            keep_alive: self
+                .keep_alive
+                .clone()
+                .or_else(|| defaults.keep_alive.clone()),
+            timeout_ms: self.timeout_ms.or(defaults.timeout_ms),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct EmbedRequest {
     pub texts: Vec<String>,
     pub model: Option<String>,
+    pub options: EmbedOptions,
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +375,31 @@ pub struct EmbedResponse {
     pub embeddings: Vec<Vec<f64>>,
     pub model: String,
     pub usage: Usage,
+}
+
+impl EmbedResponse {
+    /// Validate the provider contract before returning vectors or recording a tape.
+    pub(crate) fn validated(self, input_count: usize) -> Result<Self, LlmError> {
+        if self.embeddings.len() != input_count {
+            return Err(LlmError::Parse(format!(
+                "expected {input_count} embeddings, received {}",
+                self.embeddings.len()
+            )));
+        }
+        if let Some(first) = self.embeddings.first() {
+            let dimensions = first.len();
+            if dimensions == 0
+                || self.embeddings.iter().any(|vector| {
+                    vector.len() != dimensions || vector.iter().any(|v| !v.is_finite())
+                })
+            {
+                return Err(LlmError::Parse(
+                    "embeddings must be nonempty, finite vectors of equal dimension".into(),
+                ));
+            }
+        }
+        Ok(self)
+    }
 }
 
 /// Canonical rerank request (one shape Sema produces; each provider translates it).
@@ -346,6 +410,8 @@ pub struct RerankRequest {
     /// Keep only the top-K most relevant (provider-side); `None` returns all, reordered.
     pub top_k: Option<usize>,
     pub model: Option<String>,
+    /// Per-request network timeout in milliseconds.
+    pub timeout_ms: Option<u64>,
 }
 
 /// One reranked result: an index back into the original `documents` plus its relevance score.
@@ -360,6 +426,32 @@ pub struct RerankResult {
 pub struct RerankResponse {
     pub results: Vec<RerankResult>,
     pub model: String,
+}
+
+impl RerankResponse {
+    /// Check document identity, then honor Sema's descending-score/top-K contract.
+    pub(crate) fn validated(
+        mut self,
+        document_count: usize,
+        top_k: Option<usize>,
+    ) -> Result<Self, LlmError> {
+        let mut seen = std::collections::HashSet::new();
+        for result in &self.results {
+            if result.index >= document_count
+                || !seen.insert(result.index)
+                || !result.score.is_finite()
+            {
+                return Err(LlmError::Parse(
+                    "rerank results must have unique in-range indices and finite scores".into(),
+                ));
+            }
+        }
+        self.results.sort_by(|a, b| b.score.total_cmp(&a.score));
+        if let Some(limit) = top_k {
+            self.results.truncate(limit);
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

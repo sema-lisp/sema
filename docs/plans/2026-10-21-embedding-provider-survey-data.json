@@ -1,0 +1,157 @@
+{
+  "retrieved_date_local": "2026-10-21",
+  "timezone": "Europe/Oslo",
+  "implementation_reviewed_commit": "2af07199e99954e18f989f8b39e4318f031ea3f1",
+  "benchmark": {
+    "name": "MTEB(Multilingual, v2)",
+    "source": "https://mteb-leaderboard-backend.hf.space/v1/benchmarks/MTEB%28Multilingual%2C%20v2%29/scores",
+    "task_count": 131,
+    "note": "Fixed reference benchmark, hidden from the current default menu. Only complete rows selected. Raw scores use a 0-to-1 scale; report multiplies by 100. Published results, not a Sema evaluation. Reported zero-shot coverage differs.",
+    "models": [
+      {
+        "model": "microsoft/harrier-oss-v1-27b",
+        "model_url": "https://huggingface.co/microsoft/harrier-oss-v1-27b",
+        "mean_task_raw": 0.7427199384685496,
+        "retrieval_raw": 0.7826541941720541,
+        "reported_task_count": 131,
+        "reported_zero_shot_percent": 78
+      },
+      {
+        "model": "Qwen/Qwen3-Embedding-8B",
+        "model_url": "https://huggingface.co/Qwen/Qwen3-Embedding-8B",
+        "mean_task_raw": 0.7058388101663449,
+        "retrieval_raw": 0.7087702987397678,
+        "reported_task_count": 131,
+        "reported_zero_shot_percent": 99
+      },
+      {
+        "model": "Qwen/Qwen3-Embedding-4B",
+        "model_url": "https://huggingface.co/Qwen/Qwen3-Embedding-4B",
+        "mean_task_raw": 0.6944564599964329,
+        "retrieval_raw": 0.6960449432587259,
+        "reported_task_count": 131,
+        "reported_zero_shot_percent": 99
+      },
+      {
+        "model": "microsoft/harrier-oss-v1-0.6b",
+        "model_url": "https://huggingface.co/microsoft/harrier-oss-v1-0.6b",
+        "mean_task_raw": 0.6901251361787604,
+        "retrieval_raw": 0.7075393197714468,
+        "reported_task_count": 131,
+        "reported_zero_shot_percent": 78
+      },
+      {
+        "model": "google/gemini-embedding-001",
+        "model_url": "https://ai.google.dev/gemini-api/docs/embeddings",
+        "mean_task_raw": 0.683679871875291,
+        "retrieval_raw": 0.6770753736353683,
+        "reported_task_count": 131,
+        "reported_zero_shot_percent": 99
+      },
+      {
+        "model": "jinaai/jina-embeddings-v5-text-nano",
+        "model_url": "https://huggingface.co/jinaai/jina-embeddings-v5-text-nano",
+        "mean_task_raw": 0.6552339420490167,
+        "retrieval_raw": 0.6326010977814096,
+        "reported_task_count": 131,
+        "reported_zero_shot_percent": null
+      },
+      {
+        "model": "Qwen/Qwen3-Embedding-0.6B",
+        "model_url": "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B",
+        "mean_task_raw": 0.6433551926768859,
+        "retrieval_raw": 0.6464702360447725,
+        "reported_task_count": 131,
+        "reported_zero_shot_percent": 99
+      }
+    ]
+  },
+  "model_adoption": {
+    "note": "Hugging Face reported rolling downloads and likes. Not unique users or API-host market share.",
+    "models": [
+      {
+        "model": "Qwen/Qwen3-Embedding-0.6B",
+        "downloads": 8568001,
+        "likes": 1303,
+        "source": "https://huggingface.co/api/models/Qwen/Qwen3-Embedding-0.6B"
+      },
+      {
+        "model": "Qwen/Qwen3-Embedding-4B",
+        "downloads": 1772109,
+        "likes": 340,
+        "source": "https://huggingface.co/api/models/Qwen/Qwen3-Embedding-4B"
+      },
+      {
+        "model": "Qwen/Qwen3-Embedding-8B",
+        "downloads": 2033070,
+        "likes": 835,
+        "source": "https://huggingface.co/api/models/Qwen/Qwen3-Embedding-8B"
+      },
+      {
+        "model": "BAAI/bge-m3",
+        "downloads": 31379839,
+        "likes": 3906,
+        "source": "https://huggingface.co/api/models/BAAI/bge-m3"
+      },
+      {
+        "model": "mixedbread-ai/mxbai-embed-large-v1",
+        "downloads": 2081255,
+        "likes": 839,
+        "source": "https://huggingface.co/api/models/mixedbread-ai/mxbai-embed-large-v1"
+      },
+      {
+        "model": "microsoft/harrier-oss-v1-0.6b",
+        "downloads": 265052,
+        "likes": 324,
+        "source": "https://huggingface.co/api/models/microsoft/harrier-oss-v1-0.6b"
+      },
+      {
+        "model": "jinaai/jina-embeddings-v5-text-nano",
+        "downloads": 122102,
+        "likes": 101,
+        "source": "https://huggingface.co/api/models/jinaai/jina-embeddings-v5-text-nano"
+      }
+    ]
+  },
+  "openrouter_catalog": {
+    "source": "https://openrouter.ai/api/v1/embeddings/models",
+    "returned_model_count": 33,
+    "reported_total_count": 33,
+    "model_ids": [
+      "liquid/lfm-2.5-embedding-350m:free",
+      "voyageai/voyage-code-4",
+      "voyageai/voyage-multimodal-3.5",
+      "voyageai/voyage-4-lite",
+      "voyageai/voyage-4",
+      "voyageai/voyage-4-large",
+      "nvidia/nemotron-3-embed-1b:free",
+      "google/gemini-embedding-2",
+      "google/gemini-embedding-2-preview",
+      "perplexity/pplx-embed-v1-4b",
+      "perplexity/pplx-embed-v1-0.6b",
+      "nvidia/llama-nemotron-embed-vl-1b-v2:free",
+      "thenlper/gte-base",
+      "thenlper/gte-large",
+      "intfloat/e5-large-v2",
+      "intfloat/e5-base-v2",
+      "intfloat/multilingual-e5-large",
+      "sentence-transformers/paraphrase-minilm-l6-v2",
+      "sentence-transformers/all-minilm-l12-v2",
+      "baai/bge-base-en-v1.5",
+      "sentence-transformers/multi-qa-mpnet-base-dot-v1",
+      "baai/bge-large-en-v1.5",
+      "baai/bge-m3",
+      "sentence-transformers/all-mpnet-base-v2",
+      "sentence-transformers/all-minilm-l6-v2",
+      "mistralai/mistral-embed-2312",
+      "google/gemini-embedding-001",
+      "openai/text-embedding-ada-002",
+      "mistralai/codestral-embed-2505",
+      "openai/text-embedding-3-large",
+      "openai/text-embedding-3-small",
+      "qwen/qwen3-embedding-8b",
+      "qwen/qwen3-embedding-4b"
+    ],
+    "note": "Catalog discovery only; model entries were not live-tested. Backend limits and access can differ."
+  }
+}

@@ -106,6 +106,7 @@ mod complete;
 mod conversation;
 mod convert;
 mod embed;
+mod embedding_config;
 mod extract;
 mod lisp_provider;
 mod opts;

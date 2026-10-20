@@ -523,7 +523,7 @@ fn live_nomic_embedding_release_gate() {
         (define query (llm/embed "Which animals are mammals?" {:task "search_query"}))
         (define reduced (async/await (async/spawn (fn () (llm/embed "Cats are mammals." {:dimensions 256 :task "classification" :long-text-mode "mean" :max-tokens-per-text 1024})))))
         (list (length docs) (map embedding/length docs) (embedding/length query) (embedding/length reduced)
-              (> (llm/similarity query (first docs)) (llm/similarity query (second docs))))
+              (> (llm/similarity query (first docs)) (llm/similarity query (nth docs 1))))
     "#).unwrap();
     assert_eq!(result.to_string(), "(2 (768 768) 768 256 #t)");
 

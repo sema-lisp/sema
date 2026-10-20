@@ -1,8 +1,10 @@
 # Nomic API release gate
 
-Status: implementation and schema-based tests can be reviewed; **do not release
-the Nomic adapter until the live smoke test passes**. Account approval is pending.
-Synthetic fixtures establish the request/response contract, not service access.
+Status: **the live smoke test passed on 2026-10-21** against the hosted API with
+`nomic-embed-text-v1.5`. Account access is confirmed. The exact tested commit is
+recorded in [PR #172](https://github.com/sema-lisp/sema/pull/172). Repeat the live
+test against the final combined release commit and run the normal release checks.
+Synthetic fixtures alone do not establish service access.
 
 ## Sources
 
@@ -36,13 +38,31 @@ errors fail the test.
 It also embeds eleven documents at 64 dimensions, crossing the ten-text HTTP
 batch limit, and checks the aggregate count and nonzero token usage.
 
-- [ ] Account has API access.
+- [x] Account has API access.
+- [x] Live test passes on the Nomic adapter PR (2026-10-21).
 - [ ] Live test passes against the final release commit.
-- [ ] Record commit, date, model, and test result in the PR (no credentials).
+- [x] Record commit, date, model, and test result in the PR (no credentials).
 - [ ] Run the normal `jake ci` release checks on the combined changes.
 
 Do not infer completion from passing mock tests or ordinary CI, which excludes
 the ignored live test. No release version or tag is created by this work.
+
+## Live verification (2026-10-21)
+
+The release-gate test passed against `https://api-atlas.nomic.ai/v1/embedding/text`
+using bearer authentication and `nomic-embed-text-v1.5`. It verified:
+
+- Single and batch embeddings with the expected 768-dimensional default.
+- `search_document`, `search_query`, and `classification` tasks.
+- A spawned request with 256 dimensions, `long_text_mode: mean`, and
+  `max_tokens_per_text: 1024`.
+- Higher query similarity for the relevant document than the unrelated document.
+- Eleven documents split across the ten-text request boundary, with 64-dimensional
+  output and nonzero aggregate token usage.
+
+The first live run returned embeddings but exposed an undefined `second` helper
+in the test program. Replacing it with `(nth docs 1)` allowed the full test to
+complete. No adapter implementation change was needed for the live API.
 
 ## Cross-language review (2026-10-21)
 
@@ -72,7 +92,7 @@ and rate-limit errors to the caller; the Rust rate-limit error retains the retry
 hint. A shared embedding retry policy is separate work. Repeating a failed
 multi-request call can charge again for successful earlier chunks.
 
-Confidence is high in the small-request wire contract and deterministic local
-behavior, but moderate in live operation until the release gate passes. None of
-the source comparisons verifies account permissions, actual service defaults,
-model quality, or current quota behavior for this account.
+The live test confirms this account's access, the tested request/response fields,
+the default vector width, and batch handling. Source comparisons and synthetic
+fixtures remain useful for error cases. The smoke test is not a broad model-quality
+evaluation or a load/quota test.

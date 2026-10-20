@@ -2,8 +2,9 @@
 
 Date: 2026-10-21 (Europe/Oslo). Status: research and proposal; the providers
 listed below have not been added by this report. Nomic's native adapter is in
-[PR #172](https://github.com/sema-lisp/sema/pull/172). Its release remains blocked
-on the live test described in [the validation plan](nomic-api-validation.md).
+[PR #172](https://github.com/sema-lisp/sema/pull/172). Its live smoke test passed
+on 2026-10-21; the final combined release still needs the checks described in
+[the validation plan](nomic-api-validation.md).
 
 ## Recommendation
 
@@ -221,10 +222,10 @@ still use much larger batches, so agreement among third-party wrappers alone
 would have been misleading. PR #172 now chunks at ten, sets truncation explicitly,
 checks supported v1.5 dimensions, preserves order, and checks usage totals.
 
-Confidence is high in the tested request translation and response validation,
-but live service compatibility is still unverified. Synthetic fixtures cannot
-prove account permissions, actual model availability, undocumented server
-behavior, or production error responses. The adapter currently does not retry
-embedding requests automatically. See the validation plan for the SDK/source
-cross-check and required live test. Do not replace that gate with a numeric
-confidence estimate or a green mock-only CI result.
+The live smoke test subsequently passed on 2026-10-21 with
+`nomic-embed-text-v1.5`, confirming account access, the tested dimensions/tasks,
+and batching across the ten-text request boundary. Synthetic fixtures still
+cover error cases that the live smoke does not exercise. The adapter currently
+does not retry embedding requests automatically. See the validation plan for
+the SDK/source cross-check, recorded results, and the repeat test required on
+the final combined release commit.

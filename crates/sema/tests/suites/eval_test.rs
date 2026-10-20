@@ -1665,6 +1665,16 @@ eval_tests! {
     complex_lit_leading_pos_imag: "+2i" => common::eval("0+2i"),
 }
 
+eval_tests! {
+    complex_rational_real_part: "(real-part 1/2+3i)" => common::eval("1/2"),
+    complex_rational_pure_imaginary: "(imag-part 3/4i)" => common::eval("3/4"),
+    complex_rational_exact_prefix: "(exact? #e1/2+1i)" => Value::bool(true),
+    complex_rational_inexact_prefix: "(inexact? #i1/2+1i)" => Value::bool(true),
+    complex_rational_sum_prints: "(str (+ 1/2 3+4i))" => Value::string("7/2+4i"),
+    complex_rational_sum_round_trips: "(let ((z (+ 1/2 3+4i))) (= z (read (str z))))" => Value::bool(true),
+    complex_rational_number_string_round_trips: "(let ((z (+ 1/2 3+4i))) (= z (string->number (number->string z))))" => Value::bool(true),
+}
+
 // Task 3.3: complex builtins (make-rectangular/make-polar/real-part/imag-part/
 // magnitude/angle), complex?/real? predicates, and sqrt of a negative real
 // returning a complex. `complex?` is true for every number (R7RS); `real?` is

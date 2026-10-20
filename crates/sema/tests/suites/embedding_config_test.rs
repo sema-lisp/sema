@@ -786,3 +786,37 @@ fn invalid_environment_selection_fails_before_running_the_program() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("not configured"));
     }
 }
+
+#[test]
+#[ignore = "requires Vercel AI_GATEWAY_API_KEY"]
+fn live_embedding_custom_vercel_gateway() {
+    if std::env::var("AI_GATEWAY_API_KEY").map_or(true, |key| key.is_empty()) {
+        return;
+    }
+    let result = interpreter().eval_str_compiled(r#"
+        (llm/configure-embeddings :gateway {:api-key (env "AI_GATEWAY_API_KEY")
+          :base-url "https://ai-gateway.vercel.sh/v1" :model "google/gemini-embedding-001" :dimensions 256 :timeout 30000})
+        (list (map embedding/length (llm/embed ["cat" "dog"]))
+              (embedding/length (llm/embed "cat" {:provider :gateway :model "google/gemini-embedding-001" :dimensions 128})))
+    "#).unwrap();
+    assert_eq!(result.to_string(), "((256 256) 128)");
+}
+
+#[test]
+#[ignore = "requires Vercel AI_GATEWAY_API_KEY"]
+fn live_rerank_vercel_gateway() {
+    if std::env::var("AI_GATEWAY_API_KEY").map_or(true, |key| key.is_empty()) {
+        return;
+    }
+    let result = interpreter().eval_str_compiled(r#"
+        (llm/configure-embeddings :cohere {:api-key (env "AI_GATEWAY_API_KEY")
+          :base-url "https://ai-gateway.vercel.sh/v2" :rerank-model "cohere/rerank-v3.5" :top-k 1 :timeout 30000})
+        (llm/rerank "Where is the cat?" ["A cat sleeps on the sofa." "The weather is sunny."])
+    "#).unwrap();
+    let rows = result.as_list().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].as_map_rc().unwrap()[&sema_core::Value::keyword("index")].as_int(),
+        Some(0)
+    );
+}

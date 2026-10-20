@@ -266,8 +266,8 @@ allows the existing Rust 1.99 `fetch_update` deprecation in unrelated crates.
 | Cloudflare Workers AI | `@cf/baai/bge-m3` | Passed sync batch, Unicode/duplicate similarity, and spawned single |
 | TEI | Native Metal server 1.9.4, `BAAI/bge-small-en-v1.5` | Passed common checks and 35 texts across the 32-item boundary |
 | Nomic (regression) | `nomic-embed-text-v1.5` | Existing live release gate passed after the refactor |
-| DeepInfra | `Qwen/Qwen3-Embedding-0.6B` | API returned HTTP 402: account needs positive balance; vector smoke pending |
-| Alibaba | `text-embedding-v4` | Mock contract tests passed; live key and matching regional/workspace endpoint pending |
+| DeepInfra | `Qwen/Qwen3-Embedding-0.6B` | Passed sync batch, Unicode/duplicate similarity, and spawned single after account funding |
+| Alibaba | `text-embedding-v4` | Mock contract tests passed; account verification pending before live key/endpoint setup |
 
 To repeat an individual new-provider gate, configure its documented environment
 variables and run (replace `azure` with the preset name):
@@ -279,6 +279,6 @@ cargo test -p sema-lang --test llm_suite \
 
 The six ignored live tests fail when configuration is missing; they do not report
 a skipped request as success. The common smoke program also runs against a mock
-server in ordinary CI. DeepInfra and Alibaba still need live verification before
-the provider round is released. Repeat the live gates and the full `jake ci`
+server in ordinary CI. Alibaba still needs live verification before the provider
+round is released. Repeat the live gates and the full `jake ci`
 release suite on the final combined commit. No release was cut by this work.

@@ -86,11 +86,16 @@ reranking endpoint is configured.
 
 Use `:task` with `"search_document"`, `"search_query"`, `"classification"`, or
 `"clustering"`. The default is `"search_document"`. `:dimensions` maps to
-`dimensionality` (supported by v1.5); `:long-text-mode` maps to `long_text_mode`,
-and `:max-tokens-per-text` maps to the token limit. Omitted long-text settings
-use the API defaults. `:truncate #t` is accepted as an alias for
+`dimensionality` (64–768 for v1.5); `:long-text-mode` maps to `long_text_mode`,
+and `:max-tokens-per-text` maps to the token limit. The default long-text mode is
+`"truncate"`, matching Nomic's Python SDK. `:truncate #t` is accepted as an alias for
 `:long-text-mode "truncate"`; `#f` does not mean `"mean"` and is rejected.
 Use `:task`, not `:input-type`. `:keep-alive` applies to Ollama, not Nomic.
+
+The adapter sends at most ten texts per request, preserves input order, and sums
+input token usage across requests. `:timeout` applies to each request. A failed
+request returns an error, not a partial result. Embedding calls do not retry
+automatically; a repeated call can charge again for earlier successful requests.
 
 The adapter has deterministic tests against the documented schema. Live API
 verification is pending account approval; the release is held until it passes.

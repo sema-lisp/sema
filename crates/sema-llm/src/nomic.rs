@@ -7,6 +7,9 @@ use crate::types::{
     ChatRequest, ChatResponse, EmbedOptions, EmbedRequest, EmbedResponse, LlmError, Usage,
 };
 
+// Match the hosted limit recorded in nomic-ai/nomic#392 and its Python SDK.
+const MAX_TEXTS_PER_REQUEST: usize = 10;
+
 /// Nomic's hosted text embedding API. The base URL includes `/v1`.
 pub struct NomicEmbeddingProvider {
     api_key: String,
@@ -35,6 +38,7 @@ impl NomicEmbeddingProvider {
             ));
         }
         validate_options(&options)?;
+        validate_dimensions(&model, options.dimensions)?;
         Ok(Self {
             api_key,
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -47,17 +51,47 @@ impl NomicEmbeddingProvider {
     async fn embed_async(&self, request: EmbedRequest) -> Result<EmbedResponse, LlmError> {
         let options = request.options.with_defaults(&self.options);
         let model = request.model.as_deref().unwrap_or(&self.model);
-        let body = request_body(&request.texts, model, &options)?;
-        if request.texts.is_empty() {
-            return Ok(EmbedResponse {
-                embeddings: Vec::new(),
-                model: model.to_string(),
-                usage: Usage {
-                    model: model.to_string(),
-                    ..Default::default()
-                },
-            });
+        validate_options(&options)?;
+        validate_dimensions(model, options.dimensions)?;
+        if model.trim().is_empty() {
+            return Err(LlmError::Config(
+                "Nomic embedding model must not be empty".into(),
+            ));
         }
+        let mut combined = EmbedResponse {
+            embeddings: Vec::with_capacity(request.texts.len()),
+            model: model.to_string(),
+            usage: Usage {
+                model: model.to_string(),
+                ..Default::default()
+            },
+        };
+        let mut width = options.dimensions;
+        // Sequential chunks preserve input order without multiplying rate-limit
+        // pressure. Dropping the future cancels the current request and the rest.
+        for texts in request.texts.chunks(MAX_TEXTS_PER_REQUEST) {
+            let response = self.embed_chunk(texts, model, &options, width).await?;
+            if width.is_none() {
+                width = response.embeddings.first().map(|v| v.len() as u32);
+            }
+            combined.usage.prompt_tokens = combined
+                .usage
+                .prompt_tokens
+                .checked_add(response.usage.prompt_tokens)
+                .ok_or_else(|| LlmError::Parse("Nomic total input usage exceeds u32".into()))?;
+            combined.embeddings.extend(response.embeddings);
+        }
+        Ok(combined)
+    }
+
+    async fn embed_chunk(
+        &self,
+        texts: &[String],
+        model: &str,
+        options: &EmbedOptions,
+        width: Option<u32>,
+    ) -> Result<EmbedResponse, LlmError> {
+        let body = request_body(texts, model, options)?;
         let mut call = self
             .client
             .post(format!("{}/embedding/text", self.base_url))
@@ -75,7 +109,7 @@ impl NomicEmbeddingProvider {
             .text()
             .await
             .map_err(|e| LlmError::Http(e.to_string()))?;
-        parse_response(&body, request.texts.len(), model, options.dimensions)
+        parse_response(&body, texts.len(), model, width)
     }
 }
 
@@ -124,8 +158,18 @@ fn validate_options(options: &EmbedOptions) -> Result<(), LlmError> {
     Ok(())
 }
 
+fn validate_dimensions(model: &str, dimensions: Option<u32>) -> Result<(), LlmError> {
+    if model == "nomic-embed-text-v1.5" && dimensions.is_some_and(|n| !(64..=768).contains(&n)) {
+        return Err(LlmError::Config(
+            "Nomic v1.5 :dimensions must be between 64 and 768".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn request_body(texts: &[String], model: &str, options: &EmbedOptions) -> Result<Value, LlmError> {
     validate_options(options)?;
+    validate_dimensions(model, options.dimensions)?;
     if model.trim().is_empty() {
         return Err(LlmError::Config(
             "Nomic embedding model must not be empty".into(),
@@ -135,13 +179,7 @@ fn request_body(texts: &[String], model: &str, options: &EmbedOptions) -> Result
     if let Some(dimensions) = options.dimensions {
         body["dimensionality"] = json!(dimensions);
     }
-    if let Some(mode) = options
-        .long_text_mode
-        .as_deref()
-        .or(options.truncate.filter(|t| *t).map(|_| "truncate"))
-    {
-        body["long_text_mode"] = json!(mode);
-    }
+    body["long_text_mode"] = json!(options.long_text_mode.as_deref().unwrap_or("truncate"));
     if let Some(limit) = options.max_tokens_per_text {
         body["max_tokens_per_text"] = json!(limit);
     }
@@ -240,7 +278,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_request_preserves_api_long_text_defaults() {
+    fn default_request_matches_sdk_long_text_default() {
         let body = request_body(
             &["hello".into()],
             "nomic-embed-text-v1.5",
@@ -249,7 +287,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             body,
-            json!({"texts":["hello"],"model":"nomic-embed-text-v1.5","task_type":"search_document"})
+            json!({"texts":["hello"],"model":"nomic-embed-text-v1.5","task_type":"search_document","long_text_mode":"truncate"})
         );
     }
 

@@ -7,8 +7,10 @@ https://docs.nomic.ai/reference/api/embed-text-v-1-embedding-text-post
 
 The required fields are `embeddings` (array of arrays of numbers), `usage`
 (`prompt_tokens` and `total_tokens`, both integers), and `model` (string).
-The short vectors make order and value assertions readable; they are not model
-outputs. The tests request the same dimensionality as the fixture.
+The vectors have 64 dimensions, within the hosted v1.5 range documented in the
+[embedding guide](https://docs.nomic.ai/atlas/embeddings-and-retrieval/generate-embeddings).
+Their values are synthetic, not model outputs. The first three values identify
+each vector in order assertions; the remaining values are zero.
 
 Request translation is also checked against that reference: bearer auth,
 `POST /v1/embedding/text`, `texts`, `model`, `task_type`, `dimensionality`,

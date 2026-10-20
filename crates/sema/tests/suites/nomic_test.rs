@@ -27,6 +27,13 @@ struct Server {
 
 impl Server {
     fn new(status: u16, response: String, delay: Duration) -> Self {
+        Self::responding(move |_| (status, response.clone()), delay)
+    }
+
+    fn responding(
+        respond: impl Fn(&Value) -> (u16, String) + Send + 'static,
+        delay: Duration,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
@@ -70,12 +77,9 @@ impl Server {
                 }
                 let mut bytes = vec![0; size];
                 reader.read_exact(&mut bytes).unwrap();
-                tx.send((
-                    request_line,
-                    headers,
-                    serde_json::from_slice(&bytes).unwrap(),
-                ))
-                .unwrap();
+                let body = serde_json::from_slice(&bytes).unwrap();
+                let (status, response) = respond(&body);
+                tx.send((request_line, headers, body)).unwrap();
                 thread::sleep(delay);
                 let _ = write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len());
             }
@@ -112,13 +116,114 @@ impl Drop for Server {
 }
 
 #[test]
+fn nomic_batches_preserve_order_options_and_usage() {
+    for asynchronous in [false, true] {
+        let server = Server::responding(
+            |body| {
+                let texts = body["texts"].as_array().unwrap();
+                if texts.len() > 10 {
+                    return (422, r#"{"detail":"batch too large"}"#.into());
+                }
+                let vectors: Vec<Vec<f64>> = texts
+                    .iter()
+                    .map(|text| vec![text.as_str().unwrap().parse::<f64>().unwrap(); 64])
+                    .collect();
+                (200, json!({"embeddings":vectors,"model":"nomic-embed-text-v1.5","usage":{"prompt_tokens":texts.len()*2,"total_tokens":texts.len()*2}}).to_string())
+            },
+            Duration::ZERO,
+        );
+        let provider = NomicEmbeddingProvider::new(
+            "test-key".into(),
+            format!("{}/v1", server.url),
+            "nomic-embed-text-v1.5".into(),
+            EmbedOptions::default(),
+        )
+        .unwrap();
+        let request = EmbedRequest {
+            texts: (0..23).map(|n| n.to_string()).collect(),
+            options: EmbedOptions {
+                dimensions: Some(64),
+                task: Some("search_query".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let response = if asynchronous {
+            sema_io::io_block_on(provider.embed_future(request).unwrap())
+        } else {
+            provider.embed(request)
+        }
+        .unwrap();
+        assert_eq!(
+            response.embeddings,
+            (0..23).map(|n| vec![f64::from(n); 64]).collect::<Vec<_>>()
+        );
+        assert_eq!(response.usage.prompt_tokens, 46);
+        for count in [10, 10, 3] {
+            let (_, _, body) = server
+                .requests
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(body["texts"].as_array().unwrap().len(), count);
+            assert_eq!(body["task_type"], "search_query");
+            assert_eq!(body["dimensionality"], 64);
+            assert_eq!(body["long_text_mode"], "truncate");
+        }
+        assert!(server.requests.try_recv().is_err());
+    }
+}
+
+#[test]
+fn nomic_later_batch_failures_do_not_return_partial_embeddings() {
+    for failure in ["http", "width", "usage"] {
+        let server = Server::responding(
+            move |body| {
+                let texts = body["texts"].as_array().unwrap();
+                let later = texts[0] == "10";
+                if later && failure == "http" {
+                    return (503, r#"{"detail":"unavailable"}"#.into());
+                }
+                let width = if later && failure == "width" { 128 } else { 64 };
+                let tokens = if failure == "usage" { u32::MAX } else { 1 };
+                (200, json!({"embeddings":vec![vec![0.5; width];texts.len()],"model":"nomic-embed-text-v1.5","usage":{"prompt_tokens":tokens,"total_tokens":tokens}}).to_string())
+            },
+            Duration::ZERO,
+        );
+        let provider = NomicEmbeddingProvider::new(
+            "test-key".into(),
+            format!("{}/v1", server.url),
+            "nomic-embed-text-v1.5".into(),
+            EmbedOptions::default(),
+        )
+        .unwrap();
+        let error = provider
+            .embed(EmbedRequest {
+                texts: (0..23).map(|n| n.to_string()).collect(),
+                ..Default::default()
+            })
+            .unwrap_err();
+        match failure {
+            "http" => assert!(matches!(error, LlmError::Api { status: 503, .. })),
+            _ => assert!(matches!(error, LlmError::Parse(_))),
+        }
+        for _ in 0..2 {
+            server
+                .requests
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }
+        assert!(server.requests.try_recv().is_err());
+    }
+}
+
+#[test]
 fn nomic_uses_native_schema_and_preserves_vector_order() {
     for expression in [
-        r#"(map embedding/->list (llm/embed ["first" "second"]))"#,
-        r#"(map embedding/->list (async/await (async/spawn (fn () (llm/embed ["first" "second"])))))"#,
+        r#"(map (fn (v) (take 3 (embedding/->list v))) (llm/embed ["first" "second"]))"#,
+        r#"(map (fn (v) (take 3 (embedding/->list v))) (async/await (async/spawn (fn () (llm/embed ["first" "second"])))))"#,
     ] {
         let server = Server::fixture();
-        let interp = server.interpreter(":dimensions 3 :task \"search_document\" :long-text-mode \"mean\" :max-tokens-per-text 4096");
+        let interp = server.interpreter(":dimensions 64 :task \"search_document\" :long-text-mode \"mean\" :max-tokens-per-text 4096");
         let result = interp.eval_str_compiled(expression).unwrap();
         assert_eq!(result.to_string(), "((0.25 0.75 -0.5) (-0.5 0.125 0.875))");
         let (line, headers, body) = server
@@ -130,7 +235,7 @@ fn nomic_uses_native_schema_and_preserves_vector_order() {
         assert!(headers.contains(&"content-type: application/json".to_string()));
         assert_eq!(
             body,
-            json!({"texts":["first","second"], "model":"nomic-embed-text-v1.5", "task_type":"search_document", "dimensionality":3, "long_text_mode":"mean", "max_tokens_per_text":4096})
+            json!({"texts":["first","second"], "model":"nomic-embed-text-v1.5", "task_type":"search_document", "dimensionality":64, "long_text_mode":"mean", "max_tokens_per_text":4096})
         );
     }
 }
@@ -139,15 +244,15 @@ fn nomic_uses_native_schema_and_preserves_vector_order() {
 fn nomic_per_call_options_override_configuration() {
     let server = Server::fixture();
     let interp = server.interpreter(
-        ":dimensions 8 :task \"clustering\" :long-text-mode \"mean\" :max-tokens-per-text 8192",
+        ":dimensions 128 :task \"clustering\" :long-text-mode \"mean\" :max-tokens-per-text 8192",
     );
-    interp.eval_str_compiled(r#"(llm/embed ["first" "second"] {:dimensions 3 :task "search_query" :long-text-mode "truncate" :max-tokens-per-text 1024})"#).unwrap();
+    interp.eval_str_compiled(r#"(llm/embed ["first" "second"] {:dimensions 64 :task "search_query" :long-text-mode "truncate" :max-tokens-per-text 1024})"#).unwrap();
     let (_, _, body) = server
         .requests
         .recv_timeout(Duration::from_secs(5))
         .unwrap();
     assert_eq!(body["task_type"], "search_query");
-    assert_eq!(body["dimensionality"], 3);
+    assert_eq!(body["dimensionality"], 64);
     assert_eq!(body["long_text_mode"], "truncate");
     assert_eq!(body["max_tokens_per_text"], 1024);
 }
@@ -155,12 +260,12 @@ fn nomic_per_call_options_override_configuration() {
 #[test]
 fn nomic_single_input_model_override_and_sync_usage() {
     let mut value: Value = serde_json::from_str(RESPONSE).unwrap();
-    value["embeddings"] = json!([[0.25, 0.75, -0.5]]);
+    value["embeddings"] = json!([value["embeddings"][0]]);
     let server = Server::new(200, value.to_string(), Duration::ZERO);
     let interp = server.interpreter(":model \"nomic-embed-text-v1\"");
     let value = interp
         .eval_str_compiled(
-            r#"(embedding/->list (llm/embed "hello" {:model "nomic-embed-text-v1.5"}))"#,
+            r#"(take 3 (embedding/->list (llm/embed "hello" {:model "nomic-embed-text-v1.5" :dimensions 64})))"#,
         )
         .unwrap();
     assert_eq!(value.to_string(), "(0.25 0.75 -0.5)");
@@ -242,7 +347,7 @@ fn nomic_configuration_preserves_chat_and_forwards_options_to_custom_providers()
 #[test]
 fn nomic_cassettes_distinguish_long_text_options() {
     let server = Server::fixture();
-    let interp = server.interpreter(":dimensions 3");
+    let interp = server.interpreter(":dimensions 64");
     let tape = std::env::temp_dir().join(format!(
         "sema-nomic-cassette-{}-{}.jsonl",
         std::process::id(),
@@ -286,7 +391,7 @@ fn nomic_auto_configuration_uses_key_and_endpoint_override() {
         let output = command
             .args([
                 "-e",
-                r#"(map embedding/length (llm/embed ["first" "second"] {:dimensions 3}))"#,
+                r#"(map embedding/length (llm/embed ["first" "second"] {:dimensions 64}))"#,
             ])
             .output()
             .unwrap();
@@ -295,7 +400,7 @@ fn nomic_auto_configuration_uses_key_and_endpoint_override() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "(3 3)");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "(64 64)");
         let (_, headers, body) = server
             .requests
             .recv_timeout(Duration::from_secs(5))
@@ -330,7 +435,7 @@ fn nomic_rejects_malformed_responses() {
     }
     for value in invalid {
         let server = Server::new(200, value.to_string(), Duration::ZERO);
-        let interp = server.interpreter(":dimensions 3");
+        let interp = server.interpreter(":dimensions 64");
         assert!(
             interp
                 .eval_str_compiled(r#"(llm/embed ["first" "second"])"#)
@@ -369,6 +474,8 @@ fn nomic_invalid_options_empty_batch_and_rerank_do_not_dispatch() {
     for options in [
         r#":task "wrong""#,
         r#":long-text-mode "wrong""#,
+        ":dimensions 63",
+        ":dimensions 769",
         ":max-tokens-per-text 0",
         ":max-tokens-per-text 4294967296",
         ":truncate #f",
@@ -419,4 +526,28 @@ fn live_nomic_embedding_release_gate() {
               (> (llm/similarity query (first docs)) (llm/similarity query (second docs))))
     "#).unwrap();
     assert_eq!(result.to_string(), "(2 (768 768) 768 256 #t)");
+
+    let provider = NomicEmbeddingProvider::new(
+        key,
+        "https://api-atlas.nomic.ai/v1".into(),
+        "nomic-embed-text-v1.5".into(),
+        EmbedOptions::default(),
+    )
+    .unwrap();
+    let response = provider
+        .embed(EmbedRequest {
+            texts: (0..11)
+                .map(|n| format!("Document {n}: Cats are mammals."))
+                .collect(),
+            options: EmbedOptions {
+                dimensions: Some(64),
+                timeout_ms: Some(30_000),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(response.embeddings.len(), 11);
+    assert!(response.embeddings.iter().all(|v| v.len() == 64));
+    assert!(response.usage.prompt_tokens > 0);
 }

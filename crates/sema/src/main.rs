@@ -120,9 +120,17 @@ struct Cli {
     #[arg(long)]
     embedding_model: Option<String>,
 
-    /// Set embedding provider (jina, voyage, cohere, openai)
+    /// Set embedding provider (openai, ollama, jina, voyage, cohere, nomic, mistral, gemini, together, fireworks)
     #[arg(long)]
     embedding_provider: Option<String>,
+
+    /// Set reranking model
+    #[arg(long)]
+    rerank_model: Option<String>,
+
+    /// Set reranking provider (jina, voyage, cohere, together, fireworks)
+    #[arg(long)]
+    rerank_provider: Option<String>,
 
     /// Restrict file operations to these directories (comma-separated)
     #[arg(long, value_name = "DIRS")]
@@ -1416,10 +1424,33 @@ fn main() {
         std::env::set_var("SEMA_EMBEDDING_PROVIDER", provider);
     }
 
+    if let Some(model) = &cli.rerank_model {
+        std::env::set_var("SEMA_RERANK_MODEL", model);
+    }
+    if let Some(provider) = &cli.rerank_provider {
+        std::env::set_var("SEMA_RERANK_PROVIDER", provider);
+    }
+
     // Auto-configure LLM unless --no-llm
     if !cli.no_llm {
         if let Err(e) = interpreter.eval_str("(llm/auto-configure)") {
-            if cli.chat_provider.is_some() || cli.chat_model.is_some() {
+            if cli.chat_provider.is_some()
+                || cli.chat_model.is_some()
+                || cli.embedding_provider.is_some()
+                || cli.embedding_model.is_some()
+                || cli.rerank_provider.is_some()
+                || cli.rerank_model.is_some()
+                || [
+                    "SEMA_CHAT_PROVIDER",
+                    "SEMA_CHAT_MODEL",
+                    "SEMA_EMBEDDING_PROVIDER",
+                    "SEMA_EMBEDDING_MODEL",
+                    "SEMA_RERANK_PROVIDER",
+                    "SEMA_RERANK_MODEL",
+                ]
+                .iter()
+                .any(|key| std::env::var(key).is_ok_and(|value| !value.trim().is_empty()))
+            {
                 print_error(&e);
                 std::process::exit(1);
             }

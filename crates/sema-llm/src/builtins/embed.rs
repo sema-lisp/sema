@@ -216,17 +216,26 @@ impl sema_core::runtime::CompletionDecoder for RerankDecoder {
     }
 }
 
-/// Cassette key for an embeddings request (model + the input texts).
-pub(super) fn compute_embed_key(request: &EmbedRequest) -> String {
+/// Hash structured, resolved retrieval configuration so tapes cannot cross providers
+/// or vector spaces. Neither endpoints nor inputs are stored in plaintext in the key.
+pub(super) fn compute_embed_key(provider: &dyn LlmProvider, request: &EmbedRequest) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"embed");
-    if let Some(ref m) = request.model {
-        hasher.update(m.as_bytes());
-    }
-    for t in &request.texts {
-        hasher.update(t.as_bytes());
-        hasher.update(b"\0");
-    }
+    hasher.update(b"embed-v2");
+    let mut options = request.options.clone();
+    // Transport/lifetime settings do not change the resulting vector.
+    options.timeout_ms = None;
+    options.keep_alive = None;
+    hasher.update(
+        serde_json::json!([
+            provider.name(),
+            provider.embedding_endpoint(),
+            request.model,
+            request.texts,
+            options
+        ])
+        .to_string()
+        .as_bytes(),
+    );
     let policy_fingerprint = effective_policy_fingerprint();
     if !policy_fingerprint.is_empty() {
         hasher.update(b"\0policy\0");
@@ -294,71 +303,20 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
 
         guard_provider_url(unrestricted, &opts)?;
 
-        let api_key = opts.opt_str("api-key");
-
+        let (provider, rerank) = embedding_config::build(&provider_name, &opts)?;
+        if let Some(endpoint) = provider.embedding_endpoint() {
+            let resolved = BTreeMap::from([(Value::keyword("base-url"), Value::string(endpoint))]);
+            guard_provider_url(unrestricted, &resolved)?;
+        }
         PROVIDER_REGISTRY.with(|reg| {
             let mut reg = reg.borrow_mut();
-            match provider_name.as_str() {
-                "jina" => {
-                    let api_key = api_key
-                        .clone()
-                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
-                    let model = opts
-                        .opt_str("default-model")
-                        .unwrap_or_else(|| "jina-embeddings-v3".to_string());
-                    let provider = OpenAiCompatEmbeddingProvider::new(
-                        "jina".to_string(),
-                        api_key,
-                        "https://api.jina.ai/v1".to_string(),
-                        model,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    reg.set_embedding_provider("jina");
-                }
-                "voyage" => {
-                    let api_key = api_key
-                        .clone()
-                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
-                    let model = opts
-                        .opt_str("default-model")
-                        .unwrap_or_else(|| "voyage-3".to_string());
-                    let provider = OpenAiCompatEmbeddingProvider::new(
-                        "voyage".to_string(),
-                        api_key,
-                        "https://api.voyageai.com/v1".to_string(),
-                        model,
-                    )
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    reg.set_embedding_provider("voyage");
-                }
-                "cohere" => {
-                    let api_key = api_key
-                        .clone()
-                        .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
-                    let model = opts.opt_str("default-model");
-                    let provider = CohereEmbeddingProvider::new(api_key, model)
-                        .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    reg.register(Box::new(provider));
-                    reg.set_embedding_provider("cohere");
-                }
-                _ => {
-                    // Default: OpenAI-compatible
-                    let api_key = api_key.unwrap_or_default();
-                    let base_url = opts.opt_str("base-url");
-                    let model = opts
-                        .opt_str("default-model")
-                        .or_else(|| opts.opt_str("model"));
-                    let provider = OpenAiProvider::new(api_key, base_url, model)
-                        .map_err(|e| SemaError::Llm(e.to_string()))?;
-                    let name = provider.name().to_string();
-                    reg.register(Box::new(provider));
-                    reg.set_embedding_provider(&name);
-                }
+            reg.register_embedding(provider);
+            reg.set_embedding_provider(&provider_name);
+            if rerank {
+                reg.set_rerank_provider(&provider_name);
             }
-            Ok(Value::nil())
-        })
+        });
+        Ok(Value::nil())
     });
 
     // `llm/embed` — a single first-class native function that branches internally
@@ -390,29 +348,59 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
                 .iter()
                 .map(|v| {
                     v.as_str()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| v.to_string())
+                        .map(str::to_string)
+                        .ok_or_else(|| SemaError::type_error("string", v.type_name()))
                 })
-                .collect();
+                .collect::<Result<_, _>>()?;
             (texts, false)
         } else {
             return Err(SemaError::type_error("string or list", args[0].type_name()));
         };
 
-        let model = if let Some(opts_val) = args.get(1) {
-            if let Some(opts) = opts_val.as_map_rc() {
-                opts.opt_str("model")
-            } else {
-                None
+        let opts = args
+            .get(1)
+            .map(|v| {
+                v.as_map_rc()
+                    .ok_or_else(|| SemaError::type_error("map", v.type_name()))
+            })
+            .transpose()?;
+        let model = opts
+            .as_deref()
+            .map(|o| embedding_config::string_option(o, "model"))
+            .transpose()?
+            .flatten();
+        let provider_name = opts
+            .as_deref()
+            .map(embedding_config::provider_option)
+            .transpose()?
+            .flatten();
+        let provider = PROVIDER_REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            match provider_name.as_deref() {
+                Some(name) => reg.get_embedding(name).ok_or_else(|| {
+                    SemaError::Llm(format!("embedding provider '{name}' not found"))
+                }),
+                None => reg
+                    .embedding_provider()
+                    .or_else(|| reg.default_provider())
+                    .ok_or_else(|| SemaError::Llm("no embedding provider configured".to_string())),
             }
-        } else {
-            None
+        })?;
+        let model = Some(model.unwrap_or_else(|| provider.default_embedding_model().to_string()));
+        let options = opts
+            .as_deref()
+            .map(embedding_config::embed_options)
+            .transpose()?
+            .unwrap_or_default()
+            .with_defaults(&provider.embedding_options());
+        let mut request = EmbedRequest {
+            texts,
+            model,
+            options,
         };
-
-        let mut request = EmbedRequest { texts, model };
         apply_input_policy_to_texts(&mut request.texts, "embedding.input")?;
         let req_model = request.model.clone().unwrap_or_default();
-        let cassette_key = compute_embed_key(&request);
+        let cassette_key = compute_embed_key(provider.as_ref(), &request);
 
         // ── Runtime path: offload and suspend (native targets only) ─────────
         //
@@ -467,16 +455,6 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
             }
             let recording = matches!(decision, Some(crate::cassette::Decision::Record));
 
-            let provider = PROVIDER_REGISTRY.with(|reg| {
-                let reg = reg.borrow();
-                reg.embedding_provider().or_else(|| reg.default_provider())
-            });
-            let Some(provider) = provider else {
-                return Err(SemaError::Llm(
-                    "no embedding provider configured. Use (llm/configure-embeddings ...) first"
-                        .to_string(),
-                ));
-            };
             let model = request
                 .model
                 .as_deref()
@@ -580,7 +558,8 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
             Some(crate::cassette::Decision::Miss(k)) => return Err(cassette_miss_error(&k)),
             other => {
                 let recording = matches!(other, Some(crate::cassette::Decision::Record));
-                let (resp, provider_name) = with_embedding_provider(|p| {
+                let (resp, provider_name) = {
+                    let p = &*provider;
                     let model = request
                         .model
                         .as_deref()
@@ -601,8 +580,8 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
                         cost_usd: pricing::calculate_cost_for(p.name(), &resp.usage),
                         ..Default::default()
                     });
-                    Ok((resp, p.name().to_string()))
-                })?;
+                    (resp, p.name().to_string())
+                };
                 if recording {
                     cassette_record(crate::cassette::TapeEntry::from_embed(
                         &cassette_key,
@@ -667,10 +646,12 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
         let mut top_k = None;
         let mut model = None;
         let mut provider = None;
+        let mut timeout_ms = None;
         if let Some(options) = args.get(2) {
             let opts = options
                 .as_map_rc()
                 .ok_or_else(|| SemaError::argument_type("llm/rerank", 3, "map", options))?;
+            timeout_ms = embedding_config::embed_options(&opts)?.timeout_ms;
             top_k = opts
                 .get(&Value::keyword("top-k"))
                 .map(|value| {
@@ -685,38 +666,38 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
                         })
                 })
                 .transpose()?;
-            model = opts
-                .get(&Value::keyword("model"))
-                .map(|value| {
-                    value.as_str().map(str::to_string).ok_or_else(|| {
-                        SemaError::eval(format!(
-                            "llm/rerank option :model must be a string, got {}",
-                            value.type_name()
-                        ))
-                    })
-                })
-                .transpose()?;
-            provider = opts
-                .get(&Value::keyword("provider"))
-                .map(|value| {
-                    value
-                        .as_keyword()
-                        .or_else(|| value.as_str().map(str::to_string))
-                        .ok_or_else(|| {
-                            SemaError::eval(format!(
-                                "llm/rerank option :provider must be a keyword or string, got {}",
-                                value.type_name()
-                            ))
-                        })
-                })
-                .transpose()?;
+            model = embedding_config::string_option(&opts, "model")?;
+            provider = embedding_config::provider_option(&opts)?;
         }
 
+        let resolved_provider = PROVIDER_REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            match provider.as_deref() {
+                Some(n) => reg
+                    .get_embedding(n)
+                    .ok_or_else(|| SemaError::Llm(format!("rerank provider '{n}' not found"))),
+                None => reg
+                    .rerank_provider()
+                    .or_else(|| reg.default_provider())
+                    .ok_or_else(|| {
+                        SemaError::Llm(
+                            "no rerank provider configured — set COHERE_API_KEY, JINA_API_KEY, or \
+                     VOYAGE_API_KEY (or pass {:provider ...})"
+                                .to_string(),
+                        )
+                    }),
+            }
+        })?;
+        let model =
+            Some(model.unwrap_or_else(|| resolved_provider.default_rerank_model().to_string()));
+        let top_k = top_k.or(resolved_provider.default_rerank_top_k());
+        let timeout_ms = timeout_ms.or(resolved_provider.embedding_options().timeout_ms);
         let request = RerankRequest {
             query: query.clone(),
             documents: documents.clone(),
             top_k,
             model: model.clone(),
+            timeout_ms,
         };
 
         // ── Runtime path: offload and suspend (native targets only) ─────────
@@ -734,28 +715,10 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
 
             // Clone an Arc<provider> off the thread-local registry on THIS thread,
             // release the borrow, and move it into the offloaded future.
-            let resolved_provider = PROVIDER_REGISTRY.with(|reg| {
-                let reg = reg.borrow();
-                match provider.as_deref() {
-                    Some(n) => reg
-                        .get(n)
-                        .ok_or_else(|| SemaError::Llm(format!("rerank provider '{n}' not found"))),
-                    None => reg
-                        .rerank_provider()
-                        .or_else(|| reg.default_provider())
-                        .ok_or_else(|| {
-                            SemaError::Llm(
-                            "no rerank provider configured — set COHERE_API_KEY, JINA_API_KEY, or \
-                             VOYAGE_API_KEY (or pass {:provider ...})"
-                                .to_string(),
-                        )
-                        }),
-                }
-            })?;
             let resolved_model = request
                 .model
                 .as_deref()
-                .unwrap_or_else(|| resolved_provider.default_model());
+                .unwrap_or_else(|| resolved_provider.default_rerank_model());
             model_target_allowed(
                 resolved_provider.name(),
                 resolved_model,
@@ -820,17 +783,20 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
         let span = sema_otel::reranker_span(&query, model.as_deref().unwrap_or(""), top_k);
         span.set_input(&documents);
 
-        let resp = with_rerank_provider(provider.as_deref(), |p| {
-            let resolved_model = request
-                .model
-                .as_deref()
-                .unwrap_or_else(|| p.default_model());
-            model_target_allowed(p.name(), resolved_model, PolicySource::Request, false)?;
-            p.rerank(request).map_err(|e| {
-                span.record_error(llm_error_kind(&e), &e.to_string());
-                SemaError::Llm(e.to_string())
-            })
-        })?;
+        let resp = {
+            let p = &*resolved_provider;
+            (|| {
+                let resolved_model = request
+                    .model
+                    .as_deref()
+                    .unwrap_or_else(|| p.default_rerank_model());
+                model_target_allowed(p.name(), resolved_model, PolicySource::Request, false)?;
+                p.rerank(request).map_err(|e| {
+                    span.record_error(llm_error_kind(&e), &e.to_string());
+                    SemaError::Llm(e.to_string())
+                })
+            })()
+        }?;
 
         // Record reordered output (content + scores) on the span.
         let out_docs: Vec<(String, f64)> = resp

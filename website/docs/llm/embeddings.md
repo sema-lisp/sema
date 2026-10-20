@@ -4,11 +4,12 @@ outline: [2, 3]
 
 # Embeddings & Similarity
 
-Generate vector embeddings from text and compute similarity between them. On startup
-`(llm/auto-configure)` picks an embedding provider by **precedence** — `JINA_API_KEY`,
-then `VOYAGE_API_KEY`, then `COHERE_API_KEY`, then `NOMIC_API_KEY`; if none is set it
-falls back to `OPENAI_API_KEY` (`text-embedding-3-small`). If `TOGETHER_API_KEY` or
-`FIREWORKS_API_KEY` is set, those are also detected. The first key present wins.
+Generate vector embeddings from text and compute similarity between them. On startup, `(llm/auto-configure)` registers available providers and selects the first
+in this order: Jina, Voyage, Cohere, Nomic, OpenAI, Mistral, Fireworks, Together, Gemini,
+then local Ollama. Set `SEMA_EMBEDDING_PROVIDER` / `SEMA_EMBEDDING_MODEL` or
+`--embedding-provider` / `--embedding-model` to override that selection.
+Reranking has independent `SEMA_RERANK_PROVIDER` / `SEMA_RERANK_MODEL` and
+`--rerank-provider` / `--rerank-model` overrides.
 
 ## Configuration
 
@@ -23,8 +24,8 @@ one provider for chat and another for embeddings. Pass `:default-model` to pick 
 (llm/configure-embeddings :voyage
   {:api-key (env "VOYAGE_API_KEY") :default-model "voyage-3-large"})
 
-(llm/configure-embeddings :nomic
-  {:api-key (env "NOMIC_API_KEY")})
+(llm/configure-embeddings :ollama
+  {:model "embeddinggemma" :host "http://localhost:11434"})
 
 (llm/configure-embeddings :together
   {:api-key (env "TOGETHER_API_KEY")})
@@ -37,6 +38,71 @@ one provider for chat and another for embeddings. Pass `:default-model` to pick 
   {:api-key (env "OPENAI_API_KEY") :default-model "text-embedding-3-large"})
 ```
 
+Configuration does not replace the chat provider, even when both use the same name.
+
+Model precedence is per-call `:model`, configured `:default-model`, configured
+`:model`, then the provider default. `:base-url` overrides `<PROVIDER>_BASE_URL`;
+Ollama also accepts `:host` and reads `OLLAMA_HOST`. Custom OpenAI-compatible
+providers require an explicit `:base-url`. API keys default to the provider's
+environment variable; Gemini also accepts `GOOGLE_API_KEY`.
+
+These options can be set at configuration time and overridden by each `llm/embed` call:
+
+| Option | Meaning |
+|--------|---------|
+| `:dimensions` | Positive output dimension, where supported by the model |
+| `:input-type` | Cohere / Voyage input type, such as `"search_query"` / `"query"` |
+| `:task` | Jina task, such as `"retrieval.query"`, or Nomic task, such as `"search_query"` |
+| `:long-text-mode` | Nomic: `"truncate"` or `"mean"` |
+| `:max-tokens-per-text` | Nomic: positive token limit per text |
+| `:truncate` | Boolean; Ollama truncation, Voyage truncation, or Cohere END/NONE |
+| `:keep-alive` | Ollama model lifetime, e.g. `"5m"` or `0` |
+| `:timeout` | Positive request timeout in milliseconds |
+
+Use options supported by the selected provider/model. Configure `:rerank-model`
+and `:top-k` separately for reranking; calls can override them with `:model`,
+`:top-k`, `:provider`, and `:timeout`.
+
+Ollama uses its native [embedding API](https://docs.ollama.com/api/embed),
+`POST /api/embed`. Install the default model first with `ollama pull embeddinggemma`.
+Omitting `:truncate` and `:keep-alive` preserves the server defaults. Ollama has no
+native reranking endpoint.
+
+### Nomic hosted embeddings
+
+The `:nomic` preset uses Nomic's native
+[text embedding API](https://docs.nomic.ai/reference/api/embed-text-v-1-embedding-text-post),
+`POST https://api-atlas.nomic.ai/v1/embedding/text`. It reads `NOMIC_API_KEY`,
+defaults to `nomic-embed-text-v1.5`, and accepts `NOMIC_BASE_URL` or `:base-url`
+as an API root ending in `/v1`. It supports embeddings only; no hosted Nomic
+reranking endpoint is configured.
+
+```sema
+(llm/configure-embeddings :nomic
+  {:api-key (env "NOMIC_API_KEY") :task "search_document"})
+(define docs (llm/embed ["Cats are mammals." "Rocks are minerals."]))
+(define query (llm/embed "Which animals are mammals?" {:task "search_query"}))
+```
+
+Use `:task` with `"search_document"`, `"search_query"`, `"classification"`, or
+`"clustering"`. The default is `"search_document"`. `:dimensions` maps to
+`dimensionality` (64–768 for v1.5); `:long-text-mode` maps to `long_text_mode`,
+and `:max-tokens-per-text` maps to the token limit. The default long-text mode is
+`"truncate"`, matching Nomic's Python SDK. `:truncate #t` is accepted as an alias for
+`:long-text-mode "truncate"`; `#f` does not mean `"mean"` and is rejected.
+Use `:task`, not `:input-type`. `:keep-alive` applies to Ollama, not Nomic.
+
+The adapter sends at most ten texts per request, preserves input order, and sums
+input token usage across requests. `:timeout` applies to each request. A failed
+request returns an error, not a partial result. Embedding calls do not retry
+automatically; a repeated call can charge again for earlier successful requests.
+
+The adapter has deterministic tests against the documented schema. Live API
+verification is pending account approval; the release is held until it passes.
+
+Embedding cassette keys include the resolved provider, endpoint, model, and options.
+Re-record older embedding tapes after upgrading.
+
 ## Generating Embeddings
 
 ### `llm/embed`
@@ -48,7 +114,8 @@ Generate an embedding for a string or a list of strings. Returns a **bytevector*
 (define v1 (llm/embed "hello world"))
 
 ;; Pick the model per call with an options map
-(llm/embed "hello world" {:model "text-embedding-3-small"})
+(llm/embed "hello world" {:provider :openai :model "text-embedding-3-small"
+                         :dimensions 256 :timeout 30000})
 
 ;; Batch embeddings
 (llm/embed ["cat" "dog" "fish"])       ; => list of bytevectors
@@ -111,7 +178,7 @@ Compute cosine similarity between two embedding vectors. Returns a value between
 
 ### `llm/rerank`
 
-Reorder a list of candidate documents by their relevance to a query using a hosted **cross-encoder** reranker (Cohere, Jina, Voyage, Nomic, Together AI, or Fireworks AI — the same **API key** you already use for embeddings; see [Supported Embedding Providers](#supported-embedding-providers) below for setup). Where `llm/similarity` / `vector-store/search` embed the query and documents *independently* (a bi-encoder), a reranker reads the query and each document *together*, so it's far more precise. The standard pattern is to retrieve a generous shortlist by vector search, then rerank it to the best few.
+Reorder a list of candidate documents by their relevance to a query using a hosted **cross-encoder** reranker (Cohere, Jina, Voyage, Together AI, or Fireworks AI — the same **API key** you already use for embeddings; see [Supported Embedding Providers](#supported-embedding-providers) below for setup). Where `llm/similarity` / `vector-store/search` embed the query and documents *independently* (a bi-encoder), a reranker reads the query and each document *together*, so it's far more precise. The standard pattern is to retrieve a generous shortlist by vector search, then rerank it to the best few.
 
 ```sema
 (llm/rerank "how do I read a file?"
@@ -120,7 +187,7 @@ Reorder a list of candidate documents by their relevance to a query using a host
 ;; => ({:index 1 :score 0.91 :document "use file/read to read a file"} ...)
 ```
 
-Returns `{:index :score :document}` maps, highest relevance first; `:index` points back into the input list. Options: `:top-k`, `:model`, and `:provider` (`:cohere` / `:jina` / `:voyage` / `:nomic` / `:together` / `:fireworks`). See the **[RAG guide](/docs/llm/rag)** for the full retrieve → rerank → answer pipeline.
+Returns `{:index :score :document}` maps, highest relevance first; `:index` points back into the input list. Options: `:top-k`, `:model`, `:timeout`, and `:provider` (`:cohere` / `:jina` / `:voyage` / `:together` / `:fireworks`). See the **[RAG guide](/docs/llm/rag)** for the full retrieve → rerank → answer pipeline.
 
 ## Token Counting
 
@@ -149,9 +216,12 @@ Returns a detailed estimate map with the token count and the estimation method u
 | Jina | `JINA_API_KEY` | ✅ | `jina-embeddings-v3` |
 | Voyage | `VOYAGE_API_KEY` | ✅ | `voyage-3` |
 | Cohere | `COHERE_API_KEY` | ✅ | `embed-english-v3.0` |
-| Nomic | `NOMIC_API_KEY` | ✅ | `nomic-embed-text-v1.5` |
+| Nomic | `NOMIC_API_KEY` | — | `nomic-embed-text-v1.5` |
 | Together AI | `TOGETHER_API_KEY` | ✅ | `BAAI/bge-base-en-v1.5` |
 | Fireworks AI | `FIREWORKS_API_KEY` | ✅ | `fireworks/qwen3-embedding-8b` |
 | OpenAI | `OPENAI_API_KEY` | — | `text-embedding-3-small` |
+| Ollama | `OLLAMA_HOST` (optional) | — | `embeddinggemma` |
+| Mistral | `MISTRAL_API_KEY` | — | `mistral-embed` |
+| Gemini | `GEMINI_API_KEY` / `GOOGLE_API_KEY` | — | `gemini-embedding-001` |
 
 See [Provider Management](./providers.md) for the full provider capability table.

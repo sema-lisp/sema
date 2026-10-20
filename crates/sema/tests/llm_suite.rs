@@ -8,6 +8,8 @@ mod common;
 
 #[path = "suites/embedding_api_test.rs"]
 mod embedding_api_test;
+#[path = "suites/embedding_config_test.rs"]
+mod embedding_config_test;
 #[path = "suites/llm_cassette_test.rs"]
 mod llm_cassette_test;
 #[path = "suites/llm_chat_tools_async_test.rs"]
@@ -18,3 +20,5 @@ mod llm_fake_test;
 mod llm_root_nonblocking_test;
 #[path = "suites/memory_test.rs"]
 mod memory_test;
+#[path = "suites/nomic_test.rs"]
+mod nomic_test;

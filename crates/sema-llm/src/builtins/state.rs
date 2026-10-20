@@ -187,25 +187,6 @@ where
     })
 }
 
-pub(super) fn with_embedding_provider<F, R>(f: F) -> Result<R, SemaError>
-where
-    F: FnOnce(&dyn LlmProvider) -> Result<R, SemaError>,
-{
-    PROVIDER_REGISTRY.with(|reg| {
-        let reg = reg.borrow();
-        let provider = reg
-            .embedding_provider()
-            .or_else(|| reg.default_provider())
-            .ok_or_else(|| {
-                SemaError::Llm(
-                    "no embedding provider configured. Use (llm/configure-embeddings ...) first"
-                        .to_string(),
-                )
-            })?;
-        f(&*provider)
-    })
-}
-
 /// Pull a human-readable text snippet from a vector-store document's metadata
 /// (`:text` or `:content`), for the retriever span's `document.content`. Empty if absent.
 pub(super) fn metadata_text(metadata: &Value) -> String {
@@ -218,29 +199,4 @@ pub(super) fn metadata_text(metadata: &Value) -> String {
         }
     }
     String::new()
-}
-
-pub(super) fn with_rerank_provider<F, R>(name: Option<&str>, f: F) -> Result<R, SemaError>
-where
-    F: FnOnce(&dyn LlmProvider) -> Result<R, SemaError>,
-{
-    PROVIDER_REGISTRY.with(|reg| {
-        let reg = reg.borrow();
-        let provider = match name {
-            Some(n) => reg
-                .get(n)
-                .ok_or_else(|| SemaError::Llm(format!("rerank provider '{n}' not found")))?,
-            None => reg
-                .rerank_provider()
-                .or_else(|| reg.default_provider())
-                .ok_or_else(|| {
-                    SemaError::Llm(
-                        "no rerank provider configured — set COHERE_API_KEY, JINA_API_KEY, or \
-                         VOYAGE_API_KEY (or pass {:provider ...})"
-                            .to_string(),
-                    )
-                })?,
-        };
-        f(&*provider)
-    })
 }

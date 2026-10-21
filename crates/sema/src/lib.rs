@@ -255,6 +255,168 @@ impl Interpreter {
             .set_str(name, Value::native_fn(native));
     }
 
+    /// Register an async native function that can be called from Sema code.
+    ///
+    /// The call splits into three steps that respect the thread boundary
+    /// (`Value` is not `Send`; keywords and symbols use a thread-local interner):
+    ///
+    /// | Step | Runs on | Role |
+    /// | --- | --- | --- |
+    /// | `prepare` | interpreter thread | validate `&[Value]`, produce an owned `Input` |
+    /// | `run` | Sema's process-wide Tokio pool | await a future over `Input`, produce `Output` or a host error |
+    /// | `finish` | interpreter thread | convert `Output` into a `Value` |
+    ///
+    /// Calling the function suspends the calling Sema task while the future
+    /// runs; other runnable Sema tasks continue. [`eval_str`] still blocks its
+    /// Rust caller until evaluation finishes.
+    ///
+    /// # Runtime context
+    ///
+    /// `run` executes on Sema's own Tokio pool, not the host's runtime, so it
+    /// may construct Tokio timers and I/O resources. A `tokio::spawn` inside it
+    /// lands on Sema's pool. Do not block inside `run` (no `block_on`); a
+    /// blocking call cannot be interrupted. On wasm32 the default runtime has
+    /// no executor and a call fails with an executor-rejection error.
+    ///
+    /// # Errors
+    ///
+    /// A host `Error` is rendered to text (its `Display` chain) on the executor
+    /// and raised as `SemaError::Io("<name>: <text>")`. Errors returned by
+    /// `prepare` and `finish` are raised unchanged. Cancellation, executor
+    /// rejection, deadline, worker panic and decode failures are raised with
+    /// distinct `<name>: <reason>` prefixes, so `try`/`catch` can tell them from
+    /// a host error.
+    ///
+    /// # Cancellation
+    ///
+    /// `async/cancel`, `async/with-timeout` and interpreter shutdown drop the
+    /// host future at its next poll. Write drop-cancel-safe futures; remote
+    /// side effects are not undone, and a future stuck in a blocking call or a
+    /// task it detached is not stopped. Interpreter drop waits at most 2 s for
+    /// in-flight host futures.
+    ///
+    /// # Call-site restrictions
+    ///
+    /// The function cannot suspend, and therefore fails with the error
+    /// `<name>: async host function cannot run here`, when called from a macro
+    /// transformer during expansion, from a synchronous `apply`/`call-with-values`
+    /// path, or from debug/restricted evaluation.
+    /// `prepare` and `finish` run inside an active runtime quantum and must not
+    /// call [`eval_str`], [`eval`] or any `block_on`.
+    ///
+    /// # Captured state
+    ///
+    /// Like [`register_fn`], none of the three closures may strongly capture a
+    /// `Value`, `Env`, or anything that transitively owns one (the GC cannot
+    /// trace closure captures). `run`'s `Send` bound enforces this for the
+    /// worker; `prepare` and `finish` rely on the host.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use sema::{Interpreter, SemaError, Value};
+    /// use std::{convert::Infallible, time::Duration};
+    ///
+    /// let interp = Interpreter::new();
+    /// interp.register_async_fn(
+    ///     "host/delayed-keyword",
+    ///     |args| {
+    ///         if args.len() != 1 {
+    ///             return Err(SemaError::eval("expected one string argument"));
+    ///         }
+    ///         args[0]
+    ///             .as_str()
+    ///             .map(str::to_owned)
+    ///             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))
+    ///     },
+    ///     |name: String| async move {
+    ///         tokio::time::sleep(Duration::from_millis(10)).await;
+    ///         Ok::<String, Infallible>(name)
+    ///     },
+    ///     |name| Ok(Value::keyword(&name)),
+    /// );
+    /// let value = interp.eval_str("(host/delayed-keyword \"ready\")").unwrap();
+    /// assert_eq!(value, Value::keyword("ready"));
+    /// ```
+    ///
+    /// A `run` future that captures non-`Send` data does not compile:
+    ///
+    /// ```compile_fail
+    /// use sema::{Interpreter, Value};
+    /// use std::{convert::Infallible, rc::Rc};
+    ///
+    /// let interp = Interpreter::new();
+    /// let shared = Rc::new(1_i64);
+    /// interp.register_async_fn(
+    ///     "host/bad",
+    ///     |_args| Ok(()),
+    ///     move |_: ()| {
+    ///         let shared = Rc::clone(&shared);
+    ///         async move { Ok::<i64, Infallible>(*shared) }
+    ///     },
+    ///     |n| Ok(Value::int(n)),
+    /// );
+    /// ```
+    ///
+    /// Nor does a non-`Send` `Input` or `Output`:
+    ///
+    /// ```compile_fail
+    /// use sema::{Interpreter, Value};
+    /// use std::{convert::Infallible, rc::Rc};
+    ///
+    /// let interp = Interpreter::new();
+    /// interp.register_async_fn(
+    ///     "host/bad",
+    ///     |_args| Ok(Rc::new(1_i64)),
+    ///     |n: Rc<i64>| async move { Ok::<i64, Infallible>(*n) },
+    ///     |n| Ok(Value::int(n)),
+    /// );
+    /// ```
+    ///
+    /// [`eval_str`]: Self::eval_str
+    /// [`eval`]: Self::eval
+    /// [`register_fn`]: Self::register_fn
+    pub fn register_async_fn<Input, Output, Error, Prepare, Run, Fut, Finish>(
+        &self,
+        name: &str,
+        prepare: Prepare,
+        run: Run,
+        finish: Finish,
+    ) where
+        Input: Send + 'static,
+        Output: Send + 'static,
+        Error: std::error::Error + Send + 'static,
+        Prepare: Fn(&[Value]) -> Result<Input> + 'static,
+        Run: Fn(Input) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = std::result::Result<Output, Error>> + Send + 'static,
+        Finish: Fn(Output) -> Result<Value> + 'static,
+    {
+        use sema_core::NativeFn;
+
+        let fn_name: std::sync::Arc<str> = std::sync::Arc::from(name);
+        let run = std::sync::Arc::new(run);
+        let finish = Rc::new(finish);
+        let legacy_name = std::sync::Arc::clone(&fn_name);
+        let native = NativeFn::simple_with_runtime(
+            name,
+            // Legacy value ABI: reached only where the caller cannot suspend
+            // (macro expansion, a synchronous apply path, debug evaluation).
+            move |_args| {
+                Err(SemaError::eval(format!(
+                    "{legacy_name}: async host function cannot run here: the caller cannot \
+                     suspend (macro expansion, a synchronous apply, or debug evaluation)"
+                )))
+            },
+            move |_context, args| {
+                let input = prepare(args)?;
+                sema_io::host_async::suspend_host_async(&fn_name, input, &run, &finish)
+            },
+        );
+        self.inner
+            .global_env
+            .set_str(name, Value::native_fn(native));
+    }
+
     /// Load and evaluate a `.sema` file.
     ///
     /// Definitions persist in the global environment, just like [`eval_str`].

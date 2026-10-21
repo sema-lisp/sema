@@ -2,11 +2,14 @@
 
 ## Unreleased
 
-- Keep Rust `Value` instances on their owning thread by making them neither
-  `Send` nor `Sync`. This prevents cross-thread keyword/symbol misinterpretation
-  and concurrent access to non-atomic reference counts. Embedders must transfer
-  owned Rust data and construct Sema values on the receiving thread. Code that
-  previously moved or shared `Value` across threads will no longer compile.
+- **`Value` and `SemaError` are no longer `Send` or `Sync` (breaking for Rust
+  embedders).** A symbol or keyword is a key into its thread's string interner,
+  and heap values use non-atomic reference counts, so a value moved to another
+  thread could resolve to a different name or corrupt a reference count. Code
+  that moved or shared a `Value` or `SemaError` across threads, including via
+  `anyhow::Error` or `Box<dyn Error + Send + Sync>`, no longer compiles. Send
+  owned Rust data between threads and construct values on the receiving thread;
+  see the threading section of the embedding guide.
 
 ## 1.37.0
 

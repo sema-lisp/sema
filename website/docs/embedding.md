@@ -265,15 +265,9 @@ fn make_record(name: &str, age: i64, dept: &str) -> Value {
 Sema is **single-threaded by design**. It uses `Rc` (not `Arc`) for reference counting and a thread-local string interner for keywords and symbols.
 
 - Multiple `Interpreter` instances can coexist on the same thread with **fully isolated evaluator state** — each has its own module cache, call stack, span table, and depth counters.
-- Do **not** send `Value` instances across thread boundaries — they are not `Send` or `Sync`.
-- The string interner is per-thread, so interned keys from one thread are not valid in another.
+- `Value` and `SemaError` are neither `Send` nor `Sync`, so Rust rejects moving or sharing them across threads. This includes values that hold only a number, boolean, symbol, or keyword: a keyword is a key into its thread's string interner, and the same key can mean `"status"` on one thread and `"name"` on another.
+- Raw `Spur` keys returned by `intern` have the same restriction, even though their Rust type does not enforce it.
 - LLM state (provider registry, usage tracking, budgets) is per-thread and shared across all interpreters on the same thread.
-
-Rust rejects moving or sharing a `Value` across threads, including values that
-hold only a number, boolean, symbol, or keyword. A keyword stores an identifier
-in its thread's string table. The same identifier can mean `"status"` on one
-thread and `"name"` on another. Raw `Spur` keys returned by `intern` have the same
-restriction, even though their Rust type does not enforce it.
 
 Send owned Rust data across a channel or task boundary, then create Sema values
 on the interpreter thread:
@@ -293,13 +287,11 @@ assert_eq!(interp.eval_str("(= status :ready)").unwrap(), Value::bool(true));
 
 For structured data, transfer a Rust struct or `serde_json::Value` and convert it
 on the receiving thread. Resolve existing keyword or symbol names to owned Rust
-strings on their original thread before sending them. Create a separate
-interpreter inside each worker if the workers need to evaluate Sema themselves.
-The same rules apply to async executors: tasks that can move between worker
-threads must not hold Sema values across suspension points.
-`SemaError` can contain a `Value`, so it is also neither `Send` nor `Sync`.
-Convert an error to owned text on its original thread when reporting it to
-another thread.
+strings on their original thread before sending them, and convert a `SemaError`
+to owned text the same way. Create a separate interpreter inside each worker if
+the workers need to evaluate Sema themselves. The same rules apply to async
+executors: a task that can move between worker threads must not hold a Sema
+value across an `.await`.
 
 ## Security Considerations
 

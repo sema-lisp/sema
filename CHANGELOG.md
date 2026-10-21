@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Keep Rust `Value` instances on their owning thread by making them neither
+  `Send` nor `Sync`. This prevents cross-thread keyword/symbol misinterpretation
+  and concurrent access to non-atomic reference counts. Embedders must transfer
+  owned Rust data and construct Sema values on the receiving thread. Code that
+  previously moved or shared `Value` across threads will no longer compile.
+
 ## 1.37.0
 
 Stable release of the editor and runtime update validated in RC1 and RC2.

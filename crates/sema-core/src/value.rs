@@ -1168,27 +1168,16 @@ pub enum ValueViewRef<'a> {
 /// NaN-boxed: stored as 8 bytes. Floats stored directly,
 /// everything else encoded in quiet-NaN payload space.
 ///
-/// Values stay on the thread that created them: symbols and keywords use its
-/// string interner, and heap values use non-atomic reference counts. This
-/// applies to all values, including integers and booleans. Transfer owned Rust
-/// data such as strings or JSON between threads, then construct values there.
-///
-/// Moving a value to another thread is rejected:
+/// A value is neither `Send` nor `Sync`: symbols and keywords are keys into
+/// the creating thread's string interner, and heap values use non-atomic
+/// reference counts. This applies to every value, including integers and
+/// booleans. Transfer owned Rust data such as strings or JSON between threads,
+/// then construct values on the receiving thread.
 ///
 /// ```compile_fail
 /// use sema_core::Value;
 /// let value = Value::keyword("status");
 /// std::thread::spawn(move || println!("{value}"));
-/// ```
-///
-/// Sharing a reference between threads is also rejected:
-///
-/// ```compile_fail
-/// use sema_core::Value;
-/// let value = Value::string("hello");
-/// std::thread::scope(|scope| {
-///     scope.spawn(|| println!("{value}"));
-/// });
 /// ```
 #[repr(transparent)]
 pub struct Value(u64, PhantomData<Rc<()>>);

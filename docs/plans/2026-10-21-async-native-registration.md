@@ -1,7 +1,7 @@
 # Async native function registration for embedders
 
-**Status:** Draft design; no API in this document is implemented by this PR.
-Decisions D1-D5 below are proposed, not approved.
+**Status:** Approved design; no API in this document is implemented by this PR.
+The owner approved D1-D5 on 2026-10-21. Implementation follows in a separate PR.
 
 ## Problem and current behavior
 
@@ -28,7 +28,7 @@ worker data.
 
 ## Decision status
 
-| ID | Decision | Proposed design | Other choices and effect |
+| ID | Decision | Approved design | Other choices and effect |
 |---|---|---|---|
 | D1 | Callback shape | Three callbacks: `prepare`, `run`, `finish` (see below). | A typed `Input: FromValue` / `Output: IntoValue` form (plan 2026-03-11 sections 2 and 3) collapses this to one callback but needs the conversion traits first. It can wrap D1 later without changing the runtime adapter. |
 | D2 | Error mapping | Host `Error` is rendered to text on the executor and raised as `SemaError::Io("<name>: <text>")` on the interpreter thread, matching `http/*`. Each `ExternalFailureCode` keeps a distinct, documented message prefix so cancellation, executor rejection, deadline, worker panic and decode failures are distinguishable in `catch`. | Reusing the current `IoDecoder` mapping collapses every failure code into `SemaError::eval` text and loses classification. A new `SemaError` variant is cleaner but widens the public error enum. |

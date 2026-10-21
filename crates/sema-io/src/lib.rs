@@ -57,6 +57,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 
 mod executor;
+pub mod host_async;
 pub use executor::{process_executor, ProcessIoExecutor};
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

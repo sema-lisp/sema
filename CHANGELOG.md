@@ -10,6 +10,13 @@
   `anyhow::Error` or `Box<dyn Error + Send + Sync>`, no longer compiles. Send
   owned Rust data between threads and construct values on the receiving thread;
   see the threading section of the embedding guide.
+- `Interpreter::register_async_fn`: register async host functions through the
+  public crate. The call runs as prepare (interpreter thread), run (Sema's
+  process-wide Tokio pool) and finish (interpreter thread), suspends the calling
+  Sema task while the future runs, and maps host errors, cancellation and
+  worker failures to distinct, catchable errors. The stdlib async offload path
+  now shares its cancel hook and assembler with the new `sema_io::host_async`
+  module.
 
 ## 1.37.0
 

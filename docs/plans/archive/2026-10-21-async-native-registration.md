@@ -1,7 +1,8 @@
 # Async native function registration for embedders
 
-**Status:** Approved design; no API in this document is implemented by this PR.
-The owner approved D1-D5 on 2026-10-21. Implementation follows in a separate PR.
+**Status:** Implemented 2026-10-21 (`Interpreter::register_async_fn`,
+`sema_io::host_async`, `crates/sema/tests/register_async_fn_test.rs`). The owner
+approved D1-D5 on 2026-10-21; D6 was decided during implementation.
 
 ## Problem and current behavior
 
@@ -34,7 +35,8 @@ worker data.
 | D2 | Error mapping | Host `Error` is rendered to text on the executor and raised as `SemaError::Io("<name>: <text>")` on the interpreter thread, matching `http/*`. Each `ExternalFailureCode` keeps a distinct, documented message prefix so cancellation, executor rejection, deadline, worker panic and decode failures are distinguishable in `catch`. | Reusing the current `IoDecoder` mapping collapses every failure code into `SemaError::eval` text and loses classification. A new `SemaError` variant is cleaner but widens the public error enum. |
 | D3 | Completion kind | One shared `HOST_ASYNC_COMPLETION_KIND` constant for every host-registered async function. The kind is only checked for self-consistency when a completion is delivered, so per-registration kinds buy nothing. | Per-registration kinds need an allocator and a registry for no observable benefit. |
 | D4 | Cancellation | The adapter wraps the host future in a biased `tokio::select!` against a one-shot cancel signal owned by the wait's `CancelHook`. Cancellation drops the host future at its next poll. Late completions are discarded by the existing wait generation. | Relying on the executor's abort handle does not work: the process pool drops it for async dispatches by design. |
-| D5 | wasm32 | `register_async_fn` is compiled on every target but the default wasm32 runtime uses `NullExecutor`, which rejects every submission (`SubmitErrorKind::Capacity`), so a call fails with the existing executor-rejection error (`ExternalFailureCode::Rejected`). A browser host that installs its own `IoExecutor` can use it. | `cfg`-gating the method hides it from hosts that do supply an executor. |
+| D5 | wasm32 | The adapter lives in `sema-io`, which every dependent gates to native targets, so neither the adapter nor `register_async_fn` is compiled for wasm32 and the bundled web runtime is unchanged. A browser host that supplies its own `IoExecutor` needs a wasm-side adapter as separate work. | Compiling the method on wasm32 would make a call fail at runtime with the `NullExecutor` rejection (`ExternalFailureCode::Rejected`), which is less clear than a missing method. |
+| D6 | Legacy value ABI | Register with `NativeFn::simple_with_runtime`: the runtime ABI suspends; the value ABI, reached only where the caller cannot suspend, raises `<name>: async host function cannot run here`. | A runtime-only native (`with_context_result`) reaches the expander's value-ABI call as the internal "requires runtime invocation" stub, which reads as a bug rather than a documented limit. |
 
 ## Proposed API: prepare, run, finish
 
@@ -144,7 +146,7 @@ Implementation promotes that path to a public-safe adapter instead of writing a
 second one, so host functions get the same cancellation and teardown behavior
 as `http/*`, and the stdlib callers keep pinning it.
 
-Use `NativeFn::with_context_result`, `NativeOutcome::Suspend`,
+Use `NativeFn::simple_with_runtime` (D6), `NativeOutcome::Suspend`,
 `WaitKind::External`, and `PreparedExternalOperation::interruptible_async`.
 Keep preparation and the completion decoder on the interpreter thread. Box
 the owned result into the existing `SendPayload`; decode it through the typed
@@ -192,18 +194,15 @@ ordinary host function error.
 
 ## Call-site restrictions
 
-A function registered this way is a runtime-only native: its legacy value ABI is
-the "requires runtime invocation" stub installed by
-`NativeFn::with_context_result`. Document, next to the registration, the places
-where a call raises an error instead of suspending:
+A function registered this way is a dual-ABI native (D6): the runtime ABI
+suspends, and the value ABI raises `<name>: async host function cannot run
+here`. Document, next to the registration, the places where a call raises that
+error instead of suspending:
 
-- Macro transformers. Expansion cannot suspend; the call fails with
-  "macro transformer cannot suspend during expansion" before any job is
-  admitted (see `runtime_macro_transformer_rejects_external_wait_before_job_admission`
-  in `crates/sema-eval/src/eval.rs`).
-- Synchronous `apply` / `call-with-values` paths, which reject runtime-only
-  natives with an actionable error (`is_runtime_only_native` in
-  `crates/sema-stdlib/src/list.rs`).
+- Macro transformers. The expander invokes natives through the value ABI, so
+  the call fails with `<name>: async host function cannot run here` before any
+  job is admitted (D6).
+- Synchronous `apply` / `call-with-values` paths, which invoke the value ABI.
 - Debug evaluation, restricted/test evaluation, and synchronous wasm
   evaluation, which all report that they cannot suspend.
 - Synchronous HOF fast paths decline a callback that may suspend and fall back
@@ -237,7 +236,7 @@ callback boilerplate, but it must not hide this lifetime requirement.
    executor and runtime ABI. Keep the stdlib callers on it. Keep internal
    scheduler types out of the public method signature.
 2. Add `Interpreter::register_async_fn` in `crates/sema/src/lib.rs` wrapping
-   the adapter with `NativeFn::with_context_result`, `Arc<Run>` and
+   the adapter with `NativeFn::simple_with_runtime`, `Arc<Run>` and
    `Rc<Finish>`. Add lifecycle, error, call-site and GC documentation. Leave
    existing `register_fn` behavior unchanged.
 3. Add the runnable embedding example and acceptance tests below. Update
@@ -266,7 +265,7 @@ proposal (#176); both depend on the thread-affinity fix (#175).
   containing `Value`; local error construction and owned-data transfer work.
 - A `prepare` error submits no job and leaves `runtime_live_task_count` at 0.
 - Calling the function inside a macro transformer raises the documented
-  expansion error; no job is admitted.
+  `cannot run here` error; no job is admitted.
 - `async/timeout` around the host call cancels it: the host future is dropped
   (observed through a drop guard) and the error is the documented cancellation
   classification, distinct from a host error.
@@ -294,7 +293,7 @@ proposal (#176); both depend on the thread-affinity fix (#175).
   `SelectCancelHook`).
 - Process executor and cancellation delivery: `crates/sema-io/src/executor.rs`.
 - Evaluation entry points and interpreter shutdown: `crates/sema-eval/src/eval.rs`.
-- Related conversion work: [earlier embedding API plan](2026-03-11-embedding-api-improvements.md).
+- Related conversion work: [earlier embedding API plan](../2026-03-11-embedding-api-improvements.md).
   Its coroutine section is superseded; this proposal uses the current runtime.
   Its sections 2 and 3 (`register_fn_typed`, `IntoValue`/`FromValue`) remain
   the home of the typed form.

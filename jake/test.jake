@@ -4,15 +4,22 @@
 
 @group test
 @desc "Run the full workspace test suite"
-task workspace:
+task workspace: [doc]
     cargo nextest run --workspace
 
 # What CI runs (verify.yml): the ci nextest profile adds retries=1,
 # fail-fast=false, and JUnit output (.config/nextest.toml).
 @group test
 @desc "Workspace suite with the CI nextest profile (retries + junit)"
-task ci:
+task ci: [doc]
     cargo nextest run --workspace --profile ci
+
+# nextest never runs doctests, so the public-crate rustdoc examples and the
+# `compile_fail` checks on `register_async_fn`'s bounds need their own step.
+@group test
+@desc "Doctests of the public crate and sema-core (compile_fail checks included)"
+task doc:
+    cargo test --doc -p sema-lang -p sema-core
 
 # The protocol-level e2e suite alone (pytest-lsp over stdio) — what verify.yml
 # runs; the sema-lsp unit tests are already part of the workspace suite. Uses

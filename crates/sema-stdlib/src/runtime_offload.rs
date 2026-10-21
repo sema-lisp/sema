@@ -136,48 +136,15 @@ impl NativeContinuation for IoOffloadContinuation {
     }
 }
 
-/// Cancel hook for an interruptible I/O op whose in-flight future is torn down by
-/// firing a one-shot signal that a `tokio::select!` in the job awaits. Firing the
-/// signal makes the select drop the request future (closing the socket / dropping
-/// a `kill_on_drop` child) — the retired `IoHandle::with_abort` teardown. Lives on
-/// the runtime thread (never crosses to a worker), so it need not be `Send`.
-struct SelectCancelHook {
-    signal: Option<CancelSignal>,
-}
-
-impl Trace for SelectCancelHook {
-    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
-        true
-    }
-}
-
-impl CancelHook for SelectCancelHook {
-    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
-        if let Some(signal) = self.signal.take() {
-            // Err (receiver already gone) means the job finished first; nothing
-            // to tear down. Either way the resource is reaped.
-            let _ = signal.send(());
-        }
-        Ok(CancelDisposition::Reaped)
-    }
-    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
-        Ok(CancelDisposition::Reaped)
-    }
-}
-
-/// A cancel signal paired to a job's `select!`: the [`CancelHook`] holds the
-/// sender, the job holds the receiver. Callers that need a bespoke hook (e.g.
+/// Cancel hook, cancel-signal pair, and channel constructor for an interruptible
+/// op whose in-flight future is torn down by a `tokio::select!` on the signal.
+/// Shared with host-registered async natives (`sema_io::host_async`), so both
+/// paths use one cancellation mechanism. Callers that need a bespoke hook (e.g.
 /// shell's process-group kill) build their hook around the sender and pass the
 /// receiver to [`suspend_external_interruptible_try`].
-pub(crate) type CancelSignal = tokio::sync::oneshot::Sender<()>;
-
-/// The receiver half handed to the offloaded job.
-pub(crate) type CancelWaiter = tokio::sync::oneshot::Receiver<()>;
-
-/// Make a fresh cancel-signal pair.
-pub(crate) fn cancel_channel() -> (CancelSignal, CancelWaiter) {
-    tokio::sync::oneshot::channel()
-}
+pub(crate) use sema_io::host_async::{
+    cancel_channel, CancelSignal, CancelWaiter, SelectCancelHook,
+};
 
 /// Core assembler: build the interruptible-blocking External suspend from an
 /// already-constructed `resource` (owning the cancel hook) + its `cancel_rx`.
@@ -226,6 +193,8 @@ where
 /// mid-flight cancel fires the hook's one-shot signal; the `biased` `select!`
 /// drops the request future (socket closed / `kill_on_drop` child killed) — the
 /// same teardown the blocking tier gives, without an `io_block_on` worker.
+/// The assembler itself lives in `sema_io::host_async` and is shared with
+/// host-registered async natives.
 fn suspend_with_resource_async<T, F, Fut>(
     op: &'static str,
     kind: CompletionKind,
@@ -241,23 +210,14 @@ where
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
     let decoder = Box::new(IoDecoder { op, decode });
-    let prepared = PreparedExternalOperation::interruptible_async(
+    sema_io::host_async::suspend_async(
         kind,
-        decoder,
         resource,
-        move || async move {
-            let out: Result<T, String> = tokio::select! {
-                biased;
-                _ = cancel_rx => Err("cancelled".to_string()),
-                result = make_future() => result,
-            };
-            Ok(Box::new(out) as SendPayload)
-        },
-    );
-    Ok(NativeOutcome::Suspend(NativeSuspend {
-        wait: WaitKind::External(Box::new(prepared)),
+        cancel_rx,
+        decoder,
         continuation,
-    }))
+        make_future,
+    )
 }
 
 /// Offload an interruptible async I/O op onto the executor's ASYNC tier (real
@@ -303,12 +263,8 @@ where
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
     let (cancel_tx, cancel_rx) = cancel_channel();
-    let resource = InterruptibleResource::new(
-        resource_label,
-        Box::new(SelectCancelHook {
-            signal: Some(cancel_tx),
-        }),
-    );
+    let resource =
+        InterruptibleResource::new(resource_label, Box::new(SelectCancelHook::new(cancel_tx)));
     suspend_with_resource_async(
         op,
         kind,
@@ -342,12 +298,8 @@ where
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
     let (cancel_tx, cancel_rx) = cancel_channel();
-    let resource = InterruptibleResource::new(
-        resource_label,
-        Box::new(SelectCancelHook {
-            signal: Some(cancel_tx),
-        }),
-    );
+    let resource =
+        InterruptibleResource::new(resource_label, Box::new(SelectCancelHook::new(cancel_tx)));
     suspend_with_resource_async(
         op,
         kind,
@@ -409,12 +361,8 @@ where
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
     let (cancel_tx, cancel_rx) = cancel_channel();
-    let resource = InterruptibleResource::new(
-        resource_label,
-        Box::new(SelectCancelHook {
-            signal: Some(cancel_tx),
-        }),
-    );
+    let resource =
+        InterruptibleResource::new(resource_label, Box::new(SelectCancelHook::new(cancel_tx)));
     suspend_with_resource(op, kind, resource, cancel_rx, Box::new(decode), make_future)
 }
 

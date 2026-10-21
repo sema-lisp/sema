@@ -1,9 +1,9 @@
 # MCP access through the public embedding API
 
-**Status:** Third draft after two five-role adversarial review rounds
-(embedder, CLI and MCP-client user, security, runtime safety, performance).
-Decisions D1-D13 are proposed, not approved. No API in this document is
-implemented.
+**Status:** Fourth draft after two five-role adversarial review rounds
+(embedder, CLI and MCP-client user, security, runtime safety, performance) and
+a reuse audit against the runtime host API and the notebook engine. Decisions
+D1-D13 are proposed, not approved. No API in this document is implemented.
 
 ## Problem and current behavior
 
@@ -58,6 +58,37 @@ the name filter as the only enablement mechanism and adds presets on top (D1).
 - `build` inside a `sema build --mcp` binary is broken today: the re-exec
   runs the embedded script, not the compiler. D7 covers it.
 
+## Reuse of existing runtime and host primitives
+
+The notebook engine (`crates/sema-notebook/src/engine.rs`, `bridge.rs`) is
+already the reference host consumer of the unified runtime. The MCP session is
+built from the same primitives; it introduces no new scheduler concept.
+
+| Need | Existing primitive | Action |
+|---|---|---|
+| Run a tool call as a root | `Interpreter::submit_value` / `submit_str` + `drive_until_settled` | Reuse. |
+| Capture a call's output, including output from detached tasks it started | `RootOptions { capture_output: true }` + `take_output`; the engine's `output_roots` attribution map | Reuse; add a per-root byte budget inside the existing capture sink. |
+| Cancel the in-flight call from another thread | notebook `CancelToken` (`Interpreter::command_handle()` + a shared `running_root`) | Lift `CancelToken` from `sema-notebook` into `sema-eval` as the shared host type; `CallId` is the root's `RootId`. |
+| Per-call deadline | `ctx.set_eval_deadline`, polled at VM back-edges | Reuse; fix the shared gap below once in `drive_until_settled`. |
+| Async host bridge | `sema_notebook::bridge::EngineHandle::spawn` (dedicated 16 MiB thread, `tokio::mpsc` requests, `oneshot` replies, cancel token returned); `sema-dap` uses the same shape with `sync_channel` + `spawn_blocking` | Generalize the notebook bridge into a shared worker in `sema-eval` or `sema`; `McpWorker` is a request enum over it, and the notebook bridge becomes a second user. |
+| Keep one call from running earlier calls' detached work | `Interpreter::drive_roots(&[root])` | Reuse. |
+| Reject nested evaluation inside a quantum | the predicate in `ensure_legacy_vm_entry_allowed` | Reuse the predicate before `submit_root`. |
+| Macro expansion inside the root | the `__vm-eval` runtime path | Reuse. |
+| Frame reading | the existing `read_until` loop in `server.rs` | Extend with `Read::take` and drain-to-newline. |
+
+**Shared gap found by the audit.** The native drive loop parks on
+`block_on_inbox` bounded only by the runtime's timer deadline, never by
+`eval_deadline` (`crates/sema-eval/src/eval.rs`, the `DriveState::Idle` arms).
+A notebook cell or MCP tool parked on an `llm/*` External wait therefore
+ignores its timeout until the request completes. The fix lives once in
+`drive_until_settled`: bound the park by the earlier of the timer and the eval
+deadline, and cancel the root when the eval deadline passes, as the wasm arm
+already does. Both the notebook and the MCP server get it.
+
+Genuinely new and justified: the tool registry (it replaces three
+hand-maintained lists), presets over the existing name filter, typed errors,
+the frame cap, and the byte budget.
+
 ## Decision status
 
 | ID | Decision | Proposed design | Other choices and effect |
@@ -65,13 +96,13 @@ the name filter as the only enablement mechanism and adds presets on top (D1).
 | D1 | Tool presets and `eval` | Two presets over the existing name filter. `cli()` = today's list with `eval` on and today's `--include`/`--exclude` behavior. `embedded()` = exposed `deftool`s plus `docs`, `docs_search`, `info`; no `eval`. `enable_eval()` is the only way to add `eval`: `also_tools(["eval"])` or `only_tools(["eval"])` without it is `InvalidOptions`. Precedence: `exclude_tools` beats everything; `only_tools` intersects the enabled set and applies to `deftool`s as today; hidden `deftool`s beat any include; unknown names are `InvalidOptions`. With `eval` on, the filter is not a security boundary: a client can redefine tools and call any host-registered function; the guide says so. | A marker argument (`enable_eval(EvalAccess::FullHostAccess)`) or refusing `eval` on an unrestricted sandbox: more friction for the local case; the guide's example sandbox and an honest `info` are the chosen mitigation. |
 | D2 | Sandbox coverage | Tool bodies check `Caps` and `check_path` on the canonical path at every read, write and spawn, with `is_file()` and a `max_source_bytes` cap before reading (`run_file`, `compile` output, `fmt` in place, `disasm`, `notebook/read`, `/save`, `/export`). `compile` and `disasm` use the session interpreter. The notebook engine is built from the session's builder config (`Engine::from_session`: sandbox, stdlib/LLM/MCP flags, session deadline) and does not reset LLM state. Until that lands, `notebook/eval_cell` and `/eval_all` are absent from `embedded()`, and requesting them while the sandbox is restricted is `InvalidOptions`; the other notebook tools stay. `docs` uses the shared `is_exposed` predicate. `info` reports the real sandbox. | Excluding all `notebook/*` whenever the sandbox is restricted removes read-only tools under the documented `--sandbox no-shell,no-fs-write`. |
 | D3 | Dispatch path | `eval`, `run_file`, `deftool` handlers and `mcp/*` calls run as one runtime root each, submitted with `submit_value` on the form `((quote handler) (quote arg) ...)`, so closures and natives dispatch uniformly and `register_async_fn`, `async/*`, `llm/*` work inside handlers. Macro expansion of `eval` code runs inside the root through the existing `__vm-eval` runtime path. `notebook/*`, `compile`, `disasm`, `fmt`, `docs*` and `info` stay on the host path: constructing an interpreter inside a quantum panics in prelude loading. A conformance test requires every `io_block_on` call site in a native to be dominated by an `in_runtime_quantum()` branch, since moving handlers into a quantum turns an unguarded site from "works" into an abort. | Seeding a VM frame needs new `sema-vm` API and does not cover native handlers. Routing everything through roots aborts on notebook and compile. |
-| D4 | Async hosts | `McpWorker::spawn(builder, options, setup) -> McpWorkerHandle` owns the interpreter on a plain `std::thread`. The handle is `Send + Sync + Clone` with `call_tool`, `list_tools`, `handle_message`, `cancel(CallId)`, `shutdown`, each returning a future resolved over a oneshot channel. `serve_stdio` and `serve_on` are adapters over it. No ambient-runtime opt-out and no dispatch-time `Handle::try_current()` check: it is a false positive inside `spawn_blocking` and `block_in_place`, and with D3 nothing reaches `io_block_on` on the interpreter thread. The `block_on_ops()` oracle and the D3 conformance test are the guarantee. | `serve_on_thread(builder, setup, reader, writer)` forces an rmcp or axum host to pipe JSON-RPC to itself. `allow_ambient_runtime` cannot be made safe. |
+| D4 | Async hosts | `McpWorker::spawn(builder, options, setup) -> McpWorkerHandle` is the notebook bridge generalized: the interpreter lives on a dedicated `std::thread` (same stack size), requests are a `tokio::mpsc` enum with `oneshot` replies, and the cancel token is the lifted notebook `CancelToken`. The handle is `Send + Sync + Clone` with `call_tool`, `list_tools`, `handle_message`, `cancel(CallId)`, `shutdown`. `serve_stdio` and `serve_on` are adapters over it. No ambient-runtime opt-out and no dispatch-time `Handle::try_current()` check: it is a false positive inside `spawn_blocking` and `block_in_place`, and with D3 nothing reaches `io_block_on` on the interpreter thread. The `block_on_ops()` oracle and the D3 conformance test are the guarantee. | `serve_on_thread(builder, setup, reader, writer)` forces an rmcp or axum host to pipe JSON-RPC to itself. `allow_ambient_runtime` cannot be made safe. |
 | D5 | Error types | `McpError { InvalidOptions, Transport(io::Error), Reentrant }` for sessions; `McpCallError { UnknownTool, NotAllowed, InvalidArguments, Timeout, Panicked, Reentrant }` for `call_tool`. Both `#[non_exhaustive]`. On the wire every `McpCallError` stays an `is_error` result (today's behavior, pinned by CLI tests); `From<McpCallError> for CallToolResult` does the mapping. | Mapping dispatch failures to JSON-RPC error codes breaks existing CLI protocol tests and clients. |
 | D6 | Rust client API | Deferred. Confirm with Kameko whether the Sema builtin path suffices. No `HOST_SANDBOX` rewrite is needed. | Widening the surface before the need is confirmed. |
 | D7 | `build` tool | Removed from `sema-mcp`. `cli().with_build_hook(f)` injects an in-process implementation from the CLI binary; `build` is listed only when a hook is installed. The hook compiles through the session interpreter, gates `FS_READ`/`FS_WRITE`/`NETWORK` with `check_path` on source, includes and output, returns text and never prints. Built `--mcp` binaries install no hook. | A `current_exe()` guard breaks the mcpb shims and symlinked installs; the re-exec has argument injection; a naive in-process hook reintroduces unsandboxed compile, a runtime download and stdout writes. |
 | D8 | Session shape | `McpSession::new(&Interpreter, options)` returns an owned value: options, a runtime command handle bound at creation, and a lazily created notebook cache. Methods take `&Interpreter`. `handle_message(&self, &Interpreter, &[u8], &mut dyn Write) -> Result<(), McpError>` is the primitive; `serve_on` wraps a `Take`-capped `read_until` loop over it. The async `run_mcp_server_on` is removed and its tests move to `handle_message`. | A borrowed session cannot live beside its interpreter; a `&str -> Option<String>` primitive forces two full-frame copies and cannot stream. |
-| D9 | Timeouts and cancellation | No per-call pool watchdog. The interpreter thread passes `min(timer, deadline)` to `block_on_inbox`, and when the deadline expires it cancels its own root through the session's command handle and keeps driving until the root settles (the wasm drive arm already does this). `cancel(CallId)` and `notifications/cancelled` map to `cancel_root` of that call's `RootId`; a late cancel of a settled root is inert. Per-call `timeout_ms` may only shorten the session default; `0` no longer disables per call (a documented CLI change; `--timeout-ms 0` stays the global escape). Cancellation is cooperative: it reaches External waits and VM back-edges, never a blocking-tier job or a CPU-bound native, and a timed-out blocking job keeps its pool permit until it finishes. | A pool watchdog per call is a task and timer per call that must be aborted on every normal completion, and it cannot reach anything the self-cancel cannot. |
-| D10 | Output capture | A `HostHookScope` RAII guard saves and restores the thread-local hooks. Roots use root-tagged capture with a per-root byte budget enforced in the sema-core sink (`max_output_bytes`, default 1 MiB, marker on overflow). A session-lifetime host hook routes output from detached tasks of earlier calls to `on_output` or discards it, never to stdout. `ToolOutput::{Capture, PassThrough, Tee}`; `serve_stdio` rejects `PassThrough` and stdout `Tee` with `InvalidOptions`. `max_frame_bytes` (default 16 MiB) is enforced by `Read::take` and, on overflow, the reader drains to the next newline before replying `-32600`. `structured_content` is covered by the same byte budget and by a depth cap in the JSON converter. Rust `println!` in a host function bypasses all of this and corrupts stdio serving; the guide says so. | A cap applied after the call does not bound memory; thread-keyed capture collects other interpreters' output; an overflowed line without a drain is frame injection. |
+| D9 | Timeouts and cancellation | No per-call pool watchdog. The per-call budget is `ctx.set_eval_deadline`, as the notebook does; `drive_until_settled` is fixed once to bound its park by the earlier of the timer and the eval deadline and to cancel the root when the eval deadline passes (the wasm arm already does). `cancel(CallId)` and `notifications/cancelled` go through the lifted `CancelToken`, which targets the running root; a late cancel of a settled root is inert. Per-call `timeout_ms` may only shorten the session default; `0` no longer disables per call (a documented CLI change; `--timeout-ms 0` stays the global escape). Cancellation is cooperative: it reaches External waits and VM back-edges, never a blocking-tier job or a CPU-bound native, and a timed-out blocking job keeps its pool permit until it finishes. | A pool watchdog per call is a task and timer per call that must be aborted on every normal completion, and it cannot reach anything the self-cancel cannot. |
+| D10 | Output capture | Roots are submitted with `RootOptions { capture_output: true }` and drained with `take_output`, attributing a detached task's output to the call that started it through an `output_roots` map exactly as the notebook engine does. A per-root byte budget is enforced in the sema-core sink (`max_output_bytes`, default 1 MiB, marker on overflow). A `HostHookScope` RAII guard saves and restores the thread-local hooks for the host-path tools, and a session-lifetime host hook routes anything that falls through to `on_output` or discards it, never to stdout. `ToolOutput::{Capture, PassThrough, Tee}`; `serve_stdio` rejects `PassThrough` and stdout `Tee` with `InvalidOptions`. `max_frame_bytes` (default 16 MiB) is enforced by `Read::take` and, on overflow, the reader drains to the next newline before replying `-32600`. `structured_content` is covered by the same byte budget and by a depth cap in the JSON converter. Rust `println!` in a host function bypasses all of this and corrupts stdio serving; the guide says so. | A cap applied after the call does not bound memory; thread-keyed capture collects other interpreters' output; an overflowed line without a drain is frame injection. |
 | D11 | Re-entrancy | An RAII `in_call` guard on the session returns `Reentrant` when a host function invoked from a tool calls back into the session. `Interpreter::eval_str` rejects before `submit_root` when `ctx.runtime_quantum_active() || in_runtime_quantum()`, the same predicate as the legacy VM entry guard, so a second interpreter on the same thread fails closed instead of reaching the prelude panic. | A per-interpreter-only predicate lets a nested interpreter abort; a non-RAII flag leaves the session wedged after `Timeout` or `Panicked`. |
 | D12 | CLI and embedded parity | `InterpreterBuilder::with_llm_auto_configure(bool)` and `with_workflow_mcp(bool)` (default off, as today). `sema mcp --preset embedded` and `sema mcp --check tools.sema` (which evaluates the file) show tool-file authors what an embedded host sees; built binaries share the CLI's argument parser. One tool registry with a per-tool kind (`Host` or `RuntimeRoot`) and required `Caps` drives listing, dispatch, presets and the D3 oracle. A `deftool` whose name collides with a reserved builtin name (union of all registry names plus the `_` prefix) is dropped at listing and dispatch with `LogEvent::ToolShadowed`, not rejected at definition. | Definition-time rejection reserves MCP names language-wide, including for `defagent` tool sets and embedded hosts where the builtin does not exist. |
 | D13 | Drive isolation | MCP calls drive only their own root (`drive_roots(&[root])`), with an idle drive turn between calls for detached work, so a trivial tool does not spend its deadline on an earlier call's `async/spawn`. | Today's `drive(budget)` runs any ready detached task inside the current call's deadline and capture window. |
@@ -182,7 +213,10 @@ follow-ups enabled by D8.
 ## Implementation outline
 
 1. Prerequisite PR: span table by reference in `build_vm_for_exprs` and
-   `lower`; `collect_native_names` cached on `Env.version`.
+   `lower`; `collect_native_names` cached on `Env.version`; eval deadline
+   honored by `drive_until_settled` while parked; `CancelToken` and the
+   worker bridge lifted out of `sema-notebook` with the notebook as their
+   first user (no behavior change there).
 2. Tool registry with kind and required `Caps`; shared `is_exposed`;
    reserved-name shadowing with `LogEvent`; snapshot test pinning `cli()` with
    and without a build hook (D1, D12).
@@ -295,9 +329,13 @@ follow-ups enabled by D8.
   `crates/sema/src/workflow_mcp.rs`.
 - Notebook engine: `crates/sema-notebook/src/engine.rs`; cache:
   `crates/sema-mcp/src/notebook.rs`.
+- Notebook host pattern to generalize: `crates/sema-notebook/src/engine.rs`
+  (`CancelToken`, `running_root`, `output_roots`, `eval_source_named`) and
+  `bridge.rs` (`EngineHandle::spawn`).
 - Runtime entry and expansion: `crates/sema-eval/src/eval.rs`
-  (`submit_value`, `build_vm_for_exprs`, `drive_vm_on_runtime`, the
-  `__vm-eval` runtime path, `Drop`); `crates/sema-vm/src/lower.rs` (span
+  (`submit_value`, `submit_str`, `drive_until_settled`, `drive_roots`,
+  `take_output`, `command_handle`, `build_vm_for_exprs`, the `__vm-eval`
+  runtime path, `Drop`); `crates/sema-vm/src/lower.rs` (span
   table clone); `crates/sema-vm/src/runtime/host_api.rs` (`cancel_root`,
   `command_handle`, `drive_roots`); `wait.rs` (`block_on_inbox`).
 - Output hooks and capture sink: `crates/sema-core/src/output_hook.rs`;

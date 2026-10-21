@@ -273,19 +273,36 @@ impl Interpreter {
     /// # Runtime context
     ///
     /// `run` executes on Sema's own Tokio pool, not the host's runtime, so it
-    /// may construct Tokio timers and I/O resources. A `tokio::spawn` inside it
-    /// lands on Sema's pool. Do not block inside `run` (no `block_on`); a
-    /// blocking call cannot be interrupted. On wasm32 the default runtime has
-    /// no executor and a call fails with an executor-rejection error.
+    /// may construct Tokio timers and I/O resources (the example below needs
+    /// the host crate to depend on `tokio` with the `time` feature). A
+    /// `tokio::spawn` inside it lands on Sema's pool. Resources created on the
+    /// host's own runtime follow Tokio's cross-runtime rules. Do not block
+    /// inside `run` (no `block_on`); a blocking call cannot be interrupted.
+    /// Calling [`eval_str`] from inside an ambient Tokio runtime is not a
+    /// supported context.
     ///
     /// # Errors
     ///
     /// A host `Error` is rendered to text (its `Display` chain) on the executor
-    /// and raised as `SemaError::Io("<name>: <text>")`. Errors returned by
-    /// `prepare` and `finish` are raised unchanged. Cancellation, executor
-    /// rejection, deadline, worker panic and decode failures are raised with
-    /// distinct `<name>: <reason>` prefixes, so `try`/`catch` can tell them from
-    /// a host error.
+    /// and raised as `SemaError::Io("<name>: <text>")`, which Sema's `try`
+    /// reports as `:io`. Errors returned by `prepare` and `finish` are raised
+    /// unchanged. Runtime-side failures are raised as evaluation errors whose
+    /// message starts with `<name>: ` followed by one of these prefixes, so
+    /// `catch` can tell them from a host error by `:type` and from each other
+    /// by message:
+    ///
+    /// | Failure | Message prefix |
+    /// | --- | --- |
+    /// | executor rejected the submission | `executor rejected the operation` |
+    /// | cancelled after the job started | `operation cancelled` |
+    /// | runtime deadline | `deadline exceeded` |
+    /// | runtime bound | `bound exceeded` |
+    /// | host future panicked | `worker panicked` |
+    /// | payload did not downcast | `payload decode failed` |
+    ///
+    /// A panic inside `run` is reported this way only under the `unwind` panic
+    /// profile. With `panic = "abort"` (the workspace release profile) the
+    /// process aborts, as with any other panic.
     ///
     /// # Cancellation
     ///
@@ -370,6 +387,69 @@ impl Interpreter {
     ///     |_args| Ok(Rc::new(1_i64)),
     ///     |n: Rc<i64>| async move { Ok::<i64, Infallible>(*n) },
     ///     |n| Ok(Value::int(n)),
+    /// );
+    /// ```
+    ///
+    /// A `Value` is not `Send`, so it cannot be the `Input`:
+    ///
+    /// ```compile_fail
+    /// use sema::{Interpreter, Value};
+    /// use std::convert::Infallible;
+    ///
+    /// let interp = Interpreter::new();
+    /// interp.register_async_fn(
+    ///     "host/bad",
+    ///     |args| Ok(args[0].clone()),
+    ///     |value: Value| async move { Ok::<Value, Infallible>(value) },
+    ///     |value| Ok(value),
+    /// );
+    /// ```
+    ///
+    /// nor the `Output`:
+    ///
+    /// ```compile_fail
+    /// use sema::{Interpreter, Value};
+    /// use std::convert::Infallible;
+    ///
+    /// let interp = Interpreter::new();
+    /// interp.register_async_fn(
+    ///     "host/bad",
+    ///     |_args| Ok(()),
+    ///     |_: ()| async move { Ok::<Value, Infallible>(Value::keyword("made-off-thread")) },
+    ///     |value| Ok(value),
+    /// );
+    /// ```
+    ///
+    /// nor captured by `run`:
+    ///
+    /// ```compile_fail
+    /// use sema::{Interpreter, Value};
+    /// use std::convert::Infallible;
+    ///
+    /// let interp = Interpreter::new();
+    /// let captured = Value::keyword("captured");
+    /// interp.register_async_fn(
+    ///     "host/bad",
+    ///     |_args| Ok(()),
+    ///     move |_: ()| {
+    ///         let captured = captured.clone();
+    ///         async move { Ok::<String, Infallible>(captured.to_string()) }
+    ///     },
+    ///     |text| Ok(Value::string(&text)),
+    /// );
+    /// ```
+    ///
+    /// and a `SemaError` cannot be the host `Error`:
+    ///
+    /// ```compile_fail
+    /// use sema::{Interpreter, SemaError, Value};
+    ///
+    /// let interp = Interpreter::new();
+    /// interp.register_async_fn(
+    ///     "host/bad",
+    ///     |_args| Ok(()),
+    ///     |_: ()| async move { Err::<(), SemaError>(SemaError::eval("off-thread")) },
+    ///     |_| Ok(Value::nil()),
     /// );
     /// ```
     ///

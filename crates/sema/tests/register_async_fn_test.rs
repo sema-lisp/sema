@@ -1,5 +1,5 @@
 //! Acceptance checks for `Interpreter::register_async_fn`
-//! (`docs/plans/2026-10-21-async-native-registration.md`): a host registers an
+//! (`docs/plans/archive/2026-10-21-async-native-registration.md`): a host registers an
 //! async function through the public crate only, its future runs on Sema's I/O
 //! pool while the calling task suspends, and every settlement path (success,
 //! host error, conversion error, cancellation, worker panic, interpreter drop)
@@ -311,10 +311,15 @@ fn host_error_is_raised_as_io_error_with_the_function_name() {
 #[test]
 fn macro_transformer_cannot_call_an_async_native() {
     let interp = Interpreter::new();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let run_counter = Arc::clone(&runs);
     interp.register_async_fn(
         "host/delayed-keyword",
         expect_one_string,
-        |name: String| async move { Ok::<String, Infallible>(name) },
+        move |name: String| {
+            run_counter.fetch_add(1, Ordering::SeqCst);
+            async move { Ok::<String, Infallible>(name) }
+        },
         |name| Ok(Value::keyword(&name)),
     );
     interp
@@ -330,6 +335,7 @@ fn macro_transformer_cannot_call_an_async_native() {
             .contains("host/delayed-keyword: async host function cannot run here"),
         "unexpected error: {error}"
     );
+    assert_eq!(runs.load(Ordering::SeqCst), 0, "no job was admitted");
     assert_runtime_quiescent(&interp);
 }
 
@@ -341,10 +347,9 @@ fn with_timeout_cancels_and_drops_the_host_future() {
     let error = interp
         .eval_str("(async/with-timeout 20 (fn () (host/forever)))")
         .expect_err("deadline wins");
-    let message = error.to_string();
     assert!(
-        !message.contains("I/O error"),
-        "cancellation must not read as a host error: {message}"
+        !matches!(error.inner(), SemaError::Io(_)),
+        "cancellation must not read as a host error: {error}"
     );
     let caught = interp
         .eval_str("(try (async/with-timeout 20 (fn () (host/forever))) (catch e (:type e)))")
@@ -366,6 +371,7 @@ fn with_timeout_cancels_and_drops_the_host_future() {
 fn async_cancel_settles_the_task_and_drops_the_host_future() {
     let interp = Interpreter::new();
     let dropped = register_forever(&interp, "host/forever");
+    let weak_bindings = std::rc::Rc::downgrade(&interp.global_env().bindings);
 
     let value = interp
         .eval_str(
@@ -380,6 +386,12 @@ fn async_cancel_settles_the_task_and_drops_the_host_future() {
     assert_eq!(value, Value::keyword("cancelled"));
     assert_eq!(dropped.recv_timeout(WAIT), Ok("dropped"));
     assert_runtime_quiescent(&interp);
+    drop(interp);
+    assert_eq!(
+        weak_bindings.strong_count(),
+        0,
+        "collection after cancellation releases the interpreter graph"
+    );
 }
 
 #[cfg(panic = "unwind")]
@@ -439,17 +451,21 @@ fn interpreter_drop_cancels_a_pending_cooperative_future() {
 #[test]
 fn interpreter_drop_returns_within_deadline_for_a_blocking_future() {
     let interp = Interpreter::new();
-    let finished = Arc::new(AtomicUsize::new(0));
-    let done = Arc::clone(&finished);
+    let (started_tx, started_rx) = mpsc::channel::<()>();
+    let (finished_tx, finished_rx) = mpsc::channel::<()>();
+    let started_tx = Mutex::new(started_tx);
+    let finished_tx = Mutex::new(finished_tx);
     interp.register_async_fn(
         "host/block",
         |_args| Ok(()),
         move |_: ()| {
-            let done = Arc::clone(&done);
+            let started = started_tx.lock().expect("started lock").clone();
+            let finished = finished_tx.lock().expect("finished lock").clone();
             async move {
-                // Not cancel-safe: blocks the pool worker and ignores drop.
-                std::thread::sleep(Duration::from_secs(3));
-                done.fetch_add(1, Ordering::SeqCst);
+                let _ = started.send(());
+                // Not cancel-safe: blocks until done and ignores the drop request.
+                tokio::task::block_in_place(|| std::thread::sleep(Duration::from_secs(3)));
+                let _ = finished.send(());
                 Ok::<(), Infallible>(())
             }
         },
@@ -458,6 +474,9 @@ fn interpreter_drop_returns_within_deadline_for_a_blocking_future() {
     interp
         .eval_str("(define p (async (host/block))) (async/sleep 1)")
         .expect("spawned task parks on the host future");
+    started_rx
+        .recv_timeout(WAIT)
+        .expect("host future started on the pool");
 
     let start = Instant::now();
     drop(interp);
@@ -467,16 +486,13 @@ fn interpreter_drop_returns_within_deadline_for_a_blocking_future() {
         "drop does not join a non-cooperative future: {elapsed:?}"
     );
     assert_eq!(
-        finished.load(Ordering::SeqCst),
-        0,
+        finished_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty),
         "future was still blocked at drop"
     );
-    std::thread::sleep(
-        Duration::from_secs(3) - elapsed.min(Duration::from_secs(3)) + Duration::from_millis(200),
-    );
     assert_eq!(
-        finished.load(Ordering::SeqCst),
-        1,
+        finished_rx.recv_timeout(WAIT),
+        Ok(()),
         "detached job completes on the pool without a runtime slot"
     );
 }
@@ -498,4 +514,102 @@ fn completed_calls_release_the_interpreter_graph() {
         std::rc::Rc::downgrade(&interp.global_env().bindings)
     };
     assert_eq!(weak_bindings.strong_count(), 0);
+}
+
+#[test]
+fn prepare_and_finish_run_on_the_interpreter_thread_and_run_on_the_pool() {
+    let interp = Interpreter::new();
+    let main_thread = std::thread::current().id();
+    type Seen = Arc<Mutex<Vec<(&'static str, std::thread::ThreadId, Option<String>)>>>;
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let in_prepare = Arc::clone(&seen);
+    let in_run = Arc::clone(&seen);
+    let in_finish = Arc::clone(&seen);
+    interp.register_async_fn(
+        "host/where",
+        move |_args| {
+            in_prepare.lock().expect("seen lock").push((
+                "prepare",
+                std::thread::current().id(),
+                std::thread::current().name().map(str::to_owned),
+            ));
+            Ok(())
+        },
+        move |_: ()| {
+            let in_run = Arc::clone(&in_run);
+            async move {
+                in_run.lock().expect("seen lock").push((
+                    "run",
+                    std::thread::current().id(),
+                    std::thread::current().name().map(str::to_owned),
+                ));
+                Ok::<(), Infallible>(())
+            }
+        },
+        move |_| {
+            in_finish.lock().expect("seen lock").push((
+                "finish",
+                std::thread::current().id(),
+                std::thread::current().name().map(str::to_owned),
+            ));
+            Ok(Value::nil())
+        },
+    );
+
+    interp.eval_str("(host/where)").expect("call completes");
+    let seen = seen.lock().expect("seen lock").clone();
+    assert_eq!(
+        seen.iter().map(|(step, _, _)| *step).collect::<Vec<_>>(),
+        vec!["prepare", "run", "finish"]
+    );
+    assert_eq!(
+        seen[0].1, main_thread,
+        "prepare runs on the interpreter thread"
+    );
+    assert_eq!(
+        seen[2].1, main_thread,
+        "finish runs on the interpreter thread"
+    );
+    assert_ne!(
+        seen[1].1, main_thread,
+        "run executes off the interpreter thread"
+    );
+    assert!(
+        seen[1]
+            .2
+            .as_deref()
+            .is_some_and(|name| name.starts_with("sema-io-")),
+        "run executes on Sema's process-wide pool, got thread {:?}",
+        seen[1].2
+    );
+    assert_runtime_quiescent(&interp);
+}
+
+#[test]
+fn apply_and_map_reach_the_suspending_path() {
+    let interp = Interpreter::new();
+    interp.register_async_fn(
+        "host/shout",
+        expect_one_string,
+        |text: String| async move {
+            tokio::task::yield_now().await;
+            Ok::<String, Infallible>(text.to_uppercase())
+        },
+        |text| Ok(Value::string(&text)),
+    );
+
+    assert_eq!(
+        interp
+            .eval_str("(apply host/shout (list \"a\"))")
+            .expect("apply takes the cooperative call path"),
+        Value::string("A")
+    );
+    assert_eq!(
+        interp
+            .eval_str("(map host/shout (list \"b\" \"c\"))")
+            .expect("map drives the suspending callback cooperatively")
+            .to_string(),
+        "(\"B\" \"C\")"
+    );
+    assert_runtime_quiescent(&interp);
 }

@@ -221,13 +221,20 @@ blocks its Rust caller until the whole evaluation finishes.
 
 What to know before relying on it:
 
-- **Runtime.** `run` executes on Sema's own Tokio pool, not your runtime. Do not
-  call `block_on` inside it. A `tokio::spawn` inside `run` lands on Sema's pool.
+- **Runtime.** `run` executes on Sema's own Tokio pool, not your runtime (the
+  example needs `tokio` with the `time` feature in your crate). Do not call
+  `block_on` inside it. A `tokio::spawn` inside `run` lands on Sema's pool, and
+  resources created on your own runtime follow Tokio's cross-runtime rules.
+  Calling `eval_str` from inside an ambient Tokio runtime is not a supported
+  context.
 - **Errors.** A host error is rendered to text (its `Display` chain) and raised as
   `SemaError::Io("<name>: <text>")`, catchable from Sema as `:io`. Errors from
-  `prepare` and `finish` are raised unchanged. Cancellation, executor
-  rejection, deadline, worker panic and decode failures use distinct
-  `<name>: <reason>` prefixes.
+  `prepare` and `finish` are raised unchanged. Runtime-side failures are `:eval`
+  errors whose message starts with `<name>: ` and one of `executor rejected the
+  operation`, `operation cancelled`, `deadline exceeded`, `bound exceeded`,
+  `worker panicked`, or `payload decode failed`. A panic inside `run` is
+  reported as `worker panicked` only under the `unwind` panic profile; with
+  `panic = "abort"` the process aborts.
 - **Cancellation.** `async/cancel`, `async/with-timeout` and interpreter drop
   drop the host future at its next poll. Write drop-cancel-safe futures; remote
   side effects are not undone, and a future stuck in a blocking call is not

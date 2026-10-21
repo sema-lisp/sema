@@ -1,6 +1,6 @@
 //! Host-registered async native functions: the adapter behind
 //! `sema::Interpreter::register_async_fn`
-//! (`docs/plans/2026-10-21-async-native-registration.md`).
+//! (`docs/plans/archive/2026-10-21-async-native-registration.md`).
 //!
 //! A host async function splits into three pieces that respect the
 //! send/non-send boundary, exactly like the stdlib async offload path

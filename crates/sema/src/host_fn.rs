@@ -113,3 +113,97 @@ impl HostReturn {
         }
     }
 }
+
+// ── Typed registration ──────────────────────────────────────────
+
+use sema_core::{FromValue, IntoValue};
+
+fn check_arity(name: &str, expected: usize, args: &[Value]) -> Result<(), SemaError> {
+    if args.len() == expected {
+        Ok(())
+    } else {
+        Err(SemaError::arity(name, expected.to_string(), args.len()))
+    }
+}
+
+fn arg<T: FromValue>(name: &str, args: &[Value], index: usize) -> Result<T, SemaError> {
+    T::from_value(&args[index])
+        .map_err(|error| error.with_note(format!("argument {} of {name}", index + 1)))
+}
+
+/// A Rust closure usable with
+/// [`register_fn_typed`](crate::Interpreter::register_fn_typed): any
+/// `Fn(A1, …, An) -> Result<R, SemaError>` with `Ai: FromValue` and
+/// `R: IntoValue`, for up to six arguments.
+pub trait TypedFn<Args>: 'static {
+    #[doc(hidden)]
+    fn invoke(&self, name: &str, args: &[Value]) -> Result<Value, SemaError>;
+}
+
+/// A Rust closure usable with
+/// [`register_async_fn_typed`](crate::Interpreter::register_async_fn_typed):
+/// any `Fn(A1, …, An) -> Fut` with `Ai: FromValue + Send` and
+/// `Fut: Future<Output = Result<R, E>> + Send`, `R: IntoValue + Send`,
+/// `E: Error + Send`, for up to six arguments.
+pub trait AsyncTypedFn<Args>: Send + Sync + 'static {
+    #[doc(hidden)]
+    type Output: IntoValue + Send + 'static;
+    #[doc(hidden)]
+    type Error: std::error::Error + Send + 'static;
+    #[doc(hidden)]
+    type Fut: Future<Output = Result<Self::Output, Self::Error>> + Send + 'static;
+    #[doc(hidden)]
+    fn extract(name: &str, args: &[Value]) -> Result<Args, SemaError>;
+    #[doc(hidden)]
+    fn call(&self, args: Args) -> Self::Fut;
+}
+
+macro_rules! typed_fns {
+    ($arity:expr; $($A:ident $i:tt),*) => {
+        impl<F, R, $($A,)*> TypedFn<($($A,)*)> for F
+        where
+            F: Fn($($A),*) -> Result<R, SemaError> + 'static,
+            R: IntoValue,
+            $($A: FromValue,)*
+        {
+            #[allow(unused_variables)]
+            fn invoke(&self, name: &str, args: &[Value]) -> Result<Value, SemaError> {
+                check_arity(name, $arity, args)?;
+                Ok((self)($(arg::<$A>(name, args, $i)?),*)?.into_value())
+            }
+        }
+
+        impl<F, Fut, R, E, $($A,)*> AsyncTypedFn<($($A,)*)> for F
+        where
+            F: Fn($($A),*) -> Fut + Send + Sync + 'static,
+            Fut: Future<Output = Result<R, E>> + Send + 'static,
+            R: IntoValue + Send + 'static,
+            E: std::error::Error + Send + 'static,
+            $($A: FromValue + Send + 'static,)*
+        {
+            type Output = R;
+            type Error = E;
+            type Fut = Fut;
+
+            #[allow(unused_variables)]
+            fn extract(name: &str, args: &[Value]) -> Result<($($A,)*), SemaError> {
+                check_arity(name, $arity, args)?;
+                Ok(($(arg::<$A>(name, args, $i)?,)*))
+            }
+
+            #[allow(non_snake_case)]
+            fn call(&self, args: ($($A,)*)) -> Fut {
+                let ($($A,)*) = args;
+                (self)($($A),*)
+            }
+        }
+    };
+}
+
+typed_fns!(0;);
+typed_fns!(1; A0 0);
+typed_fns!(2; A0 0, A1 1);
+typed_fns!(3; A0 0, A1 1, A2 2);
+typed_fns!(4; A0 0, A1 1, A2 2, A3 3);
+typed_fns!(5; A0 0, A1 1, A2 2, A3 3, A4 4);
+typed_fns!(6; A0 0, A1 1, A2 2, A3 3, A4 4, A5 5);

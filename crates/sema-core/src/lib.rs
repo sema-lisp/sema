@@ -4,6 +4,7 @@ pub mod args;
 pub mod async_signal;
 pub mod content_length;
 pub mod context;
+pub mod convert;
 pub mod cycle;
 pub mod error;
 #[cfg(not(target_arch = "wasm32"))]
@@ -94,5 +95,6 @@ pub use value::{
     NAN_PAYLOAD_MASK, NAN_TAG_MASK, TAG_NATIVE_FN,
 };
 
+pub use convert::{FromValue, IntoValue, Keyword, Symbol};
 pub use value_ref::{MapRef, Name, ValueRef};
 pub mod runtime;

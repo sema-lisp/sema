@@ -100,7 +100,12 @@ impl<'a> ValueRef<'a> {
             Self::Map(MapRef::Sorted(_)) => "map",
             Self::Map(MapRef::Hash(_)) => "hashmap",
             Self::Bytes(_) => "bytevector",
-            Self::Other(value) => value.type_name(),
+            // VM closures are native-fn wrappers internally; `type` reports
+            // them as lambdas, and so does this view.
+            Self::Other(value) => match value.view_ref() {
+                ValueViewRef::NativeFn(native) if native.is_closure => "lambda",
+                _ => value.type_name(),
+            },
         }
     }
 }

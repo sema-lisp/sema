@@ -17,6 +17,14 @@
   worker failures to distinct, catchable errors. The stdlib async offload path
   now shares its cancel hook and assembler with the new `sema_io::host_async`
   module.
+- Typed host functions: `FromValue`/`IntoValue`, `register_fn_typed` and
+  `register_async_fn_typed` convert arguments and results, with arity and type
+  errors that note the argument position.
+- `register_async_fn_cx`: one closure with an `AsyncCx` that returns a value or
+  `cx.await_future(..)`, spawns tasks on Sema's pool with `cx.spawn`, and gets a
+  `CancellationToken` tied to the calling task.
+- `ValueRef`: a public, matchable view of values (`ValueRef::slice(args)`) with
+  keyword names comparable to `&str` and `MapRef` over both map kinds.
 
 ## 1.37.0
 

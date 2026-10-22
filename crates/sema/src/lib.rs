@@ -25,7 +25,9 @@ pub mod workflow_mcp;
 pub mod workflow_view;
 
 // Re-export core types.
-pub use sema_core::{intern, resolve, with_resolved, Caps, Env, Sandbox, SemaError, Value};
+pub use sema_core::{
+    intern, resolve, with_resolved, Caps, Env, MapRef, Name, Sandbox, SemaError, Value, ValueRef,
+};
 /// Result of evaluating a Sema expression.
 pub type EvalResult = Result<Value>;
 

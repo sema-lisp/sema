@@ -24,6 +24,7 @@ pub mod stack;
 pub mod testing;
 pub mod text_util;
 pub mod value;
+pub mod value_ref;
 pub mod vfs;
 
 pub use args::{ArgsExt, OptionsExt, ResultExt};
@@ -93,4 +94,5 @@ pub use value::{
     NAN_PAYLOAD_MASK, NAN_TAG_MASK, TAG_NATIVE_FN,
 };
 
+pub use value_ref::{MapRef, Name, ValueRef};
 pub mod runtime;

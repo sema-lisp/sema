@@ -152,12 +152,14 @@ fn test_stack_overflow_hint() {
             interp
                 .eval_str("(define (f x) (+ 1 (f x))) (f 0)")
                 .unwrap_err()
+                .hint()
+                .map(str::to_owned)
         })
         .unwrap()
         .join()
         .unwrap();
-    assert!(result.hint().is_some());
-    assert!(result.hint().unwrap().contains("recursion"));
+    assert!(result.is_some());
+    assert!(result.unwrap().contains("recursion"));
 }
 
 #[test]

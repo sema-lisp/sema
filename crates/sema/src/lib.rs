@@ -14,6 +14,7 @@
 
 use std::rc::Rc;
 
+pub mod host_fn;
 pub mod workflow_evidence;
 pub mod workflow_mcp;
 // `sema workflow view` — the dashboard server. Lives in the library (not just
@@ -25,7 +26,11 @@ pub mod workflow_mcp;
 pub mod workflow_view;
 
 // Re-export core types.
-pub use sema_core::{intern, resolve, with_resolved, Caps, Env, Sandbox, SemaError, Value};
+pub use host_fn::{AsyncCx, AsyncTypedFn, CancellationToken, HostReturn, TypedFn};
+pub use sema_core::{
+    intern, resolve, with_resolved, Caps, Env, FromValue, IntoValue, Keyword, MapRef, Name,
+    Sandbox, SemaError, Symbol, Value, ValueRef,
+};
 /// Result of evaluating a Sema expression.
 pub type EvalResult = Result<Value>;
 
@@ -495,6 +500,167 @@ impl Interpreter {
         self.inner
             .global_env
             .set_str(name, Value::native_fn(native));
+    }
+
+    /// Register an async native function with a single closure that receives
+    /// an [`AsyncCx`].
+    ///
+    /// The closure runs on the interpreter thread. It returns either a value
+    /// now (`Ok(value.into())`) or a pending future from
+    /// [`AsyncCx::await_future`], which suspends only the calling Sema task.
+    /// [`AsyncCx::spawn`] starts fire-and-forget tasks on Sema's I/O pool, and
+    /// [`AsyncCx::cancellation_token`] fires when the awaited call is
+    /// cancelled. This is [`register_async_fn`](Self::register_async_fn) with
+    /// `prepare` and `run` merged; runtime context, error mapping,
+    /// cancellation and call-site restrictions are the same.
+    ///
+    /// There is no way to block on a future inside the closure: it runs inside
+    /// the cooperative runtime, where blocking would freeze every Sema task.
+    ///
+    /// ```no_run
+    /// use sema::{Interpreter, SemaError, Value};
+    /// use std::{convert::Infallible, time::Duration};
+    ///
+    /// let interp = Interpreter::new();
+    /// interp.register_async_fn_cx("host/delayed-echo", |cx, args| {
+    ///     let text = args[0]
+    ///         .as_str()
+    ///         .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+    ///         .to_owned();
+    ///     if text.is_empty() {
+    ///         return Ok(Value::nil().into()); // no await needed
+    ///     }
+    ///     let token = cx.cancellation_token();
+    ///     cx.spawn(move || async move { token.cancelled().await });
+    ///     Ok(cx.await_future(
+    ///         move || async move {
+    ///             tokio::time::sleep(Duration::from_millis(10)).await;
+    ///             Ok::<String, Infallible>(text)
+    ///         },
+    ///         |text| Ok(Value::string(&text)),
+    ///     ))
+    /// });
+    /// ```
+    ///
+    /// The future may not capture a `Value`:
+    ///
+    /// ```compile_fail
+    /// use sema::{Interpreter, Value};
+    /// use std::convert::Infallible;
+    ///
+    /// let interp = Interpreter::new();
+    /// interp.register_async_fn_cx("host/bad", |cx, args| {
+    ///     let captured = args[0].clone();
+    ///     Ok(cx.await_future(
+    ///         move || async move { Ok::<Value, Infallible>(captured) },
+    ///         |value| Ok(value),
+    ///     ))
+    /// });
+    /// ```
+    pub fn register_async_fn_cx<F>(&self, name: &str, f: F)
+    where
+        F: Fn(&mut AsyncCx, &[Value]) -> Result<HostReturn> + 'static,
+    {
+        use sema_core::NativeFn;
+
+        let fn_name: std::sync::Arc<str> = std::sync::Arc::from(name);
+        let f = Rc::new(f);
+        let legacy_f = Rc::clone(&f);
+        let legacy_name = std::sync::Arc::clone(&fn_name);
+        let native = NativeFn::simple_with_runtime(
+            name,
+            move |args| {
+                let mut cx = AsyncCx::new(std::sync::Arc::clone(&legacy_name));
+                legacy_f(&mut cx, args)?.into_value(&legacy_name)
+            },
+            move |_context, args| {
+                let mut cx = AsyncCx::new(std::sync::Arc::clone(&fn_name));
+                f(&mut cx, args)?.into_native()
+            },
+        );
+        self.inner
+            .global_env
+            .set_str(name, Value::native_fn(native));
+    }
+
+    /// Register a native function with typed arguments and result.
+    ///
+    /// Arguments are converted with [`FromValue`], the result with
+    /// [`IntoValue`]. A wrong argument count raises an arity error; a wrong
+    /// type raises a type error noting the argument position. Supports up to
+    /// six arguments; use [`register_fn`](Self::register_fn) with
+    /// [`ValueRef`] for variadic or overloaded functions.
+    ///
+    /// ```
+    /// use sema::{Interpreter, Keyword, SemaError, Value};
+    ///
+    /// let interp = Interpreter::new();
+    /// interp.register_fn_typed("host/repeat", |text: String, times: usize| {
+    ///     Ok::<_, SemaError>(text.repeat(times))
+    /// });
+    /// interp.register_fn_typed("host/status", |code: i64| {
+    ///     Ok::<_, SemaError>(Keyword(if code < 400 { "ok" } else { "error" }.into()))
+    /// });
+    /// assert_eq!(interp.eval_str("(host/repeat \"ab\" 2)").unwrap(), Value::string("abab"));
+    /// assert_eq!(interp.eval_str("(host/status 404)").unwrap(), Value::keyword("error"));
+    /// ```
+    pub fn register_fn_typed<Args, F>(&self, name: &str, f: F)
+    where
+        F: TypedFn<Args>,
+    {
+        let fn_name = name.to_string();
+        self.register_fn(name, move |args| f.invoke(&fn_name, args));
+    }
+
+    /// Register an async native function with typed arguments and result.
+    ///
+    /// The closure takes owned, `Send` arguments converted with [`FromValue`]
+    /// on the interpreter thread and returns a future that runs on Sema's I/O
+    /// pool; its output is converted with [`IntoValue`] back on the
+    /// interpreter thread. Everything else (suspension, error mapping,
+    /// cancellation, call-site restrictions) is as for
+    /// [`register_async_fn`](Self::register_async_fn), which this wraps.
+    ///
+    /// ```no_run
+    /// use sema::{Interpreter, Value};
+    /// use std::{convert::Infallible, time::Duration};
+    ///
+    /// let interp = Interpreter::new();
+    /// interp.register_async_fn_typed("host/delayed-upper", |text: String, ms: u64| async move {
+    ///     tokio::time::sleep(Duration::from_millis(ms)).await;
+    ///     Ok::<_, Infallible>(text.to_uppercase())
+    /// });
+    /// assert_eq!(
+    ///     interp.eval_str("(host/delayed-upper \"hi\" 5)").unwrap(),
+    ///     Value::string("HI")
+    /// );
+    /// ```
+    ///
+    /// A `Value` cannot be an argument or result, since it would cross to the
+    /// I/O pool:
+    ///
+    /// ```compile_fail
+    /// use sema::{Interpreter, Value};
+    /// use std::convert::Infallible;
+    ///
+    /// let interp = Interpreter::new();
+    /// interp.register_async_fn_typed("host/bad", |v: Value| async move {
+    ///     Ok::<_, Infallible>(v)
+    /// });
+    /// ```
+    pub fn register_async_fn_typed<Args, F>(&self, name: &str, f: F)
+    where
+        Args: Send + 'static,
+        F: AsyncTypedFn<Args>,
+    {
+        let fn_name = name.to_string();
+        let f = std::sync::Arc::new(f);
+        self.register_async_fn(
+            name,
+            move |args| F::extract(&fn_name, args),
+            move |args: Args| f.call(args),
+            |output: F::Output| Ok(output.into_value()),
+        );
     }
 
     /// Load and evaluate a `.sema` file.

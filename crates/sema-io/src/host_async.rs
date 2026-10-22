@@ -131,6 +131,35 @@ where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = Result<T, String>> + Send + 'static,
 {
+    suspend_async_until(
+        kind,
+        resource,
+        async move {
+            let _ = cancel_rx.await;
+        },
+        decoder,
+        continuation,
+        make_future,
+    )
+}
+
+/// [`suspend_async`] with any cancel future: the job resolves to
+/// `Err("cancelled")` as soon as `cancelled` completes, dropping the host
+/// future at its next poll.
+pub fn suspend_async_until<T, C, F, Fut>(
+    kind: CompletionKind,
+    resource: InterruptibleResource,
+    cancelled: C,
+    decoder: Box<dyn CompletionDecoder>,
+    continuation: Box<dyn NativeContinuation>,
+    make_future: F,
+) -> NativeResult
+where
+    T: Send + 'static,
+    C: Future<Output = ()> + Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+{
     let prepared = PreparedExternalOperation::interruptible_async(
         kind,
         decoder,
@@ -138,7 +167,7 @@ where
         move || async move {
             let out: Result<T, String> = tokio::select! {
                 biased;
-                _ = cancel_rx => Err("cancelled".to_string()),
+                _ = cancelled => Err("cancelled".to_string()),
                 result = make_future() => result,
             };
             Ok(Box::new(out) as SendPayload)
@@ -186,7 +215,7 @@ pub type FinishFn<T> = Rc<dyn Fn(T) -> Result<Value, SemaError>>;
 /// `Value`/`Env` (Invariant I2), so it traces no edges.
 pub struct HostAsyncDecoder<T: Send + 'static> {
     name: Arc<str>,
-    finish: FinishFn<T>,
+    finish: Box<dyn FnOnce(T) -> Result<Value, SemaError>>,
 }
 
 impl<T: Send + 'static> Trace for HostAsyncDecoder<T> {
@@ -274,7 +303,7 @@ where
         Rc::clone(finish) as Rc<dyn Fn(Output) -> Result<Value, SemaError>>;
     let decoder = Box::new(HostAsyncDecoder {
         name: Arc::clone(name),
-        finish,
+        finish: Box::new(move |output| finish(output)),
     });
     let continuation = Box::new(HostAsyncContinuation {
         name: Arc::clone(name),
@@ -287,6 +316,122 @@ where
         decoder,
         continuation,
         move || async move { run(input).await.map_err(|error| render_error_chain(&error)) },
+    )
+}
+
+/// A cancellation signal tied to one suspended host call. It fires when the
+/// calling Sema task's wait is cancelled (`async/cancel`,
+/// `async/with-timeout`, interpreter shutdown). Cheap to clone and `Send`, so
+/// tasks spawned for the call can stop when the caller goes away.
+#[derive(Clone, Default)]
+pub struct CancellationToken {
+    inner: Arc<TokenInner>,
+}
+
+#[derive(Default)]
+struct TokenInner {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.inner
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Request cancellation. Idempotent.
+    pub fn cancel(&self) {
+        self.inner
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.inner.notify.notify_waiters();
+    }
+
+    /// Resolve once cancellation is requested.
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.inner.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Cancel hook that fires a [`CancellationToken`]. Holds no `Value`/`Env`.
+struct TokenCancelHook {
+    token: CancellationToken,
+}
+
+impl Trace for TokenCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CancelHook for TokenCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        self.token.cancel();
+        Ok(CancelDisposition::Reaped)
+    }
+
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+}
+
+/// Suspend the calling Sema task on one host future built by `make_future`
+/// on the I/O pool. `finish` converts the output on the interpreter thread.
+/// Cancelling the wait fires `token` and drops the future at its next poll.
+pub fn suspend_host_job<Output, Error, F, Fut>(
+    name: &Arc<str>,
+    token: CancellationToken,
+    make_future: F,
+    finish: Box<dyn FnOnce(Output) -> Result<Value, SemaError>>,
+) -> NativeResult
+where
+    Output: Send + 'static,
+    Error: std::error::Error + Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<Output, Error>> + Send + 'static,
+{
+    let kind = CompletionKind::try_from_raw(HOST_ASYNC_COMPLETION_KIND)
+        .expect("host async completion kind is nonzero");
+    let resource = InterruptibleResource::new(
+        HOST_ASYNC_RESOURCE,
+        Box::new(TokenCancelHook {
+            token: token.clone(),
+        }),
+    );
+    let decoder = Box::new(HostAsyncDecoder {
+        name: Arc::clone(name),
+        finish,
+    });
+    let continuation = Box::new(HostAsyncContinuation {
+        name: Arc::clone(name),
+    });
+    let waiter = token.clone();
+    suspend_async_until(
+        kind,
+        resource,
+        async move { waiter.cancelled().await },
+        decoder,
+        continuation,
+        move || async move {
+            make_future()
+                .await
+                .map_err(|error| render_error_chain(&error))
+        },
     )
 }
 
@@ -334,6 +479,18 @@ mod tests {
         assert!(deadline
             .to_string()
             .contains("host/x: deadline exceeded: late"));
+    }
+
+    #[test]
+    fn token_hook_fires_the_token() {
+        let token = CancellationToken::new();
+        let mut hook = TokenCancelHook {
+            token: token.clone(),
+        };
+        assert!(!token.is_cancelled());
+        assert_eq!(hook.cancel().unwrap(), CancelDisposition::Reaped);
+        assert!(token.is_cancelled());
+        crate::io_block_on(token.cancelled());
     }
 
     #[test]

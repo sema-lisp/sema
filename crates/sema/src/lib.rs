@@ -14,6 +14,7 @@
 
 use std::rc::Rc;
 
+pub mod host_fn;
 pub mod workflow_evidence;
 pub mod workflow_mcp;
 // `sema workflow view` — the dashboard server. Lives in the library (not just
@@ -25,6 +26,7 @@ pub mod workflow_mcp;
 pub mod workflow_view;
 
 // Re-export core types.
+pub use host_fn::{AsyncCx, CancellationToken, HostReturn};
 pub use sema_core::{
     intern, resolve, with_resolved, Caps, Env, MapRef, Name, Sandbox, SemaError, Value, ValueRef,
 };
@@ -492,6 +494,87 @@ impl Interpreter {
             move |_context, args| {
                 let input = prepare(args)?;
                 sema_io::host_async::suspend_host_async(&fn_name, input, &run, &finish)
+            },
+        );
+        self.inner
+            .global_env
+            .set_str(name, Value::native_fn(native));
+    }
+
+    /// Register an async native function with a single closure that receives
+    /// an [`AsyncCx`].
+    ///
+    /// The closure runs on the interpreter thread. It returns either a value
+    /// now (`Ok(value.into())`) or a pending future from
+    /// [`AsyncCx::await_future`], which suspends only the calling Sema task.
+    /// [`AsyncCx::spawn`] starts fire-and-forget tasks on Sema's I/O pool, and
+    /// [`AsyncCx::cancellation_token`] fires when the awaited call is
+    /// cancelled. This is [`register_async_fn`](Self::register_async_fn) with
+    /// `prepare` and `run` merged; runtime context, error mapping,
+    /// cancellation and call-site restrictions are the same.
+    ///
+    /// There is no way to block on a future inside the closure: it runs inside
+    /// the cooperative runtime, where blocking would freeze every Sema task.
+    ///
+    /// ```no_run
+    /// use sema::{Interpreter, SemaError, Value};
+    /// use std::{convert::Infallible, time::Duration};
+    ///
+    /// let interp = Interpreter::new();
+    /// interp.register_async_fn_cx("host/delayed-echo", |cx, args| {
+    ///     let text = args[0]
+    ///         .as_str()
+    ///         .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+    ///         .to_owned();
+    ///     if text.is_empty() {
+    ///         return Ok(Value::nil().into()); // no await needed
+    ///     }
+    ///     let token = cx.cancellation_token();
+    ///     cx.spawn(move || async move { token.cancelled().await });
+    ///     Ok(cx.await_future(
+    ///         move || async move {
+    ///             tokio::time::sleep(Duration::from_millis(10)).await;
+    ///             Ok::<String, Infallible>(text)
+    ///         },
+    ///         |text| Ok(Value::string(&text)),
+    ///     ))
+    /// });
+    /// ```
+    ///
+    /// The future may not capture a `Value`:
+    ///
+    /// ```compile_fail
+    /// use sema::{Interpreter, Value};
+    /// use std::convert::Infallible;
+    ///
+    /// let interp = Interpreter::new();
+    /// interp.register_async_fn_cx("host/bad", |cx, args| {
+    ///     let captured = args[0].clone();
+    ///     Ok(cx.await_future(
+    ///         move || async move { Ok::<Value, Infallible>(captured) },
+    ///         |value| Ok(value),
+    ///     ))
+    /// });
+    /// ```
+    pub fn register_async_fn_cx<F>(&self, name: &str, f: F)
+    where
+        F: Fn(&mut AsyncCx, &[Value]) -> Result<HostReturn> + 'static,
+    {
+        use sema_core::NativeFn;
+
+        let fn_name: std::sync::Arc<str> = std::sync::Arc::from(name);
+        let f = Rc::new(f);
+        let legacy_f = Rc::clone(&f);
+        let legacy_name = std::sync::Arc::clone(&fn_name);
+        let native = NativeFn::simple_with_runtime(
+            name,
+            move |args| {
+                let mut cx = AsyncCx::new(std::sync::Arc::clone(&legacy_name));
+                legacy_f(&mut cx, args)?.into_value(&legacy_name)
+            },
+            move |_context, args| {
+                let mut cx = AsyncCx::new(std::sync::Arc::clone(&fn_name));
+                f(&mut cx, args)?.into_native()
             },
         );
         self.inner

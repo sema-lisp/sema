@@ -335,6 +335,7 @@ struct TokenInner {
 }
 
 impl CancellationToken {
+    /// A token that has not fired. Only the runtime can fire it.
     pub fn new() -> Self {
         Self::default()
     }
@@ -346,8 +347,10 @@ impl CancellationToken {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Request cancellation. Idempotent.
-    pub fn cancel(&self) {
+    /// Request cancellation. Idempotent. Only the runtime's cancel hook calls
+    /// this: a host cancelling its own call would surface as an unrelated
+    /// `Io("<name>: cancelled")` error in Sema code.
+    pub(crate) fn cancel(&self) {
         self.inner
             .cancelled
             .store(true, std::sync::atomic::Ordering::Release);
@@ -490,7 +493,9 @@ mod tests {
         assert!(!token.is_cancelled());
         assert_eq!(hook.cancel().unwrap(), CancelDisposition::Reaped);
         assert!(token.is_cancelled());
-        crate::io_block_on(token.cancelled());
+        let mut cancelled = Box::pin(token.cancelled());
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(cancelled.as_mut().poll(&mut context).is_ready());
     }
 
     #[test]

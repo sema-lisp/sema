@@ -30,7 +30,14 @@ pub struct Keyword(pub String);
 pub struct Symbol(pub String);
 
 fn mismatch<T: FromValue>(value: &Value) -> SemaError {
-    SemaError::type_error(T::expected(), value.type_name())
+    // An int that is out of range, or a bignum, would otherwise read as
+    // "expected int in 0..=255, got int"; include the value.
+    let got = match value.view_ref() {
+        ValueViewRef::Int(n) => format!("int {n}"),
+        ValueViewRef::BigInt(n) => format!("int {n}"),
+        _ => value.type_name().to_string(),
+    };
+    SemaError::type_error(T::expected(), got)
 }
 
 macro_rules! from_with {
@@ -140,6 +147,23 @@ into_with!(i64, |v| Value::int(v));
 into_with!(i32, |v| Value::int(v.into()));
 into_with!(u32, |v| Value::int(v.into()));
 into_with!(u8, |v| Value::int(v.into()));
+into_with!(i16, |v| Value::int(v.into()));
+into_with!(u16, |v| Value::int(v.into()));
+
+macro_rules! into_wide {
+    ($($ty:ty),*) => {$(
+        impl IntoValue for $ty {
+            fn into_value(self) -> Value {
+                match i64::try_from(self) {
+                    Ok(n) => Value::int(n),
+                    Err(_) => Value::from_bigint(num_bigint::BigInt::from(self)),
+                }
+            }
+        }
+    )*};
+}
+
+into_wide!(u64, usize, isize, i128, u128);
 into_with!(f64, |v| Value::float(v));
 into_with!(bool, |v| Value::bool(v));
 into_with!(char, |v| Value::char(v));

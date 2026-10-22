@@ -31,7 +31,11 @@ impl AsyncCx {
     /// A token that fires when this call's [`await_future`](Self::await_future)
     /// is cancelled (`async/cancel`, `async/with-timeout`, interpreter
     /// shutdown). Clone it into spawned tasks so they stop with the caller.
-    /// It never fires if the call returns a value without awaiting.
+    ///
+    /// It fires only when the call actually suspends in `await_future`. It
+    /// never fires if the closure returns a value, returns an error, or runs
+    /// where the caller cannot suspend (macro expansion); a task spawned
+    /// with the token in those cases must have its own exit condition.
     pub fn cancellation_token(&mut self) -> CancellationToken {
         self.token
             .get_or_insert_with(CancellationToken::new)
@@ -56,6 +60,10 @@ impl AsyncCx {
     /// are in runtime context. A host error is raised as
     /// `SemaError::Io("<name>: <text>")`, exactly as for
     /// [`register_async_fn`](crate::Interpreter::register_async_fn).
+    ///
+    /// `finish` runs on the interpreter thread and is not `Send`, but it must
+    /// not capture a `Value` or `Env` (Invariant I2: the collector cannot
+    /// trace closure captures). Call this at most once per closure run.
     pub fn await_future<Output, Error, F, Fut, Finish>(
         &mut self,
         make: F,
@@ -79,6 +87,7 @@ impl AsyncCx {
 /// What a [`register_async_fn_cx`](crate::Interpreter::register_async_fn_cx)
 /// closure returns: a value now (`value.into()`), or a pending future from
 /// [`AsyncCx::await_future`].
+#[must_use = "a HostReturn does nothing unless returned from the closure"]
 pub struct HostReturn(Inner);
 
 enum Inner {
@@ -127,8 +136,14 @@ fn check_arity(name: &str, expected: usize, args: &[Value]) -> Result<(), SemaEr
 }
 
 fn arg<T: FromValue>(name: &str, args: &[Value], index: usize) -> Result<T, SemaError> {
-    T::from_value(&args[index])
-        .map_err(|error| error.with_note(format!("argument {} of {name}", index + 1)))
+    T::from_value(&args[index]).map_err(|error| {
+        let position = format!("argument {} of {name}", index + 1);
+        let note = match error.note() {
+            Some(inner) => format!("{position}, {inner}"),
+            None => position,
+        };
+        error.with_note(note)
+    })
 }
 
 /// A Rust closure usable with

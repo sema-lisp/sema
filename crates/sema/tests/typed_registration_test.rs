@@ -90,6 +90,26 @@ fn typed_errors_match_manual_register_fn_classification() {
 }
 
 #[test]
+fn vec_argument_errors_keep_the_element_position() {
+    let interp = Interpreter::new();
+    interp.register_fn_typed("host/sum", |xs: Vec<i64>| {
+        Ok::<_, SemaError>(xs.iter().sum::<i64>())
+    });
+    let error = interp.eval_str("(host/sum [1 \"x\"])").unwrap_err();
+    let debug = format!("{error:?}");
+    assert!(debug.contains("argument 1 of host/sum"), "{debug}");
+    assert!(debug.contains("in element 1"), "{debug}");
+}
+
+#[test]
+fn out_of_range_integers_name_the_value() {
+    let interp = Interpreter::new();
+    interp.register_fn_typed("host/byte", |b: u8| Ok::<_, SemaError>(b));
+    let error = interp.eval_str("(host/byte 300)").unwrap_err();
+    assert!(error.to_string().contains("int 300"), "{error}");
+}
+
+#[test]
 fn closure_errors_propagate_unchanged() {
     let interp = Interpreter::new();
     interp.register_fn_typed("host/positive", |n: i64| {
@@ -114,7 +134,7 @@ fn async_typed_functions_suspend_and_convert() {
         Ok::<_, Infallible>(text.to_uppercase())
     });
     interp.register_async_fn_typed("host/ids", |n: usize| async move {
-        Ok::<_, Infallible>((0..n as i64).collect::<Vec<i64>>())
+        Ok::<_, Infallible>((0..n).collect::<Vec<usize>>())
     });
     assert_eq!(
         interp.eval_str("(host/delayed-upper \"hi\" 5)").unwrap(),
@@ -124,7 +144,7 @@ fn async_typed_functions_suspend_and_convert() {
         interp.eval_str("(host/ids 3)").unwrap().to_string(),
         "(0 1 2)"
     );
-    // Two calls overlap from spawned tasks.
+    // Two calls from spawned tasks both resolve, in input order.
     assert_eq!(
         interp
             .eval_str(

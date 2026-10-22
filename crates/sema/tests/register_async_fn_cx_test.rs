@@ -184,3 +184,71 @@ fn macro_expansion_accepts_ready_values_and_rejects_awaits() {
     );
     assert_quiescent(&interp);
 }
+
+/// Registers `host/park`: requests a token, spawns a task that reports when
+/// the token fires, and awaits a future that never resolves.
+fn register_park(interp: &Interpreter) -> mpsc::Receiver<&'static str> {
+    let (tx, rx) = mpsc::channel::<&'static str>();
+    let tx = Mutex::new(tx);
+    interp.register_async_fn_cx("host/park", move |cx, _args| {
+        let token = cx.cancellation_token();
+        let seen = tx.lock().unwrap().clone();
+        cx.spawn(move || async move {
+            token.cancelled().await;
+            let _ = seen.send("token-fired");
+        });
+        Ok(cx.await_future(
+            || async {
+                std::future::pending::<()>().await;
+                Ok::<(), Infallible>(())
+            },
+            |_| Ok(Value::nil()),
+        ))
+    });
+    rx
+}
+
+#[test]
+fn token_does_not_fire_when_the_call_completes() {
+    let interp = Interpreter::new();
+    let tokens: Arc<Mutex<Vec<sema::CancellationToken>>> = Arc::default();
+    let kept = Arc::clone(&tokens);
+    interp.register_async_fn_cx("host/quick", move |cx, _args| {
+        kept.lock().unwrap().push(cx.cancellation_token());
+        Ok(cx.await_future(|| async { Ok::<i64, Infallible>(1) }, |n| Ok(Value::int(n))))
+    });
+    assert_eq!(interp.eval_str("(host/quick)").unwrap(), Value::int(1));
+    let tokens = tokens.lock().unwrap();
+    assert_eq!(tokens.len(), 1);
+    assert!(
+        !tokens[0].is_cancelled(),
+        "completion must not fire the token"
+    );
+    assert_quiescent(&interp);
+}
+
+#[test]
+fn token_fires_on_async_cancel() {
+    let interp = Interpreter::new();
+    let events = register_park(&interp);
+    let value = interp
+        .eval_str(
+            "(define p (async (host/park))) (async/sleep 1) (async/cancel p) \
+             (try (async/await p) (catch e (:type e)))",
+        )
+        .unwrap();
+    assert_eq!(value, Value::keyword("cancelled"));
+    assert_eq!(events.recv_timeout(WAIT), Ok("token-fired"));
+    assert_quiescent(&interp);
+}
+
+#[test]
+fn token_fires_on_interpreter_drop() {
+    let interp = Interpreter::new();
+    let events = register_park(&interp);
+    interp
+        .eval_str("(define p (async (host/park))) (async/sleep 1)")
+        .unwrap();
+    drop(interp);
+    assert_eq!(events.recv_timeout(WAIT), Ok("token-fired"));
+}

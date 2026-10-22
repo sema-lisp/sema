@@ -136,6 +136,10 @@ impl Name {
     }
 
     /// Run `f` with the name as a `&str`, without allocating.
+    ///
+    /// `f` runs while the thread's interner is borrowed: it must not create
+    /// keywords or symbols (`Value::keyword`, `Value::symbol`, `intern`),
+    /// which would panic. Use `to_string()` when you need to build values.
     pub fn with_str<R>(&self, f: impl FnOnce(&str) -> R) -> R {
         with_resolved(self.spur, f)
     }

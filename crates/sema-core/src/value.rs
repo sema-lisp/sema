@@ -3,6 +3,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -30,12 +31,16 @@ thread_local! {
     static INTERNER: RefCell<Rodeo> = RefCell::new(Rodeo::default());
 }
 
-/// Intern a string, returning a Spur key.
+/// Intern a string in the current thread's table, returning a Spur key.
+///
+/// The key is valid only on this thread. Transfer the string itself between
+/// threads and intern it again on the receiving thread.
 pub fn intern(s: &str) -> Spur {
     INTERNER.with(|r| r.borrow_mut().get_or_intern(s))
 }
 
-/// Resolve a Spur key back to a String.
+/// Resolve a Spur key from the current thread's interner back to a String.
+/// Keys produced on another thread can resolve to unrelated text or panic.
 pub fn resolve(spur: Spur) -> String {
     INTERNER.with(|r| r.borrow().resolve(&spur).to_string())
 }
@@ -1162,17 +1167,29 @@ pub enum ValueViewRef<'a> {
 /// The core Value type for all Sema data.
 /// NaN-boxed: stored as 8 bytes. Floats stored directly,
 /// everything else encoded in quiet-NaN payload space.
+///
+/// A value is neither `Send` nor `Sync`: symbols and keywords are keys into
+/// the creating thread's string interner, and heap values use non-atomic
+/// reference counts. This applies to every value, including integers and
+/// booleans. Transfer owned Rust data such as strings or JSON between threads,
+/// then construct values on the receiving thread.
+///
+/// ```compile_fail
+/// use sema_core::Value;
+/// let value = Value::keyword("status");
+/// std::thread::spawn(move || println!("{value}"));
+/// ```
 #[repr(transparent)]
-pub struct Value(u64);
+pub struct Value(u64, PhantomData<Rc<()>>);
 
 // ── Constructors ──────────────────────────────────────────────────
 
 impl Value {
     // -- Immediate constructors --
 
-    pub const NIL: Value = Value(make_boxed_const(TAG_NIL, 0));
-    pub const TRUE: Value = Value(make_boxed_const(TAG_TRUE, 0));
-    pub const FALSE: Value = Value(make_boxed_const(TAG_FALSE, 0));
+    pub const NIL: Value = Value(make_boxed_const(TAG_NIL, 0), PhantomData);
+    pub const TRUE: Value = Value(make_boxed_const(TAG_TRUE, 0), PhantomData);
+    pub const FALSE: Value = Value(make_boxed_const(TAG_FALSE, 0), PhantomData);
 
     #[inline(always)]
     pub fn nil() -> Value {
@@ -1193,7 +1210,7 @@ impl Value {
         if (SMALL_INT_MIN..=SMALL_INT_MAX).contains(&n) {
             // Encode as small int (45-bit two's complement)
             let payload = (n as u64) & PAYLOAD_MASK;
-            Value(make_boxed(TAG_INT_SMALL, payload))
+            Value(make_boxed(TAG_INT_SMALL, payload), PhantomData)
         } else {
             // Out of range: heap-allocate (through the boxing funnel so the
             // uniform-header guards in `from_rc_ptr` apply here too)
@@ -1206,7 +1223,7 @@ impl Value {
         let bits = f.to_bits();
         if f.is_nan() {
             // Canonicalize NaN to avoid collision with boxed patterns
-            Value(CANONICAL_NAN)
+            Value(CANONICAL_NAN, PhantomData)
         } else {
             // Check: a non-NaN float could still have the BOX_MASK pattern
             // This happens for negative infinity and some subnormals — but
@@ -1220,29 +1237,39 @@ impl Value {
                 f,
                 bits
             );
-            Value(bits)
+            Value(bits, PhantomData)
         }
     }
 
     #[inline(always)]
     pub fn char(c: char) -> Value {
-        Value(make_boxed(TAG_CHAR, c as u64))
+        Value(make_boxed(TAG_CHAR, c as u64), PhantomData)
     }
 
+    /// Construct a symbol from a key interned on the current thread.
     #[inline(always)]
     pub fn symbol_from_spur(spur: Spur) -> Value {
-        Value(make_boxed(TAG_SYMBOL, spur_to_bits(spur) as u64))
+        Value(
+            make_boxed(TAG_SYMBOL, spur_to_bits(spur) as u64),
+            PhantomData,
+        )
     }
 
+    /// Intern `s` and construct a symbol on the current thread.
     pub fn symbol(s: &str) -> Value {
         Value::symbol_from_spur(intern(s))
     }
 
+    /// Construct a keyword from a key interned on the current thread.
     #[inline(always)]
     pub fn keyword_from_spur(spur: Spur) -> Value {
-        Value(make_boxed(TAG_KEYWORD, spur_to_bits(spur) as u64))
+        Value(
+            make_boxed(TAG_KEYWORD, spur_to_bits(spur) as u64),
+            PhantomData,
+        )
     }
 
+    /// Intern `s` and construct a keyword on the current thread.
     pub fn keyword(s: &str) -> Value {
         Value::keyword_from_spur(intern(s))
     }
@@ -1270,7 +1297,7 @@ impl Value {
                 std::any::type_name::<T>()
             );
         }
-        Value(make_boxed(tag, ptr_to_payload(ptr)))
+        Value(make_boxed(tag, ptr_to_payload(ptr)), PhantomData)
     }
 
     /// Construct an integer of any magnitude, normalizing to the tightest
@@ -1578,12 +1605,13 @@ impl Value {
     /// # Safety
     ///
     /// Caller must ensure `bits` represents a valid NaN-boxed value.
-    /// For immediate types (nil, bool, int, symbol, keyword, char), this is always safe.
-    /// For heap-pointer types, the encoded pointer must be valid and have its Rc ownership
-    /// accounted for (i.e., the caller must ensure the refcount is correct).
+    /// Symbol and keyword keys must belong to the current thread's interner.
+    /// Heap pointers must belong to this thread, be valid, and have their Rc
+    /// ownership accounted for (the caller must ensure the refcount is correct).
+    /// Raw bits are not a portable serialization of symbols, keywords, or heap values.
     #[inline(always)]
     pub unsafe fn from_raw_bits(bits: u64) -> Value {
-        Value(bits)
+        Value(bits, PhantomData)
     }
 
     /// Get the NaN-boxing tag of a boxed value (0-63).
@@ -2855,12 +2883,12 @@ impl Clone for Value {
     fn clone(&self) -> Self {
         if !is_boxed(self.0) {
             // Float: trivial copy
-            return Value(self.0);
+            return Value(self.0, PhantomData);
         }
         let tag = get_tag(self.0);
         // Immediates: trivial copy
         if is_immediate_tag(tag) {
-            return Value(self.0);
+            return Value(self.0, PhantomData);
         }
         // Heap pointers: one uniform strong-count bump — the RcBox header
         // sits at the same offset for every heap payload (see RC_HEADER),
@@ -2881,7 +2909,7 @@ impl Clone for Value {
             }
             strong.set(n);
         }
-        Value(self.0)
+        Value(self.0, PhantomData)
     }
 }
 
@@ -3776,9 +3804,31 @@ impl Default for Env {
 mod tests {
     use super::*;
 
+    static_assertions::assert_not_impl_any!(Value: Send, Sync);
+    static_assertions::assert_not_impl_any!(SemaError: Send, Sync);
+
     #[test]
     fn test_size_of_value() {
         assert_eq!(std::mem::size_of::<Value>(), 8);
+        assert_eq!(std::mem::align_of::<Value>(), std::mem::align_of::<u64>());
+    }
+
+    #[test]
+    fn keyword_and_symbol_names_can_be_transferred_between_threads() {
+        let (keyword_name, symbol_name) = std::thread::spawn(|| {
+            let keyword = Value::keyword("worker-status");
+            let symbol = Value::symbol("worker-result");
+            (keyword.as_keyword().unwrap(), symbol.as_symbol().unwrap())
+        })
+        .join()
+        .unwrap();
+
+        let keyword = Value::keyword(&keyword_name);
+        let symbol = Value::symbol(&symbol_name);
+        assert_eq!(keyword.to_string(), ":worker-status");
+        assert_eq!(symbol.to_string(), "worker-result");
+        assert_eq!(keyword, Value::keyword("worker-status"));
+        assert_eq!(symbol, Value::symbol("worker-result"));
     }
 
     #[test]

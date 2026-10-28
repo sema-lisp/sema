@@ -265,9 +265,33 @@ fn make_record(name: &str, age: i64, dept: &str) -> Value {
 Sema is **single-threaded by design**. It uses `Rc` (not `Arc`) for reference counting and a thread-local string interner for keywords and symbols.
 
 - Multiple `Interpreter` instances can coexist on the same thread with **fully isolated evaluator state** — each has its own module cache, call stack, span table, and depth counters.
-- Do **not** send `Value` instances across thread boundaries — they are not `Send` or `Sync`.
-- The string interner is per-thread, so interned keys from one thread are not valid in another.
+- `Value` and `SemaError` are neither `Send` nor `Sync`, so Rust rejects moving or sharing them across threads. This includes values that hold only a number, boolean, symbol, or keyword: a keyword is a key into its thread's string interner, and the same key can mean `"status"` on one thread and `"name"` on another.
+- Raw `Spur` keys returned by `intern` have the same restriction, even though their Rust type does not enforce it.
 - LLM state (provider registry, usage tracking, budgets) is per-thread and shared across all interpreters on the same thread.
+
+Send owned Rust data across a channel or task boundary, then create Sema values
+on the interpreter thread:
+
+```rust
+use sema::{Interpreter, Value};
+
+// The worker returns a Rust String, not a Sema Value or an interned key.
+let status_name = std::thread::spawn(|| String::from("ready"))
+    .join()
+    .unwrap();
+
+let interp = Interpreter::new();
+interp.env().set_str("status", Value::keyword(&status_name));
+assert_eq!(interp.eval_str("(= status :ready)").unwrap(), Value::bool(true));
+```
+
+For structured data, transfer a Rust struct or `serde_json::Value` and convert it
+on the receiving thread. Resolve existing keyword or symbol names to owned Rust
+strings on their original thread before sending them, and convert a `SemaError`
+to owned text the same way. Create a separate interpreter inside each worker if
+the workers need to evaluate Sema themselves. The same rules apply to async
+executors: a task that can move between worker threads must not hold a Sema
+value across an `.await`.
 
 ## Security Considerations
 

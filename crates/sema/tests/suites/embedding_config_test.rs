@@ -1240,7 +1240,6 @@ fn auto_configuration_uses_native_ollama_without_api_keys() {
 fn malformed_configuration_is_rejected() {
     for source in [
         r#"(llm/configure-embeddings :unknown {})"#,
-        r#"(llm/configure-embeddings :nomic {})"#,
         r#"(llm/configure-embeddings :ollama {:rerank-model "unsupported"})"#,
         r#"(llm/configure-embeddings :openai {:model ""})"#,
         r#"(llm/configure-embeddings :openai {:dimensions 0})"#,
@@ -1251,6 +1250,14 @@ fn malformed_configuration_is_rejected() {
     ] {
         assert!(interpreter().eval_str_compiled(source).is_err(), "{source}");
     }
+    // Missing-key behavior must not depend on the developer's provider credentials.
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .env_clear()
+        .args(["-e", r#"(llm/configure-embeddings :nomic {})"#])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Nomic requires"));
 }
 
 #[test]

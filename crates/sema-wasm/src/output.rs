@@ -141,6 +141,13 @@ impl PromiseOutput {
     }
 }
 
+/// `RootId`'s local (per-runtime) numeric component, wide enough for a JS
+/// `number` correlation tag (well under `Number.MAX_SAFE_INTEGER`) — not a
+/// stable wire format, just a same-session identity JS can compare/group by.
+fn root_id_as_f64(root: RootId) -> f64 {
+    root.get() as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,11 +169,4 @@ mod tests {
         assert_eq!(a.take_lines(), ["a"]);
         assert_eq!(b.take_lines(), ["b"]);
     }
-}
-
-/// `RootId`'s local (per-runtime) numeric component, wide enough for a JS
-/// `number` correlation tag (well under `Number.MAX_SAFE_INTEGER`) — not a
-/// stable wire format, just a same-session identity JS can compare/group by.
-fn root_id_as_f64(root: RootId) -> f64 {
-    root.get() as f64
 }

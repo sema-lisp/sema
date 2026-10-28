@@ -3291,6 +3291,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "scoped-tls"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3380,7 +3386,7 @@ dependencies = [
 
 [[package]]
 name = "sema-core"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "atomic-write-file",
  "crc32fast",
@@ -3394,6 +3400,7 @@ dependencies = [
  "serde_json",
  "soft-canonicalize",
  "stacker",
+ "static_assertions",
  "tempfile",
  "thiserror 2.0.20",
  "toml",
@@ -3403,7 +3410,7 @@ dependencies = [
 
 [[package]]
 name = "sema-dap"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "sema-core",
  "sema-eval",
@@ -3417,7 +3424,7 @@ dependencies = [
 
 [[package]]
 name = "sema-docs"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "clap",
  "serde",
@@ -3427,7 +3434,7 @@ dependencies = [
 
 [[package]]
 name = "sema-eval"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "sema-core",
  "sema-io",
@@ -3440,7 +3447,7 @@ dependencies = [
 
 [[package]]
 name = "sema-fmt"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "sema-core",
  "sema-reader",
@@ -3449,7 +3456,7 @@ dependencies = [
 
 [[package]]
 name = "sema-io"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "sema-core",
  "tokio",
@@ -3457,7 +3464,7 @@ dependencies = [
 
 [[package]]
 name = "sema-lang"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -3515,7 +3522,7 @@ dependencies = [
 
 [[package]]
 name = "sema-llm"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "base64",
  "futures",
@@ -3534,7 +3541,7 @@ dependencies = [
 
 [[package]]
 name = "sema-lsp"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "sema-core",
  "sema-docs",
@@ -3551,7 +3558,7 @@ dependencies = [
 
 [[package]]
 name = "sema-mcp"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -3568,10 +3575,12 @@ dependencies = [
  "sema-fmt",
  "sema-io",
  "sema-notebook",
+ "sema-reader",
  "sema-vm",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "thiserror 2.0.20",
  "tiny_http",
  "tokio",
  "url",
@@ -3581,7 +3590,7 @@ dependencies = [
 
 [[package]]
 name = "sema-notebook"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "axum",
  "chrono",
@@ -3598,7 +3607,7 @@ dependencies = [
 
 [[package]]
 name = "sema-otel"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "libc",
  "opentelemetry",
@@ -3613,7 +3622,7 @@ dependencies = [
 
 [[package]]
 name = "sema-policy"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "globset",
  "regex",
@@ -3626,7 +3635,7 @@ dependencies = [
 
 [[package]]
 name = "sema-reader"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "num-bigint",
  "num-rational",
@@ -3636,7 +3645,7 @@ dependencies = [
 
 [[package]]
 name = "sema-stdlib"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "axum",
  "base64",
@@ -3694,7 +3703,7 @@ dependencies = [
 
 [[package]]
 name = "sema-vm"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "divan",
  "hashbrown 0.17.1",
@@ -3702,6 +3711,7 @@ dependencies = [
  "num-bigint",
  "num-integer",
  "num-rational",
+ "scoped-tls",
  "sema-core",
  "sema-eval",
  "sema-io",
@@ -3714,7 +3724,7 @@ dependencies = [
 
 [[package]]
 name = "sema-wasm"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "futures-channel",
  "getrandom 0.4.3",
@@ -3734,7 +3744,7 @@ dependencies = [
 
 [[package]]
 name = "sema-workflow"
-version = "1.37.0"
+version = "2.0.0"
 dependencies = [
  "base64",
  "libc",
@@ -4110,6 +4120,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
 name = "string_cache"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4268,7 +4284,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

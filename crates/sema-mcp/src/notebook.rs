@@ -28,7 +28,10 @@ struct CacheEntry {
 }
 
 /// Cache state: the entries plus a monotonic access counter.
+type EngineFactory = Rc<dyn Fn(Notebook) -> Engine>;
+
 pub struct CacheState {
+    factory: Option<EngineFactory>,
     entries: BTreeMap<PathBuf, CacheEntry>,
     tick: u64,
 }
@@ -36,6 +39,7 @@ pub struct CacheState {
 impl CacheState {
     fn new() -> Self {
         Self {
+            factory: None,
             entries: BTreeMap::new(),
             tick: 0,
         }
@@ -79,6 +83,18 @@ pub type NotebookCache = Rc<RefCell<CacheState>>;
 /// Construct an empty notebook cache.
 pub fn new_cache() -> NotebookCache {
     Rc::new(RefCell::new(CacheState::new()))
+}
+
+/// Construct a lazy cache with the session's interpreter configuration.
+pub fn new_cache_with_factory(factory: impl Fn(Notebook) -> Engine + 'static) -> NotebookCache {
+    let cache = new_cache();
+    cache.borrow_mut().factory = Some(Rc::new(factory));
+    cache
+}
+
+pub(crate) fn configure_cache(cache: &NotebookCache, configured: &NotebookCache) {
+    let factory = configured.borrow().factory.clone();
+    cache.borrow_mut().factory = factory;
 }
 
 /// Current modification time of `path`, if the file exists and reports one.
@@ -159,10 +175,14 @@ pub fn get_or_create_engine(
     }
 
     // Load from disk or create new if it doesn't exist.
-    let engine = if canonical.exists() {
-        Engine::from_file(&canonical)?
+    let notebook = if canonical.exists() {
+        Notebook::load(&canonical)?
     } else {
-        Engine::new(Notebook::new("Untitled"))
+        Notebook::new("Untitled")
+    };
+    let engine = match &state.factory {
+        Some(factory) => factory(notebook),
+        None => Engine::new(notebook),
     };
 
     let shared = Rc::new(RefCell::new(engine));
@@ -208,6 +228,7 @@ pub fn create_notebook(
         ));
     }
 
+    let factory = cache.borrow().factory.clone();
     let (canonical, engine_rc) = get_or_create_engine(cache, path_str)?;
     {
         let mut engine = engine_rc.borrow_mut();
@@ -217,7 +238,11 @@ pub fn create_notebook(
         // interpreter env, snapshot, and cell timeout are all reset. A cached
         // engine for this path would otherwise leak bindings/state from the
         // previous notebook into the freshly created one.
-        *engine = Engine::new(Notebook::new(t));
+        let notebook = Notebook::new(t);
+        *engine = match factory {
+            Some(factory) => factory(notebook),
+            None => Engine::new(notebook),
+        };
         engine.notebook.save(&canonical)?;
     }
     // Record our own write so the next access doesn't see it as a stale edit.

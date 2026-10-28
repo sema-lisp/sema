@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -14,29 +14,16 @@ const MAX_LOWER_DEPTH: usize = 256;
 
 thread_local! {
     static LOWER_DEPTH: Cell<usize> = const { Cell::new(0) };
-    static SPAN_MAP: RefCell<Option<SpanMap>> = const { RefCell::new(None) };
 }
+
+scoped_tls::scoped_thread_local!(static SPAN_MAP: SpanMap);
 
 /// Lower a Value AST into CoreExpr IR.
 /// If `span_map` is provided, attaches source spans for debug support.
 pub fn lower(expr: &Value, span_map: Option<&SpanMap>) -> Result<CoreExpr, SemaError> {
-    if let Some(sm) = span_map {
-        SPAN_MAP.with(|cell| {
-            *cell.borrow_mut() = Some(sm.clone());
-        });
-        // Guard ensures SPAN_MAP is cleared even on panic
-        struct SpanMapGuard;
-        impl Drop for SpanMapGuard {
-            fn drop(&mut self) {
-                SPAN_MAP.with(|cell| {
-                    *cell.borrow_mut() = None;
-                });
-            }
-        }
-        let _guard = SpanMapGuard;
-        lower_expr(expr, false)
-    } else {
-        lower_expr(expr, false)
+    match span_map {
+        Some(spans) => SPAN_MAP.set(spans, || lower_expr(expr, false)),
+        None => lower_expr(expr, false),
     }
 }
 
@@ -49,7 +36,11 @@ fn lookup_span(val: &Value) -> Option<Span> {
     } else {
         val.as_map_rc().map(|rc| Rc::as_ptr(&rc) as usize)
     }?;
-    SPAN_MAP.with(|sm| sm.borrow().as_ref().and_then(|map| map.get(&ptr).copied()))
+    if SPAN_MAP.is_set() {
+        SPAN_MAP.with(|map| map.get(&ptr).copied())
+    } else {
+        None
+    }
 }
 
 /// Attach a source location to a lowering error so the reporter can point at
@@ -2864,12 +2855,7 @@ mod tests {
         let _core = lower(&vals[0], Some(&span_map)).unwrap();
 
         // After lower returns, SPAN_MAP should be cleared
-        SPAN_MAP.with(|cell| {
-            assert!(
-                cell.borrow().is_none(),
-                "SPAN_MAP should be None after lower() returns"
-            );
-        });
+        assert!(!SPAN_MAP.is_set(), "span map scope must be released");
     }
 
     #[test]
@@ -2885,12 +2871,7 @@ mod tests {
         assert!(result.is_err());
 
         // SPAN_MAP should still be cleaned up even after error
-        SPAN_MAP.with(|cell| {
-            assert!(
-                cell.borrow().is_none(),
-                "SPAN_MAP should be None after lower() errors"
-            );
-        });
+        assert!(!SPAN_MAP.is_set(), "span map scope must be released");
     }
 
     #[test]

@@ -6,6 +6,9 @@
 #[macro_use] // make common's macros (eval_tests! et al) visible in the member modules below
 mod common;
 
+#[path = "suites/embedded_mcp_test.rs"]
+mod embedded_mcp_test;
+
 #[path = "suites/mcp_async_test.rs"]
 mod mcp_async_test;
 #[path = "suites/mcp_builtin_test.rs"]

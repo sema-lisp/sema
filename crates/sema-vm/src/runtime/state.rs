@@ -868,6 +868,10 @@ fn register_runtime_interior_hooks() {
 }
 
 impl Runtime {
+    /// Stable identity used by hosts to bind resources to this runtime.
+    pub fn runtime_id(&self) -> sema_core::runtime::RuntimeId {
+        self.runtime_id
+    }
     pub fn new(
         context: Rc<EvalContext>,
         clock: Rc<dyn RuntimeClock>,
@@ -4395,6 +4399,9 @@ impl Runtime {
                     }
                 }
                 Err(error) => {
+                    // Loop guards can return before exception unwinding. Close
+                    // those frames before a continuation or pool reuses this VM.
+                    vm.reset_for_reuse();
                     let mut native_context = NativeCallContext {
                         hof_host: None,
                         eval_context: &eval_context,

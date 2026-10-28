@@ -9,6 +9,7 @@ description = "MCP (Model Context Protocol) server for Sema"
 
 [dependencies]
 sema-core.workspace = true
+sema-reader.workspace = true
 sema-eval.workspace = true
 sema-vm.workspace = true
 sema-fmt.workspace = true
@@ -32,3 +33,4 @@ chacha20poly1305.workspace = true
 sema-notebook.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 crc32fast.workspace = true
+thiserror.workspace = true

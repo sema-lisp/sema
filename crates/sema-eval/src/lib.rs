@@ -2,6 +2,8 @@
 mod debug_session;
 mod destructure;
 mod eval;
+#[cfg(not(target_arch = "wasm32"))]
+mod host;
 mod prelude;
 mod special_forms;
 mod syntax_rules;
@@ -12,5 +14,7 @@ pub use eval::{
     execute_compile_result, load_prelude, register_vm_delegates, EvalResult, Interpreter,
     Trampoline,
 };
+#[cfg(not(target_arch = "wasm32"))]
+pub use host::{spawn_host_thread, CancelToken};
 pub use sema_core::EvalContext;
 pub use special_forms::SPECIAL_FORM_NAMES;

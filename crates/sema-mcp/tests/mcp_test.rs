@@ -88,7 +88,7 @@ async fn test_mcp_initialize_and_tools_list() {
             assert!(tool_names.contains(&"docs"));
             assert!(tool_names.contains(&"fmt"));
             assert!(tool_names.contains(&"disasm"));
-            assert!(tool_names.contains(&"build"));
+            assert!(!tool_names.contains(&"build")); // The library adapter has no CLI build hook.
             assert!(tool_names.contains(&"info"));
             assert!(tool_names.contains(&"docs_search"));
             assert!(tool_names.contains(&"notebook/new"));
@@ -1090,7 +1090,7 @@ async fn test_eval_timeout_ms_argument_overrides_server_default() {
                 "expected a deadline-exceeded error, got: {text}"
             );
 
-            // timeout_ms: 0 disables the timeout for this call only.
+            // timeout_ms: 0 retains the server's default time budget.
             call_tool(
                 &mut server_write,
                 2,
@@ -1106,4 +1106,35 @@ async fn test_eval_timeout_ms_argument_overrides_server_default() {
             server_task.await.unwrap().unwrap();
         })
         .await;
+}
+
+#[test]
+fn interrupted_callback_vm_is_reusable_and_closes_escaping_upvalues() {
+    use sema_mcp::session::{McpServerOptions, McpSession};
+    let interpreter = Interpreter::new();
+    interpreter.eval_str("(define escaped nil)").unwrap();
+    let session =
+        McpSession::new(&interpreter, McpServerOptions::embedded().enable_eval()).unwrap();
+    interpreter.ctx.set_eval_step_limit(1000);
+    let interrupted = session.call_tool(&interpreter, "eval", &json!({"code":
+        "(let ((captured 40)) (set! escaped (fn () (+ captured 1))) (set! captured 41) (let loop ((i 0)) (loop (+ i 1))))"
+    })).unwrap();
+    assert!(interrupted.is_error);
+    assert!(serde_json::to_string(&interrupted)
+        .unwrap()
+        .contains("step limit"));
+    interpreter.ctx.set_eval_step_limit(0);
+    let recovered = session
+        .call_tool(
+            &interpreter,
+            "eval",
+            &json!({"code":
+                "(list (escaped) (map (fn (x) (+ x 1)) '(1 2)))"
+            }),
+        )
+        .unwrap();
+    assert!(!recovered.is_error, "{recovered:?}");
+    assert!(serde_json::to_string(&recovered)
+        .unwrap()
+        .contains("42 (2 3)"));
 }

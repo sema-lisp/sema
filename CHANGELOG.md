@@ -1,6 +1,88 @@
 # Changelog
 
-## Unreleased
+## 2.0.0
+
+See the [migration guide](https://sema-lang.com/docs/migrating-to-2)
+for required Rust changes, retrieval defaults, and cassette re-recording.
+
+### Breaking changes
+
+- Rust `EmbedRequest` literals must include `options`; `RerankRequest` literals
+  must include `timeout_ms`. `Value` and `SemaError` are neither `Send` nor
+  `Sync`; send owned Rust data between threads.
+- Synchronous evaluation from a running host callback is rejected, including
+  evaluation of another interpreter on the same thread. Use async host
+  functions or wait for the current call to settle before evaluating again.
+- The implicit Voyage embedding model is `voyage-3` (was `voyage-3-lite`).
+  Existing indexes must keep their original model or be rebuilt. Together's
+  default reranker is `mixedbread-ai/mxbai-rerank-large-v2`.
+- Embedding cassettes use `embed-v2` identities and must be re-recorded.
+  Embedding inputs must be strings. Malformed options and retrieval responses
+  now return errors instead of being silently coerced or partially discarded.
+
+### Added
+
+- Public MCP embedding through `sema::mcp::McpSession` and `McpWorker`, with
+  explicit presets, async host-function dispatch, typed errors, cancellation,
+  bounded input/output, configurable server identity, and host callbacks.
+  `sema mcp --preset embedded --check` lists the selected tools after loading
+  their definitions. Built MCP binaries share the CLI's MCP argument parser.
+- Shared embedding presets for OpenRouter, DeepInfra, Azure OpenAI, Cloudflare,
+  Alibaba, and self-hosted TEI, including provider-specific option validation
+  and batching. Native Ollama embeddings use `/api/embed`.
+
+- Native Nomic hosted text embeddings with task selection, dimensionality,
+  long-text options, endpoint overrides, and `NOMIC_API_KEY` detection. The
+  public `RerankDialect::Nomic` variant remains available for existing custom
+  hosts; the hosted preset supports embeddings only.
+- Nomic schema-based mock tests and an opt-in live smoke test.
+- `Interpreter::register_async_fn`: register async host functions through the
+  public crate. The call runs as prepare (interpreter thread), run (Sema's
+  process-wide Tokio pool) and finish (interpreter thread), suspends the calling
+  Sema task while the future runs, and maps host errors, cancellation and
+  worker failures to distinct, catchable errors. The stdlib async offload path
+  now shares its cancel hook and assembler with the new `sema_io::host_async`
+  module.
+- Typed host functions: `FromValue`/`IntoValue`, `register_fn_typed` and
+  `register_async_fn_typed` convert arguments and results, with arity and type
+  errors that note the argument position.
+- `register_async_fn_cx`: one closure with an `AsyncCx` that returns a value or
+  `cx.await_future(..)`, spawns tasks on Sema's pool with `cx.spawn`, and gets a
+  `CancellationToken` tied to the calling task.
+- `ValueRef`: a public, matchable view of values (`ValueRef::slice(args)`) with
+  keyword names comparable to `&str` and `MapRef` over both map kinds.
+
+### Fixed
+
+- Read rational components in complex literals, including `1/2+3i`, `3/4i`,
+  and the reader's own printed arithmetic results.
+- Keep embedding and reranking configuration separate from chat configuration.
+  Validate complete responses and cassette replay, preserve input ordering and
+  usage, and reject malformed vectors or reranking indices.
+- Honor evaluation deadlines while a root is parked on an external wait.
+  MCP handlers run through the cooperative runtime; output hooks are restored
+  after dispatch, and later calls do not drive earlier detached tasks under
+  their deadlines. Compilation borrows span tables and caches native names
+  with invalidation on environment changes.
+- Clear interrupted callback frames before reusing a VM, preserving captured
+  values and allowing later MCP calls to run after a timeout or step limit.
+- MCP file tools enforce sandbox capabilities and paths. Compile and disasm
+  use session macros without retaining new compile-time bindings. Notebook
+  creation preserves the host's LLM state. The CLI build hook runs in process
+  and requires an unrestricted session; library adapters and built MCP
+  binaries omit build unless the host installs a hook.
+
+### MCP compatibility
+
+- Per-call `timeout_ms` can shorten a session limit. Zero retains the default;
+  larger values are clamped. The CLI's `--timeout-ms 0` disables its default.
+- Hidden deftools and reserved MCP names cannot be called as user tools.
+  Unknown or unavailable names in explicit tool filters are option errors.
+- MCP protocol types are non-exhaustive; construct them with their methods and
+  include a wildcard arm when matching `ToolContent`.
+- MCP sessions bound input frames/source files to 16 MiB and output text to
+  1 MiB by default. Collection results retain JSON text, with a depth limit of
+  128. Rust hosts can configure the byte limits.
 
 ## 1.37.0
 

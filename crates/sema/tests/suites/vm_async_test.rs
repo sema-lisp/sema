@@ -2453,12 +2453,26 @@ fn escaping_closure_matches_its_exact_owner_upvalue_cell() {
                     inner
                         .global_env
                         .set(intern("__collision-target"), args[0].clone());
-                    inner.eval_str_compiled(
+                    // Drive a prepared VM to test owner identity independently of
+                    // the public API's rejection of nested interpreter evaluation.
+                    let forms = sema_reader::read_many(
                         r#"(let ((x 900))
                              (let ((keep-open (fn () x)))
                                (__snapshot-owner-collision __collision-target)
                                (list (__collision-target) (keep-open))))"#,
-                    )
+                    )?;
+                    let program = sema_vm::compile_program(&forms, None)?;
+                    let mut vm = sema_vm::VM::new(
+                        inner.global_env.clone(),
+                        program.functions,
+                        &program.native_table,
+                        program.main_cache_slots,
+                    )?;
+                    vm.seed_main_frame(program.closure);
+                    let root = inner.runtime().submit_root(vm).map_err(|error| {
+                        SemaError::internal(format!("owner-collision root: {error:?}"))
+                    })?;
+                    inner.drive_until_settled(&root)
                 })
             })
             .with_escaping_args(&[0]),

@@ -76,3 +76,8 @@ mod unified_runtime_watchdog_test;
 mod wasm_async_debug_test;
 #[path = "suites/wrapper_callback_async_test.rs"]
 mod wrapper_callback_async_test;
+
+#[path = "suites/register_async_fn_cx_test.rs"]
+mod register_async_fn_cx_test;
+#[path = "suites/register_async_fn_test.rs"]
+mod register_async_fn_test;

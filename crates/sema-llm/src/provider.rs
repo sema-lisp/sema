@@ -32,6 +32,31 @@ pub trait LlmProvider: Send + Sync {
     fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError>;
     fn default_model(&self) -> &str;
 
+    /// Endpoint identity for embedding cache isolation and configuration guards.
+    fn embedding_endpoint(&self) -> Option<&str> {
+        None
+    }
+
+    /// Model used when an embedding request omits its model.
+    fn default_embedding_model(&self) -> &str {
+        self.default_model()
+    }
+
+    /// Options used when an embedding request leaves a value unspecified.
+    fn embedding_options(&self) -> crate::types::EmbedOptions {
+        Default::default()
+    }
+
+    /// Default result limit for reranking; requests may override it.
+    fn default_rerank_top_k(&self) -> Option<usize> {
+        None
+    }
+
+    /// Model used when a rerank request omits its model.
+    fn default_rerank_model(&self) -> &str {
+        self.default_model()
+    }
+
     /// True when this provider's `complete`/`embed` re-enters the Sema VM on the
     /// CALLING (VM) thread — i.e. a `LispProvider` built by
     /// `llm/define-provider`, whose `:complete` closure is dispatched through the
@@ -133,6 +158,7 @@ pub trait LlmProvider: Send + Sync {
 /// all synchronous `with_*_provider` callers keep working unchanged.
 pub struct ProviderRegistry {
     providers: std::collections::HashMap<String, std::sync::Arc<dyn LlmProvider>>,
+    embedding_providers: std::collections::HashMap<String, std::sync::Arc<dyn LlmProvider>>,
     default: Option<String>,
     embedding_provider: Option<String>,
     rerank_provider: Option<String>,
@@ -142,6 +168,7 @@ impl ProviderRegistry {
     pub fn new() -> Self {
         ProviderRegistry {
             providers: std::collections::HashMap::new(),
+            embedding_providers: std::collections::HashMap::new(),
             default: None,
             embedding_provider: None,
             rerank_provider: None,
@@ -161,8 +188,30 @@ impl ProviderRegistry {
         self.providers.insert(name, provider);
     }
 
+    /// Register retrieval configuration independently of chat configuration.
+    pub fn register_embedding(&mut self, provider: Box<dyn LlmProvider>) {
+        self.embedding_providers
+            .insert(provider.name().to_string(), std::sync::Arc::from(provider));
+    }
+
+    /// Resolve a retrieval provider before falling back to a general provider.
+    pub fn get_embedding(&self, name: &str) -> Option<std::sync::Arc<dyn LlmProvider>> {
+        let name = if name == "openai-embeddings" {
+            "openai"
+        } else {
+            name
+        };
+        self.embedding_providers
+            .get(name)
+            .or_else(|| self.providers.get(name))
+            .cloned()
+    }
+
     pub fn get(&self, name: &str) -> Option<std::sync::Arc<dyn LlmProvider>> {
-        self.providers.get(name).cloned()
+        self.providers
+            .get(name)
+            .or_else(|| self.embedding_providers.get(name))
+            .cloned()
     }
 
     pub fn default_provider(&self) -> Option<std::sync::Arc<dyn LlmProvider>> {
@@ -185,8 +234,7 @@ impl ProviderRegistry {
     pub fn embedding_provider(&self) -> Option<std::sync::Arc<dyn LlmProvider>> {
         self.embedding_provider
             .as_ref()
-            .and_then(|name| self.providers.get(name))
-            .cloned()
+            .and_then(|name| self.get_embedding(name))
     }
 
     pub fn set_rerank_provider(&mut self, name: &str) {
@@ -197,13 +245,18 @@ impl ProviderRegistry {
     pub fn rerank_provider(&self) -> Option<std::sync::Arc<dyn LlmProvider>> {
         self.rerank_provider
             .as_ref()
-            .and_then(|name| self.providers.get(name))
-            .cloned()
+            .and_then(|name| self.get_embedding(name))
     }
 
     pub fn provider_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.providers.keys().cloned().collect();
+        let mut names: Vec<String> = self
+            .providers
+            .keys()
+            .chain(self.embedding_providers.keys())
+            .cloned()
+            .collect();
         names.sort();
+        names.dedup();
         names
     }
 }

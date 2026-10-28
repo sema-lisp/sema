@@ -2240,10 +2240,15 @@ impl VM {
         self.quantum_cancellation.clone()
     }
 
-    /// Clear the frames and stack an aborted (errored or fast-path-rejected)
-    /// callback run left behind, so this scratch VM can be pooled and later
-    /// re-targeted by `reset_for_task_with_native_fns`.
+    /// Close captured upvalues and clear an aborted callback's frames and stack,
+    /// so this scratch VM can be pooled and later re-targeted by
+    /// `reset_for_task_with_native_fns`.
     pub(crate) fn reset_for_reuse(&mut self) {
+        for frame in &mut self.frames {
+            if let Some(open) = &mut frame.open_upvalues {
+                close_open_upvalues(open, &self.stack, frame.base);
+            }
+        }
         self.stack.clear();
         self.frames.clear();
         self.debug_exception_frames = None;

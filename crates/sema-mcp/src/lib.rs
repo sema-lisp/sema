@@ -7,6 +7,7 @@ pub mod notebook;
 pub mod oauth;
 pub mod protocol;
 pub mod server;
+pub mod session;
 pub mod tools;
 
 pub use builtins::{

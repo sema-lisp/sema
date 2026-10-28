@@ -1,10 +1,15 @@
 # Embedding provider survey and proposed implementation scope
 
-Date: 2026-10-21 (Europe/Oslo). Status: research and proposal; the providers
-listed below have not been added by this report. Nomic's native adapter is in
-[PR #172](https://github.com/sema-lisp/sema/pull/172). Its live smoke test passed
-on 2026-10-21; the final combined release still needs the checks described in
-[the validation plan](nomic-api-validation.md).
+Research date: 2026-10-21 (Europe/Oslo). This completed survey preserves the
+proposal and evidence available on that date. Nomic release verification is
+recorded in [the validation plan](nomic-api-validation.md).
+
+Implementation record (2026-10-28): PRs #172, #173, and #174 were merged for
+Sema 2.0. All six proposed presets are implemented and covered by deterministic
+contract tests. Live gates pass on the release commit for Nomic, OpenRouter,
+DeepInfra, Azure, and Cloudflare. Alibaba and TEI were not tested live. The
+survey below preserves the research context and future-provider proposals;
+current configuration and defaults are documented on the website.
 
 ## Recommendation
 

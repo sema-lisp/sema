@@ -1,10 +1,10 @@
 # Nomic API release gate
 
-Status: **the live smoke test passed on 2026-10-21** against the hosted API with
-`nomic-embed-text-v1.5`. Account access is confirmed. The exact tested commit is
-recorded in [PR #172](https://github.com/sema-lisp/sema/pull/172). Repeat the live
-test against the final combined release commit and run the normal release checks.
-Synthetic fixtures alone do not establish service access.
+Status: **release verification complete**. The live gate passed on 2026-10-28
+against release commit `bbec92a274d7ddbaaba275a67e95594f967fa71e` (v2.0.0),
+using `nomic-embed-text-v1.5`. The full local and GitHub release gates pass.
+Commit-specific evidence is recorded in [PR #182](https://github.com/sema-lisp/sema/pull/182)
+and `2026-10-28-release-2.md`. Synthetic fixtures alone do not establish access.
 
 ## Sources
 
@@ -40,9 +40,9 @@ batch limit, and checks the aggregate count and nonzero token usage.
 
 - [x] Account has API access.
 - [x] Live test passes on the Nomic adapter PR (2026-10-21).
-- [ ] Live test passes against the final release commit.
+- [x] Live test passes against the final release commit (2026-10-28).
 - [x] Record commit, date, model, and test result in the PR (no credentials).
-- [ ] Run the normal `jake ci` release checks on the combined changes.
+- [x] Run the normal `jake ci` release checks on the combined changes.
 
 Do not infer completion from passing mock tests or ordinary CI, which excludes
 the ignored live test. No release version or tag is created by this work.

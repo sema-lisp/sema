@@ -176,6 +176,153 @@ interp.register_fn("inc!", move |_| {
 (inc!) ; => 3
 ```
 
+### Typed Functions
+
+`register_fn_typed` converts arguments and the result for you. Arguments implement
+`FromValue` (`i64`, `f64`, `bool`, `char`, `String`, range-checked integer types,
+`Keyword`, `Symbol`, `Value`, `Option<T>` for nil-able, `Vec<T>` for lists and
+vectors); results implement `IntoValue`. Wrong argument counts raise `:arity`
+errors and wrong types raise `:type-error` errors noting the argument position,
+the same classification as a hand-written `register_fn`.
+
+```rust
+use sema::{Keyword, SemaError};
+
+interp.register_fn_typed("host/repeat", |text: String, times: usize| {
+    Ok::<_, SemaError>(text.repeat(times))
+});
+interp.register_fn_typed("host/status", |code: i64| {
+    Ok::<_, SemaError>(Keyword(if code < 400 { "ok" } else { "error" }.into()))
+});
+```
+
+Up to six arguments are supported.
+
+### Matching Arguments
+
+For variadic or overloaded functions, `ValueRef::slice` turns the argument list
+into a matchable enum. Keyword and symbol names compare with `&str`; maps come
+back as `MapRef` (sorted or hash) with `get`, `get_keyword` and `iter`; anything
+without its own variant (procedures, promises, records, big numbers) is
+`ValueRef::Other`.
+
+```rust
+use sema::{SemaError, Value, ValueRef};
+
+interp.register_fn("host/config", |args| {
+    match ValueRef::slice(args).as_slice() {
+        [] => Ok(Value::nil()),
+        [ValueRef::Keyword(k), ValueRef::Int(n)] if *k == "retries" => Ok(Value::int(*n)),
+        [ValueRef::Map(m)] => Ok(m.get_keyword("retries").cloned().unwrap_or(Value::nil())),
+        other => Err(SemaError::eval(format!("host/config: unexpected {} arguments", other.len()))),
+    }
+});
+```
+
+### Async Functions
+
+Use `register_async_fn` for host work that awaits a future (HTTP, database,
+timers). The call splits into three steps so no `Value` crosses a thread:
+
+| Step | Runs on | Role |
+| --- | --- | --- |
+| `prepare` | interpreter thread | validate `&[Value]`, return an owned `Send` input |
+| `run` | Sema's process-wide Tokio pool | await a future over the input, return an owned `Send` output or a host error |
+| `finish` | interpreter thread | turn the output into a `Value` |
+
+```rust
+use sema::{Interpreter, SemaError, Value};
+use std::{convert::Infallible, time::Duration};
+
+let interp = Interpreter::new();
+interp.register_async_fn(
+    "host/delayed-keyword",
+    |args| {
+        if args.len() != 1 {
+            return Err(SemaError::eval("expected one string argument"));
+        }
+        args[0]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))
+    },
+    |name: String| async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        Ok::<String, Infallible>(name)
+    },
+    |name| Ok(Value::keyword(&name)),
+);
+assert_eq!(
+    interp.eval_str("(host/delayed-keyword \"ready\")")?,
+    Value::keyword("ready")
+);
+```
+
+Calling the function suspends the calling Sema task while the future runs, so
+other tasks (`async/spawn`, `async/all`) keep making progress. `eval_str` still
+blocks its Rust caller until the whole evaluation finishes.
+
+Two shorter forms build on the same mechanism:
+
+- **`register_async_fn_typed`** takes typed, owned arguments and returns a future:
+
+  ```rust
+  interp.register_async_fn_typed("host/delayed-upper", |text: String, ms: u64| async move {
+      tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+      Ok::<_, std::convert::Infallible>(text.to_uppercase())
+  });
+  ```
+
+- **`register_async_fn_cx`** takes one closure with a context. It returns a value
+  now (`Ok(value.into())`) or `cx.await_future(make, finish)`, which suspends the
+  calling Sema task. `cx.spawn(make)` starts fire-and-forget tasks on Sema's pool
+  without you holding a runtime handle, and `cx.cancellation_token()` fires when
+  the awaited call is cancelled:
+
+  ```rust
+  interp.register_async_fn_cx("host/fetch", |cx, args| {
+      let url = args[0].as_str().ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?.to_owned();
+      let token = cx.cancellation_token();
+      cx.spawn(move || async move { token.cancelled().await; /* clean up */ });
+      Ok(cx.await_future(move || fetch(url), |body: String| Ok(Value::string(&body))))
+  });
+  ```
+
+  `make` closures run on Sema's pool, so Tokio timers and sockets they create are
+  in runtime context. There is no way to block on a future inside the closure:
+  it runs inside the cooperative runtime, where blocking would freeze every Sema
+  task. A closure that returns a ready value also works where callers cannot
+  suspend (macro expansion); one that awaits fails there.
+
+What to know before relying on it:
+
+- **Runtime.** `run` executes on Sema's own Tokio pool, not your runtime (the
+  example needs `tokio` with the `time` feature in your crate). Do not call
+  `block_on` inside it. A `tokio::spawn` inside `run` lands on Sema's pool, and
+  resources created on your own runtime follow Tokio's cross-runtime rules.
+  Calling `eval_str` from inside an ambient Tokio runtime is not a supported
+  context.
+- **Errors.** A host error is rendered to text (its `Display` chain) and raised as
+  `SemaError::Io("<name>: <text>")`, catchable from Sema as `:io`. Errors from
+  `prepare` and `finish` are raised unchanged. Runtime-side failures are `:eval`
+  errors whose message starts with `<name>: ` and one of `executor rejected the
+  operation`, `operation cancelled`, `deadline exceeded`, `bound exceeded`,
+  `worker panicked`, or `payload decode failed`. A panic inside `run` is
+  reported as `worker panicked` only under the `unwind` panic profile; with
+  `panic = "abort"` the process aborts.
+- **Cancellation.** `async/cancel`, `async/with-timeout` and interpreter drop
+  drop the host future at its next poll. Write drop-cancel-safe futures; remote
+  side effects are not undone, and a future stuck in a blocking call is not
+  stopped. Interpreter drop waits at most 2 s for in-flight host futures.
+- **Where it cannot be called.** A macro transformer, a synchronous
+  `apply`/`call-with-values` path and debug evaluation cannot suspend; the call
+  fails there with `<name>: async host function cannot run here`. `prepare`
+  and `finish` run inside the runtime and must not call `eval_str` or any
+  `block_on`.
+- **Captured state.** As with `register_fn`, none of the closures may strongly
+  capture a `Value` or `Env`. `run`'s `Send` bound enforces this for the
+  worker; `prepare` and `finish` rely on you.
+
 ## Real-World Example: Data Pipeline
 
 A Rust CLI tool that uses Sema as a scripting language for user-defined data transformations. The host app provides utility functions and loads a user-written `.sema` script that defines the transform logic.
@@ -388,3 +535,8 @@ Scripts can then import these modules as if they were files:
 | `interp.load_file(path)`             | Read and evaluate a `.sema` file                                 |
 | `interp.preload_module(name, source)`| Inject a virtual module into the import cache                    |
 | `interp.register_fn(name, closure)`  | Register a native Rust function callable from Sema               |
+| `interp.register_async_fn(name, prepare, run, finish)` | Register an async native function; `run` awaits on Sema's Tokio pool |
+| `interp.register_fn_typed(name, closure)` | Register a native function with typed arguments and result |
+| `interp.register_async_fn_typed(name, closure)` | Register an async native function with typed arguments |
+| `interp.register_async_fn_cx(name, closure)` | Register an async native function with one closure and an `AsyncCx` |
+| `ValueRef::of(&value)` / `ValueRef::slice(args)` | Matchable view of values for pattern matching |

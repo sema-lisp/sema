@@ -55,6 +55,7 @@ impl JsonRpcError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Tool {
     pub name: String,
     // MCP tool descriptions are optional on the wire; default to empty so a server
@@ -66,14 +67,49 @@ pub struct Tool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CallToolResult {
     pub content: Vec<ToolContent>,
     #[serde(rename = "isError", default)]
     pub is_error: bool,
 }
 
+impl Tool {
+    /// Describe a tool without depending on its wire representation.
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: serde_json::Value,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            input_schema,
+        }
+    }
+}
+
+impl CallToolResult {
+    /// A successful text result.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            content: vec![ToolContent::Text { text: text.into() }],
+            is_error: false,
+        }
+    }
+
+    /// A tool failure, represented by MCP's `isError` flag.
+    pub fn error(text: impl Into<String>) -> Self {
+        Self {
+            is_error: true,
+            ..Self::text(text)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ToolContent {
     Text { text: String },
 }

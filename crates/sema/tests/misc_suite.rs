@@ -14,3 +14,6 @@ mod fmt_cli_test;
 mod host_api_test;
 #[path = "suites/repl_display_test.rs"]
 mod repl_display_test;
+
+#[path = "suites/typed_registration_test.rs"]
+mod typed_registration_test;

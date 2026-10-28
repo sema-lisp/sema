@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use sema_core::{OptionsExt, SemaError, Value, ValueViewRef};
-use sema_eval::{call_value, Interpreter};
+use sema_eval::Interpreter;
 
 use crate::notebook::{
     add_cell, delete_cell, export_notebook, get_or_create_engine, update_cell, NotebookCache,
@@ -394,26 +394,25 @@ where
 
     let buf = Arc::new(Mutex::new(String::new()));
     let out = buf.clone();
-    sema_core::set_host_stdout_hook(Some(Box::new(move |s: &str| {
+    let stdout = Some(Box::new(move |s: &str| {
         if let Ok(mut b) = out.lock() {
             b.push_str(s);
         }
-    })));
+    }) as Box<dyn Fn(&str) + Send>);
     let err = buf.clone();
-    sema_core::set_host_stderr_hook(Some(Box::new(move |s: &str| {
+    let stderr = Some(Box::new(move |s: &str| {
         if let Ok(mut b) = err.lock() {
             b.push_str(s);
         }
-    })));
+    }) as Box<dyn Fn(&str) + Send>);
+
+    let _hooks = sema_core::output_hook::HostHookScope::new(stdout, stderr);
 
     // Run the operation, clearing the hooks even if it panics — otherwise a
     // leaked hook would capture into a dropped buffer and silence all later
     // output. The panic is re-raised for the dispatch-level handler to convert
     // into an error result.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-
-    sema_core::set_host_stdout_hook(None);
-    sema_core::set_host_stderr_hook(None);
 
     let captured = buf.lock().map(|b| b.clone()).unwrap_or_default();
 
@@ -423,12 +422,7 @@ where
     }
 }
 
-/// Lists all default, notebook, and user-defined tools matching CLI filters
-pub fn list_mcp_tools(
-    interpreter: &Interpreter,
-    include_tools: Option<&[String]>,
-    exclude_tools: Option<&[String]>,
-) -> Vec<Tool> {
+fn build_builtin_tools() -> Vec<Tool> {
     let mut tools = Vec::new();
 
     // 1. Register Default tools
@@ -502,13 +496,11 @@ pub fn list_mcp_tools(
     ];
 
     for (name, desc, schema) in default_tool_list {
-        if is_tool_allowed(name, include_tools, exclude_tools) {
-            tools.push(Tool {
-                name: name.to_string(),
-                description: desc.to_string(),
-                input_schema: schema,
-            });
-        }
+        tools.push(Tool {
+            name: name.into(),
+            description: desc.into(),
+            input_schema: schema,
+        });
     }
 
     // 2. Register Notebook tools
@@ -584,7 +576,7 @@ pub fn list_mcp_tools(
     ];
 
     for (name, desc, schema) in notebook_tool_list {
-        if is_tool_allowed(name, include_tools, exclude_tools) {
+        if true {
             tools.push(Tool {
                 name: name.to_string(),
                 description: desc.to_string(),
@@ -593,27 +585,48 @@ pub fn list_mcp_tools(
         }
     }
 
+    tools
+}
+
+pub(crate) fn builtin_tools() -> &'static [Tool] {
+    static TOOLS: std::sync::OnceLock<Vec<Tool>> = std::sync::OnceLock::new();
+    TOOLS.get_or_init(build_builtin_tools)
+}
+
+pub(crate) fn is_builtin_name(name: &str) -> bool {
+    builtin_tools().iter().any(|t| t.name == name)
+}
+
+pub(crate) fn is_exposed(td: &sema_core::ToolDefinition) -> bool {
+    !td.name.starts_with('_')
+        && !is_builtin_name(&td.name)
+        && td
+            .parameters
+            .opt("mcp/expose")
+            .is_none_or(|v| v.is_truthy())
+        && !td.parameters.flag("private")
+}
+
+/// List builtins and exposed deftools through the same name filter.
+pub fn list_mcp_tools(
+    interpreter: &Interpreter,
+    include_tools: Option<&[String]>,
+    exclude_tools: Option<&[String]>,
+) -> Vec<Tool> {
+    let mut tools: Vec<_> = builtin_tools()
+        .iter()
+        .filter(|t| is_tool_allowed(&t.name, include_tools, exclude_tools))
+        .cloned()
+        .collect();
     // 3. Discover User Defined deftool definitions in Interpreter
     interpreter.global_env.iter_bindings(|_spur, val| {
         if let ValueViewRef::ToolDef(td) = val.view_ref() {
-            if is_tool_allowed(&td.name, include_tools, exclude_tools) {
-                // Ignore hidden prefix "_"
-                if !td.name.starts_with('_') {
-                    // Check metadata tags
-                    let expose = td
-                        .parameters
-                        .opt("mcp/expose")
-                        .is_none_or(|v| v.is_truthy())
-                        && !td.parameters.flag("private");
-
-                    if expose {
-                        tools.push(Tool {
-                            name: td.name.clone(),
-                            description: td.description.clone(),
-                            input_schema: sema_core::value_to_json_schema(&td.parameters),
-                        });
-                    }
-                }
+            if is_tool_allowed(&td.name, include_tools, exclude_tools) && is_exposed(td) {
+                tools.push(Tool {
+                    name: td.name.clone(),
+                    description: td.description.clone(),
+                    input_schema: sema_core::value_to_json_schema(&td.parameters),
+                });
             }
         }
     });
@@ -639,13 +652,166 @@ fn is_tool_allowed(
     true
 }
 
+/// Check host-side file operations before they can bypass the interpreter sandbox.
+pub(crate) fn check_tool_access(
+    name: &str,
+    args: &JsonValue,
+    interpreter: &Interpreter,
+) -> Result<(), CallToolResult> {
+    use sema_core::Caps;
+    let sandbox = &interpreter.ctx.sandbox;
+    let check = |caps, path: &str| -> Result<(), CallToolResult> {
+        sandbox
+            .check(caps, name)
+            .and_then(|()| sandbox.check_path(path, name))
+            .map_err(|e| error_result(e.format_plain()))
+    };
+    match name {
+        "build" => {
+            check(
+                Caps::FS_READ.union(Caps::FS_WRITE).union(Caps::NETWORK),
+                require_str(args, "source_path")?,
+            )?;
+            check(Caps::FS_WRITE, require_str(args, "output_path")?)?;
+        }
+        "run_file" | "disasm" => {
+            check(Caps::FS_READ, require_str(args, "file_path")?)?;
+        }
+        "compile" => {
+            let source = require_str(args, "source_path")?;
+            check(Caps::FS_READ, source)?;
+            let default = Path::new(source).with_extension("semac");
+            check(
+                Caps::FS_WRITE,
+                args.get("output_path")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or(&default.to_string_lossy()),
+            )?;
+        }
+        "fmt" => {
+            if let Some(path) = args.get("file_path").and_then(JsonValue::as_str) {
+                check(Caps::FS_READ.union(Caps::FS_WRITE), path)?;
+            }
+        }
+        name if name.starts_with("notebook/") => {
+            let path = require_str(args, "path")?;
+            if matches!(name, "notebook/eval_cell" | "notebook/eval_all")
+                && !sandbox.is_unrestricted()
+            {
+                return Err(error_result(
+                    "notebook evaluation is unavailable in a restricted MCP session",
+                ));
+            }
+            let caps = match name {
+                "notebook/new" => Caps::FS_WRITE,
+                "notebook/read" | "notebook/export" => Caps::FS_READ,
+                _ => Caps::FS_READ.union(Caps::FS_WRITE),
+            };
+            check(caps, path)?;
+            if name == "notebook/export" {
+                if let Some(out) = args.get("output_path").and_then(JsonValue::as_str) {
+                    check(Caps::FS_WRITE, out)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Read only regular files, enforcing the limit before and during allocation.
+pub(crate) fn read_source_bytes(path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let metadata = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if metadata.len() > max_bytes as u64 {
+        return Err(format!("{} exceeds max_source_bytes", path.display()));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .and_then(|f| {
+            f.take((max_bytes as u64).saturating_add(1))
+                .read_to_end(&mut bytes)
+        })
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > max_bytes {
+        return Err("source exceeds max_source_bytes".into());
+    }
+    Ok(bytes)
+}
+
 /// Invokes standard dev tools, notebook tools, or user-defined deftools
 /// Restores the previous `sys/args` binding on the shared interpreter env when
 /// dropped, so a `run_file` call's argument override cannot leak into a later
 /// call — even if evaluation panics and unwinds.
-struct SysArgsGuard {
+pub(crate) struct SysArgsGuard {
     env: std::rc::Rc<sema_core::Env>,
     prev: Option<Value>,
+}
+
+impl SysArgsGuard {
+    pub(crate) fn install(
+        interpreter: &Interpreter,
+        arguments: &JsonValue,
+    ) -> Result<Option<Self>, CallToolResult> {
+        let Some(args) = arguments.get("arguments") else {
+            return Ok(None);
+        };
+        let args = args
+            .as_array()
+            .ok_or_else(|| error_result("arguments must be an array of strings"))?;
+        let args: Vec<String> = args
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| error_result("arguments must be strings"))
+            })
+            .collect::<Result<_, _>>()?;
+        let prev = interpreter.global_env.get(sema_core::intern("sys/args"));
+        interpreter.global_env.set_str(
+            "sys/args",
+            Value::native_fn(sema_core::NativeFn::simple("sys/args", move |_| {
+                Ok(Value::list(args.iter().map(|s| Value::string(s)).collect()))
+            })),
+        );
+        Ok(Some(Self {
+            env: interpreter.global_env.clone(),
+            prev,
+        }))
+    }
+}
+
+/// Restore compile-time macro bindings after compiling a file in the session.
+struct CompileBindingsGuard {
+    env: std::rc::Rc<sema_core::Env>,
+    bindings: Vec<(sema_core::Spur, Value)>,
+}
+impl CompileBindingsGuard {
+    fn new(interpreter: &Interpreter) -> Self {
+        let mut bindings = Vec::new();
+        interpreter
+            .global_env
+            .iter_bindings(|name, value| bindings.push((name, value.clone())));
+        Self {
+            env: interpreter.global_env.clone(),
+            bindings,
+        }
+    }
+}
+impl Drop for CompileBindingsGuard {
+    fn drop(&mut self) {
+        let mut names = Vec::new();
+        self.env.iter_bindings(|name, _| names.push(name));
+        for name in names {
+            self.env.take(name);
+        }
+        for (name, value) in self.bindings.drain(..) {
+            self.env.set(name, value);
+        }
+    }
 }
 
 impl Drop for SysArgsGuard {
@@ -659,50 +825,26 @@ impl Drop for SysArgsGuard {
     }
 }
 
-/// Extract a human-readable message from a caught panic payload.
-fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = panic.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = panic.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "unknown panic".to_string()
-    }
-}
-
-/// Read an optional per-call `timeout_ms` argument, falling back to the
-/// server-configured default. `Some(Duration::ZERO)` means "disabled" (either
-/// because the call explicitly asked for it, or the default is disabled and
-/// the call didn't override it) — callers must check `is_zero()` themselves,
-/// this only resolves precedence. A present-but-malformed `timeout_ms` is an
-/// error so a caller cannot accidentally run with a longer default timeout.
-fn resolve_call_timeout(
+/// A call may shorten the session budget. Zero retains the session default.
+pub(crate) fn resolve_call_timeout(
     arguments: &JsonValue,
     default_timeout: Option<std::time::Duration>,
 ) -> Result<Option<std::time::Duration>, &'static str> {
-    match arguments.get("timeout_ms") {
-        Some(value) => value
-            .as_u64()
-            .map(std::time::Duration::from_millis)
-            .map(Some)
-            .ok_or("Invalid parameter: timeout_ms must be a non-negative integer"),
-        None => Ok(default_timeout),
+    let default = default_timeout.filter(|d| !d.is_zero());
+    let Some(value) = arguments.get("timeout_ms") else {
+        return Ok(default);
+    };
+    let ms = value
+        .as_u64()
+        .ok_or("Invalid parameter: timeout_ms must be a non-negative integer")?;
+    if ms == 0 {
+        return Ok(default);
     }
+    let requested = std::time::Duration::from_millis(ms);
+    Ok(Some(default.map_or(requested, |d| d.min(requested))))
 }
 
-/// Dispatch a tool call, converting any panic during evaluation into an
-/// `isError` result instead of letting it unwind out and terminate the
-/// (single-threaded) MCP server loop.
-///
-/// Arms a wall-clock deadline on `interpreter.ctx` before dispatch and always
-/// clears it after (both success and panic paths), the same arm-before /
-/// always-clear-after shape `sema_notebook::Engine::eval_source_named` uses
-/// for per-cell timeouts. This is a runaway-loop backstop for `eval`/
-/// `run_file`/tool-handler dispatch — see issue #153, a wedged eval left the
-/// single-threaded stdio server unresponsive forever with no recovery short
-/// of killing the process. `default_tool_timeout` is the server-wide
-/// default (`sema mcp --timeout-ms`); an MCP caller can override it per call
-/// via a `timeout_ms` argument on `eval`/`run_file` (`resolve_call_timeout`).
+/// Compatibility entry point; all runtime execution uses the session dispatcher.
 pub fn call_mcp_tool(
     name: &str,
     arguments: &JsonValue,
@@ -712,44 +854,22 @@ pub fn call_mcp_tool(
     exclude_tools: Option<&[String]>,
     default_tool_timeout: Option<std::time::Duration>,
 ) -> CallToolResult {
-    let timeout = match resolve_call_timeout(arguments, default_tool_timeout) {
-        Ok(timeout) => timeout,
-        Err(message) => return error_result(message),
-    };
-    let previous_deadline = interpreter.ctx.eval_deadline.get();
-    let call_deadline = timeout
-        .filter(|budget| !budget.is_zero())
-        .map(|budget| std::time::Instant::now() + budget);
-    let effective_deadline = match (previous_deadline, call_deadline) {
-        (Some(outer), Some(inner)) => Some(outer.min(inner)),
-        (outer @ Some(_), None) => outer,
-        (None, inner) => inner,
-    };
-    interpreter.ctx.set_eval_deadline(effective_deadline);
-
-    let dispatch = std::panic::AssertUnwindSafe(|| {
-        call_mcp_tool_inner(
-            name,
-            arguments,
-            interpreter,
-            notebook_cache,
-            include_tools,
-            exclude_tools,
-        )
-    });
-    let result = match std::panic::catch_unwind(dispatch) {
-        Ok(result) => result,
-        Err(panic) => error_result(format!(
-            "Tool '{name}' panicked during evaluation: {}",
-            panic_message(panic.as_ref())
-        )),
-    };
-
-    interpreter.ctx.set_eval_deadline(previous_deadline);
-    result
+    let mut options = crate::session::McpServerOptions::cli().timeout(default_tool_timeout);
+    if let Some(include) = include_tools {
+        options = options.only_tools(include.iter().cloned());
+    }
+    if let Some(exclude) = exclude_tools {
+        options = options.exclude_tools(exclude.iter().cloned());
+    }
+    match crate::session::McpSession::new_with_cache(interpreter, options, notebook_cache.clone()) {
+        Ok(session) => session
+            .call_tool(interpreter, name, arguments)
+            .unwrap_or_else(Into::into),
+        Err(error) => error_result(error.to_string()),
+    }
 }
 
-fn call_mcp_tool_inner(
+pub(crate) fn call_host_tool(
     name: &str,
     arguments: &JsonValue,
     interpreter: &Interpreter,
@@ -767,76 +887,6 @@ fn call_mcp_tool_inner(
     }
 
     match name {
-        "run_file" => {
-            let file_path = match require_str(arguments, "file_path") {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-            let args = arguments.get("arguments").and_then(|v| v.as_array());
-
-            let path = Path::new(file_path);
-            let bytes = match std::fs::read(path) {
-                Ok(b) => b,
-                Err(e) => return error_result(format!("Failed to read {file_path}: {e}")),
-            };
-
-            // Setup sys/args override if parameters provided. The guard restores
-            // the previous binding on scope exit — including a panic unwind — so
-            // one tool call can't leak its args into the next on the shared env.
-            let _args_guard = args.map(|arg_list| {
-                let prev = interpreter.global_env.get(sema_core::intern("sys/args"));
-                let lisp_args: Vec<Value> = arg_list
-                    .iter()
-                    .map(|v| Value::string(v.as_str().unwrap_or("")))
-                    .collect();
-                let list_val = Value::list(lisp_args);
-                interpreter.global_env.set(
-                    sema_core::intern("sys/args"),
-                    Value::native_fn(sema_core::NativeFn::simple("sys/args", move |_| {
-                        Ok(list_val.clone())
-                    })),
-                );
-                SysArgsGuard {
-                    env: interpreter.global_env.clone(),
-                    prev,
-                }
-            });
-
-            let (res, stdout) = eval_with_capture(|| {
-                if sema_vm::is_bytecode_file(&bytes) {
-                    interpreter.run_bytecode_bytes(&bytes)
-                } else {
-                    let source =
-                        std::str::from_utf8(&bytes).map_err(|e| SemaError::eval(e.to_string()))?;
-                    if let Ok(canonical) = path.canonicalize() {
-                        interpreter.ctx.push_file_path(canonical);
-                    }
-                    let r = interpreter.eval_str_compiled(source);
-                    interpreter.ctx.pop_file_path();
-                    r
-                }
-            });
-
-            drop(_args_guard);
-
-            match res {
-                Ok(val) => {
-                    let mut text = stdout;
-                    if !val.is_nil() {
-                        text.push_str(&format!("\nResult: {val}"));
-                    }
-                    success_result(text)
-                }
-                Err(e) => {
-                    let mut text = stdout;
-                    text.push_str(&format!("\nError: {e}"));
-                    CallToolResult {
-                        content: vec![ToolContent::Text { text }],
-                        is_error: true,
-                    }
-                }
-            }
-        }
         "compile" => {
             let source_path = match require_str(arguments, "source_path") {
                 Ok(v) => v,
@@ -845,15 +895,16 @@ fn call_mcp_tool_inner(
             let output_path = arguments.get("output_path").and_then(|v| v.as_str());
 
             let path = Path::new(source_path);
-            let source = match std::fs::read_to_string(path) {
+            let source = match read_source_bytes(path, 16 * 1024 * 1024)
+                .and_then(|b| String::from_utf8(b).map_err(|e| e.to_string()))
+            {
                 Ok(s) => s,
                 Err(e) => return error_result(format!("Failed to read {source_path}: {e}")),
             };
 
             let source_hash = crc32fast::hash(source.as_bytes());
-            let compile_interpreter =
-                Interpreter::new_with_sandbox(&sema_core::Sandbox::allow_all());
-            let result = match compile_interpreter.compile_to_bytecode(&source) {
+            let _bindings = CompileBindingsGuard::new(interpreter);
+            let result = match interpreter.compile_file_to_bytecode(path, &source) {
                 Ok(r) => r,
                 Err(e) => return error_result(format!("compilation failed: {}", e.format_plain())),
             };
@@ -876,32 +927,6 @@ fn call_mcp_tool_inner(
 
             success_result(format!("Compiled successfully to {}", out_path.display()))
         }
-        "eval" => {
-            let code = match require_str(arguments, "code") {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-
-            let (res, stdout) = eval_with_capture(|| interpreter.eval_str_compiled(code));
-
-            match res {
-                Ok(val) => {
-                    let mut text = stdout;
-                    if !val.is_nil() {
-                        text.push_str(&format!("\nResult: {val}"));
-                    }
-                    success_result(text)
-                }
-                Err(e) => {
-                    let mut text = stdout;
-                    text.push_str(&format!("\nError: {e}"));
-                    CallToolResult {
-                        content: vec![ToolContent::Text { text }],
-                        is_error: true,
-                    }
-                }
-            }
-        }
         "docs" => {
             let symbol = match require_str(arguments, "symbol") {
                 Ok(v) => v,
@@ -912,6 +937,9 @@ fn call_mcp_tool_inner(
             let env_val = interpreter.global_env.get(sema_core::intern(symbol));
             if let Some(v) = env_val {
                 if let ValueViewRef::ToolDef(td) = v.view_ref() {
+                    if !is_exposed(td) {
+                        return error_result(format!("Tool '{symbol}' is not exposed."));
+                    }
                     let doc = format!(
                         "Tool: {}\nDescription: {}\nParameters: {}",
                         td.name,
@@ -969,7 +997,9 @@ fn call_mcp_tool_inner(
 
             if let Some(file) = file_path {
                 let path = Path::new(file);
-                let content = match std::fs::read_to_string(path) {
+                let content = match read_source_bytes(path, 16 * 1024 * 1024)
+                    .and_then(|b| String::from_utf8(b).map_err(|e| e.to_string()))
+                {
                     Ok(c) => c,
                     Err(e) => return error_result(format!("Failed to read {file}: {e}")),
                 };
@@ -1001,7 +1031,7 @@ fn call_mcp_tool_inner(
                 Err(e) => return e,
             };
 
-            let bytes = match std::fs::read(file_path) {
+            let bytes = match read_source_bytes(Path::new(file_path), 16 * 1024 * 1024) {
                 Ok(b) => b,
                 Err(e) => return error_result(format!("Failed to read {file_path}: {e}")),
             };
@@ -1021,9 +1051,8 @@ fn call_mcp_tool_inner(
                     Ok(s) => s,
                     Err(e) => return error_result(format!("Invalid UTF-8 in source: {e}")),
                 };
-                let compile_interpreter =
-                    Interpreter::new_with_sandbox(&sema_core::Sandbox::allow_all());
-                match compile_interpreter.compile_to_bytecode(source) {
+                let _bindings = CompileBindingsGuard::new(interpreter);
+                match interpreter.compile_file_to_bytecode(Path::new(file_path), source) {
                     Ok(r) => r,
                     Err(e) => {
                         return error_result(format!("compilation failed: {}", e.format_plain()))
@@ -1042,48 +1071,14 @@ fn call_mcp_tool_inner(
 
             success_result(disasm_str)
         }
-        "build" => {
-            let source_path = match require_str(arguments, "source_path") {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-            let output_path = match require_str(arguments, "output_path") {
-                Ok(v) => v,
-                Err(e) => return e,
-            };
-
-            // Call standard sema command line tool using current executable
-            let exe = match std::env::current_exe() {
-                Ok(e) => e,
-                Err(e) => return error_result(format!("Failed to get current executable: {e}")),
-            };
-
-            let output = match std::process::Command::new(exe)
-                .arg("build")
-                .arg(source_path)
-                .arg("-o")
-                .arg(output_path)
-                .output()
-            {
-                Ok(out) => out,
-                Err(e) => return error_result(format!("Failed to execute build subprocess: {e}")),
-            };
-
-            if output.status.success() {
-                success_result(format!(
-                    "Built standalone binary successfully at {output_path}"
-                ))
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                error_result(format!("Build process failed:\n{stderr}"))
-            }
-        }
+        "build" => error_result("build requires an explicit in-process build hook"),
         "info" => {
             let info_str = format!(
-                "Sema MCP Server v{}\nTarget Platform: {}/{}\nSandbox: unrestricted — tools execute with full filesystem, network, and shell access in the host environment. Only connect trusted clients.",
+                "Sema MCP Server v{}\nTarget Platform: {}/{}\nSandbox: {}. Only connect trusted clients.",
                 env!("CARGO_PKG_VERSION"),
                 std::env::consts::OS,
                 std::env::consts::ARCH,
+                if interpreter.ctx.sandbox.is_unrestricted() {"unrestricted — tools execute with full filesystem, network, and shell access in the host environment".to_string()} else {format!("restricted; denied capabilities: {:?}; path restrictions are enforced",interpreter.ctx.sandbox.denied)},
             );
             success_result(info_str)
         }
@@ -1315,55 +1310,7 @@ fn call_mcp_tool_inner(
                 Err(e) => error_result(format!("Failed to load notebook: {e}")),
             }
         }
-        // User deftool definitions
-        _ => {
-            let bindings = interpreter.global_env.get(sema_core::intern(name));
-            if let Some(v) = bindings {
-                if let ValueViewRef::ToolDef(td) = v.view_ref() {
-                    let sema_args = match json_args_to_sema(&td.parameters, arguments, &td.handler)
-                    {
-                        Ok(a) => a,
-                        Err(e) => {
-                            return error_result(format!(
-                                "Invalid arguments for tool '{name}': {e}"
-                            ));
-                        }
-                    };
-                    let (res, stdout) =
-                        eval_with_capture(|| call_value(&interpreter.ctx, &td.handler, &sema_args));
-
-                    match res {
-                        Ok(val) => {
-                            let mut text = stdout;
-                            if let Some(s) = val.as_str() {
-                                text.push_str(s);
-                            } else if val.as_map_rc().is_some() || val.as_seq().is_some() {
-                                let json_lossy = sema_core::value_to_json_lossy(&val);
-                                text.push_str(
-                                    &serde_json::to_string(&json_lossy)
-                                        .unwrap_or_else(|_| val.to_string()),
-                                );
-                            } else if !val.is_nil() {
-                                text.push_str(&val.to_string());
-                            }
-                            success_result(text)
-                        }
-                        Err(e) => {
-                            let mut text = stdout;
-                            text.push_str(&format!("\nError: {e}"));
-                            CallToolResult {
-                                content: vec![ToolContent::Text { text }],
-                                is_error: true,
-                            }
-                        }
-                    }
-                } else {
-                    error_result(format!("Symbol '{name}' is defined but is not a tool."))
-                }
-            } else {
-                error_result(format!("Unknown tool: {name}"))
-            }
-        }
+        _ => error_result(format!("Unknown host tool: {name}")),
     }
 }
 

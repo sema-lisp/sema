@@ -15,6 +15,7 @@
 use std::rc::Rc;
 
 pub mod host_fn;
+pub mod mcp;
 pub mod workflow_evidence;
 pub mod workflow_mcp;
 // `sema workflow view` — the dashboard server. Lives in the library (not just
@@ -43,6 +44,8 @@ pub struct InterpreterBuilder {
     stdlib: bool,
     llm: bool,
     mcp: bool,
+    llm_auto_configure: bool,
+    workflow_mcp: bool,
     sandbox: Sandbox,
     telemetry: sema_otel::TelemetryMode,
 }
@@ -60,6 +63,8 @@ impl InterpreterBuilder {
             stdlib: true,
             llm: true,
             mcp: true,
+            llm_auto_configure: false,
+            workflow_mcp: false,
             sandbox: Sandbox::allow_all(),
             telemetry: sema_otel::TelemetryMode::Off,
         }
@@ -91,6 +96,19 @@ impl InterpreterBuilder {
     /// Enable or disable the MCP client builtins (default: `true`).
     pub fn with_mcp(mut self, enable: bool) -> Self {
         self.mcp = enable;
+        self
+    }
+
+    /// Attempt environment-based LLM configuration, as the CLI does (default off).
+    /// Call (llm/auto-configure) explicitly after building to inspect configuration errors.
+    pub fn with_llm_auto_configure(mut self, enable: bool) -> Self {
+        self.llm_auto_configure = enable;
+        self
+    }
+
+    /// Install the workflow MCP resolver on this thread (default off).
+    pub fn with_workflow_mcp(mut self, enable: bool) -> Self {
+        self.workflow_mcp = enable;
         self
     }
 
@@ -161,10 +179,18 @@ impl InterpreterBuilder {
         sema_eval::register_vm_delegates(&global_env, &ctx);
         sema_eval::load_prelude(&ctx, &global_env);
 
-        Interpreter {
+        let interpreter = Interpreter {
             inner: sema_eval::Interpreter::from_parts(global_env, ctx),
             _otel_guard: guard,
+            features: (self.stdlib, self.llm, self.mcp),
+        };
+        if self.workflow_mcp {
+            workflow_mcp::register_real_resolver();
         }
+        if self.llm && self.llm_auto_configure {
+            let _ = interpreter.eval_str("(llm/auto-configure)");
+        }
+        interpreter
     }
 }
 
@@ -174,6 +200,7 @@ impl InterpreterBuilder {
 /// [`Interpreter::new`] for a default interpreter with stdlib enabled.
 pub struct Interpreter {
     inner: sema_eval::Interpreter,
+    features: (bool, bool, bool),
     /// Owns any self-installed OpenTelemetry provider (TelemetryMode::FromEnv) for the
     /// interpreter's lifetime; flushes on drop. `None` for all other modes.
     _otel_guard: Option<sema_otel::OtelGuard>,

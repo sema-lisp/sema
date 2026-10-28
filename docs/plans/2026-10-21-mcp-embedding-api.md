@@ -1,9 +1,50 @@
 # MCP access through the public embedding API
 
-**Status:** Fourth draft after two five-role adversarial review rounds
-(embedder, CLI and MCP-client user, security, runtime safety, performance) and
-a reuse audit against the runtime host API and the notebook engine. Decisions
-D1-D13 are proposed, not approved. No API in this document is implemented.
+**Status:** Core server embedding implemented for Sema 2.0; release verification
+is in progress. The original design below records the 1.37 baseline and the
+alternatives considered. The public API and migration guide describe the
+implemented behavior.
+
+## Implementation record — 2026-10-28
+
+Kameko's [follow-up request](https://github.com/sema-lisp/sema/pull/176#issuecomment-6451426848)
+explicitly asks for an embeddable MCP server. The implementation exposes
+`sema::mcp::{McpSession, McpWorker}` through the public interpreter wrapper and
+includes a standalone example that depends on that public API.
+
+- D1/D11: explicit embedded preset, opt-in eval, filters, hidden/reserved-name
+  checks, interpreter identity, and RAII re-entrancy guards.
+- D2/D7: capability/path and regular-file/size checks, session compilation with
+  binding restoration, a notebook factory that preserves host features and
+  provider state, and an in-process CLI build hook. Notebook evaluation stays
+  unavailable under a restricted sandbox. The CLI build hook also fails closed
+  for restricted hosts; extending it to selected allowed paths is deferred.
+- D3/D9/D13: runtime roots for eval, run_file, and deftools; parked waits honor
+  eval deadlines; calls may shorten their session budget; targeted cancellation
+  supports numeric and string request ids. Calls drive only their own root,
+  then give detached work one bounded turn outside the next call's deadline.
+- D4/D8: a dedicated 16 MiB worker thread and a bounded async request channel;
+  owned JSON crosses the thread boundary. Notebook and MCP share thread
+  construction, and notebook cancellation uses the lifted `sema_eval::CancelToken`.
+  Their domain-specific request enums remain separate. Legacy async transport
+  functions remain compatibility adapters over the same session primitive.
+- D5/D10: typed errors, protocol-type constructors, restored host hooks,
+  allocation-time root-output limits, bounded result formatting, frame limits
+  with drain/recovery, and output/log callbacks. The wire protocol remains
+  `2024-11-05` with text results. `structuredContent` and `outputSchema` are
+  deferred together, so this release does not advertise a protocol revision
+  whose full result contract it does not implement.
+- D12: builder parity flags, shared CLI/standalone arguments, `--preset` and
+  `--check`. Cached builtin schemas supply the common name registry.
+- Performance prerequisite: compilation borrows its span table through scoped
+  TLS; native names are cached against every environment scope's version.
+  The output path bounds formatting as well as captured prints. No latency
+  claim is made without a benchmark of the final build.
+
+The thirteen initial embedding acceptance tests and the existing twelve
+protocol tests pass. The public example was exercised over a real stdio pipe
+with initialize/list/async-call requests and no library stderr output. Full
+release checks and final evidence are tracked in `2026-10-28-release-2.md`.
 
 ## Problem and current behavior
 

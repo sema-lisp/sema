@@ -14,7 +14,7 @@ Add Sema to your project:
 
 ```toml
 [dependencies]
-sema-lang = "1.11"
+sema-lang = "2.0"
 ```
 
 Or use the latest unreleased version from git:
@@ -440,7 +440,140 @@ the workers need to evaluate Sema themselves. The same rules apply to async
 executors: a task that can move between worker threads must not hold a Sema
 value across an `.await`.
 
+## Serving MCP from a Rust host
+
+Use the public `sema::mcp` module to expose an existing interpreter. The
+interpreter keeps its definitions, registered host functions, sandbox, and
+telemetry configuration. A session is bound to that interpreter and stays on
+its thread; passing a different interpreter returns an error.
+
+```toml
+[dependencies]
+sema-lang = "2.0"
+serde_json = "1"
+```
+
+```rust
+use sema::{Caps, Interpreter, Sandbox};
+use sema::mcp::{McpServerOptions, McpSession};
+use serde_json::json;
+
+let interpreter = Interpreter::builder()
+    .with_sandbox(Sandbox::deny(Caps::STRICT))
+    .with_llm(false)
+    .with_mcp(false)
+    .build();
+interpreter.eval_str(r#"
+    (deftool greet "Greet someone."
+      {:name {:type :string}}
+      (lambda (name) (string-append "hello, " name)))
+"#)?;
+
+let session = McpSession::new(
+    &interpreter,
+    McpServerOptions::embedded().server_info("my-host", "2.0.0"),
+)?;
+let result = session.call_tool(&interpreter, "greet", &json!({"name": "Kameko"}))?;
+assert!(!result.is_error);
+```
+
+The embedded preset exposes visible `deftool` definitions, `docs`,
+`docs_search`, and `info`. `enable_eval()` adds arbitrary evaluation;
+`also_tools(["eval"])` without it is an error. `also_tools` adds other builtin
+tools, `only_tools` narrows the enabled set, and `exclude_tools` takes
+precedence. Hidden tools remain hidden. Builtin tool names and names beginning
+with `_` cannot be exposed as user tools.
+
+Enabling `eval` gives the client access to every function registered in the
+interpreter, within its sandbox. A tool-name filter does not limit that access.
+Rust host functions must enforce their own permissions; the sandbox cannot
+restrict arbitrary Rust code inside a callback.
+
+The session can process one JSON-RPC frame with `handle_message`, serve a
+blocking `BufRead`/`Write` pair with `serve_on`, or own process stdio with
+`serve_stdio`. Its default limits are 16 MiB per input frame, 16 MiB per source
+file, 1 MiB of captured output per root, and five minutes per call. Oversized
+input lines are drained before processing the next frame. `ToolOutput::Capture`
+is required for stdio serving. Output hooks installed by the host are restored
+after a call.
+
+Host Rust `println!` bypasses Sema's output capture and can corrupt a stdio
+connection. Send host logs through a separate channel. `on_log` receives typed
+session events; `on_output` receives detached output and output routed by
+`PassThrough` or `Tee`. These callbacks run on the interpreter thread and
+must not block or evaluate Sema.
+
+### Async Rust hosts
+
+Use `McpWorker` from Tokio or another async host. It creates the interpreter
+on a dedicated thread with a 16 MiB stack. Its cloneable handle exchanges owned
+JSON; Sema values never cross the thread boundary. The setup closure runs on
+the interpreter thread and can register synchronous or async host functions.
+
+```rust
+use sema::Interpreter;
+use sema::mcp::{McpServerOptions, McpWorker};
+use serde_json::json;
+
+let worker = McpWorker::spawn(
+    Interpreter::builder(),
+    McpServerOptions::embedded(),
+    |interpreter| {
+        interpreter.register_async_fn_typed("host/double", |n: i64| async move {
+            Ok::<_, std::convert::Infallible>(n * 2)
+        });
+        interpreter.eval_str(r#"
+            (deftool double "Double a number." {:n {:type :integer}}
+              (lambda (n) (host/double n)))
+        "#)?;
+        Ok(())
+    },
+)?;
+let result = worker.handle().call_tool("double", json!({"n": 21})).await?;
+assert!(!result.is_error);
+worker.shutdown().await?;
+```
+
+For explicit cancellation, allocate an id with `handle.next_call_id()`, pass
+it to `call_tool_with_id`, and call `handle.cancel(id)` from another task.
+A session's `cancel_handle()` provides the same control across native threads.
+Cancellation targets a running call; an id that has already settled is inert.
+Worker `handle_message` accepts numeric and string JSON-RPC request ids and
+processes `notifications/cancelled` without waiting behind the active call.
+
+Cancellation and deadlines reach VM back-edges and external async waits. They
+cannot interrupt a CPU-bound native callback or a future blocked in a system
+call. Those operations must enforce their own time limits. Panic conversion
+requires an unwinding host; the workspace release profile uses `panic=abort`,
+where a panic in a host callback terminates the process. Run untrusted tool
+files in a separate process.
+
+`with_llm_auto_configure(true)` attempts the CLI's environment-based LLM setup;
+call `(llm/auto-configure)` explicitly to inspect configuration errors.
+`with_workflow_mcp(true)` installs the workflow MCP resolver. Both flags default
+to off. Notebook evaluation tools remain unavailable in restricted MCP
+sessions. The CLI build hook requires an unrestricted session, and a built
+`--mcp` binary has no build hook.
+
+### MCP clients inside an embedded interpreter
+
+The builder enables `mcp/connect`, `mcp/tools`, `mcp/tools->sema`, `mcp/call`,
+and `mcp/close` by default. `with_mcp(false)` disables them. A stdio connection
+requires `PROCESS`; an HTTP connection requires `NETWORK`.
+
+Connections are stored per thread and are shared by interpreters on that
+thread. Close them explicitly with `mcp/close`. Dropping an interpreter does
+not close its connections; thread exit tears down stdio children. The workflow
+resolver and OAuth browser-open checks also share the last registered MCP
+sandbox on the thread. Give independent hosts their own worker threads when
+they need independent connection lifetimes and resolver configuration.
+
+A complete stdio server example is in
+[`crates/sema/examples/embedded_mcp.rs`](https://github.com/sema-lisp/sema/blob/main/crates/sema/examples/embedded_mcp.rs).
+
 ## Security Considerations
+
+See [Migrating to 2.0](/docs/migrating-to-2) when updating a 1.x Rust host.
 
 By default, Sema scripts have full access to the filesystem, shell, network, and environment. For untrusted code, you have two options:
 

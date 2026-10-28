@@ -868,6 +868,10 @@ fn register_runtime_interior_hooks() {
 }
 
 impl Runtime {
+    /// Stable identity used by hosts to bind resources to this runtime.
+    pub fn runtime_id(&self) -> sema_core::runtime::RuntimeId {
+        self.runtime_id
+    }
     pub fn new(
         context: Rc<EvalContext>,
         clock: Rc<dyn RuntimeClock>,

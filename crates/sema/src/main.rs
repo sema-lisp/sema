@@ -17,6 +17,7 @@ mod docs;
 mod eval_cli;
 mod fmt;
 mod import_tracer;
+mod mcp_cli;
 mod notebook_cli;
 mod output;
 mod pkg;
@@ -302,24 +303,8 @@ enum Commands {
         /// Optional source files to run/load tools from (server mode)
         #[arg(value_name = "FILES")]
         files: Vec<String>,
-        /// Comma-separated list of tool names to explicitly include
-        #[arg(long, value_name = "TOOLS")]
-        include: Option<String>,
-        /// Comma-separated list of tool names to explicitly exclude
-        #[arg(long, value_name = "TOOLS")]
-        exclude: Option<String>,
-        /// Sandbox mode for the server (e.g. "strict" or "no-fs-write,no-shell").
-        /// Defaults to the top-level --sandbox value, else allows everything.
-        #[arg(long, value_name = "MODE")]
-        sandbox: Option<String>,
-        /// Default per-tool-call timeout in milliseconds for eval/run_file/
-        /// tool-handler calls (a caller can override it per call via a
-        /// `timeout_ms` argument). 0 disables the timeout: a runaway loop
-        /// then wedges the single-threaded server indefinitely (issue #153),
-        /// so this is not recommended. Defaults to SEMA_MCP_EVAL_TIMEOUT_MS
-        /// if set, else 300000 (5 minutes).
-        #[arg(long, value_name = "MS")]
-        timeout_ms: Option<u64>,
+        #[command(flatten)]
+        serve: mcp_cli::McpServeArgs,
     },
     /// Cell-based notebook with a browser UI
     Notebook {
@@ -858,10 +843,7 @@ fn resolve_mcp_tool_timeout(explicit_ms: Option<u64>) -> Option<std::time::Durat
 fn run_mcp(
     auth: Option<McpAuthCommands>,
     files: Vec<String>,
-    include: Option<String>,
-    exclude: Option<String>,
-    mcp_sandbox: Option<String>,
-    timeout_ms: Option<u64>,
+    serve: mcp_cli::McpServeArgs,
     sandbox: sema_core::Sandbox,
 ) {
     if let Some(auth) = auth {
@@ -887,22 +869,11 @@ fn run_mcp(
         }
         return;
     }
-    let inc_tools = include.map(|s| {
-        s.split(',')
-            .map(|x| x.trim().to_string())
-            .collect::<Vec<String>>()
-    });
-    let exc_tools = exclude.map(|s| {
-        s.split(',')
-            .map(|x| x.trim().to_string())
-            .collect::<Vec<String>>()
-    });
-
     // --sandbox on the subcommand wins; else the top-level --sandbox
     // (already parsed into `sandbox`, defaulting to allow-all). The
     // server historically hardcoded allow_all, so absent flags keep
     // exactly that behavior.
-    let sandbox = match mcp_sandbox.as_deref() {
+    let sandbox = match serve.sandbox.as_deref() {
         Some(value) => sema_core::Sandbox::parse_cli(value).unwrap_or_else(|e| {
             die(format!("invalid MCP --sandbox value: {e}"));
         }),
@@ -912,7 +883,15 @@ fn run_mcp(
 
     let _ = interpreter.eval_str("(llm/auto-configure)");
 
+    let _loading_output = sema_core::output_hook::HostHookScope::new(
+        Some(Box::new(|s| eprint!("{s}"))),
+        Some(Box::new(|s| eprint!("{s}"))),
+    );
     for file in files {
+        sandbox
+            .check(sema_core::Caps::FS_READ, "mcp/load")
+            .and_then(|()| sandbox.check_path(&file, "mcp/load"))
+            .unwrap_or_else(|e| die(e.format_plain()));
         match read_source_file(&file) {
             Ok(content) => {
                 if let Err(e) = interpreter.eval_str_compiled(&content) {
@@ -925,11 +904,7 @@ fn run_mcp(
         }
     }
 
-    // Sync loop, deliberately NO tokio runtime: with an ambient
-    // runtime, llm/* builtins hit io_block_on's runtime-in-runtime
-    // panic and killed the server on the first LLM tool call.
-    let tool_timeout = resolve_mcp_tool_timeout(timeout_ms);
-    if let Err(e) = sema_mcp::run_mcp_server_sync(interpreter, inc_tools, exc_tools, tool_timeout) {
+    if let Err(e) = mcp_cli::run(&interpreter, serve, true) {
         die(format!("MCP server failed: {e}"));
     }
 }
@@ -1346,22 +1321,7 @@ fn main() {
                 block_on_server(sema_lsp::run_server());
             }
             Commands::Dap => block_on_server(sema_dap::run_server()),
-            Commands::Mcp {
-                auth,
-                files,
-                include,
-                exclude,
-                sandbox: mcp_sandbox,
-                timeout_ms,
-            } => run_mcp(
-                auth,
-                files,
-                include,
-                exclude,
-                mcp_sandbox,
-                timeout_ms,
-                sandbox,
-            ),
+            Commands::Mcp { auth, files, serve } => run_mcp(auth, files, serve, sandbox),
             Commands::Notebook { command } => {
                 notebook_cli::run_notebook_command(command);
             }

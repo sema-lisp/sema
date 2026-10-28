@@ -1,337 +1,108 @@
-use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-use crate::notebook::{new_cache, NotebookCache};
-use crate::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
-use crate::tools::{call_mcp_tool, list_mcp_tools};
+//! Compatibility transport adapters over the shared MCP session.
+use crate::session::{McpServerOptions, McpSession};
 use sema_eval::Interpreter;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+fn options(
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    timeout: Option<std::time::Duration>,
+) -> McpServerOptions {
+    let mut options = McpServerOptions::cli().timeout(timeout);
+    if let Some(names) = include {
+        options = options.only_tools(names);
+    }
+    if let Some(names) = exclude {
+        options = options.exclude_tools(names);
+    }
+    options
+}
+
+/// Serve over process stdio. Use a session directly to configure logging or build.
+pub fn run_mcp_server_sync(
+    interpreter: Interpreter,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    timeout: Option<std::time::Duration>,
+) -> Result<(), String> {
+    let session = McpSession::new(&interpreter, options(include, exclude, timeout))
+        .map_err(|e| e.to_string())?;
+    session.serve_stdio(&interpreter).map_err(|e| e.to_string())
+}
+
+/// Legacy async transport adapter. Tool execution is synchronous on this thread;
+/// async Rust hosts should use `sema::mcp::McpWorker` instead.
 pub async fn run_mcp_server(
     interpreter: Interpreter,
-    include_tools: Option<Vec<String>>,
-    exclude_tools: Option<Vec<String>>,
-    tool_timeout: Option<std::time::Duration>,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    timeout: Option<std::time::Duration>,
 ) -> Result<(), String> {
     run_mcp_server_on(
         tokio::io::stdin(),
         tokio::io::stdout(),
         interpreter,
-        include_tools,
-        exclude_tools,
-        tool_timeout,
+        include,
+        exclude,
+        timeout,
     )
     .await
 }
 
-/// Synchronous stdio server loop for the CLI entry point.
-///
-/// The server MUST NOT run inside a tokio runtime: tool bodies evaluate
-/// synchronously and LLM builtins reach `sema_io::io_block_on`, which panics
-/// ("Cannot start a runtime from within a runtime") when an ambient runtime
-/// exists — under `panic = "abort"` release builds that killed the whole
-/// server on the first `llm/*` call from an MCP client. Requests are handled
-/// serially anyway, so plain blocking std::io is the correct shape; the async
-/// `run_mcp_server_on` remains for in-memory duplex tests.
-pub fn run_mcp_server_sync(
-    interpreter: Interpreter,
-    include_tools: Option<Vec<String>>,
-    exclude_tools: Option<Vec<String>>,
-    tool_timeout: Option<std::time::Duration>,
-) -> Result<(), String> {
-    use std::io::BufRead;
-
-    let stdin = std::io::stdin();
-    let mut reader = stdin.lock();
-    let stdout = std::io::stdout();
-    let mut writer = stdout.lock();
-    // Same raw-bytes-per-line contract as the async loop: one non-UTF-8 byte
-    // must produce a JSON-RPC parse error, not tear down the server.
-    let mut buf: Vec<u8> = Vec::new();
-
-    let notebook_cache: NotebookCache = new_cache();
-
-    eprintln!("Sema MCP server starting stdio loop...");
-
-    loop {
-        buf.clear();
-        let bytes_read = reader
-            .read_until(b'\n', &mut buf)
-            .map_err(|e| format!("Failed to read stdin: {e}"))?;
-        if bytes_read == 0 {
-            break; // EOF
-        }
-
-        let line = match std::str::from_utf8(&buf) {
-            Ok(s) => s.trim(),
-            Err(_) => {
-                write_line(
-                    &mut writer,
-                    &parse_error_frame("request was not valid UTF-8"),
-                );
-                continue;
-            }
-        };
-        if line.is_empty() {
-            continue;
-        }
-
-        let request: JsonRpcRequest = match serde_json::from_str(line) {
-            Ok(req) => req,
-            Err(e) => {
-                write_line(&mut writer, &parse_error_frame(&format!("{e}")));
-                continue;
-            }
-        };
-
-        let response = handle_request(
-            request,
-            &interpreter,
-            &notebook_cache,
-            include_tools.as_deref(),
-            exclude_tools.as_deref(),
-            tool_timeout,
-        );
-
-        if let Some(resp) = response {
-            if !write_line(&mut writer, &serialize_response(&resp)) {
-                break;
-            }
-        }
-    }
-
-    eprintln!("Sema MCP server stdio loop exited.");
-    Ok(())
-}
-
-/// Write one already-serialized frame + flush; false = writer gone, stop loop.
-fn write_line(writer: &mut impl std::io::Write, frame: &str) -> bool {
-    if let Err(e) = writer.write_all(frame.as_bytes()) {
-        eprintln!("Error writing response to stdout: {e}");
-        return false;
-    }
-    if let Err(e) = writer.flush() {
-        eprintln!("Error flushing stdout: {e}");
-        return false;
-    }
-    true
-}
-
-fn parse_error_frame(message: &str) -> String {
-    let err_resp = JsonRpcResponse {
-        jsonrpc: "2.0".to_string(),
-        result: None,
-        error: Some(JsonRpcError::new(-32700, format!("Parse error: {message}"))),
-        id: None,
-        method: None,
-    };
-    serde_json::to_string(&err_resp)
-        .map(|s| format!("{s}\n"))
-        .unwrap_or_default()
-}
-
-/// Serialize a response without unwrapping: a serialization failure falls back
-/// to a -32603 frame carrying the original id (shared by both server loops).
-fn serialize_response(resp: &JsonRpcResponse) -> String {
-    match serde_json::to_string(resp) {
-        Ok(s) => format!("{s}\n"),
-        Err(e) => {
-            eprintln!("Failed to serialize response: {e}");
-            let fallback = JsonRpcResponse {
-                jsonrpc: "2.0".to_string(),
-                result: None,
-                error: Some(JsonRpcError::new(
-                    -32603,
-                    format!("Internal error: failed to serialize response: {e}"),
-                )),
-                id: resp.id.clone(),
-                method: None,
-            };
-            match serde_json::to_string(&fallback) {
-                Ok(s) => format!("{s}\n"),
-                Err(_) => "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"Internal error\"},\"id\":null}\n".to_string(),
-            }
-        }
-    }
-}
-
+/// Legacy async transport adapter using the same bounded frame and session rules.
 pub async fn run_mcp_server_on<R, W>(
     reader: R,
     mut writer: W,
     interpreter: Interpreter,
-    include_tools: Option<Vec<String>>,
-    exclude_tools: Option<Vec<String>>,
-    tool_timeout: Option<std::time::Duration>,
+    include: Option<Vec<String>>,
+    exclude: Option<Vec<String>>,
+    timeout: Option<std::time::Duration>,
 ) -> Result<(), String>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut stdin = BufReader::new(reader);
-    // Read raw bytes per line: a single non-UTF-8 byte must NOT tear down the
-    // server (it should produce a JSON-RPC parse error and continue), so we
-    // cannot use `read_line` which fails the whole read on invalid UTF-8.
-    let mut buf: Vec<u8> = Vec::new();
-
-    let notebook_cache: NotebookCache = new_cache();
-
-    eprintln!("Sema MCP server starting stdio loop...");
-
+    let options = options(include, exclude, timeout);
+    let limit = options.max_frame_bytes;
+    let session = McpSession::new(&interpreter, options).map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(reader);
+    let mut frame = Vec::new();
     loop {
-        buf.clear();
-        let bytes_read = stdin
-            .read_until(b'\n', &mut buf)
+        frame.clear();
+        let read = (&mut reader)
+            .take((limit as u64).saturating_add(1))
+            .read_until(b'\n', &mut frame)
             .await
-            .map_err(|e| format!("Failed to read stdin: {e}"))?;
-        if bytes_read == 0 {
-            break; // EOF
+            .map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
         }
-
-        // Decode as UTF-8. A malformed line is a recoverable parse error.
-        let line = match std::str::from_utf8(&buf) {
-            Ok(s) => s,
-            Err(_) => {
-                write_parse_error(&mut writer, "request was not valid UTF-8".to_string()).await;
-                continue;
+        if frame.len() > limit && frame.last() != Some(&b'\n') {
+            loop {
+                let bytes = reader.fill_buf().await.map_err(|e| e.to_string())?;
+                if bytes.is_empty() {
+                    break;
+                }
+                let end = bytes.iter().position(|b| *b == b'\n');
+                let used = end.map_or(bytes.len(), |n| n + 1);
+                reader.consume(used);
+                if end.is_some() {
+                    break;
+                }
             }
-        };
-
-        let line_trimmed = line.trim();
-        if line_trimmed.is_empty() {
+        }
+        if frame.len() <= limit && frame.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-
-        let request: JsonRpcRequest = match serde_json::from_str(line_trimmed) {
-            Ok(req) => req,
-            Err(e) => {
-                write_parse_error(&mut writer, format!("{e}")).await;
-                continue;
-            }
-        };
-
-        let response = handle_request(
-            request,
-            &interpreter,
-            &notebook_cache,
-            include_tools.as_deref(),
-            exclude_tools.as_deref(),
-            tool_timeout,
-        );
-
-        if let Some(resp) = response {
-            // Shared with the sync loop: serialize without unwrapping, falling
-            // back to a -32603 frame that keeps the request id.
-            let resp_str = serialize_response(&resp);
-            if let Err(e) = writer.write_all(resp_str.as_bytes()).await {
-                eprintln!("Error writing response to stdout: {e}");
-                break;
-            }
-            if let Err(e) = writer.flush().await {
-                eprintln!("Error flushing stdout: {e}");
-                break;
-            }
-        }
+        let mut response = Vec::new();
+        session
+            .handle_message(&interpreter, &frame, &mut response)
+            .map_err(|e| e.to_string())?;
+        writer
+            .write_all(&response)
+            .await
+            .map_err(|e| e.to_string())?;
+        writer.flush().await.map_err(|e| e.to_string())?;
     }
-
-    eprintln!("Sema MCP server stdio loop exited.");
     Ok(())
-}
-
-/// Write a JSON-RPC parse-error (-32700) response with a null id and flush.
-/// Used for unrecoverable per-line decode failures (invalid UTF-8 or invalid
-/// JSON) that must not terminate the server loop.
-async fn write_parse_error<W>(writer: &mut W, message: String)
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let err_resp = JsonRpcResponse {
-        jsonrpc: "2.0".to_string(),
-        result: None,
-        error: Some(JsonRpcError::new(-32700, format!("Parse error: {message}"))),
-        id: None,
-        method: None,
-    };
-    if let Ok(s) = serde_json::to_string(&err_resp) {
-        writer.write_all(format!("{s}\n").as_bytes()).await.ok();
-        writer.flush().await.ok();
-    }
-}
-
-fn handle_request(
-    req: JsonRpcRequest,
-    interpreter: &Interpreter,
-    notebook_cache: &NotebookCache,
-    include_tools: Option<&[String]>,
-    exclude_tools: Option<&[String]>,
-    tool_timeout: Option<std::time::Duration>,
-) -> Option<JsonRpcResponse> {
-    // Per JSON-RPC 2.0, a request without an `id` is a notification: the server
-    // MUST NOT reply to it. Bailing out with None here keeps us silent for every
-    // notification method (e.g. notifications/cancelled, notifications/progress)
-    // instead of emitting a spurious `id: null` response.
-    req.id.as_ref()?;
-
-    let method = req.method.as_str();
-    let id = req.id.clone();
-
-    let result = match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "tools": {
-                    "listChanged": false
-                }
-            },
-            "serverInfo": {
-                "name": "sema-mcp",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        })),
-        "notifications/initialized" => {
-            return None;
-        }
-        "ping" => Ok(json!({})),
-        "tools/list" => {
-            let tools = list_mcp_tools(interpreter, include_tools, exclude_tools);
-            Ok(json!({
-                "tools": tools
-            }))
-        }
-        "tools/call" => {
-            let params = req.params.clone().unwrap_or(json!({}));
-            let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-
-            let call_res = call_mcp_tool(
-                name,
-                &arguments,
-                interpreter,
-                notebook_cache,
-                include_tools,
-                exclude_tools,
-                tool_timeout,
-            );
-            Ok(json!(call_res))
-        }
-        _ => Err(JsonRpcError::new(
-            -32601,
-            format!("Method not found: {method}"),
-        )),
-    };
-
-    match result {
-        Ok(res) => Some(JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            result: Some(res),
-            error: None,
-            id,
-            method: None,
-        }),
-        Err(err) => Some(JsonRpcResponse {
-            jsonrpc: "2.0".to_string(),
-            result: None,
-            error: Some(err),
-            id,
-            method: None,
-        }),
-    }
 }

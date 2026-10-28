@@ -55,9 +55,16 @@ fn collect_native_names(env: &Env) -> HashSet<Spur> {
         .collect()
 }
 
+struct NativeNameCache {
+    // Keeping version cells alive prevents allocator address reuse in cache identities.
+    scopes: Vec<(Rc<std::cell::Cell<u64>>, u64)>,
+    names: HashSet<Spur>,
+}
+
 /// The interpreter holds the global environment and state.
 pub struct Interpreter {
     pub global_env: Rc<Env>,
+    native_names: RefCell<Option<NativeNameCache>>,
     /// Shared evaluation context. Held behind an `Rc` so the unified runtime can
     /// share the *same* context the interpreter registered its eval/call
     /// callbacks and module cache onto (see `run_exprs_via_runtime`); a fresh
@@ -240,17 +247,34 @@ impl Interpreter {
     }
 
     pub fn new_with_sandbox(sandbox: &sema_core::Sandbox) -> Self {
+        Self::new_configured(sandbox, true, true, true)
+    }
+
+    /// Build a second host interpreter without clearing thread-shared LLM state.
+    pub fn new_host(sandbox: &sema_core::Sandbox, stdlib: bool, llm: bool) -> Self {
+        Self::new_configured(sandbox, stdlib, llm, false)
+    }
+
+    fn new_configured(sandbox: &sema_core::Sandbox, stdlib: bool, llm: bool, reset: bool) -> Self {
         let env = Env::new();
         let ctx = EvalContext::new_with_sandbox(sandbox.clone());
         sema_core::set_eval_callback(&ctx, eval_value_vm);
         sema_core::set_call_callback(&ctx, call_value);
         sema_core::set_call_owned_callback(&ctx, call_value_owned);
-        sema_stdlib::register_stdlib(&env, sandbox);
+        if stdlib {
+            sema_stdlib::register_stdlib(&env, sandbox);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            sema_llm::builtins::reset_runtime_state();
-            sema_llm::builtins::register_llm_builtins(&env, sandbox);
+            if reset {
+                sema_llm::builtins::reset_runtime_state();
+            }
+            if llm {
+                sema_llm::builtins::register_llm_builtins(&env, sandbox);
+            }
         }
+        #[cfg(target_arch = "wasm32")]
+        let _ = (llm, reset);
         let global_env = Rc::new(env);
         let ctx = Rc::new(ctx);
         register_vm_delegates(&global_env, &ctx);
@@ -268,6 +292,7 @@ impl Interpreter {
             global_env,
             ctx,
             runtime: Some(runtime),
+            native_names: RefCell::new(None),
         }
     }
 
@@ -289,6 +314,7 @@ impl Interpreter {
             global_env,
             ctx,
             runtime: Some(runtime),
+            native_names: RefCell::new(None),
         }
     }
 
@@ -342,6 +368,11 @@ impl Interpreter {
     }
 
     fn ensure_synchronous_runtime_entry_allowed(&self) -> Result<(), SemaError> {
+        if self.ctx.runtime_quantum_active() || sema_core::in_runtime_quantum() {
+            return Err(SemaError::eval(
+                "nested evaluation cannot run inside a runtime quantum",
+            ));
+        }
         #[cfg(target_arch = "wasm32")]
         if self.runtime().is_debug_paused() {
             return Err(SemaError::eval(
@@ -352,6 +383,35 @@ impl Interpreter {
         Ok(())
     }
 
+    fn known_native_names(&self) -> HashSet<Spur> {
+        let mut revision = Vec::new();
+        let mut env = Some(self.global_env.as_ref());
+        while let Some(scope) = env {
+            revision.push((Rc::clone(&scope.version), scope.version.get()));
+            env = scope.parent.as_deref();
+        }
+        let mut cache = self.native_names.borrow_mut();
+        let valid = cache.as_ref().is_some_and(|cached| {
+            cached.scopes.len() == revision.len()
+                && cached
+                    .scopes
+                    .iter()
+                    .zip(&revision)
+                    .all(|((a, av), (b, bv))| Rc::ptr_eq(a, b) && av == bv)
+        });
+        if !valid {
+            *cache = Some(NativeNameCache {
+                scopes: revision,
+                names: collect_native_names(&self.global_env),
+            });
+        }
+        cache
+            .as_ref()
+            .expect("native names initialized above")
+            .names
+            .clone()
+    }
+
     /// Macro-expand and compile a sequence of top-level forms into a
     /// seeded-but-not-yet-submitted VM. Shared by every entry point that
     /// builds a root from source/data forms — [`run_exprs_via_runtime`],
@@ -359,8 +419,8 @@ impl Interpreter {
     /// [`submit_value`](Self::submit_value).
     fn build_vm_for_exprs(&self, exprs: &[Value]) -> Result<sema_vm::VM, SemaError> {
         let expanded = expand_for_vm_batch(&self.ctx, &self.global_env, exprs)?;
-        let known_natives = collect_native_names(&self.global_env);
-        let span_map = self.ctx.span_table.borrow().clone();
+        let known_natives = self.known_native_names();
+        let span_map = self.ctx.span_table.borrow();
         // This path passes no `source_file` to the compiler (stamping
         // `Function::source_file` here would change runtime trace rendering),
         // so lowering-error trace frames arrive with `file: None` — fill them
@@ -473,6 +533,7 @@ impl Interpreter {
     where
         F: FnOnce() -> Result<(), SemaError>,
     {
+        self.ensure_synchronous_runtime_entry_allowed()?;
         let nil_placeholder = [Value::nil()];
         let exprs = if exprs.is_empty() {
             &nil_placeholder[..]
@@ -500,6 +561,11 @@ impl Interpreter {
     /// function is now a thin wrapper: submit, then call this.
     pub fn drive_until_settled(&self, root: &sema_vm::runtime::RootHandle) -> EvalResult {
         self.drive_handle_to_settlement(root)
+    }
+
+    /// Drive only this root, preserving unrelated detached work for a later turn.
+    pub fn drive_until_settled_isolated(&self, root: &sema_vm::runtime::RootHandle) -> EvalResult {
+        self.drive_handle_to_settlement_inner(root, true)
     }
 
     /// Drive the interpreter's persistent runtime for exactly one bounded
@@ -737,6 +803,14 @@ impl Interpreter {
     /// [`drive_until_settled`](Self::drive_until_settled) (which drives an
     /// already-submitted [`RootHandle`](sema_vm::runtime::RootHandle)).
     fn drive_handle_to_settlement(&self, handle: &sema_vm::runtime::RootHandle) -> EvalResult {
+        self.drive_handle_to_settlement_inner(handle, false)
+    }
+
+    fn drive_handle_to_settlement_inner(
+        &self,
+        handle: &sema_vm::runtime::RootHandle,
+        isolated: bool,
+    ) -> EvalResult {
         use sema_vm::runtime::{DriveBudget, DriveState, RootPoll};
 
         let runtime = self
@@ -744,7 +818,28 @@ impl Interpreter {
             .as_ref()
             .expect("runtime is present outside of Drop");
         let budget = DriveBudget::host_default();
+        let drive = || {
+            if isolated {
+                runtime.drive_roots(&budget, &[handle.id()])
+            } else {
+                drive_runtime_root(runtime, &budget, handle.id())
+            }
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let park_deadline =
+            |timer: Option<web_time::Instant>| match (timer, self.ctx.eval_deadline.get()) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
         loop {
+            if self
+                .ctx
+                .eval_deadline
+                .get()
+                .is_some_and(|d| web_time::Instant::now() >= d)
+            {
+                runtime.cancel_root(handle.id(), sema_core::runtime::CancelReason::HostStop);
+            }
             match handle.poll_result() {
                 RootPoll::Ready(settlement) => {
                     let result = match &settlement.outcome {
@@ -754,6 +849,9 @@ impl Interpreter {
                             Err(SemaError::eval(format!("evaluation cancelled: {reason:?}")))
                         }
                     };
+                    if isolated {
+                        return result;
+                    }
                     // Drain any READY detached work before returning (legacy
                     // "top-level (async …) drains the scheduler at exit"): a
                     // cooperative child spawned by this program does not run until
@@ -772,14 +870,9 @@ impl Interpreter {
                     // that the common case; this keeps the drain going for any
                     // teardown the drive scan still owes.
                     loop {
-                        match drive_runtime_root(runtime, &budget, handle.id()).map_err(
-                            |error| {
-                                runtime_internal(
-                                    "the runtime could not drive the evaluation",
-                                    error,
-                                )
-                            },
-                        )? {
+                        match drive().map_err(|error| {
+                            runtime_internal("the runtime could not drive the evaluation", error)
+                        })? {
                             DriveState::Progress {
                                 ready_remaining: true,
                                 ..
@@ -805,7 +898,7 @@ impl Interpreter {
                     return Err(SemaError::internal("the runtime state is inconsistent"));
                 }
             }
-            match drive_runtime_root(runtime, &budget, handle.id()).map_err(|error| {
+            match drive().map_err(|error| {
                 runtime_internal("the runtime could not drive the evaluation", error)
             })? {
                 DriveState::Progress { .. } => {}
@@ -821,7 +914,7 @@ impl Interpreter {
                             break;
                         }
                         if !matches!(
-                            drive_runtime_root(runtime, &budget, handle.id()).map_err(|error| {
+                            drive().map_err(|error| {
                                 runtime_internal(
                                     "the runtime could not cancel a suspended WebAssembly evaluation",
                                     error,
@@ -851,7 +944,9 @@ impl Interpreter {
                     inbox_wakeup_required: true,
                     ..
                 } => {
-                    if !runtime.block_on_inbox(next_deadline) && next_deadline.is_none() {
+                    if !runtime.block_on_inbox(park_deadline(next_deadline))
+                        && park_deadline(next_deadline).is_none()
+                    {
                         // The inbox closed with no completion and no timer to fall
                         // back on: the parked task can never be resumed.
                         return Err(SemaError::internal(
@@ -883,7 +978,7 @@ impl Interpreter {
                     inbox_wakeup_required: false,
                     ..
                 } => {
-                    runtime.block_on_inbox(Some(deadline));
+                    runtime.block_on_inbox(park_deadline(Some(deadline)));
                 }
                 // Fully idle: no task made progress this turn, no timer deadline,
                 // and no pending external completion — nothing can ever change
@@ -9204,5 +9299,46 @@ mod runtime_eval_tests {
             .eval_str_via_runtime("(channel/recv ch)")
             .expect("eval");
         assert_eq!(drained, Value::keyword("ran"));
+    }
+}
+
+#[cfg(test)]
+mod native_name_cache_tests {
+    use super::*;
+
+    #[test]
+    fn native_names_follow_global_and_parent_mutations() {
+        let mut interpreter = Interpreter::new();
+        interpreter.global_env.set_str(
+            "host/cache-test",
+            Value::native_fn(NativeFn::simple("host/cache-test", |_| Ok(Value::int(1)))),
+        );
+        assert!(interpreter
+            .known_native_names()
+            .contains(&intern("host/cache-test")));
+        interpreter
+            .eval_str("(define host/cache-test (lambda () 2))")
+            .unwrap();
+        assert!(!interpreter
+            .known_native_names()
+            .contains(&intern("host/cache-test")));
+        assert_eq!(
+            interpreter.eval_str("(host/cache-test)").unwrap(),
+            Value::int(2)
+        );
+        let parent = interpreter.global_env.clone();
+        interpreter.global_env = Rc::new(Env::with_parent(parent.clone()));
+        interpreter.known_native_names();
+        parent.set_str(
+            "host/from-parent",
+            Value::native_fn(NativeFn::simple("host/from-parent", |_| Ok(Value::int(3)))),
+        );
+        assert!(interpreter
+            .known_native_names()
+            .contains(&intern("host/from-parent")));
+        assert_eq!(
+            interpreter.eval_str("(host/from-parent)").unwrap(),
+            Value::int(3)
+        );
     }
 }

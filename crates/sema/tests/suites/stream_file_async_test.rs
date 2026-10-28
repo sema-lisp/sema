@@ -708,47 +708,19 @@ impl Drop for FifoFixture {
     }
 }
 
-/// Run `sema --no-llm -e PROGRAM` with no stdin, killing it if it does not
-/// settle within `timeout` (a blocking open/read on a non-regular file would
-/// pin a worker forever — the timeout is the hang tooth). Returns the exit
-/// status and captured stdout/stderr.
+/// Run a subprocess with concurrent, bounded output drains and a hard deadline.
 #[cfg(unix)]
 fn run_sema_with_deadline(
     program: &str,
     timeout: std::time::Duration,
 ) -> (std::process::ExitStatus, String, String) {
-    use std::process::Stdio;
-    use std::time::Instant;
-
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
-        .args(["--no-llm", "-e", program])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn sema");
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("poll sema child") {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = child.wait_with_output().expect("reap timed-out sema");
-            panic!(
-                "sema program did not settle within {timeout:?} (a blocking open/read pinned a worker?); stdout={} stderr={}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    };
-    let output = child.wait_with_output().expect("collect sema output");
-    (
-        status,
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-    )
+    let result = crate::common::watchdog::run_sema_with_timeout(program, timeout);
+    assert!(
+        !result.timed_out,
+        "sema program did not settle within {timeout:?}; stdout={} stderr={}",
+        result.stdout, result.stderr
+    );
+    (result.status, result.stdout, result.stderr)
 }
 
 /// `stream/open-input` on a FIFO inside a runtime quantum must be REJECTED by

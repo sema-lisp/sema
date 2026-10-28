@@ -55,6 +55,29 @@ pub fn set_host_stderr_hook(hook: OutputHook) {
     HOST_STDERR_HOOK.with(|cell| *cell.borrow_mut() = hook);
 }
 
+/// Restore a host's output hooks on scope exit, including during unwinding.
+pub struct HostHookScope {
+    stdout: OutputHook,
+    stderr: OutputHook,
+}
+
+impl HostHookScope {
+    /// Temporarily replace both fallback hooks. Hooks must not block or evaluate Sema.
+    pub fn new(stdout: OutputHook, stderr: OutputHook) -> Self {
+        Self {
+            stdout: HOST_STDOUT_HOOK.with(|cell| cell.replace(stdout)),
+            stderr: HOST_STDERR_HOOK.with(|cell| cell.replace(stderr)),
+        }
+    }
+}
+
+impl Drop for HostHookScope {
+    fn drop(&mut self) {
+        HOST_STDOUT_HOOK.with(|cell| *cell.borrow_mut() = self.stdout.take());
+        HOST_STDERR_HOOK.with(|cell| *cell.borrow_mut() = self.stderr.take());
+    }
+}
+
 /// One line of program output captured for a root that opted into
 /// [`RootOptions::capture_output`](../../sema_eval/struct.RootOptions.html)
 /// instead of inheriting process stdout/stderr. Produced by
@@ -85,6 +108,48 @@ thread_local! {
     // The root of the task currently executing a quantum on this thread, set
     // by the runtime around every VM step (mirrors `CURRENT_TASK_ID`).
     static CURRENT_ROOT: Cell<Option<RootId>> = const { Cell::new(None) };
+    static OUTPUT_BUDGETS: RefCell<HashMap<RootId, (usize, usize, bool)>> = RefCell::new(HashMap::new());
+}
+
+/// Bound captured output before allocating it. The overflow marker is additional.
+pub fn limit_root_output(root: RootId, max_bytes: usize) {
+    OUTPUT_BUDGETS.with(|budgets| {
+        budgets.borrow_mut().insert(root, (max_bytes, 0, false));
+    });
+}
+
+fn push_capture(root: RootId, sink: &OutputCaptureSink, is_stderr: bool, text: &str) {
+    OUTPUT_BUDGETS.with(|budgets| {
+        let mut budgets = budgets.borrow_mut();
+        let mut end = text.len();
+        let mut overflow = false;
+        if let Some((limit, used, truncated)) = budgets.get_mut(&root) {
+            if *truncated {
+                return;
+            }
+            end = end.min(limit.saturating_sub(*used));
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            *used += end;
+            overflow = end < text.len();
+            *truncated = overflow;
+        }
+        if end != 0 {
+            sink.borrow_mut().push(CapturedOutput {
+                root,
+                is_stderr,
+                text: text[..end].to_owned(),
+            });
+        }
+        if overflow {
+            sink.borrow_mut().push(CapturedOutput {
+                root,
+                is_stderr,
+                text: "\n[output truncated]\n".to_owned(),
+            });
+        }
+    });
 }
 
 /// Register the buffer owned by `runtime_id`. Other live runtime routes and
@@ -102,6 +167,11 @@ pub fn register_output_capture_sink(
 /// it minted. Teardown is scoped by the full runtime identity so another live
 /// runtime on the same thread is unaffected.
 pub fn unregister_output_capture_sink(runtime_id: RuntimeId) {
+    OUTPUT_BUDGETS.with(|budgets| {
+        budgets
+            .borrow_mut()
+            .retain(|root, _| root.runtime() != runtime_id)
+    });
     OUTPUT_CAPTURE_ROUTES.with(|routes| {
         routes.borrow_mut().remove(&runtime_id);
     });
@@ -137,6 +207,9 @@ pub fn mark_root_capturing(root: RootId) {
 /// Stop capturing `root`'s output — called when a root is reaped, so the
 /// capturing set never accumulates dead entries. Idempotent.
 pub fn unmark_root_capturing(root: RootId) {
+    OUTPUT_BUDGETS.with(|budgets| {
+        budgets.borrow_mut().remove(&root);
+    });
     CAPTURING_ROOTS.with(|set| {
         if set.borrow_mut().remove(&root) {
             CAPTURING_COUNT.with(|c| c.set(c.get().saturating_sub(1)));
@@ -186,11 +259,7 @@ fn try_capture(is_stderr: bool, s: &str) -> bool {
     let Some((root, sink)) = current_capture_sink() else {
         return false;
     };
-    sink.borrow_mut().push(CapturedOutput {
-        root,
-        is_stderr,
-        text: s.to_string(),
-    });
+    push_capture(root, &sink, is_stderr, s);
     true
 }
 
@@ -217,11 +286,7 @@ fn capture_text(bytes: &[u8]) -> std::io::Result<&str> {
 fn write_output_bytes(is_stderr: bool, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     if let Some((root, sink)) = current_capture_sink() {
-        sink.borrow_mut().push(CapturedOutput {
-            root,
-            is_stderr,
-            text: capture_text(bytes)?.to_string(),
-        });
+        push_capture(root, &sink, is_stderr, capture_text(bytes)?);
         return Ok(());
     }
     if let Some(_guard) = HostHookGuard::enter() {

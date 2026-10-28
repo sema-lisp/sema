@@ -186,7 +186,7 @@ Any other client needs the same two facts: command `sema`, args `["mcp"]`. CLI a
 
 ## Default MCP Tools
 
-When started, the MCP server exposes a set of core developer tools:
+The CLI preset exposes the developer tools below. Use `sema mcp tools.sema --preset embedded` to expose visible deftools, docs, docs_search, and info. Add `--check` to evaluate the tool files, print selected tool descriptions as JSON, and exit. Tool-file top-level code runs during this check. Rust hosts can use the [public embedding API](/docs/embedding#serving-mcp-from-a-rust-host) with their own transport.
 
 | Tool Name | Description | Parameters |
 |---|---|---|
@@ -198,6 +198,8 @@ When started, the MCP server exposes a set of core developer tools:
 | `disasm` | Disassemble a `.sema` or `.semac` file to VM instructions | `file_path` (string) |
 | `build` | Compile a `.sema` file into a standalone executable | `source_path` (string), `output_path` (string) |
 | `info` | Get environment and version information about the server | None |
+
+The CLI installs an in-process `build` implementation that requires an unrestricted session. Library adapters and built `--mcp` binaries omit `build` unless the host installs an explicit hook.
 
 ### Path Resolution
 All file paths passed to these tools are resolved relative to the current working directory (CWD) of the MCP server process. Both absolute and relative paths are supported.
@@ -211,14 +213,13 @@ leaves every later request unread, with no recovery short of killing the
 process.
 
 To prevent this, `eval`, `run_file`, and `deftool` handler calls run under a
-wall-clock deadline. On expiry the call returns a normal tool error
-(`evaluation exceeded time budget (looks like an infinite loop?)`) instead of
-hanging, and the server keeps serving requests.
+wall-clock deadline. On expiry the call returns a tool error and the server
+keeps serving requests. A pending async host future is cancelled as well.
 
 ```bash
 # Default is 300000ms (5 minutes) — generous on purpose. A CPU-bound
-# runaway loop is caught almost immediately regardless of how long the
-# deadline is; a short default risks cutting off a legitimate, slow
+# runaway loop is stopped when its deadline expires. A short default risks
+# cutting off a legitimate, slow
 # llm/* agent-loop eval instead.
 sema mcp --timeout-ms 60000
 
@@ -231,17 +232,15 @@ An explicit `--timeout-ms` wins over the environment variable. `0` disables
 the timeout entirely — not recommended, since it reintroduces the wedge
 described above.
 
-`eval` and `run_file` also accept a `timeout_ms` argument that overrides the
-server's default for that one call — useful when a caller knows a specific
-call should fail fast, or needs more time than the default allows:
+A call can supply `timeout_ms` to shorten the session's limit:
 
 ```json
-{"name": "eval", "arguments": {"code": "(long-running-agent-loop)", "timeout_ms": 900000}}
+{"name": "eval", "arguments": {"code": "(long-running-agent-loop)", "timeout_ms": 10000}}
 ```
 
-`timeout_ms: 0` disables the timeout for that call only. The value must be a
-non-negative integer; negative, fractional, and string values return a tool
-error instead of using the server default.
+In 2.0, a per-call value of zero retains the session limit, and a value above
+the session limit is clamped. Only the server's `--timeout-ms 0` disables its
+default limit. Negative, fractional, and string values return a tool error.
 
 The VM checks the deadline at loop back-edges and frame transitions. It bounds
 runaway Sema loops, but it cannot interrupt a native tool handler while that

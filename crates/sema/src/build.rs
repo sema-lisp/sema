@@ -1,9 +1,9 @@
+use crate::build_interpreter;
 use crate::cross_compile;
 use crate::import_tracer;
 use crate::print_cli_warning;
 use crate::print_error;
 use crate::read_source_file;
-use crate::{build_interpreter, resolve_mcp_tool_timeout};
 use crate::{die, print_cli_error};
 use sema_core::archive;
 use sema_core::path::PathExt as _;
@@ -126,64 +126,43 @@ pub(crate) fn try_run_embedded() -> Option<i32> {
 
     sema_core::vfs::init_vfs(arch.files);
 
-    let sandbox = sema_core::Sandbox::allow_all();
-    let interpreter = build_interpreter(&sandbox);
-
-    let _ = interpreter.eval_str("(llm/auto-configure)");
-
     let args: Vec<String> = std::env::args().collect();
     let is_mcp = args
         .iter()
         .any(|arg| arg == "--mcp" || arg.starts_with("--mcp="));
+    let serve = if is_mcp {
+        Some(crate::mcp_cli::parse_embedded(args).unwrap_or_else(|e| e.exit()))
+    } else {
+        None
+    };
+    let sandbox = serve
+        .as_ref()
+        .and_then(|args| args.sandbox.as_deref())
+        .map(sema_core::Sandbox::parse_cli)
+        .transpose()
+        .unwrap_or_else(|e| die(e))
+        .unwrap_or_else(sema_core::Sandbox::allow_all);
+    let interpreter = build_interpreter(&sandbox);
+
+    let _ = interpreter.eval_str("(llm/auto-configure)");
+
     let run_entry = || match &entry_file {
         Some(path) => interpreter.run_bytecode_at_path(path, &bytecode),
         None => interpreter.run_bytecode_bytes(&bytecode),
     };
 
     if is_mcp {
-        let mut include = None;
-        let mut exclude = None;
-        let mut timeout_ms = None;
-        for window in args.windows(2) {
-            if window[0] == "--include" {
-                include = Some(window[1].clone());
-            } else if window[0] == "--exclude" {
-                exclude = Some(window[1].clone());
-            } else if window[0] == "--timeout-ms" {
-                timeout_ms = window[1].trim().parse::<u64>().ok();
-            }
-        }
-        for arg in &args {
-            if let Some(rest) = arg.strip_prefix("--include=") {
-                include = Some(rest.to_string());
-            } else if let Some(rest) = arg.strip_prefix("--exclude=") {
-                exclude = Some(rest.to_string());
-            } else if let Some(rest) = arg.strip_prefix("--timeout-ms=") {
-                timeout_ms = rest.trim().parse::<u64>().ok();
-            }
-        }
-
-        let inc_tools = include.map(|s| {
-            s.split(',')
-                .map(|x| x.trim().to_string())
-                .collect::<Vec<String>>()
-        });
-        let exc_tools = exclude.map(|s| {
-            s.split(',')
-                .map(|x| x.trim().to_string())
-                .collect::<Vec<String>>()
-        });
-        let tool_timeout = resolve_mcp_tool_timeout(timeout_ms);
-
+        let serve = serve.expect("MCP arguments parsed above");
+        let _loading_output = sema_core::output_hook::HostHookScope::new(
+            Some(Box::new(|s| eprint!("{s}"))),
+            Some(Box::new(|s| eprint!("{s}"))),
+        );
         if let Err(e) = run_entry() {
             print_error(&e);
             return Some(1);
         }
 
-        // Same no-ambient-runtime rule as the CLI mcp arm (llm/* + io_block_on).
-        if let Err(e) =
-            sema_mcp::run_mcp_server_sync(interpreter, inc_tools, exc_tools, tool_timeout)
-        {
+        if let Err(e) = crate::mcp_cli::run(&interpreter, serve, false) {
             die(format!("MCP server failed: {e}"));
         }
         Some(0)
@@ -417,6 +396,15 @@ fn build_archive(
     includes: &[String],
     opts: BuildOutputOpts,
 ) -> Result<BuildArchive, String> {
+    build_archive_using(file, includes, opts, None)
+}
+
+fn build_archive_using(
+    file: &str,
+    includes: &[String],
+    opts: BuildOutputOpts,
+    session: Option<&Interpreter>,
+) -> Result<BuildArchive, String> {
     let path = std::path::Path::new(file);
     let source = read_source_file(path)?;
 
@@ -426,7 +414,14 @@ fn build_archive(
 
     let source_hash = crc32fast::hash(source.as_bytes());
     let sandbox = sema_core::Sandbox::allow_all();
-    let interpreter = build_interpreter(&sandbox);
+    let owned;
+    let interpreter = match session {
+        Some(interpreter) => interpreter,
+        None => {
+            owned = build_interpreter(&sandbox);
+            &owned
+        }
+    };
 
     let result = interpreter
         .compile_file_to_bytecode(path, &source)
@@ -519,12 +514,14 @@ fn build_archive(
 
     let archive_bytes = archive::serialize_archive(&metadata, &files)
         .map_err(|error| format!("could not serialize build archive: {error}"))?;
-    eprintln!(
-        "Compiled {file} → archive ({} file{}, {})",
-        files.len(),
-        if files.len() == 1 { "" } else { "s" },
-        human_size(archive_bytes.len() as u64)
-    );
+    if session.is_none() || opts.verbose {
+        eprintln!(
+            "Compiled {file} → archive ({} file{}, {})",
+            files.len(),
+            if files.len() == 1 { "" } else { "s" },
+            human_size(archive_bytes.len() as u64)
+        );
+    }
 
     Ok(BuildArchive {
         files_count: files.len(),
@@ -777,6 +774,63 @@ fn run_build_all(
         ));
     }
     Ok(())
+}
+
+/// MCP's in-process build hook. Restricted builds fail before any file access.
+pub(crate) fn mcp_build(
+    interpreter: &Interpreter,
+    args: &serde_json::Value,
+) -> sema_mcp::protocol::CallToolResult {
+    use sema_mcp::protocol::CallToolResult;
+    let result = (|| -> Result<String, String> {
+        if !interpreter.ctx.sandbox.is_unrestricted() {
+            return Err("build requires an unrestricted MCP session".into());
+        }
+        let source = args
+            .get("source_path")
+            .and_then(|v| v.as_str())
+            .ok_or("missing source_path")?;
+        let output = args
+            .get("output_path")
+            .and_then(|v| v.as_str())
+            .ok_or("missing output_path")?;
+        let source_path = Path::new(source);
+        let output_path = Path::new(output);
+        check_output_not_source(source_path, output_path)?;
+        struct Bindings<'a>(&'a sema_core::Env, Vec<(sema_core::Spur, sema_core::Value)>);
+        impl Drop for Bindings<'_> {
+            fn drop(&mut self) {
+                let mut names = Vec::new();
+                self.0.iter_bindings(|n, _| names.push(n));
+                for name in names {
+                    self.0.take(name);
+                }
+                for (name, value) in self.1.drain(..) {
+                    self.0.set(name, value);
+                }
+            }
+        }
+        let mut previous = Vec::new();
+        interpreter
+            .global_env
+            .iter_bindings(|n, v| previous.push((n, v.clone())));
+        let _bindings = Bindings(&interpreter.global_env, previous);
+        let opts = BuildOutputOpts {
+            verbose: false,
+            json: false,
+        };
+        let archive = build_archive_using(source, &[], opts, Some(interpreter))?;
+        let artifact =
+            write_target_executable(source_path, &archive, output_path, None, None, false, opts)?;
+        Ok(format!(
+            "Built standalone binary successfully at {}",
+            artifact.path.display()
+        ))
+    })();
+    match result {
+        Ok(text) => CallToolResult::text(text),
+        Err(error) => CallToolResult::error(error),
+    }
 }
 
 pub(crate) fn run_build(

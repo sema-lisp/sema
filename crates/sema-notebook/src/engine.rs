@@ -12,7 +12,7 @@ use chrono::Utc;
 use sema_core::runtime::RootId;
 use sema_core::{pretty_print, resolve, Env, Spur, Value, ValueView};
 use sema_eval::Interpreter;
-use sema_vm::runtime::{OutputEvent, RootOptions, RuntimeCommandHandle};
+use sema_vm::runtime::{OutputEvent, RootOptions};
 
 use crate::format::{CellOutput, CellType, CellUsage, Notebook, OutputType};
 
@@ -217,35 +217,7 @@ pub struct UndoInfo {
     pub cell_id: String,
 }
 
-/// A `Send + Sync` token that lets another thread (a server request handler,
-/// a watchdog) cancel whichever cell an [`Engine`] is *currently* driving,
-/// without needing access to the (`!Send`) `Engine`/`Interpreter` itself.
-///
-/// Obtained once via [`Engine::cancel_token`] and cloned freely — cloning is
-/// cheap (an `Rc`-free channel handle plus a shared `Arc<Mutex<..>>>` root
-/// id). `cancel_running` is a no-op (`false`) when no cell is currently
-/// being driven, or once the running root has already settled.
-#[derive(Clone)]
-pub struct CancelToken {
-    command: RuntimeCommandHandle,
-    running_root: Arc<Mutex<Option<RootId>>>,
-}
-
-impl CancelToken {
-    /// Cancel the cell currently being driven, if any. Returns `false` if no
-    /// cell is running right now, or if the underlying runtime is already
-    /// gone — in neither case is that an error, just nothing to cancel.
-    pub fn cancel_running(&self) -> bool {
-        let root = *self
-            .running_root
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        match root {
-            Some(root) => self.command.cancel_root(root),
-            None => false,
-        }
-    }
-}
+pub use sema_eval::CancelToken;
 
 /// The notebook evaluation engine. Wraps an `Interpreter` and a `Notebook`.
 pub struct Engine {
@@ -271,7 +243,11 @@ pub struct Engine {
 impl Engine {
     /// Create a new engine with a fresh interpreter and notebook.
     pub fn new(notebook: Notebook) -> Self {
-        let interpreter = Interpreter::new();
+        Self::from_interpreter(notebook, Interpreter::new())
+    }
+
+    /// Use a host-configured interpreter without resetting shared provider state.
+    pub fn from_interpreter(notebook: Notebook, interpreter: Interpreter) -> Self {
         Self {
             interpreter,
             notebook,
@@ -302,10 +278,7 @@ impl Engine {
     /// whichever cell this engine is currently driving (`async/sleep 60000`
     /// stuck in a loop, a runaway agent call). See [`CancelToken`].
     pub fn cancel_token(&self) -> CancelToken {
-        CancelToken {
-            command: self.interpreter.command_handle(),
-            running_root: self.running_root.clone(),
-        }
+        CancelToken::new(self.interpreter.command_handle(), self.running_root.clone())
     }
 
     /// Evaluate a single cell by ID. Returns the result and updates the notebook.

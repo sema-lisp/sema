@@ -88,7 +88,7 @@ async fn test_mcp_initialize_and_tools_list() {
             assert!(tool_names.contains(&"docs"));
             assert!(tool_names.contains(&"fmt"));
             assert!(tool_names.contains(&"disasm"));
-            assert!(tool_names.contains(&"build"));
+            assert!(!tool_names.contains(&"build")); // The library adapter has no CLI build hook.
             assert!(tool_names.contains(&"info"));
             assert!(tool_names.contains(&"docs_search"));
             assert!(tool_names.contains(&"notebook/new"));

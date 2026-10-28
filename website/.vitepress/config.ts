@@ -343,6 +343,7 @@ export default defineConfig({
           text: 'Integration & Embedding',
           collapsed: false,
           items: [
+            { text: 'Migrating to 2.0', link: '/docs/migrating-to-2' },
             { text: 'Embedding in Rust', link: '/docs/embedding' },
             { text: 'Embedding in JavaScript', link: '/docs/embedding-js' }
           ]

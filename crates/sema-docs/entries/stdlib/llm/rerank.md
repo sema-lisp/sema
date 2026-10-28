@@ -6,11 +6,11 @@ returns: "list"
 see_also: ["llm/embed", "llm/similarity"]
 ---
 
-Reorder `documents` (a list of strings) by their cross-encoder relevance to `query`, using a hosted reranking provider (Cohere, Jina, or Voyage — the same **API key** you use for embeddings, e.g. `COHERE_API_KEY` / `JINA_API_KEY` / `VOYAGE_API_KEY`). Unlike cosine similarity over embeddings, a reranker reads the query and each document *together*, so it is far more precise — the standard RAG move is to retrieve many candidates by vector search, then rerank to the best few.
+Reorder `documents` (a list of strings) by their cross-encoder relevance to `query`, using a hosted reranking provider (Cohere, Jina, Voyage, Together, or Fireworks — the same **API key** you use for embeddings, e.g. `COHERE_API_KEY` / `JINA_API_KEY` / `VOYAGE_API_KEY`). Unlike cosine similarity over embeddings, a reranker reads the query and each document *together*, so it is far more precise — the standard RAG move is to retrieve many candidates by vector search, then rerank to the best few.
 
 Returns a list of maps `{:index :score :document}`, highest relevance first. `:index` is the position in the original `documents` list, `:score` the relevance (higher is better; scores are query-dependent, use them for ordering, not as calibrated probabilities).
 
-The opts map accepts `:top-k` (keep only the K best), `:model` (override the provider's default reranker), and `:provider` (`:cohere` / `:jina` / `:voyage` — defaults to the configured rerank provider).
+The opts map accepts `:top-k` (keep only the K best), `:model` (override the provider's default reranker), `:provider` (defaults to the configured rerank provider), and `:timeout` in positive milliseconds. These override configured `:top-k`, `:rerank-model`, and `:timeout` defaults.
 
 ```sema
 (llm/rerank "how do I read a file?"

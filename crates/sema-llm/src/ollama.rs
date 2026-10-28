@@ -104,6 +104,8 @@ fn build_ollama_messages(request: &ChatRequest) -> Vec<serde_json::Value> {
 pub struct OllamaProvider {
     host: String,
     default_model: String,
+    embedding_model: String,
+    embedding_options: crate::types::EmbedOptions,
     client: reqwest::Client,
 }
 
@@ -111,12 +113,76 @@ impl OllamaProvider {
     pub fn new(host: Option<String>, default_model: Option<String>) -> Result<Self, LlmError> {
         let client = crate::http::create_client(None)?;
         Ok(OllamaProvider {
-            host: host.unwrap_or_else(|| {
+            host: normalize_host(&host.unwrap_or_else(|| {
                 std::env::var("OLLAMA_HOST")
                     .unwrap_or_else(|_| "http://localhost:11434".to_string())
-            }),
+            }))?,
+            embedding_model: "embeddinggemma".to_string(),
+            embedding_options: Default::default(),
             default_model: default_model.unwrap_or_else(|| "gemma4".to_string()),
             client,
+        })
+    }
+
+    /// Select an embedding model without changing the chat default.
+    pub fn with_embedding_model(mut self, model: String) -> Self {
+        self.embedding_model = model;
+        self
+    }
+
+    /// Set defaults for individual embedding request options.
+    pub fn with_embedding_options(mut self, options: crate::types::EmbedOptions) -> Self {
+        self.embedding_options = options;
+        self
+    }
+
+    async fn embed_async(
+        &self,
+        request: crate::types::EmbedRequest,
+    ) -> Result<crate::types::EmbedResponse, LlmError> {
+        let model = request
+            .model
+            .unwrap_or_else(|| self.embedding_model.clone());
+        let options = request.options.with_defaults(&self.embedding_options);
+        let mut body = serde_json::json!({"model": model, "input": request.texts});
+        if let Some(n) = options.dimensions {
+            body["dimensions"] = serde_json::json!(n);
+        }
+        if let Some(b) = options.truncate {
+            body["truncate"] = serde_json::json!(b);
+        }
+        if let Some(v) = options.keep_alive {
+            body["keep_alive"] = v;
+        }
+        let response = crate::http::with_timeout(
+            self.client.post(format!("{}/api/embed", self.host)),
+            options.timeout_ms,
+        )
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| LlmError::Http(e.to_string()))?;
+        let response = crate::http::check_status(response).await?;
+        let body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| LlmError::Parse(e.to_string()))?;
+        let embeddings =
+            serde_json::from_value(body.get("embeddings").cloned().ok_or_else(|| {
+                LlmError::Parse("missing embeddings in Ollama response".to_string())
+            })?)
+            .map_err(|e| LlmError::Parse(e.to_string()))?;
+        Ok(crate::types::EmbedResponse {
+            embeddings,
+            model: model.clone(),
+            usage: Usage {
+                model,
+                prompt_tokens: body
+                    .get("prompt_eval_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32,
+                ..Default::default()
+            },
         })
     }
 
@@ -252,6 +318,33 @@ const USAGE_FIELDS: crate::types::UsageFields = crate::types::UsageFields {
 };
 
 impl LlmProvider for OllamaProvider {
+    fn embedding_endpoint(&self) -> Option<&str> {
+        Some(&self.host)
+    }
+
+    fn embedding_options(&self) -> crate::types::EmbedOptions {
+        self.embedding_options.clone()
+    }
+
+    fn default_embedding_model(&self) -> &str {
+        &self.embedding_model
+    }
+
+    fn embed(
+        &self,
+        request: crate::types::EmbedRequest,
+    ) -> Result<crate::types::EmbedResponse, LlmError> {
+        sema_io::io_block_on(self.embed_async(request))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn embed_future(
+        &self,
+        request: crate::types::EmbedRequest,
+    ) -> Option<crate::provider::BoxEmbedFuture<'_>> {
+        Some(Box::pin(self.embed_async(request)))
+    }
+
     fn name(&self) -> &str {
         "ollama"
     }
@@ -328,4 +421,30 @@ fn chat_body(request: &ChatRequest, model: &str, stream: bool) -> serde_json::Va
         body["think"] = serde_json::json!(effort != "none");
     }
     body
+}
+
+/// Accept the host:port form used by OLLAMA_HOST as well as proxy URLs.
+fn normalize_host(host: &str) -> Result<String, LlmError> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Ok("http://localhost:11434".to_string());
+    }
+    let bare = !host.contains("://");
+    let value = if bare {
+        format!("http://{host}")
+    } else {
+        host.to_string()
+    };
+    let mut url = reqwest::Url::parse(&value)
+        .map_err(|e| LlmError::Config(format!("invalid Ollama host: {e}")))?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(LlmError::Config(
+            "Ollama host must be an HTTP(S) URL".to_string(),
+        ));
+    }
+    if bare && url.port().is_none() {
+        url.set_port(Some(11434))
+            .map_err(|_| LlmError::Config("invalid Ollama port".to_string()))?;
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
 }

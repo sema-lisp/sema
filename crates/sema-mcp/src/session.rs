@@ -636,7 +636,7 @@ impl McpSession {
             return Ok(result);
         }
         let source_key = match name {
-            "compile" => Some("source_path"),
+            "compile" | "build" => Some("source_path"),
             "fmt" | "disasm" => Some("file_path"),
             n if n.starts_with("notebook/") && n != "notebook/new" => Some("path"),
             _ => None,

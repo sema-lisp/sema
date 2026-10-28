@@ -383,6 +383,24 @@ fn hidden_tools_stay_hidden_and_source_limits_apply_before_reading() {
     assert!(serde_json::to_string(&result)
         .unwrap()
         .contains("max_source_bytes"));
+    let session = McpSession::new(
+        &interp,
+        McpServerOptions::embedded()
+            .also_tools(["build"])
+            .with_build_hook(|_, _| panic!("oversized input must not reach the build hook")),
+    )
+    .unwrap();
+    let result = session
+        .call_tool(
+            &interp,
+            "build",
+            &json!({"source_path":path,"output_path":"unused"}),
+        )
+        .unwrap();
+    assert!(result.is_error);
+    assert!(serde_json::to_string(&result)
+        .unwrap()
+        .contains("max_source_bytes"));
 }
 
 #[test]

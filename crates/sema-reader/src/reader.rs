@@ -1154,6 +1154,93 @@ mod tests {
     }
 
     #[test]
+    fn test_read_complex_rational_components() {
+        use num_bigint::BigInt;
+        use num_rational::BigRational;
+        use sema_core::number::SemaNumber;
+
+        let n = SemaNumber::from_i64;
+        let r = |a: i64, b: i64| {
+            SemaNumber::Rational(BigRational::new(BigInt::from(a), BigInt::from(b)))
+        };
+        let f = SemaNumber::from_f64;
+        for (source, re, im) in [
+            ("3/4i", n(0), r(3, 4)),
+            ("-3/4i", n(0), r(-3, 4)),
+            ("+3/4i", n(0), r(3, 4)),
+            ("1/2+3i", r(1, 2), n(3)),
+            ("-1/2-3/4i", r(-1, 2), r(-3, 4)),
+            ("+1/2+3/4i", r(1, 2), r(3, 4)),
+            ("1/2+i", r(1, 2), n(1)),
+            ("1/2-i", r(1, 2), n(-1)),
+            ("1/2+1.5i", r(1, 2), f(1.5)),
+            ("1/2-2e-3i", r(1, 2), f(-0.002)),
+            ("#e1/2+1i", r(1, 2), n(1)),
+            ("#e#d1/2+1.5i", r(1, 2), r(3, 2)),
+            ("#d#e1/2+1i", r(1, 2), n(1)),
+            ("#i1/2+3/4i", f(0.5), f(0.75)),
+            ("#i#d1/2+3/4i", f(0.5), f(0.75)),
+            ("#d#i1/2+3/4i", f(0.5), f(0.75)),
+            ("#e3/4i", n(0), r(3, 4)),
+            ("#i3/4i", f(0.0), f(0.75)),
+            ("2/4+6/8i", r(1, 2), r(3, 4)),
+            ("2/2+0/3i", n(1), n(0)),
+        ] {
+            let expected = Value::complex(re, im);
+            assert_eq!(read(source).unwrap(), expected, "{source}");
+            assert_eq!(
+                read_many(&format!("[{source}]; comment\n42")).unwrap(),
+                vec![Value::vector(vec![expected]), Value::int(42)],
+                "{source} inside a collection"
+            );
+        }
+    }
+
+    #[test]
+    fn test_complex_rational_values_round_trip() {
+        use num_bigint::BigInt;
+        use num_rational::BigRational;
+        use sema_core::number::SemaNumber;
+
+        let components = [
+            SemaNumber::from_i64(0),
+            SemaNumber::from_i64(-3),
+            SemaNumber::from_f64(0.5),
+            SemaNumber::from_f64(-1.25),
+            SemaNumber::Rational(BigRational::new(BigInt::from(7), BigInt::from(2))),
+            SemaNumber::Rational(BigRational::new(BigInt::from(-3), BigInt::from(4))),
+            SemaNumber::Rational(BigRational::new(BigInt::from(1) << 100, BigInt::from(3))),
+        ];
+        for re in &components {
+            for im in &components {
+                let value = Value::complex(re.clone(), im.clone());
+                let printed = value.to_string();
+                assert_eq!(read(&printed).unwrap(), value, "{printed}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_read_invalid_complex_rational_components() {
+        for source in [
+            "1/0+3i",
+            "1/0i",
+            "1/2+3/0i",
+            "#e1/0+1i",
+            "#i1/2+3/0i",
+            "1/2+3ix",
+            "3/4ix",
+            "1/2+3",
+            "1/2+",
+            "1/2/3i",
+            "1/2+-3i",
+            "1/2+3/i",
+        ] {
+            assert!(read(source).is_err(), "{source} must be rejected");
+        }
+    }
+
+    #[test]
     fn test_read_float() {
         assert_eq!(read("3.14").unwrap(), Value::float(3.14));
     }

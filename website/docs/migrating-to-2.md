@@ -39,6 +39,12 @@ host work. The async future receives owned `Send` input and produces owned
 A Tokio task that may move between worker threads must not hold a Sema value
 across an `.await`.
 
+Synchronous interpreter evaluation from a running host callback returns an
+error before submitting a root. This includes evaluating a different
+interpreter on the same thread. Return the callback's result first, or use the
+async host-function APIs and process the next evaluation after the current call
+settles.
+
 ## Add fields to Rust retrieval requests
 
 `sema_llm::types::EmbedRequest` adds `options: EmbedOptions`. Add the field to

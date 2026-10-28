@@ -548,6 +548,12 @@ requires an unwinding host; the workspace release profile uses `panic=abort`,
 where a panic in a host callback terminates the process. Run untrusted tool
 files in a separate process.
 
+Do not call synchronous interpreter evaluation from a running host callback.
+It returns an error before root submission, including when the target is a
+different interpreter on the same thread. Return the callback's result first,
+or use the async host-function APIs and process the next evaluation after the
+current call settles.
+
 `with_llm_auto_configure(true)` attempts the CLI's environment-based LLM setup;
 call `(llm/auto-configure)` explicitly to inspect configuration errors.
 `with_workflow_mcp(true)` installs the workflow MCP resolver. Both flags default

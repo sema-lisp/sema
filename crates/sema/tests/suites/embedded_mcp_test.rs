@@ -327,6 +327,26 @@ fn nested_eval_returns_error_before_creating_a_root() {
     assert_eq!(interp.runtime_live_task_count(), 0);
 }
 
+#[test]
+fn nested_evaluation_of_a_different_interpreter_is_rejected() {
+    let nested = std::rc::Rc::new(Interpreter::new());
+    let interp = Interpreter::new();
+    let weak = std::rc::Rc::downgrade(&nested);
+    interp.register_fn("host/nested", move |_| {
+        weak.upgrade().unwrap().eval_str("42")
+    });
+    let session = McpSession::new(&interp, McpServerOptions::embedded().enable_eval()).unwrap();
+    let result = session
+        .call_tool(&interp, "eval", &json!({"code":"(host/nested)"}))
+        .unwrap();
+    assert!(result.is_error);
+    assert!(serde_json::to_string(&result)
+        .unwrap()
+        .contains("nested evaluation"));
+    assert_eq!(nested.runtime_live_task_count(), 0);
+    assert_eq!(interp.runtime_live_task_count(), 0);
+}
+
 #[tokio::test]
 async fn worker_can_call_async_functions_and_shutdown_from_tokio() {
     let worker = sema::mcp::McpWorker::spawn(

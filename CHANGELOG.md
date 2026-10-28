@@ -10,6 +10,9 @@ for required Rust changes, retrieval defaults, and cassette re-recording.
 - Rust `EmbedRequest` literals must include `options`; `RerankRequest` literals
   must include `timeout_ms`. `Value` and `SemaError` are neither `Send` nor
   `Sync`; send owned Rust data between threads.
+- Synchronous evaluation from a running host callback is rejected, including
+  evaluation of another interpreter on the same thread. Use async host
+  functions or wait for the current call to settle before evaluating again.
 - The implicit Voyage embedding model is `voyage-3` (was `voyage-3-lite`).
   Existing indexes must keep their original model or be rebuilt. Together's
   default reranker is `mixedbread-ai/mxbai-rerank-large-v2`.

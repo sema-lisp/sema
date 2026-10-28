@@ -1,7 +1,7 @@
 # MCP access through the public embedding API
 
-**Status:** Core server embedding implemented for Sema 2.0; release verification
-is in progress. The original design below records the 1.37 baseline and the
+**Status:** Core server embedding implemented and verified for Sema 2.0.
+The original design below records the 1.37 baseline and the
 alternatives considered. The public API and migration guide describe the
 implemented behavior.
 
@@ -41,10 +41,11 @@ includes a standalone example that depends on that public API.
   The output path bounds formatting as well as captured prints. No latency
   claim is made without a benchmark of the final build.
 
-The thirteen initial embedding acceptance tests and the existing twelve
-protocol tests pass. The public example was exercised over a real stdio pipe
-with initialize/list/async-call requests and no library stderr output. Full
-release checks and final evidence are tracked in `2026-10-28-release-2.md`.
+Eighteen public embedding acceptance tests and thirteen protocol/session tests
+pass. The public example was exercised over a real stdio pipe in debug and
+optimized panic=abort builds with initialize/list/async-call requests and no
+library stderr output. Full release checks and commit-specific evidence are
+recorded in `2026-10-28-release-2.md`.
 
 ## Problem and current behavior
 

@@ -367,12 +367,17 @@ impl Interpreter {
         self.drive_vm_on_runtime(vm)
     }
 
-    fn ensure_synchronous_runtime_entry_allowed(&self) -> Result<(), SemaError> {
+    fn ensure_runtime_submission_allowed(&self) -> Result<(), SemaError> {
         if self.ctx.runtime_quantum_active() || sema_core::in_runtime_quantum() {
             return Err(SemaError::eval(
                 "nested evaluation cannot run inside a runtime quantum",
             ));
         }
+        Ok(())
+    }
+
+    fn ensure_synchronous_runtime_entry_allowed(&self) -> Result<(), SemaError> {
+        self.ensure_runtime_submission_allowed()?;
         #[cfg(target_arch = "wasm32")]
         if self.runtime().is_debug_paused() {
             return Err(SemaError::eval(
@@ -533,7 +538,7 @@ impl Interpreter {
     where
         F: FnOnce() -> Result<(), SemaError>,
     {
-        self.ensure_synchronous_runtime_entry_allowed()?;
+        self.ensure_runtime_submission_allowed()?;
         let nil_placeholder = [Value::nil()];
         let exprs = if exprs.is_empty() {
             &nil_placeholder[..]

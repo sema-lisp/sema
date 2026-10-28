@@ -64,6 +64,8 @@ for required Rust changes, retrieval defaults, and cassette re-recording.
   after dispatch, and later calls do not drive earlier detached tasks under
   their deadlines. Compilation borrows span tables and caches native names
   with invalidation on environment changes.
+- Clear interrupted callback frames before reusing a VM, preserving captured
+  values and allowing later MCP calls to run after a timeout or step limit.
 - MCP file tools enforce sandbox capabilities and paths. Compile and disasm
   use session macros without retaining new compile-time bindings. Notebook
   creation preserves the host's LLM state. The CLI build hook runs in process

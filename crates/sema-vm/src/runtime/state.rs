@@ -4399,6 +4399,9 @@ impl Runtime {
                     }
                 }
                 Err(error) => {
+                    // Loop guards can return before exception unwinding. Close
+                    // those frames before a continuation or pool reuses this VM.
+                    vm.reset_for_reuse();
                     let mut native_context = NativeCallContext {
                         hof_host: None,
                         eval_context: &eval_context,

@@ -1068,7 +1068,7 @@ fn embedding_cassette_does_not_mix_providers_or_dimensions() {
             interp.eval_str_compiled(&format!(r#"
                 (llm/configure-embeddings :{provider} {{:api-key "test" :base-url "{}" :model "same-model"}})
                 (llm/with-cassette "{}" {{:mode :auto}} (fn () (llm/embed "same text" {{:dimensions {dimension}}})))
-            "#, server.url, path.display())).unwrap();
+            "#, server.url, crate::common::sema_path(&path))).unwrap();
         }
         server.request();
         let second = server.requests.try_recv();

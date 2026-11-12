@@ -25,19 +25,18 @@ thread_local! {
 }
 
 fn sema_binary() -> String {
-    // Find the sema binary in the target directory
-    let mut path = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    path.push("sema");
-    if cfg!(windows) {
-        path.set_extension("exe");
-    }
-    path.to_string_lossy().to_string()
+    // Search every ancestor of the test executable. Cargo 1.100 moved test
+    // executables from `target/debug/deps/` to
+    // `target/debug/build/<package>/<hash>/…`, so a fixed number of
+    // `parent()` steps no longer reaches `target/debug/`.
+    let name = if cfg!(windows) { "sema.exe" } else { "sema" };
+    let exe = std::env::current_exe().expect("resolve test executable");
+    exe.ancestors()
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("no {name} in any ancestor of {}", exe.display()))
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {

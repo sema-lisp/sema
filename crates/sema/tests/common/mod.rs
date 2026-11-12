@@ -145,3 +145,19 @@ macro_rules! __eval_error_test_legacy {
         }
     };
 }
+
+/// A `sema` CLI command with an empty environment, for tests that must not
+/// read the developer's provider keys or endpoints.
+///
+/// On Windows the child keeps `SystemRoot`. Without it Winsock cannot load
+/// its service providers, every socket call in the child fails, and a request
+/// to a loopback mock server reports only "error sending request for url".
+pub fn sema_command_clean_env() -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_sema"));
+    command.env_clear();
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", root);
+    }
+    command
+}

@@ -202,8 +202,7 @@ fn new_embedding_presets_auto_configure_from_environment() {
         ("tei", "TEI_API_KEY", "TEI_MODEL", "served-model"),
     ] {
         let server = Server::new();
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
-            .env_clear()
+        let output = crate::common::sema_command_clean_env()
             .env(key_env, "test")
             .env(model_env, model)
             .env(
@@ -345,8 +344,7 @@ fn unsupported_preset_options_fail_without_http() {
 #[test]
 fn partial_accounts_do_not_change_existing_automatic_selection() {
     let server = Server::new();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
-        .env_clear()
+    let output = crate::common::sema_command_clean_env()
         .env("OPENAI_API_KEY", "test")
         .env("OPENAI_BASE_URL", &server.url)
         .env("OPENROUTER_API_KEY", "test")
@@ -365,8 +363,7 @@ fn partial_accounts_do_not_change_existing_automatic_selection() {
     assert_eq!(server.request().1["model"], "text-embedding-3-small");
 
     for provider in ["azure", "cloudflare", "alibaba", "tei"] {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
-            .env_clear()
+        let output = crate::common::sema_command_clean_env()
             .env("AZURE_OPENAI_API_KEY", "partial")
             .env("CLOUDFLARE_API_TOKEN", "partial")
             .env("DASHSCOPE_API_KEY", "partial")
@@ -385,8 +382,7 @@ fn partial_accounts_do_not_change_existing_automatic_selection() {
 #[test]
 fn explicitly_selected_hosted_presets_require_environment_credentials() {
     for provider in ["openai", "jina", "cohere", "voyage", "mistral", "gemini"] {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
-            .env_clear()
+        let output = crate::common::sema_command_clean_env()
             .args(["--embedding-provider", provider, "-e", "42"])
             .output()
             .unwrap();
@@ -733,8 +729,7 @@ fn configured_embedding_options_can_be_overridden_per_call() {
 #[test]
 fn auto_configuration_honors_forced_openai_with_other_keys_present() {
     let server = Server::new();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
-        .env_clear()
+    let output = crate::common::sema_command_clean_env()
         .env("OPENAI_API_KEY", "test")
         .env("JINA_API_KEY", "test")
         .env("OPENAI_BASE_URL", &server.url)
@@ -1184,8 +1179,7 @@ fn provider_specific_options_and_defaults_reach_the_wire() {
 #[test]
 fn cli_overrides_environment_for_embedding_and_rerank_independently() {
     let server = Server::new();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
-        .env_clear()
+    let output = crate::common::sema_command_clean_env()
         .env("OPENAI_API_KEY", "test")
         .env("JINA_API_KEY", "test")
         .env("JINA_BASE_URL", &server.url)
@@ -1220,8 +1214,7 @@ fn cli_overrides_environment_for_embedding_and_rerank_independently() {
 #[test]
 fn auto_configuration_uses_native_ollama_without_api_keys() {
     let server = Server::new();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
-        .env_clear()
+    let output = crate::common::sema_command_clean_env()
         .env("OLLAMA_HOST", server.url.trim_start_matches("http://"))
         .args(["-e", r#"(llm/embed "hello")"#])
         .output()
@@ -1251,8 +1244,7 @@ fn malformed_configuration_is_rejected() {
         assert!(interpreter().eval_str_compiled(source).is_err(), "{source}");
     }
     // Missing-key behavior must not depend on the developer's provider credentials.
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
-        .env_clear()
+    let output = crate::common::sema_command_clean_env()
         .args(["-e", r#"(llm/configure-embeddings :nomic {})"#])
         .output()
         .unwrap();
@@ -1263,8 +1255,7 @@ fn malformed_configuration_is_rejected() {
 #[test]
 fn invalid_environment_selection_fails_before_running_the_program() {
     for variable in ["SEMA_EMBEDDING_PROVIDER", "SEMA_RERANK_PROVIDER"] {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
-            .env_clear()
+        let output = crate::common::sema_command_clean_env()
             .env(variable, "missing-provider")
             .args(["-e", "42"])
             .output()

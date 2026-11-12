@@ -378,9 +378,8 @@ fn nomic_cassettes_distinguish_long_text_options() {
 fn nomic_auto_configuration_uses_key_and_endpoint_override() {
     for forced in [false, true] {
         let server = Server::fixture();
-        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_sema"));
+        let mut command = crate::common::sema_command_clean_env();
         command
-            .env_clear()
             .env("NOMIC_API_KEY", "test-key")
             .env("NOMIC_BASE_URL", format!("{}/v1", server.url));
         if forced {

@@ -8,7 +8,9 @@ permissions:
 
 jobs:
   focused-e2e:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest resolves to 26.04 (seen 2026-11-12) and Playwright has no
+    # chromium build for it ("Playwright does not support chromium on ubuntu26.04-x64").
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7

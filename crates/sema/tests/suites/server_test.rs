@@ -1439,6 +1439,19 @@ fn test_ws_runtime_cancelled_recv_preserves_connection_receiver() {
     });
 
     let interpreter = Interpreter::new();
+    // Blocks the VM thread without yielding to the runtime, so the server's
+    // "still-open" reply is already queued when `ws/recv-timeout` polls and
+    // the main task never suspends. The cancelled task then has not run its
+    // teardown when the main task inspects it. This is the ordering that
+    // failed on the loaded Windows nightly.
+    interpreter.global_env.set_str(
+        "test/block-ms",
+        Value::native_fn(sema_core::NativeFn::simple("test/block-ms", |args| {
+            let ms = args[0].as_int().expect("test/block-ms takes an int") as u64;
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            Ok(Value::nil())
+        })),
+    );
     interpreter.global_env.set_str(
         "test/ws-waiting?",
         Value::native_fn(sema_core::NativeFn::simple("test/ws-waiting?", move |_| {
@@ -1459,7 +1472,12 @@ fn test_ws_runtime_cancelled_recv_preserves_connection_receiver() {
                     (else (async/sleep 1) (wait (- remaining 1)))))
                 (async/cancel pending)
                 (ws/send sock "release")
+                (test/block-ms 300)
                 (let ((event (ws/recv-timeout sock 1000)))
+                  ;; async/cancel only records a request. The parked receive settles
+                  ;; Cancelled when the runtime tears its wait down, so await it before
+                  ;; async/cancelled? reads the settled state.
+                  (try (await pending) (catch e nil))
                   (list (async/cancelled? pending) (:text event)))))))
         "#,
             server.url()

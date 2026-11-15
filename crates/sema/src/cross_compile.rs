@@ -503,7 +503,8 @@ pub(crate) fn extract_zip(
             continue;
         }
 
-        let file_name = Path::new(file.name())
+        let entry_name = file.name()?;
+        let file_name = Path::new(entry_name.as_ref())
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");

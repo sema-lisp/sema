@@ -452,7 +452,10 @@ fn zip_extract_from_reader<R: std::io::Read + std::io::Seek>(
         let mut entry = archive
             .by_index(i)
             .map_err(|e| SemaError::eval(format!("zip/extract: {e}")))?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map_err(|e| SemaError::eval(format!("zip/extract: {e}")))?
+            .into_owned();
         // zip-slip guard: skip entries whose path would escape dest-dir.
         let rel = match safe_relative(&name) {
             Some(r) => r,
@@ -536,7 +539,10 @@ fn zip_list_from_reader<R: std::io::Read + std::io::Seek>(
         let entry = archive
             .by_index(i)
             .map_err(|e| SemaError::eval(format!("zip/list: {e}")))?;
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map_err(|e| SemaError::eval(format!("zip/list: {e}")))?
+            .into_owned();
         if let Some(bounds) = bounds {
             output_bytes = output_bytes
                 .checked_add(name.len() as u64)

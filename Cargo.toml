@@ -134,7 +134,7 @@ flate2 = "1"
 crc32fast = "1"
 # minimal features: deflate covers ~all real zips, deflate64 the Windows-Explorer
 # variant. Trade-off: zstd/bzip2/AES-encrypted archives error at runtime.
-zip = { version = "8", default-features = false, features = ["deflate", "deflate64"] }
+zip = { version = "9", default-features = false, features = ["deflate", "deflate64"] }
 similar = "2"
 pulldown-cmark = "0.12"
 scraper = "0.21"

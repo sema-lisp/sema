@@ -5,5 +5,8 @@
     "build:wasm": "./scripts/wasm-build.sh crates/sema-wasm --target web --out-dir ../../packages/sema-wasm/pkg",
     "build": "npm run build --workspaces --if-present",
     "test": "npm test --workspaces --if-present"
+  },
+  "overrides": {
+    "esbuild": "^0.28.1"
   }
 }

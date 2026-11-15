@@ -90,7 +90,7 @@ impl Drop for InflightGuard {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
         let _ =
-            IO_INFLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
+            IO_INFLIGHT.try_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
     }
 }
 

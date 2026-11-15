@@ -91,7 +91,7 @@ impl RuntimeTaskId {
 
 fn allocate_atomic(counter: &AtomicU64) -> Result<NonZeroU64, IdExhausted> {
     let raw = counter
-        .fetch_update(
+        .try_update(
             Ordering::Relaxed,
             Ordering::Relaxed,
             |current| match current {

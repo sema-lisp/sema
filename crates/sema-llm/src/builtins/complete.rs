@@ -1908,7 +1908,7 @@ pub(super) fn register(env: &Env) {
                 move || async move {
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                     let _ = IO_INFLIGHT
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
                     Ok(Box::new(id) as SendPayload)
                 },
             );
@@ -1928,7 +1928,7 @@ pub(super) fn register(env: &Env) {
         #[cfg(not(target_arch = "wasm32"))]
         std::thread::sleep(std::time::Duration::from_millis(ms));
         let _ =
-            IO_INFLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
+            IO_INFLIGHT.try_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
         Ok(NativeOutcome::Return(Value::int(id)))
     });
 }

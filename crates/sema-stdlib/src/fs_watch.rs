@@ -77,7 +77,7 @@ impl EventSink {
             Err(TrySendError::Full(_)) => {
                 let _ = self
                     .dropped
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                         Some(count.saturating_add(1))
                     });
             }
@@ -107,7 +107,7 @@ impl WorkerCapacity {
 
     fn try_acquire(self: &Arc<Self>) -> Result<WorkerLease, SemaError> {
         self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < self.limit).then_some(active + 1)
             })
             .map_err(|_| {

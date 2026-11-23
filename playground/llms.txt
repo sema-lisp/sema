@@ -14,6 +14,6 @@ The playground at https://sema.run exposes an experimental WebMCP tool surface i
 
 ## Using the playground
 
-Use the registered WebMCP tools when available instead of manipulating the DOM. Start with `read_editor` or `find_examples`, use `write_editor` or `load_example` to select a program, then call `run_editor` and inspect `read_output`. For debugging, set lines with `set_breakpoints`, call `start_debugging`, and use the step or continue tools until the debugger is paused or idle. Inspect the returned `status` for `paused`, `finished`, `error`, or `stopped`.
+Use the registered WebMCP tools when available instead of manipulating the DOM. Start with `read_editor` or `find_examples`, use `write_editor` or `load_example` to select a program, then call `run_editor` and inspect `read_output`. For debugging, set lines with `set_breakpoints`, call `start_debugging`, and use the step or continue tools until the debugger is paused or idle. Inspect the returned `status` for `paused`, `finished`, `error`, or `stopped`. Every tool declares an `outputSchema`; results are either `{ "ok": true, … }` or `{ "ok": false, "error": { "code", "message" } }`. Aborting a tool call's signal stops a worker-backed run or ends the active debugger session, and the call returns the `CANCELLED` error code.
 
 WebMCP is an evolving browser API and this integration is an experiment. Browsers without `document.modelContext` keep the normal playground UI and do not register tools.

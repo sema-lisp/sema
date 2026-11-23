@@ -57,6 +57,10 @@ const DESCRIPTION_TERMS: Record<string, string[]> = {
   get_debug_state: ['status', 'locals', 'stack'],
 };
 
+// Models the WebMCP API as Chrome 160 ships it: registerTool() returns a
+// promise and honours `options.signal`; getTools() returns Tool objects (not the
+// registration dictionary) with null for missing schemas and annotations;
+// executeTool() takes an input object; execute() receives `{ signal }`.
 async function installModelContext(
   page: Page,
   rejectTool: string | null = null,
@@ -66,6 +70,35 @@ async function installModelContext(
     const tools = new Map<string, Record<string, unknown>>();
     const signals = new Set<AbortSignal>();
     const registrations: Array<{ name: string; status: string | null; hasSignal: boolean }> = [];
+    const calls = new Map<string, AbortController>();
+
+    function toolView(tool: Record<string, unknown>) {
+      return Object.freeze({
+        name: tool.name,
+        title: tool.title ?? '',
+        description: tool.description,
+        inputSchema: tool.inputSchema ?? null,
+        outputSchema: tool.outputSchema ?? null,
+        annotations: tool.annotations ?? null,
+        origin: location.origin,
+        source: window,
+      });
+    }
+
+    function invoke(name: string, input: unknown = {}) {
+      const tool = tools.get(name);
+      if (!tool) return Promise.reject(new Error(`WebMCP tool not registered: ${name}`));
+      if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+        return Promise.reject(new TypeError('Failed to parse input arguments'));
+      }
+      const controller = new AbortController();
+      calls.set(name, controller);
+      const execute = tool.execute as (
+        value: unknown,
+        options: { signal: AbortSignal },
+      ) => Promise<unknown>;
+      return Promise.resolve(execute(structuredClone(input), { signal: controller.signal }));
+    }
 
     Object.defineProperty(document, 'modelContext', {
       configurable: true,
@@ -88,30 +121,32 @@ async function installModelContext(
           return Promise.resolve();
         },
         async getTools() {
-          return [...tools.values()];
+          return [...tools.values()].map(toolView);
         },
-        async executeTool(tool: Record<string, unknown>, params: string) {
-          const execute = tool.execute as (input: unknown) => unknown;
-          return execute(JSON.parse(params));
+        async executeTool(tool: { name: string }, input?: unknown) {
+          return invoke(tool.name, input ?? {});
         },
       },
     });
 
     Object.defineProperty(window, '__webMcpTest', {
-      value: { tools, registrations, signals },
+      value: { tools, registrations, signals, calls, invoke },
     });
   }, { rejectedName: rejectTool, synchronousThrow: throwSynchronously });
 }
 
+type WebMcpTestState = {
+  tools: Map<string, Record<string, unknown>>;
+  registrations: Array<{ name: string; status: string | null; hasSignal: boolean }>;
+  signals: Set<AbortSignal>;
+  calls: Map<string, AbortController>;
+  invoke: (name: string, input?: unknown) => Promise<unknown>;
+};
+
 async function executeTool<T>(page: Page, name: string, input: Record<string, unknown> = {}) {
-  return page.evaluate(async ({ toolName, params }) => {
-    const state = (window as unknown as {
-      __webMcpTest: { tools: Map<string, Record<string, unknown>> };
-    }).__webMcpTest;
-    const tool = state.tools.get(toolName);
-    if (!tool) throw new Error(`WebMCP tool not registered: ${toolName}`);
-    const execute = tool.execute as (value: Record<string, unknown>) => Promise<unknown>;
-    return execute(params);
+  return page.evaluate(({ toolName, params }) => {
+    const state = (window as unknown as { __webMcpTest: WebMcpTestState }).__webMcpTest;
+    return state.invoke(toolName, params);
   }, { toolName: name, params: input }) as Promise<T>;
 }
 
@@ -139,13 +174,27 @@ test('registers the complete playground tool surface before WASM is ready', asyn
       signalCount: state.signals.size,
       descriptors: [...state.tools.values()].map((tool) => ({
         name: tool.name,
+        title: tool.title,
         description: tool.description,
         inputSchema: tool.inputSchema,
+        outputSchema: tool.outputSchema,
         annotations: tool.annotations,
         hasExecute: typeof tool.execute === 'function',
       })),
     };
   });
+  const listed = await page.evaluate(async () => {
+    const tools = await (document as unknown as {
+      modelContext: { getTools(): Promise<Array<Record<string, unknown>>> };
+    }).modelContext.getTools();
+    return tools.map(({ name, title, outputSchema }) => ({
+      name,
+      title,
+      hasOutputSchema: outputSchema !== null && typeof outputSchema === 'object',
+    }));
+  });
+  expect(listed).toHaveLength(TOOL_NAMES.length);
+  expect(listed.every(({ title, hasOutputSchema }) => Boolean(title) && hasOutputSchema)).toBe(true);
 
   expect(registrations.registrations.map(({ name }) => name).sort()).toEqual([...TOOL_NAMES]);
   expect(registrations.registrations.every(({ hasSignal }) => hasSignal)).toBe(true);
@@ -167,11 +216,20 @@ test('registers the complete playground tool surface before WASM is ready', asyn
       expect(property.description).toEqual(expect.any(String));
       expect(property.description!.length).toBeLessThanOrEqual(150);
     }
+    expect(descriptor.title).toEqual(expect.any(String));
+    expect((descriptor.title as string).length).toBeGreaterThan(0);
+    expect((descriptor.title as string).length).toBeLessThanOrEqual(40);
+    expect(descriptor.outputSchema).toMatchObject({
+      oneOf: [
+        { type: 'object', properties: { ok: { const: true } } },
+        { type: 'object', properties: { ok: { const: false } } },
+      ],
+    });
     expect(descriptor.annotations).toEqual({
       readOnlyHint: READ_ONLY_TOOLS.has(String(descriptor.name)),
-      ...(UNTRUSTED_CONTENT_TOOLS.has(String(descriptor.name))
-        ? { untrustedContentHint: true }
-        : {}),
+      untrustedContentHint: UNTRUSTED_CONTENT_TOOLS.has(String(descriptor.name)),
+      consequentialHint: false,
+      debugging: false,
     });
     expect(descriptor.hasExecute).toBe(true);
   }
@@ -447,13 +505,8 @@ test('guards concurrent mutations and cancels a worker-backed run', async ({ pag
   const source = '(await (async (async/sleep 5000) (println "should not print")))';
   await executeTool(page, 'write_editor', { code: source });
   await page.evaluate(() => {
-    const state = (window as unknown as {
-      __webMcpTest: { tools: Map<string, Record<string, unknown>> };
-    }).__webMcpTest;
-    const run = state.tools.get('run_editor')?.execute as (
-      input: Record<string, never>,
-    ) => Promise<unknown>;
-    (window as unknown as { __webMcpRun: Promise<unknown> }).__webMcpRun = run({});
+    const state = (window as unknown as { __webMcpTest: WebMcpTestState }).__webMcpTest;
+    (window as unknown as { __webMcpRun: Promise<unknown> }).__webMcpRun = state.invoke('run_editor', {});
   });
 
   await expect(page.getByTestId('run-btn')).toContainText('Stop', { timeout: 5000 });
@@ -481,4 +534,73 @@ test('guards concurrent mutations and cancels a worker-backed run', async ({ pag
     ok: true,
     value: '42',
   });
+});
+
+test('aborting the execute signal cancels a worker-backed run', async ({ page }) => {
+  await installModelContext(page);
+  await page.goto('/?worker');
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 20000 });
+
+  await executeTool(page, 'write_editor', {
+    code: '(await (async (async/sleep 5000) (println "should not print")))',
+  });
+  await page.evaluate(() => {
+    const state = (window as unknown as { __webMcpTest: WebMcpTestState }).__webMcpTest;
+    (window as unknown as { __webMcpRun: Promise<unknown> }).__webMcpRun = state.invoke('run_editor', {});
+  });
+  await expect(page.getByTestId('run-btn')).toContainText('Stop', { timeout: 5000 });
+
+  const cancelled = await page.evaluate(() => {
+    const state = (window as unknown as { __webMcpTest: WebMcpTestState }).__webMcpTest;
+    state.calls.get('run_editor')!.abort();
+    return (window as unknown as { __webMcpRun: Promise<unknown> }).__webMcpRun;
+  });
+  expect(cancelled).toEqual({
+    ok: false,
+    error: { code: 'CANCELLED', message: expect.any(String) },
+  });
+  await expect(page.getByTestId('status')).toHaveText('Stopped');
+  await expect(page.getByTestId('output')).not.toContainText('should not print');
+});
+
+test('aborting the execute signal stops a debugger session', async ({ page }) => {
+  await installModelContext(page);
+  await page.goto('/');
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
+
+  await executeTool(page, 'write_editor', { code: '(+ 1 2)\n(+ 3 4)' });
+  const cancelled = await page.evaluate(() => {
+    const state = (window as unknown as { __webMcpTest: WebMcpTestState }).__webMcpTest;
+    const pending = state.invoke('start_debugging', {});
+    state.calls.get('start_debugging')!.abort();
+    return pending;
+  });
+  expect(cancelled).toEqual({
+    ok: false,
+    error: { code: 'CANCELLED', message: expect.any(String) },
+  });
+  await expect(executeTool(page, 'get_debug_state')).resolves.toMatchObject({
+    ok: true,
+    state: 'idle',
+    status: 'stopped',
+  });
+  await expect(page.getByTestId('status')).toHaveText('Ready');
+});
+
+test('runs a tool through getTools() and executeTool() with an input object', async ({ page }) => {
+  await installModelContext(page);
+  await page.goto('/');
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
+
+  const result = await page.evaluate(async () => {
+    const context = (document as unknown as {
+      modelContext: {
+        getTools(): Promise<Array<{ name: string }>>;
+        executeTool(tool: unknown, input: unknown): Promise<unknown>;
+      };
+    }).modelContext;
+    const tool = (await context.getTools()).find(({ name }) => name === 'read_editor');
+    return context.executeTool(tool, { limit: 5 });
+  });
+  expect(result).toMatchObject({ ok: true, offset: 0, limit: 5 });
 });

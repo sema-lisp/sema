@@ -1122,6 +1122,36 @@ editorEl.addEventListener('keydown', (e) => {
 // Highlight initial content
 scheduleHighlight();
 
+// Runs `task` for a WebMCP tool call. When `signal` aborts while `task` is
+// pending, `onAbort` runs once. When `signal` is aborted after `task` settles,
+// the call fails with CANCELLED, because the agent no longer wants the result.
+async function withToolAbort(signal, onAbort, task) {
+  if (!signal) return task();
+  signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    const result = await task();
+    if (signal.aborted) toolFailure('CANCELLED', 'The tool call was cancelled.');
+    return result;
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+  }
+}
+
+// A cancelled debugger call stops the debug session, so the playground does not
+// stay paused on behalf of an agent that has stopped waiting.
+function withDebugAbort(signal, task) {
+  const stopIfActive = () => {
+    if (debugState !== 'idle') stopDebugging();
+  };
+  return withToolAbort(signal, stopIfActive, async () => {
+    try {
+      return await task();
+    } finally {
+      if (signal?.aborted) stopIfActive();
+    }
+  });
+}
+
 const webMcpActions = {
   read_editor: (input) => pageText(editorEl.value, input),
   write_editor: ({ code }) => {
@@ -1135,10 +1165,14 @@ const webMcpActions = {
     const formatted = formatEditorSource();
     return { ok: true, formatted: true, length: formatted.length };
   },
-  run_editor: async () => {
+  run_editor: async (_input, { signal } = {}) => {
     requireToolIdle();
     if (!editorEl.value.trim()) toolFailure('INVALID_INPUT', 'The editor is empty.');
-    const result = await run();
+    // Only a worker-backed run can be interrupted. A main-thread run blocks
+    // the page until it finishes, so its abort is reported after the fact.
+    const result = await withToolAbort(signal, () => {
+      if (workerActive && workerRunning) cancelWorker();
+    }, () => run());
     if (result?.error) {
       const code = result.error.toLowerCase().includes('cancelled') ? 'CANCELLED' : 'EVAL_ERROR';
       toolFailure(code, result.error);
@@ -1220,13 +1254,13 @@ const webMcpActions = {
     return { ok: true, ...written };
   },
   set_breakpoints: ({ lines }) => ({ ok: true, breakpoints: replaceBreakpoints(lines) }),
-  start_debugging: () => startDebugging(),
-  continue_debugging: () => continueDebugging(),
-  step_debugger: ({ mode }) => {
+  start_debugging: (_input, { signal } = {}) => withDebugAbort(signal, () => startDebugging()),
+  continue_debugging: (_input, { signal } = {}) => withDebugAbort(signal, () => continueDebugging()),
+  step_debugger: ({ mode }, { signal } = {}) => {
     if (!['into', 'over', 'out'].includes(mode)) {
       toolFailure('INVALID_INPUT', 'mode must be into, over, or out.');
     }
-    return stepDebugger(mode);
+    return withDebugAbort(signal, () => stepDebugger(mode));
   },
   stop_debugging: () => stopDebugging(),
   get_debug_state: () => {

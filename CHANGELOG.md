@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Playground
+
+- The WebMCP Origin Trial token for sema.run expired on 2026-11-17, so Chrome
+  stopped exposing `document.modelContext` there and no playground tools were
+  registered. The token is renewed until 2027-03-30.
+- WebMCP tools follow the current Chrome API (through Chrome 160): each tool
+  declares a `title`, an `outputSchema` (success or `{ ok: false, error }`),
+  and all four `ToolAnnotations` members. `execute` uses the
+  `{ signal }` argument. An abort stops a worker-backed `run_editor` or the
+  active debugger session and returns `CANCELLED`.
+
 ## 2.0.0
 
 See the [migration guide](https://sema-lang.com/docs/migrating-to-2)

@@ -120,21 +120,13 @@ impl sema_core::runtime::CompletionDecoder for EmbedDecoder {
                         ),
                     );
                 }
-                if let Some(slot) = &self.usage_accum_slot {
-                    let cost = pricing::calculate_cost_for(&self.provider_name, &resp.usage);
-                    accumulate_into(slot, &resp.usage, cost);
-                }
                 let value = embed_value_from_response(&resp, self.single);
-                let prev_budget = ACTIVE_BUDGET
-                    .with(|b| std::mem::replace(&mut *b.borrow_mut(), self.budget_slot.clone()));
-                let track_result = USAGE_ACCUM_SUPPRESS.with(|s| {
-                    s.set(true);
-                    let r = track_usage(&resp.usage);
-                    s.set(false);
-                    r
-                });
-                ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
-                track_result?;
+                charge_dispatch_frames(
+                    &billable_usage(ResponseOrigin::Provider, &resp.usage),
+                    &self.provider_name,
+                    self.usage_accum_slot.as_ref(),
+                    self.budget_slot.clone(),
+                )?;
                 Ok(value)
             }
             Err(e) => {
@@ -455,7 +447,7 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
                         ..Default::default()
                     });
                     drop(span);
-                    track_usage(&resp.usage)?;
+                    track_usage(&billable_usage(ResponseOrigin::CassetteReplay, &resp.usage))?;
                     return Ok(NativeOutcome::Return(embed_value_from_response(
                         &resp, single,
                     )));
@@ -545,7 +537,7 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
         let span = sema_otel::llm_span("embeddings");
         span.set_embedding_input(&request.texts);
         let decision = cassette_decide(&cassette_key);
-        let response = match decision {
+        let (response, origin) = match decision {
             Some(crate::cassette::Decision::Replay(entry)) => {
                 enforce_stored_model_policy(&entry.provider, &entry.model, PolicySource::Cassette)?;
                 let resp = EmbedResponse {
@@ -568,7 +560,7 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
                     response_model: resp.model.clone(),
                     ..Default::default()
                 });
-                resp
+                (resp, ResponseOrigin::CassetteReplay)
             }
             Some(crate::cassette::Decision::Miss(k)) => return Err(cassette_miss_error(&k)),
             other => {
@@ -609,11 +601,11 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
                         resp.usage.prompt_tokens,
                     ));
                 }
-                resp
+                (resp, ResponseOrigin::Provider)
             }
         };
 
-        track_usage(&response.usage)?;
+        track_usage(&billable_usage(origin, &response.usage))?;
         Ok(NativeOutcome::Return(embed_value_from_response(
             &response, single,
         )))

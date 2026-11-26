@@ -1232,3 +1232,318 @@ fn sync_only_provider_offload_enforces_a_deadline() {
         "a deadline-abandoned completion must charge nothing"
     );
 }
+
+// ── Response origin accounting: provider / cache hit / cassette replay ──────
+//
+// Each result origin has one charge rule (`sema_llm::builtins` `billable_usage`):
+// a provider call charges the usage it reported, a cache hit charges zero, and a
+// cassette replay charges the usage stored on the tape. These tests check the rule
+// on the runtime `llm/complete` and `llm/stream` paths, inside a spawned task and a
+// nested `llm/with-budget`, and on the host (synchronous) `llm/complete` path.
+
+/// A prompt no other test or earlier run uses, so the on-disk response cache never
+/// serves it before the first call.
+fn origin_unique_prompt(tag: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("origin-{tag}-{}-{nanos}", std::process::id())
+}
+
+/// Record one `reply_with_usage` completion (or stream) onto a fresh tape.
+fn origin_record_tape(tag: &str, prompt: &str, stream: bool) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("sema-origin-{}-{tag}.jsonl", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let fake = FakeProvider::builder("fake")
+        .model("m")
+        .reply_with_usage("recorded", 111, 222)
+        .build();
+    let call = if stream {
+        format!(r#"(llm/stream "{prompt}" (fn (c) nil) {{:model "m"}})"#)
+    } else {
+        format!(r#"(llm/complete "{prompt}" {{:model "m"}})"#)
+    };
+    let (result, recorder) = eval_with_fake(
+        &format!(
+            r#"(llm/with-cassette "{}" {{:mode :record}} (fn () {call}))"#,
+            crate::common::sema_path(&path)
+        ),
+        fake,
+    );
+    result.expect("record run succeeds");
+    assert_eq!(
+        recorder.call_count(),
+        1,
+        "the record run calls the provider"
+    );
+    path
+}
+
+/// A fake that fails the test's eval if it is called.
+fn origin_must_not_call() -> FakeProvider {
+    FakeProvider::builder("fake")
+        .model("m")
+        .error(LlmError::Api {
+            status: 500,
+            message: "this result must not come from the provider".into(),
+        })
+        .build()
+}
+
+/// Read `[result, inner-tokens-spent, outer-tokens-spent, session-total-tokens]`.
+fn origin_tokens(value: &Value) -> (Option<String>, Vec<Option<i64>>) {
+    let items = value.as_seq().expect("vector result");
+    (
+        items[0].as_str().map(String::from),
+        items[1..].iter().map(Value::as_int).collect(),
+    )
+}
+
+#[test]
+fn provider_and_cache_hit_charge_by_origin_in_task_and_nested_budget() {
+    let prompt = origin_unique_prompt("complete-cache");
+    let fake = FakeProvider::builder("fake")
+        .model("m")
+        .reply_with_usage("live", 100, 50)
+        .build();
+    let src = format!(
+        r#"
+        (llm/set-pricing "m" 1.0 1.0)
+        (llm/with-budget {{:max-tokens 100000 :max-cost-usd 100.0}}
+          (fn ()
+            (llm/with-budget {{:max-tokens 10000 :max-cost-usd 10.0}}
+              (fn ()
+                (llm/with-cache {{:ttl 3600}}
+                  (fn ()
+                    (let ((live (async/await (async/spawn (fn () (llm/complete "{prompt}" {{:model "m"}})))))
+                          (after-live (llm/budget-remaining))
+                          (hit (async/await (async/spawn (fn () (llm/complete "{prompt}" {{:model "m"}})))))
+                          (after-hit (llm/budget-remaining)))
+                      [live hit
+                       (:tokens-spent after-live) (:tokens-spent after-hit)
+                       (:spent after-live) (:spent after-hit)
+                       (:total-tokens (llm/session-usage))
+                       (:cost-usd (llm/session-usage))
+                       (:hits (llm/cache-stats))])))))))
+        "#
+    );
+    let (result, recorder) = eval_with_fake(&src, fake);
+    let value = result.expect("provider call then cache hit succeed");
+    let items = value.as_seq().expect("vector result");
+    assert_eq!(items[0].as_str(), Some("live"));
+    assert_eq!(
+        items[1].as_str(),
+        Some("live"),
+        "the cache serves the same text"
+    );
+    assert_eq!(
+        items[2].as_int(),
+        Some(150),
+        "provider call charges actual tokens"
+    );
+    assert_eq!(
+        items[3].as_int(),
+        Some(150),
+        "cache hit adds no budget tokens"
+    );
+    let spent_live = items[4]
+        .as_float()
+        .expect("cost spent after the provider call");
+    assert!(spent_live > 0.0, "provider call charges cost to the budget");
+    assert_eq!(
+        items[5].as_float(),
+        Some(spent_live),
+        "cache hit adds no budget cost"
+    );
+    assert_eq!(
+        items[6].as_int(),
+        Some(150),
+        "session tokens count only the provider call"
+    );
+    assert_eq!(
+        items[7].as_float(),
+        Some(spent_live),
+        "session cost counts only the provider call"
+    );
+    assert_eq!(items[8].as_int(), Some(1), "the second call is a cache hit");
+    assert_eq!(
+        recorder.call_count(),
+        1,
+        "the cache hit makes no provider call"
+    );
+}
+
+#[test]
+fn complete_cassette_replay_charges_recorded_usage_in_task_and_nested_budget() {
+    let prompt = origin_unique_prompt("complete-replay");
+    let path = origin_record_tape("complete-replay", &prompt, false);
+    let src = format!(
+        r#"
+        (llm/with-cassette "{}" {{:mode :replay}}
+          (fn ()
+            (llm/with-budget {{:max-tokens 100000}}
+              (fn ()
+                (let ((outer-before (:tokens-spent (llm/budget-remaining))))
+                  (llm/with-budget {{:max-tokens 10000}}
+                    (fn ()
+                      (let ((text (async/await (async/spawn (fn () (llm/complete "{prompt}" {{:model "m"}}))))))
+                        [text
+                         (:tokens-spent (llm/budget-remaining))
+                         outer-before
+                         (:total-tokens (llm/session-usage))]))))))))
+        "#,
+        crate::common::sema_path(&path)
+    );
+    let (result, recorder) = eval_with_fake(&src, origin_must_not_call());
+    let (text, tokens) = origin_tokens(&result.expect("replay succeeds"));
+    assert_eq!(text.as_deref(), Some("recorded"));
+    assert_eq!(
+        tokens,
+        vec![Some(333), Some(0), Some(333)],
+        "replay charges the recorded 111+222 tokens to the inner budget and the session"
+    );
+    assert_eq!(recorder.call_count(), 0, "replay makes no provider call");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn stream_provider_charges_actual_usage_in_task_and_nested_budget() {
+    let fake = FakeProvider::builder("fake")
+        .model("m")
+        .reply_with_usage("streamed", 70, 30)
+        .build();
+    let src = r#"
+        (llm/with-budget {:max-tokens 100000}
+          (fn ()
+            (llm/with-budget {:max-tokens 10000}
+              (fn ()
+                (let ((text (async/await (async/spawn (fn () (llm/stream "s" (fn (c) nil) {:model "m"}))))))
+                  [text
+                   (:tokens-spent (llm/budget-remaining))
+                   (:total-tokens (llm/session-usage))])))))
+    "#;
+    let (result, recorder) = eval_with_fake(src, fake);
+    let (text, tokens) = origin_tokens(&result.expect("stream succeeds"));
+    assert_eq!(text.as_deref(), Some("streamed"));
+    assert_eq!(
+        tokens,
+        vec![Some(100), Some(100)],
+        "a provider stream charges its actual 70+30 tokens"
+    );
+    assert_eq!(recorder.call_count(), 1);
+}
+
+#[test]
+fn stream_cassette_replay_charges_recorded_usage_in_task_and_nested_budget() {
+    let prompt = origin_unique_prompt("stream-replay");
+    let path = origin_record_tape("stream-replay", &prompt, true);
+    let src = format!(
+        r#"
+        (define out "")
+        (llm/with-cassette "{}" {{:mode :replay}}
+          (fn ()
+            (llm/with-budget {{:max-tokens 100000}}
+              (fn ()
+                (llm/with-budget {{:max-tokens 10000}}
+                  (fn ()
+                    (async/await (async/spawn (fn ()
+                      (llm/stream "{prompt}" (fn (c) (set! out (string-append out c))) {{:model "m"}}))))
+                    [out
+                     (:tokens-spent (llm/budget-remaining))
+                     (:total-tokens (llm/session-usage))]))))))
+        "#,
+        crate::common::sema_path(&path)
+    );
+    let (result, recorder) = eval_with_fake(&src, origin_must_not_call());
+    let (text, tokens) = origin_tokens(&result.expect("stream replay succeeds"));
+    assert_eq!(text.as_deref(), Some("recorded"));
+    assert_eq!(
+        tokens,
+        vec![Some(333), Some(333)],
+        "a replayed stream charges the recorded 111+222 tokens"
+    );
+    assert_eq!(recorder.call_count(), 0, "replay makes no provider call");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Host (synchronous) `llm/complete` path: `do_complete` outside a runtime quantum,
+/// reached by calling a Sema function from Rust with `call_callback`. The cassette
+/// is the ambient one (`install_cassette`, as `SEMA_LLM_CASSETTE` installs it), so
+/// it stays active inside `llm/with-cache` (`llm/with-cassette` turns the cache
+/// off for its extent). A cassette replay is charged its recorded usage and is NOT
+/// written to the response cache: only a provider result is cached, as on the
+/// runtime path. A provider result is cached, and the later hit charges zero.
+#[test]
+fn host_complete_charges_by_origin_and_caches_only_provider_results() {
+    let replay_prompt = origin_unique_prompt("host-replay");
+    let path = origin_record_tape("host-replay", &replay_prompt, false);
+    let live_prompt = origin_unique_prompt("host-live");
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    let fake = FakeProvider::builder("fake")
+        .model("m")
+        .reply_with_usage("live", 100, 50)
+        .build();
+    let recorder = fake.recorder();
+    register_test_provider(Box::new(fake));
+    let body = interp
+        .eval_str_compiled(&format!(
+            r#"
+            (fn ()
+              (llm/with-budget {{:max-tokens 100000}}
+                (fn ()
+                  (llm/with-cache {{:ttl 3600}}
+                    (fn ()
+                      (let ((replayed (llm/complete "{replay_prompt}" {{:model "m"}}))
+                            (after-replay (:tokens-spent (llm/budget-remaining)))
+                            (size-after-replay (:size (llm/cache-stats)))
+                            (live (llm/complete "{live_prompt}" {{:model "m"}}))
+                            (after-live (:tokens-spent (llm/budget-remaining)))
+                            (size-after-live (:size (llm/cache-stats)))
+                            (hit (llm/complete "{live_prompt}" {{:model "m"}}))
+                            (after-hit (:tokens-spent (llm/budget-remaining))))
+                        [replayed after-replay size-after-replay
+                         live after-live size-after-live
+                         hit after-hit (:total-tokens (llm/session-usage))]))))))
+            "#
+        ))
+        .expect("compile host body");
+    // Replay mode serves the recorded prompt; any other prompt is a hard miss, so
+    // the live prompt uses :auto (record on miss) instead.
+    sema_llm::builtins::install_cassette(sema_llm::cassette::Cassette::load(
+        path.clone(),
+        sema_llm::cassette::CassetteMode::Auto,
+    ));
+    let value = sema_core::call_callback(&interp.ctx, &body, &[]).expect("host run succeeds");
+    let items = value.as_seq().expect("vector result");
+    assert_eq!(items[0].as_str(), Some("recorded"));
+    assert_eq!(
+        items[1].as_int(),
+        Some(333),
+        "replay charges the recorded tokens"
+    );
+    assert_eq!(
+        items[2].as_int(),
+        Some(0),
+        "a cassette replay is not cached"
+    );
+    assert_eq!(items[3].as_str(), Some("live"));
+    assert_eq!(
+        items[4].as_int(),
+        Some(483),
+        "provider call charges actual tokens"
+    );
+    assert_eq!(items[5].as_int(), Some(1), "a provider result is cached");
+    assert_eq!(items[6].as_str(), Some("live"));
+    assert_eq!(items[7].as_int(), Some(483), "cache hit charges zero");
+    assert_eq!(items[8].as_int(), Some(483));
+    assert_eq!(
+        recorder.call_count(),
+        1,
+        "only the live call reaches the provider"
+    );
+    drop(sema_llm::builtins::take_cassette());
+    let _ = std::fs::remove_file(&path);
+}

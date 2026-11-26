@@ -14,6 +14,19 @@
 - `(+ 1 "x")` through `apply` hints `use (str a b ...)`, and
   `(contains? [1 2] 0)` hints `use (nth coll i)`, as the direct form did.
 
+### LLM
+
+- A cassette replay is no longer written to the response cache. With an
+  ambient cassette (`SEMA_LLM_CASSETTE`, `llm/cassette-load`) inside
+  `llm/with-cache`, the host completion path stored replayed responses as if
+  a provider had returned them. Only live provider results are cached now,
+  on both the host and the runtime path.
+- Internal: every completion result carries a `ResponseOrigin` (`Provider`,
+  `CacheHit`, `CassetteReplay`). Usage is charged only through
+  `billable_usage`, which applies the rule for each origin: a cache hit
+  charges zero, a cassette replay charges the recorded usage, a provider
+  call charges the usage it reported.
+
 ### Playground
 
 - The WebMCP Origin Trial token for sema.run expired on 2026-11-17, so Chrome

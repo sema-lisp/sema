@@ -161,8 +161,7 @@ pub(super) fn complete_with_prompt(
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let response = do_complete(request)?;
-        track_usage(&response.usage)?;
+        let response = do_complete(request)?.charge()?;
         Ok(NativeOutcome::Return(Value::string(&response.content)))
     }
 }
@@ -697,8 +696,7 @@ pub(super) fn register(env: &Env, sandbox: &sema_core::Sandbox, unrestricted: bo
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let response = do_complete(request)?;
-            track_usage(&response.usage)?;
+            let response = do_complete(request)?.charge()?;
             Ok(NativeOutcome::Return(Value::string(&response.content)))
         }
     });
@@ -791,8 +789,7 @@ pub(super) fn register(env: &Env, sandbox: &sema_core::Sandbox, unrestricted: bo
                 }
                 #[cfg(target_arch = "wasm32")]
                 {
-                    let response = do_complete(request)?;
-                    track_usage(&response.usage)?;
+                    let response = do_complete(request)?.charge()?;
                     Ok(NativeOutcome::Return(Value::string(&response.content)))
                 }
             } else {
@@ -1011,8 +1008,7 @@ pub(super) fn register(env: &Env, sandbox: &sema_core::Sandbox, unrestricted: bo
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let response = do_complete(request)?;
-            track_usage(&response.usage)?;
+            let response = do_complete(request)?.charge()?;
             Ok(NativeOutcome::Return(Value::string(&response.content)))
         }
     });
@@ -1073,8 +1069,7 @@ pub(super) fn register(env: &Env, sandbox: &sema_core::Sandbox, unrestricted: bo
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let response = do_complete(request)?;
-            track_usage(&response.usage)?;
+            let response = do_complete(request)?.charge()?;
             parse_comparison(response).map(NativeOutcome::Return)
         }
     });

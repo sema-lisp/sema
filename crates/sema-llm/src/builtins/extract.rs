@@ -502,9 +502,7 @@ pub(super) fn extract_validate_and_reask(
         } else {
             let request =
                 extract_reask_request(cfg, &last_response_content, &last_validation_error);
-            let resp = do_complete(request)?;
-            track_usage(&resp.usage)?;
-            resp
+            do_complete(request)?.charge()?
         };
 
         let content = response.content.trim().to_string();
@@ -592,14 +590,12 @@ pub(super) fn register(env: &Env, sandbox: &sema_core::Sandbox) {
                     CompleteFinalize::runtime(Box::new(RuntimeExtractDriver::new(cfg))),
                 );
             }
-            let first = do_complete(request)?;
-            track_usage(&first.usage)?;
+            let first = do_complete(request)?.charge()?;
             extract_validate_and_reask(first, &cfg).map(NativeOutcome::Return)
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let first = do_complete(request)?;
-            track_usage(&first.usage)?;
+            let first = do_complete(request)?.charge()?;
             extract_validate_and_reask(first, &cfg).map(NativeOutcome::Return)
         }
     });
@@ -680,8 +676,7 @@ pub(super) fn register(env: &Env, sandbox: &sema_core::Sandbox) {
             }
             #[cfg(target_arch = "wasm32")]
             {
-                let response = do_complete(request)?;
-                track_usage(&response.usage)?;
+                let response = do_complete(request)?.charge()?;
                 extract_parse_response(&response).map(NativeOutcome::Return)
             }
         },
@@ -753,8 +748,7 @@ pub(super) fn register(env: &Env, sandbox: &sema_core::Sandbox) {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let response = do_complete(request)?;
-            track_usage(&response.usage)?;
+            let response = do_complete(request)?.charge()?;
             parse_category(response).map(NativeOutcome::Return)
         }
     });

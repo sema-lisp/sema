@@ -717,11 +717,11 @@ pub(super) fn agent_step(ctx: &EvalContext, token: u64) -> sema_core::runtime::N
     // Synchronous round: an `:on-text` streaming round drives the SSE stream inline on
     // the VM thread; a plain round in non-async context is the ordinary blocking
     // completion. Either way the usage is accounted once and the state updated inline.
-    let response = match on_text.as_ref() {
+    let completion = match on_text.as_ref() {
         Some(cb) => do_complete_streaming(ctx, request, cb)?,
         None => do_complete(request)?,
     };
-    track_usage(&response.usage)?;
+    let response = completion.charge()?;
     agent_apply_step_response(token, response).map(NativeOutcome::Return)
 }
 
@@ -1454,17 +1454,20 @@ pub(super) fn run_tool_loop(
             Some(cb) => do_complete_streaming(ctx, request, cb),
             None => do_complete(request),
         };
-        let response = match completion {
-            Ok(r) => r,
+        let completion = match completion {
+            Ok(c) => c,
             Err(e) => {
                 _agent_span.record_error("provider_error", &e.to_string());
                 return Err(e);
             }
         };
-        if let Err(e) = track_usage(&response.usage) {
-            _agent_span.record_error("budget_error", &e.to_string());
-            return Err(e);
-        }
+        let response = match completion.charge() {
+            Ok(r) => r,
+            Err(e) => {
+                _agent_span.record_error("budget_error", &e.to_string());
+                return Err(e);
+            }
+        };
         last_content = response.content.clone();
 
         if response.tool_calls.is_empty() {

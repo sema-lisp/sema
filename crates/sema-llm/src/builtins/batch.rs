@@ -112,21 +112,14 @@ pub(super) fn finalize_batch_responses(
         let mut resp = resp_result.map_err(|error| SemaError::Llm(error.to_string()))?;
         let policy_result = apply_output_policy_to_response(&mut resp, PolicySource::Request);
         // Priced with an empty provider, matching the sync path (which never
-        // stamps a serving provider for `llm/batch`).
-        if let Some(slot) = &usage_accum_slot {
-            let cost = pricing::calculate_cost_for("", &resp.usage);
-            accumulate_into(slot, &resp.usage, cost);
-        }
-        let prev_budget = ACTIVE_BUDGET
-            .with(|active| std::mem::replace(&mut *active.borrow_mut(), budget_slot.clone()));
-        let track_result = USAGE_ACCUM_SUPPRESS.with(|suppress| {
-            suppress.set(true);
-            let result = track_usage(&resp.usage);
-            suppress.set(false);
-            result
-        });
-        ACTIVE_BUDGET.with(|active| *active.borrow_mut() = prev_budget);
-        track_result?;
+        // stamps a serving provider for `llm/batch`). A batch has no cache or
+        // cassette, so every result has the `Provider` origin.
+        charge_dispatch_frames(
+            &billable_usage(ResponseOrigin::Provider, &resp.usage),
+            "",
+            usage_accum_slot.as_ref(),
+            budget_slot.clone(),
+        )?;
         policy_result?;
         results.push(Value::string(&resp.content));
     }
@@ -234,13 +227,14 @@ pub(super) fn register(env: &Env) {
             .into_iter()
             .map(|response| {
                 let mut response = response.map_err(|error| SemaError::Llm(error.to_string()))?;
+                let billable = billable_usage(ResponseOrigin::Provider, &response.usage);
                 if let Err(error) =
                     apply_output_policy_to_response(&mut response, PolicySource::Request)
                 {
-                    track_usage(&response.usage)?;
+                    track_usage(&billable)?;
                     return Err(error);
                 }
-                track_usage(&response.usage)?;
+                track_usage(&billable)?;
                 Ok(Value::string(&response.content))
             })
             .collect::<Result<Vec<_>, SemaError>>()
@@ -381,11 +375,12 @@ pub(super) fn register(env: &Env) {
         let mut results = Vec::with_capacity(responses.len());
         for resp_result in responses {
             let mut resp = resp_result.map_err(|e| SemaError::Llm(e.to_string()))?;
+            let billable = billable_usage(ResponseOrigin::Provider, &resp.usage);
             if let Err(error) = apply_output_policy_to_response(&mut resp, PolicySource::Request) {
-                track_usage(&resp.usage)?;
+                track_usage(&billable)?;
                 return Err(error);
             }
-            track_usage(&resp.usage)?;
+            track_usage(&billable)?;
             results.push(Value::string(&resp.content));
         }
         Ok(NativeOutcome::Return(Value::list(results)))

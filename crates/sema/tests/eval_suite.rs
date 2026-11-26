@@ -14,6 +14,8 @@ mod eval_core_test;
 mod eval_data_test;
 #[path = "suites/eval_ergonomic_test.rs"]
 mod eval_ergonomic_test;
+#[path = "suites/eval_intrinsic_parity_test.rs"]
+mod eval_intrinsic_parity_test;
 #[path = "suites/eval_io_test.rs"]
 mod eval_io_test;
 #[path = "suites/eval_map_test.rs"]

@@ -2411,6 +2411,42 @@ impl VM {
     /// synchronous fresh-VM and callback adapters reject while that quantum is
     /// active, so an unresolved task-owned wait cannot be bypassed by value-ABI
     /// re-entry.
+    /// Compute the result of an intrinsic opcode whose fast path rejected its
+    /// operands, by calling the global native function of the same name with
+    /// the same operands. stdlib owns argument checking and error text, so an
+    /// intrinsic call and an indirect call (`apply`, a call through a local)
+    /// agree on every input.
+    ///
+    /// Only a `NativeFn` binding is used: Sema code cannot create one, so a
+    /// user redefinition the compiler did not see is never called here.
+    /// Pushes the native's value. Returns `vm_err` when the name has no
+    /// native binding (an interpreter built without stdlib) or the native
+    /// suspends.
+    #[cold]
+    #[inline(never)]
+    fn intrinsic_fallback(
+        &mut self,
+        op: Op,
+        args: &[Value],
+        ctx: &EvalContext,
+        vm_err: SemaError,
+    ) -> Result<(), SemaError> {
+        let Some(native) = intrinsic_name(op)
+            .and_then(|name| self.globals.get(sema_core::intern(name)))
+            .and_then(|v| v.as_native_fn_rc())
+        else {
+            return Err(vm_err);
+        };
+        match self.dispatch_native(&native, args, ctx) {
+            Ok(NativeDispatchResult::Value(v)) => {
+                self.stack.push(v);
+                Ok(())
+            }
+            Ok(NativeDispatchResult::Pending(_)) => Err(vm_err),
+            Err(err) => Err(err),
+        }
+    }
+
     fn dispatch_native(
         &mut self,
         func: &Rc<NativeFn>,
@@ -2724,6 +2760,24 @@ impl VM {
                 match $self.handle_exception($err, $saved_pc)? {
                     ExceptionAction::Handled => continue $label,
                     ExceptionAction::Propagate(e) => return Err(e),
+                }
+            }};
+        }
+
+        // Error exit of an intrinsic opcode. The intrinsic arm owns only the
+        // fast success paths; the result for every other input comes from the
+        // canonical native (`intrinsic_fallback`), so `(f x)` and
+        // `(apply f (list x))` return the same value or the same error. On a
+        // value, resume after the opcode; on an error, raise it at the opcode.
+        macro_rules! intrinsic_err {
+            ($self:expr, $fi:expr, $pc:expr, $op:expr, [$($arg:expr),+], $err:expr, $label:tt) => {{
+                let args = [$($arg),+];
+                match $self.intrinsic_fallback($op, &args, ctx, $err) {
+                    Ok(()) => {
+                        $self.frames[$fi].pc = $pc;
+                        continue $label;
+                    }
+                    Err(err) => handle_err!($self, $fi, $pc, err, $pc - op::SIZE_OP, $label),
                 }
             }};
         }
@@ -3553,7 +3607,9 @@ impl VM {
                         let a = unsafe { pop_unchecked(&mut self.stack) };
                         match vm_add(&a, &b) {
                             Ok(v) => self.stack.push(v),
-                            Err(err) => handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch),
+                            Err(err) => {
+                                intrinsic_err!(self, fi, pc, Op::Add, [a, b], err, 'dispatch)
+                            }
                         }
                     }
                     op::SUB => {
@@ -3561,7 +3617,9 @@ impl VM {
                         let a = unsafe { pop_unchecked(&mut self.stack) };
                         match vm_sub(&a, &b) {
                             Ok(v) => self.stack.push(v),
-                            Err(err) => handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch),
+                            Err(err) => {
+                                intrinsic_err!(self, fi, pc, Op::Sub, [a, b], err, 'dispatch)
+                            }
                         }
                     }
                     op::MUL => {
@@ -3569,7 +3627,9 @@ impl VM {
                         let a = unsafe { pop_unchecked(&mut self.stack) };
                         match vm_mul(&a, &b) {
                             Ok(v) => self.stack.push(v),
-                            Err(err) => handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch),
+                            Err(err) => {
+                                intrinsic_err!(self, fi, pc, Op::Mul, [a, b], err, 'dispatch)
+                            }
                         }
                     }
                     op::DIV => {
@@ -3577,7 +3637,9 @@ impl VM {
                         let a = unsafe { pop_unchecked(&mut self.stack) };
                         match vm_div(&a, &b) {
                             Ok(v) => self.stack.push(v),
-                            Err(err) => handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch),
+                            Err(err) => {
+                                intrinsic_err!(self, fi, pc, Op::Div, [a, b], err, 'dispatch)
+                            }
                         }
                     }
                     op::NEGATE => {
@@ -3600,7 +3662,7 @@ impl VM {
                             self.stack.push(Value::from_number(n.neg()));
                         } else {
                             let err = SemaError::type_error("number", a.type_name());
-                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                            intrinsic_err!(self, fi, pc, Op::Negate, [a], err, 'dispatch);
                         }
                     }
                     op::NOT => {
@@ -3617,7 +3679,9 @@ impl VM {
                         let a = unsafe { pop_unchecked(&mut self.stack) };
                         match vm_lt(&a, &b) {
                             Ok(v) => self.stack.push(Value::bool(v)),
-                            Err(err) => handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch),
+                            Err(err) => {
+                                intrinsic_err!(self, fi, pc, Op::Lt, [a, b], err, 'dispatch)
+                            }
                         }
                     }
                     op::GT => {
@@ -3625,7 +3689,9 @@ impl VM {
                         let a = unsafe { pop_unchecked(&mut self.stack) };
                         match vm_lt(&b, &a) {
                             Ok(v) => self.stack.push(Value::bool(v)),
-                            Err(err) => handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch),
+                            Err(err) => {
+                                intrinsic_err!(self, fi, pc, Op::Gt, [a, b], err, 'dispatch)
+                            }
                         }
                     }
                     op::LE => {
@@ -3633,7 +3699,9 @@ impl VM {
                         let a = unsafe { pop_unchecked(&mut self.stack) };
                         match vm_le(&a, &b) {
                             Ok(v) => self.stack.push(Value::bool(v)),
-                            Err(err) => handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch),
+                            Err(err) => {
+                                intrinsic_err!(self, fi, pc, Op::Le, [a, b], err, 'dispatch)
+                            }
                         }
                     }
                     op::GE => {
@@ -3641,7 +3709,9 @@ impl VM {
                         let a = unsafe { pop_unchecked(&mut self.stack) };
                         match vm_le(&b, &a) {
                             Ok(v) => self.stack.push(Value::bool(v)),
-                            Err(err) => handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch),
+                            Err(err) => {
+                                intrinsic_err!(self, fi, pc, Op::Ge, [a, b], err, 'dispatch)
+                            }
                         }
                     }
 
@@ -3684,7 +3754,7 @@ impl VM {
                             match vm_add(&a, &b) {
                                 Ok(v) => self.stack.push(v),
                                 Err(err) => {
-                                    handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch)
+                                    intrinsic_err!(self, fi, pc, Op::AddInt, [a, b], err, 'dispatch)
                                 }
                             }
                         }
@@ -3716,7 +3786,7 @@ impl VM {
                             match vm_sub(&a, &b) {
                                 Ok(v) => self.stack.push(v),
                                 Err(err) => {
-                                    handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch)
+                                    intrinsic_err!(self, fi, pc, Op::SubInt, [a, b], err, 'dispatch)
                                 }
                             }
                         }
@@ -3761,7 +3831,7 @@ impl VM {
                             match vm_mul(&a, &b) {
                                 Ok(v) => self.stack.push(v),
                                 Err(err) => {
-                                    handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch)
+                                    intrinsic_err!(self, fi, pc, Op::MulInt, [a, b], err, 'dispatch)
                                 }
                             }
                         }
@@ -3791,7 +3861,7 @@ impl VM {
                             match vm_lt(&a, &b) {
                                 Ok(v) => self.stack.push(Value::bool(v)),
                                 Err(err) => {
-                                    handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch)
+                                    intrinsic_err!(self, fi, pc, Op::LtInt, [a, b], err, 'dispatch)
                                 }
                             }
                         }
@@ -3977,7 +4047,7 @@ impl VM {
                             });
                         } else {
                             let err = SemaError::type_error("list or vector", val.type_name());
-                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                            intrinsic_err!(self, fi, pc, Op::Car, [val], err, 'dispatch);
                         }
                     }
                     op::CDR => {
@@ -3996,7 +4066,7 @@ impl VM {
                             });
                         } else {
                             let err = SemaError::type_error("list or vector", val.type_name());
-                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                            intrinsic_err!(self, fi, pc, Op::Cdr, [val], err, 'dispatch);
                         }
                     }
                     op::CONS => {
@@ -4066,7 +4136,7 @@ impl VM {
                                 "list, vector, string, map, hashmap, bytevector, typed array, or mutable-array",
                                 val.type_name(),
                             );
-                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                            intrinsic_err!(self, fi, pc, Op::Length, [val], err, 'dispatch);
                         }
                     }
 
@@ -4086,7 +4156,7 @@ impl VM {
                                 result.extend(v.iter().cloned());
                             } else {
                                 let err = SemaError::type_error("list or vector", a.type_name());
-                                handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                                intrinsic_err!(self, fi, pc, Op::Append, [a, b], err, 'dispatch);
                             }
                             if let Some(l) = b.as_list() {
                                 result.extend(l.iter().cloned());
@@ -4094,7 +4164,7 @@ impl VM {
                                 result.extend(v.iter().cloned());
                             } else {
                                 let err = SemaError::type_error("list or vector", b.type_name());
-                                handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                                intrinsic_err!(self, fi, pc, Op::Append, [a, b], err, 'dispatch);
                             }
                             self.stack.push(Value::list(result));
                         }
@@ -4111,7 +4181,7 @@ impl VM {
                         } else {
                             let err = SemaError::type_error("map or hashmap", coll.type_name())
                                 .with_hint(map_access_hint("get", &coll));
-                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                            intrinsic_err!(self, fi, pc, Op::Get, [coll, key], err, 'dispatch);
                         }
                     }
                     op::CONTAINS_Q => {
@@ -4124,7 +4194,7 @@ impl VM {
                         } else {
                             let err = SemaError::type_error("map or hashmap", coll.type_name())
                                 .with_hint(map_access_hint("contains?", &coll));
-                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                            intrinsic_err!(self, fi, pc, Op::ContainsQ, [coll, key], err, 'dispatch);
                         }
                     }
 
@@ -4134,7 +4204,7 @@ impl VM {
                         match vm_mod(&a, &b) {
                             Ok(v) => self.stack.push(v),
                             Err(err) => {
-                                handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch)
+                                intrinsic_err!(self, fi, pc, Op::Mod, [a, b], err, 'dispatch)
                             }
                         }
                     }
@@ -4147,7 +4217,7 @@ impl VM {
                                 let err = SemaError::eval(format!(
                                     "nth: index must be non-negative, got {i}"
                                 ));
-                                handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                                intrinsic_err!(self, fi, pc, Op::Nth, [coll, idx_val], err, 'dispatch);
                             }
                             None => {
                                 // A collection in the index slot almost always
@@ -4161,7 +4231,7 @@ impl VM {
                                 };
                                 let err = SemaError::type_error("int", idx_val.type_name())
                                     .with_hint(hint);
-                                handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                                intrinsic_err!(self, fi, pc, Op::Nth, [coll, idx_val], err, 'dispatch);
                             }
                         };
                         if let Some(l) = coll.as_list() {
@@ -4173,7 +4243,7 @@ impl VM {
                                         idx,
                                         l.len()
                                     ));
-                                    handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                                    intrinsic_err!(self, fi, pc, Op::Nth, [coll, idx_val], err, 'dispatch);
                                 }
                             }
                         } else if let Some(v) = coll.as_vector() {
@@ -4185,7 +4255,7 @@ impl VM {
                                         idx,
                                         v.len()
                                     ));
-                                    handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                                    intrinsic_err!(self, fi, pc, Op::Nth, [coll, idx_val], err, 'dispatch);
                                 }
                             }
                         } else if let Some(arr) = coll.as_mutable_array() {
@@ -4198,12 +4268,12 @@ impl VM {
                                         idx,
                                         arr.items.borrow().len()
                                     ));
-                                    handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                                    intrinsic_err!(self, fi, pc, Op::Nth, [coll, idx_val], err, 'dispatch);
                                 }
                             }
                         } else {
                             let err = SemaError::type_error("list or vector", coll.type_name());
-                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                            intrinsic_err!(self, fi, pc, Op::Nth, [coll, idx_val], err, 'dispatch);
                         }
                     }
 
@@ -4214,7 +4284,7 @@ impl VM {
                             self.stack.push(Value::int(s.chars().count() as i64));
                         } else {
                             let err = SemaError::type_error("string", val.type_name());
-                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                            intrinsic_err!(self, fi, pc, Op::StringLength, [val], err, 'dispatch);
                         }
                     }
                     op::STRING_REF => {
@@ -4222,17 +4292,17 @@ impl VM {
                         let str_val = unsafe { pop_unchecked(&mut self.stack) };
                         let Some(s) = str_val.as_str() else {
                             let err = SemaError::type_error("string", str_val.type_name());
-                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                            intrinsic_err!(self, fi, pc, Op::StringRef, [str_val, idx_val], err, 'dispatch);
                         };
                         let Some(idx_signed) = idx_val.as_int() else {
                             let err = SemaError::type_error("int", idx_val.type_name());
-                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                            intrinsic_err!(self, fi, pc, Op::StringRef, [str_val, idx_val], err, 'dispatch);
                         };
                         if idx_signed < 0 {
                             let err = SemaError::eval(format!(
                                 "string-ref: index {idx_signed} must be non-negative"
                             ));
-                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                            intrinsic_err!(self, fi, pc, Op::StringRef, [str_val, idx_val], err, 'dispatch);
                         }
                         let idx = idx_signed as usize;
                         match s.chars().nth(idx) {
@@ -4243,7 +4313,7 @@ impl VM {
                                     "string-ref: index {idx} out of bounds (string length {len})"
                                 ))
                                 .with_hint("indices are 0-based");
-                                handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                                intrinsic_err!(self, fi, pc, Op::StringRef, [str_val, idx_val], err, 'dispatch);
                             }
                         }
                     }

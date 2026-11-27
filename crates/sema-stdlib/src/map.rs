@@ -558,6 +558,11 @@ pub fn register(env: &sema_core::Env) {
         match args[0].view_ref() {
             ValueViewRef::Map(map) => Ok(Value::bool(map.contains_key(&args[1]))),
             ValueViewRef::HashMap(map) => Ok(Value::bool(map.contains_key(&args[1]))),
+            ValueViewRef::List(_) | ValueViewRef::Vector(_) => Err(SemaError::type_error(
+                "map or hashmap",
+                args[0].type_name(),
+            )
+            .with_hint("contains? works on maps; use (nth coll i) to index a list or vector")),
             _ => Err(SemaError::type_error("map or hashmap", args[0].type_name())
                 .with_hint("contains?: argument 1 must be a map; checks for the given key")),
         }

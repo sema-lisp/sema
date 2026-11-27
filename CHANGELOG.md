@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Errors
+
+- A direct call to a builtin that the compiler turns into an inline opcode
+  (`+`, `-`, `*`, `/`, `<`, `>`, `<=`, `>=`, `mod`, `nth`, `string-ref`,
+  `string-length`, and the other intrinsics) returns the same error as
+  `(apply f args)`. Before, the direct form lost the function name and the
+  argument index (`expected string, got int` instead of
+  `string-ref argument 1 expected string, got int`), and for `+` and `nth`
+  named different accepted types.
+- `(+ 1 "x")` through `apply` hints `use (str a b ...)`, and
+  `(contains? [1 2] 0)` hints `use (nth coll i)`, as the direct form did.
+
 ### Playground
 
 - The WebMCP Origin Trial token for sema.run expired on 2026-11-17, so Chrome

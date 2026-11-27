@@ -180,7 +180,15 @@ pub fn register(env: &sema_core::Env) {
                 return Ok(Value::string(&combined));
             }
         }
-        sum_through_tower(args.iter())
+        sum_through_tower(args.iter()).map_err(|err| {
+            if args.iter().any(|a| a.as_str().is_some()) {
+                err.with_hint(
+                    "+: cannot mix strings with other types; use (str a b ...) to build a string",
+                )
+            } else {
+                err
+            }
+        })
     });
 
     register_fn(env, "-", |args| {

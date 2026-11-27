@@ -69,12 +69,10 @@ pub(super) fn accumulate_into(
     let usage = billable.usage();
     let input = usage.prompt_tokens as u64;
     let output = usage.completion_tokens as u64;
-    // A result with no tokens and no cost is tallied with the cache hits too, so a
-    // provider or tape entry that reports no usage keeps `calls == 0` (no zero
-    // budget event). Priced models can report the cost as `Some(0.0)`, so
-    // `cost.is_none()` cannot identify such a result.
-    let reports_nothing = input == 0 && output == 0 && cost.unwrap_or(0.0) == 0.0;
-    if billable.origin() == ResponseOrigin::CacheHit || reports_nothing {
+    // The origin alone marks a cache hit. A provider result or tape entry that
+    // reports zero tokens is still a call; the workflow runtime skips the budget
+    // event for a leaf that spent nothing (`sema-stdlib` `workflow.rs`).
+    if billable.origin() == ResponseOrigin::CacheHit {
         slot.borrow_mut().cache_hits += 1;
         return;
     }
@@ -234,10 +232,9 @@ pub(super) struct BudgetFrame {
 /// (cache hit charges zero) is applied before anything is charged.
 pub(super) fn track_usage(billable: &BillableUsage) -> Result<(), SemaError> {
     let usage = billable.usage();
-    // Price the model as served by the provider that produced this response (falls back to
-    // the canonical first-party price when the serving provider is unknown).
-    let provider = take_serving_provider().unwrap_or_default();
-    let cost = pricing::calculate_cost_for(&provider, usage);
+    // Priced as served by the provider stored on the charge (the canonical
+    // first-party price when that name is empty).
+    let cost = billable.cost();
     let total_tokens = (usage.prompt_tokens + usage.completion_tokens) as u64;
 
     LAST_USAGE.with(|u| *u.borrow_mut() = Some(usage.clone()));
@@ -266,7 +263,13 @@ pub(super) fn track_usage(billable: &BillableUsage) -> Result<(), SemaError> {
     // Charge the active (per-task) budget frame and enforce its limits. Because the
     // frame is shared by `Rc`, all concurrent tasks spawned in one `with-budget` charge
     // one aggregate — so a fan-out is gated, not just a single sequential call.
-    if let Some(frame) = active_budget() {
+    // A cache hit spends nothing, so it is not checked against the limits: a scope
+    // that is already over its limit still serves cached results.
+    let budget = match billable.origin() {
+        ResponseOrigin::CacheHit => None,
+        ResponseOrigin::Provider | ResponseOrigin::CassetteReplay => active_budget(),
+    };
+    if let Some(frame) = budget {
         charge_budget_frame(&frame, total_tokens, cost)?;
         // Cost unknown while a cost cap is set — warn once (enforcement is best-effort).
         if cost.is_none() && frame.borrow().cost_limit.is_some() {

@@ -1083,3 +1083,92 @@ fn cassette_replay_uses_the_recorded_provider_not_the_current_route() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// A cassette replay that the output policy rejects charges the recorded usage, on
+/// the runtime `llm/complete` and `llm/stream` paths alike (the same rule as a
+/// rejected provider result). Sema never records a response its own policy rejects,
+/// so the test edits the recorded tape to stand for a tape that was edited by hand
+/// or written by another Sema version.
+#[test]
+fn output_policy_rejected_replay_charges_recorded_usage_on_complete_and_stream() {
+    let base = temp_run_dir("policy-replay-charge");
+    std::fs::create_dir_all(&base).expect("create run base");
+    let tape = base.join("tape.jsonl");
+    let tape_path = tape
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let src = |mode: &str| {
+        format!(
+            r#"
+            (defpolicy private
+              {{:output {{:detect [:email]
+                         :actions {{:email :block}}}}}})
+            (defworkflow guarded "replay charge" {{:policy private}}
+              (phase "Run")
+              (def completion
+                (llm/with-cassette "{tape_path}" {{:mode :{mode}}}
+                  (fn () (try (llm/complete "complete") (catch error (:type error))))))
+              (def after-complete (:total-tokens (llm/session-usage)))
+              (def streaming
+                (llm/with-cassette "{tape_path}" {{:mode :{mode}}}
+                  (fn ()
+                    (try (llm/stream "stream" (lambda (chunk) nil))
+                      (catch error (:type error))))))
+              {{:status :success
+                :results (list completion streaming)
+                :after-complete after-complete
+                :total (:total-tokens (llm/session-usage))}})
+            "#
+        )
+    };
+
+    let record = FakeProvider::builder("fake")
+        .model("fake-model")
+        .reply_with_usage("plain words", 111, 222)
+        .reply_with_usage("plain words", 111, 222)
+        .build();
+    let out = run_workflow(
+        &src("record"),
+        record,
+        RunOpts::fresh("wf_policy_replay_record", &base),
+    );
+    assert_eq!(out.result["status"], "success", "{}", out.result);
+    assert_eq!(
+        out.result["results"],
+        serde_json::json!(["plain words", "plain words"])
+    );
+    assert_eq!(out.recorder.call_count(), 2);
+
+    let recorded = std::fs::read_to_string(&tape).expect("read tape");
+    assert_eq!(recorded.matches("plain words").count(), 3, "{recorded}");
+    std::fs::write(&tape, recorded.replace("plain words", "alice@example.com")).expect("edit tape");
+
+    let must_not_call = FakeProvider::builder("fake")
+        .model("fake-model")
+        .error(sema_llm::types::LlmError::Config(
+            "replay must not call the provider".into(),
+        ))
+        .build();
+    let out = run_workflow(
+        &src("replay"),
+        must_not_call,
+        RunOpts::fresh("wf_policy_replay_replay", &base),
+    );
+    assert_eq!(out.result["status"], "success", "{}", out.result);
+    assert_eq!(
+        out.result["results"],
+        serde_json::json!(["policy-denied", "policy-denied"])
+    );
+    assert_eq!(out.recorder.call_count(), 0);
+    assert_eq!(
+        out.result["after-complete"], 333,
+        "the rejected complete replay charges 111+222"
+    );
+    assert_eq!(
+        out.result["total"], 666,
+        "the rejected stream replay charges 111+222 too"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}

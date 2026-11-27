@@ -1547,3 +1547,107 @@ fn host_complete_charges_by_origin_and_caches_only_provider_results() {
     drop(sema_llm::builtins::take_cassette());
     let _ = std::fs::remove_file(&path);
 }
+
+// ── Accounting follow-ups: budget over limit, zero usage, batch pricing ──────
+
+#[test]
+fn a_cache_hit_is_served_after_the_budget_is_exceeded() {
+    let prompt = origin_unique_prompt("budget-over-cache");
+    let fake = FakeProvider::builder("fake")
+        .model("m")
+        .reply_with_usage("live", 100, 50)
+        .build();
+    let src = format!(
+        r#"
+        (llm/with-budget {{:max-tokens 100}}
+          (fn ()
+            (llm/with-cache {{:ttl 3600}}
+              (fn ()
+                (let ((first (try (llm/complete "{prompt}" {{:model "m"}})
+                               (catch e "over budget")))
+                      (hit (try (llm/complete "{prompt}" {{:model "m"}})
+                             (catch e "over budget"))))
+                  [first hit (:hits (llm/cache-stats))])))))
+        "#
+    );
+    let (result, recorder) = eval_with_fake(&src, fake);
+    let value = result.expect("both calls return");
+    let items = value.as_seq().expect("vector result");
+    assert_eq!(
+        items[0].as_str(),
+        Some("over budget"),
+        "150 tokens exceed the 100-token budget"
+    );
+    assert_eq!(
+        items[1].as_str(),
+        Some("live"),
+        "the cache hit spends nothing, so the exceeded budget does not fail it"
+    );
+    assert_eq!(items[2].as_int(), Some(1));
+    assert_eq!(recorder.call_count(), 1, "the hit makes no provider call");
+}
+
+#[test]
+fn agent_run_counts_a_zero_usage_provider_round_as_a_call() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .reply_with_usage("done", 0, 0)
+        .build();
+    let src = r#"
+        (defagent quiet-bot {:model "fake-model" :max-turns 2})
+        (:calls (:usage (agent/run quiet-bot "hi" {})))
+    "#;
+    let (result, recorder) = eval_with_fake(src, fake);
+    assert_eq!(recorder.call_count(), 1);
+    assert_eq!(
+        result.expect("agent/run completes").as_int(),
+        Some(1),
+        "a provider round that reports zero tokens is still a call"
+    );
+}
+
+/// `Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8` costs $0.20/M input tokens at the
+/// canonical price and $2.00/M as served by `togetherai` (`pricing-data.json`).
+fn togetherai_batch_fake() -> FakeProvider {
+    FakeProvider::builder("togetherai")
+        .model("Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8")
+        .reply_with_usage("a", 1_000_000, 0)
+        .reply_with_usage("b", 1_000_000, 0)
+        .build()
+}
+
+const BATCH_COST_SRC: &str = r#"
+    (begin
+      (llm/batch ["p1" "p2"] {:model "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"})
+      (:cost-usd (llm/session-usage)))
+"#;
+
+#[test]
+fn runtime_llm_batch_prices_each_result_as_served_by_the_batch_provider() {
+    let (result, recorder) = eval_with_fake(BATCH_COST_SRC, togetherai_batch_fake());
+    let cost = result.expect("batch succeeds").as_float().expect("cost");
+    assert_eq!(recorder.call_count(), 2);
+    assert!(
+        (cost - 4.0).abs() < 1e-9,
+        "two results at the togetherai price ($2.00 each), got {cost}"
+    );
+}
+
+#[test]
+fn host_llm_batch_prices_each_result_as_served_by_the_batch_provider() {
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    let fake = togetherai_batch_fake();
+    let recorder = fake.recorder();
+    register_test_provider(Box::new(fake));
+    let body = interp
+        .eval_str_compiled(&format!("(fn () {BATCH_COST_SRC})"))
+        .expect("compile host body");
+    let value = sema_core::call_callback(&interp.ctx, &body, &[]).expect("host batch succeeds");
+    let cost = value.as_float().expect("cost");
+    assert_eq!(recorder.call_count(), 2);
+    assert!(
+        (cost - 4.0).abs() < 1e-9,
+        "two results at the togetherai price ($2.00 each), got {cost}"
+    );
+}

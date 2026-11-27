@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) enum StreamCassettePlan {
-    Replay(ChatResponse),
+    Replay(Completion),
     Live { record_key: Option<String> },
 }
 
@@ -18,23 +18,25 @@ pub(super) fn prepare_stream_cassette(
     match cassette_decide(&key).expect("cassette scope checked above") {
         crate::cassette::Decision::Replay(entry) => {
             enforce_stored_model_policy(&entry.provider, &entry.model, PolicySource::Cassette)?;
-            let provider = entry.provider.clone();
-            let mut response = entry.to_response();
+            let mut completion = Completion::new(
+                entry.to_response(),
+                ResponseOrigin::CassetteReplay,
+                entry.provider.clone(),
+            );
             if output_policy_active() {
-                apply_output_policy_to_response(&mut response, PolicySource::Cassette)?;
-                if !response.content.is_empty() {
-                    chunk_cb(&response.content)
-                        .map_err(|error| SemaError::Llm(error.to_string()))?;
+                completion = completion.checked(PolicySource::Cassette)?;
+                let content = &completion.response.content;
+                if !content.is_empty() {
+                    chunk_cb(content).map_err(|error| SemaError::Llm(error.to_string()))?;
                 }
             } else {
                 for chunk in &entry.chunks {
                     chunk_cb(chunk).map_err(|error| SemaError::Llm(error.to_string()))?;
                 }
             }
-            span.set_dispatch("cassette", &response.model);
-            span.set_response(&response_facts("cassette", &response));
-            set_serving_provider(&provider);
-            Ok(StreamCassettePlan::Replay(response))
+            span.set_dispatch("cassette", &completion.response.model);
+            span.set_response(&response_facts("cassette", &completion.response));
+            Ok(StreamCassettePlan::Replay(completion))
         }
         crate::cassette::Decision::Miss(key) => Err(cassette_miss_error(&key)),
         crate::cassette::Decision::Record => Ok(StreamCassettePlan::Live {
@@ -92,7 +94,7 @@ pub(super) fn stream_live(
     };
     if defer_output {
         if let Err(error) = apply_output_policy_to_response(&mut response, PolicySource::Request) {
-            Completion::new(response, ResponseOrigin::Provider).charge()?;
+            Completion::new(response, ResponseOrigin::Provider, p.name()).charge()?;
             return Err(error);
         }
         if let Some(key) = record_key {
@@ -229,20 +231,18 @@ pub(super) fn stream_one_provider(
             request.model = provider.default_model().to_string();
         }
         let record_key = match prepare_stream_cassette(&request, chunk_cb, span)? {
-            StreamCassettePlan::Replay(response) => {
-                return Ok(Some(Completion::new(
-                    response,
-                    ResponseOrigin::CassetteReplay,
-                )))
-            }
+            StreamCassettePlan::Replay(completion) => return Ok(Some(completion)),
             StreamCassettePlan::Live { record_key } => record_key,
         };
         if !model_target_allowed(&entry.provider, &request.model, PolicySource::Request, true)? {
             return Ok(None);
         }
         let resp = stream_live(&*provider, request, record_key.as_deref(), chunk_cb, span)?;
-        set_serving_provider(&entry.provider);
-        Ok(Some(Completion::new(resp, ResponseOrigin::Provider)))
+        Ok(Some(Completion::new(
+            resp,
+            ResponseOrigin::Provider,
+            entry.provider.clone(),
+        )))
     })
 }
 
@@ -300,14 +300,12 @@ pub(super) fn stream_with_dispatch(
                 req.model = p.default_model().to_string();
             }
             let record_key = match prepare_stream_cassette(&req, chunk_cb, span)? {
-                StreamCassettePlan::Replay(response) => {
-                    return Ok(Completion::new(response, ResponseOrigin::CassetteReplay))
-                }
+                StreamCassettePlan::Replay(completion) => return Ok(completion),
                 StreamCassettePlan::Live { record_key } => record_key,
             };
             model_target_allowed(p.name(), &req.model, PolicySource::Request, false)?;
             stream_live(p, req, record_key.as_deref(), chunk_cb, span)
-                .map(|response| Completion::new(response, ResponseOrigin::Provider))
+                .map(|response| Completion::new(response, ResponseOrigin::Provider, p.name()))
         }),
     }
 }
@@ -323,6 +321,9 @@ pub(super) enum StreamEvent {
 
 pub(super) struct StreamDone {
     result: Result<ChatResponse, LlmError>,
+    /// The registry name of the serving provider, or for a cassette replay the
+    /// provider stored on the tape. Prices the charge. The span names the provider
+    /// from [`ResponseOrigin::telemetry_provider`] instead when that is set.
     provider: String,
     /// `CassetteReplay` for a pre-filled cassette run, `Provider` otherwise.
     origin: ResponseOrigin,
@@ -598,7 +599,7 @@ pub(super) fn stream_run_begin(
             }
             buffered.push_back(StreamEvent::Done(Box::new(StreamDone {
                 result: Ok(entry.to_response()),
-                provider: "cassette".to_string(),
+                provider: entry.provider.clone(),
                 origin: ResponseOrigin::CassetteReplay,
             })));
             prefilled = true;
@@ -964,7 +965,8 @@ pub(super) fn stream_finalize(
     } = context;
     match done.result {
         Ok(mut resp) => {
-            let billable = billable_usage(done.origin, &resp.usage);
+            let billable = billable_usage(done.origin, &resp.usage, &done.provider);
+            let span_provider = done.origin.telemetry_provider().unwrap_or(&done.provider);
             if defer_deltas {
                 let source = match done.origin {
                     ResponseOrigin::CassetteReplay => PolicySource::Cassette,
@@ -972,27 +974,17 @@ pub(super) fn stream_finalize(
                 };
                 if let Err(error) = apply_output_policy_to_response(&mut resp, source) {
                     if let Some(span) = span {
-                        span.set_dispatch(&done.provider, &resp.model);
+                        span.set_dispatch(span_provider, &resp.model);
                         span.record_error("policy", &error.to_string());
                     }
-                    charge_dispatch_frames(
-                        &billable,
-                        &done.provider,
-                        usage_accum_slot.as_ref(),
-                        budget_slot,
-                    )?;
+                    charge_dispatch_frames(&billable, usage_accum_slot.as_ref(), budget_slot)?;
                     return Err(error);
                 }
             }
             if let Some(span) = span {
-                span.set_dispatch(&done.provider, &resp.model);
-                span.set_response(&response_facts(&done.provider, &resp));
+                span.set_dispatch(span_provider, &resp.model);
+                span.set_response(&response_facts(span_provider, &resp));
                 // span drops here → ends the span.
-            }
-            // A cassette replay made no provider call — leave the serving stamp
-            // alone (matches the sync no-chain path's canonical pricing).
-            if done.origin.is_provider() && !done.provider.is_empty() {
-                set_serving_provider(&done.provider);
             }
             if let Some(key) = &cassette_record_key {
                 let guarded_chunks;
@@ -1019,13 +1011,7 @@ pub(super) fn stream_finalize(
             // Charge THIS run's captured frames — the finalizer runs outside the
             // per-task install boundary, so the thread-locals may hold a sibling's
             // scope.
-            charge_dispatch_frames(
-                &billable,
-                &done.provider,
-                usage_accum_slot.as_ref(),
-                budget_slot,
-            )
-            .map(|()| resp)
+            charge_dispatch_frames(&billable, usage_accum_slot.as_ref(), budget_slot).map(|()| resp)
         }
         Err(e) => {
             if let Some(span) = span {

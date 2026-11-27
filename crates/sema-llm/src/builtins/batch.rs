@@ -54,12 +54,13 @@ impl SemaBatchDriver {
         }
 
         let Self {
+            provider,
             responses,
             usage_accum_slot,
             budget_slot,
             ..
         } = *self;
-        finalize_batch_responses(responses, usage_accum_slot, budget_slot)
+        finalize_batch_responses(responses, &provider, usage_accum_slot, budget_slot)
             .map(NativeOutcome::Return)
     }
 }
@@ -104,6 +105,7 @@ impl sema_core::runtime::NativeContinuation for SemaBatchDriver {
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn finalize_batch_responses(
     responses: Vec<Result<ChatResponse, LlmError>>,
+    provider: &str,
     usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
     budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
 ) -> Result<Value, SemaError> {
@@ -111,12 +113,10 @@ pub(super) fn finalize_batch_responses(
     for resp_result in responses {
         let mut resp = resp_result.map_err(|error| SemaError::Llm(error.to_string()))?;
         let policy_result = apply_output_policy_to_response(&mut resp, PolicySource::Request);
-        // Priced with an empty provider, matching the sync path (which never
-        // stamps a serving provider for `llm/batch`). A batch has no cache or
-        // cassette, so every result has the `Provider` origin.
+        // Priced as served by the provider that ran the batch, like the sync path.
+        // A batch has no cache or cassette, so every result has the `Provider` origin.
         charge_dispatch_frames(
-            &billable_usage(ResponseOrigin::Provider, &resp.usage),
-            "",
+            &billable_usage(ResponseOrigin::Provider, &resp.usage, provider),
             usage_accum_slot.as_ref(),
             budget_slot.clone(),
         )?;
@@ -131,6 +131,7 @@ pub(super) fn finalize_batch_responses(
 /// Holds no live `Value`.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) struct BatchDecoder {
+    provider: String,
     usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
     budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
 }
@@ -160,7 +161,12 @@ impl sema_core::runtime::CompletionDecoder for BatchDecoder {
             Ok(responses) => responses,
             Err(failure) => return Err(SemaError::eval(format!("batch: {}", failure.message()))),
         };
-        finalize_batch_responses(responses, self.usage_accum_slot, self.budget_slot)
+        finalize_batch_responses(
+            responses,
+            &self.provider,
+            self.usage_accum_slot,
+            self.budget_slot,
+        )
     }
 }
 
@@ -219,15 +225,19 @@ pub(super) fn register(env: &Env) {
             })
             .collect::<Vec<_>>();
 
-        let responses = with_provider(|provider| {
+        let (responses, provider_name) = with_provider(|provider| {
             let requests = resolve_batch_models(provider, requests)?;
-            Ok(provider.batch_complete(requests))
+            Ok((
+                provider.batch_complete(requests),
+                provider.name().to_string(),
+            ))
         })?;
         responses
             .into_iter()
             .map(|response| {
                 let mut response = response.map_err(|error| SemaError::Llm(error.to_string()))?;
-                let billable = billable_usage(ResponseOrigin::Provider, &response.usage);
+                let billable =
+                    billable_usage(ResponseOrigin::Provider, &response.usage, &provider_name);
                 if let Err(error) =
                     apply_output_policy_to_response(&mut response, PolicySource::Request)
                 {
@@ -347,6 +357,7 @@ pub(super) fn register(env: &Env) {
                 };
                 let p_job = provider.clone();
                 let decoder = Box::new(BatchDecoder {
+                    provider: provider.name().to_string(),
                     usage_accum_slot: usage_accum_slot.clone(),
                     budget_slot: budget_slot.clone(),
                 });
@@ -367,15 +378,15 @@ pub(super) fn register(env: &Env) {
             }
         }
 
-        let responses = with_provider(|p| {
+        let (responses, provider_name) = with_provider(|p| {
             let reqs = resolve_batch_models(p, requests)?;
-            Ok(p.batch_complete(reqs))
+            Ok((p.batch_complete(reqs), p.name().to_string()))
         })?;
 
         let mut results = Vec::with_capacity(responses.len());
         for resp_result in responses {
             let mut resp = resp_result.map_err(|e| SemaError::Llm(e.to_string()))?;
-            let billable = billable_usage(ResponseOrigin::Provider, &resp.usage);
+            let billable = billable_usage(ResponseOrigin::Provider, &resp.usage, &provider_name);
             if let Err(error) = apply_output_policy_to_response(&mut resp, PolicySource::Request) {
                 track_usage(&billable)?;
                 return Err(error);

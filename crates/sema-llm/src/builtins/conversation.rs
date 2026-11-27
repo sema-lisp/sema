@@ -449,8 +449,7 @@ pub(super) fn register(env: &Env) {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let response = do_complete(request)?;
-            track_usage(&response.usage)?;
+            let response = do_complete(request)?.charge()?;
             finalize(response).map(NativeOutcome::Return)
         }
     });
@@ -840,8 +839,7 @@ pub(super) fn register(env: &Env) {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let response = do_complete(request)?;
-            track_usage(&response.usage)?;
+            let response = do_complete(request)?.charge()?;
             finalize(response).map(NativeOutcome::Return)
         }
     });

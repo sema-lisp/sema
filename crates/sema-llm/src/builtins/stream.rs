@@ -92,7 +92,7 @@ pub(super) fn stream_live(
     };
     if defer_output {
         if let Err(error) = apply_output_policy_to_response(&mut response, PolicySource::Request) {
-            track_usage(&response.usage)?;
+            Completion::new(response, ResponseOrigin::Provider).charge()?;
             return Err(error);
         }
         if let Some(key) = record_key {
@@ -217,7 +217,7 @@ pub(super) fn stream_one_provider(
     mut request: ChatRequest,
     chunk_cb: &mut dyn FnMut(&str) -> Result<(), crate::types::LlmError>,
     span: &sema_otel::LlmSpan,
-) -> Result<Option<ChatResponse>, SemaError> {
+) -> Result<Option<Completion>, SemaError> {
     PROVIDER_REGISTRY.with(|reg| {
         let reg = reg.borrow();
         let provider = reg.get(&entry.provider).ok_or_else(|| {
@@ -229,7 +229,12 @@ pub(super) fn stream_one_provider(
             request.model = provider.default_model().to_string();
         }
         let record_key = match prepare_stream_cassette(&request, chunk_cb, span)? {
-            StreamCassettePlan::Replay(response) => return Ok(Some(response)),
+            StreamCassettePlan::Replay(response) => {
+                return Ok(Some(Completion::new(
+                    response,
+                    ResponseOrigin::CassetteReplay,
+                )))
+            }
             StreamCassettePlan::Live { record_key } => record_key,
         };
         if !model_target_allowed(&entry.provider, &request.model, PolicySource::Request, true)? {
@@ -237,7 +242,7 @@ pub(super) fn stream_one_provider(
         }
         let resp = stream_live(&*provider, request, record_key.as_deref(), chunk_cb, span)?;
         set_serving_provider(&entry.provider);
-        Ok(Some(resp))
+        Ok(Some(Completion::new(resp, ResponseOrigin::Provider)))
     })
 }
 
@@ -250,7 +255,7 @@ pub(super) fn stream_with_dispatch(
     mut request: ChatRequest,
     chunk_cb: &mut dyn FnMut(&str) -> Result<(), crate::types::LlmError>,
     span: &sema_otel::LlmSpan,
-) -> Result<ChatResponse, SemaError> {
+) -> Result<Completion, SemaError> {
     apply_input_policy_to_request(&mut request)?;
     stream_budget_pregate()?;
     enforce_rate_limit();
@@ -295,11 +300,14 @@ pub(super) fn stream_with_dispatch(
                 req.model = p.default_model().to_string();
             }
             let record_key = match prepare_stream_cassette(&req, chunk_cb, span)? {
-                StreamCassettePlan::Replay(response) => return Ok(response),
+                StreamCassettePlan::Replay(response) => {
+                    return Ok(Completion::new(response, ResponseOrigin::CassetteReplay))
+                }
                 StreamCassettePlan::Live { record_key } => record_key,
             };
             model_target_allowed(p.name(), &req.model, PolicySource::Request, false)?;
             stream_live(p, req, record_key.as_deref(), chunk_cb, span)
+                .map(|response| Completion::new(response, ResponseOrigin::Provider))
         }),
     }
 }
@@ -316,6 +324,8 @@ pub(super) enum StreamEvent {
 pub(super) struct StreamDone {
     result: Result<ChatResponse, LlmError>,
     provider: String,
+    /// `CassetteReplay` for a pre-filled cassette run, `Provider` otherwise.
+    origin: ResponseOrigin,
 }
 
 /// Provider-at-a-time dispatch state retained between `__stream-next` calls.
@@ -449,6 +459,7 @@ pub(super) fn stream_wire_walk(
                 emit(StreamEvent::Done(Box::new(StreamDone {
                     result: Ok(resp),
                     provider: entry.name.clone(),
+                    origin: ResponseOrigin::Provider,
                 })));
                 return;
             }
@@ -457,6 +468,7 @@ pub(super) fn stream_wire_walk(
                 emit(StreamEvent::Done(Box::new(StreamDone {
                     result: Err(e),
                     provider: entry.name.clone(),
+                    origin: ResponseOrigin::Provider,
                 })));
                 return;
             }
@@ -474,6 +486,7 @@ pub(super) fn stream_wire_walk(
     emit(StreamEvent::Done(Box::new(StreamDone {
         result: Err(e),
         provider: name,
+        origin: ResponseOrigin::Provider,
     })));
 }
 
@@ -586,6 +599,7 @@ pub(super) fn stream_run_begin(
             buffered.push_back(StreamEvent::Done(Box::new(StreamDone {
                 result: Ok(entry.to_response()),
                 provider: "cassette".to_string(),
+                origin: ResponseOrigin::CassetteReplay,
             })));
             prefilled = true;
         }
@@ -727,6 +741,7 @@ impl RuntimeStreamDriver {
                         .push_back(StreamEvent::Done(Box::new(StreamDone {
                             result: Err(error),
                             provider,
+                            origin: ResponseOrigin::Provider,
                         })));
                     return Ok(Action::Terminal);
                 };
@@ -828,6 +843,7 @@ impl RuntimeStreamDriver {
                 .push_back(StreamEvent::Done(Box::new(StreamDone {
                     result: Ok(response),
                     provider,
+                    origin: ResponseOrigin::Provider,
                 })));
             Ok(())
         })?;
@@ -948,31 +964,23 @@ pub(super) fn stream_finalize(
     } = context;
     match done.result {
         Ok(mut resp) => {
+            let billable = billable_usage(done.origin, &resp.usage);
             if defer_deltas {
-                let source = if done.provider == "cassette" {
-                    PolicySource::Cassette
-                } else {
-                    PolicySource::Request
+                let source = match done.origin {
+                    ResponseOrigin::CassetteReplay => PolicySource::Cassette,
+                    ResponseOrigin::Provider | ResponseOrigin::CacheHit => PolicySource::Request,
                 };
                 if let Err(error) = apply_output_policy_to_response(&mut resp, source) {
                     if let Some(span) = span {
                         span.set_dispatch(&done.provider, &resp.model);
                         span.record_error("policy", &error.to_string());
                     }
-                    if let Some(slot) = &usage_accum_slot {
-                        let cost = pricing::calculate_cost_for(&done.provider, &resp.usage);
-                        accumulate_into(slot, &resp.usage, cost);
-                    }
-                    let previous_budget = ACTIVE_BUDGET
-                        .with(|active| std::mem::replace(&mut *active.borrow_mut(), budget_slot));
-                    let track_result = USAGE_ACCUM_SUPPRESS.with(|suppress| {
-                        suppress.set(true);
-                        let result = track_usage(&resp.usage);
-                        suppress.set(false);
-                        result
-                    });
-                    ACTIVE_BUDGET.with(|active| *active.borrow_mut() = previous_budget);
-                    track_result?;
+                    charge_dispatch_frames(
+                        &billable,
+                        &done.provider,
+                        usage_accum_slot.as_ref(),
+                        budget_slot,
+                    )?;
                     return Err(error);
                 }
             }
@@ -983,7 +991,7 @@ pub(super) fn stream_finalize(
             }
             // A cassette replay made no provider call — leave the serving stamp
             // alone (matches the sync no-chain path's canonical pricing).
-            if done.provider != "cassette" && !done.provider.is_empty() {
+            if done.origin.is_provider() && !done.provider.is_empty() {
                 set_serving_provider(&done.provider);
             }
             if let Some(key) = &cassette_record_key {
@@ -1008,26 +1016,16 @@ pub(super) fn stream_finalize(
                     ),
                 );
             }
-            // Fold into THIS run's captured accumulator frame, then suppress
-            // `track_usage`'s own fold — the finalizer runs outside the per-task
-            // install boundary, so the thread-local may hold a sibling's scope.
-            if let Some(slot) = &usage_accum_slot {
-                let cost = pricing::calculate_cost_for(&done.provider, &resp.usage);
-                accumulate_into(slot, &resp.usage, cost);
-            }
-            let track_result = {
-                let prev_budget = ACTIVE_BUDGET
-                    .with(|b| std::mem::replace(&mut *b.borrow_mut(), budget_slot.clone()));
-                let r = USAGE_ACCUM_SUPPRESS.with(|s| {
-                    s.set(true);
-                    let r = track_usage(&resp.usage);
-                    s.set(false);
-                    r
-                });
-                ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
-                r
-            };
-            track_result.map(|()| resp)
+            // Charge THIS run's captured frames — the finalizer runs outside the
+            // per-task install boundary, so the thread-locals may hold a sibling's
+            // scope.
+            charge_dispatch_frames(
+                &billable,
+                &done.provider,
+                usage_accum_slot.as_ref(),
+                budget_slot,
+            )
+            .map(|()| resp)
         }
         Err(e) => {
             if let Some(span) = span {
@@ -1121,6 +1119,7 @@ pub(super) fn stream_poll_batch(token: u64, blocking: bool) -> Result<Option<Val
         done_event = Some(Box::new(StreamDone {
             result: Err(LlmError::Config("stream: io worker dropped".to_string())),
             provider: String::new(),
+            origin: ResponseOrigin::Provider,
         }));
     }
 
@@ -1140,7 +1139,9 @@ pub(super) fn stream_poll_batch(token: u64, blocking: bool) -> Result<Option<Val
     });
     #[cfg(not(target_arch = "wasm32"))]
     if should_fallback && done.result.is_err() {
-        let StreamDone { result, provider } = *done;
+        let StreamDone {
+            result, provider, ..
+        } = *done;
         let error = result.expect_err("stream fallback branch requires an error");
         stream_note_open_failure(token, provider, error)?;
         debug_assert!(batch.is_empty());
@@ -1471,14 +1472,14 @@ pub(super) fn register(env: &Env) {
             Ok(())
         };
         // Stream-open dispatch: budget pre-gate + rate-limit + fallback-at-open.
-        let response = stream_with_dispatch(request, &mut chunk_cb, &span)?;
+        let completion = stream_with_dispatch(request, &mut chunk_cb, &span)?;
 
         // Print newline after streaming if using default display
         if callback.is_none() {
             println!();
         }
 
-        track_usage(&response.usage)?;
+        let response = completion.charge()?;
         Ok(Value::string(&response.content))
     });
 

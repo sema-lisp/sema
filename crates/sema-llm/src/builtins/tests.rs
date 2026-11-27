@@ -5,7 +5,11 @@ use serde_json::json;
 #[test]
 fn accumulate_into_counts_cache_hits_without_calls() {
     let slot = Rc::new(RefCell::new(LeafUsage::default()));
-    accumulate_into(&slot, &Usage::default(), None);
+    accumulate_into(
+        &slot,
+        &billable_usage(ResponseOrigin::CacheHit, &Usage::default()),
+        None,
+    );
     let usage = slot.borrow().clone();
     assert_eq!(usage.cache_hits, 1);
     assert_eq!(usage.calls, 0);
@@ -237,11 +241,58 @@ fn usage(prompt: u32, completion: u32) -> Usage {
     }
 }
 
+fn provider_usage(prompt: u32, completion: u32) -> BillableUsage {
+    billable_usage(ResponseOrigin::Provider, &usage(prompt, completion))
+}
+
+#[test]
+fn billable_usage_follows_the_response_origin() {
+    let recorded = Usage {
+        cache_read_input_tokens: 4,
+        cache_creation_input_tokens: 2,
+        ..usage(100, 50)
+    };
+    let cache_hit = billable_usage(ResponseOrigin::CacheHit, &recorded);
+    assert_eq!(cache_hit.usage().prompt_tokens, 0, "cache hit charges zero");
+    assert_eq!(cache_hit.usage().completion_tokens, 0);
+    assert_eq!(cache_hit.usage().cache_read_input_tokens, 0);
+    assert_eq!(cache_hit.usage().cache_creation_input_tokens, 0);
+    assert_eq!(cache_hit.usage().model, "fake-model", "model name is kept");
+    for origin in [ResponseOrigin::Provider, ResponseOrigin::CassetteReplay] {
+        let billable = billable_usage(origin, &recorded);
+        assert_eq!(billable.usage().prompt_tokens, 100, "{origin:?}");
+        assert_eq!(billable.usage().completion_tokens, 50, "{origin:?}");
+        assert_eq!(billable.usage().cache_read_input_tokens, 4, "{origin:?}");
+        assert_eq!(
+            billable.usage().cache_creation_input_tokens,
+            2,
+            "{origin:?}"
+        );
+    }
+}
+
+#[test]
+fn accumulate_into_counts_a_cache_hit_with_nonzero_recorded_usage_as_a_hit() {
+    // The origin, not the token count, marks the cache hit: recorded tokens on a
+    // cache-hit result are never folded into the leaf tally.
+    let slot = Rc::new(RefCell::new(LeafUsage::default()));
+    accumulate_into(
+        &slot,
+        &billable_usage(ResponseOrigin::CacheHit, &usage(100, 50)),
+        Some(0.5),
+    );
+    let u = slot.borrow();
+    assert_eq!(u.cache_hits, 1);
+    assert_eq!(u.calls, 0);
+    assert_eq!(u.input_tokens, 0);
+    assert!(u.cost_usd.is_none());
+}
+
 #[test]
 fn accumulate_into_sums_tokens_cost_and_calls() {
     let slot = Rc::new(RefCell::new(LeafUsage::default()));
-    accumulate_into(&slot, &usage(10, 5), Some(0.001));
-    accumulate_into(&slot, &usage(100, 50), Some(0.002));
+    accumulate_into(&slot, &provider_usage(10, 5), Some(0.001));
+    accumulate_into(&slot, &provider_usage(100, 50), Some(0.002));
     let u = slot.borrow();
     assert_eq!(u.input_tokens, 110, "tokens sum across calls");
     assert_eq!(u.output_tokens, 55);
@@ -255,7 +306,11 @@ fn accumulate_into_skips_cache_hit_zero_usage() {
     // A cache hit is all-zero + unpriced — it must NOT count as a call (no phantom
     // zero Budget event downstream), per the cache-hit-zero-usage invariant.
     let slot = Rc::new(RefCell::new(LeafUsage::default()));
-    accumulate_into(&slot, &Usage::default(), None);
+    accumulate_into(
+        &slot,
+        &billable_usage(ResponseOrigin::CacheHit, &Usage::default()),
+        None,
+    );
     let u = slot.borrow();
     assert_eq!(u.calls, 0, "cache hit doesn't bump calls");
     assert_eq!(u.input_tokens, 0);
@@ -267,13 +322,13 @@ fn accumulate_into_unpriced_call_counts_but_leaves_cost_none() {
     // An unpriced (no pricing-table entry) but token-bearing call IS a call; cost stays
     // genuinely absent rather than $0, then a later priced call seeds the running sum.
     let slot = Rc::new(RefCell::new(LeafUsage::default()));
-    accumulate_into(&slot, &usage(7, 3), None);
+    accumulate_into(&slot, &provider_usage(7, 3), None);
     assert_eq!(slot.borrow().calls, 1);
     assert!(
         slot.borrow().cost_usd.is_none(),
         "unpriced ⇒ cost still None"
     );
-    accumulate_into(&slot, &usage(1, 1), Some(0.005));
+    accumulate_into(&slot, &provider_usage(1, 1), Some(0.005));
     assert!((slot.borrow().cost_usd.unwrap() - 0.005).abs() < 1e-9);
     assert_eq!(slot.borrow().calls, 2);
 }
@@ -303,8 +358,8 @@ fn open_usage_scope_collects_completions_made_while_alive() {
     let scope = open_usage_scope();
     // Simulate two completions folding into the active frame (as track_usage does).
     let slot = current_usage_accum().expect("scope active");
-    accumulate_into(&slot, &usage(20, 10), Some(0.01));
-    accumulate_into(&slot, &usage(4, 2), None);
+    accumulate_into(&slot, &provider_usage(20, 10), Some(0.01));
+    accumulate_into(&slot, &provider_usage(4, 2), None);
     let u = scope.usage();
     assert_eq!(u.input_tokens, 24);
     assert_eq!(u.output_tokens, 12);

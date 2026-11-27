@@ -27,7 +27,7 @@ pub(super) fn set_rate_limit_last_value(value: u64) {
     });
 }
 
-pub(super) fn do_complete(mut request: ChatRequest) -> Result<ChatResponse, SemaError> {
+pub(super) fn do_complete(mut request: ChatRequest) -> Result<Completion, SemaError> {
     apply_input_policy_to_request(&mut request)?;
     // Standalone completions get their own conversation id so every chat span carries
     // gen_ai.conversation.id; agent-nested completions inherit the agent's scope.
@@ -88,35 +88,40 @@ pub(super) fn do_complete(mut request: ChatRequest) -> Result<ChatResponse, Sema
             enforce_stored_model_policy(&cached.provider, &cached.model, PolicySource::Cache)?;
             CACHE_HITS.with(|c| c.set(c.get() + 1));
             // A cache hit makes no provider call: no tokens are consumed and no money
-            // is spent. Report ZERO usage so the caller's `track_usage` does not
-            // re-charge session cost or burn the budget for a cached response.
+            // is spent. The response reports ZERO usage and the `CacheHit` origin
+            // makes the caller's charge zero as well.
             let mut resp = cache_hit_response(cached, key_request.model.clone());
             apply_output_policy_to_response(&mut resp, PolicySource::Cache)?;
             // Cache-hit span: no provider served it; tag gen_ai.cache.hit=true with
             // zero usage (matches the zero-usage accounting invariant).
             span.set_dispatch("", &resp.model);
             span.set_response(&response_facts("", &resp));
-            return Ok(resp);
+            return Ok(Completion::new(resp, ResponseOrigin::CacheHit));
         }
     }
     CACHE_MISSES.with(|c| c.set(c.get() + 1));
-    let response = run_completion(request, &span)?;
-    let serving_provider = LAST_SERVING_PROVIDER.with(|p| p.borrow().clone().unwrap_or_default());
-    store_cached(&cache_key, &response, &serving_provider);
-    Ok(response)
+    let completion = run_completion(request, &span)?;
+    // Only a live provider result is cached. A cassette replay is not written to the
+    // response cache, which persists on disk across processes.
+    if completion.origin.is_provider() {
+        let serving_provider =
+            LAST_SERVING_PROVIDER.with(|p| p.borrow().clone().unwrap_or_default());
+        store_cached(&cache_key, &completion.response, &serving_provider);
+    }
+    Ok(completion)
 }
 
 /// Streaming counterpart of [`do_complete`] for the agent tool loop's `:on-text`
 /// option. Opens the same per-completion `chat` span/scope, but drives
 /// `stream_with_dispatch` and delivers each text delta to the Sema `on_text`
-/// callback. Returns the assembled [`ChatResponse`] so the loop's tool-call
+/// callback. Returns the assembled [`Completion`] so the loop's tool-call
 /// handling and `track_usage` accounting match the non-streaming path. Streaming
 /// bypasses the completion cache (like `llm/stream`).
 pub(super) fn do_complete_streaming(
     ctx: &EvalContext,
     request: ChatRequest,
     on_text: &Value,
-) -> Result<ChatResponse, SemaError> {
+) -> Result<Completion, SemaError> {
     let _conv = if sema_otel::current_conversation_id().is_none() {
         Some(sema_otel::set_conversation_scope(
             &sema_otel::new_conversation_id(),
@@ -216,11 +221,11 @@ impl sema_core::runtime::Trace for CompleteFinalize {
 }
 
 /// On-VM-thread preparation result for a runtime completion. `Inline` is a cache
-/// hit or cassette replay that made no provider call; the caller accounts zero
-/// usage and finalizes without suspending. `Offload` carries the provider plan.
+/// hit or cassette replay that made no provider call; the caller charges it by its
+/// origin and finalizes without suspending. `Offload` carries the provider plan.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) enum CompletePrep {
-    Inline(ChatResponse),
+    Inline(Completion),
     Offload(Box<CompleteOffloadPlan>),
 }
 
@@ -311,9 +316,12 @@ pub(super) fn complete_offload_prep(mut request: ChatRequest) -> Result<Complete
                 CACHE_HITS.with(|c| c.set(c.get() + 1));
                 let mut resp = cache_hit_response(cached, key_request.model.clone());
                 apply_output_policy_to_response(&mut resp, PolicySource::Cache)?;
-                set_guarded_response_telemetry(&span, &request, "", &resp);
+                set_origin_response_telemetry(&span, &request, ResponseOrigin::CacheHit, &resp);
                 drop(span);
-                return Ok(CompletePrep::Inline(resp));
+                return Ok(CompletePrep::Inline(Completion::new(
+                    resp,
+                    ResponseOrigin::CacheHit,
+                )));
             }
         }
         Some(key)
@@ -334,9 +342,12 @@ pub(super) fn complete_offload_prep(mut request: ChatRequest) -> Result<Complete
             enforce_stored_model_policy(&entry.provider, &entry.model, PolicySource::Cassette)?;
             let mut resp = entry.to_response();
             apply_output_policy_to_response(&mut resp, PolicySource::Cassette)?;
-            set_guarded_response_telemetry(&span, &request, "cassette", &resp);
+            set_origin_response_telemetry(&span, &request, ResponseOrigin::CassetteReplay, &resp);
             drop(span);
-            return Ok(CompletePrep::Inline(resp));
+            return Ok(CompletePrep::Inline(Completion::new(
+                resp,
+                ResponseOrigin::CassetteReplay,
+            )));
         }
         Some((k, crate::cassette::Decision::Miss(_))) => return Err(cassette_miss_error(&k)),
         _ => {}
@@ -374,10 +385,11 @@ pub(super) fn complete_offload_prep(mut request: ChatRequest) -> Result<Complete
     })))
 }
 
-/// VM-thread finalizer for a successful offloaded completion: finalize the span (retry spans,
+/// VM-thread finalizer for a successful offloaded completion. The result has the
+/// `Provider` origin. Finalize the span (retry spans,
 /// dispatch/response/messages facts), store the cache entry, record the cassette,
-/// fold the leaf usage accumulator, then `track_usage` under the captured budget
-/// frame (a budget overrun fails the task, exactly as the sync path's `?`) and
+/// then charge the provider usage to the captured leaf and budget
+/// frames (a budget overrun fails the task, exactly as the sync path's `?`) and
 /// finally `finalize` the response into the per-native return value. `span`,
 /// `finalize`, and the captured `Rc` slots are all consumed exactly once here.
 #[cfg(not(target_arch = "wasm32"))]
@@ -406,12 +418,13 @@ pub(super) fn finalize_complete_success(
         emit_retry_spans(&retry_events);
     });
     span.set_dispatch(&serving_provider, &serving_model);
+    let billable = billable_usage(ResponseOrigin::Provider, &resp.usage);
     if let Err(error) = apply_output_policy_to_response(&mut resp, PolicySource::Request) {
         span.record_error("policy", &error.to_string());
         drop(span);
-        account_complete_usage(
+        charge_dispatch_frames(
+            &billable,
             &serving_provider,
-            &resp.usage,
             usage_accum_slot.as_ref(),
             budget_slot,
         )?;
@@ -438,40 +451,13 @@ pub(super) fn finalize_complete_success(
             crate::cassette::TapeEntry::from_response(key, &serving_provider, &resp),
         );
     }
-    account_complete_usage(
+    charge_dispatch_frames(
+        &billable,
         &serving_provider,
-        &resp.usage,
         usage_accum_slot.as_ref(),
         budget_slot,
     )?;
     finalize.finish(resp)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(super) fn account_complete_usage(
-    serving_provider: &str,
-    usage: &Usage,
-    usage_accum_slot: Option<&Rc<RefCell<LeafUsage>>>,
-    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
-) -> Result<(), SemaError> {
-    // Fold this completion into the LEAF'S OWN captured accumulator frame — the
-    // `Rc` snapshotted at dispatch, not whatever scope is active when the offload
-    // lands. Suppress `track_usage`'s ambient accumulator fold so the completion
-    // is counted exactly once.
-    if let Some(slot) = usage_accum_slot {
-        let cost = pricing::calculate_cost_for(serving_provider, usage);
-        accumulate_into(slot, usage, cost);
-    }
-    let previous_budget =
-        ACTIVE_BUDGET.with(|active| std::mem::replace(&mut *active.borrow_mut(), budget_slot));
-    let result = USAGE_ACCUM_SUPPRESS.with(|suppress| {
-        suppress.set(true);
-        let result = track_usage(usage);
-        suppress.set(false);
-        result
-    });
-    ACTIVE_BUDGET.with(|active| *active.borrow_mut() = previous_budget);
-    result
 }
 
 /// Completion-kind tag for an agent/chat provider round offloaded through the
@@ -513,8 +499,7 @@ pub(super) fn dispatch_complete_offload(
     if in_runtime_offload_task() {
         return do_complete_runtime_suspend(request, finalize);
     }
-    let response = do_complete(request)?;
-    track_usage(&response.usage)?;
+    let response = do_complete(request)?.charge()?;
     finalize.finish(response)
 }
 
@@ -530,9 +515,8 @@ pub(super) fn do_complete_runtime_suspend(
     finalize: CompleteFinalize,
 ) -> sema_core::runtime::NativeResult {
     let plan = match complete_offload_prep(request)? {
-        CompletePrep::Inline(resp) => {
-            track_usage(&resp.usage)?;
-            return finalize.finish(resp);
+        CompletePrep::Inline(completion) => {
+            return finalize.finish(completion.charge()?);
         }
         CompletePrep::Offload(plan) => *plan,
     };
@@ -722,8 +706,8 @@ impl RuntimeCompleteDriver {
     }
 
     /// Resume after the offloaded cache disk read. A valid on-disk entry is a HIT:
-    /// populate the in-memory cache, count the hit, and finalize inline with ZERO
-    /// usage — identical to the mem hit, so `track_usage` never recharges. Otherwise
+    /// populate the in-memory cache, count the hit, and finalize inline as a
+    /// `CacheHit` — identical to the mem hit, so nothing is charged. Otherwise
     /// count the miss and proceed to the provider chain.
     fn finish_cache_peek(
         mut self: Box<Self>,
@@ -733,16 +717,32 @@ impl RuntimeCompleteDriver {
             if is_cache_valid(&cached) {
                 enforce_stored_model_policy(&cached.provider, &cached.model, PolicySource::Cache)?;
                 CACHE_HITS.with(|c| c.set(c.get() + 1));
-                let Self { plan, finalize, .. } = *self;
+                let Self {
+                    plan,
+                    finalize,
+                    usage_accum_slot,
+                    budget_slot,
+                    ..
+                } = *self;
                 if let Some(key) = &plan.cache_key {
                     CACHE_MEM.with(|c| c.borrow_mut().insert(key.clone(), cached.clone()));
                 }
                 let usage_model = cached.model.clone();
                 let mut resp = cache_hit_response(cached, usage_model);
                 apply_output_policy_to_response(&mut resp, PolicySource::Cache)?;
-                set_guarded_response_telemetry(&plan.span, &plan.request_for_messages, "", &resp);
+                set_origin_response_telemetry(
+                    &plan.span,
+                    &plan.request_for_messages,
+                    ResponseOrigin::CacheHit,
+                    &resp,
+                );
                 drop(plan.span);
-                track_usage(&resp.usage)?;
+                charge_dispatch_frames(
+                    &billable_usage(ResponseOrigin::CacheHit, &resp.usage),
+                    "",
+                    usage_accum_slot.as_ref(),
+                    budget_slot,
+                )?;
                 return finalize.finish(resp);
             }
         }
@@ -1296,15 +1296,15 @@ impl sema_core::runtime::CompletionDecoder for IoSleepDecoder {
 pub(super) fn run_completion(
     request: ChatRequest,
     span: &sema_otel::LlmSpan,
-) -> Result<ChatResponse, SemaError> {
+) -> Result<Completion, SemaError> {
     if current_cassette_scope().is_none() {
         let mut response = do_complete_inner(request.clone(), span)?;
         if let Err(error) = apply_output_policy_to_response(&mut response, PolicySource::Request) {
-            track_usage(&response.usage)?;
+            Completion::new(response, ResponseOrigin::Provider).charge()?;
             return Err(error);
         }
-        set_guarded_response_telemetry(span, &request, "", &response);
-        return Ok(response);
+        set_origin_response_telemetry(span, &request, ResponseOrigin::Provider, &response);
+        return Ok(Completion::new(response, ResponseOrigin::Provider));
     }
     // Key by the request as-is (no default-model resolution) so record and replay
     // produce the same key for an identical call, even with no provider configured
@@ -1319,36 +1319,45 @@ pub(super) fn run_completion(
             // recorded tokens (distinct from a cache hit, which reports zero usage).
             let mut response = entry.to_response();
             apply_output_policy_to_response(&mut response, PolicySource::Cassette)?;
-            set_guarded_response_telemetry(span, &request, "cassette", &response);
-            Ok(response)
+            set_origin_response_telemetry(
+                span,
+                &request,
+                ResponseOrigin::CassetteReplay,
+                &response,
+            );
+            Ok(Completion::new(response, ResponseOrigin::CassetteReplay))
         }
         crate::cassette::Decision::Miss(k) => Err(cassette_miss_error(&k)),
         crate::cassette::Decision::Record => {
             let mut resp = do_complete_inner(request.clone(), span)?;
             if let Err(error) = apply_output_policy_to_response(&mut resp, PolicySource::Request) {
-                track_usage(&resp.usage)?;
+                Completion::new(resp, ResponseOrigin::Provider).charge()?;
                 return Err(error);
             }
-            set_guarded_response_telemetry(span, &request, "", &resp);
+            set_origin_response_telemetry(span, &request, ResponseOrigin::Provider, &resp);
             let provider = LAST_SERVING_PROVIDER.with(|p| p.borrow().clone().unwrap_or_default());
             cassette_record(crate::cassette::TapeEntry::from_response(
                 &key, &provider, &resp,
             ));
-            Ok(resp)
+            Ok(Completion::new(resp, ResponseOrigin::Provider))
         }
     }
 }
 
-pub(super) fn set_guarded_response_telemetry(
+/// Set the `chat` span's dispatch, response, and message facts for a result of
+/// `origin`. A provider result names the serving provider; a cache hit or cassette
+/// replay names the provider from [`ResponseOrigin::telemetry_provider`].
+pub(super) fn set_origin_response_telemetry(
     span: &sema_otel::LlmSpan,
     request: &ChatRequest,
-    provider_override: &str,
+    origin: ResponseOrigin,
     response: &ChatResponse,
 ) {
-    let provider = if provider_override.is_empty() {
-        LAST_SERVING_PROVIDER.with(|provider| provider.borrow().clone().unwrap_or_default())
-    } else {
-        provider_override.to_string()
+    let provider = match origin.telemetry_provider() {
+        Some(name) => name.to_string(),
+        None => {
+            LAST_SERVING_PROVIDER.with(|provider| provider.borrow().clone().unwrap_or_default())
+        }
     };
     span.set_dispatch(&provider, &response.model);
     span.set_response(&response_facts(&provider, response));

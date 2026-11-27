@@ -59,14 +59,22 @@ pub struct LeafUsage {
     pub cache_hits: u32,
 }
 
-/// Fold one completion's usage into a `LeafUsage` tally. A cache hit (all-zero usage)
-/// does NOT increment `calls`, so a purely-cached leaf stays filtered downstream.
-pub(super) fn accumulate_into(slot: &Rc<RefCell<LeafUsage>>, usage: &Usage, cost: Option<f64>) {
+/// Fold one completion's billable usage into a `LeafUsage` tally. A cache hit does
+/// NOT increment `calls`, so a purely-cached leaf stays filtered downstream.
+pub(super) fn accumulate_into(
+    slot: &Rc<RefCell<LeafUsage>>,
+    billable: &BillableUsage,
+    cost: Option<f64>,
+) {
+    let usage = billable.usage();
     let input = usage.prompt_tokens as u64;
     let output = usage.completion_tokens as u64;
-    // A cache hit reports no tokens and no cost. Priced models can report the
-    // cost as `Some(0.0)`, so `cost.is_none()` cannot identify cache hits.
-    if input == 0 && output == 0 && cost.unwrap_or(0.0) == 0.0 {
+    // A result with no tokens and no cost is tallied with the cache hits too, so a
+    // provider or tape entry that reports no usage keeps `calls == 0` (no zero
+    // budget event). Priced models can report the cost as `Some(0.0)`, so
+    // `cost.is_none()` cannot identify such a result.
+    let reports_nothing = input == 0 && output == 0 && cost.unwrap_or(0.0) == 0.0;
+    if billable.origin() == ResponseOrigin::CacheHit || reports_nothing {
         slot.borrow_mut().cache_hits += 1;
         return;
     }
@@ -220,7 +228,12 @@ pub(super) struct BudgetFrame {
     pub(super) tokens_spent: u64,
 }
 
-pub(super) fn track_usage(usage: &Usage) -> Result<(), SemaError> {
+/// Charge one result's billable usage: last usage, the active leaf-usage frame,
+/// session usage and cost, and the active budget frame (which can fail the call).
+/// The [`BillableUsage`] argument comes from [`billable_usage`], so the origin rule
+/// (cache hit charges zero) is applied before anything is charged.
+pub(super) fn track_usage(billable: &BillableUsage) -> Result<(), SemaError> {
+    let usage = billable.usage();
     // Price the model as served by the provider that produced this response (falls back to
     // the canonical first-party price when the serving provider is unknown).
     let provider = take_serving_provider().unwrap_or_default();
@@ -234,7 +247,7 @@ pub(super) fn track_usage(usage: &Usage) -> Result<(), SemaError> {
     // sets USAGE_ACCUM_SUPPRESS to keep this fold from double-counting.
     if !USAGE_ACCUM_SUPPRESS.with(|s| s.get()) {
         if let Some(slot) = current_usage_accum() {
-            accumulate_into(&slot, usage, cost);
+            accumulate_into(&slot, billable, cost);
         }
     }
     SESSION_USAGE.with(|u| {

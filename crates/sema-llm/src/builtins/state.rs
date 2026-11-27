@@ -94,14 +94,6 @@ impl Drop for InflightGuard {
     }
 }
 
-pub(super) fn set_serving_provider(name: &str) {
-    LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = Some(name.to_string()));
-}
-
-pub(super) fn take_serving_provider() -> Option<String> {
-    LAST_SERVING_PROVIDER.with(|p| p.borrow_mut().take())
-}
-
 /// Snapshot this thread's cumulative session LLM cost in USD — the same figure
 /// `(llm/session-usage)` reports as `:cost-usd`. Zeroed by
 /// [`reset_runtime_state`], i.e. on interpreter construction.
@@ -145,7 +137,6 @@ pub fn reset_runtime_state() {
     ACTIVE_POLICIES.with(|policies| policies.borrow_mut().clear());
     POLICY_BYPASS.with(|bypass| bypass.borrow_mut().clear());
     POLICY_AGENT_ID.with(|agent| *agent.borrow_mut() = None);
-    LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = None);
     RETRY_BASE_MS.with(|c| c.set(500));
     NETWORK_MAX_RETRIES.with(|c| c.set(3));
     clear_agent_runs();

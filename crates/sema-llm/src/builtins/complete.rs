@@ -67,9 +67,6 @@ pub(super) fn do_complete(mut request: ChatRequest) -> Result<Completion, SemaEr
     }
     // User :tags / :metadata for this call (auto-tags are derived inside the span).
     apply_call_telemetry_llm(&span);
-    // Reset the serving-provider stamp so a cache hit (which serves no provider) doesn't
-    // inherit a stale name from a prior completion.
-    LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = None);
     let cache_enabled = CACHE_ENABLED.with(|c| c.get());
     if !cache_enabled {
         return run_completion(request, &span);
@@ -90,13 +87,14 @@ pub(super) fn do_complete(mut request: ChatRequest) -> Result<Completion, SemaEr
             // A cache hit makes no provider call: no tokens are consumed and no money
             // is spent. The response reports ZERO usage and the `CacheHit` origin
             // makes the caller's charge zero as well.
-            let mut resp = cache_hit_response(cached, key_request.model.clone());
-            apply_output_policy_to_response(&mut resp, PolicySource::Cache)?;
+            let resp = cache_hit_response(cached, key_request.model.clone());
+            let completion =
+                Completion::new(resp, ResponseOrigin::CacheHit, "").checked(PolicySource::Cache)?;
             // Cache-hit span: no provider served it; tag gen_ai.cache.hit=true with
             // zero usage (matches the zero-usage accounting invariant).
-            span.set_dispatch("", &resp.model);
-            span.set_response(&response_facts("", &resp));
-            return Ok(Completion::new(resp, ResponseOrigin::CacheHit));
+            span.set_dispatch("", &completion.response.model);
+            span.set_response(&response_facts("", &completion.response));
+            return Ok(completion);
         }
     }
     CACHE_MISSES.with(|c| c.set(c.get() + 1));
@@ -104,9 +102,7 @@ pub(super) fn do_complete(mut request: ChatRequest) -> Result<Completion, SemaEr
     // Only a live provider result is cached. A cassette replay is not written to the
     // response cache, which persists on disk across processes.
     if completion.origin.is_provider() {
-        let serving_provider =
-            LAST_SERVING_PROVIDER.with(|p| p.borrow().clone().unwrap_or_default());
-        store_cached(&cache_key, &completion.response, &serving_provider);
+        store_cached(&cache_key, &completion.response, &completion.provider);
     }
     Ok(completion)
 }
@@ -314,14 +310,12 @@ pub(super) fn complete_offload_prep(mut request: ChatRequest) -> Result<Complete
             if is_cache_valid(&cached) {
                 enforce_stored_model_policy(&cached.provider, &cached.model, PolicySource::Cache)?;
                 CACHE_HITS.with(|c| c.set(c.get() + 1));
-                let mut resp = cache_hit_response(cached, key_request.model.clone());
-                apply_output_policy_to_response(&mut resp, PolicySource::Cache)?;
-                set_origin_response_telemetry(&span, &request, ResponseOrigin::CacheHit, &resp);
+                let resp = cache_hit_response(cached, key_request.model.clone());
+                let completion = Completion::new(resp, ResponseOrigin::CacheHit, "")
+                    .checked(PolicySource::Cache)?;
+                set_origin_response_telemetry(&span, &request, &completion);
                 drop(span);
-                return Ok(CompletePrep::Inline(Completion::new(
-                    resp,
-                    ResponseOrigin::CacheHit,
-                )));
+                return Ok(CompletePrep::Inline(completion));
             }
         }
         Some(key)
@@ -340,14 +334,15 @@ pub(super) fn complete_offload_prep(mut request: ChatRequest) -> Result<Complete
     match cassette_decision {
         Some((_, crate::cassette::Decision::Replay(entry))) => {
             enforce_stored_model_policy(&entry.provider, &entry.model, PolicySource::Cassette)?;
-            let mut resp = entry.to_response();
-            apply_output_policy_to_response(&mut resp, PolicySource::Cassette)?;
-            set_origin_response_telemetry(&span, &request, ResponseOrigin::CassetteReplay, &resp);
-            drop(span);
-            return Ok(CompletePrep::Inline(Completion::new(
-                resp,
+            let completion = Completion::new(
+                entry.to_response(),
                 ResponseOrigin::CassetteReplay,
-            )));
+                entry.provider.clone(),
+            )
+            .checked(PolicySource::Cassette)?;
+            set_origin_response_telemetry(&span, &request, &completion);
+            drop(span);
+            return Ok(CompletePrep::Inline(completion));
         }
         Some((k, crate::cassette::Decision::Miss(_))) => return Err(cassette_miss_error(&k)),
         _ => {}
@@ -418,16 +413,11 @@ pub(super) fn finalize_complete_success(
         emit_retry_spans(&retry_events);
     });
     span.set_dispatch(&serving_provider, &serving_model);
-    let billable = billable_usage(ResponseOrigin::Provider, &resp.usage);
+    let billable = billable_usage(ResponseOrigin::Provider, &resp.usage, &serving_provider);
     if let Err(error) = apply_output_policy_to_response(&mut resp, PolicySource::Request) {
         span.record_error("policy", &error.to_string());
         drop(span);
-        charge_dispatch_frames(
-            &billable,
-            &serving_provider,
-            usage_accum_slot.as_ref(),
-            budget_slot,
-        )?;
+        charge_dispatch_frames(&billable, usage_accum_slot.as_ref(), budget_slot)?;
         return Err(error);
     }
     span.set_response(&response_facts(&serving_provider, &resp));
@@ -441,7 +431,6 @@ pub(super) fn finalize_complete_success(
             .as_deref(),
     );
     drop(span); // ends the span
-    set_serving_provider(&serving_provider);
     if let Some(key) = &cache_key {
         store_cached(key, &resp, &serving_provider);
     }
@@ -451,12 +440,7 @@ pub(super) fn finalize_complete_success(
             crate::cassette::TapeEntry::from_response(key, &serving_provider, &resp),
         );
     }
-    charge_dispatch_frames(
-        &billable,
-        &serving_provider,
-        usage_accum_slot.as_ref(),
-        budget_slot,
-    )?;
+    charge_dispatch_frames(&billable, usage_accum_slot.as_ref(), budget_slot)?;
     finalize.finish(resp)
 }
 
@@ -728,22 +712,23 @@ impl RuntimeCompleteDriver {
                     CACHE_MEM.with(|c| c.borrow_mut().insert(key.clone(), cached.clone()));
                 }
                 let usage_model = cached.model.clone();
-                let mut resp = cache_hit_response(cached, usage_model);
-                apply_output_policy_to_response(&mut resp, PolicySource::Cache)?;
-                set_origin_response_telemetry(
-                    &plan.span,
-                    &plan.request_for_messages,
+                let mut completion = Completion::new(
+                    cache_hit_response(cached, usage_model),
                     ResponseOrigin::CacheHit,
-                    &resp,
-                );
-                drop(plan.span);
-                charge_dispatch_frames(
-                    &billable_usage(ResponseOrigin::CacheHit, &resp.usage),
                     "",
-                    usage_accum_slot.as_ref(),
-                    budget_slot,
-                )?;
-                return finalize.finish(resp);
+                );
+                let billable = completion.billable();
+                // Same rule as `Completion::checked`, charged to the dispatch frames.
+                if let Err(error) =
+                    apply_output_policy_to_response(&mut completion.response, PolicySource::Cache)
+                {
+                    charge_dispatch_frames(&billable, usage_accum_slot.as_ref(), budget_slot)?;
+                    return Err(error);
+                }
+                set_origin_response_telemetry(&plan.span, &plan.request_for_messages, &completion);
+                drop(plan.span);
+                charge_dispatch_frames(&billable, usage_accum_slot.as_ref(), budget_slot)?;
+                return finalize.finish(completion.response);
             }
         }
         // Miss (no entry, or entry present but invalid) — count it once here (deferred
@@ -1298,13 +1283,11 @@ pub(super) fn run_completion(
     span: &sema_otel::LlmSpan,
 ) -> Result<Completion, SemaError> {
     if current_cassette_scope().is_none() {
-        let mut response = do_complete_inner(request.clone(), span)?;
-        if let Err(error) = apply_output_policy_to_response(&mut response, PolicySource::Request) {
-            Completion::new(response, ResponseOrigin::Provider).charge()?;
-            return Err(error);
-        }
-        set_origin_response_telemetry(span, &request, ResponseOrigin::Provider, &response);
-        return Ok(Completion::new(response, ResponseOrigin::Provider));
+        let (response, provider) = do_complete_inner(request.clone(), span)?;
+        let completion = Completion::new(response, ResponseOrigin::Provider, provider)
+            .checked(PolicySource::Request)?;
+        set_origin_response_telemetry(span, &request, &completion);
+        return Ok(completion);
     }
     // Key by the request as-is (no default-model resolution) so record and replay
     // produce the same key for an identical call, even with no provider configured
@@ -1317,50 +1300,46 @@ pub(super) fn run_completion(
             // A replayed call is a stand-in for a real one: emit the span with the
             // recorded facts and let the caller's usage/cost accounting run on the
             // recorded tokens (distinct from a cache hit, which reports zero usage).
-            let mut response = entry.to_response();
-            apply_output_policy_to_response(&mut response, PolicySource::Cassette)?;
-            set_origin_response_telemetry(
-                span,
-                &request,
+            let completion = Completion::new(
+                entry.to_response(),
                 ResponseOrigin::CassetteReplay,
-                &response,
-            );
-            Ok(Completion::new(response, ResponseOrigin::CassetteReplay))
+                entry.provider.clone(),
+            )
+            .checked(PolicySource::Cassette)?;
+            set_origin_response_telemetry(span, &request, &completion);
+            Ok(completion)
         }
         crate::cassette::Decision::Miss(k) => Err(cassette_miss_error(&k)),
         crate::cassette::Decision::Record => {
-            let mut resp = do_complete_inner(request.clone(), span)?;
-            if let Err(error) = apply_output_policy_to_response(&mut resp, PolicySource::Request) {
-                Completion::new(resp, ResponseOrigin::Provider).charge()?;
-                return Err(error);
-            }
-            set_origin_response_telemetry(span, &request, ResponseOrigin::Provider, &resp);
-            let provider = LAST_SERVING_PROVIDER.with(|p| p.borrow().clone().unwrap_or_default());
+            let (resp, provider) = do_complete_inner(request.clone(), span)?;
+            let completion = Completion::new(resp, ResponseOrigin::Provider, provider)
+                .checked(PolicySource::Request)?;
+            set_origin_response_telemetry(span, &request, &completion);
             cassette_record(crate::cassette::TapeEntry::from_response(
-                &key, &provider, &resp,
+                &key,
+                &completion.provider,
+                &completion.response,
             ));
-            Ok(Completion::new(resp, ResponseOrigin::Provider))
+            Ok(completion)
         }
     }
 }
 
-/// Set the `chat` span's dispatch, response, and message facts for a result of
-/// `origin`. A provider result names the serving provider; a cache hit or cassette
-/// replay names the provider from [`ResponseOrigin::telemetry_provider`].
+/// Set the `chat` span's dispatch, response, and message facts for `completion`. A
+/// provider result names the serving provider; a cache hit or cassette replay names
+/// the provider from [`ResponseOrigin::telemetry_provider`].
 pub(super) fn set_origin_response_telemetry(
     span: &sema_otel::LlmSpan,
     request: &ChatRequest,
-    origin: ResponseOrigin,
-    response: &ChatResponse,
+    completion: &Completion,
 ) {
-    let provider = match origin.telemetry_provider() {
-        Some(name) => name.to_string(),
-        None => {
-            LAST_SERVING_PROVIDER.with(|provider| provider.borrow().clone().unwrap_or_default())
-        }
-    };
-    span.set_dispatch(&provider, &response.model);
-    span.set_response(&response_facts(&provider, response));
+    let response = &completion.response;
+    let provider = completion
+        .origin
+        .telemetry_provider()
+        .unwrap_or(&completion.provider);
+    span.set_dispatch(provider, &response.model);
+    span.set_response(&response_facts(provider, response));
     span.set_messages(
         &messages_json(&request.messages),
         &content_json("assistant", &response.content),
@@ -1381,17 +1360,19 @@ pub(super) fn cassette_miss_error(key: &str) -> SemaError {
     ))
 }
 
+/// Run `request` through the fallback chain, or the default provider when no chain
+/// is set. Returns the response and the registry name of the provider that served it.
 pub(super) fn do_complete_inner(
     request: ChatRequest,
     span: &sema_otel::LlmSpan,
-) -> Result<ChatResponse, SemaError> {
+) -> Result<(ChatResponse, String), SemaError> {
     let fallback_chain = FALLBACK_CHAIN.with(|c| c.borrow().clone());
     match fallback_chain {
         Some(chain) if !chain.is_empty() => {
             let mut last_error = None;
             for entry in &chain {
                 match do_complete_with_provider(entry, request.clone(), span) {
-                    Ok(Some(resp)) => return Ok(resp),
+                    Ok(Some(resp)) => return Ok((resp, entry.provider.clone())),
                     Ok(None) => continue,
                     Err(e) => {
                         eprintln!(
@@ -1570,7 +1551,7 @@ pub(super) struct ResolvedProvider {
 }
 
 /// Result of the offloadable completion wire stage: the response, the name of the
-/// provider that served it (for `set_serving_provider` + pricing on the VM thread),
+/// provider that served it (for pricing and the cache entry on the VM thread),
 /// and the collected retry events (replayed as spans in the VM-thread finalizer).
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) struct CompleteOutcome {
@@ -1710,9 +1691,6 @@ pub(super) fn do_complete_with_provider(
         let max_retries = NETWORK_MAX_RETRIES.with(|c| c.get());
         let resp = complete_with_retry(&*provider, &request, max_retries)
             .map_err(|e| SemaError::Llm(e.to_string()))?;
-        set_serving_provider(&entry.provider);
-        // Provider + model + response are all in scope here, before track_usage
-        // consumes the serving-provider stamp.
         span.set_dispatch(&entry.provider, &request.model);
         Ok(Some(resp))
     })
@@ -1721,7 +1699,7 @@ pub(super) fn do_complete_with_provider(
 pub(super) fn do_complete_uncached(
     mut request: ChatRequest,
     span: &sema_otel::LlmSpan,
-) -> Result<ChatResponse, SemaError> {
+) -> Result<(ChatResponse, String), SemaError> {
     enforce_rate_limit();
     let max_retries = NETWORK_MAX_RETRIES.with(|c| c.get());
     with_provider(|p| {
@@ -1731,10 +1709,8 @@ pub(super) fn do_complete_uncached(
         model_target_allowed(p.name(), &request.model, PolicySource::Request, false)?;
         let resp = complete_with_retry(p, &request, max_retries)
             .map_err(|e| SemaError::Llm(e.to_string()))?;
-        set_serving_provider(p.name());
-        // Capture provider/model/response before track_usage consumes the stamp.
         span.set_dispatch(p.name(), &request.model);
-        Ok(resp)
+        Ok((resp, p.name().to_string()))
     })
 }
 

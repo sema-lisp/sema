@@ -26,6 +26,24 @@
   `billable_usage`, which applies the rule for each origin: a cache hit
   charges zero, a cassette replay charges the recorded usage, a provider
   call charges the usage it reported.
+- A cache hit inside an `llm/with-budget` scope that is already over its limit
+  returns the cached result. It raised "budget exceeded" before, although a
+  cache hit spends nothing.
+- `llm/batch` (and `llm/pmap`) price each result as served by the provider
+  that ran the batch, on the host and the runtime path. The host path used the
+  provider name left by an earlier completion for the first result, and the
+  default price for the rest; the runtime path used the default price.
+- `llm/embed` on the host path prices the result as served by its provider
+  (a replay: the provider on the tape) instead of the provider name left by an
+  earlier completion.
+- A provider round that reports zero tokens counts in `:calls` of the
+  `agent/run` `:usage` map and in the notebook cell usage. It was counted as a
+  cache hit before. A workflow leaf that spent nothing still emits no `Budget`
+  event.
+- A cassette replay that the output policy rejects charges the recorded usage
+  on every path. Only the runtime `llm/stream` path charged it before. Sema
+  never records a response its own policy rejects, so this applies to tapes
+  edited by hand or written by another Sema version.
 
 ### Playground
 

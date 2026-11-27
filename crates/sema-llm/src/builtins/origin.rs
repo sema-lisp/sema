@@ -13,6 +13,18 @@
 //! leaf tallies behave the same on replay as on the recorded run. A cache hit made
 //! no provider call, so it charges nothing (AGENTS.md "Accounting invariant").
 //!
+//! Further rules that follow from the origin:
+//!
+//! - A result the output policy rejects is charged before the policy error is
+//!   returned, for every origin ([`Completion::checked`]).
+//! - A cache hit is not checked against the budget limits, so a scope that is over
+//!   its limit still serves cached results (`track_usage`).
+//! - Only `CacheHit` counts as a cache hit in a leaf tally. A provider result or a
+//!   replay that reports zero tokens is still a call (`accumulate_into`).
+//! - Each charge carries the provider name its cost is priced with: the serving
+//!   provider, or for a replay the provider stored on the tape. No charge reads the
+//!   provider from thread-local state.
+//!
 //! Workflow memo replay (`workflow/step` on resume) is not an origin here: it returns
 //! the stored leaf value in `sema-stdlib` before any LLM builtin runs, so no result
 //! from that path reaches this module.
@@ -60,6 +72,7 @@ impl ResponseOrigin {
 pub(super) struct BillableUsage {
     usage: Usage,
     origin: ResponseOrigin,
+    pricing_provider: String,
 }
 
 impl BillableUsage {
@@ -70,13 +83,31 @@ impl BillableUsage {
     pub(super) fn origin(&self) -> ResponseOrigin {
         self.origin
     }
+
+    /// The cost of this usage, priced as served by the provider the charge was built
+    /// with (`pricing::calculate_cost_for`). An empty provider name means the
+    /// canonical first-party price.
+    pub(super) fn cost(&self) -> Option<f64> {
+        pricing::calculate_cost_for(&self.pricing_provider, &self.usage)
+    }
 }
 
 /// Derive the usage to charge from the usage a result reports (`recorded`) and the
 /// result's origin. `CacheHit` charges zero tokens and keeps only the model name
 /// (so `llm/last-usage` still names the model); `CassetteReplay` and `Provider`
 /// charge `recorded` unchanged.
-pub(super) fn billable_usage(origin: ResponseOrigin, recorded: &Usage) -> BillableUsage {
+///
+/// `pricing_provider` names the provider whose price list prices the usage: the
+/// serving provider for `Provider`, the provider stored on the tape for
+/// `CassetteReplay`. A cache hit charges zero tokens, so its provider does not
+/// change the cost. The caller passes the name explicitly; no charge reads it from
+/// thread-local state, so a provider name left by an earlier call cannot price
+/// this one.
+pub(super) fn billable_usage(
+    origin: ResponseOrigin,
+    recorded: &Usage,
+    pricing_provider: &str,
+) -> BillableUsage {
     let usage = match origin {
         ResponseOrigin::CacheHit => Usage {
             model: recorded.model.clone(),
@@ -84,7 +115,11 @@ pub(super) fn billable_usage(origin: ResponseOrigin, recorded: &Usage) -> Billab
         },
         ResponseOrigin::Provider | ResponseOrigin::CassetteReplay => recorded.clone(),
     };
-    BillableUsage { usage, origin }
+    BillableUsage {
+        usage,
+        origin,
+        pricing_provider: pricing_provider.to_string(),
+    }
 }
 
 /// A completion result with its origin, as returned by the synchronous completion
@@ -94,15 +129,26 @@ pub(super) fn billable_usage(origin: ResponseOrigin, recorded: &Usage) -> Billab
 pub(super) struct Completion {
     pub(super) response: ChatResponse,
     pub(super) origin: ResponseOrigin,
+    /// The provider that served the result (`Provider`), the provider stored on the
+    /// tape (`CassetteReplay`), or empty (`CacheHit`). Prices the charge.
+    pub(super) provider: String,
 }
 
 impl Completion {
-    pub(super) fn new(response: ChatResponse, origin: ResponseOrigin) -> Self {
-        Self { response, origin }
+    pub(super) fn new(
+        response: ChatResponse,
+        origin: ResponseOrigin,
+        provider: impl Into<String>,
+    ) -> Self {
+        Self {
+            response,
+            origin,
+            provider: provider.into(),
+        }
     }
 
     pub(super) fn billable(&self) -> BillableUsage {
-        billable_usage(self.origin, &self.response.usage)
+        billable_usage(self.origin, &self.response.usage, &self.provider)
     }
 
     /// Charge this completion through [`track_usage`] and return the response.
@@ -110,25 +156,34 @@ impl Completion {
         track_usage(&self.billable())?;
         Ok(self.response)
     }
+
+    /// Run the output policy on the response. A rejected result is charged before
+    /// the policy error is returned, for every origin: the result was produced (or,
+    /// for a replay, stands in for a produced result) before the policy refused it.
+    pub(super) fn checked(mut self, source: PolicySource) -> Result<Self, SemaError> {
+        if let Err(error) = apply_output_policy_to_response(&mut self.response, source) {
+            track_usage(&self.billable())?;
+            return Err(error);
+        }
+        Ok(self)
+    }
 }
 
 /// Charge `billable` against the leaf-usage frame and budget frame captured when the
 /// request was dispatched, instead of the frames active now. Runtime finalizers use
 /// this: they run after the task's dynamic scope may have been swapped out.
 ///
-/// The leaf frame is folded here (priced as served by `serving_provider`), and the
+/// The leaf frame is folded here (priced by `billable`'s pricing provider), and the
 /// ambient fold inside [`track_usage`] is suppressed so the completion is counted
 /// once. The captured budget frame is installed around [`track_usage`] and the
 /// previous frame is restored afterwards.
 pub(super) fn charge_dispatch_frames(
     billable: &BillableUsage,
-    serving_provider: &str,
     usage_accum_slot: Option<&Rc<RefCell<LeafUsage>>>,
     budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
 ) -> Result<(), SemaError> {
     if let Some(slot) = usage_accum_slot {
-        let cost = pricing::calculate_cost_for(serving_provider, billable.usage());
-        accumulate_into(slot, billable, cost);
+        accumulate_into(slot, billable, billable.cost());
     }
     let previous_budget =
         ACTIVE_BUDGET.with(|active| std::mem::replace(&mut *active.borrow_mut(), budget_slot));

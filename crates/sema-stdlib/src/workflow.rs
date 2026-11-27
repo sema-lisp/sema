@@ -1238,7 +1238,11 @@ fn finish_step(
         dur_ms,
         model,
     });
-    if usage.calls > 0 {
+    // A leaf that made calls but spent nothing (zero tokens, zero or unknown cost)
+    // emits no Budget event and charges nothing.
+    let spent = usage.input_tokens + usage.output_tokens > 0
+        || usage.cost_usd.is_some_and(|cost| cost > 0.0);
+    if usage.calls > 0 && spent {
         ctx.emit(WorkflowEvent::Budget {
             seq: ctx.next_seq(),
             ts: ctx.ts(),

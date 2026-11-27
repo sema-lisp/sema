@@ -7,7 +7,7 @@ fn accumulate_into_counts_cache_hits_without_calls() {
     let slot = Rc::new(RefCell::new(LeafUsage::default()));
     accumulate_into(
         &slot,
-        &billable_usage(ResponseOrigin::CacheHit, &Usage::default()),
+        &billable_usage(ResponseOrigin::CacheHit, &Usage::default(), ""),
         None,
     );
     let usage = slot.borrow().clone();
@@ -242,7 +242,7 @@ fn usage(prompt: u32, completion: u32) -> Usage {
 }
 
 fn provider_usage(prompt: u32, completion: u32) -> BillableUsage {
-    billable_usage(ResponseOrigin::Provider, &usage(prompt, completion))
+    billable_usage(ResponseOrigin::Provider, &usage(prompt, completion), "")
 }
 
 #[test]
@@ -252,14 +252,14 @@ fn billable_usage_follows_the_response_origin() {
         cache_creation_input_tokens: 2,
         ..usage(100, 50)
     };
-    let cache_hit = billable_usage(ResponseOrigin::CacheHit, &recorded);
+    let cache_hit = billable_usage(ResponseOrigin::CacheHit, &recorded, "");
     assert_eq!(cache_hit.usage().prompt_tokens, 0, "cache hit charges zero");
     assert_eq!(cache_hit.usage().completion_tokens, 0);
     assert_eq!(cache_hit.usage().cache_read_input_tokens, 0);
     assert_eq!(cache_hit.usage().cache_creation_input_tokens, 0);
     assert_eq!(cache_hit.usage().model, "fake-model", "model name is kept");
     for origin in [ResponseOrigin::Provider, ResponseOrigin::CassetteReplay] {
-        let billable = billable_usage(origin, &recorded);
+        let billable = billable_usage(origin, &recorded, "");
         assert_eq!(billable.usage().prompt_tokens, 100, "{origin:?}");
         assert_eq!(billable.usage().completion_tokens, 50, "{origin:?}");
         assert_eq!(billable.usage().cache_read_input_tokens, 4, "{origin:?}");
@@ -278,7 +278,7 @@ fn accumulate_into_counts_a_cache_hit_with_nonzero_recorded_usage_as_a_hit() {
     let slot = Rc::new(RefCell::new(LeafUsage::default()));
     accumulate_into(
         &slot,
-        &billable_usage(ResponseOrigin::CacheHit, &usage(100, 50)),
+        &billable_usage(ResponseOrigin::CacheHit, &usage(100, 50), ""),
         Some(0.5),
     );
     let u = slot.borrow();
@@ -308,7 +308,7 @@ fn accumulate_into_skips_cache_hit_zero_usage() {
     let slot = Rc::new(RefCell::new(LeafUsage::default()));
     accumulate_into(
         &slot,
-        &billable_usage(ResponseOrigin::CacheHit, &Usage::default()),
+        &billable_usage(ResponseOrigin::CacheHit, &Usage::default(), ""),
         None,
     );
     let u = slot.borrow();
@@ -1095,4 +1095,211 @@ fn cache_entries_without_tool_calls_still_deserialize() {
         serde_json::from_str(legacy).expect("a pre-existing entry must still load");
     assert_eq!(parsed.content, "hi");
     assert!(parsed.tool_calls.is_empty());
+}
+
+// ── Accounting rules for policy rejection, zero usage, budgets, and pricing ─────
+
+/// The model `Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8` costs $0.20/M input tokens at
+/// the canonical price and $2.00/M as served by `togetherai` (`pricing-data.json`).
+const TWO_PRICE_MODEL: &str = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8";
+
+fn one_million_input_tokens() -> Usage {
+    Usage {
+        prompt_tokens: 1_000_000,
+        model: TWO_PRICE_MODEL.into(),
+        ..Usage::default()
+    }
+}
+
+fn session_tokens() -> u32 {
+    SESSION_USAGE.with(|u| {
+        let u = u.borrow();
+        u.prompt_tokens + u.completion_tokens
+    })
+}
+
+#[test]
+fn track_usage_prices_with_the_provider_on_the_charge() {
+    reset_runtime_state();
+    track_usage(&billable_usage(
+        ResponseOrigin::Provider,
+        &one_million_input_tokens(),
+        "togetherai",
+    ))
+    .unwrap();
+    assert!(
+        (session_cost_snapshot() - 2.0).abs() < 1e-9,
+        "togetherai price"
+    );
+
+    reset_runtime_state();
+    track_usage(&billable_usage(
+        ResponseOrigin::Provider,
+        &one_million_input_tokens(),
+        "",
+    ))
+    .unwrap();
+    assert!(
+        (session_cost_snapshot() - 0.2).abs() < 1e-9,
+        "canonical price"
+    );
+}
+
+#[test]
+fn accumulate_into_counts_a_zero_usage_provider_result_as_a_call() {
+    let slot = Rc::new(RefCell::new(LeafUsage::default()));
+    for origin in [ResponseOrigin::Provider, ResponseOrigin::CassetteReplay] {
+        accumulate_into(&slot, &billable_usage(origin, &usage(0, 0), ""), Some(0.0));
+    }
+    let u = slot.borrow();
+    assert_eq!(u.calls, 2, "a zero-usage result is still a call");
+    assert_eq!(u.cache_hits, 0, "only the CacheHit origin is a cache hit");
+}
+
+#[test]
+fn a_cache_hit_is_not_checked_against_an_exceeded_budget() {
+    reset_runtime_state();
+    let frame = ensure_active_budget();
+    {
+        let mut f = frame.borrow_mut();
+        f.token_limit = Some(100);
+        f.tokens_spent = 150;
+    }
+    track_usage(&billable_usage(
+        ResponseOrigin::CacheHit,
+        &usage(100, 50),
+        "",
+    ))
+    .expect("a cache hit spends nothing, so the exceeded budget does not fail it");
+    assert_eq!(frame.borrow().tokens_spent, 150);
+    let error = track_usage(&billable_usage(ResponseOrigin::Provider, &usage(1, 0), ""))
+        .expect_err("a provider result in an exceeded budget still fails");
+    assert!(
+        error.to_string().contains("token budget exceeded"),
+        "{error}"
+    );
+}
+
+fn policy_map(entries: Vec<(&str, Value)>) -> Value {
+    Value::map(
+        entries
+            .into_iter()
+            .map(|(key, value)| (Value::keyword(key), value))
+            .collect(),
+    )
+}
+
+/// Install an output policy that blocks any response containing an e-mail address.
+fn block_email_output() -> PolicyScope {
+    let policy = sema_policy::CompiledPolicy::compile(&policy_map(vec![(
+        "output",
+        policy_map(vec![
+            ("detect", Value::vector(vec![Value::keyword("email")])),
+            (
+                "actions",
+                policy_map(vec![("email", Value::keyword("block"))]),
+            ),
+        ]),
+    )]))
+    .expect("compile the output policy");
+    open_policy_scopes(
+        vec![Rc::new(policy)],
+        std::env::temp_dir(),
+        Rc::new(|_observation| {}),
+    )
+}
+
+fn origin_request() -> ChatRequest {
+    ChatRequest::new(
+        "m".to_string(),
+        vec![ChatMessage::new("user", "policy-replay prompt")],
+    )
+}
+
+/// Write a tape holding one 111+222-token completion whose text the e-mail policy
+/// blocks, keyed as a replay under that policy looks it up. Sema never records such
+/// an entry itself (each record path runs the output policy first), so this stands
+/// for a tape that was edited or written by another Sema version.
+fn record_blocked_tape(tag: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "sema-llm-policy-replay-{}-{tag}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    reset_runtime_state();
+    let key = {
+        let _policy = block_email_output();
+        compute_cache_key(&origin_request())
+    };
+    let response = ChatResponse {
+        content: "mail alice@example.com".to_string(),
+        model: "m".to_string(),
+        usage: Usage {
+            prompt_tokens: 111,
+            completion_tokens: 222,
+            model: "m".to_string(),
+            ..Usage::default()
+        },
+        role: "assistant".to_string(),
+        tool_calls: Vec::new(),
+        stop_reason: None,
+    };
+    install_cassette(crate::cassette::Cassette::load(
+        path.clone(),
+        crate::cassette::CassetteMode::Record,
+    ));
+    cassette_record(crate::cassette::TapeEntry::from_response(
+        &key, "fake", &response,
+    ));
+    take_cassette()
+        .expect("cassette installed")
+        .save()
+        .expect("save tape");
+    path
+}
+
+/// Start a replay of `path` with no live provider and the e-mail policy active.
+fn replay_blocked_tape(path: &std::path::Path) -> PolicyScope {
+    reset_runtime_state();
+    register_test_provider(Box::new(
+        crate::fake::FakeProvider::builder("fake")
+            .model("m")
+            .error(crate::types::LlmError::Config("must not be called".into()))
+            .build(),
+    ));
+    install_cassette(crate::cassette::Cassette::load(
+        path.to_path_buf(),
+        crate::cassette::CassetteMode::Replay,
+    ));
+    block_email_output()
+}
+
+#[test]
+fn a_replay_rejected_by_the_output_policy_charges_the_recorded_usage_on_complete() {
+    let path = record_blocked_tape("complete");
+    let _policy = replay_blocked_tape(&path);
+    let error = do_complete(origin_request()).expect_err("the policy blocks the replay");
+    assert!(error.to_string().contains("policy"), "{error}");
+    assert_eq!(session_tokens(), 333, "the rejected replay charges 111+222");
+    drop(take_cassette());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_replay_rejected_by_the_output_policy_charges_the_recorded_usage_on_stream() {
+    let path = record_blocked_tape("stream");
+    let _policy = replay_blocked_tape(&path);
+    let span = sema_otel::llm_span("chat");
+    let mut chunks = Vec::new();
+    let mut on_chunk = |chunk: &str| -> Result<(), crate::types::LlmError> {
+        chunks.push(chunk.to_string());
+        Ok(())
+    };
+    let error = stream_with_dispatch(origin_request(), &mut on_chunk, &span)
+        .expect_err("the policy blocks the replay");
+    assert!(error.to_string().contains("policy"), "{error}");
+    assert!(chunks.is_empty(), "no blocked text reaches the callback");
+    assert_eq!(session_tokens(), 333, "the rejected replay charges 111+222");
+    drop(take_cassette());
+    let _ = std::fs::remove_file(&path);
 }

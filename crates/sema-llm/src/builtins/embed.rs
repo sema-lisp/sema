@@ -122,8 +122,7 @@ impl sema_core::runtime::CompletionDecoder for EmbedDecoder {
                 }
                 let value = embed_value_from_response(&resp, self.single);
                 charge_dispatch_frames(
-                    &billable_usage(ResponseOrigin::Provider, &resp.usage),
-                    &self.provider_name,
+                    &billable_usage(ResponseOrigin::Provider, &resp.usage, &self.provider_name),
                     self.usage_accum_slot.as_ref(),
                     self.budget_slot.clone(),
                 )?;
@@ -447,7 +446,11 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
                         ..Default::default()
                     });
                     drop(span);
-                    track_usage(&billable_usage(ResponseOrigin::CassetteReplay, &resp.usage))?;
+                    track_usage(&billable_usage(
+                        ResponseOrigin::CassetteReplay,
+                        &resp.usage,
+                        &entry.provider,
+                    ))?;
                     return Ok(NativeOutcome::Return(embed_value_from_response(
                         &resp, single,
                     )));
@@ -537,7 +540,7 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
         let span = sema_otel::llm_span("embeddings");
         span.set_embedding_input(&request.texts);
         let decision = cassette_decide(&cassette_key);
-        let (response, origin) = match decision {
+        let (response, origin, pricing_provider) = match decision {
             Some(crate::cassette::Decision::Replay(entry)) => {
                 enforce_stored_model_policy(&entry.provider, &entry.model, PolicySource::Cassette)?;
                 let resp = EmbedResponse {
@@ -560,7 +563,7 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
                     response_model: resp.model.clone(),
                     ..Default::default()
                 });
-                (resp, ResponseOrigin::CassetteReplay)
+                (resp, ResponseOrigin::CassetteReplay, entry.provider)
             }
             Some(crate::cassette::Decision::Miss(k)) => return Err(cassette_miss_error(&k)),
             other => {
@@ -601,11 +604,11 @@ pub(super) fn register(env: &Env, unrestricted: bool) {
                         resp.usage.prompt_tokens,
                     ));
                 }
-                (resp, ResponseOrigin::Provider)
+                (resp, ResponseOrigin::Provider, provider_name)
             }
         };
 
-        track_usage(&billable_usage(origin, &response.usage))?;
+        track_usage(&billable_usage(origin, &response.usage, &pricing_provider))?;
         Ok(NativeOutcome::Return(embed_value_from_response(
             &response, single,
         )))

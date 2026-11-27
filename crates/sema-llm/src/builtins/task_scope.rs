@@ -246,9 +246,4 @@ thread_local! {
         RefCell::new(std::collections::HashMap::new());
     pub(super) static RATE_LIMIT_RPS: Cell<Option<f64>> = const { Cell::new(None) };
     pub(super) static RATE_LIMIT_LAST: RefCell<Option<Rc<Cell<u64>>>> = const { RefCell::new(None) };
-    // Name of the provider that served the most recent `do_complete` response, so cost
-    // tracking can price the model as served by that provider (resellers/gateways can list
-    // the same model id at a different rate). Set at the dispatch choke points, consumed +
-    // cleared by `track_usage`. `None` → canonical first-party price.
-    pub(super) static LAST_SERVING_PROVIDER: RefCell<Option<String>> = const { RefCell::new(None) };
 }
